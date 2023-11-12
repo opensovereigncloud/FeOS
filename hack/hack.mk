@@ -8,7 +8,8 @@ build-container:
 	touch hack/build-container
 
 container-release:
-	docker run -it --rm -u $${UID} -v "`pwd`:/feos" aurae-builder bash -c "cd /feos && make release"
+	mkdir -p target/cargo
+	docker run -it --rm -u $${UID} -v "`pwd`/target/cargo:/.cargo" -v "`pwd`:/feos" aurae-builder bash -c "cd /feos && CARGO_HOME=/.cargo make release"
 
 kernel:
 	mkdir -p target/rootfs/boot
