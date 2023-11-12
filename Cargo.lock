@@ -4,4 +4,4 @@ version = 3
 
 [[package]]
 name = "feos"
-version = "0.1.62"
+version = "0.1.0"
