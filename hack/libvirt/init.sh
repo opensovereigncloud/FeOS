@@ -6,4 +6,4 @@ thisDir=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 targetDir=$(realpath "$thisDir/../../")
 
 . ${thisDir}/../../hack/kernel/config.sh
-cat ${thisDir}/$1 | sed "s#__PWD__#${targetDir}#" | sed "s#__KERNEL_VERSION__#${KERNEL_VERSION}#" | tee ${thisDir}/../../target/libvirt.xml
+cat ${thisDir}/$1 | sed "s#__PWD__#${targetDir}#" | sed "s#__KERNEL_VERSION__#${KERNEL_VERSION}#" > ${thisDir}/../../target/libvirt.xml

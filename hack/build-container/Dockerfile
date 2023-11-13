@@ -6,10 +6,12 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     gperf \
     ninja-build \
     protobuf-compiler \
-    libprotobuf-dev
+    libprotobuf-dev \
+    sbsigntool python3-pefile systemd
 
 RUN cargo new xyz; cd xyz; cargo fetch; cd ..; rm -rf xyz
 RUN rustup component add clippy
 RUN mkdir /feos
 RUN mkdir /target
+RUN wget https://raw.githubusercontent.com/systemd/systemd/main/src/ukify/ukify.py -O /usr/bin/ukify && chmod +x /usr/bin/ukify
 WORKDIR /feos

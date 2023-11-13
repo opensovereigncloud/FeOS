@@ -6,6 +6,7 @@ This directory includes scripts to run FeOS as the pid 1 process within a VM.
     make build-container
     make kernel
     make initramfs
+    make uki
 
     # create `vm-br0` bridge on your machine:
     make network

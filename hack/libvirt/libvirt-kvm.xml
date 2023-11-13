@@ -9,10 +9,8 @@
   <vcpu>4</vcpu>
   <os firmware="efi">
     <type arch="x86_64" machine="q35">hvm</type>
-    <kernel>__PWD__/target/kernel/vmlinuz-__KERNEL_VERSION__</kernel>
-    <initrd>__PWD__/target/initramfs.zst</initrd>
-    <cmdline>rdinit=/bin/feos console=tty0 console=ttyS0,115200</cmdline>
-    <loader readonly="yes" type="pflash">/usr/share/edk2/x64/OVMF_CODE.fd</loader>
+    <kernel>__PWD__/target/uki.efi</kernel>
+    <loader readonly="yes" type="pflash" secure="yes">/usr/share/edk2/x64/OVMF_CODE.secboot.fd</loader>
     <boot dev="hd"/>
   </os>
   <features>

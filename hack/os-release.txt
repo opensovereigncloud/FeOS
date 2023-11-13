@@ -1,0 +1,10 @@
+NAME="FeOS"
+VERSION="0.1.0-6.1.62"
+ID=feos
+PRETTY_NAME="FeOS v0.1.0-6.1.62"
+VERSION_ID="0.1.0"
+HOME_URL="https://www.github.com/maltej/feos"
+SUPPORT_URL="https://www.github.com/maltej/feos"
+BUG_REPORT_URL="https://www.github.com/maltej/feos"
+PRIVACY_POLICY_URL="https://www.github.com/maltej/feos"
+VERSION_CODENAME="0.1.0"

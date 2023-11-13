@@ -26,6 +26,23 @@ initramfs: container-release
 	cd target/rootfs && rm -f init && ln -s bin/feos init
 	docker run -it --rm -u $${UID} -v "`pwd`:/feos" feos-builder bash -c "cd hack/initramfs && ./mk-initramfs"
 
+keys:
+	mkdir keys
+	chmod 700 keys
+	cp hack/secureboot-cert.conf keys/
+	openssl genrsa -out keys/secureboot.key 2048
+	openssl req -config keys/secureboot-cert.conf -new -x509 -newkey rsa:2048 -keyout keys/secureboot.key -outform PEM -out keys/secureboot.crt -nodes -days 3650 -subj "/CN=FeOS/"
+
+uki: keys
+	docker run -it --rm -u $${UID} -v "`pwd`:/feos" feos-builder ukify build \
+	  --os-release @/feos/hack/os-release.txt \
+	  --linux /feos/target/kernel/vmlinuz \
+	  --initrd /feos/target/initramfs.zst \
+	  --cmdline @/feos/hack/kernel/cmdline.txt \
+	  --secureboot-private-key /feos/keys/secureboot.key \
+	  --secureboot-certificate /feos/keys/secureboot.crt \
+	  --output /feos/target/uki.efi
+
 virsh-start:
 	./hack/libvirt/init.sh libvirt-kvm.xml
 	virsh --connect qemu:///system create target/libvirt.xml
