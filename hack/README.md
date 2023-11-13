@@ -12,7 +12,7 @@ This directory includes scripts to run FeOS as the pid 1 process within a VM.
     make network
 
     # run FeOS in a VM as pid 1:
-    make virsh-init virsh-start virsh-console virsh-stop
+    make virsh-start virsh-console virsh-stop
 
     # exit VM console with Ctrl+]
 
