@@ -19,6 +19,31 @@ async fn main() -> Result<(), ()> {
     ", env!("CARGO_PKG_VERSION"));
 
     env_logger::init();
+
+    // Special stuff for pid 1
+    if std::process::id() == 1 { 
+        mount_virtual_filesystems();
+        configure_network_devices().await;
+    }
+
+    feos_daemon();
+    
+    // loop forever if pid == 1
+    if std::process::id() == 1 { 
+        loop {
+            thread::sleep(Duration::from_secs(1))
+        }
+    }
+    Ok(())
+}
+
+fn mount_virtual_filesystems() {
+    // TODO: Mount virtual filesystems /dev /sys /proc 
+}
+
+async fn configure_network_devices() {
+    // TODO: configure network devices
+
     let (connection, handle, _) = new_connection().unwrap();
     tokio::spawn(connection);
 
@@ -26,18 +51,22 @@ async fn main() -> Result<(), ()> {
     if let Err(e) = dump_links(handle.clone()).await {
         eprintln!("{e}");
     }
-
     let name = "eth0";
     println!("\n*** retrieving link named \"{name}\" ***");
     if let Err(e) = get_link_by_name(handle.clone(), name.to_string()).await {
         eprintln!("{e}");
     }
-    
-
-    // Do not exit if pid == 1
-    if std::process::id() == 1 { loop { thread::sleep(Duration::from_secs(1)) } }
-    Ok(())
 }
+
+fn feos_daemon() {
+    // TODO: implement feos daemon stuff
+}
+
+
+
+
+
+
 
 async fn dump_links(handle: Handle) -> Result<(), Error> {
     let mut links = handle.link().get().execute();
