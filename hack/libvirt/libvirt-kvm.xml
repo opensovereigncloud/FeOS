@@ -10,11 +10,7 @@
   <os firmware="efi">
     <type arch="x86_64" machine="q35">hvm</type>
     <kernel>__PWD__/target/uki.efi</kernel>
-    <firmware>
-      <feature enabled='yes' name='secure-boot'/>
-    </firmware>
-    <loader readonly="yes" type="pflash">/usr/share/edk2/x64/OVMF_CODE.secboot.fd</loader>
-    <nvram template='/usr/share/edk2/x64/OVMF_VARS.4m.fd'>__PWD__/target/OVMF_VARS.fd</nvram>
+    <loader readonly="yes" type="pflash">/usr/share/edk2/x64/OVMF_CODE.fd</loader>
     <boot dev="hd"/>
   </os>
   <features>
