@@ -9,13 +9,30 @@ Booting FeOS from USB is quite easy. You just need to prepare a USB stick with a
 
 > This will wipe all data on your USB stick!
 
-1. Download the latest FeOS UKI from the [Releases page](https://github.com/maltej/feos/releases).
+1. Download the latest FeOS UKI `*.efi` file from the [Releases page](https://github.com/maltej/feos/releases).
 2. Insert a USB stick into your machine and identify its device address using `sudo parted -l` - for this example we assume the USB stick is `/dev/sda`
-3. Create a new GPT partition table and an ESP partition: `sudo parted /dev/sda --script -- mklabel gpt mkpart primary fat32 1MiB 100% set 1 on`
-4. Format the newly created partition with FAT32 `sudo mkfs.fat -F32 /dev/sda1`
-5. Mount the partition `sudo mount /dev/sda1 /mnt`
-6. Create the EFI directory structure `sudo mkdir -p /mnt/EFI/BOOT`
-7. Copy the FeOS UKI to the EFI partition `sudo cp feos-*.efi /mnt/EFI/BOOT/BOOTX64.EFI`
-8. Optional: copy the secureboot certificate also to the USB stick `sudo cp feos.crt /mnt/` - you can install it into the UEFI secureboot certificate DB of your machine via the system setup (aka BIOS).
+3. Create a new GPT partition table and an ESP partition:
+
+    sudo parted /dev/sda --script -- mklabel gpt mkpart primary fat32 1MiB 100% set 1 on
+
+4. Format the newly created partition with FAT32
+
+    sudo mkfs.fat -F32 /dev/sda1
+
+5. Mount the partition
+
+    sudo mount /dev/sda1 /mnt
+
+6. Create the EFI directory structure
+
+    sudo mkdir -p /mnt/EFI/BOOT
+
+7. Copy the FeOS UKI to the EFI partition
+
+    sudo cp feos-*.efi /mnt/EFI/BOOT/BOOTX64.EFI
+
+8. *Optional*: copy the secureboot certificate also to the USB stick. You can install it into the UEFI secureboot certificate DB of your machine via the system setup (aka BIOS).
+
+    sudo cp feos.crt /mnt/
 
 Now you have a UEFI bootable USB stick with FeOS.
