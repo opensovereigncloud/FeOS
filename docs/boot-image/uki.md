@@ -12,21 +12,24 @@ Booting FeOS from USB is quite easy. You just need to prepare a USB stick with a
 
 1. Download the latest FeOS UKI `*.efi` file from the [Releases page](https://github.com/maltej/feos/releases).
 
-2. Insert a USB stick into your machine and identify its device address using `sudo parted -l` - for this example we assume the USB stick is `/dev/sda`
+2. Insert a USB stick into your machine and identify its device address using parted - for this example we assume the USB stick is `/dev/sdX`
+```
+    sudo parted -l
+```
 
 3. Create a new GPT partition table and an ESP partition:
 ```
-    sudo parted /dev/sda --script -- mklabel gpt mkpart primary fat32 1MiB 100% set 1 on
+    sudo parted /dev/sdX --script -- mklabel gpt mkpart primary fat32 1MiB 100% set 1 on
 ```
 
 4. Format the newly created partition with FAT32
 ```
-    sudo mkfs.fat -F32 /dev/sda1
+    sudo mkfs.fat -F32 /dev/sdX1
 ```
 
 5. Mount the partition
 ```
-    sudo mount /dev/sda1 /mnt
+    sudo mount /dev/sdX1 /mnt
 ```
 
 6. Create the EFI directory structure
