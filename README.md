@@ -11,17 +11,11 @@ FeOS is a revolutionary init system for Linux, designed specifically for hypervi
 **Cluster Integration**: Designed for use in clustered environments, FeOS treats servers as hardware resources for executing programs.  
 **gRPC API**: Exposes a gRPC API for external orchestrators to manage VMs, Containers, and MicroVMs.
 
+## For Developers
+For detailed information on contributing to FeOS, including development guidelines, setup instructions, and coding standards, please refer to our [Developer Documentation](docs/development.md). This document provides all the necessary information for developers to understand the codebase, contribute effectively, and collaborate with the FeOS community.
+
 ## Installation and Setup
-**Network Booting**: FeOS primarily boots via the network using a signed Unified Kernel Image (UKI) to support secure booting.  
-**Initial Configuration**: Initial setup through the Kernel command line, configuring external network connectivity.  
-**Ongoing Configuration**: Further configurations and management are handled via the gRPC API.
-
-## Security and Isolation
-**MicroVMs for Multi-Tenancy**: Running containers in MicroVMs ensures secure operation in multi-tenant environments.  
-**SmartNIC Integration**: Compatible with SmartNICs (DPUs) for enhanced security, allowing Kubernetes controllers on DPUs to manage workloads on the host via the gRPC API.
-
-## Logging and Monitoring
-**Log Management**: The gRPC API also facilitates the transport of log output from applications running on the server.
+Just download the Unified Kernel Image (UKI) from the [Releases](releases) page and boot them with UEFI. You can do that in a VM by providing the UKI as a Kernel, via PXE boot or [boot from USB stick](docs/boot-image/uki.md).
 
 ## Use Cases
 **Multi-Tenant Environments**: Ideal for environments requiring strong isolation between different tenants' workloads.  
