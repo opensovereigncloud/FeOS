@@ -10,4 +10,7 @@ run: all
 clean:
 	rm -rf target
 
+test:
+	cargo test
+
 include hack/hack.mk

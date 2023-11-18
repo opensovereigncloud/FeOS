@@ -1,0 +1,46 @@
+name: FeOS Release
+
+on:
+  push:
+    tags:
+    - '*'
+
+jobs:
+  build_release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check Out Repo
+      uses: actions/checkout@v2
+
+    - name: Run Tests
+      run: make test
+
+    - name: Build build-container
+      run: make build-container
+
+    - name: Build Kernel
+      run: make kernel
+
+    - name: Build initramfs
+      run: make initramfs
+
+    - name: Build UKI
+      run: |
+        mkdir keys
+        echo "${{ secrets.SECUREBOOT_PRIVATEKEY }}" > keys/secureboot.key
+        echo "${{ secrets.SECUREBOOT_CERTIFICATE }}" > keys/secureboot.pem
+        openssl x509 -in keys/secureboot.pem -out keys/FeOS.crt -outform DER
+        make uki
+        mv target/uki.efi target/feos-${{ github.ref_name }}-x86_64.efi
+
+    - name: Release
+      uses: softprops/action-gh-release@v1
+      id: create_release
+      with:
+        body_path: docs/changelog/FeOS-${{ github.ref_name }}.md
+        files: |
+          target/feos-${{ github.ref_name }}-x86_64.efi
+          keys/FeOS.crt

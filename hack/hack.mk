@@ -10,11 +10,11 @@ build-container:
 container-release:
 #	make cargo index cache
 	mkdir -p target/cargo
-	docker run -it --rm -u $${UID} -v "`pwd`/target/cargo:/.cargo" -v "`pwd`:/feos" feos-builder bash -c "cd /feos && CARGO_HOME=/.cargo make release"
+	docker run --rm -u $${UID} -v "`pwd`/target/cargo:/.cargo" -v "`pwd`:/feos" feos-builder bash -c "cd /feos && CARGO_HOME=/.cargo make release"
 
 kernel:
 	mkdir -p target/rootfs/boot
-	docker run -it --rm -u $${UID} -v "`pwd`:/feos" feos-builder bash -c "cd hack/kernel && ./mk-kernel"
+	docker run --rm -u $${UID} -v "`pwd`:/feos" feos-builder bash -c "cd hack/kernel && ./mk-kernel"
 
 menuconfig:
 	docker run -it --rm -u $${UID} -v "`pwd`:/feos" feos-builder bash -c "cd hack/kernel && ./mk-menuconfig"
@@ -25,7 +25,7 @@ initramfs: container-release
 	cp target/release/feos target/rootfs/bin/feos
 	sudo chown -R `whoami` target/rootfs/etc/feos/
 	cd target/rootfs && rm -f init && ln -s bin/feos init
-	docker run -it --rm -u $${UID} -v "`pwd`:/feos" feos-builder bash -c "cd hack/initramfs && ./mk-initramfs"
+	docker run --rm -u $${UID} -v "`pwd`:/feos" feos-builder bash -c "cd hack/initramfs && ./mk-initramfs"
 
 keys:
 	mkdir keys
@@ -36,7 +36,7 @@ keys:
 	openssl x509 -in keys/secureboot.pem -out keys/secureboot.der -outform DER
 
 uki: keys
-	docker run -it --rm -u $${UID} -v "`pwd`:/feos" feos-builder ukify build \
+	docker run --rm -u $${UID} -v "`pwd`:/feos" feos-builder ukify build \
 	  --os-release @/feos/hack/uki/os-release.txt \
 	  --linux /feos/target/kernel/vmlinuz \
 	  --initrd /feos/target/initramfs.zst \
