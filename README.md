@@ -3,7 +3,11 @@
 ## Overview
 FeOS is a revolutionary init system for Linux, designed specifically for hypervisors and servers that run containers. Unlike traditional systems that use sysvinit or systemd, FeOS boots directly from the Linux Kernel. Written in Rust for enhanced security and memory safety, FeOS is an ideal solution for multi-tenant environments, offering robust protection against common vulnerabilities like buffer overflows.
 
-## Key Features
+### Use Cases
+**Multi-Tenant Environments**: Ideal for environments requiring strong isolation between different tenants' workloads.  
+**Clustered Server Environments**: Optimized for clustered server environments, providing efficient management and execution of containers and VMs.
+
+### Key Features
 **Init System**: FeOS replaces traditional Linux init systems, booting directly from the Linux Kernel.  
 **Container and VM Support**: Supports running VMs, Containers, and MicroVMs, including the ability to run containers within MicroVMs for enhanced security.  
 **Rust-Based**: Developed in Rust, leveraging memory-safe programming to mitigate common vulnerabilities.  
@@ -16,13 +20,6 @@ For detailed information on contributing to FeOS, including development guidelin
 
 ## Installation and Setup
 Just download the Unified Kernel Image (UKI) from the [Releases](https://github.com/maltej/feos/releases) page and boot it with UEFI. You can do that in a VM by providing the UKI as a Kernel, via PXE boot or [boot from USB stick](docs/boot-image/uki.md#boot-from-usb-stick).
-
-## Use Cases
-**Multi-Tenant Environments**: Ideal for environments requiring strong isolation between different tenants' workloads.  
-**Clustered Server Environments**: Optimized for clustered server environments, providing efficient management and execution of containers and VMs.
-
-## Contributing
-Contributions are welcome! Guidelines for contributing to FeOS are provided to maintain the quality and integrity of the codebase.
 
 ## Licensing
 FeOS is licensed under the [Apache License v2.0](LICENSE), ensuring open-source availability and collaborative development potential.
