@@ -32,7 +32,7 @@ jobs:
         mkdir keys
         echo "${{ secrets.SECUREBOOT_PRIVATEKEY }}" > keys/secureboot.key
         echo "${{ secrets.SECUREBOOT_CERTIFICATE }}" > keys/secureboot.pem
-        openssl x509 -in keys/secureboot.pem -out keys/FeOS.crt -outform DER
+        openssl x509 -in keys/secureboot.pem -out keys/feos.crt -outform DER
         make uki
         mv target/uki.efi target/feos-${{ github.ref_name }}-x86_64.efi
 
@@ -40,6 +40,7 @@ jobs:
       uses: softprops/action-gh-release@v1
       id: create_release
       with:
+        name: FeOS ${{ github.ref_name }}
         body_path: docs/changelog/FeOS-${{ github.ref_name }}.md
         files: |
           target/feos-${{ github.ref_name }}-x86_64.efi
