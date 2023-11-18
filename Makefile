@@ -1,7 +1,10 @@
-all:
+clippy:
+	cargo clippy
+
+all: clippy
 	cargo build
 
-release:
+release: clippy
 	cargo build --release
 
 run: all
@@ -10,7 +13,7 @@ run: all
 clean:
 	rm -rf target
 
-test:
+test: clippy
 	cargo test
 
 include hack/hack.mk

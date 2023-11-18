@@ -153,7 +153,7 @@ async fn dump_addresses(handle: Handle, link: String) -> Result<(), Error> {
     }
 }
 
-fn format_mac(bytes: &Vec<u8>) -> String {
+fn format_mac(bytes: &[u8]) -> String {
     bytes
         .iter()
         .map(|byte| format!("{:02x}", byte))
