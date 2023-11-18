@@ -1,9 +1,12 @@
+extern crate nix;
+
 use std::thread;
 use std::time::Duration;
 
 use futures::stream::TryStreamExt;
 use rtnetlink::{new_connection, Error, Handle};
 use netlink_packet_route::link::nlas::Nla;
+use nix::mount::{mount, MsFlags};
 
 #[tokio::main]
 async fn main() -> Result<(), ()> {
@@ -38,7 +41,31 @@ async fn main() -> Result<(), ()> {
 }
 
 fn mount_virtual_filesystems() {
-    // TODO: Mount virtual filesystems /dev /sys /proc 
+    const NONE: Option<&'static [u8]> = None;
+
+    mount(
+        Some(b"proc".as_ref()), 
+        "/proc", 
+        Some(b"proc".as_ref()), 
+        MsFlags::empty(), 
+        NONE)
+        .unwrap_or_else(|e| panic!("/proc mount failed: {e}"));
+
+    mount(
+        Some(b"sys".as_ref()), 
+        "/sys", 
+        Some(b"sysfs".as_ref()), 
+        MsFlags::empty(), 
+        NONE)
+        .unwrap_or_else(|e| panic!("/sys mount failed: {e}"));
+
+    mount(
+        Some(b"devtmpfs".as_ref()), 
+        "/dev", 
+        Some(b"devtmpfs".as_ref()), 
+        MsFlags::empty(), 
+        NONE)
+        .unwrap_or_else(|e| panic!("/dev mount failed: {e}"));
 }
 
 async fn configure_network_devices() {
