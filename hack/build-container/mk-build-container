@@ -3,4 +3,5 @@
 docker rmi feos-builder
 
 set -e
+docker pull rust:1-bullseye
 docker build . -t feos-builder
