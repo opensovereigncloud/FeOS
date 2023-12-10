@@ -1,17 +1,18 @@
 extern crate nix;
+mod daemon;
 mod filesystem;
 mod network;
 
+use crate::daemon::daemon_start;
 use crate::filesystem::mount_virtual_filesystems;
 use crate::network::configure_network_devices;
 
-use log::{info, warn, LevelFilter};
+use log::{error, info, warn, LevelFilter};
 use nix::unistd::Uid;
 use simple_logger::SimpleLogger;
-use std::time::Duration;
 
 #[tokio::main]
-async fn main() -> Result<(), ()> {
+async fn main() {
     println!(
         "
 
@@ -48,13 +49,8 @@ async fn main() -> Result<(), ()> {
     }
 
     info!("Starting FeOS daemon...");
-    feos_daemon()
-}
-
-fn feos_daemon() -> Result<(), ()> {
-    // TODO: implement feos daemon stuff
-
-    loop {
-        std::thread::sleep(Duration::from_secs(1));
+    match daemon_start().await {
+        Err(e) => error!("FeOS daemon crashed: {}", e),
+        _ => error!("FeOS daemon exited."),
     }
 }
