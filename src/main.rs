@@ -4,7 +4,11 @@ mod network;
 
 use crate::filesystem::mount_virtual_filesystems;
 use crate::network::configure_network_devices;
+use nix::unistd::Uid;
+use simple_logger::SimpleLogger;
 use std::time::Duration;
+
+use log::{info, warn, LevelFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), ()> {
@@ -22,27 +26,33 @@ async fn main() -> Result<(), ()> {
         env!("CARGO_PKG_VERSION")
     );
 
-    env_logger::init();
+    SimpleLogger::new()
+        .with_level(LevelFilter::Debug)
+        .init()
+        .unwrap();
 
-    let pid1 = std::process::id() == 1;
+    // if not run as root, print warning.
+    if !Uid::current().is_root() {
+        warn!("Not running as root! (uid: {})", Uid::current());
+    }
 
     // Special stuff for pid 1
-    if pid1 {
+    if std::process::id() == 1 {
+        info!("Mounting virtual filesystems...");
         mount_virtual_filesystems();
+
+        info!("Configuring network devices...");
         configure_network_devices().await;
     }
 
-    feos_daemon();
-
-    // loop forever if pid == 1
-    if pid1 {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-    Ok(())
+    info!("Starting FeOS daemon...");
+    feos_daemon()
 }
 
-fn feos_daemon() {
+fn feos_daemon() -> Result<(), ()> {
     // TODO: implement feos daemon stuff
+
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
