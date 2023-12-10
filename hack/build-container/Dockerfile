@@ -1,4 +1,4 @@
-FROM rust:1-bullseye
+FROM rust:1-bookworm
 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     flex bison bc libelf-dev \
@@ -7,7 +7,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     ninja-build \
     protobuf-compiler \
     libprotobuf-dev \
-    sbsigntool python3-pefile systemd
+    sbsigntool python3-pefile systemd-boot
 
 RUN cargo new xyz; cd xyz; cargo fetch; cd ..; rm -rf xyz
 RUN rustup component add clippy
