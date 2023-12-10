@@ -1,8 +1,10 @@
+use log::debug;
 use nix::mount::{mount, MsFlags};
 
 pub fn mount_virtual_filesystems() {
     const NONE: Option<&'static [u8]> = None;
 
+    debug!("Mounting /proc");
     mount(
         Some(b"proc".as_ref()),
         "/proc",
@@ -12,6 +14,7 @@ pub fn mount_virtual_filesystems() {
     )
     .unwrap_or_else(|e| panic!("/proc mount failed: {e}"));
 
+    debug!("Mounting /sys");
     mount(
         Some(b"sys".as_ref()),
         "/sys",
@@ -21,6 +24,7 @@ pub fn mount_virtual_filesystems() {
     )
     .unwrap_or_else(|e| panic!("/sys mount failed: {e}"));
 
+    debug!("Mounting /dev");
     mount(
         Some(b"devtmpfs".as_ref()),
         "/dev",

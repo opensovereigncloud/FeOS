@@ -4,11 +4,11 @@ mod network;
 
 use crate::filesystem::mount_virtual_filesystems;
 use crate::network::configure_network_devices;
+
+use log::{info, warn, LevelFilter};
 use nix::unistd::Uid;
 use simple_logger::SimpleLogger;
 use std::time::Duration;
-
-use log::{info, warn, LevelFilter};
 
 #[tokio::main]
 async fn main() -> Result<(), ()> {
@@ -27,7 +27,9 @@ async fn main() -> Result<(), ()> {
     );
 
     SimpleLogger::new()
-        .with_level(LevelFilter::Debug)
+        .with_level(LevelFilter::Info)
+        .with_module_level("feos::filesystem", LevelFilter::Debug)
+        .with_utc_timestamps()
         .init()
         .unwrap();
 
