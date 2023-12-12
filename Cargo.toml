@@ -13,8 +13,8 @@ enum_glob_use = "deny"
 
 [dependencies]
 futures = "0.3.29"
-netlink-packet-route = "0.17.1"
-rtnetlink = "0.13.1"
+netlink-packet-route = "0.18.1"
+rtnetlink = "0.14.0"
 
 nix = { version = "0.27.1", features = ["mount", "user"] }
 tokio = { version = "1.35.0", features = ["full", "macros", "rt-multi-thread"] }

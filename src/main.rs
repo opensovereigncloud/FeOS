@@ -12,7 +12,7 @@ use nix::unistd::Uid;
 use simple_logger::SimpleLogger;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), String> {
     println!(
         "
 
@@ -43,14 +43,23 @@ async fn main() {
     if std::process::id() == 1 {
         info!("Mounting virtual filesystems...");
         mount_virtual_filesystems();
-
-        info!("Configuring network devices...");
-        configure_network_devices().await;
     }
+    /*
+        info!("Configuring network devices...");
+        configure_network_devices().await.map_err(|e| {
+            error!("could not configure network devices: {}", e);
+            "fuck".to_string()
+        })?;
+    */
+    info!("Configuring network devices...");
+    configure_network_devices()
+        .await
+        .expect("could not configure network devices");
 
     info!("Starting FeOS daemon...");
     match daemon_start().await {
         Err(e) => error!("FeOS daemon crashed: {}", e),
         _ => error!("FeOS daemon exited."),
     }
+    Err("FeOS exited".to_string())
 }

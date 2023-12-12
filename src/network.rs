@@ -1,80 +1,84 @@
 use futures::stream::TryStreamExt;
-use netlink_packet_route::link::nlas::Nla;
-use rtnetlink::{new_connection, Error, Handle};
+use log::info;
+use rtnetlink::new_connection;
 
-pub async fn configure_network_devices() {
+pub async fn configure_network_devices() -> Result<(), String> {
     // TODO: configure network devices
 
     let (connection, handle, _) = new_connection().unwrap();
     tokio::spawn(connection);
 
-    println!("*** dumping links ***");
-    if let Err(e) = dump_links(handle.clone()).await {
-        eprintln!("{e}");
-    }
-    let name = "eth0";
-    println!("\n*** retrieving link named \"{name}\" ***");
-    if let Err(e) = get_link_by_name(handle.clone(), name.to_string()).await {
-        eprintln!("{e}");
-    }
-}
+    let mut link_ts = handle
+        .link()
+        .get()
+        .match_name(String::from("eth0"))
+        .execute();
 
-async fn dump_links(handle: Handle) -> Result<(), Error> {
-    let mut links = handle.link().get().execute();
-    while let Some(msg) = links.try_next().await? {
-        for nla in msg.nlas.into_iter() {
-            if let Nla::IfName(name) = nla {
-                println!("found link {} ({})", msg.header.index, name);
-                if let Err(e) = dump_addresses(handle.clone(), name).await {
-                    eprintln!("{e}");
-                }
-                //continue 'outer;
-            } else if let Nla::Address(ether_addr) = nla {
-                println!("  EtherAddr: {}", format_mac(&ether_addr));
-            } else if let Nla::Carrier(carrier) = nla {
-                let status = if carrier > 0 { "UP" } else { "DOWN" };
-                println!("  Carrier: {}", status);
-            } else if let Nla::Mtu(mtu) = nla {
-                println!("  MTU: {}", mtu);
+    let link = link_ts
+        .try_next()
+        .await
+        .map_err(|e| format!("'eth0' not found: {}", e))?
+        .ok_or("option A empty".to_string())?;
+
+    info!("eth0:");
+    for attr in link.attributes {
+        match attr {
+            netlink_packet_route::link::LinkAttribute::Address(mac_bytes) => {
+                info!("  mac: {}", format_mac(mac_bytes));
+            }
+            netlink_packet_route::link::LinkAttribute::Carrier(carrier) => {
+                info!("  carrier: {}", carrier);
+            }
+            netlink_packet_route::link::LinkAttribute::Mtu(mtu) => {
+                info!("  mtu: {}", mtu);
+            }
+            netlink_packet_route::link::LinkAttribute::MaxMtu(max_mtu) => {
+                info!("  max_mtu: {}", max_mtu);
+            }
+            netlink_packet_route::link::LinkAttribute::OperState(state) => {
+                let state = match state {
+                    netlink_packet_route::link::State::Unknown => String::from("unknown"),
+                    netlink_packet_route::link::State::NotPresent => String::from("not present"),
+                    netlink_packet_route::link::State::Down => String::from("down"),
+                    netlink_packet_route::link::State::LowerLayerDown => {
+                        String::from("lower layer down")
+                    }
+                    netlink_packet_route::link::State::Testing => String::from("testing"),
+                    netlink_packet_route::link::State::Dormant => String::from("dormant"),
+                    netlink_packet_route::link::State::Up => String::from("up"),
+                    netlink_packet_route::link::State::Other(x) => {
+                        format!("other ({})", x)
+                    }
+                    _ => String::from("unknown state"),
+                };
+                info!("  state: {}", state);
+            }
+            _ => (),
+        }
+    }
+
+    let mut addr_ts = handle
+        .address()
+        .get()
+        .set_link_index_filter(link.header.index)
+        .execute();
+
+    while let Some(addr_msg) = addr_ts
+        .try_next()
+        .await
+        .map_err(|e| format!("Could not get addr: {}", e))?
+    {
+        for attr in addr_msg.attributes {
+            if let netlink_packet_route::address::AddressAttribute::Address(addr) = attr {
+                info!("- {}/{}", addr, addr_msg.header.prefix_len);
             }
         }
-
-        eprintln!("found link {}, but the link has no name", msg.header.index);
     }
+
     Ok(())
 }
 
-async fn get_link_by_name(handle: Handle, name: String) -> Result<(), Error> {
-    let mut links = handle.link().get().match_name(name.clone()).execute();
-    if (links.try_next().await?).is_some() {
-        println!("found link {name}");
-        // We should only have one link with that name
-        assert!(links.try_next().await?.is_none());
-    } else {
-        println!("no link link {name} found");
-    }
-    Ok(())
-}
-
-async fn dump_addresses(handle: Handle, link: String) -> Result<(), Error> {
-    let mut links = handle.link().get().match_name(link.clone()).execute();
-    if let Some(link) = links.try_next().await? {
-        let mut addresses = handle
-            .address()
-            .get()
-            .set_link_index_filter(link.header.index)
-            .execute();
-        while let Some(msg) = addresses.try_next().await? {
-            println!("{msg:?}");
-        }
-        Ok(())
-    } else {
-        eprintln!("link {link} not found");
-        Ok(())
-    }
-}
-
-fn format_mac(bytes: &[u8]) -> String {
+fn format_mac(bytes: Vec<u8>) -> String {
     bytes
         .iter()
         .map(|byte| format!("{:02x}", byte))
