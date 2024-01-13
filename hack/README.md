@@ -24,3 +24,15 @@ The Linux kernel is built from source (`make kernel`) with a custom kernel confi
 The virtual machine has a virtio-net NIC attached which will be connected to a Linux bridge on the host system. You can create and configure this bridge using `make network`. The NIC will appear as `eth0` within the VM.
 
 With the make target `virsh-start` the VM will be created and started. `virsh-console` brings you into the serial console of the VM (you can exit it with `Ctrl+]`). To stop and destroy the VM call `make virsh-stop` - you'll probably want to concatenate those commands to `make virsh-start virsh-console virsh-stop`. This will start the VM, opens the serial console and waits for you to hit `Ctrl+]` to exit the serial console and destroy the VM.
+
+
+## Cloud-Hypervisor
+If you want to run FeOS within a [cloud-hypervisor](https://www.cloudhypervisor.org/) VM get some inspiration from this command:
+
+    sudo ip tuntap add mode tap name tap0
+    sudo ip link set tap0 up
+    sudo ip link set tap0 master vm-br0
+    
+    cloud-hypervisor --kernel target/kernel/vmlinux.bin --initramfs target/initramfs.zst --cmdline rdinit=/bin/feos  console=tty0 console=ttyS0,115200 --memory size=512M --cpus boot=4 --serial tty --net tap=tap0
+
+
