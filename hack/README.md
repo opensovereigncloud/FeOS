@@ -27,12 +27,19 @@ With the make target `virsh-start` the VM will be created and started. `virsh-co
 
 
 ## Cloud-Hypervisor
-If you want to run FeOS within a [cloud-hypervisor](https://www.cloudhypervisor.org/) VM get some inspiration from this command:
+If you want to run FeOS within a [cloud-hypervisor](https://www.cloudhypervisor.org/) VM get some inspiration from this bash snippet:
 
     sudo ip tuntap add mode tap name tap0
     sudo ip link set tap0 up
     sudo ip link set tap0 master vm-br0
     
-    cloud-hypervisor --kernel target/kernel/vmlinux.bin --initramfs target/initramfs.zst --cmdline rdinit=/bin/feos  console=tty0 console=ttyS0,115200 --memory size=512M --cpus boot=4 --serial tty --net tap=tap0
+    cloud-hypervisor \
+        --cpus boot=4 \
+        --memory size=1024M \
+        --net tap=tap0 \
+        --serial tty \
+        --kernel target/kernel/vmlinux.bin \
+        --initramfs target/initramfs.zst \
+        --cmdline "`cat target/cmdline`"
 
 
