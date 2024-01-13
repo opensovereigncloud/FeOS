@@ -44,6 +44,7 @@ uki: keys
 	  --secureboot-private-key /feos/keys/secureboot.key \
 	  --secureboot-certificate /feos/keys/secureboot.pem \
 	  --output /feos/target/uki.efi
+	cp hack/uki/cmdline.txt target/cmdline
 
 virsh-start:
 	./hack/libvirt/init.sh libvirt-kvm.xml
