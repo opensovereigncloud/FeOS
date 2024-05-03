@@ -2,6 +2,7 @@ extern crate nix;
 mod daemon;
 mod dhcpv6;
 mod filesystem;
+mod host;
 mod network;
 mod vm;
 
