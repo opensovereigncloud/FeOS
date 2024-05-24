@@ -4,6 +4,18 @@ use log::{info, warn};
 use rtnetlink::new_connection;
 use tokio::time::{self, Duration};
 
+use pnet::datalink::{self, Channel::Ethernet, Config};
+use pnet::packet::ethernet::EthernetPacket;
+use pnet::packet::icmp::IcmpPacket;
+use pnet::packet::icmpv6::{Icmpv6Packet, Icmpv6Types};
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::ipv6::Ipv6Packet;
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::udp::UdpPacket;
+use pnet::packet::Packet;
+
+use netlink_packet_route::neighbour::*;
+
 pub async fn configure_network_devices() -> Result<(), String> {
     let ignore_ra_flag = true; // Till the RA has the correct flags (O or M), ignore the flag
     let interface_name = String::from("eth0");
@@ -88,14 +100,10 @@ pub async fn configure_network_devices() -> Result<(), String> {
 
     if let Some(ipv6_gateway) = is_dhcpv6_needed(interface_name.clone(), ignore_ra_flag) {
         time::sleep(Duration::from_secs(4)).await;
-        let result = set_ipv6_gateway(&handle, &interface_name, ipv6_gateway).await;
-        if let Err(e) = result {
-            warn!(
-                "{} cannot set IPv6 Gateway (already set ?): {}",
-                interface_name, e
-            );
+        match run_dhcpv6_client(interface_name.clone()).await {
+            Ok(addr) => send_neigh_solicitation(interface_name.clone(), &ipv6_gateway, &addr),
+            Err(e) => warn!("Error: {}", e),
         }
-        run_dhcpv6_client(interface_name).await.unwrap();
     }
 
     let mut addr_ts = handle
@@ -128,7 +136,7 @@ fn format_mac(bytes: Vec<u8>) -> String {
 }
 
 // Print all packets to the console for debugging purposes
-async fn capture_packets(interface_name: String) {
+async fn _capture_packets(interface_name: String) {
     let interfaces = datalink::interfaces();
     let interface = interfaces
         .into_iter()
@@ -198,16 +206,76 @@ async fn capture_packets(interface_name: String) {
                                 pnet::packet::ip::IpNextHeaderProtocols::Icmpv6 => {
                                     if let Some(icmpv6) = Icmpv6Packet::new(ipv6.payload()) {
                                         info!("ICMPv6 packet: {:?}", icmpv6);
+                                        match icmpv6.get_icmpv6_type() {
+                                            Icmpv6Types::RouterSolicit => {
+                                                info!("Router Solicitation")
+                                            }
+                                            Icmpv6Types::RouterAdvert => {
+                                                info!("Router Advertisement")
+                                            }
+                                            Icmpv6Types::NeighborSolicit => {
+                                                info!("Neighbor Solicitation")
+                                            }
+                                            Icmpv6Types::NeighborAdvert => {
+                                                info!("Neighbor Advertisement")
+                                            }
+                                            Icmpv6Types::Redirect => info!("Redirect"),
+                                            _ => info!("Other ICMPv6 type"),
+                                        }
                                     }
                                 }
-                                _ => info!("Unknown IPv6 L4 protocol"),
+                                pnet::packet::ip::IpNextHeaderProtocols::Hopopt => {
+                                    info!("IPv6 Hop-by-Hop Options header");
+                                }
+                                _ => info!(
+                                    "Unknown or unsupported next header: {:?}",
+                                    ipv6.get_next_header()
+                                ),
                             }
                         }
                     }
                     _ => info!("Unknown packet type"),
                 }
             }
-            Err(e) => info!("An error occurred while reading packet capture: {}", e),
+            Err(e) => {
+                info!("An error occurred while reading: {}", e);
+                tokio::task::yield_now().await;
+            }
         }
     }
+}
+
+async fn _get_nd_cache() -> Result<(), Box<dyn std::error::Error>> {
+    let (connection, handle, _) = new_connection().unwrap();
+    tokio::spawn(connection);
+
+    let mut neighbors = handle.neighbours().get().execute();
+
+    while let Ok(Some(neigh)) = neighbors.try_next().await {
+        for attr in &neigh.attributes {
+            match attr {
+                NeighbourAttribute::Destination(addr) => {
+                    info!("IP Address: {:?}", addr);
+                }
+                NeighbourAttribute::LinkLocalAddress(lladdr) => {
+                    let hex_address: String = lladdr
+                        .iter()
+                        .map(|byte| format!("{:02x}", byte))
+                        .collect::<Vec<String>>()
+                        .join(":");
+                    info!("Link-layer Address: {:?}", hex_address);
+                }
+                NeighbourAttribute::CacheInfo(info) => {
+                    info!("Cache Info: {:?}", info);
+                }
+                _ => {
+                    info!("Other attribute: {:?}", attr);
+                }
+            }
+        }
+        info!("------------------------");
+    }
+    info!("");
+    info!("");
+    Ok(())
 }

@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - master
-      - fix/link_local_panic
     tags:
     - '*'
     paths-ignore:
