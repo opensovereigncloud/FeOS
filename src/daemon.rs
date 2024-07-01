@@ -3,15 +3,16 @@ use std::path::PathBuf;
 use tonic::{transport::Server, Request, Response, Status};
 
 use crate::host;
+use crate::vm::image;
 use feos_grpc::feos_grpc_server::{FeosGrpc, FeosGrpcServer};
-use feos_grpc::Empty;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 use self::feos_grpc::{
-    BootVmRequest, BootVmResponse, CreateVmRequest, CreateVmResponse, FetchImageRequest,
-    FetchImageResponse, GetVmRequest, GetVmResponse, HostInfoRequest, HostInfoResponse,
-    RebootRequest, RebootResponse, ShutdownRequest, ShutdownResponse,
+    AttachNicVmRequest, AttachNicVmResponse, BootVmRequest, BootVmResponse, CreateVmRequest,
+    CreateVmResponse, Empty, FetchImageRequest, FetchImageResponse, GetVmRequest, GetVmResponse,
+    HostInfoRequest, HostInfoResponse, NetInterface, RebootRequest, RebootResponse,
+    ShutdownRequest, ShutdownResponse,
 };
 use crate::vm::{self};
 
@@ -24,6 +25,36 @@ pub struct FeOSAPI {
     vmm: vm::Manager,
 }
 
+fn handle_error(e: vm::Error) -> tonic::Status {
+    match e {
+        vm::Error::AlreadyExists => Status::new(tonic::Code::AlreadyExists, "vm already exists"),
+        vm::Error::NotFound => Status::new(tonic::Code::NotFound, "vm not found"),
+        vm::Error::SocketFailure(e) => {
+            info!("socket error: {:?}", e);
+            Status::new(tonic::Code::Internal, "failed to ")
+        }
+        vm::Error::InvalidInput(e) => {
+            info!("invalid input error: {:?}", e);
+            Status::new(tonic::Code::Internal, "invalid input")
+        }
+        vm::Error::CHCommandFailure(e) => {
+            info!("failed to connect to cloud hypervisor: {:?}", e);
+            Status::new(
+                tonic::Code::Internal,
+                "failed to connect to cloud hypervisor",
+            )
+        }
+        vm::Error::CHApiFailure(e) => {
+            info!("failed to connect to cloud hypervisor api: {:?}", e);
+            Status::new(
+                tonic::Code::Internal,
+                "failed to connect to cloud hypervisor api",
+            )
+        }
+        vm::Error::Failed => Status::new(tonic::Code::AlreadyExists, "vm already exists"),
+    }
+}
+
 #[tonic::async_trait]
 impl FeosGrpc for FeOSAPI {
     async fn ping(
@@ -31,7 +62,7 @@ impl FeosGrpc for FeOSAPI {
         request: Request<Empty>, // Accept request of type HelloRequest
     ) -> Result<Response<Empty>, Status> {
         // Return an instance of type HelloReply
-        println!("Got a request: {:?}", request);
+        info!("Got a request: {:?}", request);
 
         let reply = feos_grpc::Empty {};
 
@@ -42,14 +73,23 @@ impl FeosGrpc for FeOSAPI {
         &self,
         request: Request<FetchImageRequest>,
     ) -> Result<Response<FetchImageResponse>, Status> {
-        info!("Got create_vm request");
+        info!("Got fetch_image request");
 
         let id = Uuid::new_v4();
         let path: PathBuf = PathBuf::from(format!("./images/{}", id.clone()));
         tokio::spawn(async move {
             match vm::image::fetch_image(request.get_ref().image.clone(), path).await {
                 Ok(_) => info!("image pulled"),
-                Err(e) => info!("failed to pull image: {:?}", e),
+                Err(image::ImageError::IOError(e)) => {
+                    info!("failed to pull image: io error: {:?}", e)
+                }
+                Err(image::ImageError::PullError(e)) => info!("failed to pull image: {:?}", e),
+                Err(image::ImageError::InvalidReference(e)) => {
+                    info!("failed to pull image: invalid reference: {:?}", e)
+                }
+                Err(image::ImageError::MissingLayer(e)) => {
+                    info!("failed to pull image: missing layer: {:?}", e)
+                }
             }
         });
 
@@ -85,6 +125,34 @@ impl FeosGrpc for FeOSAPI {
         Ok(Response::new(feos_grpc::ShutdownResponse {}))
     }
 
+    async fn attach_nic_vm(
+        &self,
+        request: Request<AttachNicVmRequest>,
+    ) -> Result<Response<AttachNicVmResponse>, Status> {
+        info!("Got attach_nic_vm request");
+
+        let id = request.get_ref().uuid.to_owned();
+        let id =
+            Uuid::parse_str(&id).map_err(|_| Status::invalid_argument("failed to parse uuid"))?;
+
+        let mac_address = if request.get_ref().mac_address.is_empty() {
+            None
+        } else {
+            Some(request.get_ref().mac_address.clone())
+        };
+        let pci_address = if request.get_ref().pci_address.is_empty() {
+            None
+        } else {
+            Some(request.get_ref().pci_address.clone())
+        };
+
+        self.vmm
+            ._add_net_device(id, mac_address, pci_address)
+            .map_err(handle_error)?;
+
+        Ok(Response::new(feos_grpc::AttachNicVmResponse {}))
+    }
+
     async fn host_info(
         &self,
         _: Request<HostInfoRequest>,
@@ -93,11 +161,21 @@ impl FeosGrpc for FeOSAPI {
 
         let host = host::info::check_info();
 
+        let mut interfaces = Vec::new();
+        for interface in host.net_interfaces {
+            interfaces.push(NetInterface {
+                name: interface.name,
+                pci_address: interface.pci_address.unwrap_or_default(),
+                mac_address: interface.mac_address.unwrap_or_default(),
+            })
+        }
+
         Ok(Response::new(feos_grpc::HostInfoResponse {
             uptime: host.uptime,
             ram_total: host.ram_total,
             ram_unused: host.ram_unused,
             num_cores: host.num_cores,
+            net_interfaces: interfaces,
         }))
     }
 
@@ -108,10 +186,7 @@ impl FeosGrpc for FeOSAPI {
         info!("Got create_vm request");
 
         let id = Uuid::new_v4();
-        self.vmm.init_vmm(id, true).map_err(|e| {
-            info!("failed to init vvm: {:?}", e);
-            Status::unknown("failed to init vvm")
-        })?;
+        self.vmm.init_vmm(id, true).map_err(handle_error)?;
 
         let root_fs = PathBuf::from(format!(
             "./images/{}/application.vnd.ironcore.image.rootfs.v1alpha1.rootfs",
@@ -124,10 +199,7 @@ impl FeosGrpc for FeOSAPI {
                 request.get_ref().memory_bytes,
                 root_fs,
             )
-            .map_err(|e| {
-                info!("failed to create vm: {:?}", e);
-                Status::unknown("failed to create vm")
-            })?;
+            .map_err(handle_error)?;
 
         Ok(Response::new(feos_grpc::CreateVmResponse {
             uuid: id.to_string(),
@@ -143,14 +215,8 @@ impl FeosGrpc for FeOSAPI {
         let id = request.get_ref().uuid.to_owned();
         let id =
             Uuid::parse_str(&id).map_err(|_| Status::invalid_argument("failed to parse uuid"))?;
-        self.vmm.ping_vmm(id).map_err(|e| {
-            info!("failed to ping vvm: {:?}", e);
-            Status::unknown("failed to ping vvm")
-        })?;
-        let vm_status = self.vmm.get_vm(id).map_err(|e| {
-            info!("failed to get vm: {:?}", e);
-            Status::unknown("failed to get vm")
-        })?;
+        self.vmm.ping_vmm(id).map_err(handle_error)?;
+        let vm_status = self.vmm.get_vm(id).map_err(handle_error)?;
 
         Ok(Response::new(feos_grpc::GetVmResponse { info: vm_status }))
     }
@@ -164,12 +230,23 @@ impl FeosGrpc for FeOSAPI {
         let id = request.get_ref().uuid.to_owned();
         let id =
             Uuid::parse_str(&id).map_err(|_| Status::invalid_argument("failed to parse uuid"))?;
-        self.vmm.boot_vm(id).map_err(|e| {
-            info!("failed to boot vm: {:?}", e);
-            Status::unknown("failed to boot vm")
-        })?;
+        self.vmm.boot_vm(id).map_err(handle_error)?;
 
         Ok(Response::new(feos_grpc::BootVmResponse {}))
+    }
+
+    async fn console_vm(
+        &self,
+        request: Request<feos_grpc::ConsoleVmRequest>,
+    ) -> Result<Response<feos_grpc::ConsoleVmResponse>, Status> {
+        info!("Got console_vm request");
+
+        let id = request.get_ref().uuid.to_owned();
+        let id =
+            Uuid::parse_str(&id).map_err(|_| Status::invalid_argument("failed to parse uuid"))?;
+        self.vmm.console(id).map_err(handle_error)?;
+
+        Ok(Response::new(feos_grpc::ConsoleVmResponse {}))
     }
 }
 
