@@ -662,6 +662,7 @@ dependencies = [
  "serde_json",
  "simple_logger",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-build",
  "uuid",
