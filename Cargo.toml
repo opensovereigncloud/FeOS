@@ -41,3 +41,8 @@ async-stream = "0.3"
 
 [build-dependencies]
 tonic-build = "0.12.1"
+
+[workspace]
+members = [
+    "client",
+]
