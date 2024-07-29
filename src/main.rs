@@ -57,7 +57,6 @@ async fn main() -> Result<(), String> {
     if let Err(e) = configure_sriov(VFS_NUM).await {
         warn!("failed to configure sriov: {}", e.to_string())
     }
-
     let vmm = vm::Manager::new(String::from("cloud-hypervisor"));
 
     info!("Starting FeOS daemon...");

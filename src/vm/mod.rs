@@ -10,7 +10,6 @@ use std::{
     thread::sleep,
     time,
 };
-use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use vmm::vm_config;
 
@@ -32,7 +31,6 @@ pub enum Error {
     InvalidInput(TryFromIntError),
     CHCommandFailure(std::io::Error),
     CHApiFailure(api_client::Error),
-    Io(std::io::Error),
     Failed,
 }
 
@@ -164,16 +162,11 @@ impl Manager {
             Some(&vm_config.to_string()),
         )
         .map_err(Error::CHApiFailure)?;
-        if response.is_some() {
-            info!(
-                "create vm: id {}, response: {}",
-                id.to_string(),
-                response.unwrap()
-            )
+        if let Some(response) = response {
+            info!("create vm: id {}, response: {}", id.to_string(), response)
         }
 
         info!("created vm with id: {}", id.to_string());
-
         Ok(())
     }
 
@@ -196,26 +189,6 @@ impl Manager {
         }
 
         info!("booted vm with id: {}", id.to_string());
-        Ok(())
-    }
-
-    pub async fn console_write(
-        &self,
-        id: Uuid,
-        input: String,
-        stream: &mut tokio::net::UnixStream,
-    ) -> Result<(), Error> {
-        {
-            let vms = self.vms.lock().unwrap();
-            if !vms.contains_key(&id) {
-                return Err(Error::NotFound);
-            }
-        }
-        stream
-            .write_all(input.as_bytes())
-            .await
-            .map_err(Error::Io)?;
-
         Ok(())
     }
 

@@ -1,4 +1,4 @@
-use log::info;
+use log::{error, info};
 use std::path::PathBuf;
 use tonic::{transport::Server, Request, Response, Status};
 
@@ -9,7 +9,8 @@ use feos_grpc::feos_grpc_server::{FeosGrpc, FeosGrpcServer};
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 use tokio_stream::wrappers::ReceiverStream;
@@ -75,10 +76,6 @@ fn handle_error(e: vm::Error) -> tonic::Status {
                 "failed to connect to cloud hypervisor api",
             )
         }
-        vm::Error::Io(e) => {
-            info!("I/O error: {:?}", e);
-            Status::new(tonic::Code::Internal, "I/O error")
-        }
         vm::Error::Failed => Status::new(tonic::Code::AlreadyExists, "vm already exists"),
     }
 }
@@ -119,84 +116,71 @@ impl FeosGrpc for FeOSAPI {
         &self,
         request: Request<tonic::Streaming<feos_grpc::ConsoleVmInteractiveRequest>>,
     ) -> Result<Response<Self::ConsoleVMInteractiveStream>, Status> {
-        info!("Got console_vm_interactive request");
-
-        let mut stream = request.into_inner();
+        let mut input_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(4);
 
-        let mut initial_id: Option<Uuid> = None;
-        let manager = Arc::clone(&self.vmm);
+        info!("Got console_vm_interactive request");
 
         tokio::spawn(async move {
-            while let Some(req) = {
-                match stream.message().await {
-                    Ok(message) => message,
-                    Err(e) => {
-                        info!("Stream error: {:?}", e);
-                        None
+            let initial_request = match input_stream.message().await {
+                Ok(Some(req)) => req,
+                Ok(None) => {
+                    error!("Received empty initial request");
+                    return;
+                }
+                Err(e) => {
+                    error!("Error receiving initial request: {:?}", e);
+                    return;
+                }
+            };
+
+            let id = match Uuid::parse_str(&initial_request.uuid) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Failed to parse UUID: {:?}", e);
+                    return;
+                }
+            };
+
+            let socket_path = format!("{}.console", id);
+            let stream = match UnixStream::connect(&socket_path).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!("Failed to connect to Unix socket: {:?}", e);
+                    return;
+                }
+            };
+
+            let (reader, writer) = stream.into_split();
+
+            tokio::spawn(async move {
+                let mut writer = writer;
+                while let Ok(Some(req)) = input_stream.message().await {
+                    let input_with_newline = format!("{}\n", req.input);
+                    if let Err(e) = writer.write_all(input_with_newline.as_bytes()).await {
+                        error!("Failed to write to console: {:?}", e);
+                        break;
                     }
                 }
-            } {
-                let id = match initial_id {
-                    Some(id) => id,
-                    None => match Uuid::parse_str(&req.uuid) {
-                        Ok(parsed_id) => {
-                            initial_id = Some(parsed_id);
-                            parsed_id
-                        }
-                        Err(_) => {
-                            info!("Failed to parse UUID");
+            });
+
+            let mut reader = reader;
+            let mut buffer = vec![0; 1024];
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let message = String::from_utf8_lossy(&buffer[..n]).to_string();
+                        let response = ConsoleVmInteractiveResponse { message };
+                        if tx.send(Ok(response)).await.is_err() {
+                            error!("Failed to send response through channel");
                             break;
                         }
-                    },
-                };
-
-                let input = req.input.clone();
-                let socket_path = format!("{}.console", id);
-
-                match tokio::net::UnixStream::connect(&socket_path).await {
-                    Ok(stream) => {
-                        let stream = Arc::new(Mutex::new(stream));
-
-                        let manager_clone = Arc::clone(&manager);
-                        let input_clone = input.clone();
-                        let stream_write = Arc::clone(&stream);
-                        let tx_clone = tx.clone();
-
-                        tokio::spawn(async move {
-                            let mut stream_lock = stream_write.lock().await;
-                            if let Err(e) = manager_clone
-                                .console_write(id, input_clone, &mut stream_lock)
-                                .await
-                            {
-                                info!("Failed to write to console: {:?}", e);
-                            }
-                        });
-
-                        let stream_read = Arc::clone(&stream);
-                        tokio::spawn(async move {
-                            let mut buffer = vec![0; 1024];
-                            loop {
-                                let mut stream_lock = stream_read.lock().await;
-                                match stream_lock.read(&mut buffer).await {
-                                    Ok(n) if n > 0 => {
-                                        let message =
-                                            String::from_utf8_lossy(&buffer[..n]).to_string();
-                                        let response = ConsoleVmInteractiveResponse { message };
-                                        if tx_clone.send(Ok(response)).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Ok(_) => break,
-                                    Err(e) => {
-                                        info!("Failed to read from stream: {:?}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                        });
                     }
-                    Err(e) => info!("Failed to connect to Unix socket: {:?}", e),
+                    Err(e) => {
+                        error!("Failed to read from stream: {:?}", e);
+                        break;
+                    }
                 }
             }
         });
