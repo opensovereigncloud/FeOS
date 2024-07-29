@@ -1,4 +1,5 @@
 extern crate nix;
+mod container;
 mod daemon;
 mod dhcpv6;
 mod filesystem;

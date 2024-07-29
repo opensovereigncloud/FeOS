@@ -2,9 +2,11 @@ use log::info;
 use std::path::PathBuf;
 use tonic::{transport::Server, Request, Response, Status};
 
+use crate::container;
 use crate::host;
 use crate::vm::image;
 use feos_grpc::feos_grpc_server::{FeosGrpc, FeosGrpcServer};
+
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -259,6 +261,11 @@ pub async fn daemon_start(vmm: vm::Manager) -> Result<(), Box<dyn std::error::Er
     Server::builder()
         .timeout(Duration::from_secs(30))
         .add_service(FeosGrpcServer::new(api))
+        .add_service(
+            container::container_service::container_service_server::ContainerServiceServer::new(
+                container::ContainerAPI {},
+            ),
+        )
         .serve(addr)
         .await?;
 
