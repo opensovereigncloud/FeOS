@@ -192,6 +192,20 @@ impl Manager {
         Ok(())
     }
 
+    pub fn get_vm_console_path(&self, id: Uuid) -> Result<String, Error> {
+        let vms = self.vms.lock().unwrap();
+        if !vms.contains_key(&id) {
+            return Err(Error::NotFound);
+        }
+
+        let socket_path = id.to_string() + ".console";
+        if !Path::new(&socket_path).exists() {
+            return Err(Error::NotFound);
+        }
+
+        Ok(socket_path)
+    }
+
     pub fn _add_net_device(
         &self,
         id: Uuid,

@@ -13,19 +13,19 @@ service FeosGrpc {
     rpc CreateVM (CreateVMRequest) returns (CreateVMResponse);
     rpc GetVM (GetVMRequest) returns (GetVMResponse);
     rpc BootVM (BootVMRequest) returns (BootVMResponse);
-    rpc ConsoleVMInteractive (stream ConsoleVMInteractiveRequest) returns (stream ConsoleVMInteractiveResponse);
+    rpc ConsoleVM (stream ConsoleVMRequest) returns (stream ConsoleVMResponse);
     rpc AttachNicVM (AttachNicVMRequest) returns (AttachNicVMResponse);
 
     rpc GetFeOSKernelLogs (GetFeOSKernelLogRequest) returns (stream GetFeOSKernelLogResponse);
     rpc GetFeOSLogs(GetFeOsLogRequest) returns (stream GetFeOsLogResponse);
 }
 
-message ConsoleVMInteractiveRequest {
+message ConsoleVMRequest {
   string uuid = 1;
   string input = 2;
 }
 
-message ConsoleVMInteractiveResponse {
+message ConsoleVMResponse {
   string message = 1;
 }
 

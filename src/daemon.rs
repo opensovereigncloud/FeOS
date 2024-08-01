@@ -17,11 +17,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use self::feos_grpc::{
-    AttachNicVmRequest, AttachNicVmResponse, BootVmRequest, BootVmResponse,
-    ConsoleVmInteractiveResponse, CreateVmRequest, CreateVmResponse, Empty, FetchImageRequest,
-    FetchImageResponse, GetFeOsKernelLogRequest, GetFeOsKernelLogResponse, GetFeOsLogRequest,
-    GetFeOsLogResponse, GetVmRequest, GetVmResponse, HostInfoRequest, HostInfoResponse,
-    NetInterface, RebootRequest, RebootResponse, ShutdownRequest, ShutdownResponse,
+    AttachNicVmRequest, AttachNicVmResponse, BootVmRequest, BootVmResponse, ConsoleVmResponse,
+    CreateVmRequest, CreateVmResponse, Empty, FetchImageRequest, FetchImageResponse,
+    GetFeOsKernelLogRequest, GetFeOsKernelLogResponse, GetFeOsLogRequest, GetFeOsLogResponse,
+    GetVmRequest, GetVmResponse, HostInfoRequest, HostInfoResponse, NetInterface, RebootRequest,
+    RebootResponse, ShutdownRequest, ShutdownResponse,
 };
 use crate::vm::{self};
 
@@ -84,8 +84,7 @@ fn handle_error(e: vm::Error) -> tonic::Status {
 impl FeosGrpc for FeOSAPI {
     type GetFeOSKernelLogsStream = ReceiverStream<Result<GetFeOsKernelLogResponse, Status>>;
     type GetFeOSLogsStream = ReceiverStream<Result<GetFeOsLogResponse, Status>>;
-    type ConsoleVMInteractiveStream =
-        ReceiverStream<Result<feos_grpc::ConsoleVmInteractiveResponse, Status>>;
+    type ConsoleVMStream = ReceiverStream<Result<feos_grpc::ConsoleVmResponse, Status>>;
 
     async fn get_fe_os_kernel_logs(
         &self,
@@ -112,37 +111,29 @@ impl FeosGrpc for FeOSAPI {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn console_vm_interactive(
+    async fn console_vm(
         &self,
-        request: Request<tonic::Streaming<feos_grpc::ConsoleVmInteractiveRequest>>,
-    ) -> Result<Response<Self::ConsoleVMInteractiveStream>, Status> {
+        request: Request<tonic::Streaming<feos_grpc::ConsoleVmRequest>>,
+    ) -> Result<Response<Self::ConsoleVMStream>, Status> {
         let mut input_stream = request.into_inner();
         let (tx, rx) = mpsc::channel(4);
 
-        info!("Got console_vm_interactive request");
+        info!("Got console_vm request");
+        let initial_request = match input_stream.message().await {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                return Err(Status::new(
+                    tonic::Code::InvalidArgument,
+                    "No initial request received",
+                ))
+            }
+            Err(status) => return Err(status),
+        };
+        let id = Uuid::parse_str(&initial_request.uuid)
+            .map_err(|_| Status::invalid_argument("failed to parse uuid"))?;
+        let socket_path = self.vmm.get_vm_console_path(id).map_err(handle_error)?;
 
         tokio::spawn(async move {
-            let initial_request = match input_stream.message().await {
-                Ok(Some(req)) => req,
-                Ok(None) => {
-                    error!("Received empty initial request");
-                    return;
-                }
-                Err(e) => {
-                    error!("Error receiving initial request: {:?}", e);
-                    return;
-                }
-            };
-
-            let id = match Uuid::parse_str(&initial_request.uuid) {
-                Ok(id) => id,
-                Err(e) => {
-                    error!("Failed to parse UUID: {:?}", e);
-                    return;
-                }
-            };
-
-            let socket_path = format!("{}.console", id);
             let stream = match UnixStream::connect(&socket_path).await {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -171,7 +162,7 @@ impl FeosGrpc for FeOSAPI {
                     Ok(0) => break, // EOF
                     Ok(n) => {
                         let message = String::from_utf8_lossy(&buffer[..n]).to_string();
-                        let response = ConsoleVmInteractiveResponse { message };
+                        let response = ConsoleVmResponse { message };
                         if tx.send(Ok(response)).await.is_err() {
                             error!("Failed to send response through channel");
                             break;

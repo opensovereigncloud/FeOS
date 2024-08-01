@@ -52,7 +52,7 @@ pub enum Command {
     },
     GetFeOSKernelLogs,
     GetFeOSLogs,
-    ConsoleVMInteractive {
+    ConsoleVM {
         uuid: String,
     },
 }
@@ -156,7 +156,7 @@ pub async fn run_client(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
                 println!("FEOS LOG RESPONSE={:?}", log_response);
             }
         }
-        Command::ConsoleVMInteractive { uuid } => {
+        Command::ConsoleVM { uuid } => {
             let (tx, rx) = mpsc::channel(4);
 
             tokio::spawn(async move {
@@ -165,7 +165,7 @@ pub async fn run_client(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
                     println!("Failed to read line from stdin: {:?}", e);
                     None
                 }) {
-                    let request = ConsoleVmInteractiveRequest {
+                    let request = ConsoleVmRequest {
                         uuid: uuid.clone(),
                         input: line,
                     };
@@ -176,10 +176,7 @@ pub async fn run_client(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
             });
 
             let request_stream = ReceiverStream::new(rx);
-            let mut response = client
-                .console_vm_interactive(request_stream)
-                .await?
-                .into_inner();
+            let mut response = client.console_vm(request_stream).await?.into_inner();
 
             while let Some(response) = response.message().await? {
                 print!("{}", response.message);
