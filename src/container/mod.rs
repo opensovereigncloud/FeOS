@@ -5,10 +5,22 @@ use libcontainer::container::Container;
 use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
 use log::info;
-use std::path::PathBuf;
+use oci::{fetch_image, DEFAULT_IMAGE_PATH};
+use std::fs::File;
+use std::{fmt::Debug, path::PathBuf};
 use tonic::{Request, Response, Status};
-
+pub mod oci;
+use flate2::read::GzDecoder;
+use libcontainer::oci_spec::runtime::{LinuxNamespace, LinuxNamespaceType, Spec};
 use libcontainer::workload::default::DefaultExecutor;
+use serde_json::to_writer_pretty;
+use std::fs;
+use std::io::BufReader;
+use std::io::{BufWriter, Write};
+use tar::Archive;
+use uuid::Uuid;
+
+pub const DEFAULT_CONTAINER_PATH: &str = "/var/lib/feos/containers";
 
 pub mod container_service {
     tonic::include_proto!("container");
@@ -43,15 +55,66 @@ impl ContainerService for ContainerAPI {
     ) -> Result<Response<container_service::CreateContainerResponse>, Status> {
         info!("Got create_container request");
 
-        let id = request.get_ref().uuid.clone();
-        // TODO get from image
-        let bundle = PathBuf::from("/home/lukasfrank/dev/sample-nginx-pod");
+        let id: Uuid = Uuid::new_v4();
+
+        let digest = fetch_image(request.get_ref().image.to_owned())
+            .await
+            .map_err(|_: oci::ImageError| {
+                Status::new(tonic::Code::Internal, "failed to fetch image")
+            })?;
+
+        let mut bundle_path = PathBuf::from(DEFAULT_CONTAINER_PATH);
+        bundle_path.push(id.to_string());
+
+        let mut rootfs_path = bundle_path.clone();
+        rootfs_path.push("rootfs");
+        fs::create_dir_all(&rootfs_path)?;
+
+        info!("unpacking image content");
+        let src = format!("{}/{}", DEFAULT_IMAGE_PATH, digest);
+        let paths = fs::read_dir(PathBuf::from(&src))?;
+        for path in paths {
+            let path = path?.path();
+
+            if path.is_file() {
+                let file = File::open(&path)?;
+                let gz_decoder = GzDecoder::new(BufReader::new(file));
+                let mut archive = Archive::new(gz_decoder);
+
+                archive.unpack(&rootfs_path)?;
+            }
+        }
+
+        let mut spec = Spec::default();
+        let linux = spec
+            .linux_mut()
+            .as_mut()
+            .ok_or_else(|| Status::new(tonic::Code::Internal, ""))?;
+        let ns: &mut Vec<LinuxNamespace> = linux
+            .namespaces_mut()
+            .as_mut()
+            .ok_or_else(|| Status::new(tonic::Code::Internal, ""))?;
+        ns.retain(|ns| ns.typ() != LinuxNamespaceType::Network);
+
+        if let Some(mut process) = spec.process_mut().take() {
+            process.set_args(Some(request.get_ref().command.to_owned()));
+            spec.set_process(Some(process));
+        }
+
+        let mut cfg_file = bundle_path.clone();
+        cfg_file.push("config.json");
+        let cfg_file = File::create(cfg_file).expect("msg");
+        let mut writer = BufWriter::new(cfg_file);
+        to_writer_pretty(&mut writer, &spec).expect("msg");
+        writer.flush().expect("msg");
 
         // let socket = PathBuf::from("/home/lukasfrank/dev/sample-nginx-pod/sock.tty");
 
-        let mut container = create(id, bundle, None).expect("msg");
+        let _ = create(id.to_string(), bundle_path, None).expect("msg");
 
-        Ok(Response::new(container_service::CreateContainerResponse {}))
+        Ok(Response::new(container_service::CreateContainerResponse {
+            uuid: id.to_string(),
+        }))
     }
 
     async fn run_container(
@@ -128,11 +191,17 @@ impl ContainerService for ContainerAPI {
 
         let container_root = PathBuf::from(format!("/run/containers/youki/{}", container_id));
         if !container_root.exists() {
-            info!("container {} does not exist.", container_id)
+            info!("container {} does not exist.", container_id);
+            return Ok(Response::new(container_service::DeleteContainerResponse {}));
         }
 
         let mut container = Container::load(container_root).expect("msg");
         container.delete(false).expect("msg");
+
+        let bundle_path = PathBuf::from(format!("{}/{}", DEFAULT_CONTAINER_PATH, container_id));
+        if bundle_path.exists() {
+            fs::remove_dir_all(bundle_path).expect("msg");
+        }
 
         Ok(Response::new(container_service::DeleteContainerResponse {}))
     }

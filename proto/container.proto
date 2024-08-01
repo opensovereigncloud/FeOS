@@ -10,9 +10,12 @@ service ContainerService {
 }
 
 message CreateContainerRequest {
-    string uuid = 1;
+    string image = 1;
+    repeated string command = 2;
 }
-message CreateContainerResponse {}
+message CreateContainerResponse {
+    string uuid = 1;    
+}
 
 message RunContainerRequest {
     string uuid = 1;    
