@@ -1,18 +1,27 @@
-use log::info;
+use log::{error, info};
 use std::path::PathBuf;
 use tonic::{transport::Server, Request, Response, Status};
 
 use crate::host;
+use crate::ringbuffer::*;
 use crate::vm::image;
 use feos_grpc::feos_grpc_server::{FeosGrpc, FeosGrpcServer};
+use std::sync::Arc;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
+use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use self::feos_grpc::{
-    AttachNicVmRequest, AttachNicVmResponse, BootVmRequest, BootVmResponse, CreateVmRequest,
-    CreateVmResponse, Empty, FetchImageRequest, FetchImageResponse, GetVmRequest, GetVmResponse,
-    HostInfoRequest, HostInfoResponse, NetInterface, RebootRequest, RebootResponse,
-    ShutdownRequest, ShutdownResponse,
+    AttachNicVmRequest, AttachNicVmResponse, BootVmRequest, BootVmResponse, ConsoleVmResponse,
+    CreateVmRequest, CreateVmResponse, Empty, FetchImageRequest, FetchImageResponse,
+    GetFeOsKernelLogRequest, GetFeOsKernelLogResponse, GetFeOsLogRequest, GetFeOsLogResponse,
+    GetVmRequest, GetVmResponse, HostInfoRequest, HostInfoResponse, NetInterface, RebootRequest,
+    RebootResponse, ShutdownRequest, ShutdownResponse,
 };
 use crate::vm::{self};
 
@@ -20,9 +29,25 @@ pub mod feos_grpc {
     tonic::include_proto!("feos_grpc"); // The string specified here must match the proto package name
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FeOSAPI {
-    vmm: vm::Manager,
+    vmm: Arc<vm::Manager>,
+    buffer: Arc<RingBuffer>,
+    log_receiver: Arc<Mutex<mpsc::Receiver<String>>>,
+}
+
+impl FeOSAPI {
+    pub fn new(
+        vmm: vm::Manager,
+        buffer: Arc<RingBuffer>,
+        log_receiver: Arc<Mutex<mpsc::Receiver<String>>>,
+    ) -> Self {
+        FeOSAPI {
+            vmm: Arc::new(vmm),
+            buffer,
+            log_receiver,
+        }
+    }
 }
 
 fn handle_error(e: vm::Error) -> tonic::Status {
@@ -57,6 +82,132 @@ fn handle_error(e: vm::Error) -> tonic::Status {
 
 #[tonic::async_trait]
 impl FeosGrpc for FeOSAPI {
+    type GetFeOSKernelLogsStream = ReceiverStream<Result<GetFeOsKernelLogResponse, Status>>;
+    type GetFeOSLogsStream = ReceiverStream<Result<GetFeOsLogResponse, Status>>;
+    type ConsoleVMStream = ReceiverStream<Result<feos_grpc::ConsoleVmResponse, Status>>;
+
+    async fn get_fe_os_kernel_logs(
+        &self,
+        _: Request<GetFeOsKernelLogRequest>,
+    ) -> Result<Response<Self::GetFeOSKernelLogsStream>, Status> {
+        let (tx, rx) = mpsc::channel(4);
+        let tx = tx.clone();
+
+        tokio::spawn(async move {
+            let file = File::open("/dev/kmsg")
+                .await
+                .expect("Failed to open /dev/kmsg");
+            let reader = BufReader::new(file);
+            let mut lines = reader.lines();
+
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let response = GetFeOsKernelLogResponse { message: line };
+                if tx.send(Ok(response)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn console_vm(
+        &self,
+        request: Request<tonic::Streaming<feos_grpc::ConsoleVmRequest>>,
+    ) -> Result<Response<Self::ConsoleVMStream>, Status> {
+        let mut input_stream = request.into_inner();
+        let (tx, rx) = mpsc::channel(4);
+
+        info!("Got console_vm request");
+        let initial_request = match input_stream.message().await {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                return Err(Status::new(
+                    tonic::Code::InvalidArgument,
+                    "No initial request received",
+                ))
+            }
+            Err(status) => return Err(status),
+        };
+        let id = Uuid::parse_str(&initial_request.uuid)
+            .map_err(|_| Status::invalid_argument("failed to parse uuid"))?;
+        let socket_path = self.vmm.get_vm_console_path(id).map_err(handle_error)?;
+
+        tokio::spawn(async move {
+            let stream = match UnixStream::connect(&socket_path).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!("Failed to connect to Unix socket: {:?}", e);
+                    return;
+                }
+            };
+
+            let (reader, writer) = stream.into_split();
+
+            tokio::spawn(async move {
+                let mut writer = writer;
+                while let Ok(Some(req)) = input_stream.message().await {
+                    let input_with_newline = format!("{}\n", req.input);
+                    if let Err(e) = writer.write_all(input_with_newline.as_bytes()).await {
+                        error!("Failed to write to console: {:?}", e);
+                        break;
+                    }
+                }
+            });
+
+            let mut reader = reader;
+            let mut buffer = vec![0; 1024];
+            loop {
+                match reader.read(&mut buffer).await {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        let message = String::from_utf8_lossy(&buffer[..n]).to_string();
+                        let response = ConsoleVmResponse { message };
+                        if tx.send(Ok(response)).await.is_err() {
+                            error!("Failed to send response through channel");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to read from stream: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn get_fe_os_logs(
+        &self,
+        _: Request<GetFeOsLogRequest>,
+    ) -> Result<Response<ReceiverStream<Result<GetFeOsLogResponse, Status>>>, Status> {
+        let (tx, rx) = mpsc::channel(4);
+        let buffer = self.buffer.clone();
+        let log_receiver = self.log_receiver.clone();
+
+        tokio::spawn(async move {
+            let logs = buffer.get_lines().await;
+            for log in logs {
+                let response = GetFeOsLogResponse { message: log };
+                if tx.send(Ok(response)).await.is_err() {
+                    break;
+                }
+            }
+
+            let mut log_receiver = log_receiver.lock().await;
+            while let Some(log_entry) = log_receiver.recv().await {
+                let response = GetFeOsLogResponse { message: log_entry };
+                if tx.send(Ok(response)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn ping(
         &self,
         request: Request<Empty>, // Accept request of type HelloRequest
@@ -235,26 +386,16 @@ impl FeosGrpc for FeOSAPI {
 
         Ok(Response::new(feos_grpc::BootVmResponse {}))
     }
-
-    async fn console_vm(
-        &self,
-        request: Request<feos_grpc::ConsoleVmRequest>,
-    ) -> Result<Response<feos_grpc::ConsoleVmResponse>, Status> {
-        info!("Got console_vm request");
-
-        let id = request.get_ref().uuid.to_owned();
-        let id =
-            Uuid::parse_str(&id).map_err(|_| Status::invalid_argument("failed to parse uuid"))?;
-        self.vmm.console(id).map_err(handle_error)?;
-
-        Ok(Response::new(feos_grpc::ConsoleVmResponse {}))
-    }
 }
 
-pub async fn daemon_start(vmm: vm::Manager) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn daemon_start(
+    vmm: vm::Manager,
+    buffer: Arc<RingBuffer>,
+    log_receiver: Arc<Mutex<mpsc::Receiver<String>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::]:1337".parse()?;
 
-    let api = FeOSAPI { vmm };
+    let api = FeOSAPI::new(vmm, buffer, log_receiver);
 
     Server::builder()
         .timeout(Duration::from_secs(30))

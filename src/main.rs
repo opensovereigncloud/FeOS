@@ -4,16 +4,17 @@ mod dhcpv6;
 mod filesystem;
 mod host;
 mod network;
+mod ringbuffer;
 mod vm;
 
 use crate::daemon::daemon_start;
 use crate::filesystem::mount_virtual_filesystems;
 use crate::network::configure_network_devices;
 
-use log::{error, info, warn, LevelFilter};
+use log::{error, info, warn};
 use network::configure_sriov;
 use nix::unistd::Uid;
-use simple_logger::SimpleLogger;
+use ringbuffer::*;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -31,12 +32,9 @@ async fn main() -> Result<(), String> {
         env!("CARGO_PKG_VERSION")
     );
 
-    SimpleLogger::new()
-        .with_level(LevelFilter::Info)
-        .with_module_level("feos::filesystem", LevelFilter::Debug)
-        .with_utc_timestamps()
-        .init()
-        .unwrap();
+    const FEOS_RINGBUFFER_CAP: usize = 100;
+    let buffer = RingBuffer::new(FEOS_RINGBUFFER_CAP);
+    let log_receiver = init_logger(buffer.clone());
 
     // if not run as root, print warning.
     if !Uid::current().is_root() {
@@ -59,11 +57,10 @@ async fn main() -> Result<(), String> {
     if let Err(e) = configure_sriov(VFS_NUM).await {
         warn!("failed to configure sriov: {}", e.to_string())
     }
-
     let vmm = vm::Manager::new(String::from("cloud-hypervisor"));
 
     info!("Starting FeOS daemon...");
-    match daemon_start(vmm).await {
+    match daemon_start(vmm, buffer, log_receiver).await {
         Err(e) => error!("FeOS daemon crashed: {}", e),
         _ => error!("FeOS daemon exited."),
     }

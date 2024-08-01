@@ -17,3 +17,6 @@ test: clippy
 	cargo test
 
 include hack/hack.mk
+
+feos_client:
+	cd client && cargo build

@@ -1,6 +1,5 @@
 use log::info;
 use serde_json::json;
-use std::io::{BufRead, BufReader};
 use std::{
     collections::HashMap,
     num::TryFromIntError,
@@ -163,16 +162,11 @@ impl Manager {
             Some(&vm_config.to_string()),
         )
         .map_err(Error::CHApiFailure)?;
-        if response.is_some() {
-            info!(
-                "create vm: id {}, response: {}",
-                id.to_string(),
-                response.unwrap()
-            )
+        if let Some(response) = response {
+            info!("create vm: id {}, response: {}", id.to_string(), response)
         }
 
         info!("created vm with id: {}", id.to_string());
-
         Ok(())
     }
 
@@ -198,7 +192,7 @@ impl Manager {
         Ok(())
     }
 
-    pub fn console(&self, id: Uuid) -> Result<(), Error> {
+    pub fn get_vm_console_path(&self, id: Uuid) -> Result<String, Error> {
         let vms = self.vms.lock().unwrap();
         if !vms.contains_key(&id) {
             return Err(Error::NotFound);
@@ -209,39 +203,7 @@ impl Manager {
             return Err(Error::NotFound);
         }
 
-        // TODO: stream over HTTP
-        std::thread::spawn(move || {
-            match UnixStream::connect(socket_path).map_err(Error::SocketFailure) {
-                Ok(stream) => {
-                    let mut buffer = Vec::new();
-
-                    let mut reader = BufReader::new(stream);
-                    loop {
-                        match reader.read_until(b'\n', &mut buffer) {
-                            Ok(0) => {
-                                // Connection was closed
-                                info!("Connection closed");
-                                break;
-                            }
-                            Ok(_) => {
-                                if let Ok(line) = String::from_utf8(buffer.clone()) {
-                                    info!("Received: {}", line);
-                                } else {
-                                    info!("Received invalid UTF-8 data");
-                                }
-                            }
-                            Err(e) => {
-                                info!("Failed to read from stream: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => info!("Failed to accept connection: {:?}", e),
-            }
-        });
-
-        Ok(())
+        Ok(socket_path)
     }
 
     pub fn _add_net_device(
