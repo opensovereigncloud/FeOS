@@ -13,6 +13,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
 
 RUN cargo new xyz; cd xyz; cargo fetch; cd ..; rm -rf xyz
 RUN rustup component add clippy
+RUN rustup component add rustfmt
 RUN rustup target add x86_64-unknown-linux-musl
 RUN mkdir /feos
 RUN mkdir /target

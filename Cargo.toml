@@ -39,6 +39,16 @@ thiserror = "1.0.63"
 anyhow = "1.0.86"
 tar = "0.4"
 flate2 = "1.0"
+tokio-stream = "0.1.15"
+chrono = "0.4"
+futures-util = "0.3"
+futures-core = "0.3"
+async-stream = "0.3"
 
 [build-dependencies]
 tonic-build = "0.12.1"
+
+[workspace]
+members = [
+    "client",
+]
