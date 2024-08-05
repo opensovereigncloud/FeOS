@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - feat/container
     tags:
     - '*'
     paths-ignore:
