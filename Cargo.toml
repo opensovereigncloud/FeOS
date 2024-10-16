@@ -44,10 +44,20 @@ chrono = "0.4"
 futures-util = "0.3"
 futures-core = "0.3"
 async-stream = "0.3"
+tokio-vsock = { git = "https://github.com/rust-vsock/tokio-vsock", rev = "3a41323", features = ["tonic-conn"]}
+tower = "0.4.13"
+hyper-util = "0.1"
+socket2 = "0.5.7"
 libc = "0.2"
+
+pelite = "0.9"
+regex = "1.10.6"
 
 [build-dependencies]
 tonic-build = "0.12.1"
+
+[dev-dependencies]
+serial_test = "3.1.1"
 
 [workspace]
 members = [

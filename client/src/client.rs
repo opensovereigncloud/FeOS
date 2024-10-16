@@ -6,6 +6,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Endpoint;
 use tonic::Request;
 
+use crate::client_container::ContainerCommand;
 use feos_grpc::feos_grpc_client::FeosGrpcClient;
 use feos_grpc::*;
 
@@ -45,6 +46,12 @@ pub enum Command {
     BootVM {
         uuid: String,
     },
+    ShutdownVM {
+        uuid: String,
+    },
+    PingVM {
+        uuid: String,
+    },
     AttachNicVM {
         uuid: String,
         mac_address: String,
@@ -55,6 +62,7 @@ pub enum Command {
     ConsoleVM {
         uuid: String,
     },
+    Container(ContainerCommand),
 }
 
 fn format_address(ip: &str, port: u16) -> String {
@@ -77,6 +85,10 @@ pub async fn run_client(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = FeosGrpcClient::new(channel);
 
     match opt.cmd {
+        Command::Container(container_cmd) => {
+            crate::client_container::run_container_client(opt.server_ip, opt.port, container_cmd)
+                .await?;
+        }
         Command::Reboot => {
             let request = Request::new(RebootRequest {});
             let response = client.reboot(request).await?;
@@ -126,6 +138,16 @@ pub async fn run_client(opt: Opt) -> Result<(), Box<dyn std::error::Error>> {
             let request = Request::new(BootVmRequest { uuid });
             let response = client.boot_vm(request).await?;
             println!("BOOT VM RESPONSE={:?}", response);
+        }
+        Command::PingVM { uuid } => {
+            let request = Request::new(PingVmRequest { uuid });
+            let response = client.ping_vm(request).await?;
+            println!("BOOT VM RESPONSE={:?}", response);
+        }
+        Command::ShutdownVM { uuid } => {
+            let request = Request::new(ShutdownVmRequest { uuid });
+            let response = client.shutdown_vm(request).await?;
+            println!("SHUTDOWN VM RESPONSE={:?}", response);
         }
         Command::AttachNicVM {
             uuid,

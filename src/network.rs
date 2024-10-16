@@ -297,7 +297,7 @@ async fn get_device_information(pci: &str, field: &str) -> Result<String, io::Er
 }
 
 // Print all packets to the console for debugging purposes
-async fn _capture_packets(interface_name: String) {
+pub async fn _capture_packets(interface_name: String) {
     let interfaces = datalink::interfaces();
     let interface = interfaces
         .into_iter()
