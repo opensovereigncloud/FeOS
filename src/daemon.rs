@@ -7,12 +7,12 @@ use tonic::{transport::Server, Request, Response, Status};
 use crate::feos_grpc;
 use crate::feos_grpc::feos_grpc_server::*;
 use crate::feos_grpc::{
-    AttachNicVmRequest, AttachNicVmResponse, BootVmRequest, BootVmResponse, ConsoleVmResponse,
-    CreateVmRequest, CreateVmResponse, Empty, FetchImageRequest, FetchImageResponse,
-    GetFeOsKernelLogRequest, GetFeOsKernelLogResponse, GetFeOsLogRequest, GetFeOsLogResponse,
-    GetVmRequest, GetVmResponse, HostInfoRequest, HostInfoResponse, NetInterface, PingVmRequest,
-    PingVmResponse, RebootRequest, RebootResponse, ShutdownRequest, ShutdownResponse,
-    ShutdownVmRequest, ShutdownVmResponse,
+    attach_nic_vm_request::NicData, AttachNicVmRequest, AttachNicVmResponse, BootVmRequest,
+    BootVmResponse, ConsoleVmResponse, CreateVmRequest, CreateVmResponse, Empty, FetchImageRequest,
+    FetchImageResponse, GetFeOsKernelLogRequest, GetFeOsKernelLogResponse, GetFeOsLogRequest,
+    GetFeOsLogResponse, GetVmRequest, GetVmResponse, HostInfoRequest, HostInfoResponse,
+    NetInterface, NicType as ProtoNicType, PingVmRequest, PingVmResponse, RebootRequest,
+    RebootResponse, ShutdownRequest, ShutdownResponse, ShutdownVmRequest, ShutdownVmResponse,
 };
 use crate::host;
 use crate::ringbuffer::*;
@@ -23,12 +23,13 @@ use hyper_util::rt::TokioIo;
 use nix::libc::VMADDR_CID_ANY;
 use nix::unistd::Uid;
 use std::sync::Arc;
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
-use tokio::sync::{mpsc, Mutex};
-use tokio::time::{sleep, Duration};
+use tokio::{
+    fs::File,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::UnixStream,
+    sync::{mpsc, Mutex},
+    time::{sleep, Duration},
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_vsock::{VsockAddr, VsockListener};
 use tonic::transport::{Endpoint, Uri};
@@ -37,13 +38,14 @@ use uuid::Uuid;
 
 use crate::filesystem::mount_virtual_filesystems;
 use crate::isolated_container::{isolated_container_service, IsolatedContainerAPI};
-use crate::network::{configure_network_devices, configure_sriov};
+use crate::network::configure_network_devices;
 
 #[derive(Debug)]
 pub struct FeOSAPI {
     vmm: Arc<vm::Manager>,
     buffer: Arc<RingBuffer>,
     log_receiver: Arc<Mutex<mpsc::Receiver<String>>>,
+    network: Arc<network::Manager>,
 }
 
 impl FeOSAPI {
@@ -51,11 +53,13 @@ impl FeOSAPI {
         vmm: Arc<vm::Manager>,
         buffer: Arc<RingBuffer>,
         log_receiver: Arc<Mutex<mpsc::Receiver<String>>>,
+        network: Arc<network::Manager>,
     ) -> Self {
         FeOSAPI {
             vmm,
             buffer,
             log_receiver,
+            network,
         }
     }
 
@@ -78,6 +82,13 @@ impl FeOSAPI {
                 Status::new(
                     tonic::Code::Internal,
                     "failed to connect to cloud hypervisor",
+                )
+            }
+            vm::Error::NetworkingError(e) => {
+                info!("failed to prepare network {:?}", e);
+                Status::new(
+                    tonic::Code::Internal,
+                    format!("failed to prepare network: {:?}", e),
                 )
             }
             vm::Error::CHApiFailure(e) => {
@@ -240,6 +251,13 @@ impl FeosGrpc for FeOSAPI {
             .map_err(|_| Status::invalid_argument("Failed to parse UUID"))?;
 
         self.vmm.boot_vm(id).map_err(|e| self.handle_error(e))?;
+        //TODO remove this sleep
+        sleep(Duration::from_secs(2)).await;
+        self.network
+            .start_dhcp(id)
+            .await
+            .map_err(vm::Error::NetworkingError)
+            .map_err(|e| self.handle_error(e))?;
 
         Ok(Response::new(feos_grpc::BootVmResponse {}))
     }
@@ -321,25 +339,46 @@ impl FeosGrpc for FeOSAPI {
         &self,
         request: Request<AttachNicVmRequest>,
     ) -> Result<Response<AttachNicVmResponse>, Status> {
-        info!("Got attach_nic_vm request");
+        info!("Received AttachNicVM request");
 
-        let id = request.get_ref().uuid.to_owned();
-        let id =
-            Uuid::parse_str(&id).map_err(|_| Status::invalid_argument("failed to parse uuid"))?;
+        let req = request.into_inner();
 
-        let net_config = if !request.get_ref().mac_address.is_empty() {
-            vm::NetworkMode::MACAddress(request.get_ref().mac_address.clone())
-        } else if !request.get_ref().pci_address.is_empty() {
-            vm::NetworkMode::PCIAddress(request.get_ref().pci_address.clone())
-        } else {
-            return Err(Status::invalid_argument("no network config provided"));
+        let vm_uuid = Uuid::parse_str(&req.uuid)
+            .map_err(|_| Status::invalid_argument("Failed to parse UUID"))?;
+
+        let net_config = match ProtoNicType::try_from(req.nic_type) {
+            Ok(ProtoNicType::Mac) => {
+                if let Some(NicData::MacAddress(mac)) = req.nic_data {
+                    vm::NetworkMode::MACAddress(mac)
+                } else {
+                    return Err(Status::invalid_argument(
+                        "mac_address must be provided for NIC type MAC",
+                    ));
+                }
+            }
+            Ok(ProtoNicType::Pci) => {
+                if let Some(NicData::PciAddress(pci)) = req.nic_data {
+                    vm::NetworkMode::PCIAddress(pci)
+                } else {
+                    return Err(Status::invalid_argument(
+                        "pci_address must be provided for NIC type PCI",
+                    ));
+                }
+            }
+            Ok(ProtoNicType::Tap) => {
+                let tap_name = network::Manager::device_name(&vm_uuid);
+                vm::NetworkMode::TAPDeviceName(tap_name)
+            }
+            Err(_) => {
+                return Err(Status::invalid_argument("Invalid NIC type provided"));
+            }
         };
 
         self.vmm
-            .add_net_device(id, net_config)
+            .add_net_device(vm_uuid, net_config)
             .map_err(|e| self.handle_error(e))?;
 
-        Ok(Response::new(feos_grpc::AttachNicVmResponse {}))
+        Ok(Response::new(AttachNicVmResponse {}))
     }
 
     async fn shutdown_vm(
@@ -350,6 +389,12 @@ impl FeosGrpc for FeOSAPI {
 
         let id = Uuid::parse_str(&request.get_ref().uuid)
             .map_err(|_| Status::invalid_argument("Failed to parse UUID"))?;
+
+        self.network
+            .stop_dhcp(id)
+            .await
+            .map_err(vm::Error::NetworkingError)
+            .map_err(|e| self.handle_error(e))?;
 
         // TODO differentiate between kill and shutdown
         self.vmm.kill_vm(id).map_err(|e| self.handle_error(e))?;
@@ -480,7 +525,7 @@ pub async fn daemon_start(
     log_receiver: Arc<Mutex<mpsc::Receiver<String>>>,
     is_nested: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let api = FeOSAPI::new(vmm.clone(), buffer, log_receiver);
+    let api = FeOSAPI::new(vmm.clone(), buffer, log_receiver, network.clone());
     let isolated_container_api = IsolatedContainerAPI::new(vmm, network);
 
     if is_nested {
@@ -513,10 +558,9 @@ pub async fn daemon_start(
     Ok(())
 }
 
-pub async fn start_feos(ipv6_address: Ipv6Addr, prefix_length: u8) -> Result<(), String> {
+pub async fn start_feos(mut ipv6_address: Ipv6Addr, mut prefix_length: u8) -> Result<(), String> {
     println!(
         "
-
     ███████╗███████╗ ██████╗ ███████╗
     ██╔════╝██╔════╝██╔═══██╗██╔════╝
     █████╗  █████╗  ██║   ██║███████╗
@@ -537,6 +581,10 @@ pub async fn start_feos(ipv6_address: Ipv6Addr, prefix_length: u8) -> Result<(),
         warn!("Not running as root! (uid: {})", Uid::current());
     }
 
+    if ipv6_address == Ipv6Addr::UNSPECIFIED {
+        info!("No --ipam flag found. Expecting Prefix Delegation from the dhcpv6 server");
+    }
+
     if std::process::id() == 1 {
         info!("Mounting virtual filesystems...");
         mount_virtual_filesystems();
@@ -554,22 +602,25 @@ pub async fn start_feos(ipv6_address: Ipv6Addr, prefix_length: u8) -> Result<(),
 
     if std::process::id() == 1 {
         info!("Configuring network devices...");
-        configure_network_devices()
+        if let Some((delegated_prefix, delegated_prefix_length)) = configure_network_devices()
             .await
-            .expect("could not configure network devices");
+            .expect("could not configure network devices")
+        {
+            ipv6_address = delegated_prefix;
+            prefix_length = delegated_prefix_length;
+        }
     }
 
     // Special stuff for pid 1
     if std::process::id() == 1 && !is_nested {
-        info!("Configuring sriov...");
-        const VFS_NUM: u32 = 125;
+        info!("Skip configuring sriov...");
+        /*const VFS_NUM: u32 = 125;
         if let Err(e) = configure_sriov(VFS_NUM).await {
             warn!("failed to configure sriov: {}", e.to_string())
-        }
+        }*/
     }
 
     let vmm = Manager::new(String::from("cloud-hypervisor"));
-
     let network_manager = network::Manager::new(ipv6_address, prefix_length);
 
     info!("Starting FeOS daemon...");

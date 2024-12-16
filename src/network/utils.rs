@@ -1,9 +1,12 @@
+use std::fs::File;
 use std::io;
+use std::io::Write;
 
 use crate::network::dhcpv6::*;
 use futures::stream::TryStreamExt;
-use log::{info, warn};
-use rtnetlink::new_connection;
+use log::{debug, info, warn};
+use rtnetlink::{new_connection, Handle, IpVersion};
+use std::net::Ipv6Addr;
 use tokio::fs::{read_link, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{self, sleep, Duration};
@@ -19,15 +22,19 @@ use pnet::packet::udp::UdpPacket;
 use pnet::packet::Packet;
 
 use netlink_packet_route::neighbour::*;
+use netlink_packet_route::route::{RouteAddress, RouteAttribute};
 
 const INTERFACE_NAME: &str = "eth0";
 
-pub async fn configure_network_devices() -> Result<(), String> {
+pub async fn configure_network_devices() -> Result<Option<(Ipv6Addr, u8)>, String> {
     let ignore_ra_flag = true; // Till the RA has the correct flags (O or M), ignore the flag
     let interface_name = String::from(INTERFACE_NAME);
     let (connection, handle, _) = new_connection().unwrap();
     let mut mac_bytes_option: Option<Vec<u8>> = None;
+    let mut delegated_prefix_option: Option<(Ipv6Addr, u8)> = None;
     tokio::spawn(connection);
+
+    enable_ipv6_forwarding().map_err(|e| format!("Failed to enable ipv6 forwarding: {}", e))?;
 
     let mut link_ts = handle
         .link()
@@ -107,7 +114,27 @@ pub async fn configure_network_devices() -> Result<(), String> {
     if let Some(ipv6_gateway) = is_dhcpv6_needed(interface_name.clone(), ignore_ra_flag) {
         time::sleep(Duration::from_secs(4)).await;
         match run_dhcpv6_client(interface_name.clone()).await {
-            Ok(addr) => send_neigh_solicitation(interface_name.clone(), &ipv6_gateway, &addr),
+            Ok(result) => {
+                send_neigh_solicitation(interface_name.clone(), &ipv6_gateway, &result.address);
+                if let Some(prefix_info) = result.prefix {
+                    let delegated_prefix = prefix_info.prefix;
+                    let prefix_length = prefix_info.prefix_length;
+                    info!(
+                        "Received delegated prefix {} with length {}",
+                        delegated_prefix, prefix_length
+                    );
+                    delegated_prefix_option = Some((delegated_prefix, prefix_length));
+                } else {
+                    info!("No prefix delegation received.");
+                }
+                info!(
+                    "Setting IPv6 gateway to {} on interface {}",
+                    ipv6_gateway, interface_name
+                );
+                if let Err(e) = set_ipv6_gateway(&handle, &interface_name, ipv6_gateway).await {
+                    warn!("Failed to set IPv6 gateway: {}", e);
+                }
+            }
             Err(e) => warn!("Error: {}", e),
         }
     }
@@ -130,6 +157,127 @@ pub async fn configure_network_devices() -> Result<(), String> {
         }
     }
 
+    Ok(delegated_prefix_option)
+}
+
+pub fn enable_ipv6_forwarding() -> Result<(), std::io::Error> {
+    let forwarding_paths = ["/proc/sys/net/ipv6/conf/all/forwarding"];
+
+    for path in forwarding_paths {
+        let mut file = File::create(path)?;
+        file.write_all(b"1")?;
+    }
+
+    Ok(())
+}
+
+// Keep for debugging purposes
+async fn _print_ipv6_routes(
+    handle: &Handle,
+    iface_index: u32,
+    interface_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("IPv6 Routes:");
+
+    let mut route_ts = handle.route().get(IpVersion::V6).execute();
+
+    while let Some(route_msg) = route_ts
+        .try_next()
+        .await
+        .map_err(|e| format!("Could not get route: {}", e))?
+    {
+        let mut destination: Option<String> = None;
+        let mut gateway: Option<String> = None;
+        let mut oif: Option<u32> = None;
+
+        for attr in &route_msg.attributes {
+            match attr {
+                RouteAttribute::Oif(oif_idx) => {
+                    oif = Some(*oif_idx);
+                    debug!("Route OIF: {}", oif_idx);
+                }
+
+                RouteAttribute::Destination(dest) => {
+                    match dest {
+                        RouteAddress::Inet6(addr) => {
+                            destination = Some(format!(
+                                "{}/{}",
+                                addr, route_msg.header.destination_prefix_length
+                            ));
+                            debug!("Parsed IPv6 Destination: {}", addr);
+                        }
+                        RouteAddress::Other(v) => {
+                            if v.is_empty() {
+                                destination = Some("::/0".to_string());
+                                debug!("Parsed Default Route");
+                            } else {
+                                // Unknown or unsupported address
+                                let hex_str = v
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<String>>()
+                                    .join(":");
+                                destination = Some(format!("unknown({})", hex_str));
+                                debug!("Parsed Unknown Destination: {}", hex_str);
+                            }
+                        }
+                        _ => {
+                            debug!("Unhandled Destination variant");
+                        }
+                    }
+                }
+
+                RouteAttribute::Gateway(gw) => {
+                    match gw {
+                        RouteAddress::Inet6(addr) => {
+                            gateway = Some(addr.to_string());
+                            debug!("Parsed IPv6 Gateway: {}", addr);
+                        }
+                        RouteAddress::Other(v) => {
+                            // Some other form of gateway, handle if needed
+                            if v.is_empty() {
+                                debug!("Parsed Empty Gateway");
+                            } else {
+                                let hex_str = v
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<String>>()
+                                    .join(":");
+                                gateway = Some(format!("unknown({})", hex_str));
+                                debug!("Parsed Unknown Gateway: {}", hex_str);
+                            }
+                        }
+                        _ => {
+                            debug!("Unhandled Gateway variant");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if oif != Some(iface_index) {
+            debug!(
+                "Skipping route not associated with interface '{}'",
+                interface_name
+            );
+            continue;
+        }
+
+        if route_msg.header.destination_prefix_length == 0 && destination.is_none() {
+            destination = Some("::/0".to_string());
+            debug!("Default route detected (no destination attribute)");
+        }
+
+        let dest_str = destination.unwrap_or_else(|| "unknown".to_string());
+        let mut route_str = dest_str.to_string();
+        if let Some(gw) = gateway {
+            route_str.push_str(&format!(" via {}", gw));
+        }
+        route_str.push_str(&format!(" dev {}", interface_name));
+
+        info!("- {}", route_str);
+    }
     Ok(())
 }
 
@@ -141,7 +289,7 @@ fn format_mac(bytes: Vec<u8>) -> String {
         .join(":")
 }
 
-pub async fn configure_sriov(num_vfs: u32) -> Result<(), String> {
+pub async fn _configure_sriov(num_vfs: u32) -> Result<(), String> {
     let base_path = format!("/sys/class/net/{}/device", INTERFACE_NAME);
 
     let file_path = format!("{}/sriov_numvfs", base_path);

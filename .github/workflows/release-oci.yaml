@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - master
-      - feat/container
     tags:
     - '*'
     paths-ignore:
@@ -74,8 +73,8 @@ jobs:
       with:
         path: |
           target/kernel/
-        key: ${{ runner.os }}-kernel-${{ hashFiles('/hack/kernel/**') }}
-        restore-keys: ${{ runner.os }}-kernel-
+        key: ${{ runner.os }}-kernel-${{ hashFiles('hack/kernel/**') }}
+        restore-keys: ${{ runner.os }}-kernel-${{ hashFiles('hack/kernel/**') }}
 
     - name: Build Kernel
       run: make kernel

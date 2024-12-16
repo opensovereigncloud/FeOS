@@ -8,10 +8,12 @@ use hyper_util::rt::TokioIo;
 use isolated_container_service::isolated_container_service_server::IsolatedContainerService;
 use log::info;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{collections::HashMap, sync::Mutex};
 use std::{fmt::Debug, io, path::PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::time::sleep;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{transport, Request, Response, Status};
 use tower::service_fn;
@@ -117,7 +119,7 @@ impl IsolatedContainerAPI {
                 id,
                 2,
                 // TODO make configurable through container request
-                536870912,
+                4294967296,
                 vm::BootMode::KernelBoot(vm::KernelBootMode {
                     kernel: PathBuf::from("/usr/share/feos/vmlinuz"),
                     initramfs: PathBuf::from("/usr/share/feos/initramfs"),
@@ -129,14 +131,14 @@ impl IsolatedContainerAPI {
             )
             .map_err(Error::VMError)?;
 
-        self.vmm.boot_vm(id).map_err(Error::VMError)?;
-
         self.vmm
             .add_net_device(
                 id,
                 NetworkMode::TAPDeviceName(network::Manager::device_name(&id)),
             )
             .map_err(Error::VMError)?;
+
+        self.vmm.boot_vm(id).map_err(Error::VMError)?;
 
         Ok(())
     }
@@ -191,6 +193,8 @@ impl IsolatedContainerService for IsolatedContainerAPI {
         let id = Uuid::new_v4();
 
         self.prepare_vm(id).map_err(|e| self.handle_error(e))?;
+        //TODO get rid of sleep
+        sleep(Duration::from_secs(2)).await;
 
         self.network
             .start_dhcp(id)
@@ -209,9 +213,15 @@ impl IsolatedContainerService for IsolatedContainerAPI {
         let response = client
             .create_container(request)
             .await
-            .map_err(|_| match self.vmm.kill_vm(id) {
-                Ok(_) => Error::Error("failed to create container".to_string()),
-                Err(e) => Error::Error(format!("failed to create container: {:?}", e)),
+            .map_err(|e| {
+                info!("Failed to create container: {:?}", e);
+                match self.vmm.kill_vm(id) {
+                    Ok(_) => Error::Error("failed to create container".to_string()),
+                    Err(kill_error) => Error::Error(format!(
+                        "failed to create container: {:?}, kill VM error: {:?}",
+                        e, kill_error
+                    )),
+                }
             })
             .map_err(|e| self.handle_error(e))?;
 
