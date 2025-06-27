@@ -22,3 +22,8 @@ include hack/hack.mk
 
 cli:
 	 cargo build --bin feos-cli
+
+nginx: uki
+	@echo "Building nginx container with FeOS UKI..."
+	docker build -f hack/Dockerfile.nginx -t feos-nginx .
+	@echo "Built feos-nginx container successfully"
