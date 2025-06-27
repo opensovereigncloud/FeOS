@@ -32,6 +32,8 @@ jobs:
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
+      with:
+        install: true
 
     - name: Install Protobuf Compiler
       run: sudo apt-get update && sudo apt-get install protobuf-compiler -y
@@ -79,7 +81,7 @@ jobs:
 
     - name: Build UKI with secrets
       run: |
-        CMDLINE="console=tty0 console=ttyS0,115200 earlyprintk=ttyS0,115200 consoleblank=0"
+        CMDLINE="console=tty0 console=ttyS0,115200 intel_iommu=on iommu=pt"
         echo $CMDLINE > target/cmdline
         mkdir -p keys
         echo "${{ secrets.SECUREBOOT_PRIVATEKEY }}" > keys/secureboot.key
@@ -87,17 +89,13 @@ jobs:
         openssl x509 -in keys/secureboot.pem -out keys/feos.crt -outform DER
         make uki
 
-    - name: Build nginx container
-      run: make nginx
+    - name: Build and push multiarch nginx container
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: hack/Dockerfile.nginx
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
 
-    - name: Tag and push Docker image
-      run: |
-        # Tag the locally built image with the registry tags
-        for tag in ${{ steps.meta.outputs.tags }}; do
-          docker tag feos-nginx $tag
-        done
-        
-        # Push all tags
-        for tag in ${{ steps.meta.outputs.tags }}; do
-          docker push $tag
-        done 
