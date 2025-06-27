@@ -7,11 +7,4 @@ keys:
 	openssl x509 -in keys/secureboot.pem -out keys/secureboot.der -outform DER
 
 uki: keys
-	docker run --rm -u $${UID} -v "`pwd`:/feos" feos-builder ukify build \
-	  --os-release @/feos/hack/uki/os-release.txt \
-	  --linux /feos/target/kernel/vmlinuz \
-	  --initrd /feos/target/initramfs.zst \
-	  --cmdline @/feos/target/cmdline \
-	  --secureboot-private-key /feos/keys/secureboot.key \
-	  --secureboot-certificate /feos/keys/secureboot.pem \
-	  --output /feos/target/uki.efi
+	docker run --rm -u $${UID} -v "`pwd`:/feos" feos-builder /feos/hack/uki/build-uki.sh

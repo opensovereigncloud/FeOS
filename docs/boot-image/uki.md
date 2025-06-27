@@ -2,7 +2,8 @@ Unified Kernel Images
 =====================
 
 Have a look at the [Arch Documentation - Unified Kernel Images](https://wiki.archlinux.org/title/Unified_kernel_image).
-It also describes how to build a UKI with `objcopy` instead of `ukify`.
+
+FeOS uses `objcopy` to build UKIs instead of `ukify` to avoid overlapping PE sections that can cause boot failures. The UKI creation process dynamically calculates section offsets to ensure proper alignment and prevent memory corruption.
 
 ## Boot from USB Stick
 Booting FeOS from USB is quite easy. You just need to prepare a USB stick with a bootable UEFI partition and insert the FeOS UKI.
