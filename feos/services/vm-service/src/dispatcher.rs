@@ -6,11 +6,11 @@ use crate::{
         handle_create_vm_command, handle_delete_vm_command, handle_get_vm_command,
         handle_list_vms_command, handle_stream_vm_events_command, perform_startup_sanity_check,
     },
+    error::VmServiceError,
     persistence::repository::VmRepository,
     vmm::{factory, Hypervisor, VmmType},
     worker, Command, VmEventWrapper,
 };
-use anyhow::Result;
 use feos_proto::vm_service::{VmState, VmStateChangedEvent};
 use log::{debug, error, info};
 use prost::Message;
@@ -29,7 +29,7 @@ pub struct VmServiceDispatcher {
 }
 
 impl VmServiceDispatcher {
-    pub async fn new(rx: mpsc::Receiver<Command>, db_url: &str) -> Result<Self> {
+    pub async fn new(rx: mpsc::Receiver<Command>, db_url: &str) -> Result<Self, VmServiceError> {
         let (event_bus_tx, event_bus_rx_for_dispatcher) = mpsc::channel(32);
         let (status_channel_tx, _) = broadcast::channel(32);
         let (healthcheck_cancel_bus, _) = broadcast::channel::<Uuid>(32);

@@ -6,14 +6,8 @@ edition.workspace = true
 [dependencies]
 feos-proto = { workspace = true }
 image-service = { path = "../image-service" }
-hyper = { version = "1.6.0" }
 cloud-hypervisor-client = { version = "0.3.3"}
-once_cell = "1.19"
 hyperlocal = "0.9.1"
-hyper-util = { version = "0.1.14" }
-thiserror = "1.0"
-urlencoding = "2.1.3"
-dotenvy = "0.15"
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "macros", "uuid"] }
 
 # Workspace dependencies
@@ -30,3 +24,6 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
 tower = { workspace = true }
+thiserror = { workspace = true }
+hyper = {workspace = true}
+hyper-util = { workspace = true }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2023 SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::error::VmServiceError;
 use feos_proto::vm_service::{
     AttachDiskRequest, AttachDiskResponse, CreateVmRequest, CreateVmResponse, DeleteVmRequest,
     DeleteVmResponse, GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest,
@@ -15,6 +16,7 @@ use tonic::{Status, Streaming};
 pub mod api;
 pub mod dispatcher;
 pub mod dispatcher_handlers;
+pub mod error;
 pub mod persistence;
 pub mod vmm;
 pub mod worker;
@@ -34,17 +36,20 @@ pub struct VmEventWrapper {
 pub enum Command {
     CreateVm(
         CreateVmRequest,
-        oneshot::Sender<Result<CreateVmResponse, Status>>,
+        oneshot::Sender<Result<CreateVmResponse, VmServiceError>>,
     ),
     StartVm(
         StartVmRequest,
-        oneshot::Sender<Result<StartVmResponse, Status>>,
+        oneshot::Sender<Result<StartVmResponse, VmServiceError>>,
     ),
-    GetVm(GetVmRequest, oneshot::Sender<Result<VmInfo, Status>>),
+    GetVm(
+        GetVmRequest,
+        oneshot::Sender<Result<VmInfo, VmServiceError>>,
+    ),
     StreamVmEvents(StreamVmEventsRequest, mpsc::Sender<Result<VmEvent, Status>>),
     DeleteVm(
         DeleteVmRequest,
-        oneshot::Sender<Result<DeleteVmResponse, Status>>,
+        oneshot::Sender<Result<DeleteVmResponse, VmServiceError>>,
     ),
     StreamVmConsole(
         Box<Streaming<StreamVmConsoleRequest>>,
@@ -52,31 +57,31 @@ pub enum Command {
     ),
     ListVms(
         ListVmsRequest,
-        oneshot::Sender<Result<ListVmsResponse, Status>>,
+        oneshot::Sender<Result<ListVmsResponse, VmServiceError>>,
     ),
     PingVm(
         PingVmRequest,
-        oneshot::Sender<Result<PingVmResponse, Status>>,
+        oneshot::Sender<Result<PingVmResponse, VmServiceError>>,
     ),
     ShutdownVm(
         ShutdownVmRequest,
-        oneshot::Sender<Result<ShutdownVmResponse, Status>>,
+        oneshot::Sender<Result<ShutdownVmResponse, VmServiceError>>,
     ),
     PauseVm(
         PauseVmRequest,
-        oneshot::Sender<Result<PauseVmResponse, Status>>,
+        oneshot::Sender<Result<PauseVmResponse, VmServiceError>>,
     ),
     ResumeVm(
         ResumeVmRequest,
-        oneshot::Sender<Result<ResumeVmResponse, Status>>,
+        oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     ),
     AttachDisk(
         AttachDiskRequest,
-        oneshot::Sender<Result<AttachDiskResponse, Status>>,
+        oneshot::Sender<Result<AttachDiskResponse, VmServiceError>>,
     ),
     RemoveDisk(
         RemoveDiskRequest,
-        oneshot::Sender<Result<RemoveDiskResponse, Status>>,
+        oneshot::Sender<Result<RemoveDiskResponse, VmServiceError>>,
     ),
 }
 
