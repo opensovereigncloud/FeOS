@@ -3,8 +3,11 @@
 
 use crate::{
     dispatcher_handlers::{
-        handle_create_vm_command, handle_delete_vm_command, handle_get_vm_command,
-        handle_list_vms_command, handle_stream_vm_events_command, perform_startup_sanity_check,
+        handle_attach_disk_command, handle_create_vm_command, handle_delete_vm_command,
+        handle_get_vm_command, handle_list_vms_command, handle_pause_vm_command,
+        handle_remove_disk_command, handle_resume_vm_command, handle_shutdown_vm_command,
+        handle_start_vm_command, handle_stream_vm_console_command, handle_stream_vm_events_command,
+        perform_startup_sanity_check,
     },
     error::VmServiceError,
     persistence::repository::VmRepository,
@@ -65,15 +68,13 @@ impl VmServiceDispatcher {
                     let hypervisor = self.hypervisor.clone();
                     let event_bus_tx = self.event_bus_tx.clone();
                     let status_channel_tx = self.status_channel_tx.clone();
-                    let healthcheck_cancel_bus_tx = self.healthcheck_cancel_bus.clone();
 
                     match cmd {
                         Command::CreateVm(req, responder) => {
                             handle_create_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
                         }
                         Command::StartVm(req, responder) => {
-                            let cancel_bus = healthcheck_cancel_bus_tx.subscribe();
-                            tokio::spawn(worker::handle_start_vm(req, responder, hypervisor, event_bus_tx, cancel_bus));
+                            handle_start_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, &self.healthcheck_cancel_bus).await;
                         }
                         Command::GetVm(req, responder) => {
                             handle_get_vm_command(&self.repository, req, responder).await;
@@ -85,7 +86,7 @@ impl VmServiceDispatcher {
                             handle_delete_vm_command(&self.repository, &self.healthcheck_cancel_bus, req, responder, hypervisor, event_bus_tx).await;
                         }
                         Command::StreamVmConsole(input_stream, output_tx) => {
-                            tokio::spawn(worker::handle_stream_vm_console(*input_stream, output_tx, hypervisor));
+                            handle_stream_vm_console_command(&self.repository, *input_stream, output_tx, hypervisor).await;
                         }
                         Command::ListVms(req, responder) => {
                             handle_list_vms_command(&self.repository, req, responder).await;
@@ -94,19 +95,19 @@ impl VmServiceDispatcher {
                             tokio::spawn(worker::handle_ping_vm(req, responder, hypervisor));
                         }
                         Command::ShutdownVm(req, responder) => {
-                            tokio::spawn(worker::handle_shutdown_vm(req, responder, hypervisor, event_bus_tx));
+                            handle_shutdown_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
                         }
                         Command::PauseVm(req, responder) => {
-                            tokio::spawn(worker::handle_pause_vm(req, responder, hypervisor, event_bus_tx));
+                            handle_pause_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
                         }
                         Command::ResumeVm(req, responder) => {
-                            tokio::spawn(worker::handle_resume_vm(req, responder, hypervisor, event_bus_tx));
+                            handle_resume_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
                         }
                         Command::AttachDisk(req, responder) => {
-                            tokio::spawn(worker::handle_attach_disk(req, responder, hypervisor));
+                            handle_attach_disk_command(&self.repository, req, responder, hypervisor).await;
                         }
                         Command::RemoveDisk(req, responder) => {
-                            tokio::spawn(worker::handle_remove_disk(req, responder, hypervisor));
+                            handle_remove_disk_command(&self.repository, req, responder, hypervisor).await;
                         }
                     }
                 },
