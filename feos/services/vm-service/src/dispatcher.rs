@@ -3,10 +3,11 @@
 
 use crate::{
     dispatcher_handlers::{
-        handle_attach_disk_command, handle_create_vm_command, handle_delete_vm_command,
-        handle_get_vm_command, handle_list_vms_command, handle_pause_vm_command,
-        handle_remove_disk_command, handle_resume_vm_command, handle_shutdown_vm_command,
-        handle_start_vm_command, handle_stream_vm_console_command, handle_stream_vm_events_command,
+        handle_attach_disk_command, handle_attach_nic_command, handle_create_vm_command,
+        handle_delete_vm_command, handle_get_vm_command, handle_list_vms_command,
+        handle_pause_vm_command, handle_remove_disk_command, handle_remove_nic_command,
+        handle_resume_vm_command, handle_shutdown_vm_command, handle_start_vm_command,
+        handle_stream_vm_console_command, handle_stream_vm_events_command,
         perform_startup_sanity_check,
     },
     error::VmServiceError,
@@ -108,6 +109,12 @@ impl VmServiceDispatcher {
                         }
                         Command::RemoveDisk(req, responder) => {
                             handle_remove_disk_command(&self.repository, req, responder, hypervisor).await;
+                        }
+                        Command::AttachNic(req, responder) => {
+                            handle_attach_nic_command(&self.repository, req, responder, hypervisor).await;
+                        }
+                        Command::RemoveNic(req, responder) => {
+                            handle_remove_nic_command(&self.repository, req, responder, hypervisor).await;
                         }
                     }
                 },

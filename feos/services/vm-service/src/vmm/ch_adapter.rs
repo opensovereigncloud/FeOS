@@ -11,9 +11,10 @@ use cloud_hypervisor_client::{
     },
 };
 use feos_proto::vm_service::{
-    net_config, AttachDiskRequest, AttachDiskResponse, CreateVmRequest, DeleteVmRequest,
-    DeleteVmResponse, GetVmRequest, PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse,
-    RemoveDiskRequest, RemoveDiskResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest,
+    net_config, AttachDiskRequest, AttachDiskResponse, AttachNicRequest, AttachNicResponse,
+    CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetVmRequest, PauseVmRequest,
+    PauseVmResponse, PingVmRequest, PingVmResponse, RemoveDiskRequest, RemoveDiskResponse,
+    RemoveNicRequest, RemoveNicResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest,
     ShutdownVmResponse, StartVmRequest, StartVmResponse, VmConfig, VmInfo, VmState,
 };
 use hyper_util::client::legacy::Client;
@@ -28,6 +29,67 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{self, timeout, Duration};
 use uuid::Uuid;
+
+#[derive(Debug)]
+pub enum ChNetworkDevice {
+    Net(Box<models::NetConfig>),
+    Device(models::DeviceConfig),
+}
+
+impl ChNetworkDevice {
+    pub fn id(&self) -> Option<String> {
+        match self {
+            ChNetworkDevice::Net(config) => config.id.clone(),
+            ChNetworkDevice::Device(config) => config.id.clone(),
+        }
+    }
+}
+
+fn convert_net_config_to_ch(
+    nic: &feos_proto::vm_service::NetConfig,
+) -> Result<ChNetworkDevice, VmmError> {
+    match &nic.backend {
+        Some(net_config::Backend::Tap(tap)) => {
+            let id = if !nic.device_id.is_empty() {
+                Some(nic.device_id.clone())
+            } else {
+                Some(tap.tap_name.clone())
+            };
+
+            let mac = if nic.mac_address.is_empty() {
+                None
+            } else {
+                Some(nic.mac_address.clone())
+            };
+
+            let ch_net_config = models::NetConfig {
+                tap: Some(tap.tap_name.clone()),
+                mac,
+                id,
+                ..Default::default()
+            };
+            Ok(ChNetworkDevice::Net(Box::new(ch_net_config)))
+        }
+        Some(net_config::Backend::VfioPci(vfio_pci)) => {
+            let device_path = format!("/sys/bus/pci/devices/{}", vfio_pci.bdf);
+            let id = if !nic.device_id.is_empty() {
+                Some(nic.device_id.clone())
+            } else {
+                Some(device_path.clone())
+            };
+
+            let ch_device_config = models::DeviceConfig {
+                path: device_path,
+                id,
+                ..Default::default()
+            };
+            Ok(ChNetworkDevice::Device(ch_device_config))
+        }
+        None => Err(VmmError::InvalidConfig(
+            "NetConfig backend (tap or vfio_pci) is required".to_string(),
+        )),
+    }
+}
 
 pub struct CloudHypervisorAdapter {
     ch_binary_path: PathBuf,
@@ -58,7 +120,6 @@ impl CloudHypervisorAdapter {
 
         Ok(DefaultApiClient::new(Arc::new(configuration)))
     }
-
     async fn perform_vm_creation(
         &self,
         vm_id: &str,
@@ -132,28 +193,12 @@ impl CloudHypervisorAdapter {
         let mut ch_device_configs: Vec<models::DeviceConfig> = Vec::new();
 
         for nc in config.net {
-            if let Some(backend) = nc.backend {
-                match backend {
-                    net_config::Backend::VfioPci(vfio_pci) => {
-                        let device_path = format!("/sys/bus/pci/devices/{}", vfio_pci.bdf);
-                        ch_device_configs.push(models::DeviceConfig {
-                            path: device_path,
-                            ..Default::default()
-                        });
-                    }
-                    net_config::Backend::Tap(tap) => {
-                        let mac = if nc.mac_address.is_empty() {
-                            None
-                        } else {
-                            Some(nc.mac_address)
-                        };
-
-                        ch_net_configs.push(models::NetConfig {
-                            tap: Some(tap.tap_name),
-                            mac,
-                            ..Default::default()
-                        });
-                    }
+            match convert_net_config_to_ch(&nc)? {
+                ChNetworkDevice::Net(net_config) => {
+                    ch_net_configs.push(*net_config);
+                }
+                ChNetworkDevice::Device(device_config) => {
+                    ch_device_configs.push(device_config);
                 }
             }
         }
@@ -457,5 +502,48 @@ impl Hypervisor for CloudHypervisorAdapter {
         Err(VmmError::Internal(
             "RemoveDisk not implemented for CloudHypervisorAdapter".to_string(),
         ))
+    }
+
+    async fn attach_nic(&self, req: AttachNicRequest) -> Result<AttachNicResponse, VmmError> {
+        let api_client = self.get_ch_api_client(&req.vm_id)?;
+        let nic = req
+            .nic
+            .ok_or_else(|| VmmError::InvalidConfig("NetConfig is required".to_string()))?;
+
+        let ch_device = convert_net_config_to_ch(&nic)?;
+        let device_id = ch_device.id();
+
+        match ch_device {
+            ChNetworkDevice::Net(ch_net_config) => {
+                api_client
+                    .vm_add_net_put(*ch_net_config)
+                    .await
+                    .map_err(|e| VmmError::ApiOperationFailed(format!("vm.add-net failed: {e}")))?;
+            }
+            ChNetworkDevice::Device(ch_device_config) => {
+                api_client
+                    .vm_add_device_put(ch_device_config)
+                    .await
+                    .map_err(|e| {
+                        VmmError::ApiOperationFailed(format!("vm.add-device failed: {e}"))
+                    })?;
+            }
+        }
+
+        Ok(AttachNicResponse {
+            device_id: device_id.unwrap_or_default(),
+        })
+    }
+
+    async fn remove_nic(&self, req: RemoveNicRequest) -> Result<RemoveNicResponse, VmmError> {
+        let api_client = self.get_ch_api_client(&req.vm_id)?;
+        let device_to_remove = models::VmRemoveDevice {
+            id: Some(req.device_id),
+        };
+        api_client
+            .vm_remove_device_put(device_to_remove)
+            .await
+            .map_err(|e| VmmError::ApiOperationFailed(format!("vm.remove-device failed: {e}")))?;
+        Ok(RemoveNicResponse {})
     }
 }
