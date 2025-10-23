@@ -16,8 +16,8 @@ pub mod error;
 pub mod filestore;
 pub mod worker;
 
-pub const IMAGE_DIR: &str = "/tmp/feos/images";
-pub const IMAGE_SERVICE_SOCKET: &str = "/tmp/feos/image_service.sock";
+pub const IMAGE_DIR: &str = "/var/lib/feos/images";
+pub const IMAGE_SERVICE_SOCKET: &str = "/var/lib/feos/image_service.sock";
 
 #[derive(Debug, Clone)]
 pub struct ImageStateEvent {
@@ -47,6 +47,18 @@ pub enum Command {
 }
 
 #[derive(Debug)]
+pub struct PulledLayer {
+    pub media_type: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct PulledImageData {
+    pub config: Vec<u8>,
+    pub layers: Vec<PulledLayer>,
+}
+
+#[derive(Debug)]
 pub enum OrchestratorCommand {
     PullImage {
         image_ref: String,
@@ -55,7 +67,7 @@ pub enum OrchestratorCommand {
     FinalizePull {
         image_uuid: String,
         image_ref: String,
-        image_data: Vec<u8>,
+        image_data: PulledImageData,
     },
     FailPull {
         image_uuid: String,
@@ -79,7 +91,7 @@ pub enum FileCommand {
     StoreImage {
         image_uuid: String,
         image_ref: String,
-        image_data: Vec<u8>,
+        image_data: PulledImageData,
         responder: oneshot::Sender<Result<(), std::io::Error>>,
     },
     DeleteImage {

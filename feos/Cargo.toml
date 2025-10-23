@@ -3,6 +3,9 @@ name = "feos"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "feos"
 path = "src/main.rs"
@@ -16,6 +19,8 @@ feos-utils = { path = "utils" }
 vm-service = { path = "services/vm-service" }
 host-service = { path = "services/host-service" }
 image-service = { path = "services/image-service" }
+task-service = { path = "services/task-service" }
+container-service = { path = "services/container-service" }
 feos-proto = { workspace = true }
 
 # Workspace dependencies

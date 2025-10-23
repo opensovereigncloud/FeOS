@@ -10,3 +10,9 @@ pub mod host_service {
 pub mod image_service {
     tonic::include_proto!("feos.image.vmm.api.v1");
 }
+pub mod task_service {
+    tonic::include_proto!("feos.task.v1");
+}
+pub mod container_service {
+    tonic::include_proto!("feos.container.v1");
+}
