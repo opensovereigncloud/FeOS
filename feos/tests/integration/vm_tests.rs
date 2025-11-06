@@ -6,9 +6,9 @@ use super::{ensure_server, get_public_clients, skip_if_ch_binary_missing, TEST_I
 use anyhow::{Context, Result};
 use feos_proto::vm_service::{
     net_config, stream_vm_console_request as console_input, AttachConsoleMessage, AttachNicRequest,
-    CpuConfig, CreateVmRequest, DeleteVmRequest, GetVmRequest, MemoryConfig, NetConfig,
-    PauseVmRequest, PingVmRequest, RemoveNicRequest, ResumeVmRequest, ShutdownVmRequest,
-    StartVmRequest, StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig, VmConfig, VmState,
+    CpuConfig, CreateVmRequest, DeleteVmRequest, DetachNicRequest, GetVmRequest, MemoryConfig,
+    NetConfig, PauseVmRequest, PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest,
+    StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig, VmConfig, VmState,
 };
 use log::info;
 use nix::sys::signal::{kill, Signal};
@@ -258,13 +258,13 @@ async fn test_create_and_start_vm() -> Result<()> {
     assert!(nic_found, "Attached NIC 'test' was not found in VM config");
     info!("Successfully verified NIC attachment.");
 
-    info!("Removing NIC 'test' from vm_id: {}", &vm_id);
-    let remove_nic_req = RemoveNicRequest {
+    info!("Detaching NIC 'test' from vm_id: {}", &vm_id);
+    let detach_nic_req = DetachNicRequest {
         vm_id: vm_id.clone(),
         device_id: "test".to_string(),
     };
-    vm_client.remove_nic(remove_nic_req).await?;
-    info!("RemoveNic call successful");
+    vm_client.detach_nic(detach_nic_req).await?;
+    info!("DetachNic call successful");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 

@@ -4,9 +4,9 @@
 use crate::error::VmServiceError;
 use feos_proto::vm_service::{
     AttachDiskRequest, AttachDiskResponse, AttachNicRequest, AttachNicResponse, CreateVmRequest,
-    CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest, ListVmsRequest,
-    ListVmsResponse, PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse,
-    RemoveDiskRequest, RemoveDiskResponse, RemoveNicRequest, RemoveNicResponse, ResumeVmRequest,
+    CreateVmResponse, DeleteVmRequest, DeleteVmResponse, DetachDiskRequest, DetachDiskResponse,
+    DetachNicRequest, DetachNicResponse, GetVmRequest, ListVmsRequest, ListVmsResponse,
+    PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
     ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
     StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest, VmEvent, VmInfo,
 };
@@ -80,17 +80,17 @@ pub enum Command {
         AttachDiskRequest,
         oneshot::Sender<Result<AttachDiskResponse, VmServiceError>>,
     ),
-    RemoveDisk(
-        RemoveDiskRequest,
-        oneshot::Sender<Result<RemoveDiskResponse, VmServiceError>>,
+    DetachDisk(
+        DetachDiskRequest,
+        oneshot::Sender<Result<DetachDiskResponse, VmServiceError>>,
     ),
     AttachNic(
         AttachNicRequest,
         oneshot::Sender<Result<AttachNicResponse, VmServiceError>>,
     ),
-    RemoveNic(
-        RemoveNicRequest,
-        oneshot::Sender<Result<RemoveNicResponse, VmServiceError>>,
+    DetachNic(
+        DetachNicRequest,
+        oneshot::Sender<Result<DetachNicResponse, VmServiceError>>,
     ),
 }
 
@@ -111,9 +111,9 @@ impl std::fmt::Debug for Command {
             Command::PauseVm(req, _) => f.debug_tuple("PauseVm").field(req).finish(),
             Command::ResumeVm(req, _) => f.debug_tuple("ResumeVm").field(req).finish(),
             Command::AttachDisk(req, _) => f.debug_tuple("AttachDisk").field(req).finish(),
-            Command::RemoveDisk(req, _) => f.debug_tuple("RemoveDisk").field(req).finish(),
+            Command::DetachDisk(req, _) => f.debug_tuple("DetachDisk").field(req).finish(),
             Command::AttachNic(req, _) => f.debug_tuple("AttachNic").field(req).finish(),
-            Command::RemoveNic(req, _) => f.debug_tuple("RemoveNic").field(req).finish(),
+            Command::DetachNic(req, _) => f.debug_tuple("DetachNic").field(req).finish(),
         }
     }
 }

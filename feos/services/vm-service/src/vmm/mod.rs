@@ -4,9 +4,9 @@
 use crate::VmEventWrapper;
 use feos_proto::vm_service::{
     AttachDiskRequest, AttachDiskResponse, AttachNicRequest, AttachNicResponse, CreateVmRequest,
-    DeleteVmRequest, DeleteVmResponse, GetVmRequest, PauseVmRequest, PauseVmResponse,
-    PingVmRequest, PingVmResponse, RemoveDiskRequest, RemoveDiskResponse, RemoveNicRequest,
-    RemoveNicResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
+    DeleteVmRequest, DeleteVmResponse, DetachDiskRequest, DetachDiskResponse, DetachNicRequest,
+    DetachNicResponse, GetVmRequest, PauseVmRequest, PauseVmResponse, PingVmRequest,
+    PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
     StartVmRequest, StartVmResponse, VmEvent, VmInfo, VmStateChangedEvent,
 };
 use prost::Message;
@@ -90,9 +90,9 @@ pub trait Hypervisor: Send + Sync {
     async fn pause_vm(&self, req: PauseVmRequest) -> Result<PauseVmResponse, VmmError>;
     async fn resume_vm(&self, req: ResumeVmRequest) -> Result<ResumeVmResponse, VmmError>;
     async fn attach_disk(&self, req: AttachDiskRequest) -> Result<AttachDiskResponse, VmmError>;
-    async fn remove_disk(&self, req: RemoveDiskRequest) -> Result<RemoveDiskResponse, VmmError>;
+    async fn detach_disk(&self, req: DetachDiskRequest) -> Result<DetachDiskResponse, VmmError>;
     async fn attach_nic(&self, req: AttachNicRequest) -> Result<AttachNicResponse, VmmError>;
-    async fn remove_nic(&self, req: RemoveNicRequest) -> Result<RemoveNicResponse, VmmError>;
+    async fn detach_nic(&self, req: DetachNicRequest) -> Result<DetachNicResponse, VmmError>;
 }
 
 pub async fn broadcast_state_change_event(
