@@ -8,6 +8,7 @@ members = [
     "crates/services/host-service",
     "crates/services/image-service",
     "crates/services/task-service",
+    "crates/services/tool-service",
     "crates/services/vm-service",
 ]
 resolver = "3"
@@ -74,4 +75,5 @@ container-service = { path = "crates/services/container-service" }
 host-service = { path = "crates/services/host-service" }
 image-service = { path = "crates/services/image-service" }
 task-service = { path = "crates/services/task-service" }
+tool-service = { path = "crates/services/tool-service" }
 vm-service = { path = "crates/services/vm-service" }

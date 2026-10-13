@@ -69,18 +69,26 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     let image_service = initialize_image_service().await?;
     task_supervisor::start().await;
 
+    #[cfg(feature = "guest")]
+    let guest_services = guest::GuestServices::new();
+
     let api_uds_stream = bind_unix_socket(API_SOCKET).await?;
-    let api_unix_socket_server = Server::builder()
+    let api_router = Server::builder()
         .add_service(container_service.clone())
         .add_service(host_service.clone())
-        .add_service(image_service.clone())
-        .serve_with_incoming(api_uds_stream);
+        .add_service(image_service.clone());
+    #[cfg(feature = "guest")]
+    let api_router = guest_services.add_to(api_router);
+    let api_unix_socket_server = api_router.serve_with_incoming(api_uds_stream);
 
     #[cfg(feature = "guest")]
-    let vsock_server = Server::builder()
-        .add_service(container_service.clone())
-        .add_service(host_service.clone())
-        .add_service(image_service.clone())
+    let vsock_server = guest_services
+        .add_to(
+            Server::builder()
+                .add_service(container_service.clone())
+                .add_service(host_service.clone())
+                .add_service(image_service.clone()),
+        )
         .serve_with_incoming(guest::vsock_incoming()?);
     #[cfg(not(feature = "guest"))]
     let vsock_server = std::future::pending::<Result<(), tonic::transport::Error>>();

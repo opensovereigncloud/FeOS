@@ -112,7 +112,7 @@ boot first
 log "creating container main from ${IMAGE}"
 ctl container create --image-ref "${IMAGE}" --id main --cmd "sleep 3600"
 ctl container start main
-ctl container info main | grep -q "State: Running" || fail "container not running"
+grep -q "State: Running" <<<"$(ctl container info main)" || fail "container not running"
 
 out="$(cexec echo hello)"
 [ "${out}" = "hello" ] || fail "exec echo: ${out}"
@@ -126,6 +126,17 @@ set -e
 cexec sh -c 'echo kept > /persist'
 log "exec, resolvers, toolbox and exit codes work"
 
+tool() { ctl tool --container main "$@"; }
+printf 'alpha\nbeta\n' | tool write /work/notes.txt
+[ "$(tool read /work/notes.txt)" = "$(printf 'alpha\nbeta')" ] || fail "tool write/read"
+tool edit /work/notes.txt --old beta --new gamma >/dev/null
+grep -q "notes.txt:2:gamma" <<<"$(tool rg gamma /work)" || fail "tool edit/rg"
+grep -q "notes.txt" <<<"$(tool fd notes /work)" || fail "tool fd"
+grep -q "nameserver ${DNS}" <<<"$(tool read /etc/resolv.conf)" || fail "tool read of the managed resolv.conf"
+tool write /etc/resolv.conf </dev/null 2>/dev/null && fail "tool wrote the managed resolv.conf"
+[ "$(cexec cat /work/notes.txt)" = "$(printf 'alpha\ngamma')" ] || fail "tool changes not visible in the container"
+log "tools read, write, edit, rg and fd in the container"
+
 # A host freezes the data volume before it stops a guest it wants to adopt
 # later; freezing writes back what is in the guest's page cache.
 ctl host freeze >/dev/null
@@ -137,5 +148,5 @@ ctl container start main
 log "adopted the container after a reboot; its writable layer survived"
 
 ctl container delete main
-ctl container list | grep -q main && fail "container still listed after delete"
+grep -q main <<<"$(ctl container list)" && fail "container still listed after delete"
 log "PASS"

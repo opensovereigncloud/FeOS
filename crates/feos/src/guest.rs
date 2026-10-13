@@ -10,6 +10,7 @@
 
 use feos_proto::lifecycle_service::lifecycle_service_client::LifecycleServiceClient;
 use feos_proto::lifecycle_service::{hello, Hello};
+use feos_proto::tool_service::tool_service_server::ToolServiceServer;
 use feos_utils::filesystem::{mount_data_volume, DATA_ROOT};
 use feos_utils::vsock::{API_PORT, UPLINK_PORT};
 use hyper_util::rt::TokioIo;
@@ -19,7 +20,9 @@ use std::time::Duration;
 use tokio_vsock::{
     Incoming, VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY, VMADDR_CID_HOST,
 };
+use tonic::transport::server::Router;
 use tonic::transport::{Endpoint, Uri};
+use tool_service::ToolApiHandler;
 use tower::service_fn;
 
 /// Backoff for failed connects to the host, which only happen while no
@@ -35,6 +38,26 @@ const BACKOFF_MAX: Duration = Duration::from_secs(1);
 /// generous interval.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The services only the guest serves: what an agent in a container uses.
+/// One instance serves every listener, so that state they keep (watches,
+/// listeners) is the guest's, whichever transport a call came in on.
+#[derive(Clone)]
+pub(crate) struct GuestServices {
+    tool: ToolServiceServer<ToolApiHandler>,
+}
+
+impl GuestServices {
+    pub(crate) fn new() -> Self {
+        Self {
+            tool: ToolServiceServer::new(ToolApiHandler),
+        }
+    }
+
+    pub(crate) fn add_to(&self, router: Router) -> Router {
+        router.add_service(self.tool.clone())
+    }
+}
 
 /// First-boot setup of the guest: the data volume and memory overcommit.
 pub(crate) fn initialize_guest() {

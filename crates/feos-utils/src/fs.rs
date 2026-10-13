@@ -33,14 +33,59 @@ pub fn openat2_confined(
         .flags(flags | OFlag::O_CLOEXEC)
         .mode(mode)
         .resolve(resolve);
-    // The kernel fails RESOLVE_BENEATH and RESOLVE_IN_ROOT walks over ".."
-    // with a spurious EAGAIN when a rename or mount races anywhere on the
-    // system; retry a bounded number of times, then let it through.
+    Ok(retry_eagain(|| {
+        nix::fcntl::openat2(dir.as_fd(), path, how)
+    })?)
+}
+
+/// The kernel fails RESOLVE_BENEATH and RESOLVE_IN_ROOT walks over ".." with
+/// a spurious EAGAIN when a rename or mount races anywhere on the system;
+/// retry a bounded number of times, then let it through.
+fn retry_eagain<T>(mut op: impl FnMut() -> nix::Result<T>) -> nix::Result<T> {
     let mut left = OPENAT2_RETRIES;
     loop {
-        match nix::fcntl::openat2(dir.as_fd(), path, how) {
+        match op() {
             Err(Errno::EAGAIN) if left > 1 => left -= 1,
-            result => return Ok(result?),
+            result => return result,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eagain_is_retried_but_bounded() {
+        let mut n = 0;
+        assert_eq!(
+            retry_eagain(|| {
+                n += 1;
+                if n < 3 {
+                    Err(Errno::EAGAIN)
+                } else {
+                    Ok(n)
+                }
+            }),
+            Ok(3)
+        );
+        n = 0;
+        assert_eq!(
+            retry_eagain(|| -> nix::Result<()> {
+                n += 1;
+                Err(Errno::EAGAIN)
+            }),
+            Err(Errno::EAGAIN)
+        );
+        assert_eq!(n, OPENAT2_RETRIES);
+        n = 0;
+        assert_eq!(
+            retry_eagain(|| -> nix::Result<()> {
+                n += 1;
+                Err(Errno::EXDEV)
+            }),
+            Err(Errno::EXDEV)
+        );
+        assert_eq!(n, 1); // other errors are not retried
     }
 }

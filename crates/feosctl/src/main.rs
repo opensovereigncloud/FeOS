@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 mod container_commands;
 mod host_commands;
 mod image_commands;
+mod tool_commands;
 mod transport;
 mod vm_commands;
 
@@ -23,6 +24,8 @@ enum Service {
     Host(host_commands::HostArgs),
     Image(image_commands::ImageArgs),
     Container(container_commands::ContainerArgs),
+    /// Agent tools on a container's files, in a guest
+    Tool(tool_commands::ToolArgs),
 }
 
 #[tokio::main]
@@ -39,6 +42,7 @@ async fn main() -> Result<()> {
         Service::Host(args) => host_commands::handle_host_command(args).await?,
         Service::Image(args) => image_commands::handle_image_command(args).await?,
         Service::Container(args) => container_commands::handle_container_command(args).await?,
+        Service::Tool(args) => tool_commands::handle_tool_command(args).await?,
     }
 
     Ok(())
