@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 mod container_commands;
 mod host_commands;
 mod image_commands;
+mod transport;
 mod vm_commands;
 
 #[derive(Parser, Debug)]

@@ -1,29 +1,26 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 use feos_proto::image_service::{
     image_service_client::ImageServiceClient, DeleteImageRequest, ImageState, ListImagesRequest,
     PullImageRequest, WatchImageStatusRequest,
 };
-use hyper_util::rt::TokioIo;
-use std::path::PathBuf;
-use tokio::net::UnixStream;
 use tokio_stream::StreamExt;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
+use tonic::transport::Channel;
 
 #[derive(Args, Debug)]
 pub struct ImageArgs {
+    /// The image service is not on the TCP API, hence the local socket.
     #[arg(
         short,
         long,
         global = true,
-        env = "FEOS_IMAGE_SOCKET",
-        default_value = "/tmp/feos/image_service.sock"
+        env = "FEOS_IMAGE_ADDRESS",
+        default_value = "unix:/run/feos/api.sock"
     )]
-    pub socket: PathBuf,
+    pub address: String,
 
     #[command(subcommand)]
     command: ImageCommand,
@@ -53,20 +50,8 @@ pub enum ImageCommand {
     },
 }
 
-async fn get_image_client(socket: PathBuf) -> Result<ImageServiceClient<Channel>> {
-    let channel = Endpoint::try_from("http://[::1]:50051")?
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let socket = socket.clone();
-            async move { UnixStream::connect(socket).await.map(TokioIo::new) }
-        }))
-        .await
-        .context("Failed to connect to ImageService via Unix socket")?;
-
-    Ok(ImageServiceClient::new(channel))
-}
-
 pub async fn handle_image_command(args: ImageArgs) -> Result<()> {
-    let mut client = get_image_client(args.socket).await?;
+    let mut client = ImageServiceClient::new(crate::transport::channel(&args.address).await?);
 
     match args.command {
         ImageCommand::Pull { image_ref } => pull_image(&mut client, image_ref).await?,

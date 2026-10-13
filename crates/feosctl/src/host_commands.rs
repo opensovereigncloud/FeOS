@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 mod kernel_stats;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 use feos_proto::host_service::{
-    host_service_client::HostServiceClient, GetCpuInfoRequest, GetNetworkInfoRequest,
-    GetVersionInfoRequest, HostnameRequest, MemoryRequest, RebootRequest, ShutdownRequest,
-    StreamFeosLogsRequest, StreamKernelLogsRequest, UpgradeFeosBinaryRequest,
+    host_service_client::HostServiceClient, FreezeFilesystemRequest, GetCpuInfoRequest,
+    GetMemoryBreakdownRequest, GetNetworkConfigRequest, GetNetworkInfoRequest, GetTimeRequest,
+    GetVersionInfoRequest, HostnameRequest, MemoryBreakdown, MemoryRequest, PingRequest,
+    PreparePauseRequest, RebootRequest, SetNetworkConfigRequest, SetTimeRequest, ShutdownRequest,
+    StreamFeosLogsRequest, StreamKernelLogsRequest, ThawFilesystemRequest,
+    UpgradeFeosBinaryRequest,
 };
+use prost_types::Timestamp;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
@@ -62,12 +67,62 @@ pub enum HostCommand {
     Reboot,
     /// Get kernel and FeOS version information
     VersionInfo,
+    /// Check that FeOS answers; prints the ping count, uptime and boot id
+    Ping,
+    /// Set the host's clock; defaults to the local time of this machine
+    SetTime {
+        #[arg(help = "Seconds since the Unix epoch")]
+        unix_seconds: Option<i64>,
+    },
+    /// Read the host's clock
+    GetTime,
+    /// Push a static IPv4 network configuration
+    SetNetwork {
+        #[arg(long, default_value = "eth0")]
+        interface: String,
+        #[arg(
+            long,
+            required = true,
+            help = "Address with prefix, e.g. 192.168.100.10/24"
+        )]
+        ipv4: String,
+        #[arg(long, required = true)]
+        gateway: String,
+        #[arg(long = "dns", help = "Resolver; repeat for more than one")]
+        dns: Vec<String>,
+        #[arg(long, default_value = "")]
+        hostname: String,
+    },
+    /// Show the last pushed network configuration
+    GetNetwork,
+    /// Freeze a filesystem (default: the data root)
+    Freeze {
+        #[arg(default_value = "")]
+        mountpoint: String,
+    },
+    /// Thaw a frozen filesystem (default: the data root)
+    Thaw {
+        #[arg(default_value = "")]
+        mountpoint: String,
+    },
+    /// Show who holds the memory a snapshot would write
+    MemoryBreakdown {
+        #[arg(long, help = "Include the resident memory of every process")]
+        processes: bool,
+    },
+    /// Empty memory before a pause: sync and drop caches, optionally more
+    PreparePause {
+        #[arg(long)]
+        compact: bool,
+        #[arg(long)]
+        zero_free_pages: bool,
+        #[arg(long, default_value_t = 0)]
+        settle_seconds: u32,
+    },
 }
 
 pub async fn handle_host_command(args: HostArgs) -> Result<()> {
-    let mut client = HostServiceClient::connect(args.address)
-        .await
-        .context("Failed to connect to host service")?;
+    let mut client = HostServiceClient::new(crate::transport::channel(&args.address).await?);
 
     match args.command {
         HostCommand::Hostname => get_hostname(&mut client).await?,
@@ -83,6 +138,68 @@ pub async fn handle_host_command(args: HostArgs) -> Result<()> {
         HostCommand::Shutdown => shutdown_host(&mut client).await?,
         HostCommand::Reboot => reboot_host(&mut client).await?,
         HostCommand::VersionInfo => get_version_info(&mut client).await?,
+        HostCommand::Ping => ping(&mut client).await?,
+        HostCommand::SetTime { unix_seconds } => set_time(&mut client, unix_seconds).await?,
+        HostCommand::GetTime => get_time(&mut client).await?,
+        HostCommand::SetNetwork {
+            interface,
+            ipv4,
+            gateway,
+            dns,
+            hostname,
+        } => {
+            let request = SetNetworkConfigRequest {
+                interface,
+                ipv4_cidr: ipv4,
+                gateway,
+                dns,
+                hostname,
+            };
+            set_network(&mut client, request).await?
+        }
+        HostCommand::GetNetwork => get_network(&mut client).await?,
+        HostCommand::Freeze { mountpoint } => {
+            let request = FreezeFilesystemRequest { mountpoint };
+            let device = client.freeze_filesystem(request).await?.into_inner().device;
+            println!("Frozen ({device})");
+        }
+        HostCommand::Thaw { mountpoint } => {
+            let request = ThawFilesystemRequest { mountpoint };
+            let device = client.thaw_filesystem(request).await?.into_inner().device;
+            println!("Thawed ({device})");
+        }
+        HostCommand::MemoryBreakdown { processes } => {
+            let request = GetMemoryBreakdownRequest {
+                with_processes: processes,
+                ..Default::default()
+            };
+            let breakdown = client.get_memory_breakdown(request).await?.into_inner();
+            print_memory_breakdown(&breakdown);
+        }
+        HostCommand::PreparePause {
+            compact,
+            zero_free_pages,
+            settle_seconds,
+        } => {
+            let request = PreparePauseRequest {
+                compact,
+                zero_free_pages,
+                settle_seconds,
+                ..Default::default()
+            };
+            let response = client.prepare_pause(request).await?.into_inner();
+            for step in &response.steps {
+                println!("{step}");
+            }
+            if let (Some(before), Some(after)) = (response.before, response.after) {
+                println!(
+                    "MemFree: {} -> {} MiB in {} ms",
+                    before.mem_free_kb / 1024,
+                    after.mem_free_kb / 1024,
+                    response.duration_ms
+                );
+            }
+        }
     }
 
     Ok(())
@@ -326,4 +443,102 @@ async fn reboot_host(client: &mut HostServiceClient<Channel>) -> Result<()> {
     client.reboot(request).await?;
     println!("Reboot command sent successfully. Connection will be lost.");
     Ok(())
+}
+
+async fn ping(client: &mut HostServiceClient<Channel>) -> Result<()> {
+    let response = client.ping(PingRequest {}).await?.into_inner();
+    println!(
+        "pong: tick={} uptime={}s boot_id={}",
+        response.tick, response.uptime_seconds, response.boot_id
+    );
+    Ok(())
+}
+
+async fn set_time(
+    client: &mut HostServiceClient<Channel>,
+    unix_seconds: Option<i64>,
+) -> Result<()> {
+    let time = match unix_seconds {
+        Some(seconds) => Timestamp { seconds, nanos: 0 },
+        None => {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            Timestamp {
+                seconds: now.as_secs() as i64,
+                nanos: now.subsec_nanos() as i32,
+            }
+        }
+    };
+    let seconds = time.seconds;
+    client.set_time(SetTimeRequest { time: Some(time) }).await?;
+    println!("Clock set to {seconds}");
+    Ok(())
+}
+
+async fn get_time(client: &mut HostServiceClient<Channel>) -> Result<()> {
+    let response = client.get_time(GetTimeRequest {}).await?.into_inner();
+    let time = response.time.unwrap_or_default();
+    match chrono::DateTime::from_timestamp(time.seconds, time.nanos as u32) {
+        Some(datetime) => println!("{}", datetime.to_rfc3339()),
+        None => println!("{}.{:09}", time.seconds, time.nanos),
+    }
+    Ok(())
+}
+
+async fn set_network(
+    client: &mut HostServiceClient<Channel>,
+    request: SetNetworkConfigRequest,
+) -> Result<()> {
+    let response = client.set_network_config(request).await?.into_inner();
+    println!("Network configured.");
+    for failure in response.resolver_failed {
+        println!(
+            "Container {}: resolvers not linked: {}",
+            failure.container_id, failure.reason
+        );
+    }
+    Ok(())
+}
+
+async fn get_network(client: &mut HostServiceClient<Channel>) -> Result<()> {
+    let response = client
+        .get_network_config(GetNetworkConfigRequest {})
+        .await?
+        .into_inner();
+    if !response.configured {
+        println!("No network configuration pushed since boot.");
+        return Ok(());
+    }
+    println!("Interface: {}", response.interface);
+    println!("Address:   {}", response.ipv4_cidr);
+    println!("Gateway:   {}", response.gateway);
+    println!("DNS:       {}", response.dns.join(", "));
+    println!("Hostname:  {}", response.hostname);
+    Ok(())
+}
+
+fn print_memory_breakdown(m: &MemoryBreakdown) {
+    let mib = |kb: u64| kb as f64 / 1024.0;
+    println!(
+        "System RAM {:.0} MiB = MemTotal {:.0} MiB + kernel image {:.1} MiB + memmap/reserved {:.1} MiB",
+        mib(m.system_ram_kb),
+        mib(m.mem_total_kb),
+        mib(m.kernel_image_kb),
+        mib(m.memmap_reserved_kb)
+    );
+    println!(
+        "Free {:.0} MiB, available {:.0} MiB, cached {:.1} MiB, anon {:.1} MiB, unreclaimable {:.1} MiB",
+        mib(m.mem_free_kb),
+        mib(m.mem_available_kb),
+        mib(m.cached_kb),
+        mib(m.anon_pages_kb),
+        mib(m.unreclaimable_kb)
+    );
+    for process in &m.processes {
+        println!(
+            "{:>7} {:<20} {:>8.1} MiB",
+            process.pid,
+            process.name,
+            mib(process.rss_kb)
+        );
+    }
 }

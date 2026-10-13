@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, ContainerConfig, ContainerState,
@@ -85,9 +85,7 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 }
 
 pub async fn handle_container_command(args: ContainerArgs) -> Result<()> {
-    let mut client = ContainerServiceClient::connect(args.address)
-        .await
-        .context("Failed to connect to container service")?;
+    let mut client = ContainerServiceClient::new(crate::transport::channel(&args.address).await?);
 
     match args.command {
         ContainerCommand::Create {

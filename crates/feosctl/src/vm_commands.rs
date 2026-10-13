@@ -206,9 +206,7 @@ struct CreateVmOptions {
 }
 
 pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
-    let mut client = VmServiceClient::connect(args.address)
-        .await
-        .context("Failed to connect to VM service")?;
+    let mut client = VmServiceClient::new(crate::transport::channel(&args.address).await?);
 
     match args.command {
         VmCommand::Create {
