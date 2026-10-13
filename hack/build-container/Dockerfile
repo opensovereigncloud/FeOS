@@ -13,9 +13,11 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     binutils
 
 RUN cargo new xyz; cd xyz; cargo fetch; cd ..; rm -rf xyz
-RUN rustup component add clippy
-RUN rustup component add rustfmt
-RUN rustup target add x86_64-unknown-linux-musl
+# The toolchain rust-toolchain.toml pins. It has to be in the image: the
+# container runs as the calling user, who cannot write to RUSTUP_HOME.
+ARG RUST_TOOLCHAIN
+RUN test -n "$RUST_TOOLCHAIN" && rustup toolchain install "$RUST_TOOLCHAIN" \
+    --profile minimal --component clippy,rustfmt --target x86_64-unknown-linux-musl
 RUN mkdir /feos
 RUN mkdir /target
 WORKDIR /feos
