@@ -4,8 +4,16 @@
 use crate::error::HostError;
 use feos_proto::host_service::{RebootRequest, RebootResponse, ShutdownRequest, ShutdownResponse};
 use log::{error, info};
-use nix::sys::reboot::{reboot, RebootMode};
 use tokio::sync::oneshot;
+
+/// Firecracker cannot power a VM off: the guest would halt and its VMM run
+/// on. A guest that reboots ends its VMM instead.
+#[cfg(feature = "guest")]
+const SHUTDOWN: fn() -> Result<std::convert::Infallible, nix::Error> =
+    feos_utils::host::power::reboot;
+#[cfg(not(feature = "guest"))]
+const SHUTDOWN: fn() -> Result<std::convert::Infallible, nix::Error> =
+    feos_utils::host::power::shutdown;
 
 pub async fn handle_shutdown(
     _req: ShutdownRequest,
@@ -22,7 +30,7 @@ pub async fn handle_shutdown(
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     info!("HostWorker: Executing system shutdown.");
-    match reboot(RebootMode::RB_POWER_OFF) {
+    match SHUTDOWN() {
         Ok(infallible) => match infallible {},
         Err(e) => {
             error!("HostWorker: CRITICAL - Failed to execute system shutdown: {e}");
@@ -43,7 +51,7 @@ pub async fn handle_reboot(
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     info!("HostWorker: Executing system reboot.");
-    match reboot(RebootMode::RB_AUTOBOOT) {
+    match feos_utils::host::power::reboot() {
         Ok(infallible) => match infallible {},
         Err(e) => {
             error!("HostWorker: CRITICAL - Failed to execute system reboot: {e}");

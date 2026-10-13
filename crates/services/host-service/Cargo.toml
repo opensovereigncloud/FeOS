@@ -30,3 +30,6 @@ reqwest = { workspace = true }
 [features]
 # Clock sync over NTP, for hosts that have to find out the time themselves.
 ntp = ["dep:sntpc"]
+# A Firecracker guest, which cannot be powered off: shutting down reboots,
+# which ends the VM.
+guest = []

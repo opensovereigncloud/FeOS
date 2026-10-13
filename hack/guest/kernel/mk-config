@@ -1,7 +1,7 @@
 #!/bin/bash
 # Generate the guest kernel config: Firecracker's minimal microVM guest
 # config as the base, plus FeOS's changes (balloon, vsock, IPv4 only,
-# containers, no modules).
+# containers, Ctrl-Alt-Del, no modules).
 #
 # Usage: hack/guest/kernel/mk-config <path-to-kernel-tree>
 # Writes config/feos-guest-linux-<VERSION>.config next to this script.
@@ -49,6 +49,11 @@ apply --enable  CGROUPS --enable MEMCG --enable CGROUP_SCHED --enable CPUSETS \
       --enable  CGROUP_PIDS --enable CGROUP_DEVICE
 apply --enable  OVERLAY_FS
 apply --enable  SECCOMP --enable SECCOMP_FILTER
+
+# Ctrl-Alt-Del from Firecracker (SendCtrlAltDel), how the host shuts the
+# guest down: its i8042 keyboard controller and an AT keyboard
+apply --enable  INPUT_KEYBOARD --enable SERIO --enable SERIO_I8042 \
+      --enable  KEYBOARD_ATKBD
 
 # no modules: everything built-in
 apply --disable MODULES
