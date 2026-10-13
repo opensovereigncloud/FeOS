@@ -4,9 +4,9 @@
 use super::dhcpv6::*;
 use futures::stream::TryStreamExt;
 use log::{error, info, warn};
-use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
-use netlink_packet_route::route::RouteType;
 use rtnetlink::new_connection;
+use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
+use rtnetlink::packet_route::route::RouteType;
 use std::fs::File;
 use std::io;
 use std::io::Write;

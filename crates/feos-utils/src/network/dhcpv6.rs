@@ -4,10 +4,6 @@
 use dhcproto::v6::*;
 use futures::stream::TryStreamExt;
 use log::{error, info, warn};
-use netlink_packet_route::route::{
-    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
-};
-use netlink_packet_route::AddressFamily;
 use nix::net::if_::if_nametoindex;
 use pnet::packet::icmpv6::Icmpv6Code;
 use pnet::{
@@ -21,6 +17,10 @@ use pnet::{
     },
     util::MacAddr,
 };
+use rtnetlink::packet_route::route::{
+    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
+};
+use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::{new_connection, Error, Handle};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;

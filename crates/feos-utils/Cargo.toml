@@ -18,7 +18,6 @@ tower = { workspace = true }
 termcolor = { workspace = true }
 dhcproto = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-netlink-packet-route = { workspace = true, optional = true }
 pnet = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 rtnetlink = { workspace = true, optional = true }
@@ -35,7 +34,6 @@ git-version = []
 host = [
     "dep:dhcproto",
     "dep:futures",
-    "dep:netlink-packet-route",
     "dep:pnet",
     "dep:rand",
     "dep:rtnetlink",
