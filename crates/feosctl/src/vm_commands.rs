@@ -407,9 +407,7 @@ async fn wait_for_vm_state(
         match event {
             Ok(event) => {
                 if let Some(data) = event.data
-                    && data
-                        .type_url
-                        .contains("feos.vm.vmm.api.v1.VmStateChangedEvent")
+                    && data.type_url.contains("feos.vm.v1.VmStateChangedEvent")
                 {
                     let state_change = VmStateChangedEvent::decode(&*data.value)?;
                     let new_state =
@@ -642,10 +640,7 @@ async fn watch_events(client: &mut VmServiceClient<Channel>, vm_id: Option<Strin
             Ok(event) => {
                 println!("[{}] Event ID: {}", event.vm_id, event.id);
                 if let Some(data) = event.data {
-                    if data
-                        .type_url
-                        .contains("feos.vm.vmm.api.v1.VmStateChangedEvent")
-                    {
+                    if data.type_url.contains("feos.vm.v1.VmStateChangedEvent") {
                         let state_change = VmStateChangedEvent::decode(&*data.value)?;
                         println!(
                             "  New State: {:?} (Reason: {})",

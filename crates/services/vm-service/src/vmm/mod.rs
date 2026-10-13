@@ -107,7 +107,7 @@ pub async fn broadcast_state_change_event(
         id: Uuid::new_v4().to_string(),
         component_id: component.to_string(),
         data: Some(Any {
-            type_url: "type.googleapis.com/feos.vm.vmm.api.v1.VmStateChangedEvent".to_string(),
+            type_url: "type.googleapis.com/feos.vm.v1.VmStateChangedEvent".to_string(),
             value: data.encode_to_vec(),
         }),
     };

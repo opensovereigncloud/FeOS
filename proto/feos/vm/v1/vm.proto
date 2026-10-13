@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package feos.vm.vmm.api.v1;
+package feos.vm.v1;
 
 import "google/protobuf/any.proto";
 

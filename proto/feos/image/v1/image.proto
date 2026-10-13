@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package feos.image.vmm.api.v1;
+package feos.image.v1;
 
 // Image Service
 

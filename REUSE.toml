@@ -17,7 +17,7 @@ path = [
     "**/*.rs",
     "**/*.sql",
     "**/*.json",
-    "proto/v1/*.proto"
+    "proto/**/*.proto"
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "SAP SE or an SAP affiliate company and IronCore contributors"

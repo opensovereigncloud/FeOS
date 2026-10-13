@@ -63,7 +63,7 @@ pub async fn wait_for_target_state(
     while let Some(event_res) = stream.next().await {
         let event = event_res?;
         let any_data = event.data.expect("Event should have data payload");
-        if any_data.type_url == "type.googleapis.com/feos.vm.vmm.api.v1.VmStateChangedEvent" {
+        if any_data.type_url == "type.googleapis.com/feos.vm.v1.VmStateChangedEvent" {
             let state_change = VmStateChangedEvent::decode(&*any_data.value)?;
             let new_state =
                 VmState::try_from(state_change.new_state).unwrap_or(VmState::Unspecified);

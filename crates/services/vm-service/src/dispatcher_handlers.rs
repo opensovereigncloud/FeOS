@@ -263,8 +263,7 @@ pub(crate) async fn handle_stream_vm_events_command(
                     id: Uuid::new_v4().to_string(),
                     component_id: "vm-service-db".to_string(),
                     data: Some(Any {
-                        type_url: "type.googleapis.com/feos.vm.vmm.api.v1.VmStateChangedEvent"
-                            .to_string(),
+                        type_url: "type.googleapis.com/feos.vm.v1.VmStateChangedEvent".to_string(),
                         value: state_change_event.encode_to_vec(),
                     }),
                 };
@@ -327,7 +326,7 @@ pub(crate) async fn handle_stream_vm_events_command(
                         id: Uuid::new_v4().to_string(),
                         component_id: "vm-service-db".to_string(),
                         data: Some(Any {
-                            type_url: "type.googleapis.com/feos.vm.vmm.api.v1.VmStateChangedEvent"
+                            type_url: "type.googleapis.com/feos.vm.v1.VmStateChangedEvent"
                                 .to_string(),
                             value: state_change_event.encode_to_vec(),
                         }),
