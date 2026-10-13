@@ -15,7 +15,7 @@ FeOS is a revolutionary init system for Linux, designed specifically for hypervi
 **Init System**: FeOS replaces traditional Linux init systems, booting directly from the Linux Kernel.  
 **Container and VM Support**: Supports running VMs, Containers, and MicroVMs, including the ability to run containers within MicroVMs for enhanced security.  
 **Rust-Based**: Developed in Rust, leveraging memory-safe programming to mitigate common vulnerabilities.  
-**Compatibility**: Compatible with Rust-based container and VM runtimes like youki, rustvmm, and cloud-hypervisor.  
+**Compatibility**: Runs containers with youki's libcontainer, built in, and VMs with cloud-hypervisor.  
 **Cluster Integration**: Designed for use in clustered environments, FeOS treats servers as hardware resources for executing programs.  
 **gRPC API**: Exposes a gRPC API for external orchestrators to manage VMs, Containers, and MicroVMs.
 
