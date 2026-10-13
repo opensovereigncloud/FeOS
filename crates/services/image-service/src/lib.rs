@@ -24,7 +24,7 @@ pub const IMAGE_DIR: &str = "/var/lib/feos/images";
 pub fn pull_dir(image_uuid: &str) -> std::path::PathBuf {
     std::path::Path::new(IMAGE_DIR).join(format!("{image_uuid}.tmp"))
 }
-pub const IMAGE_SERVICE_SOCKET: &str = "/var/lib/feos/image_service.sock";
+pub const IMAGE_SERVICE_SOCKET: &str = "/run/feos/image.sock";
 
 #[derive(Debug, Clone)]
 pub struct ImageStateEvent {

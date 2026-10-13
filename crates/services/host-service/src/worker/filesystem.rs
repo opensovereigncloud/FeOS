@@ -90,9 +90,10 @@ fn freeze(mountpoint: &str, op: Op) -> Result<String, HostError> {
 }
 
 /// The block device name (e.g. "vda") behind the mount at `mountpoint`, read
-/// through /sys/dev/block/<major:minor>.
+/// through /sys/dev/block/<major:minor>. Mounts stack, and mountinfo lists
+/// the one on top last: that is the one a path resolves to.
 fn device_of(mountinfo: &str, mountpoint: &str) -> Option<String> {
-    let majmin = mountinfo.lines().find_map(|line| {
+    let majmin = mountinfo.lines().rev().find_map(|line| {
         let fields: Vec<&str> = line.split(' ').collect();
         (fields.len() > 4 && fields[4] == mountpoint).then(|| fields[2].to_string())
     })?;
@@ -103,4 +104,22 @@ fn device_of(mountinfo: &str, mountpoint: &str) -> Option<String> {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or(majmin),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_top_mount_wins() {
+        let mountinfo = "\
+30 22 0:25 / /var/lib/feos rw,relatime - tmpfs tmpfs rw
+31 30 0:0 / /var/lib/feos rw,relatime - ext4 /dev/vda rw";
+        // 0:0 has no /sys/dev/block entry, so the major:minor comes back.
+        assert_eq!(
+            device_of(mountinfo, "/var/lib/feos").as_deref(),
+            Some("0:0")
+        );
+        assert_eq!(device_of(mountinfo, "/nowhere"), None);
+    }
 }

@@ -14,7 +14,7 @@ pub use feos_proto::task_service::{
     StartRequest, StartResponse, WaitRequest, WaitResponse,
 };
 
-pub const TASK_SERVICE_SOCKET: &str = "/tmp/feos/task_service.sock";
+pub const TASK_SERVICE_SOCKET: &str = "/run/feos/task.sock";
 
 #[derive(Debug)]
 pub struct Container {

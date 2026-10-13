@@ -5,7 +5,7 @@
 mod guest;
 mod setup;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use host_service::RestartSignal;
 use image_service::IMAGE_SERVICE_SOCKET;
 use log::{error, info, warn};
@@ -68,12 +68,7 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     let image_service = initialize_image_service().await?;
     let task_service = initialize_task_service().await?;
 
-    if let Some(api_dir) = Path::new(API_SOCKET).parent() {
-        fs::create_dir_all(api_dir).await?;
-    }
-    fs::remove_file(API_SOCKET).await.ok();
-    let api_uds = UnixListener::bind(API_SOCKET)?;
-    let api_uds_stream = UnixListenerStream::new(api_uds);
+    let api_uds_stream = bind_unix_socket(API_SOCKET).await?;
     let api_unix_socket_server = Server::builder()
         .add_service(container_service.clone())
         .add_service(host_service.clone())
@@ -100,16 +95,12 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     #[cfg(not(feature = "host"))]
     let tcp_server = std::future::pending::<Result<(), tonic::transport::Error>>();
 
-    fs::remove_file(IMAGE_SERVICE_SOCKET).await.ok();
-    let image_uds = UnixListener::bind(IMAGE_SERVICE_SOCKET)?;
-    let image_uds_stream = UnixListenerStream::new(image_uds);
+    let image_uds_stream = bind_unix_socket(IMAGE_SERVICE_SOCKET).await?;
     let image_unix_socket_server = Server::builder()
         .add_service(image_service)
         .serve_with_incoming(image_uds_stream);
 
-    fs::remove_file(TASK_SERVICE_SOCKET).await.ok();
-    let task_uds = UnixListener::bind(TASK_SERVICE_SOCKET)?;
-    let task_uds_stream = UnixListenerStream::new(task_uds);
+    let task_uds_stream = bind_unix_socket(TASK_SERVICE_SOCKET).await?;
     let task_unix_socket_server = Server::builder()
         .add_service(task_service)
         .serve_with_incoming(task_uds_stream);
@@ -181,4 +172,16 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     }
 
     anyhow::bail!("a gRPC server stopped serving")
+}
+
+/// Binds a Unix socket, creating its directory and replacing a stale socket.
+async fn bind_unix_socket(path: &str) -> Result<UnixListenerStream> {
+    if let Some(dir) = Path::new(path).parent() {
+        fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("create {}", dir.display()))?;
+    }
+    fs::remove_file(path).await.ok();
+    let listener = UnixListener::bind(path).with_context(|| format!("bind {path}"))?;
+    Ok(UnixListenerStream::new(listener))
 }
