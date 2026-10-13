@@ -9,6 +9,9 @@ service ImageService {
   // Initiates the pull of an OCI image from a remote registry.
   // This call is non-blocking. It returns a UUID for the image immediately,
   // which can then be used to track the download status.
+  // Images are immutable and shared: pulling a reference that is present or
+  // being pulled returns that image's UUID, unless the request is
+  // `exclusive`. Delete an image to pull its reference anew.
   rpc PullImage(PullImageRequest) returns (PullImageResponse);
 
   // Watches the status of an image pull operation. This is a server-streaming
@@ -42,12 +45,21 @@ message ImageInfo {
   string image_ref = 2;
   // The current state of the image.
   ImageState state = 3;
+  // Digest of the image config, the image's content id. Set once READY.
+  string digest = 4;
+  // Compressed size of the config and the layers. Set once READY.
+  uint64 size_bytes = 5;
 }
 
 message PullImageRequest {
   // The full reference to the OCI image, including the registry and tag.
-  // e.g., "docker.io/library/alpine:latest"
+  // e.g., "docker.io/library/alpine:latest". Short forms are normalized like
+  // docker does ("alpine" is "docker.io/library/alpine:latest").
   string image_ref = 1;
+  // Pull into a new image that is handed to nobody else, even if the
+  // reference is present. For consumers that write to the image's files,
+  // such as a VM using its disk image.
+  bool exclusive = 2;
 }
 
 message PullImageResponse {

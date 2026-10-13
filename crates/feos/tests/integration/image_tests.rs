@@ -27,6 +27,7 @@ async fn test_image_lifecycle() -> Result<()> {
     info!("Pulling image: {image_ref}");
     let pull_req = PullImageRequest {
         image_ref: image_ref.clone(),
+        exclusive: false,
     };
     let pull_res = image_client.pull_image(pull_req).await?.into_inner();
     let image_uuid = pull_res.image_uuid;
@@ -98,6 +99,7 @@ async fn test_container_image_lifecycle() -> Result<()> {
     info!("Pulling container image: {image_ref}");
     let pull_req = PullImageRequest {
         image_ref: image_ref.clone(),
+        exclusive: false,
     };
     let pull_res = image_client.pull_image(pull_req).await?.into_inner();
     let image_uuid = pull_res.image_uuid;

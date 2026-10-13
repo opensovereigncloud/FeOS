@@ -29,7 +29,8 @@ libc = { workspace = true }
 rtnetlink = { workspace = true }
 futures = { workspace = true }
 
-hyper-rustls = "0.27.2"
+# ring, like reqwest: one crypto provider, and no C build of aws-lc.
+hyper-rustls = { version = "0.27.2", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
 http-body-util = "0.1.2"
 
 [features]

@@ -65,7 +65,10 @@ pub async fn handle_image_command(args: ImageArgs) -> Result<()> {
 
 async fn pull_image(client: &mut ImageServiceClient<Channel>, image_ref: String) -> Result<()> {
     println!("Requesting image pull for: {image_ref}...");
-    let request = PullImageRequest { image_ref };
+    let request = PullImageRequest {
+        image_ref,
+        exclusive: false,
+    };
     let response = client.pull_image(request).await?.into_inner();
     println!("Image pull initiated. UUID: {}", response.image_uuid);
     println!(

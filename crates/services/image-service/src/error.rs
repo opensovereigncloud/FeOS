@@ -23,6 +23,12 @@ pub enum ImageServiceError {
 
     #[error("An internal orchestrator error occurred: {0}")]
     Internal(String),
+
+    #[error("Pull failed: {0}")]
+    Pull(String),
+
+    #[error("Unsupported layer media type: {0}")]
+    UnsupportedLayer(String),
 }
 
 impl From<ImageServiceError> for Status {
@@ -33,9 +39,10 @@ impl From<ImageServiceError> for Status {
                 Status::not_found(format!("Image with ID '{id}' not found"))
             }
             ImageServiceError::OciParse(_) => Status::invalid_argument(err.to_string()),
-            ImageServiceError::OciPull(_) | ImageServiceError::MissingLayer(_) => {
-                Status::unavailable(err.to_string())
-            }
+            ImageServiceError::OciPull(_)
+            | ImageServiceError::MissingLayer(_)
+            | ImageServiceError::Pull(_) => Status::unavailable(err.to_string()),
+            ImageServiceError::UnsupportedLayer(_) => Status::unimplemented(err.to_string()),
             ImageServiceError::Storage(_) | ImageServiceError::Internal(_) => {
                 Status::internal(err.to_string())
             }

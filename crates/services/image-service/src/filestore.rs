@@ -1,25 +1,23 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{FileCommand, ImageInfo, PulledImageData, IMAGE_DIR};
+use crate::pull::Pulled;
+use crate::{pull_dir, FileCommand, ImageInfo, IMAGE_DIR};
 use feos_proto::image_service::ImageState;
-use flate2::read::GzDecoder;
 use log::{error, info, warn};
-use oci_distribution::manifest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Cursor;
+use std::os::fd::AsFd;
 use std::path::Path;
-use tar::Archive;
 use tokio::{fs, sync::mpsc};
-
-const INITRAMFS_MEDIA_TYPE: &str = "application/vnd.ironcore.image.initramfs.v1alpha1.initramfs";
-const VMLINUZ_MEDIA_TYPE: &str = "application/vnd.ironcore.image.vmlinuz.v1alpha1.vmlinuz";
-const ROOTFS_MEDIA_TYPE: &str = "application/vnd.ironcore.image.rootfs.v1alpha1.rootfs";
 
 #[derive(Serialize, Deserialize)]
 struct ImageMetadata {
     image_ref: String,
+    #[serde(default)]
+    digest: String,
+    #[serde(default)]
+    size_bytes: u64,
 }
 
 pub struct FileStore {
@@ -59,12 +57,14 @@ impl FileStore {
             FileCommand::StoreImage {
                 image_uuid,
                 image_ref,
-                image_data,
+                pulled,
                 responder,
             } => {
                 info!("FileStore: Storing image {image_uuid}");
                 let final_dir = Path::new(IMAGE_DIR).join(&image_uuid);
-                let result = Self::store_image_impl(&final_dir, image_data, &image_ref).await;
+                let result =
+                    Self::store_image_impl(&pull_dir(&image_uuid), &final_dir, pulled, &image_ref)
+                        .await;
                 let _ = responder.send(result);
             }
             FileCommand::DeleteImage {
@@ -84,55 +84,32 @@ impl FileStore {
         }
     }
 
+    /// Commits a pull: writes the config and the metadata next to the pulled
+    /// files and renames the pull directory into place. The image is on disk,
+    /// not only in the page cache, when this returns: a host may freeze and
+    /// copy the data volume right after the pull.
     async fn store_image_impl(
+        pull_dir: &Path,
         final_dir: &Path,
-        image_data: PulledImageData,
+        pulled: Pulled,
         image_ref: &str,
     ) -> Result<(), std::io::Error> {
-        fs::create_dir_all(final_dir).await?;
-
-        for layer in image_data.layers {
-            match layer.media_type.as_str() {
-                manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE
-                | manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE => {
-                    let rootfs_path = final_dir.join("rootfs");
-                    if !rootfs_path.exists() {
-                        fs::create_dir_all(&rootfs_path).await?;
-                    }
-                    let cursor = Cursor::new(layer.data);
-                    let decoder = GzDecoder::new(cursor);
-                    let mut archive = Archive::new(decoder);
-                    tokio::task::block_in_place(move || archive.unpack(&rootfs_path))?;
-                }
-                ROOTFS_MEDIA_TYPE => {
-                    let path = final_dir.join("disk.image");
-                    fs::write(path, layer.data).await?;
-                }
-                INITRAMFS_MEDIA_TYPE => {
-                    let path = final_dir.join("initramfs");
-                    fs::write(path, layer.data).await?;
-                }
-                VMLINUZ_MEDIA_TYPE => {
-                    let path = final_dir.join("vmlinuz");
-                    fs::write(path, layer.data).await?;
-                }
-                _ => {
-                    warn!(
-                        "FileStore: Skipping layer with unsupported media type: {}",
-                        layer.media_type
-                    );
-                }
-            }
-        }
-
-        fs::write(final_dir.join("config.json"), image_data.config).await?;
+        fs::write(pull_dir.join("config.json"), &pulled.config).await?;
 
         let metadata = ImageMetadata {
             image_ref: image_ref.to_string(),
+            digest: pulled.digest,
+            size_bytes: pulled.size_bytes,
         };
         let metadata_json =
             serde_json::to_string_pretty(&metadata).map_err(std::io::Error::other)?;
-        fs::write(final_dir.join("metadata.json"), metadata_json).await?;
+        fs::write(pull_dir.join("metadata.json"), metadata_json).await?;
+
+        let _ = fs::remove_dir_all(final_dir).await;
+        fs::rename(pull_dir, final_dir).await?;
+
+        let store = std::fs::File::open(IMAGE_DIR)?;
+        nix::unistd::syncfs(store.as_fd())?;
         Ok(())
     }
 
@@ -151,6 +128,12 @@ impl FileStore {
             if !path.is_dir() {
                 continue;
             }
+            // A pull that did not finish, e.g. because the guest rebooted.
+            if path.extension().is_some_and(|ext| ext == "tmp") {
+                info!("FileStore: Removing unfinished pull {}", path.display());
+                let _ = fs::remove_dir_all(&path).await;
+                continue;
+            }
 
             if let Some(uuid) = path.file_name().and_then(|s| s.to_str()) {
                 let metadata_path = path.join("metadata.json");
@@ -164,6 +147,8 @@ impl FileStore {
                                 image_uuid: uuid.to_string(),
                                 image_ref: metadata.image_ref,
                                 state: ImageState::Ready as i32,
+                                digest: metadata.digest,
+                                size_bytes: metadata.size_bytes,
                             };
                             store.insert(uuid.to_string(), image_info);
                         } else {

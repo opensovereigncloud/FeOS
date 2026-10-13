@@ -86,6 +86,8 @@ async fn initiate_image_pull_for_vm(req: &CreateVmRequest) -> Result<String, VmS
     let response = client
         .pull_image(PullImageRequest {
             image_ref: image_ref.clone(),
+            // The VM writes to the image's disk.
+            exclusive: true,
         })
         .await
         .map_err(|status| {

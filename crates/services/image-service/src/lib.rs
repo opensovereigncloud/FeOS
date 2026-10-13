@@ -14,9 +14,16 @@ pub mod api;
 pub mod dispatcher;
 pub mod error;
 pub mod filestore;
+pub mod pull;
+pub mod unpack;
 pub mod worker;
 
 pub const IMAGE_DIR: &str = "/var/lib/feos/images";
+
+/// Where a pull of `image_uuid` writes before it is committed.
+pub fn pull_dir(image_uuid: &str) -> std::path::PathBuf {
+    std::path::Path::new(IMAGE_DIR).join(format!("{image_uuid}.tmp"))
+}
 pub const IMAGE_SERVICE_SOCKET: &str = "/var/lib/feos/image_service.sock";
 
 #[derive(Debug, Clone)]
@@ -47,27 +54,16 @@ pub enum Command {
 }
 
 #[derive(Debug)]
-pub struct PulledLayer {
-    pub media_type: String,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug)]
-pub struct PulledImageData {
-    pub config: Vec<u8>,
-    pub layers: Vec<PulledLayer>,
-}
-
-#[derive(Debug)]
 pub enum OrchestratorCommand {
     PullImage {
         image_ref: String,
+        exclusive: bool,
         responder: oneshot::Sender<Result<PullImageResponse, ImageServiceError>>,
     },
     FinalizePull {
         image_uuid: String,
         image_ref: String,
-        image_data: PulledImageData,
+        pulled: pull::Pulled,
     },
     FailPull {
         image_uuid: String,
@@ -88,10 +84,11 @@ pub enum OrchestratorCommand {
 
 #[derive(Debug)]
 pub enum FileCommand {
+    /// Commits a pull whose files are in [`pull_dir`].
     StoreImage {
         image_uuid: String,
         image_ref: String,
-        image_data: PulledImageData,
+        pulled: pull::Pulled,
         responder: oneshot::Sender<Result<(), std::io::Error>>,
     },
     DeleteImage {

@@ -2,24 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    error::ImageServiceError, FileCommand, ImageStateEvent, OrchestratorCommand, PulledImageData,
-    PulledLayer,
+    pull::{normalize_ref, pull_image},
+    pull_dir, FileCommand, ImageStateEvent, OrchestratorCommand,
 };
 use feos_proto::image_service::{
     DeleteImageResponse, ImageInfo, ImageState, ImageStatusResponse, ListImagesResponse,
     PullImageResponse,
 };
 use log::{error, info, warn};
-use oci_distribution::{client::ClientConfig, manifest, secrets::RegistryAuth, Client, Reference};
 use std::collections::HashMap;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tonic::Status;
 use uuid::Uuid;
-
-const SQUASHFS_MEDIA_TYPE: &str = "application/vnd.ironcore.image.squashfs.v1alpha1.squashfs";
-const INITRAMFS_MEDIA_TYPE: &str = "application/vnd.ironcore.image.initramfs.v1alpha1.initramfs";
-const VMLINUZ_MEDIA_TYPE: &str = "application/vnd.ironcore.image.vmlinuz.v1alpha1.vmlinuz";
-const ROOTFS_MEDIA_TYPE: &str = "application/vnd.ironcore.image.rootfs.v1alpha1.rootfs";
 
 pub struct Orchestrator {
     command_rx: mpsc::Receiver<OrchestratorCommand>,
@@ -69,8 +63,37 @@ impl Orchestrator {
         match cmd {
             OrchestratorCommand::PullImage {
                 image_ref,
+                exclusive,
                 responder,
             } => {
+                let image_ref = match normalize_ref(&image_ref) {
+                    Ok(image_ref) => image_ref,
+                    Err(e) => {
+                        let _ = responder.send(Err(e));
+                        return;
+                    }
+                };
+                // Images are immutable: a pull of a reference that is there
+                // or on its way joins it.
+                if !exclusive
+                    && let Some(existing) = self.store.values().find(|info| {
+                        info.image_ref == image_ref
+                            && matches!(
+                                ImageState::try_from(info.state),
+                                Ok(ImageState::Ready | ImageState::Downloading)
+                            )
+                    })
+                {
+                    info!(
+                        "Orchestrator: '{image_ref}' is already image {}",
+                        existing.image_uuid
+                    );
+                    let _ = responder.send(Ok(PullImageResponse {
+                        image_uuid: existing.image_uuid.clone(),
+                    }));
+                    return;
+                }
+
                 let image_uuid = Uuid::new_v4().to_string();
                 info!("Orchestrator: Start pull for '{image_ref}', assigned UUID {image_uuid}");
 
@@ -80,6 +103,7 @@ impl Orchestrator {
                         image_uuid: image_uuid.clone(),
                         image_ref: image_ref.clone(),
                         state: ImageState::Downloading as i32,
+                        ..Default::default()
                     },
                 );
                 self.broadcast_state_change(
@@ -101,14 +125,18 @@ impl Orchestrator {
             OrchestratorCommand::FinalizePull {
                 image_uuid,
                 image_ref,
-                image_data,
+                pulled,
             } => {
                 info!("Orchestrator: Finalizing pull for {image_uuid}");
+                if let Some(info) = self.store.get_mut(&image_uuid) {
+                    info.digest = pulled.digest.clone();
+                    info.size_bytes = pulled.size_bytes;
+                }
                 let (responder, resp_rx) = oneshot::channel();
                 let file_cmd = FileCommand::StoreImage {
                     image_uuid: image_uuid.clone(),
                     image_ref,
-                    image_data,
+                    pulled,
                     responder,
                 };
 
@@ -233,100 +261,33 @@ impl Orchestrator {
     }
 }
 
-async fn pull_oci_data(image_ref: &str) -> Result<PulledImageData, ImageServiceError> {
-    info!("ImagePuller: fetching image: {image_ref}");
-    let reference = Reference::try_from(image_ref.to_string())?;
-
-    let accepted_media_types = [
-        ROOTFS_MEDIA_TYPE,
-        SQUASHFS_MEDIA_TYPE,
-        INITRAMFS_MEDIA_TYPE,
-        VMLINUZ_MEDIA_TYPE,
-        manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
-        manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
-    ];
-
-    let config = ClientConfig {
-        ..Default::default()
-    };
-    let client = Client::new(config);
-    let auth = &RegistryAuth::Anonymous;
-
-    info!("ImagePuller: pulling manifest and config for {image_ref}");
-    let (manifest, _, _) = client.pull_manifest_and_config(&reference, auth).await?;
-
-    let mut config_data = Vec::new();
-    client
-        .pull_blob(&reference, &manifest.config, &mut config_data)
-        .await?;
-    info!(
-        "ImagePuller: pulled config blob {} bytes",
-        config_data.len()
-    );
-
-    let mut layers = Vec::new();
-    for layer in manifest.layers {
-        if !accepted_media_types.contains(&layer.media_type.as_str()) {
-            warn!(
-                "ImagePuller: skipping layer with unsupported media type: {}",
-                layer.media_type
-            );
-            continue;
-        }
-
-        info!(
-            "ImagePuller: pulling layer {} ({})",
-            layer.digest, layer.media_type
-        );
-
-        let mut layer_data = Vec::new();
-        client
-            .pull_blob(&reference, &layer, &mut layer_data)
-            .await?;
-        info!("ImagePuller: pulled layer blob {} bytes", layer_data.len());
-        layers.push(PulledLayer {
-            media_type: layer.media_type.clone(),
-            data: layer_data,
-        });
-    }
-
-    if layers.is_empty() {
-        return Err(ImageServiceError::MissingLayer(
-            "No compatible layers found".to_string(),
-        ));
-    }
-
-    Ok(PulledImageData {
-        config: config_data,
-        layers,
-    })
-}
-
+/// Pulls an image into its pull directory and hands the result back to the
+/// orchestrator.
 pub async fn pull_oci_image(
     command_tx: mpsc::Sender<OrchestratorCommand>,
     image_uuid: String,
     image_ref: String,
 ) {
-    match pull_oci_data(&image_ref).await {
-        Ok(image_data) => {
-            let cmd = OrchestratorCommand::FinalizePull {
-                image_uuid,
-                image_ref,
-                image_data,
-            };
-            if command_tx.send(cmd).await.is_err() {
-                error!("ImagePuller: Failed to send FinalizePull command. Actor may be down.");
-            }
+    let dir = pull_dir(&image_uuid);
+    let result = async {
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await?;
+        pull_image(&image_ref, &dir).await
+    }
+    .await;
+    let cmd = match result {
+        Ok(pulled) => OrchestratorCommand::FinalizePull {
+            image_uuid,
+            image_ref,
+            pulled,
+        },
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            OrchestratorCommand::FailPull { image_uuid, error }
         }
-        Err(e) => {
-            let cmd = OrchestratorCommand::FailPull {
-                image_uuid,
-                error: e,
-            };
-            if command_tx.send(cmd).await.is_err() {
-                error!("ImagePuller: Failed to send FailPull command. Actor may be down.");
-            }
-        }
+    };
+    if command_tx.send(cmd).await.is_err() {
+        error!("ImagePuller: Failed to report the pull result. Actor may be down.");
     }
 }
 

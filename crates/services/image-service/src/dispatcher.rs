@@ -37,6 +37,7 @@ impl ImageServiceDispatcher {
         let orchestrator_cmd = match cmd {
             Command::PullImage(req, responder) => OrchestratorCommand::PullImage {
                 image_ref: req.image_ref,
+                exclusive: req.exclusive,
                 responder,
             },
             Command::ListImages(_req, responder) => OrchestratorCommand::ListImages { responder },

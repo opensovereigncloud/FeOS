@@ -50,6 +50,7 @@ async fn initiate_image_pull(image_ref: &str) -> Result<String, ContainerService
     let response = client
         .pull_image(PullImageRequest {
             image_ref: image_ref.to_string(),
+            exclusive: false,
         })
         .await
         .map_err(|status| {

@@ -9,6 +9,8 @@ workspace = true
 [dependencies]
 feos-proto = { workspace = true }
 feos-utils = { workspace = true }
+nix = { workspace = true, features = ["dir", "fs", "user"] }
+libc = { workspace = true }
 oci-distribution = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -20,3 +22,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tar = "0.4"
 flate2 = "1.0"
+
+[dev-dependencies]
+tempfile = { workspace = true }
