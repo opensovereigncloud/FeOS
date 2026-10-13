@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! VMs as Firecracker processes. Each VM has a directory of its own:
+//! VMs as Firecracker processes. Each VM has a directory of its own, the
+//! chroot of its jail (see `jail`):
 //!
 //! - `config.json`: its Firecracker configuration, written at creation
 //! - `fc.sock`: Firecracker's API socket
@@ -10,7 +11,9 @@
 //! - `serial.log`: the serial console's output since the last boot
 //!   (Firecracker's stdout)
 //! - `vmm.log`: Firecracker's own log
-//! - `firecracker.pid`
+//! - `firecracker.pid`, `firecracker` and `dev/`: the jailer's
+//! - `vmlinuz`, `initramfs`, `rootfs.img`, `<drive>.img`: the image's files
+//!   and the data disks, linked in
 //! - `snapshot/`: the snapshot of a suspended VM (see `snapshot`)
 //!
 //! Creating a VM writes its configuration. Starting it starts a Firecracker

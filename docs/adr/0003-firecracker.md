@@ -80,9 +80,5 @@ line.
   hugepages back VM memory when a VM asks for them.
 - `make test-vm` runs the VM integration tests against Firecracker, with
   the guest profile as the VM image.
-- Firecracker runs as root without the jailer, confined by its seccomp
-  filters only. The jailer, snapshots and restore, the balloon, and the
-  host end of the guest's lifecycle uplink are still to come. With them, the
-  VM half of the sandbox manager (starting Firecracker, snapshots, pushing
-  time and network after a boot or resume) moves into the VM service; the
-  sandbox half stays a service of its own.
+- The jailer, snapshots and restore, the balloon, and the host end of the
+  guest's lifecycle uplink followed: [ADR 0004](0004-vm-half-of-the-manager.md).
