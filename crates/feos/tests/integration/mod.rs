@@ -62,8 +62,13 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
     let container_db_path = temp_dir.path().join("containers.db");
     let container_db_url = format!("sqlite:{}", container_db_path.to_str().unwrap());
 
-    env::set_var("DATABASE_URL", &db_url);
-    env::set_var("CONTAINER_DATABASE_URL", &container_db_url);
+    // SAFETY: not strictly sound: the test harness runs tests on several
+    // threads, and another thread may read the environment concurrently.
+    // TODO: pass the database URLs to run_server instead of the environment.
+    unsafe {
+        env::set_var("DATABASE_URL", &db_url);
+        env::set_var("CONTAINER_DATABASE_URL", &container_db_url);
+    }
     info!("Using temporary database for tests: {db_url}");
     info!("Using temporary container database for tests: {container_db_url}");
 

@@ -1,0 +1,3 @@
+# Keep the 2021 formatting style: the 2024 style would reformat most
+# files and move their lines away from their authors in git blame.
+style_edition = "2021"
