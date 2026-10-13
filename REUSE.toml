@@ -17,11 +17,7 @@ path = [
     "**/*.rs",
     "**/*.sql",
     "**/*.json",
-    "proto/v1/*.proto",
-    "go/feos-go/Makefile",
-    "go/feos-go/go.mod",
-    "go/feos-go/hack/get_version.sh",
-    "LICENCES/Apache-2.0.txt"
+    "proto/v1/*.proto"
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "SAP SE or an SAP affiliate company and IronCore contributors"
