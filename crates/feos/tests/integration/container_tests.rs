@@ -46,9 +46,10 @@ async fn test_create_and_start_container() -> Result<()> {
     let (_, _, mut container_client) = get_public_clients().await?;
 
     let image_ref = TEST_CONTAINER_IMAGE_REF.clone();
+    // Something that keeps running, to exec in.
     let container_config = ContainerConfig {
         image_ref,
-        command: vec![],
+        command: vec!["sleep".to_string(), "300".to_string()],
         env: Default::default(),
     };
 

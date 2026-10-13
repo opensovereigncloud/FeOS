@@ -31,7 +31,7 @@ pub mod vm_tests;
 
 pub const PUBLIC_SERVER_ADDRESS: &str = "http://[::1]:1337";
 pub const DEFAULT_TEST_IMAGE_REF: &str = "ghcr.io/ironcore-dev/os-images/gardenlinux-ch-dev";
-pub const DEFAULT_TEST_CONTAINER_IMAGE_REF: &str = "ghcr.io/appvia/hello-world/hello-world";
+pub const DEFAULT_TEST_CONTAINER_IMAGE_REF: &str = "docker.io/library/busybox:1.36";
 
 pub static TEST_IMAGE_REF: Lazy<String> =
     Lazy::new(|| env::var("TEST_IMAGE_REF").unwrap_or_else(|_| DEFAULT_TEST_IMAGE_REF.to_string()));
