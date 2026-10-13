@@ -1,0 +1,17 @@
+[package]
+name = "forward-service"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-proto = { workspace = true }
+feos-utils = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-vsock = { workspace = true }
+tonic = { workspace = true }

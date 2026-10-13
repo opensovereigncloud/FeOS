@@ -5,6 +5,7 @@ members = [
     "crates/feos-utils",
     "crates/feosctl",
     "crates/services/container-service",
+    "crates/services/forward-service",
     "crates/services/host-service",
     "crates/services/image-service",
     "crates/services/task-service",
@@ -73,6 +74,7 @@ once_cell = "1.19"
 feos-proto = { path = "crates/feos-proto" }
 feos-utils = { path = "crates/feos-utils" }
 container-service = { path = "crates/services/container-service" }
+forward-service = { path = "crates/services/forward-service" }
 host-service = { path = "crates/services/host-service" }
 image-service = { path = "crates/services/image-service" }
 task-service = { path = "crates/services/task-service" }

@@ -11,5 +11,6 @@ pub mod host;
 pub mod network;
 pub mod reaper;
 pub mod resolver;
+pub mod share;
 pub mod version;
 pub mod vsock;

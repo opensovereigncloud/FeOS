@@ -8,12 +8,16 @@
 //! LifecycleService call open: that call is how the host learns that the
 //! guest is ready, and its end tells the host that the guest is gone.
 
+use feos_proto::kube_service::kube_service_server::KubeServiceServer;
 use feos_proto::lifecycle_service::lifecycle_service_client::LifecycleServiceClient;
 use feos_proto::lifecycle_service::{hello, Hello};
+use feos_proto::portforward_service::port_forward_service_server::PortForwardServiceServer;
+use feos_proto::ssh_service::ssh_service_server::SshServiceServer;
 use feos_proto::tool_service::tool_service_server::ToolServiceServer;
 use feos_proto::watch_service::watch_service_server::WatchServiceServer;
 use feos_utils::filesystem::{mount_data_volume, DATA_ROOT};
 use feos_utils::vsock::{API_PORT, UPLINK_PORT};
+use forward_service::{KubeApiHandler, PortForwardApiHandler, SshApiHandler};
 use hyper_util::rt::TokioIo;
 use log::{debug, info, warn};
 use std::io;
@@ -49,13 +53,23 @@ pub(crate) struct GuestServices {
     tool: ToolServiceServer<ToolApiHandler>,
     // One inotify instance and one refcount table for every listener.
     watch: WatchServiceServer<WatchApiHandler>,
+    // The guest's kube listeners; port forwarding refuses exactly those.
+    kube: KubeServiceServer<KubeApiHandler>,
+    forward: PortForwardServiceServer<PortForwardApiHandler>,
+    // The guest's one SSH agent socket.
+    ssh: SshServiceServer<SshApiHandler>,
 }
 
 impl GuestServices {
     pub(crate) fn new() -> Self {
+        let kube = KubeApiHandler::default();
+        let forward = PortForwardApiHandler::new(kube.ports());
         Self {
             tool: ToolServiceServer::new(ToolApiHandler),
             watch: WatchServiceServer::new(WatchApiHandler::default()),
+            kube: KubeServiceServer::new(kube),
+            forward: PortForwardServiceServer::new(forward),
+            ssh: SshServiceServer::new(SshApiHandler::default()),
         }
     }
 
@@ -63,6 +77,9 @@ impl GuestServices {
         router
             .add_service(self.tool.clone())
             .add_service(self.watch.clone())
+            .add_service(self.kube.clone())
+            .add_service(self.forward.clone())
+            .add_service(self.ssh.clone())
     }
 }
 

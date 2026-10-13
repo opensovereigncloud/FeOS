@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package feos.portforward.v1;
+
+// PortForwardService carries inbound connections to a TCP port inside the
+// guest. The only sanctioned inbound path is front door → manager → vsock
+// → FeOS → the guest's loopback, so a served port never has to be bound on the VM's
+// external interface. Containers share the guest's network namespace, so
+// the container's 127.0.0.1 is this one.
+service PortForwardService {
+  // Forward one connection. The first message must carry `open`, every
+  // later one `data`. Bytes flow verbatim in both directions: this is a
+  // pipe, not a protocol, so HTTP, its upgrades and whatever an upgrade
+  // turns into all ride it unchanged.
+  //
+  // Ending the request stream closes the write side of the guest
+  // connection; the guest closing its side ends the response stream.
+  // Cancelling drops the connection.
+  rpc Forward(stream ForwardRequest) returns (stream ForwardResponse);
+}
+
+message ForwardRequest {
+  oneof frame {
+    Open open = 1;
+    bytes data = 2;
+  }
+}
+
+// Open names the target port on the guest's loopback. Nothing is excluded:
+// the guest API listens on vsock only and has no TCP socket to protect.
+message Open {
+  uint32 port = 1;
+}
+
+message ForwardResponse {
+  oneof frame {
+    // Sent once, as soon as the guest connection stands, so the caller can
+    // tell "nothing listens there" from "the peer has not spoken yet".
+    Ready ready = 1;
+    bytes data = 2;
+  }
+}
+
+message Ready {}

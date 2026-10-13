@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod container_commands;
+mod forward_commands;
 mod host_commands;
 mod image_commands;
 mod tool_commands;
@@ -28,6 +29,9 @@ enum Service {
     /// Agent tools on a container's files, in a guest
     Tool(tool_commands::ToolArgs),
     Watch(watch_commands::WatchArgs),
+    Forward(forward_commands::ForwardArgs),
+    Kube(forward_commands::KubeArgs),
+    Ssh(forward_commands::SshArgs),
 }
 
 #[tokio::main]
@@ -46,6 +50,9 @@ async fn main() -> Result<()> {
         Service::Container(args) => container_commands::handle_container_command(args).await?,
         Service::Tool(args) => tool_commands::handle_tool_command(args).await?,
         Service::Watch(args) => watch_commands::handle_watch_command(args).await?,
+        Service::Forward(args) => forward_commands::handle_forward_command(args).await?,
+        Service::Kube(args) => forward_commands::handle_kube_command(args).await?,
+        Service::Ssh(args) => forward_commands::handle_ssh_command(args).await?,
     }
 
     Ok(())

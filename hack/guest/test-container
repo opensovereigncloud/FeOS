@@ -147,6 +147,53 @@ kill "${WATCH_PID}" 2>/dev/null || true
 grep -q "CREATED /work/new-file" "${WATCH_LOG}" || fail "watch saw no event: $(cat "${WATCH_LOG}")"
 log "watch reports a file created in the container"
 
+# Port forwarding: a web server on the container's loopback, reached from
+# this machine through the guest's API.
+cexec sh -c 'mkdir -p /www && echo forwarded > /www/index.html && httpd -p 8080 -h /www </dev/null >/dev/null 2>&1'
+"${FEOSCTL}" forward --address "vsock:${VSOCK}" --port 8080 --listen 127.0.0.1:18080 >/dev/null 2>&1 &
+FORWARD_PID=$!
+for _ in $(seq 50); do curl -s http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.1; done
+out="$(curl -s http://127.0.0.1:18080/index.html)"
+kill "${FORWARD_PID}" 2>/dev/null || true
+[ "${out}" = "forwarded" ] || fail "port forward: ${out}"
+log "port forwarding reaches a server on the container's loopback"
+
+# Kubernetes offloading: a loopback listener in the guest whose connections
+# go to the host's kube proxy (vsock port 10002). Without a proxy the guest
+# answers 502; with this stand-in, the proxy's answer comes through.
+ctl kube set-listeners 6443 >/dev/null
+grep -q "502 Bad Gateway" <<<"$(cexec wget -qO- http://127.0.0.1:6443/ 2>&1 || true)" \
+  || fail "no 502 without a kube proxy"
+python3 - "${VSOCK}_10002" <<'PY' &
+import socket, sys
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(sys.argv[1])
+server.listen(8)
+while True:
+    conn, _ = server.accept()
+    preamble = b""
+    while not preamble.endswith(b"\n"):
+        preamble += conn.recv(1)
+    conn.recv(65536)
+    body = preamble.strip()
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body))
+    conn.close()
+PY
+KUBE_PID=$!
+sleep 0.3
+out="$(cexec wget -qO- http://127.0.0.1:6443/)"
+kill "${KUBE_PID}" 2>/dev/null || true
+[ "${out}" = "kube 6443" ] || fail "kube offloading: ${out}"
+log "kube listeners reach the host's proxy with the port in the preamble"
+
+# SSH agent offloading: the socket every container sees.
+ctl ssh set-agent --enabled >/dev/null
+cexec test -S /run/feos/ssh-agent.sock || fail "no ssh agent socket in the container"
+grep -q "SSH_AUTH_SOCK=/run/feos/ssh-agent.sock" <<<"$(cexec env)" || fail "SSH_AUTH_SOCK not set"
+ctl ssh set-agent >/dev/null
+cexec test -S /run/feos/ssh-agent.sock && fail "ssh agent socket not removed"
+log "the ssh agent socket comes and goes in the container"
+
 # A host freezes the data volume before it stops a guest it wants to adopt
 # later; freezing writes back what is in the guest's page cache.
 ctl host freeze >/dev/null

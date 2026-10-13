@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package feos.kube.v1;
+
+// KubeService owns the guest half of Kubernetes credential offloading: one
+// loopback listener per Kubernetes binding of the sandbox. Every connection
+// accepted on such a listener is piped to the host over vsock (CID 2, port 10002) behind a
+// one-line preamble naming the port, where the sandbox's kube-proxy adds
+// the credential. The guest never holds one.
+service KubeService {
+  // Set the complete listener set. Idempotent: ports not named are
+  // closed (connections already open on them are left alone), ports
+  // already listening are kept. The host calls this after every boot and
+  // resume and whenever the sandbox's bindings change.
+  rpc SetListeners(SetListenersRequest) returns (SetListenersResponse);
+}
+
+message SetListenersRequest {
+  // TCP ports on 127.0.0.1, each 1024–65535.
+  repeated uint32 ports = 1;
+  // Set by the host only in its push after a boot or resume: the host
+  // side of every stream opened before is gone (the kube-proxy dies with
+  // its run), but an idle vsock stream held across a snapshot never wakes
+  // its reader. FeOS closes every open kube connection, so a quiet
+  // `kubectl get -w` sees EOF and reconnects instead of hanging.
+  bool reset_connections = 2;
+}
+
+message SetListenersResponse {
+  // Ports listening after the call.
+  repeated uint32 listening = 1;
+  // Ports that could not be bound (in use inside the guest, out of range).
+  repeated ListenerFailure failed = 2;
+}
+
+message ListenerFailure {
+  uint32 port = 1;
+  string reason = 2;
+}

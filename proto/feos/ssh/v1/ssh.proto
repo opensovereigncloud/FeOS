@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package feos.ssh.v1;
+
+// SshService owns the guest half of SSH agent offloading: the agent socket the
+// container sees at /run/feos/ssh-agent.sock (SSH_AUTH_SOCK). Every
+// connection accepted there is piped to the host over vsock (CID 2, port
+// 10003), where the sandbox's jailed ssh agent signs with keys the guest
+// never holds.
+service SshService {
+  // Set whether the socket exists. Idempotent. The host calls this after
+  // every boot and resume and whenever the sandbox's SSH bindings go from
+  // none to some or back.
+  rpc SetAgent(SetAgentRequest) returns (SetAgentResponse);
+}
+
+message SetAgentRequest {
+  // true: the socket exists and accepts. false: it is removed; agent
+  // connections already open are left to finish.
+  bool enabled = 1;
+  // Set by the host only in its push after a boot or resume: the host
+  // side of every stream opened before is gone (the agent dies with its
+  // run), but an idle vsock stream held across a snapshot never wakes its
+  // reader. FeOS closes every open agent connection.
+  bool reset_connections = 2;
+}
+
+message SetAgentResponse {
+  // Whether the socket exists after the call.
+  bool listening = 1;
+  // Why it could not be created, when enabled was true and listening is
+  // false.
+  string error = 2;
+}

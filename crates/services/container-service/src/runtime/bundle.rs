@@ -100,6 +100,8 @@ pub fn process(
         None => vars.push(format!("PATH={DEFAULT_PATH}:{TOOLBOX_PATH}")),
     }
 
+    feos_utils::share::set_ssh_agent_env(&mut vars);
+
     let cwd = config["WorkingDir"]
         .as_str()
         .filter(|dir| !dir.is_empty())
@@ -297,6 +299,7 @@ pub fn exec_env(id: &str, overrides: &HashMap<String, String>) -> Vec<String> {
     if !env.iter().any(|v| v.starts_with("PATH=")) {
         env.push(format!("PATH={DEFAULT_PATH}:{TOOLBOX_PATH}"));
     }
+    feos_utils::share::set_ssh_agent_env(&mut env);
     env
 }
 
@@ -322,7 +325,14 @@ mod tests {
         }));
         let p = process(dir.path(), &[], &HashMap::new()).unwrap();
         assert_eq!(p.args, ["/entry", "serve"]);
-        assert_eq!(p.env, ["PATH=/usr/bin:/feos-tools/bin", "A=1"]);
+        assert_eq!(
+            p.env,
+            [
+                "PATH=/usr/bin:/feos-tools/bin",
+                "A=1",
+                "SSH_AUTH_SOCK=/run/feos/ssh-agent.sock"
+            ]
+        );
         assert_eq!(p.cwd, "/app");
     }
 
@@ -337,7 +347,8 @@ mod tests {
             [
                 "B=2",
                 "A=9",
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/feos-tools/bin"
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/feos-tools/bin",
+                "SSH_AUTH_SOCK=/run/feos/ssh-agent.sock"
             ]
         );
         assert_eq!(p.cwd, "/");

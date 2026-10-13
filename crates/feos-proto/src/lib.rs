@@ -25,3 +25,12 @@ pub mod tool_service {
 pub mod watch_service {
     tonic::include_proto!("feos.watch.v1");
 }
+pub mod portforward_service {
+    tonic::include_proto!("feos.portforward.v1");
+}
+pub mod kube_service {
+    tonic::include_proto!("feos.kube.v1");
+}
+pub mod ssh_service {
+    tonic::include_proto!("feos.ssh.v1");
+}

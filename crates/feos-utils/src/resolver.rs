@@ -34,12 +34,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-/// The share directory: what every container sees, read-only, at
-/// [`SHARE_DEST`]. Its own directory on the /run tmpfs, never /run/feos
-/// itself, which holds FeOS's sockets.
-pub const SHARE_DIR: &str = "/run/feos/share";
-/// Where a container sees the share directory.
-pub const SHARE_DEST: &str = "/run/feos";
+pub use crate::share::{make_share_dir, SHARE_DEST, SHARE_DIR};
 /// What a container's /etc/resolv.conf links to.
 pub const CONTAINER_RESOLVER: &str = "/run/feos/resolv.conf";
 
@@ -113,16 +108,6 @@ fn publish_in(
         }
     }
     Ok(failed)
-}
-
-/// Creates the share directory if it is missing. 0755: a container process
-/// of any user has to read it, and only FeOS writes there.
-pub fn make_share_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o755)
-        .create(dir)
 }
 
 /// Makes `root`/etc/resolv.conf the managed link, for a container being

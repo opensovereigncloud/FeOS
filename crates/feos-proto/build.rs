@@ -16,6 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_dir}/feos/lifecycle/v1/lifecycle.proto"),
                 format!("{proto_dir}/feos/tool/v1/tool.proto"),
                 format!("{proto_dir}/feos/watch/v1/watch.proto"),
+                format!("{proto_dir}/feos/portforward/v1/portforward.proto"),
+                format!("{proto_dir}/feos/kube/v1/kube.proto"),
+                format!("{proto_dir}/feos/ssh/v1/ssh.proto"),
             ],
             &[proto_dir],
         )?;
