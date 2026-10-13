@@ -72,7 +72,7 @@ the codebase and in `git blame`, not only in the history.
 - Files move with `git mv`, so `git blame` follows them. `rustfmt.toml` keeps
   the 2021 style edition to avoid reformatting code nobody changed.
 - CI lints both profiles.
-- Next: port the sandbox system's guest functionality into the FeOS crates,
-  bring over the host-side components, and extract the shared building
-  blocks (vsock transport, sandboxing helpers, the helper control protocol)
-  into crates.
+- Next: port the sandbox system's guest functionality into the FeOS crates
+  (done, see ADR 0002), bring over the host-side components, and extract
+  the shared building blocks (vsock transport, sandboxing helpers, the
+  helper control protocol) into crates.

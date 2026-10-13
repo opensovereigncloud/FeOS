@@ -20,4 +20,6 @@ Hard rules:
 - **Keep authorship.** Use `git mv` to move files, and do not reformat code you
   are not otherwise changing.
 
-Before you commit: `make fmt-check clippy test-unit`.
+Before you commit: `make fmt-check clippy test-unit`. When you change what
+runs in the guest, also `make guest test-guest test-guest-container` (needs
+/dev/kvm, and sudo for the test network).

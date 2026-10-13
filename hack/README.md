@@ -53,6 +53,12 @@ the lifecycle uplink with `feosctl --address vsock:target/guest/run/v.sock`.
 It needs /dev/kvm and runs Firecracker with sudo when /dev/kvm is not
 writable.
 
+`make test-guest-container` also gives the guest a network: a bridge, a TAP
+device and NAT on this machine (with sudo, removed when the test ends). It
+pulls a busybox image in the guest and runs a container: exec, the tools,
+watches, port forwarding, kube and SSH offloading, and the adoption of the
+container after a reboot.
+
 ## Nested Virtualization Test Environment
 
 For integration tests of the `vm-service`, FeOS needs to run within a virtual machine that itself can run other VMs (e.g., cloud-hypervisor). This requires a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.

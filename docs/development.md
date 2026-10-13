@@ -11,18 +11,23 @@ other languages get their own top-level directory when they arrive.
 
 ```
 crates/
-  feos/                 PID 1: boot, wiring of the services
+  feos/                 PID 1: boot, wiring of the services, the task supervisor
   feos-proto/           generated gRPC code for proto/
-  feos-utils/           shared building blocks: logger, mounts, networking, dispatch
+  feos-utils/           shared building blocks: logger, mounts, reaper, vsock,
+                        resolvers, confined container file access, dispatch
   feosctl/              command-line client
   services/
-    container-service/  containers (API, persistence)
-    host-service/       host information, logs, power, upgrade, time
+    container-service/  containers: overlay roots, exec, adoption, persistence
+    host-service/       host information, logs, power, upgrade, time, network
+                        push, filesystem freezing, memory
     image-service/      OCI image pulls and the image store
-    task-service/       low-level container runtime
+    task-service/       the container runtime (libcontainer), its own process
     vm-service/         VMs through a Hypervisor trait (cloud-hypervisor)
+    tool-service/       guest: agent file and web tools on a container's files
+    watch-service/      guest: inotify subscriptions on a container's files
+    forward-service/    guest: port forwarding, kube and SSH credential offloading
 proto/feos/<api>/v1/    the gRPC APIs, package feos.<api>.v1
-hack/                   kernel, initramfs, UKI and VM tooling
+hack/                   kernel, initramfs, UKI, guest image and VM tooling
 docs/                   documentation and ADRs
 ```
 
@@ -38,8 +43,13 @@ docs/                   documentation and ADRs
   microVM whose host configures it. Its API listens on vsock port 10000, not
   on TCP, and once it is ready it dials the host (vsock port 10001) and holds
   a `LifecycleService.Attach` call open. A data volume, if the VM has one,
-  holds images and containers. None of the host-only code or dependencies
-  are in this binary.
+  holds images and containers. It also serves the tool, watch, port forward,
+  kube and SSH services for the agent in its containers. None of the
+  host-only code or dependencies are in this binary.
+
+PID 1 runs the container runtime in a process of its own, `feos
+--task-service`, and starts it again when it exits. See
+[ADR 0002](adr/0002-guest-profile.md) for the guest's API.
 
 Both serve the public API on `/run/feos/api.sock`. Features are additive: code
 that only the host needs sits behind `#[cfg(feature = "host")]`, in `feos` and
@@ -60,8 +70,10 @@ use) and `protoc`.
     make release-guest   # guest profile: target/x86_64-unknown-linux-musl/release-guest/feos
     make cli             # feosctl
 
-    make guest           # guest kernel and initramfs: target/guest/
-    make test-guest      # boot the guest under Firecracker and talk to it
+    make guest                 # guest kernel and initramfs: target/guest/
+    make test-guest            # boot the guest under Firecracker and talk to it
+    make test-guest-container  # run containers in the guest; needs sudo for a
+                               # bridge, a TAP device and NAT
 
 Build release artifacts per package (`cargo build -p <crate>`), never with
 `--workspace`: a workspace build unifies the features of all crates into every
