@@ -1,0 +1,122 @@
+#!/bin/bash
+# Boot the FeOS guest under Firecracker with a data volume and talk to it
+# from the host over vsock with feosctl.
+#
+#   hack/guest/test-vsock [timeout_seconds]
+#
+# Needs target/guest/{vmlinuz,initramfs.cpio.zst} (make guest), Firecracker
+# (make firecracker) and /dev/kvm; runs Firecracker with sudo when /dev/kvm
+# is not writable.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+GUEST_DIR="${REPO_ROOT}/target/guest"
+RUN_DIR="${GUEST_DIR}/run"
+FC="${FC:-${REPO_ROOT}/target/firecracker/firecracker}"
+KERNEL="${KERNEL:-${GUEST_DIR}/vmlinuz}"
+INITRD="${INITRD:-${GUEST_DIR}/initramfs.cpio.zst}"
+SERIAL_LOG="${RUN_DIR}/serial.log"
+VSOCK="${RUN_DIR}/v.sock"
+DATA_IMG="${RUN_DIR}/data.img"
+UPLINK_SEEN="${RUN_DIR}/uplink-seen"
+TIMEOUT="${1:-60}"
+FEOSCTL="${REPO_ROOT}/target/debug/feosctl"
+
+log() { printf '[test-vsock] %s\n' "$*"; }
+fail() { log "FAIL: $*"; tail -40 "${SERIAL_LOG}" >&2 || true; exit 1; }
+
+for f in "${FC}" "${KERNEL}" "${INITRD}"; do
+  [ -e "$f" ] || { log "missing $f"; exit 1; }
+done
+
+log "building feosctl"
+cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" -p feosctl
+
+mkdir -p "${RUN_DIR}"
+rm -f "${SERIAL_LOG}" "${VSOCK}" "${VSOCK}_10001" "${UPLINK_SEEN}" "${DATA_IMG}"
+
+# A sparse ext4 data volume; FeOS mounts it at /var/lib/feos.
+truncate -s 256M "${DATA_IMG}"
+/sbin/mkfs.ext4 -q -F "${DATA_IMG}"
+
+# Stand-in for the host's manager: FeOS dials vsock port 10001 once its
+# API is up, which Firecracker forwards to <uds>_10001. Record that the
+# connection carries an HTTP/2 client preface.
+python3 - "${VSOCK}_10001" "${UPLINK_SEEN}" <<'PY' &
+import socket, sys
+path, seen = sys.argv[1], sys.argv[2]
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(path)
+server.listen(8)
+while True:
+    conn, _ = server.accept()
+    if conn.recv(24, socket.MSG_WAITALL).startswith(b"PRI * HTTP/2.0"):
+        open(seen, "w").close()
+    conn.close()
+PY
+UPLINK_PID=$!
+
+cat > "${RUN_DIR}/config.json" <<JSON
+{
+  "boot-source": {
+    "kernel_image_path": "${KERNEL}",
+    "initrd_path": "${INITRD}",
+    "boot_args": "console=ttyS0 reboot=k panic=1 quiet"
+  },
+  "drives": [{"drive_id": "data", "path_on_host": "${DATA_IMG}", "is_root_device": false, "is_read_only": false}],
+  "machine-config": {"vcpu_count": 2, "mem_size_mib": 256},
+  "vsock": {"guest_cid": 3, "uds_path": "${VSOCK}"}
+}
+JSON
+
+SUDO=""
+[ -w /dev/kvm ] || SUDO="sudo"
+log "booting"
+${SUDO} "${FC}" --no-api --config-file "${RUN_DIR}/config.json" >"${SERIAL_LOG}" 2>&1 &
+FC_PID=$!
+cleanup() {
+  ${SUDO} kill "${FC_PID}" 2>/dev/null || true
+  kill "${UPLINK_PID}" 2>/dev/null || true
+  wait 2>/dev/null || true
+}
+trap cleanup EXIT
+
+end=$((SECONDS + TIMEOUT))
+until grep -q "listening on vsock port" "${SERIAL_LOG}" 2>/dev/null; do
+  [ ${SECONDS} -lt ${end} ] || fail "API not up within ${TIMEOUT}s"
+  kill -0 "${FC_PID}" 2>/dev/null || fail "Firecracker exited"
+  sleep 0.2
+done
+[ -z "${SUDO}" ] || ${SUDO} chmod 0666 "${VSOCK}"
+grep -q "Mounted data volume /dev/vda at /var/lib/feos" "${SERIAL_LOG}" || fail "data volume not mounted"
+log "API is up, data volume mounted"
+
+ctl() { "${FEOSCTL}" host --address "vsock:${VSOCK}" "$@"; }
+
+out="$(ctl ping)"; log "${out}"
+grep -q "tick=1 " <<<"${out}" || fail "first ping"
+
+now=$(date +%s)
+ctl set-time "${now}" >/dev/null
+guest_time="$(ctl get-time)"; log "guest time ${guest_time}"
+guest_s=$(date -d "${guest_time}" +%s)
+drift=$(( guest_s - now )); drift=${drift#-}
+[ "${drift}" -le 5 ] || fail "clock drift ${drift}s after set-time"
+
+out="$(ctl ping)"
+grep -q "tick=2 " <<<"${out}" || fail "tick did not advance: ${out}"
+
+out="$(ctl freeze)"; log "${out}"
+grep -q "(vda)" <<<"${out}" || fail "freeze"
+out="$(ctl thaw)"; log "${out}"
+grep -q "(vda)" <<<"${out}" || fail "thaw"
+
+ctl memory-breakdown | head -2
+
+until [ -e "${UPLINK_SEEN}" ]; do
+  [ ${SECONDS} -lt ${end} ] || fail "the guest never dialed the uplink"
+  sleep 0.2
+done
+log "uplink dialed the host"
+
+log "PASS"

@@ -60,6 +60,9 @@ use) and `protoc`.
     make release-guest   # guest profile: target/x86_64-unknown-linux-musl/release-guest/feos
     make cli             # feosctl
 
+    make guest           # guest kernel and initramfs: target/guest/
+    make test-guest      # boot the guest under Firecracker and talk to it
+
 Build release artifacts per package (`cargo build -p <crate>`), never with
 `--workspace`: a workspace build unifies the features of all crates into every
 binary.

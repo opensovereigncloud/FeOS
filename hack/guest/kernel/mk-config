@@ -1,0 +1,109 @@
+#!/bin/bash
+# Generate the guest kernel config: Firecracker's minimal microVM guest
+# config as the base, plus FeOS's changes (balloon, vsock, IPv4 only,
+# containers, no modules).
+#
+# Usage: hack/guest/kernel/mk-config <path-to-kernel-tree>
+# Writes config/feos-guest-linux-<VERSION>.config next to this script.
+set -euo pipefail
+
+KERNEL_TREE=${1:?usage: mk-config <kernel-tree>}
+thisDir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${thisDir}/config.sh"
+
+CFG_DIR="${thisDir}/config"
+mkdir -p "${CFG_DIR}"
+BASE_CFG="$(mktemp)"
+
+echo "[mk-config] downloading Firecracker guest config → adapt onto ${KERNEL_VERSION}"
+curl -sSfL "${FC_GUEST_CONFIG_URL}" -o "${BASE_CFG}"
+cp "${BASE_CFG}" "${KERNEL_TREE}/.config"
+
+apply() {
+  "${KERNEL_TREE}/scripts/config" --file "${KERNEL_TREE}/.config" "$@"
+}
+
+# ── FeOS changes on top of the Firecracker guest config ─────────────────────
+# virtio: mmio (firecracker classic, pci=off) + all four devices, built-in
+apply --enable  VIRTIO --enable VIRTIO_MMIO --enable VIRTIO_MMIO_CMDLINE_DEVICES
+apply --enable  VIRTIO_BLK --enable VIRTIO_NET
+apply --enable  VIRTIO_BALLOON            # required: memory hand-back for snapshots
+apply --enable  BALLOON_COMPACTION
+apply --enable  VSOCKETS --enable VSOCKETS_LOOPBACK --enable VIRTIO_VSOCKETS
+
+# The guest OS ships as an initramfs (cpio.zst). There is no root disk; the
+# only block device is the data volume.
+apply --enable  DEVTMPFS --enable DEVTMPFS_MOUNT
+apply --enable  EXT4_FS
+apply --enable  BLK_DEV_INITRD
+apply --enable  RD_ZSTD                   # initramfs is zstd-compressed
+
+# IPv4 only
+apply --disable IPV6
+apply --disable RTC_HCTOSYS               # the host pushes the time
+
+# containers
+apply --enable  NAMESPACES --enable UTS_NS --enable IPC_NS --enable PID_NS \
+      --enable  NET_NS --enable USER_NS
+apply --enable  CGROUPS --enable MEMCG --enable CGROUP_SCHED --enable CPUSETS \
+      --enable  CGROUP_PIDS --enable CGROUP_DEVICE
+apply --enable  OVERLAY_FS
+apply --enable  SECCOMP --enable SECCOMP_FILTER
+
+# no modules: everything built-in
+apply --disable MODULES
+
+# introspectability for debugging/tuning
+apply --enable  IKCONFIG --enable IKCONFIG_PROC
+
+# ── boot-time diet: drop subsystems the guest never uses ────────────────────
+# (the Firecracker CI base config carries a lot of legacy baggage)
+# Two independent groups for bisecting: DIET=0 disables both,
+# DIET_FS=0 / DIET_DEV=0 disable each half.
+DIET="${DIET:-1}"
+DIET_FS="${DIET_FS:-${DIET}}"
+DIET_DEV="${DIET_DEV:-${DIET}}"
+DIET_DEV1="${DIET_DEV1:-${DIET_DEV}}"   # bus/serial/net-toggles
+DIET_DEV2="${DIET_DEV2:-${DIET_DEV}}"   # cosmetic devices (drm/usb/sound/…)
+if [ "${DIET_FS}" = "1" ]; then
+# network filesystems / RPC (inet_init+sunrpc+nfs ≈ 100 ms of initcalls)
+apply --disable NFS_FS --disable ROOT_NFS --disable SUNRPC --disable CIFS
+# iSCSI / SCSI (virtio-blk only, no SCSI stack)
+apply --disable ISCSI_TCP --disable SCSI_ISCSI_ATTRS --disable SCSI
+# filesystems we never mount
+apply --disable XFS_FS --disable SQUASHFS --disable FUSE_FS \
+      --disable ISO9660_FS --disable UDF_FS --disable GFS2_FS \
+      --disable OCFS2_FS --disable BTRFS_FS --disable REISERFS_FS \
+      --disable JFS_FS --disable NTFS_FS
+# quotas + fs-level encryption
+apply --disable QUOTA --disable FS_ENCRYPTION
+fi
+if [ "${DIET_DEV1}" = "1" ]; then
+# legacy bus: PnP (PCI stays ON: VIRTIO_PCI_LIB deps cascade badly and, as
+# bisected, disabling PCI breaks probing of mmio virtio devices → -EINVAL)
+apply --disable PNP --disable PNPACPI
+apply --disable SERIAL_8250_PNP --disable SERIAL_8250_PCI --disable SERIAL_8250_PCILIB
+# IPv4 push config: no DHCP/bootp/rarp autoconfig, no NetLabel
+apply --disable IP_PNP --disable NETLABEL
+fi
+if [ "${DIET_DEV2}" = "1" ]; then
+# huge pages (containers use plain anon memory)
+apply --disable HUGETLBFS --disable HUGETLB_PAGE --disable CGROUP_HUGETLB
+# PPS, thermal governors, vmclock PTP (the host pushes the time)
+apply --disable PPS --disable PTP_1588_CLOCK_VMCLOCK --disable THERMAL
+# no consoles/GPUs/HID/USB in a microVM
+apply --disable VGA_CONSOLE --disable FB --disable DRM --disable SOUND \
+      --disable USB --disable MEDIA_SUPPORT --disable WIRELESS --disable WLAN \
+      --disable BT --disable INFINIBAND
+fi
+# smaller kernel image
+apply --enable  KERNEL_ZSTD
+
+pushd "${KERNEL_TREE}" >/dev/null
+make olddefconfig >/dev/null
+popd >/dev/null
+
+cp "${KERNEL_TREE}/.config" "${CFG_DIR}/${KERNEL_CONFIG}"
+rm -f "${BASE_CFG}"
+echo "[mk-config] wrote ${CFG_DIR}/${KERNEL_CONFIG}"
+echo "[mk-config] drivers/menu stats: $(grep -c '=y' "${CFG_DIR}/${KERNEL_CONFIG}") enabled / $(grep -c 'is not set' "${CFG_DIR}/${KERNEL_CONFIG}") disabled options"

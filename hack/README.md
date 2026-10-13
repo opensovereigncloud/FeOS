@@ -31,6 +31,28 @@ To test feos locally, you can execute `make run` to compile and run feos locally
     make run
 
 
+## Guest image (Firecracker)
+
+The guest profile of FeOS runs as PID 1 in a Firecracker microVM, booted
+directly from a kernel and an initramfs, without a root disk:
+
+    make guest          # target/guest/vmlinuz and target/guest/initramfs.cpio.zst
+    make test-guest     # downloads Firecracker, boots the guest, talks to it over vsock
+
+The guest kernel (`hack/guest/kernel`) starts from Firecracker's minimal
+microVM config with FeOS's changes on top: virtio-mmio devices, balloon and
+vsock, IPv4 only, no modules, no RTC sync. `make guest-kernel-config`
+regenerates it. The initramfs (`hack/guest/rootfs/mk-rootfs`) holds FeOS in
+the guest profile as `/init` and a static uutils coreutils that containers
+get as a toolbox. Kernel, Firecracker and coreutils downloads are pinned by
+sha256. Builds run natively, without the build container and without root.
+
+`make test-guest` attaches a data volume, which FeOS mounts at
+/var/lib/feos, and checks the vsock API, the clock, filesystem freezing and
+the lifecycle uplink with `feosctl --address vsock:target/guest/run/v.sock`.
+It needs /dev/kvm and runs Firecracker with sudo when /dev/kvm is not
+writable.
+
 ## Nested Virtualization Test Environment
 
 For integration tests of the `vm-service`, FeOS needs to run within a virtual machine that itself can run other VMs (e.g., cloud-hypervisor). This requires a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.

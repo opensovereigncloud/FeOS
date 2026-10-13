@@ -7,6 +7,8 @@ include hack/cloud-hypervisor/make.mk
 include hack/cloud-hypervisor-firmware/make.mk
 include hack/youki/make.mk
 include hack/uki/make.mk
+include hack/firecracker/make.mk
+include hack/guest/make.mk
 
 container-release:
 #	make cargo index cache

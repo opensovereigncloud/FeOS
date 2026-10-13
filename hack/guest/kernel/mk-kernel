@@ -1,0 +1,46 @@
+#!/bin/bash
+# Build the guest kernel: one bzImage, everything built in, no modules.
+#
+#   hack/guest/kernel/mk-kernel
+#
+# Output: target/guest/vmlinuz. Downloads are cached in
+# target/guest/kernel-cache/.
+set -euo pipefail
+
+thisDir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+REPO_ROOT="$(cd "${thisDir}/../../.." && pwd)"
+source "${thisDir}/config.sh"
+
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/target/guest}"
+CACHE="${OUT_DIR}/kernel-cache"
+TREE="${CACHE}/linux-${KERNEL_VERSION}"
+TARBALL="${CACHE}/linux-${KERNEL_VERSION}.tar.xz"
+URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}/linux-${KERNEL_VERSION}.tar.xz"
+
+mkdir -p "${CACHE}"
+
+if ! echo "${KERNEL_SHA256}  ${TARBALL}" | sha256sum -c - >/dev/null 2>&1; then
+  echo "[mk-kernel] downloading ${URL}"
+  curl -fsSL "${URL}" -o "${TARBALL}"
+  echo "${KERNEL_SHA256}  ${TARBALL}" | sha256sum -c -
+  rm -rf "${TREE}"
+fi
+
+if [ ! -d "${TREE}" ]; then
+  echo "[mk-kernel] extracting linux-${KERNEL_VERSION}"
+  tar -C "${CACHE}" -xf "${TARBALL}"
+fi
+
+CFG="${thisDir}/config/${KERNEL_CONFIG}"
+if [ ! -f "${CFG}" ]; then
+  echo "[mk-kernel] no ${CFG} yet, generating it from the Firecracker base"
+  "${thisDir}/mk-config" "${TREE}"
+fi
+cp "${CFG}" "${TREE}/.config"
+
+echo "[mk-kernel] building bzImage (linux ${KERNEL_VERSION})"
+make -C "${TREE}" olddefconfig
+make -C "${TREE}" -j"$(nproc)" bzImage
+
+cp "${TREE}/arch/x86/boot/bzImage" "${OUT_DIR}/vmlinuz"
+echo "[mk-kernel] done: ${OUT_DIR}/vmlinuz ($(du -h "${OUT_DIR}/vmlinuz" | cut -f1))"
