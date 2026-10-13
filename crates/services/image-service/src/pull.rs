@@ -18,9 +18,10 @@
 use crate::error::ImageServiceError;
 use crate::unpack::unpack_layer;
 use log::{info, warn};
+use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::{self, OciDescriptor};
 use oci_client::secrets::RegistryAuth;
-use oci_client::{client::ClientConfig, Client, Reference};
+use oci_client::{Client, Reference};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,6 +83,34 @@ fn classify(media_type: &str) -> Result<Layer, ImageServiceError> {
     })
 }
 
+/// HTTPS, except for a registry on the loopback interface, which may speak
+/// plain HTTP, as docker allows: a local registry for development and tests.
+fn client_config(reference: &Reference) -> ClientConfig {
+    let registry = reference.resolve_registry();
+    let protocol = if is_loopback(registry) {
+        ClientProtocol::HttpsExcept(vec![registry.to_string()])
+    } else {
+        ClientProtocol::Https
+    };
+    ClientConfig {
+        protocol,
+        ..Default::default()
+    }
+}
+
+/// Whether a registry's host ("host", "host:port", "[v6]:port") is this
+/// machine.
+fn is_loopback(registry: &str) -> bool {
+    let host = match registry.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => registry.split(':').next().unwrap_or_default(),
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Normalizes a reference the way docker does: "debian:13" becomes
 /// "docker.io/library/debian:13", a missing tag becomes ":latest".
 pub fn normalize_ref(image_ref: &str) -> Result<String, ImageServiceError> {
@@ -94,7 +123,7 @@ pub fn normalize_ref(image_ref: &str) -> Result<String, ImageServiceError> {
 /// `dest/initramfs` and `dest/vmlinuz`.
 pub async fn pull_image(image_ref: &str, dest: &Path) -> Result<Pulled, ImageServiceError> {
     let reference = Reference::try_from(image_ref)?;
-    let client = Arc::new(Client::new(ClientConfig::default()));
+    let client = Arc::new(Client::new(client_config(&reference)));
 
     info!("ImagePuller: pulling manifest and config for {image_ref}");
     let (manifest, _digest, config) = retry("manifest", || {
@@ -461,5 +490,30 @@ mod tests {
         assert!(pulled.size_bytes > 0);
         assert!(dest.path().join("rootfs/bin/busybox").is_file());
         assert!(!dest.path().join("layer.1.blob").exists());
+    }
+
+    #[test]
+    fn only_loopback_registries_may_speak_http() {
+        for registry in [
+            "localhost",
+            "localhost:5000",
+            "127.0.0.1:5000",
+            "[::1]:5000",
+        ] {
+            assert!(is_loopback(registry), "{registry}");
+        }
+        for registry in [
+            "ghcr.io",
+            "docker.io",
+            "10.0.0.1:5000",
+            "localhost.example.com",
+        ] {
+            assert!(!is_loopback(registry), "{registry}");
+        }
+        let reference = Reference::try_from("127.0.0.1:5000/feos/guest:test").unwrap();
+        assert!(matches!(
+            client_config(&reference).protocol,
+            ClientProtocol::HttpsExcept(ref hosts) if hosts == &["127.0.0.1:5000".to_string()]
+        ));
     }
 }
