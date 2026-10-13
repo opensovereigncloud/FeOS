@@ -19,6 +19,7 @@ use tonic::transport::Server;
 /// Serves the task service on the Unix socket `socket` until the server
 /// fails. Call once, in a tokio runtime of its own process.
 pub async fn serve(socket: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    die_with_parent()?;
     nix::sys::prctl::set_child_subreaper(true)?;
     feos_utils::reaper::spawn();
     std::fs::create_dir_all(RUNTIME_STATE_DIR)?;
@@ -36,5 +37,22 @@ pub async fn serve(socket: &str) -> Result<(), Box<dyn std::error::Error + Send 
         .add_service(TaskServiceServer::new(TaskApiHandler::new(dispatcher_tx)))
         .serve_with_incoming(UnixListenerStream::new(listener))
         .await?;
+    Ok(())
+}
+
+/// Ends this process when the FeOS that started it ends, unless that is
+/// PID 1: PID 1 never ends, and after a live upgrade the new binary keeps
+/// the task service. Without this, a FeOS run as an ordinary process (a
+/// test, `make run`) would leave the task service behind.
+fn die_with_parent() -> nix::Result<()> {
+    let parent = nix::unistd::getppid();
+    if parent.as_raw() == 1 {
+        return Ok(());
+    }
+    nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGTERM)?;
+    // The parent may have ended before the signal was armed.
+    if nix::unistd::getppid() != parent {
+        std::process::exit(0);
+    }
     Ok(())
 }
