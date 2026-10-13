@@ -110,22 +110,29 @@ impl Dispatcher {
                 }
             }
             Command::Delete { req, responder } => {
-                let id = req.container_id.clone();
-                match self.containers.get(&id) {
-                    Some(container) if container.status != Status::Running => {
-                        tokio::spawn(worker::handle_delete(req, self.event_tx.clone(), responder));
-                    }
-                    Some(container) => {
-                        let _ = responder.send(Err(TaskError::InvalidState {
-                            id,
-                            current_state: container.status,
-                            required_states: vec![Status::Created, Status::Stopped],
-                        }));
-                    }
-                    None => {
-                        let _ = responder.send(Err(TaskError::ContainerNotFound(id)));
-                    }
-                }
+                // The runtime kills a container that still runs. A container
+                // the dispatcher does not know may still have runtime state,
+                // e.g. from before a restart of the task service.
+                tokio::spawn(worker::handle_delete(req, self.event_tx.clone(), responder));
+            }
+            Command::ExecTarget {
+                container_id,
+                responder,
+            } => {
+                let result = match self.containers.get(&container_id) {
+                    Some(Container {
+                        status: Status::Running,
+                        pid: Some(pid),
+                        ..
+                    }) => Ok(*pid),
+                    Some(container) => Err(TaskError::InvalidState {
+                        id: container_id,
+                        current_state: container.status,
+                        required_states: vec![Status::Running],
+                    }),
+                    None => Err(TaskError::ContainerNotFound(container_id)),
+                };
+                let _ = responder.send(result);
             }
             Command::Wait { req, responder } => {
                 let id = req.container_id;

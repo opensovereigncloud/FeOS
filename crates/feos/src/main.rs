@@ -4,7 +4,7 @@
 use anyhow::Result;
 use clap::Parser;
 use feos_utils::filesystem::{get_root_fstype, move_root};
-use main_server::run_server;
+use main_server::{run_server, run_task_service};
 use nix::sys::prctl;
 use nix::unistd::{execv, pause};
 use std::env;
@@ -15,6 +15,11 @@ use std::ffi::CString;
 struct ServerArgs {
     #[arg(long, hide = true)]
     restarted_after_upgrade: bool,
+
+    /// Run the task service, the process FeOS starts for the container
+    /// runtime.
+    #[arg(long, hide = true)]
+    task_service: bool,
 }
 
 #[tokio::main]
@@ -48,6 +53,10 @@ async fn run() -> Result<()> {
         ServerArgs::default()
     });
 
+    if args.task_service {
+        return run_task_service().await;
+    }
+
     if std::process::id() == 1 {
         let root_fstype = get_root_fstype().unwrap_or_else(|e| {
             eprintln!("[feos] Failed to get root fstype: {e}");
@@ -72,6 +81,9 @@ async fn run() -> Result<()> {
             )
         })?;
     }
+
+    // PID 1 and subreapers inherit orphans; reap them.
+    feos_utils::reaper::spawn();
 
     run_server(args.restarted_after_upgrade).await
 }

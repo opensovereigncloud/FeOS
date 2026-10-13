@@ -68,6 +68,8 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
     unsafe {
         env::set_var("DATABASE_URL", &db_url);
         env::set_var("CONTAINER_DATABASE_URL", &container_db_url);
+        // FeOS runs inside this test binary; the task service needs the real one.
+        env::set_var("FEOS_TASK_SERVICE_BINARY", env!("CARGO_BIN_EXE_feos"));
     }
     info!("Using temporary database for tests: {db_url}");
     info!("Using temporary container database for tests: {container_db_url}");

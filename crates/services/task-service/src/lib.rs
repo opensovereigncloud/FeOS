@@ -7,6 +7,8 @@ use tokio::sync::oneshot;
 pub mod api;
 pub mod dispatcher;
 pub mod error;
+pub mod exec;
+pub mod server;
 pub mod worker;
 
 pub use feos_proto::task_service::{
@@ -15,6 +17,9 @@ pub use feos_proto::task_service::{
 };
 
 pub const TASK_SERVICE_SOCKET: &str = "/run/feos/task.sock";
+/// libcontainer's state of each container. In RAM: a reboot ends every
+/// container.
+pub const RUNTIME_STATE_DIR: &str = "/run/feos/containers";
 
 #[derive(Debug)]
 pub struct Container {
@@ -54,6 +59,11 @@ pub enum Command {
     Wait {
         req: WaitRequest,
         responder: oneshot::Sender<Result<WaitResponse, TaskError>>,
+    },
+    /// The init pid of a running container, to exec in.
+    ExecTarget {
+        container_id: String,
+        responder: oneshot::Sender<Result<i32, TaskError>>,
     },
 }
 

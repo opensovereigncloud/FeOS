@@ -8,6 +8,7 @@ pub mod fs;
 pub mod host;
 #[cfg(feature = "host")]
 pub mod network;
+pub mod reaper;
 pub mod resolver;
 pub mod version;
 pub mod vsock;

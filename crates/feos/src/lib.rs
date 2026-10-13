@@ -4,6 +4,7 @@
 #[cfg(feature = "guest")]
 mod guest;
 mod setup;
+mod task_supervisor;
 
 use anyhow::{Context, Result};
 use host_service::RestartSignal;
@@ -66,7 +67,7 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     let host_service = initialize_host_service(restart_tx.clone(), log_handle, boot_info);
 
     let image_service = initialize_image_service().await?;
-    let task_service = initialize_task_service().await?;
+    task_supervisor::start().await;
 
     let api_uds_stream = bind_unix_socket(API_SOCKET).await?;
     let api_unix_socket_server = Server::builder()
@@ -100,11 +101,6 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
         .add_service(image_service)
         .serve_with_incoming(image_uds_stream);
 
-    let task_uds_stream = bind_unix_socket(TASK_SERVICE_SOCKET).await?;
-    let task_unix_socket_server = Server::builder()
-        .add_service(task_service)
-        .serve_with_incoming(task_uds_stream);
-
     info!("Main: Public gRPC Server listening on Unix socket {API_SOCKET}");
     #[cfg(feature = "guest")]
     info!(
@@ -114,7 +110,6 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     #[cfg(feature = "host")]
     info!("Main: Public gRPC Server listening on {tcp_addr}");
     info!("Main: Internal ImageService listening on Unix socket {IMAGE_SERVICE_SOCKET}");
-    info!("Main: Internal TaskService listening on Unix socket {TASK_SERVICE_SOCKET}");
 
     // Tell the host that the guest is ready. The listeners are bound, so the
     // host's first call lands in their backlog.
@@ -125,8 +120,7 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
         api_unix_socket_server,
         vsock_server,
         tcp_server,
-        image_unix_socket_server,
-        task_unix_socket_server
+        image_unix_socket_server
     );
 
     // Serve until one of the servers stops. A failed upgrade leaves the
@@ -157,12 +151,6 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
                 }
                 break;
             },
-            res = &mut task_unix_socket_server => {
-                if let Err(e) = res {
-                    error!("Task unix socket server failed: {e}");
-                }
-                break;
-            },
             Some(RestartSignal(new_binary_path)) = restart_rx.recv() => {
                 if let Err(e) = handle_upgrade(&new_binary_path) {
                     error!("Upgrade failed: {e}");
@@ -172,6 +160,18 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     }
 
     anyhow::bail!("a gRPC server stopped serving")
+}
+
+/// The task service process, `feos --task-service`, which run_server starts.
+pub async fn run_task_service() -> Result<()> {
+    feos_utils::feos_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .max_history(150)
+        .init()
+        .context("logger")?;
+    task_service::server::serve(TASK_SERVICE_SOCKET)
+        .await
+        .map_err(|e| anyhow::anyhow!("task service: {e}"))
 }
 
 /// Binds a Unix socket, creating its directory and replacing a stale socket.

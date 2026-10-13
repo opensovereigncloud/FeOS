@@ -19,8 +19,11 @@ pub enum TaskError {
         required_states: Vec<crate::Status>,
     },
 
-    #[error("Youki command failed: {0}")]
-    YoukiCommand(String),
+    #[error("Container runtime failed: {0}")]
+    Runtime(String),
+
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
 
     #[error("An internal error occurred: {0}")]
     Internal(String),
@@ -48,7 +51,8 @@ impl From<TaskError> for Status {
             } => Status::failed_precondition(format!(
                 "Invalid state for operation on container '{id}': current state is {current_state:?}, required one of {required_states:?}"
             )),
-            TaskError::YoukiCommand(msg) | TaskError::Internal(msg) => Status::internal(msg),
+            TaskError::Runtime(msg) | TaskError::Internal(msg) => Status::internal(msg),
+            TaskError::InvalidArgument(msg) => Status::invalid_argument(msg),
             TaskError::Io(msg) => Status::internal(format!("I/O error: {msg}")),
         }
     }

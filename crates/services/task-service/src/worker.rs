@@ -1,49 +1,84 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+//! The container runtime: youki's libcontainer, as a library. Its calls
+//! block on the filesystem and on processes it forks, so they run on the
+//! blocking pool.
+
 use crate::error::TaskError;
-use crate::Event;
+use crate::{Event, RUNTIME_STATE_DIR};
 use feos_proto::task_service::{
     CreateRequest, CreateResponse, DeleteRequest, DeleteResponse, KillRequest, KillResponse,
     StartRequest, StartResponse,
 };
-use log::{debug, error, info, warn};
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::Pid;
-use std::process::Stdio;
-use tokio::process::Command;
+use libcontainer::container::builder::ContainerBuilder;
+use libcontainer::container::{Container, ContainerStatus};
+use libcontainer::signal::Signal;
+use libcontainer::syscall::syscall::SyscallType;
+use log::{error, info, warn};
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 use tokio::sync::{mpsc, oneshot};
 
-const YOUKI_BIN: &str = "youki";
-
-async fn run_youki_command(args: &[&str]) -> Result<(), TaskError> {
-    info!(
-        "Worker: Executing short-lived command: {} {}",
-        YOUKI_BIN,
-        args.join(" ")
-    );
-
-    let output = Command::new(YOUKI_BIN)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+/// Runs `f` on the blocking pool.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, TaskError> + Send + 'static,
+) -> Result<T, TaskError> {
+    tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| TaskError::YoukiCommand(format!("Failed to execute youki process: {e}")))?;
+        .map_err(|e| TaskError::Internal(format!("runtime task: {e}")))?
+}
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let err_msg = format!(
-            "youki exited with code {}: stderr='{}', stdout='{}'",
-            output.status, stderr, stdout
+fn load(id: &str) -> Result<Container, TaskError> {
+    Container::load(Path::new(RUNTIME_STATE_DIR).join(id))
+        .map_err(|e| TaskError::Runtime(format!("load container {id}: {e}")))
+}
+
+/// Where a container's stdout or stderr goes: appended to `path`, or
+/// discarded when it is empty.
+fn output(path: &str) -> Result<File, TaskError> {
+    let path = if path.is_empty() { "/dev/null" } else { path };
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| TaskError::Io(format!("{path}: {e}")))
+}
+
+/// Creates the container from its bundle; returns the pid of its init
+/// process, which waits for Start.
+fn create(req: &CreateRequest) -> Result<i32, TaskError> {
+    let state = Path::new(RUNTIME_STATE_DIR).join(&req.container_id);
+    if state.exists() {
+        // Runtime state the dispatcher does not know: left from a task
+        // service that restarted. Running containers are not touched.
+        let mut stale = load(&req.container_id)?;
+        if stale.status() == ContainerStatus::Running {
+            return Err(TaskError::ContainerAlreadyExists(req.container_id.clone()));
+        }
+        warn!(
+            "Worker: Removing stale runtime state of {}",
+            req.container_id
         );
-        error!("Worker: {err_msg}");
-        return Err(TaskError::YoukiCommand(err_msg));
+        stale
+            .delete(true)
+            .map_err(|e| TaskError::Runtime(format!("remove stale state: {e}")))?;
     }
 
-    debug!("Worker: Youki command successful.");
-    Ok(())
+    std::fs::create_dir_all(RUNTIME_STATE_DIR)?;
+    let container = ContainerBuilder::new(req.container_id.clone(), SyscallType::Linux)
+        .with_root_path(RUNTIME_STATE_DIR)
+        .map_err(|e| TaskError::Runtime(format!("runtime state directory: {e}")))?
+        .with_stdout(output(&req.stdout_path)?)
+        .with_stderr(output(&req.stderr_path)?)
+        .as_init(&req.bundle_path)
+        .with_systemd(false)
+        .build()
+        .map_err(|e| TaskError::Runtime(format!("create {}: {e}", req.container_id)))?;
+    container
+        .pid()
+        .map(|pid| pid.as_raw())
+        .ok_or_else(|| TaskError::Internal("created container has no pid".to_string()))
 }
 
 pub async fn handle_create(
@@ -52,103 +87,22 @@ pub async fn handle_create(
     responder: oneshot::Sender<Result<CreateResponse, TaskError>>,
 ) {
     let id = req.container_id.clone();
-    let pid_file = format!("{}/container.pid", req.bundle_path);
-
-    let args = &[
-        "create",
-        "--bundle",
-        &req.bundle_path,
-        "--pid-file",
-        &pid_file,
-        &id,
-    ];
-
-    info!(
-        "Worker: Spawning youki create command: {} {}",
-        YOUKI_BIN,
-        args.join(" ")
-    );
-
-    let child_result = Command::new(YOUKI_BIN)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    let mut child = match child_result {
-        Ok(child) => child,
-        Err(e) => {
-            let err = TaskError::YoukiCommand(format!("Failed to spawn youki create: {e}"));
-            let _ = event_tx
-                .send(Event::ContainerCreateFailed {
-                    id,
-                    error: err.clone(),
-                })
-                .await;
-            let _ = responder.send(Err(err));
-            return;
-        }
-    };
-
-    let status = match child.wait().await {
-        Ok(status) => status,
-        Err(e) => {
-            let err =
-                TaskError::YoukiCommand(format!("Failed to wait for youki create process: {e}"));
-            let _ = event_tx
-                .send(Event::ContainerCreateFailed {
-                    id,
-                    error: err.clone(),
-                })
-                .await;
-            let _ = responder.send(Err(err));
-            return;
-        }
-    };
-
-    if !status.success() {
-        let err = TaskError::YoukiCommand(format!(
-            "youki create exited with non-zero status: {status}"
-        ));
-        let _ = event_tx
-            .send(Event::ContainerCreateFailed {
-                id,
-                error: err.clone(),
-            })
-            .await;
-        let _ = responder.send(Err(err));
-        return;
-    }
-
-    let result: Result<i32, TaskError> = async {
-        let pid_str = tokio::fs::read_to_string(&pid_file)
-            .await
-            .map_err(|e| TaskError::Internal(format!("Could not read pid file: {e}")))?;
-        let pid = pid_str
-            .trim()
-            .parse::<i32>()
-            .map_err(|e| TaskError::Internal(format!("Failed to parse PID from file: {e}")))?;
-        tokio::fs::remove_file(&pid_file)
-            .await
-            .map_err(|e| TaskError::Internal(format!("Could not remove pid file: {e}")))?;
-        Ok(pid)
-    }
-    .await;
-
-    match result {
+    info!("Worker: Creating container {id} from {}", req.bundle_path);
+    match blocking(move || create(&req)).await {
         Ok(pid) => {
-            info!("Worker: Got actual container PID {pid} for '{id}' from pid-file");
+            info!("Worker: Created container {id} with init pid {pid}");
             let _ = event_tx.send(Event::ContainerCreated { id, pid }).await;
-            let _ = responder.send(Ok(CreateResponse { pid: pid as i64 }));
+            let _ = responder.send(Ok(CreateResponse { pid: pid.into() }));
         }
-        Err(e) => {
+        Err(error) => {
+            error!("Worker: Failed to create container {id}: {error}");
             let _ = event_tx
                 .send(Event::ContainerCreateFailed {
                     id,
-                    error: e.clone(),
+                    error: error.clone(),
                 })
                 .await;
-            let _ = responder.send(Err(e));
+            let _ = responder.send(Err(error));
         }
     }
 }
@@ -160,35 +114,52 @@ pub async fn handle_start(
     responder: oneshot::Sender<Result<StartResponse, TaskError>>,
 ) {
     let id = req.container_id.clone();
-    let result = run_youki_command(&["start", &id]).await;
+    let result = blocking(move || {
+        load(&req.container_id)?
+            .start()
+            .map_err(|e| TaskError::Runtime(format!("start {}: {e}", req.container_id)))
+    })
+    .await;
 
     match result {
-        Ok(_) => {
+        Ok(()) => {
             let _ = event_tx
                 .send(Event::ContainerStarted { id: id.clone() })
                 .await;
             let _ = responder.send(Ok(StartResponse {}));
             tokio::spawn(wait_for_process_exit(id, pid, event_tx));
         }
-        Err(e) => {
+        Err(error) => {
             let _ = event_tx
                 .send(Event::ContainerStartFailed {
                     id,
-                    error: e.clone(),
+                    error: error.clone(),
                 })
                 .await;
-            let _ = responder.send(Err(e));
+            let _ = responder.send(Err(error));
         }
     }
+}
+
+fn signal(number: u32) -> Result<Signal, TaskError> {
+    i32::try_from(number)
+        .ok()
+        .and_then(|n| Signal::try_from(n).ok())
+        .ok_or_else(|| TaskError::InvalidArgument(format!("invalid signal {number}")))
 }
 
 pub async fn handle_kill(
     req: KillRequest,
     responder: oneshot::Sender<Result<KillResponse, TaskError>>,
 ) {
-    let signal = req.signal.to_string();
-    let result = run_youki_command(&["kill", &req.container_id, &signal]).await;
-    let _ = responder.send(result.map(|_| KillResponse {}));
+    let result = blocking(move || {
+        let signal = signal(req.signal)?;
+        load(&req.container_id)?
+            .kill(signal, true)
+            .map_err(|e| TaskError::Runtime(format!("kill {}: {e}", req.container_id)))
+    })
+    .await;
+    let _ = responder.send(result.map(|()| KillResponse {}));
 }
 
 pub async fn handle_delete(
@@ -197,51 +168,57 @@ pub async fn handle_delete(
     responder: oneshot::Sender<Result<DeleteResponse, TaskError>>,
 ) {
     let id = req.container_id.clone();
-    let result = run_youki_command(&["delete", "--force", &id]).await;
+    let result = blocking(move || {
+        let mut container = match load(&req.container_id) {
+            Ok(container) => container,
+            // Nothing left to delete.
+            Err(_)
+                if !Path::new(RUNTIME_STATE_DIR)
+                    .join(&req.container_id)
+                    .exists() =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        // force: a running container is killed first.
+        container
+            .delete(true)
+            .map_err(|e| TaskError::Runtime(format!("delete {}: {e}", req.container_id)))
+    })
+    .await;
 
-    if let Err(e) = result {
-        let _ = responder.send(Err(e));
+    if let Err(error) = result {
+        let _ = responder.send(Err(error));
         return;
     }
-
     let _ = event_tx.send(Event::ContainerDeleted { id }).await;
     let _ = responder.send(Ok(DeleteResponse {}));
 }
 
+/// Reports the exit of a container's init process. The reaper owns
+/// waitpid in this process.
 pub async fn wait_for_process_exit(id: String, pid: i32, event_tx: mpsc::Sender<Event>) {
-    info!("Worker: Background task started, waiting for PID {pid} ({id}) to exit");
-    let pid_obj = Pid::from_raw(pid);
-
-    let wait_result = waitpid(pid_obj, None);
-
-    let status = match wait_result {
-        Ok(status) => status,
-        Err(e) => {
-            error!("Worker: waitpid failed for PID {pid}: {e}");
-            return;
-        }
-    };
-
-    let exit_code = match status {
-        WaitStatus::Exited(_, code) => {
-            info!("Worker: Process {pid} ({id}) exited with code {code}");
-            code
-        }
-        WaitStatus::Signaled(_, signal, _) => {
-            info!("Worker: Process {pid} ({id}) was terminated by signal {signal}");
-            128 + (signal as i32)
-        }
-        _ => {
-            warn!("Worker: Process {pid} ({id}) ended with unexpected status: {status:?}");
-            255
-        }
-    };
-
+    info!("Worker: Waiting for container {id} (pid {pid}) to exit");
+    let exit_code = feos_utils::reaper::wait_for_exit(pid).await;
+    info!("Worker: Container {id} (pid {pid}) exited with code {exit_code}");
     if event_tx
         .send(Event::ContainerStopped { id, exit_code })
         .await
         .is_err()
     {
         error!("Worker: Failed to send ContainerStopped event. Dispatcher may be down.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_numbers_are_checked() {
+        assert!(signal(9).is_ok());
+        assert!(signal(0).is_err());
+        assert!(signal(u32::MAX).is_err());
     }
 }

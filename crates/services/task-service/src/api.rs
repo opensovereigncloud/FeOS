@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::exec::{self, ExecStream};
 use crate::Command;
 use feos_proto::task_service::{
     task_service_server::TaskService, CreateRequest, CreateResponse, DeleteRequest, DeleteResponse,
-    KillRequest, KillResponse, StartRequest, StartResponse, WaitRequest, WaitResponse,
+    ExecRequest, KillRequest, KillResponse, StartRequest, StartResponse, WaitRequest, WaitResponse,
 };
 use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
 pub struct TaskApiHandler {
@@ -23,6 +24,7 @@ impl TaskApiHandler {
 
 #[tonic::async_trait]
 impl TaskService for TaskApiHandler {
+    type ExecStream = ExecStream;
     async fn create(
         &self,
         request: Request<CreateRequest>,
@@ -90,5 +92,22 @@ impl TaskService for TaskApiHandler {
             responder,
         })
         .await
+    }
+
+    async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecStream>, Status> {
+        let req = request.into_inner();
+        info!("API: Received Exec request for {}", req.container_id);
+        let (responder, pid) = oneshot::channel();
+        self.dispatcher_tx
+            .send(Command::ExecTarget {
+                container_id: req.container_id.clone(),
+                responder,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("Failed to send command to dispatcher: {e}")))?;
+        let pid = pid
+            .await
+            .map_err(|_| Status::internal("Dispatcher task dropped response channel."))??;
+        Ok(Response::new(exec::spawn(pid, req)?))
     }
 }
