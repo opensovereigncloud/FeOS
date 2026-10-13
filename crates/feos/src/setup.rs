@@ -6,29 +6,37 @@ use container_service::{
     api::ContainerApiHandler, dispatcher::Dispatcher as ContainerDispatcher,
     Command as ContainerCommand, DEFAULT_CONTAINER_DB_URL,
 };
+#[cfg(feature = "host")]
+use feos_proto::vm_service::vm_service_server::VmServiceServer;
 use feos_proto::{
     container_service::container_service_server::ContainerServiceServer,
     host_service::host_service_server::HostServiceServer,
     image_service::image_service_server::ImageServiceServer,
     task_service::task_service_server::TaskServiceServer,
-    vm_service::vm_service_server::VmServiceServer,
 };
 use feos_utils::filesystem::mount_virtual_filesystems;
+#[cfg(feature = "host")]
 use feos_utils::host::info::is_running_on_vm;
+#[cfg(feature = "host")]
 use feos_utils::host::memory::configure_hugepages;
+#[cfg(feature = "host")]
 use feos_utils::network::{configure_network_devices, configure_sriov};
+#[cfg(feature = "host")]
+use host_service::worker::TimeSyncWorker;
 use host_service::{
-    api::HostApiHandler, dispatcher::HostServiceDispatcher, worker::TimeSyncWorker,
-    Command as HostCommand, RestartSignal,
+    api::HostApiHandler, dispatcher::HostServiceDispatcher, Command as HostCommand, RestartSignal,
 };
 use image_service::{
     api::ImageApiHandler, dispatcher::ImageServiceDispatcher, filestore::FileStore,
     worker::Orchestrator, IMAGE_DIR,
 };
-use log::{error, info, warn};
+#[cfg(feature = "host")]
+use log::warn;
+use log::{error, info};
 use nix::libc;
 use std::env;
 use std::ffi::CString;
+#[cfg(feature = "host")]
 use std::net::Ipv6Addr;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
@@ -36,14 +44,26 @@ use std::path::Path;
 use task_service::{api::TaskApiHandler, dispatcher::Dispatcher, Command as TaskCommand};
 use tokio::fs::{self, File};
 use tokio::sync::mpsc;
+#[cfg(feature = "host")]
 use vm_service::{
     api::VmApiHandler, dispatcher::VmServiceDispatcher, Command as VmCommand, DEFAULT_VM_DB_URL,
     VM_API_SOCKET_DIR, VM_CONSOLE_DIR,
 };
 
+#[cfg(feature = "host")]
 pub(crate) const VFS_NUM: u32 = 125;
+#[cfg(feature = "host")]
 pub(crate) const HUGEPAGES_NUM: u32 = 1024;
 
+/// What the first-boot initialization learned that the services need later.
+#[derive(Default)]
+pub(crate) struct BootInfo {
+    /// NTP servers announced via DHCPv6.
+    #[cfg(feature = "host")]
+    pub(crate) ntp_servers: Vec<Ipv6Addr>,
+}
+
+#[cfg(feature = "host")]
 pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmServiceServer<VmApiHandler>> {
     info!("Main: Ensuring VM socket directory '{VM_API_SOCKET_DIR}' exists...");
     fs::create_dir_all(VM_API_SOCKET_DIR).await?;
@@ -98,7 +118,7 @@ pub(crate) async fn initialize_container_service(
 pub(crate) fn initialize_host_service(
     restart_tx: mpsc::Sender<RestartSignal>,
     log_handle: feos_utils::feos_logger::LogHandle,
-    ntp_servers: Vec<Ipv6Addr>,
+    #[cfg_attr(not(feature = "host"), expect(unused_variables))] boot_info: BootInfo,
 ) -> HostServiceServer<HostApiHandler> {
     let (host_tx, host_rx) = mpsc::channel::<HostCommand>(32);
     let host_dispatcher = HostServiceDispatcher::new(host_rx, restart_tx, log_handle);
@@ -106,7 +126,9 @@ pub(crate) fn initialize_host_service(
         host_dispatcher.run().await;
     });
 
-    let time_worker = TimeSyncWorker::new(ntp_servers);
+    #[cfg(feature = "host")]
+    let time_worker = TimeSyncWorker::new(boot_info.ntp_servers);
+    #[cfg(feature = "host")]
     tokio::spawn(async move {
         time_worker.run().await;
     });
@@ -168,11 +190,22 @@ pub(crate) async fn initialize_task_service() -> Result<TaskServiceServer<TaskAp
     Ok(task_service)
 }
 
-pub(crate) async fn perform_first_boot_initialization() -> Result<Vec<Ipv6Addr>> {
+pub(crate) async fn perform_first_boot_initialization() -> Result<BootInfo> {
     info!("Main: Performing first-boot initialization...");
     info!("Main: Mounting virtual filesystems...");
     mount_virtual_filesystems();
 
+    #[cfg(feature = "host")]
+    let boot_info = initialize_host_hardware().await?;
+    #[cfg(not(feature = "host"))]
+    let boot_info = BootInfo::default();
+
+    Ok(boot_info)
+}
+
+/// Bare-metal setup: hugepages, network autoconfiguration and SR-IOV.
+#[cfg(feature = "host")]
+async fn initialize_host_hardware() -> Result<BootInfo> {
     info!("Main: Configuring hugepages...");
     if let Err(e) = configure_hugepages(HUGEPAGES_NUM).await {
         warn!("Failed to configure hugepages: {e}");
@@ -200,12 +233,11 @@ pub(crate) async fn perform_first_boot_initialization() -> Result<Vec<Ipv6Addr>>
         }
     }
 
-    Ok(ntp_servers)
+    Ok(BootInfo { ntp_servers })
 }
 
+#[cfg(feature = "host")]
 pub(crate) async fn setup_database() -> Result<String> {
-    dotenvy::dotenv().ok();
-
     let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| {
         info!("Main: DATABASE_URL not set, using default '{DEFAULT_VM_DB_URL}'");
         DEFAULT_VM_DB_URL.to_string()

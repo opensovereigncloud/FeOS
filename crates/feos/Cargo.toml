@@ -16,7 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 feos-utils = { workspace = true }
-vm-service = { workspace = true }
+vm-service = { workspace = true, optional = true }
 host-service = { workspace = true }
 image-service = { workspace = true }
 task-service = { workspace = true }
@@ -53,4 +53,9 @@ tower = { workspace = true }
 tempfile = { workspace = true }
 
 [features]
+default = ["host"]
 git-version = ["feos-utils/git-version"]
+# Bare-metal hypervisor profile: DHCPv6, NTP, SR-IOV, hugepages, the VM
+# service and the public gRPC API on TCP. Without it, FeOS builds as the
+# guest profile: PID 1 in a microVM that the host configures.
+host = ["dep:vm-service", "feos-utils/host", "host-service/ntp"]

@@ -9,10 +9,14 @@ use image_service::IMAGE_SERVICE_SOCKET;
 use log::{error, info, warn};
 use nix::unistd::Uid;
 use setup::*;
+use std::path::Path;
 use task_service::TASK_SERVICE_SOCKET;
 use tokio::{fs, net::UnixListener, sync::mpsc};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
+
+/// The public gRPC API on a local Unix socket, served in every profile.
+pub const API_SOCKET: &str = "/run/feos/api.sock";
 
 pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     println!(
@@ -38,34 +42,50 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
         warn!("Not running as root! (uid: {})", Uid::current());
     }
 
-    let mut ntp_servers = Vec::new();
+    dotenvy::dotenv().ok();
+
+    let mut boot_info = BootInfo::default();
 
     if !restarted_after_upgrade {
         if std::process::id() == 1 {
-            ntp_servers = perform_first_boot_initialization().await?;
+            boot_info = perform_first_boot_initialization().await?;
         }
     } else {
         info!("Main: Skipping one-time initialization on restart after upgrade.");
     }
 
-    let vm_db_url = setup_database().await?;
-
     let (restart_tx, mut restart_rx) = mpsc::channel::<RestartSignal>(1);
 
-    let vm_service = initialize_vm_service(&vm_db_url).await?;
+    #[cfg(feature = "host")]
+    let vm_service = initialize_vm_service(&setup_database().await?).await?;
     let container_service = initialize_container_service().await?;
 
-    let host_service = initialize_host_service(restart_tx.clone(), log_handle, ntp_servers);
+    let host_service = initialize_host_service(restart_tx.clone(), log_handle, boot_info);
 
     let image_service = initialize_image_service().await?;
     let task_service = initialize_task_service().await?;
 
-    let tcp_addr = "[::]:1337".parse().unwrap();
+    if let Some(api_dir) = Path::new(API_SOCKET).parent() {
+        fs::create_dir_all(api_dir).await?;
+    }
+    fs::remove_file(API_SOCKET).await.ok();
+    let api_uds = UnixListener::bind(API_SOCKET)?;
+    let api_uds_stream = UnixListenerStream::new(api_uds);
+    let api_unix_socket_server = Server::builder()
+        .add_service(container_service.clone())
+        .add_service(host_service.clone())
+        .serve_with_incoming(api_uds_stream);
+
+    #[cfg(feature = "host")]
+    let tcp_addr: std::net::SocketAddr = "[::]:1337".parse().unwrap();
+    #[cfg(feature = "host")]
     let tcp_server = Server::builder()
         .add_service(vm_service)
         .add_service(container_service)
         .add_service(host_service)
         .serve(tcp_addr);
+    #[cfg(not(feature = "host"))]
+    let tcp_server = std::future::pending::<Result<(), tonic::transport::Error>>();
 
     fs::remove_file(IMAGE_SERVICE_SOCKET).await.ok();
     let image_uds = UnixListener::bind(IMAGE_SERVICE_SOCKET)?;
@@ -81,11 +101,18 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
         .add_service(task_service)
         .serve_with_incoming(task_uds_stream);
 
+    info!("Main: Public gRPC Server listening on Unix socket {API_SOCKET}");
+    #[cfg(feature = "host")]
     info!("Main: Public gRPC Server listening on {tcp_addr}");
     info!("Main: Internal ImageService listening on Unix socket {IMAGE_SERVICE_SOCKET}");
     info!("Main: Internal TaskService listening on Unix socket {TASK_SERVICE_SOCKET}");
 
     tokio::select! {
+        res = api_unix_socket_server => {
+            if let Err(e) = res {
+                error!("API unix socket server failed: {e}");
+            }
+        },
         res = tcp_server => {
             if let Err(e) = res {
                 error!("TCP server failed: {e}");

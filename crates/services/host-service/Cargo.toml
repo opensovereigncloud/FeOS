@@ -22,9 +22,13 @@ prost-types = { workspace = true }
 thiserror = { workspace = true }
 hyper = {workspace = true}
 hyper-util = { workspace = true }
-sntpc = { version = "0.7", features = ["tokio-socket", "utils"] }
+sntpc = { version = "0.7", features = ["tokio-socket", "utils"], optional = true }
 chrono = { workspace = true }
 libc = { workspace = true }
 
 hyper-rustls = "0.27.2"
 http-body-util = "0.1.2"
+
+[features]
+# Clock sync over NTP, for hosts that have to find out the time themselves.
+ntp = ["dep:sntpc"]
