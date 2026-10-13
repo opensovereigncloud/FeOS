@@ -11,12 +11,15 @@
 //!   (Firecracker's stdout)
 //! - `vmm.log`: Firecracker's own log
 //! - `firecracker.pid`
+//! - `snapshot/`: the snapshot of a suspended VM (see `snapshot`)
 //!
 //! Creating a VM writes its configuration. Starting it starts a Firecracker
 //! process that boots it at once. The process ends when the guest reboots or
-//! shuts down, so every boot is a new process.
+//! shuts down, so every boot is a new process. Suspending a VM writes a
+//! snapshot and ends the process; restoring it starts a process that loads
+//! the snapshot.
 
-use super::{fc_api, Hypervisor, VmmError};
+use super::{fc_api, snapshot, Hypervisor, VmmError};
 use crate::{vm_dir, vsock_path, VmEventWrapper, IMAGE_DIR};
 use feos_proto::vm_service::{
     BalloonStats, CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetBalloonResponse,
@@ -30,6 +33,7 @@ use nix::sys::stat::Mode;
 use nix::unistd::{self, Pid};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::{self, SeekFrom};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -52,6 +56,9 @@ const DEFAULT_MEMORY_MIB: u64 = 512;
 /// How long Firecracker may take to boot the VM and answer on its socket.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long writing or loading a snapshot may take: the guest's memory goes
+/// to disk and is synced.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 const CTRL_ALT_DEL_REPEAT: Duration = Duration::from_secs(3);
 /// How long a killed Firecracker may take to go.
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -273,6 +280,136 @@ fn internal(what: &str) -> impl FnOnce(io::Error) -> VmmError + '_ {
     move |e| VmmError::Internal(format!("{what}: {e}"))
 }
 
+async fn firecracker_version(api: &Path) -> Result<String, VmmError> {
+    let version = fc_api::request(api, "GET", "/version", None)
+        .await?
+        .unwrap_or_default();
+    Ok(version["firecracker_version"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// A Firecracker process this adapter just started.
+struct Spawned {
+    pid: i32,
+    exit: ExitWatch,
+    log: PathBuf,
+    log_offset: u64,
+}
+
+impl Spawned {
+    /// Waits for `ready`. Kills the process if it does not get there in
+    /// time, and reports from its log if it ends instead.
+    async fn wait(&mut self, ready: impl Future<Output = ()>, what: &str) -> Result<(), VmmError> {
+        tokio::select! {
+            result = tokio::time::timeout(BOOT_TIMEOUT, ready) => {
+                if result.is_err() {
+                    let _ = kill(Pid::from_raw(self.pid), Signal::SIGKILL);
+                    return Err(VmmError::ProcessSpawnFailed(format!(
+                        "Firecracker did not {what} within {}s: {}",
+                        BOOT_TIMEOUT.as_secs(),
+                        log_tail(&self.log, self.log_offset)
+                    )));
+                }
+            }
+            _ = self.exit.wait_for(Option::is_some) => {
+                return Err(VmmError::ProcessSpawnFailed(format!(
+                    "Firecracker exited: {}",
+                    log_tail(&self.log, self.log_offset)
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl FirecrackerAdapter {
+    /// Starts Firecracker for the VM. With a configuration file it boots
+    /// the VM at once; without one it waits for calls on its API.
+    fn spawn(&self, vm_id: &str, config: Option<&Path>) -> Result<Spawned, VmmError> {
+        let dir = vm_dir(vm_id);
+        // Firecracker binds both sockets and fails if they exist.
+        let api = api_socket(vm_id);
+        for socket in [&api, &vsock_path(vm_id)] {
+            match std::fs::remove_file(socket) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(internal("remove a stale socket")(e)),
+            }
+        }
+
+        // Firecracker's stdin is the console's input, its stdout the
+        // console's output. Holding the FIFO open for reading and writing,
+        // it never sees an end of input.
+        let console_in = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("console.in"))
+            .map_err(internal("open the console FIFO"))?;
+        // A boot starts the console's output over; a restored guest goes on.
+        let serial_path = dir.join("serial.log");
+        let serial = match config {
+            Some(_) => std::fs::File::create(&serial_path),
+            None => std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&serial_path),
+        }
+        .map_err(internal("open the serial log"))?;
+        let vmm_log_path = dir.join("vmm.log");
+        let vmm_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&vmm_log_path)
+            .map_err(internal("open the VMM log"))?;
+        let log_offset = vmm_log.metadata().map(|m| m.len()).unwrap_or(0);
+        let stderr = vmm_log.try_clone().map_err(internal("open the VMM log"))?;
+
+        let mut command = Command::new(&self.binary);
+        command.arg("--id").arg(vm_id).arg("--api-sock").arg(&api);
+        if let Some(config) = config {
+            command.arg("--config-file").arg(config);
+        }
+        command
+            .arg("--log-path")
+            .arg(&vmm_log_path)
+            .stdin(console_in)
+            .stdout(serial)
+            .stderr(stderr);
+        // SAFETY: setsid is async-signal-safe. Its own session keeps the VMM
+        // away from signals for this process's terminal.
+        unsafe {
+            command.pre_exec(|| unistd::setsid().map(drop).map_err(io::Error::other));
+        }
+        // A std child: in FeOS the reaper owns waitpid, and a tokio child
+        // would race it.
+        let child = command
+            .spawn()
+            .map_err(|e| VmmError::ProcessSpawnFailed(format!("{}: {e}", self.binary.display())))?;
+        let pid = child.id() as i32;
+        if let Err(e) = std::fs::write(dir.join("firecracker.pid"), pid.to_string()) {
+            warn!("FirecrackerAdapter ({vm_id}): Failed to record pid {pid}: {e}");
+        }
+        let exit = self.watch_process(vm_id, pid, Some(child));
+        info!("FirecrackerAdapter ({vm_id}): Started Firecracker (pid {pid})");
+        Ok(Spawned {
+            pid,
+            exit,
+            log: vmm_log_path,
+            log_offset,
+        })
+    }
+
+    /// Ends a process that did not get the VM running.
+    async fn discard(&self, vm_id: &str, vmm: &mut Spawned) {
+        self.exits().remove(vm_id);
+        let _ = kill(Pid::from_raw(vmm.pid), Signal::SIGKILL);
+        let _ = tokio::time::timeout(KILL_TIMEOUT, vmm.exit.wait_for(Option::is_some)).await;
+        let _ = std::fs::remove_file(vm_dir(vm_id).join("firecracker.pid"));
+    }
+}
+
 #[tonic::async_trait]
 impl Hypervisor for FirecrackerAdapter {
     async fn create_vm(
@@ -306,70 +443,15 @@ impl Hypervisor for FirecrackerAdapter {
 
     async fn start_vm(&self, req: StartVmRequest) -> Result<i64, VmmError> {
         let vm_id = req.vm_id.as_str();
-        let dir = vm_dir(vm_id);
-        let config = dir.join("config.json");
+        let config = vm_dir(vm_id).join("config.json");
         if !config.exists() {
             return Err(VmmError::VmNotFound(vm_id.to_string()));
         }
-        // Firecracker binds both sockets and fails if they exist.
+        // A cold boot: the memory in a snapshot is gone for good.
+        snapshot::remove(vm_id).map_err(internal("remove the snapshot"))?;
+
+        let mut vmm = self.spawn(vm_id, Some(&config))?;
         let api = api_socket(vm_id);
-        for socket in [&api, &vsock_path(vm_id)] {
-            match std::fs::remove_file(socket) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(internal("remove a stale socket")(e)),
-            }
-        }
-
-        // Firecracker's stdin is the console's input, its stdout the
-        // console's output. Holding the FIFO open for reading and writing,
-        // it never sees an end of input.
-        let console_in = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(dir.join("console.in"))
-            .map_err(internal("open the console FIFO"))?;
-        let serial = std::fs::File::create(dir.join("serial.log"))
-            .map_err(internal("create the serial log"))?;
-        let vmm_log_path = dir.join("vmm.log");
-        let vmm_log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&vmm_log_path)
-            .map_err(internal("open the VMM log"))?;
-        let log_offset = vmm_log.metadata().map(|m| m.len()).unwrap_or(0);
-        let stderr = vmm_log.try_clone().map_err(internal("open the VMM log"))?;
-
-        let mut command = Command::new(&self.binary);
-        command
-            .arg("--id")
-            .arg(vm_id)
-            .arg("--api-sock")
-            .arg(&api)
-            .arg("--config-file")
-            .arg(&config)
-            .arg("--log-path")
-            .arg(&vmm_log_path)
-            .stdin(console_in)
-            .stdout(serial)
-            .stderr(stderr);
-        // SAFETY: setsid is async-signal-safe. Its own session keeps the VMM
-        // away from signals for this process's terminal.
-        unsafe {
-            command.pre_exec(|| unistd::setsid().map(drop).map_err(io::Error::other));
-        }
-        // A std child: in FeOS the reaper owns waitpid, and a tokio child
-        // would race it.
-        let child = command
-            .spawn()
-            .map_err(|e| VmmError::ProcessSpawnFailed(format!("{}: {e}", self.binary.display())))?;
-        let pid = child.id() as i32;
-        if let Err(e) = std::fs::write(dir.join("firecracker.pid"), pid.to_string()) {
-            warn!("FirecrackerAdapter ({vm_id}): Failed to record pid {pid}: {e}");
-        }
-        let mut exit = self.watch_process(vm_id, pid, Some(child));
-        info!("FirecrackerAdapter ({vm_id}): Started Firecracker (pid {pid})");
-
         let booted = async {
             loop {
                 if let Ok(Some(info)) = fc_api::request(&api, "GET", "/", None).await
@@ -380,25 +462,145 @@ impl Hypervisor for FirecrackerAdapter {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         };
-        tokio::select! {
-            result = tokio::time::timeout(BOOT_TIMEOUT, booted) => {
-                if result.is_err() {
-                    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-                    return Err(VmmError::ProcessSpawnFailed(format!(
-                        "Firecracker did not boot the VM within {}s: {}",
-                        BOOT_TIMEOUT.as_secs(),
-                        log_tail(&vmm_log_path, log_offset)
-                    )));
-                }
-            }
-            _ = exit.wait_for(Option::is_some) => {
-                return Err(VmmError::ProcessSpawnFailed(format!(
-                    "Firecracker exited: {}",
-                    log_tail(&vmm_log_path, log_offset)
-                )));
-            }
+        vmm.wait(booted, "boot the VM").await?;
+        Ok(vmm.pid.into())
+    }
+
+    async fn suspend_vm(&self, vm_id: &str, settle_free_pages: bool) -> Result<u64, VmmError> {
+        let pid = read_pid(vm_id)
+            .filter(|&pid| self.is_vmm_process(vm_id, pid.into()))
+            .ok_or_else(|| VmmError::VmNotFound(vm_id.to_string()))?;
+        let mut exit = self.exit_watch(vm_id)?;
+        let api = api_socket(vm_id);
+        if settle_free_pages {
+            snapshot::settle_free_pages(pid).await;
         }
-        Ok(pid.into())
+
+        let state = fc_api::request(&api, "GET", "/", None)
+            .await?
+            .unwrap_or_default();
+        let was_running = state["state"] == "Running";
+        if was_running {
+            let body = json!({"state": "Paused"});
+            fc_api::request(&api, "PATCH", "/vm", Some(&body)).await?;
+        }
+        let written = async {
+            snapshot::remove(vm_id).map_err(internal("remove the old snapshot"))?;
+            std::fs::create_dir_all(snapshot::dir(vm_id))
+                .map_err(internal("create the snapshot directory"))?;
+            let body = json!({
+                "snapshot_type": "Full",
+                "snapshot_path": snapshot::vmstate(vm_id),
+                "mem_file_path": snapshot::memory(vm_id),
+            });
+            fc_api::request_within(
+                &api,
+                "PUT",
+                "/snapshot/create",
+                Some(&body),
+                SNAPSHOT_TIMEOUT,
+            )
+            .await?;
+            snapshot::Host::this(&firecracker_version(&api).await?)
+                .save(vm_id)
+                .map_err(internal("record the host"))
+        }
+        .await;
+        if let Err(e) = written {
+            let _ = snapshot::remove(vm_id);
+            if was_running {
+                let body = json!({"state": "Resumed"});
+                let _ = fc_api::request(&api, "PATCH", "/vm", Some(&body)).await;
+            }
+            return Err(e);
+        }
+
+        // An end, not a crash: the health check of this process must not
+        // report it.
+        self.exits().remove(vm_id);
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        if tokio::time::timeout(KILL_TIMEOUT, exit.wait_for(Option::is_some))
+            .await
+            .is_err()
+        {
+            warn!("FirecrackerAdapter ({vm_id}): Firecracker (pid {pid}) outlived SIGKILL");
+        }
+        let _ = std::fs::remove_file(vm_dir(vm_id).join("firecracker.pid"));
+
+        let memory = snapshot::memory(vm_id);
+        let punched = {
+            let memory = memory.clone();
+            tokio::task::spawn_blocking(move || snapshot::punch_zero_pages(&memory)).await
+        };
+        match punched {
+            Ok(Ok(bytes)) => info!(
+                "FirecrackerAdapter ({vm_id}): Suspended; {} MiB of zeroes punched out of the memory",
+                bytes >> 20
+            ),
+            Ok(Err(e)) => warn!("FirecrackerAdapter ({vm_id}): Failed to punch holes: {e}"),
+            Err(e) => warn!("FirecrackerAdapter ({vm_id}): Failed to punch holes: {e}"),
+        }
+        snapshot::disk_usage(&memory).map_err(internal("measure the snapshot"))
+    }
+
+    async fn restore_vm(&self, vm_id: &str) -> Result<i64, VmmError> {
+        if !snapshot::exists(vm_id) {
+            return Err(VmmError::SnapshotUnusable(
+                "the VM has no snapshot".to_string(),
+            ));
+        }
+        let saved = snapshot::Host::load(vm_id)
+            .map_err(|e| VmmError::SnapshotUnusable(format!("host record: {e}")))?;
+
+        let mut vmm = self.spawn(vm_id, None)?;
+        let api = api_socket(vm_id);
+        let listening = async {
+            while fc_api::request(&api, "GET", "/", None).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        vmm.wait(listening, "answer on its API").await?;
+
+        let loaded = async {
+            let host = snapshot::Host::this(&firecracker_version(&api).await?);
+            if let Some(why) = saved.mismatch(&host) {
+                return Err(VmmError::SnapshotUnusable(why));
+            }
+            // The vCPUs start only once the load worked, so that a failure
+            // up to here leaves the snapshot good.
+            let body = json!({
+                "snapshot_path": snapshot::vmstate(vm_id),
+                "mem_backend": {"backend_type": "File", "backend_path": snapshot::memory(vm_id)},
+                "resume_vm": false,
+            });
+            fc_api::request_within(&api, "PUT", "/snapshot/load", Some(&body), SNAPSHOT_TIMEOUT)
+                .await
+                .map(drop)
+        }
+        .await;
+        if let Err(e) = loaded {
+            self.discard(vm_id, &mut vmm).await;
+            return Err(e);
+        }
+
+        let body = json!({"state": "Resumed"});
+        if let Err(e) = fc_api::request(&api, "PATCH", "/vm", Some(&body)).await {
+            let state = fc_api::request(&api, "GET", "/", None).await.ok().flatten();
+            if state.is_some_and(|state| state["state"] == "Paused") {
+                self.discard(vm_id, &mut vmm).await;
+                return Err(e);
+            }
+            warn!(
+                "FirecrackerAdapter ({vm_id}): The resume reported {e}, but the VM is not paused"
+            );
+        }
+        // The guest ran: its disks moved on from the snapshot. Firecracker
+        // keeps the memory file mapped; its blocks go when it exits.
+        if let Err(e) = snapshot::remove(vm_id) {
+            warn!("FirecrackerAdapter ({vm_id}): Failed to remove the restored snapshot: {e}");
+        }
+        info!("FirecrackerAdapter ({vm_id}): Restored from the snapshot");
+        Ok(vmm.pid.into())
     }
 
     async fn healthcheck_vm(

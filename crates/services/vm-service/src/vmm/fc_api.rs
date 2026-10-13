@@ -26,12 +26,23 @@ pub async fn request(
     path: &str,
     body: Option<&Value>,
 ) -> Result<Option<Value>, VmmError> {
-    tokio::time::timeout(REQUEST_TIMEOUT, exchange(socket, method, path, body))
+    request_within(socket, method, path, body, REQUEST_TIMEOUT).await
+}
+
+/// `request` for one that takes longer, such as writing a snapshot.
+pub async fn request_within(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: Duration,
+) -> Result<Option<Value>, VmmError> {
+    tokio::time::timeout(timeout, exchange(socket, method, path, body))
         .await
         .map_err(|_| {
             VmmError::ApiOperationFailed(format!(
                 "{method} {path}: no answer within {}s",
-                REQUEST_TIMEOUT.as_secs()
+                timeout.as_secs()
             ))
         })?
 }

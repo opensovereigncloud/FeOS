@@ -19,7 +19,8 @@
 
 use crate::{vsock_path, VmEventWrapper};
 use feos_proto::host_service::{
-    host_service_client::HostServiceClient, PingRequest, SetNetworkConfigRequest, SetTimeRequest,
+    host_service_client::HostServiceClient, PingRequest, PreparePauseRequest,
+    SetNetworkConfigRequest, SetTimeRequest,
 };
 use feos_proto::lifecycle_service::lifecycle_service_server::{
     LifecycleService, LifecycleServiceServer,
@@ -173,6 +174,41 @@ impl Guests {
             Err(e) => Err(format!("the resumed guest does not answer: {e}")),
         };
         self.pushed(vm_id, result);
+    }
+
+    /// Before a snapshot: has a FeOS guest empty its memory as far as it
+    /// can, so that the snapshot gets smaller. Best effort.
+    pub async fn prepare_pause(&self, vm_id: &str, free_page_reporting: bool) {
+        if self.info(vm_id).is_none() {
+            return;
+        }
+        let prepared = tokio::time::timeout(PUSH_TIMEOUT, async {
+            let channel = feos_utils::vsock::channel(vsock_path(vm_id), API_PORT)
+                .await
+                .map_err(|e| e.to_string())?;
+            HostServiceClient::new(channel)
+                .prepare_pause(PreparePauseRequest {
+                    compact: true,
+                    // Free page reporting reports small blocks too.
+                    page_reporting_order: free_page_reporting.then_some(0),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|status| status.message().to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err(format!("no answer within {}s", PUSH_TIMEOUT.as_secs())));
+        match prepared {
+            Ok(response) => {
+                let response = response.into_inner();
+                info!(
+                    "Guests ({vm_id}): The guest emptied its memory in {} ms: {}",
+                    response.duration_ms,
+                    response.steps.join(", ")
+                );
+            }
+            Err(e) => warn!("Guests ({vm_id}): The guest could not empty its memory: {e}"),
+        }
     }
 
     /// Pushes the wall time and the network configuration into the guest.

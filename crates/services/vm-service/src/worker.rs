@@ -12,7 +12,8 @@ use feos_proto::{
         DeleteVmRequest, DeleteVmResponse, PauseVmRequest, PauseVmResponse, PingVmRequest,
         PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
         StartVmRequest, StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse,
-        StreamVmEventsRequest, VmEvent, VmState, VmStateChangedEvent,
+        StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse, VmEvent, VmState,
+        VmStateChangedEvent,
     },
 };
 use log::{error, info, warn};
@@ -406,6 +407,79 @@ pub async fn handle_resume_vm(
         guests.resumed(&vm_id).await;
     }
 
+    if responder.send(result.map_err(Into::into)).is_err() {
+        error!("VmWorker: Failed to send response for ResumeVm.");
+    }
+}
+
+pub async fn handle_suspend_vm(
+    req: SuspendVmRequest,
+    responder: oneshot::Sender<Result<SuspendVmResponse, VmServiceError>>,
+    hypervisor: Arc<dyn Hypervisor>,
+    broadcast_tx: mpsc::Sender<VmEventWrapper>,
+    guests: Arc<Guests>,
+    free_page_reporting: bool,
+) {
+    let vm_id = req.vm_id.clone();
+    if req.purge_guest {
+        guests.prepare_pause(&vm_id, free_page_reporting).await;
+    }
+    let result = hypervisor
+        .suspend_vm(&vm_id, req.purge_guest && free_page_reporting)
+        .await;
+
+    if let Ok(memory_bytes) = result {
+        crate::vmm::broadcast_state_change_event(
+            &broadcast_tx,
+            &vm_id,
+            "vm-service",
+            VmStateChangedEvent {
+                new_state: VmState::Suspended as i32,
+                reason: format!(
+                    "Suspended to a snapshot with {} MiB of memory",
+                    memory_bytes >> 20
+                ),
+            },
+            None,
+        )
+        .await;
+    }
+
+    let result = result.map(|memory_bytes| SuspendVmResponse { memory_bytes });
+    if responder.send(result.map_err(Into::into)).is_err() {
+        error!("VmWorker: Failed to send response for SuspendVm.");
+    }
+}
+
+pub async fn handle_restore_vm(
+    req: ResumeVmRequest,
+    responder: oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
+    hypervisor: Arc<dyn Hypervisor>,
+    broadcast_tx: mpsc::Sender<VmEventWrapper>,
+    cancel_bus: broadcast::Receiver<Uuid>,
+    guests: Arc<Guests>,
+) {
+    let vm_id = req.vm_id.clone();
+    let result = hypervisor.restore_vm(&vm_id).await;
+
+    if let Ok(pid) = result {
+        crate::vmm::broadcast_state_change_event(
+            &broadcast_tx,
+            &vm_id,
+            "vm-service",
+            VmStateChangedEvent {
+                new_state: VmState::Running as i32,
+                reason: "Restored from its snapshot".to_string(),
+            },
+            Some(pid),
+        )
+        .await;
+        start_healthcheck_monitor(vm_id.clone(), hypervisor, broadcast_tx, cancel_bus);
+        // The guest's clock stood still in the snapshot.
+        guests.resumed(&vm_id).await;
+    }
+
+    let result = result.map(|_pid| ResumeVmResponse {});
     if responder.send(result.map_err(Into::into)).is_err() {
         error!("VmWorker: Failed to send response for ResumeVm.");
     }

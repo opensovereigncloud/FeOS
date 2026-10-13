@@ -8,7 +8,8 @@ use feos_proto::vm_service::{
     ListVmsResponse, PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse,
     ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
     StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest,
-    UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo,
+    SuspendVmRequest, SuspendVmResponse, UpdateBalloonRequest, UpdateBalloonResponse, VmEvent,
+    VmInfo,
 };
 use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
@@ -156,6 +157,17 @@ impl VmService for VmApiHandler {
         info!("VmApi: Received ResumeVm request.");
         dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
             Command::ResumeVm(request.into_inner(), resp_tx)
+        })
+        .await
+    }
+
+    async fn suspend_vm(
+        &self,
+        request: Request<SuspendVmRequest>,
+    ) -> Result<Response<SuspendVmResponse>, Status> {
+        info!("VmApi: Received SuspendVm request.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::SuspendVm(request.into_inner(), resp_tx)
         })
         .await
     }

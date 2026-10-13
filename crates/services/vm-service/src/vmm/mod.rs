@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 mod fc_api;
 pub mod firecracker;
+pub mod snapshot;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VmmError {
@@ -40,6 +41,9 @@ pub enum VmmError {
     #[error("The image service returned an error: {0}")]
     ImageServiceFailed(String),
 
+    #[error("The snapshot cannot be restored: {0}")]
+    SnapshotUnusable(String),
+
     #[error("An internal or unexpected error occurred: {0}")]
     Internal(String),
 }
@@ -49,6 +53,7 @@ impl From<VmmError> for Status {
         match err {
             VmmError::VmNotFound(id) => Status::not_found(id),
             VmmError::InvalidConfig(msg) => Status::invalid_argument(msg),
+            VmmError::SnapshotUnusable(msg) => Status::failed_precondition(msg),
             VmmError::ApiConnectionFailed(msg) | VmmError::ImageServiceFailed(msg) => {
                 Status::unavailable(msg)
             }
@@ -70,8 +75,20 @@ pub trait Hypervisor: Send + Sync {
         image_uuid: String,
     ) -> Result<Option<i64>, VmmError>;
 
-    /// Boots the VM; returns the pid of its VMM process.
+    /// Boots the VM, discarding a snapshot it has; returns the pid of its
+    /// VMM process.
     async fn start_vm(&self, req: StartVmRequest) -> Result<i64, VmmError>;
+
+    /// Writes a snapshot of the running or paused VM and ends its VMM
+    /// process; first waits until free page reporting is done, if asked.
+    /// Returns what the snapshot's memory takes on disk. A VM that cannot
+    /// be suspended is left running or paused, as it was.
+    async fn suspend_vm(&self, vm_id: &str, settle_free_pages: bool) -> Result<u64, VmmError>;
+
+    /// Restores a suspended VM in a new VMM process and resumes it; returns
+    /// the process's pid. The snapshot is gone once the guest ran; an error
+    /// before that keeps it.
+    async fn restore_vm(&self, vm_id: &str) -> Result<i64, VmmError>;
 
     /// Watches a running VM until its VMM process ends, and reports how it
     /// ended, unless the VM's ID arrives on the cancel bus first.

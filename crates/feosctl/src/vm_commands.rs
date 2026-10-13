@@ -10,8 +10,8 @@ use feos_proto::vm_service::{
     AttachConsoleMessage, BalloonConfig, ConsoleData, CpuConfig, CreateVmRequest, DeleteVmRequest,
     DiskConfig, GetBalloonRequest, GetVmRequest, GuestAttachedEvent, GuestNetworkConfig,
     ListVmsRequest, MemoryConfig, NetConfig, PauseVmRequest, PingVmRequest, ResumeVmRequest,
-    ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig,
-    UpdateBalloonRequest, VmConfig, VmState, VmStateChangedEvent,
+    ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest, StreamVmEventsRequest,
+    SuspendVmRequest, TapConfig, UpdateBalloonRequest, VmConfig, VmState, VmStateChangedEvent,
 };
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -65,7 +65,15 @@ pub enum VmCommand {
         #[arg(required = true, help = "VM identifier")]
         vm_id: String,
     },
-    /// Resume a paused virtual machine
+    /// Suspend a virtual machine to a snapshot on disk; resume restores it
+    Suspend {
+        #[arg(required = true, help = "VM identifier")]
+        vm_id: String,
+
+        #[arg(long, help = "Have a FeOS guest empty its memory first")]
+        purge: bool,
+    },
+    /// Resume a paused virtual machine, or restore a suspended one
     Resume {
         #[arg(required = true, help = "VM identifier")]
         vm_id: String,
@@ -189,6 +197,7 @@ pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
         VmCommand::Ping { vm_id } => ping_vm(&mut client, vm_id).await?,
         VmCommand::Shutdown { vm_id } => shutdown_vm(&mut client, vm_id).await?,
         VmCommand::Pause { vm_id } => pause_vm(&mut client, vm_id).await?,
+        VmCommand::Suspend { vm_id, purge } => suspend_vm(&mut client, vm_id, purge).await?,
         VmCommand::Resume { vm_id } => resume_vm(&mut client, vm_id).await?,
         VmCommand::Delete { vm_id } => delete_vm(&mut client, vm_id).await?,
         VmCommand::CreateAndStart(opts) => create_and_start_vm(&mut client, opts).await?,
@@ -512,6 +521,25 @@ async fn delete_vm(client: &mut VmServiceClient<Channel>, vm_id: String) -> Resu
     };
     client.delete_vm(request).await?.into_inner();
     println!("Successfully deleted VM: {vm_id}");
+    Ok(())
+}
+
+async fn suspend_vm(
+    client: &mut VmServiceClient<Channel>,
+    vm_id: String,
+    purge_guest: bool,
+) -> Result<()> {
+    let response = client
+        .suspend_vm(SuspendVmRequest {
+            vm_id: vm_id.clone(),
+            purge_guest,
+        })
+        .await?
+        .into_inner();
+    println!(
+        "VM {vm_id} suspended; its memory takes {} MiB on disk",
+        response.memory_bytes >> 20
+    );
     Ok(())
 }
 

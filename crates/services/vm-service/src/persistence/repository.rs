@@ -31,6 +31,7 @@ fn string_to_vm_state(s: &str) -> Result<VmState, PersistenceError> {
         "VM_STATE_PAUSED" => Ok(VmState::Paused),
         "VM_STATE_STOPPED" => Ok(VmState::Stopped),
         "VM_STATE_CRASHED" => Ok(VmState::Crashed),
+        "VM_STATE_SUSPENDED" => Ok(VmState::Suspended),
         "VM_STATE_UNSPECIFIED" => Ok(VmState::Unspecified),
         _ => Err(PersistenceError::InvalidStateString(s.to_string())),
     }

@@ -14,6 +14,7 @@ service VMService {
   // 'vm_id' must be used for all subsequent operations on this VM.
   rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
   // Boots a created or stopped Virtual Machine in a new Firecracker process.
+  // Booting a suspended VM discards its snapshot.
   rpc StartVm(StartVmRequest) returns (StartVmResponse);
   // Retrieves detailed information about a specific Virtual Machine.
   rpc GetVm(GetVmRequest) returns (VmInfo);
@@ -37,8 +38,16 @@ service VMService {
   rpc ShutdownVm(ShutdownVmRequest) returns (ShutdownVmResponse);
   // Pauses a running Virtual Machine.
   rpc PauseVm(PauseVmRequest) returns (PauseVmResponse);
-  // Resumes a paused Virtual Machine.
+  // Resumes a paused Virtual Machine, or restores a suspended one from its
+  // snapshot in a new Firecracker process. A FeOS guest is pushed the time
+  // and its network configuration before this returns.
   rpc ResumeVm(ResumeVmRequest) returns (ResumeVmResponse);
+  // Writes the state and the memory of a running or paused Virtual Machine
+  // to a snapshot in its directory and ends its Firecracker process. The
+  // suspended VM holds no memory until ResumeVm restores it. Its disks must
+  // stay as they are until then. VMs with huge pages cannot be suspended
+  // yet: restoring them needs a userfaultfd memory backend.
+  rpc SuspendVm(SuspendVmRequest) returns (SuspendVmResponse);
   // Sets the target size of the balloon of a running or paused VM. The
   // guest inflates or deflates it on its own time.
   rpc UpdateBalloon(UpdateBalloonRequest) returns (UpdateBalloonResponse);
@@ -213,6 +222,8 @@ enum VmState {
   VM_STATE_PAUSED = 4;
   VM_STATE_STOPPED = 5;
   VM_STATE_CRASHED = 6;
+  // In a snapshot on disk, without a Firecracker process.
+  VM_STATE_SUSPENDED = 7;
 }
 
 message VmInfo {
@@ -289,6 +300,20 @@ message PauseVmRequest {
 
 message ResumeVmRequest {
   string vm_id = 1;
+}
+
+message SuspendVmRequest {
+  string vm_id = 1;
+  // Before the snapshot, a FeOS guest empties its memory as far as it can
+  // (sync, drop caches, compact; feos.host.v1.HostService.PreparePause),
+  // and with free page reporting the VM service waits until the guest has
+  // handed the freed memory back. The snapshot gets smaller.
+  bool purge_guest = 2;
+}
+
+message SuspendVmResponse {
+  // What the snapshot's memory takes on disk.
+  uint64 memory_bytes = 1;
 }
 
 message UpdateBalloonRequest {

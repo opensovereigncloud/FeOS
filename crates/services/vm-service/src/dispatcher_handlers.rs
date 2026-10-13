@@ -16,7 +16,8 @@ use feos_proto::{
         GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest, PauseVmResponse,
         ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
         StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest,
-        UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo, VmState, VmStateChangedEvent,
+        SuspendVmRequest, SuspendVmResponse, UpdateBalloonRequest, UpdateBalloonResponse, VmEvent,
+        VmInfo, VmState, VmStateChangedEvent,
     },
 };
 use hyper_util::rt::TokioIo;
@@ -548,9 +549,12 @@ pub(crate) async fn handle_start_vm_command(
     };
 
     let current_state = record.status.state;
-    if !matches!(current_state, VmState::Created | VmState::Stopped) {
+    if !matches!(
+        current_state,
+        VmState::Created | VmState::Stopped | VmState::Suspended
+    ) {
         let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-            "Cannot start VM in {current_state:?} state. Must be in Created or Stopped."
+            "Cannot start VM in {current_state:?} state. Must be in Created, Stopped or Suspended."
         ))));
         return;
     }
@@ -636,6 +640,52 @@ pub(crate) async fn handle_resume_vm_command(
     responder: oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
+    healthcheck_cancel_bus_tx: &broadcast::Sender<Uuid>,
+    guests: Arc<Guests>,
+) {
+    let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
+        Ok(result) => result,
+        Err(e) => {
+            let _ = responder.send(Err(e));
+            return;
+        }
+    };
+
+    match record.status.state {
+        VmState::Paused => {
+            tokio::spawn(worker::handle_resume_vm(
+                req,
+                responder,
+                hypervisor,
+                event_bus_tx,
+                guests,
+            ));
+        }
+        // A new VMM process to watch.
+        VmState::Suspended => {
+            tokio::spawn(worker::handle_restore_vm(
+                req,
+                responder,
+                hypervisor,
+                event_bus_tx,
+                healthcheck_cancel_bus_tx.subscribe(),
+                guests,
+            ));
+        }
+        current_state => {
+            let _ = responder.send(Err(VmServiceError::InvalidState(format!(
+                "Cannot resume VM in {current_state:?} state. Must be in Paused or Suspended."
+            ))));
+        }
+    }
+}
+
+pub(crate) async fn handle_suspend_vm_command(
+    repository: &VmRepository,
+    req: SuspendVmRequest,
+    responder: oneshot::Sender<Result<SuspendVmResponse, VmServiceError>>,
+    hypervisor: Arc<dyn Hypervisor>,
+    event_bus_tx: mpsc::Sender<VmEventWrapper>,
     guests: Arc<Guests>,
 ) {
     let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
@@ -647,19 +697,31 @@ pub(crate) async fn handle_resume_vm_command(
     };
 
     let current_state = record.status.state;
-    if current_state != VmState::Paused {
+    if !matches!(current_state, VmState::Running | VmState::Paused) {
         let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-            "Cannot resume VM in {current_state:?} state. Must be in Paused."
+            "Cannot suspend VM in {current_state:?} state. Must be in Running or Paused."
         ))));
         return;
     }
+    let memory = record.config.memory.unwrap_or_default();
+    // Firecracker restores hugetlbfs memory only through userfaultfd.
+    if memory.hugepages {
+        let _ = responder.send(Err(VmServiceError::InvalidState(
+            "Cannot suspend a VM with huge pages yet.".to_string(),
+        )));
+        return;
+    }
+    let free_page_reporting = memory
+        .balloon
+        .is_some_and(|balloon| balloon.free_page_reporting);
 
-    tokio::spawn(worker::handle_resume_vm(
+    tokio::spawn(worker::handle_suspend_vm(
         req,
         responder,
         hypervisor,
         event_bus_tx,
         guests,
+        free_page_reporting,
     ));
 }
 
@@ -727,11 +789,26 @@ pub(crate) async fn check_and_cleanup_vms(
     vms: Vec<VmRecord>,
 ) {
     for vm in vms {
+        let vm_id = vm.vm_id.to_string();
+        if vm.status.state == VmState::Suspended && !crate::vmm::snapshot::exists(&vm_id) {
+            warn!("VmDispatcher (Sanity Check): VM {vm_id} was suspended, but its snapshot is gone. Marking it stopped.");
+            crate::vmm::broadcast_state_change_event(
+                &event_bus_tx,
+                &vm_id,
+                "vm-service",
+                VmStateChangedEvent {
+                    new_state: VmState::Stopped as i32,
+                    reason: "The snapshot was gone when the VM service started".to_string(),
+                },
+                None,
+            )
+            .await;
+            continue;
+        }
         // Only a running or paused VM has a VMM process.
         if !matches!(vm.status.state, VmState::Running | VmState::Paused) {
             continue;
         }
-        let vm_id = vm.vm_id.to_string();
         let alive = vm
             .status
             .process_id

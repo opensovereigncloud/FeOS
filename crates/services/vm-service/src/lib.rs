@@ -7,8 +7,8 @@ use feos_proto::vm_service::{
     GetBalloonResponse, GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest,
     PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse,
     ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse, StreamVmConsoleRequest,
-    StreamVmConsoleResponse, StreamVmEventsRequest, UpdateBalloonRequest, UpdateBalloonResponse,
-    VmEvent, VmInfo,
+    StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse,
+    UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo,
 };
 use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
@@ -86,6 +86,10 @@ pub enum Command {
         ResumeVmRequest,
         oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     ),
+    SuspendVm(
+        SuspendVmRequest,
+        oneshot::Sender<Result<SuspendVmResponse, VmServiceError>>,
+    ),
     UpdateBalloon(
         UpdateBalloonRequest,
         oneshot::Sender<Result<UpdateBalloonResponse, VmServiceError>>,
@@ -112,6 +116,7 @@ impl std::fmt::Debug for Command {
             Command::ShutdownVm(req, _) => f.debug_tuple("ShutdownVm").field(req).finish(),
             Command::PauseVm(req, _) => f.debug_tuple("PauseVm").field(req).finish(),
             Command::ResumeVm(req, _) => f.debug_tuple("ResumeVm").field(req).finish(),
+            Command::SuspendVm(req, _) => f.debug_tuple("SuspendVm").field(req).finish(),
             Command::UpdateBalloon(req, _) => f.debug_tuple("UpdateBalloon").field(req).finish(),
             Command::GetBalloon(req, _) => f.debug_tuple("GetBalloon").field(req).finish(),
         }

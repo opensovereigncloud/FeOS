@@ -7,7 +7,7 @@ use crate::{
         handle_get_vm_command, handle_list_vms_command, handle_pause_vm_command,
         handle_resume_vm_command, handle_shutdown_vm_command, handle_start_vm_command,
         handle_stream_vm_console_command, handle_stream_vm_events_command,
-        handle_update_balloon_command, perform_startup_sanity_check,
+        handle_suspend_vm_command, handle_update_balloon_command, perform_startup_sanity_check,
     },
     error::VmServiceError,
     guest::Guests,
@@ -106,6 +106,9 @@ impl VmServiceDispatcher {
                         Command::PauseVm(req, responder) => {
                             handle_pause_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
                         }
+                        Command::SuspendVm(req, responder) => {
+                            handle_suspend_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, guests).await;
+                        }
                         Command::UpdateBalloon(req, responder) => {
                             handle_update_balloon_command(&self.repository, req, responder, hypervisor).await;
                         }
@@ -113,7 +116,7 @@ impl VmServiceDispatcher {
                             handle_get_balloon_command(&self.repository, req, responder, hypervisor).await;
                         }
                         Command::ResumeVm(req, responder) => {
-                            handle_resume_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, guests).await;
+                            handle_resume_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, &self.healthcheck_cancel_bus, guests).await;
                         }
                     }
                 },

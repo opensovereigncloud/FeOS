@@ -14,8 +14,8 @@ use feos_proto::vm_service::{
     stream_vm_console_request as console_input, AttachConsoleMessage, BalloonConfig, CpuConfig,
     CreateVmRequest, DeleteVmRequest, DiskConfig, GetBalloonRequest, GetVmRequest,
     GuestNetworkConfig, MemoryConfig, NetConfig, PauseVmRequest, PingVmRequest, ResumeVmRequest,
-    ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig,
-    UpdateBalloonRequest, VmConfig, VmState,
+    ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest, StreamVmEventsRequest,
+    SuspendVmRequest, TapConfig, UpdateBalloonRequest, VmConfig, VmState,
 };
 use feos_utils::vsock::API_PORT;
 use log::info;
@@ -533,6 +533,228 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
 
     verify_vm_socket_cleanup(&vm_id);
 
+    guard.disable_cleanup();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_suspend_and_restore_vm() -> Result<()> {
+    let Some(image_ref) = vm_test_image() else {
+        return Ok(());
+    };
+
+    ensure_server().await;
+    let (mut vm_client, _, _) = get_public_clients().await?;
+
+    let vm_config = VmConfig {
+        cpus: Some(CpuConfig { vcpu_count: 1 }),
+        memory: Some(MemoryConfig {
+            size_mib: 256,
+            hugepages: false,
+            balloon: Some(BalloonConfig {
+                amount_mib: 0,
+                deflate_on_oom: true,
+                free_page_reporting: true,
+                stats_interval_s: 0,
+            }),
+        }),
+        image_ref,
+        disks: vec![],
+        net: vec![],
+        guest_network: None,
+    };
+    let vm_id = vm_client
+        .create_vm(CreateVmRequest {
+            config: Some(vm_config),
+            vm_id: None,
+        })
+        .await?
+        .into_inner()
+        .vm_id;
+    info!("VM created with ID: {vm_id}");
+    let mut guard = VmGuard::new(vm_id.clone());
+
+    let mut stream = vm_client
+        .stream_vm_events(StreamVmEventsRequest {
+            vm_id: Some(vm_id.clone()),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    timeout(
+        Duration::from_secs(180),
+        wait_for_target_state(&mut stream, VmState::Created),
+    )
+    .await
+    .expect("Timed out waiting for VM to become created")?;
+
+    let start_req = StartVmRequest {
+        vm_id: vm_id.clone(),
+    };
+    vm_client.start_vm(start_req.clone()).await?;
+    timeout(
+        Duration::from_secs(30),
+        wait_for_target_state(&mut stream, VmState::Running),
+    )
+    .await
+    .expect("Timed out waiting for VM to become running")?;
+    let boot_id = timeout(
+        Duration::from_secs(30),
+        wait_for_guest_attached(&mut stream),
+    )
+    .await
+    .expect("Timed out waiting for the guest to attach")?
+    .boot_id;
+
+    let vsock_path = vm_client
+        .get_vm(GetVmRequest {
+            vm_id: vm_id.clone(),
+        })
+        .await?
+        .into_inner()
+        .vsock_path;
+    let ping = |vsock_path: String| async move {
+        let channel = feos_utils::vsock::channel(&vsock_path, API_PORT).await?;
+        anyhow::Ok(
+            HostServiceClient::new(channel)
+                .ping(PingRequest {})
+                .await?
+                .into_inner(),
+        )
+    };
+    let mut tick = ping(vsock_path.clone()).await?.tick;
+
+    for purge_guest in [true, false] {
+        info!("Suspending VM {vm_id} (purge: {purge_guest})");
+        let memory_bytes = vm_client
+            .suspend_vm(SuspendVmRequest {
+                vm_id: vm_id.clone(),
+                purge_guest,
+            })
+            .await?
+            .into_inner()
+            .memory_bytes;
+        timeout(
+            Duration::from_secs(30),
+            wait_for_target_state(&mut stream, VmState::Suspended),
+        )
+        .await
+        .expect("Timed out waiting for VM to become suspended")?;
+        info!(
+            "VM is suspended; its memory takes {} MiB",
+            memory_bytes >> 20
+        );
+        assert!(memory_bytes > 0 && memory_bytes < 256 << 20);
+        assert!(vm_dir(&vm_id).join("snapshot/vmstate").exists());
+        assert!(
+            vm_client
+                .ping_vm(PingVmRequest {
+                    vm_id: vm_id.clone(),
+                })
+                .await
+                .is_err(),
+            "A suspended VM has no VMM"
+        );
+
+        // The guest's clock stands still in the snapshot.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        info!("Restoring VM {vm_id}");
+        vm_client
+            .resume_vm(ResumeVmRequest {
+                vm_id: vm_id.clone(),
+            })
+            .await?;
+        timeout(
+            Duration::from_secs(30),
+            wait_for_target_state(&mut stream, VmState::Running),
+        )
+        .await
+        .expect("Timed out waiting for VM to run again")?;
+        assert!(
+            !vm_dir(&vm_id).join("snapshot").exists(),
+            "A restored VM's snapshot is gone"
+        );
+
+        // The same boot, with its memory: the ping count goes on.
+        let pong = ping(vsock_path.clone()).await?;
+        assert_eq!(pong.boot_id, boot_id);
+        assert!(pong.tick > tick, "The guest forgot its pings");
+        tick = pong.tick;
+
+        let guest = vm_client
+            .get_vm(GetVmRequest {
+                vm_id: vm_id.clone(),
+            })
+            .await?
+            .into_inner()
+            .guest
+            .context("GetVm reports no guest")?;
+        assert!(
+            guest.push_error.is_empty(),
+            "Push failed: {}",
+            guest.push_error
+        );
+        let guest_time: SystemTime =
+            HostServiceClient::new(feos_utils::vsock::channel(&vsock_path, API_PORT).await?)
+                .get_time(GetTimeRequest {})
+                .await?
+                .into_inner()
+                .time
+                .context("GetTime returned no time")?
+                .try_into()?;
+        let skew = SystemTime::now()
+            .duration_since(guest_time)
+            .unwrap_or_else(|e| e.duration());
+        assert!(
+            skew < Duration::from_secs(2),
+            "The guest's clock is {skew:?} off"
+        );
+    }
+
+    info!("Suspending VM {vm_id} and booting it instead of restoring it");
+    vm_client
+        .suspend_vm(SuspendVmRequest {
+            vm_id: vm_id.clone(),
+            purge_guest: false,
+        })
+        .await?;
+    timeout(
+        Duration::from_secs(30),
+        wait_for_target_state(&mut stream, VmState::Suspended),
+    )
+    .await
+    .expect("Timed out waiting for VM to become suspended")?;
+    vm_client.start_vm(start_req).await?;
+    timeout(
+        Duration::from_secs(30),
+        wait_for_target_state(&mut stream, VmState::Running),
+    )
+    .await
+    .expect("Timed out waiting for VM to boot")?;
+    let guest = timeout(
+        Duration::from_secs(30),
+        wait_for_guest_attached(&mut stream),
+    )
+    .await
+    .expect("Timed out waiting for the guest to attach")?;
+    assert_ne!(guest.boot_id, boot_id, "A boot discards the snapshot");
+    assert!(!vm_dir(&vm_id).join("snapshot").exists());
+
+    let ping_res = vm_client
+        .ping_vm(PingVmRequest {
+            vm_id: vm_id.clone(),
+        })
+        .await?
+        .into_inner();
+    guard.set_pid(ping_res.pid as i32);
+
+    vm_client
+        .delete_vm(DeleteVmRequest {
+            vm_id: vm_id.clone(),
+        })
+        .await?;
+    verify_vm_socket_cleanup(&vm_id);
     guard.disable_cleanup();
     Ok(())
 }
