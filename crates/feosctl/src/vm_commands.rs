@@ -406,28 +406,27 @@ async fn wait_for_vm_state(
     while let Some(event) = stream.next().await {
         match event {
             Ok(event) => {
-                if let Some(data) = event.data {
-                    if data
+                if let Some(data) = event.data
+                    && data
                         .type_url
                         .contains("feos.vm.vmm.api.v1.VmStateChangedEvent")
-                    {
-                        let state_change = VmStateChangedEvent::decode(&*data.value)?;
-                        let new_state = VmState::try_from(state_change.new_state)
-                            .unwrap_or(VmState::Unspecified);
+                {
+                    let state_change = VmStateChangedEvent::decode(&*data.value)?;
+                    let new_state =
+                        VmState::try_from(state_change.new_state).unwrap_or(VmState::Unspecified);
 
-                        println!(
-                            "   State transition: {:?} ({})",
-                            new_state, state_change.reason
-                        );
+                    println!(
+                        "   State transition: {:?} ({})",
+                        new_state, state_change.reason
+                    );
 
-                        if new_state == target_state {
-                            return Ok(());
-                        }
+                    if new_state == target_state {
+                        return Ok(());
+                    }
 
-                        // Check for error states
-                        if new_state == VmState::Crashed {
-                            anyhow::bail!("VM entered crashed state: {}", state_change.reason);
-                        }
+                    // Check for error states
+                    if new_state == VmState::Crashed {
+                        anyhow::bail!("VM entered crashed state: {}", state_change.reason);
                     }
                 }
             }

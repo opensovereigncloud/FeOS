@@ -14,6 +14,8 @@ resolver = "3"
 
 [workspace.lints.clippy]
 uninlined_format_args = "warn"
+# tonic::Status is 176 bytes; every gRPC handler returns it.
+result_large_err = "allow"
 
 [workspace.package]
 version = "0.5.0"

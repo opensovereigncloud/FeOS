@@ -146,7 +146,7 @@ impl VmServiceDispatcher {
             Err(e) => {
                 error!(
                     "DatabaseUpdate: Could not parse UUID from event vm_id '{}': {e}",
-                    &event.vm_id
+                    event.vm_id
                 );
                 return;
             }
@@ -159,16 +159,11 @@ impl VmServiceDispatcher {
             }
         }
 
-        if let Some(data) = &event.data {
-            if data.type_url.contains("VmStateChangedEvent") {
-                self.handle_vm_state_changed_event(
-                    data,
-                    vm_id_uuid,
-                    &event.vm_id,
-                    event_to_forward,
-                )
+        if let Some(data) = &event.data
+            && data.type_url.contains("VmStateChangedEvent")
+        {
+            self.handle_vm_state_changed_event(data, vm_id_uuid, &event.vm_id, event_to_forward)
                 .await;
-            }
         }
     }
 

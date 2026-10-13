@@ -53,10 +53,9 @@ impl Orchestrator {
             .send(FileCommand::ScanExistingImages { responder })
             .await
             .is_ok()
+            && let Ok(initial_store) = resp_rx.await
         {
-            if let Ok(initial_store) = resp_rx.await {
-                self.store = initial_store;
-            }
+            self.store = initial_store;
         }
 
         info!("Orchestrator: Running and waiting for commands.");
@@ -177,10 +176,10 @@ impl Orchestrator {
 
                 if self.filestore_tx.send(file_cmd).await.is_err() {
                     error!("Orchestrator: Failed to send DeleteImage command to FileStore.");
-                } else if let Ok(Err(e)) = file_resp_rx.await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        warn!("Orchestrator: FileStore failed to delete {image_uuid}: {e}");
-                    }
+                } else if let Ok(Err(e)) = file_resp_rx.await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!("Orchestrator: FileStore failed to delete {image_uuid}: {e}");
                 }
 
                 self.broadcast_state_change(

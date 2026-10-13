@@ -178,21 +178,17 @@ pub fn is_dhcpv6_needed(interface_name: String, ignore_ra_flag: bool) -> Option<
     send_router_solicitation(&interface, &mut *tx);
 
     while let Ok(raw_packet) = rx.next() {
-        if let Some(eth_packet) = EthernetPacket::new(raw_packet) {
-            if eth_packet.get_ethertype() == EtherTypes::Ipv6 {
-                if let Some(ipv6_packet) = Ipv6Packet::new(eth_packet.payload()) {
-                    sender_ipv6_address = Some(ipv6_packet.get_source());
-                    if let Some(icmp_packet) = Icmpv6Packet::new(ipv6_packet.payload()) {
-                        if icmp_packet.get_icmpv6_type() == Icmpv6Types::RouterAdvert {
-                            if let Some(ra_packet) = RouterAdvertPacket::new(ipv6_packet.payload())
-                            {
-                                if (ra_packet.get_flags() & 0xC0) == 0xC0 || ignore_ra_flag {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
+        if let Some(eth_packet) = EthernetPacket::new(raw_packet)
+            && eth_packet.get_ethertype() == EtherTypes::Ipv6
+            && let Some(ipv6_packet) = Ipv6Packet::new(eth_packet.payload())
+        {
+            sender_ipv6_address = Some(ipv6_packet.get_source());
+            if let Some(icmp_packet) = Icmpv6Packet::new(ipv6_packet.payload())
+                && icmp_packet.get_icmpv6_type() == Icmpv6Types::RouterAdvert
+                && let Some(ra_packet) = RouterAdvertPacket::new(ipv6_packet.payload())
+                && ((ra_packet.get_flags() & 0xC0) == 0xC0 || ignore_ra_flag)
+            {
+                break;
             }
         }
     }
@@ -301,15 +297,15 @@ pub async fn run_dhcpv6_client(
         match response.msg_type() {
             MessageType::Advertise => {
                 info!("DHCPv6 processing in progress...");
-                if let Some(DhcpOption::IANA(iana)) = response.opts().get(OptionCode::IANA) {
-                    if let Some(ia_addr_opt) = iana.opts.get(OptionCode::IAAddr) {
-                        ia_addr = Some(ia_addr_opt);
-                    }
+                if let Some(DhcpOption::IANA(iana)) = response.opts().get(OptionCode::IANA)
+                    && let Some(ia_addr_opt) = iana.opts.get(OptionCode::IAAddr)
+                {
+                    ia_addr = Some(ia_addr_opt);
                 }
-                if let Some(DhcpOption::IAPD(iapd)) = response.opts().get(OptionCode::IAPD) {
-                    if let Some(iaprefix_opt) = iapd.opts.get(OptionCode::IAPrefix) {
-                        ia_pd = Some(iaprefix_opt);
-                    }
+                if let Some(DhcpOption::IAPD(iapd)) = response.opts().get(OptionCode::IAPD)
+                    && let Some(iaprefix_opt) = iapd.opts.get(OptionCode::IAPrefix)
+                {
+                    ia_pd = Some(iaprefix_opt);
                 }
                 if let Some(server_option) = response.opts().get(OptionCode::ServerId) {
                     serverid = Some(server_option);
@@ -378,17 +374,16 @@ pub async fn run_dhcpv6_client(
                 socket.send_to(&buf, multicast_address).await?;
             }
             MessageType::Reply => {
-                if let Some(DhcpOption::IANA(iana)) = response.opts().get(OptionCode::IANA) {
-                    if let Some(ia_addr_opt) = iana.opts.get(OptionCode::IAAddr) {
-                        ia_addr_confirm = Some((*ia_addr_opt).clone());
-                    }
+                if let Some(DhcpOption::IANA(iana)) = response.opts().get(OptionCode::IANA)
+                    && let Some(ia_addr_opt) = iana.opts.get(OptionCode::IAAddr)
+                {
+                    ia_addr_confirm = Some((*ia_addr_opt).clone());
                 }
-                if let Some(DhcpOption::IAPD(iapd)) = response.opts().get(OptionCode::IAPD) {
-                    if let Some(DhcpOption::IAPrefix(iaprefix)) =
+                if let Some(DhcpOption::IAPD(iapd)) = response.opts().get(OptionCode::IAPD)
+                    && let Some(DhcpOption::IAPrefix(iaprefix)) =
                         iapd.opts.get(OptionCode::IAPrefix)
-                    {
-                        ia_pd_confirm = Some((*iaprefix).clone());
-                    }
+                {
+                    ia_pd_confirm = Some((*iaprefix).clone());
                 }
 
                 // Check for Option 56 (RFC 5908 NTP Server)
@@ -532,11 +527,11 @@ pub async fn add_ipv6_route(
     msg.header.destination_prefix_length = prefix_length;
     msg.attributes
         .push(RouteAttribute::Destination(RouteAddress::from(destination)));
-    if route_type == RouteType::Unicast {
-        if let Some(gw) = gateway {
-            msg.attributes
-                .push(RouteAttribute::Gateway(RouteAddress::from(gw)));
-        }
+    if route_type == RouteType::Unicast
+        && let Some(gw) = gateway
+    {
+        msg.attributes
+            .push(RouteAttribute::Gateway(RouteAddress::from(gw)));
     }
     msg.attributes.push(RouteAttribute::Oif(link.header.index));
     msg.attributes.push(RouteAttribute::Priority(metric));

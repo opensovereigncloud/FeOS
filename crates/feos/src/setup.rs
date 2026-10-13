@@ -242,7 +242,7 @@ pub(crate) fn handle_upgrade(new_binary_path: &Path) -> Result<()> {
             panic!("FATAL: Could not get current executable path: {e}");
         }
     };
-    info!("Main: Current binary is at {:?}", &current_exe);
+    info!("Main: Current binary is at {current_exe:?}");
 
     let rename_result = std::fs::rename(new_binary_path, &current_exe);
 
@@ -255,8 +255,7 @@ pub(crate) fn handle_upgrade(new_binary_path: &Path) -> Result<()> {
             let staging_path = current_exe.with_extension("staging");
             if let Err(copy_err) = std::fs::copy(new_binary_path, &staging_path) {
                 error!(
-                    "CRITICAL: Failed to copy new binary to staging path {:?}: {}. Aborting upgrade.",
-                    &staging_path, copy_err
+                    "CRITICAL: Failed to copy new binary to staging path {staging_path:?}: {copy_err}. Aborting upgrade."
                 );
                 return Ok(());
             }
@@ -264,16 +263,14 @@ pub(crate) fn handle_upgrade(new_binary_path: &Path) -> Result<()> {
                 std::fs::set_permissions(&staging_path, std::fs::Permissions::from_mode(0o755))
             {
                 error!(
-                    "CRITICAL: Failed to set permissions on staged binary {:?}: {}. Aborting upgrade.",
-                    &staging_path, perm_err
+                    "CRITICAL: Failed to set permissions on staged binary {staging_path:?}: {perm_err}. Aborting upgrade."
                 );
                 let _ = std::fs::remove_file(&staging_path);
                 return Ok(());
             }
             if let Err(final_rename_err) = std::fs::rename(&staging_path, &current_exe) {
                 error!(
-                    "CRITICAL: Failed to perform final atomic rename from {:?}: {}. Aborting upgrade.",
-                    &staging_path, final_rename_err
+                    "CRITICAL: Failed to perform final atomic rename from {staging_path:?}: {final_rename_err}. Aborting upgrade."
                 );
                 let _ = std::fs::remove_file(&staging_path);
                 return Ok(());
@@ -301,10 +298,7 @@ pub(crate) fn handle_upgrade(new_binary_path: &Path) -> Result<()> {
         .collect();
     let cstr_path = CString::new(current_exe.into_os_string().into_vec()).unwrap();
 
-    info!(
-        "Main: Executing new binary with arguments: {:?}",
-        &cstr_args
-    );
+    info!("Main: Executing new binary with arguments: {cstr_args:?}");
     let Err(e) = nix::unistd::execv(&cstr_path, &cstr_args);
     // execv replaces the current process, so it should not return.
     // If it returns, it's a fatal error.

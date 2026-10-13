@@ -37,15 +37,15 @@ use tower::service_fn;
 use uuid::Uuid;
 
 fn ensure_net_config_device_id(net_config: &mut feos_proto::vm_service::NetConfig) {
-    if net_config.device_id.is_empty() {
-        if let Some(backend) = &net_config.backend {
-            match backend {
-                net_config::Backend::Tap(tap) => {
-                    net_config.device_id = tap.tap_name.clone();
-                }
-                net_config::Backend::VfioPci(pci) => {
-                    net_config.device_id = format!("/sys/bus/pci/devices/{}", pci.bdf);
-                }
+    if net_config.device_id.is_empty()
+        && let Some(backend) = &net_config.backend
+    {
+        match backend {
+            net_config::Backend::Tap(tap) => {
+                net_config.device_id = tap.tap_name.clone();
+            }
+            net_config::Backend::VfioPci(pci) => {
+                net_config.device_id = format!("/sys/bus/pci/devices/{}", pci.bdf);
             }
         }
     }

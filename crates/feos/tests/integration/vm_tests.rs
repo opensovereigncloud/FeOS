@@ -53,17 +53,14 @@ async fn test_create_and_start_vm() -> Result<()> {
 
     let mut guard = VmGuard::new(vm_id.clone());
 
-    info!(
-        "Immediately calling StartVm for vm_id: {}, expecting error",
-        &vm_id
-    );
+    info!("Immediately calling StartVm for vm_id: {vm_id}, expecting error");
     let start_req = StartVmRequest {
         vm_id: vm_id.clone(),
     };
     let result = vm_client.start_vm(start_req.clone()).await;
     assert!(result.is_err(), "StartVm should fail when VM is Creating");
 
-    info!("Connecting to StreamVmEvents stream for vm_id: {}", &vm_id);
+    info!("Connecting to StreamVmEvents stream for vm_id: {vm_id}");
     let events_req = StreamVmEventsRequest {
         vm_id: Some(vm_id.clone()),
         ..Default::default()
@@ -78,7 +75,7 @@ async fn test_create_and_start_vm() -> Result<()> {
     .expect("Timed out waiting for VM to become created")?;
     info!("VM is in CREATED state");
 
-    info!("Sending StartVm request for vm_id: {}", &vm_id);
+    info!("Sending StartVm request for vm_id: {vm_id}");
     vm_client.start_vm(start_req.clone()).await?;
 
     timeout(
@@ -89,7 +86,7 @@ async fn test_create_and_start_vm() -> Result<()> {
     .expect("Timed out waiting for VM to become running")?;
     info!("VM is in RUNNING state");
 
-    info!("Sending ShutdownVm request for vm_id: {}", &vm_id);
+    info!("Sending ShutdownVm request for vm_id: {vm_id}");
     let shutdown_req = ShutdownVmRequest {
         vm_id: vm_id.clone(),
     };
@@ -103,20 +100,14 @@ async fn test_create_and_start_vm() -> Result<()> {
     .expect("Timed out waiting for VM to become stopped")?;
     info!("VM is in STOPPED state");
 
-    info!(
-        "Calling ResumeVm in Stopped state for vm_id: {}, expecting error",
-        &vm_id
-    );
+    info!("Calling ResumeVm in Stopped state for vm_id: {vm_id}, expecting error");
     let resume_req = ResumeVmRequest {
         vm_id: vm_id.clone(),
     };
     let result = vm_client.resume_vm(resume_req.clone()).await;
     assert!(result.is_err(), "ResumeVm should fail when VM is Stopped");
 
-    info!(
-        "Calling StreamVmConsole in Stopped state for vm_id: {}, expecting error",
-        &vm_id
-    );
+    info!("Calling StreamVmConsole in Stopped state for vm_id: {vm_id}, expecting error");
     let (console_tx, console_rx) = tokio::sync::mpsc::channel(1);
     let console_stream = tokio_stream::wrappers::ReceiverStream::new(console_rx);
 
@@ -160,7 +151,7 @@ async fn test_create_and_start_vm() -> Result<()> {
         None => panic!("StreamVmConsole stream ended unexpectedly without error"),
     }
 
-    info!("Sending StartVm request again for vm_id: {}", &vm_id);
+    info!("Sending StartVm request again for vm_id: {vm_id}");
     vm_client.start_vm(start_req).await?;
 
     timeout(
@@ -171,7 +162,7 @@ async fn test_create_and_start_vm() -> Result<()> {
     .expect("Timed out waiting for VM to become running again")?;
     info!("VM is in RUNNING state again");
 
-    info!("Sending PauseVm request for vm_id: {}", &vm_id);
+    info!("Sending PauseVm request for vm_id: {vm_id}");
     let pause_req = PauseVmRequest {
         vm_id: vm_id.clone(),
     };
@@ -185,17 +176,14 @@ async fn test_create_and_start_vm() -> Result<()> {
     .expect("Timed out waiting for VM to become paused")?;
     info!("VM is in PAUSED state");
 
-    info!(
-        "Calling StartVm in Paused state for vm_id: {}, expecting error",
-        &vm_id
-    );
+    info!("Calling StartVm in Paused state for vm_id: {vm_id}, expecting error");
     let start_req_paused = StartVmRequest {
         vm_id: vm_id.clone(),
     };
     let result = vm_client.start_vm(start_req_paused).await;
     assert!(result.is_err(), "StartVm should fail when VM is Paused");
 
-    info!("Sending ResumeVm request for vm_id: {}", &vm_id);
+    info!("Sending ResumeVm request for vm_id: {vm_id}");
     vm_client.resume_vm(resume_req).await?;
 
     timeout(
@@ -216,7 +204,7 @@ async fn test_create_and_start_vm() -> Result<()> {
         "VM state from GetVm should be RUNNING"
     );
 
-    info!("Pinging VMM for vm_id: {}", &vm_id);
+    info!("Pinging VMM for vm_id: {vm_id}");
     let ping_req = PingVmRequest {
         vm_id: vm_id.clone(),
     };
@@ -224,7 +212,7 @@ async fn test_create_and_start_vm() -> Result<()> {
     info!("VMM Ping successful, PID: {}", ping_res.pid);
     guard.set_pid(ping_res.pid as i32);
 
-    info!("Attaching NIC 'test-nic' to vm_id: {}", &vm_id);
+    info!("Attaching NIC 'test-nic' to vm_id: {vm_id}");
     let attach_nic_req = AttachNicRequest {
         vm_id: vm_id.clone(),
         nic: Some(NetConfig {
@@ -258,7 +246,7 @@ async fn test_create_and_start_vm() -> Result<()> {
     assert!(nic_found, "Attached NIC 'test' was not found in VM config");
     info!("Successfully verified NIC attachment.");
 
-    info!("Detaching NIC 'test' from vm_id: {}", &vm_id);
+    info!("Detaching NIC 'test' from vm_id: {vm_id}");
     let detach_nic_req = DetachNicRequest {
         vm_id: vm_id.clone(),
         device_id: "test".to_string(),
@@ -285,7 +273,7 @@ async fn test_create_and_start_vm() -> Result<()> {
     );
     info!("Successfully verified NIC removal.");
 
-    info!("Deleting VM: {}", &vm_id);
+    info!("Deleting VM: {vm_id}");
     let delete_req = DeleteVmRequest {
         vm_id: vm_id.clone(),
     };
@@ -334,7 +322,7 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
 
     let mut guard = VmGuard::new(vm_id.clone());
 
-    info!("Connecting to StreamVmEvents stream for vm_id: {}", &vm_id);
+    info!("Connecting to StreamVmEvents stream for vm_id: {vm_id}");
     let events_req = StreamVmEventsRequest {
         vm_id: Some(vm_id.clone()),
         ..Default::default()
@@ -349,7 +337,7 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
     .expect("Timed out waiting for VM to become created")?;
     info!("VM is in CREATED state");
 
-    info!("Sending StartVm request for vm_id: {}", &vm_id);
+    info!("Sending StartVm request for vm_id: {vm_id}");
     let start_req = StartVmRequest {
         vm_id: vm_id.clone(),
     };
@@ -363,7 +351,7 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
     .expect("Timed out waiting for VM to become running")?;
     info!("VM is in RUNNING state");
 
-    info!("Pinging VMM for vm_id: {}", &vm_id);
+    info!("Pinging VMM for vm_id: {vm_id}");
     let ping_req = PingVmRequest {
         vm_id: vm_id.clone(),
     };
@@ -384,7 +372,7 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
     .expect("Timed out waiting for VM to enter Crashed state")?;
     info!("VM is in CRASHED state as expected");
 
-    info!("Verifying API calls fail for crashed VM: {}", &vm_id);
+    info!("Verifying API calls fail for crashed VM: {vm_id}");
 
     let start_req = StartVmRequest {
         vm_id: vm_id.clone(),
@@ -420,7 +408,7 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
 
     info!("API call failure checks passed for crashed VM");
 
-    info!("Deleting crashed VM: {}", &vm_id);
+    info!("Deleting crashed VM: {vm_id}");
     let delete_req = DeleteVmRequest {
         vm_id: vm_id.clone(),
     };

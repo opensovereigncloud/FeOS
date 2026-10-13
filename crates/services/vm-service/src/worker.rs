@@ -484,13 +484,13 @@ async fn bridge_console_streams(
             tokio::select! {
                 biased;
                 _ = grpc_output_clone.closed() => {
-                    info!("VmmHelper (Console {}): gRPC client disconnected, terminating read task.", &read_task_vm_id);
+                    info!("VmmHelper (Console {read_task_vm_id}): gRPC client disconnected, terminating read task.");
                     break;
                 }
                 read_result = socket_reader.read(&mut buf) => {
                     match read_result {
                         Ok(0) => {
-                            info!("VmmHelper (Console {}): Console socket closed (EOF).", &read_task_vm_id);
+                            info!("VmmHelper (Console {read_task_vm_id}): Console socket closed (EOF).");
                             break;
                         }
                         Ok(n) => {
@@ -516,7 +516,7 @@ async fn bridge_console_streams(
                 Ok(msg) => match msg.payload {
                     Some(console_input::Payload::Data(ConsoleData { input })) => {
                         if let Err(e) = socket_writer.write_all(&input).await {
-                            warn!("VmmHelper (Console {}): Failed to write to socket: {}. VM may have shut down.", &write_task_vm_id, e);
+                            warn!("VmmHelper (Console {write_task_vm_id}): Failed to write to socket: {e}. VM may have shut down.");
                             break;
                         }
                     }
@@ -537,8 +537,7 @@ async fn bridge_console_streams(
                 },
                 Err(e) => {
                     warn!(
-                        "VmmHelper (Console {}): Error reading from gRPC client stream: {}",
-                        &write_task_vm_id, e
+                        "VmmHelper (Console {write_task_vm_id}): Error reading from gRPC client stream: {e}"
                     );
                     break;
                 }

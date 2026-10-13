@@ -245,7 +245,7 @@ pub async fn handle_upgrade(
         return;
     }
 
-    info!("HostWorker: Staged new binary at {:?}", &final_path);
+    info!("HostWorker: Staged new binary at {final_path:?}");
 
     if let Err(e) = restart_tx.send(RestartSignal(final_path)).await {
         error!("HostWorker: CRITICAL - Failed to send restart signal to main process: {e}");

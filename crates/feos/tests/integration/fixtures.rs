@@ -79,7 +79,7 @@ pub async fn wait_for_target_state(
 
             if new_state == VmState::Crashed {
                 let err_msg = format!("VM entered Crashed state. Reason: {}", state_change.reason);
-                error!("{}", &err_msg);
+                error!("{err_msg}");
                 return Err(anyhow::anyhow!(err_msg));
             }
         }
