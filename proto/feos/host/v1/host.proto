@@ -27,6 +27,43 @@ service HostService {
 
   // Retrieves version information about the host system.
   rpc GetVersionInfo(GetVersionInfoRequest) returns (GetVersionInfoResponse);
+
+  // Liveness check. `tick` counts the pings since boot and lives in RAM, so
+  // it survives a snapshot resume but not a reboot.
+  rpc Ping(PingRequest) returns (PingResponse);
+
+  // Sets CLOCK_REALTIME. A guest has no NTP and does not read its RTC: its
+  // host pushes the wall time after every boot and every resume, so that a
+  // clock does not drift across a pause.
+  rpc SetTime(SetTimeRequest) returns (SetTimeResponse);
+  // Reads CLOCK_REALTIME.
+  rpc GetTime(GetTimeRequest) returns (GetTimeResponse);
+
+  // Configures an interface with a static IPv4 address, the default route,
+  // the DNS resolvers and the hostname. A guest has no DHCP: its host pushes
+  // this after every boot and every resume. Pushing the same configuration
+  // twice is fine.
+  rpc SetNetworkConfig(SetNetworkConfigRequest) returns (SetNetworkConfigResponse);
+  // Returns the last configuration pushed since boot.
+  rpc GetNetworkConfig(GetNetworkConfigRequest) returns (GetNetworkConfigResponse);
+
+  // Freezes a filesystem (FIFREEZE): syncs it and blocks writes to it, so
+  // that the host can copy the block device consistently. FeOS itself does
+  // not write to it until ThawFilesystem.
+  rpc FreezeFilesystem(FreezeFilesystemRequest) returns (FreezeFilesystemResponse);
+  // Thaws a frozen filesystem (FITHAW).
+  rpc ThawFilesystem(ThawFilesystemRequest) returns (ThawFilesystemResponse);
+
+  // Who holds the memory a VM snapshot has to write. /proc/meminfo only
+  // describes what the page allocator manages; the struct page array and
+  // the kernel image sit below MemTotal and are reconstructed from
+  // /proc/iomem.
+  rpc GetMemoryBreakdown(GetMemoryBreakdownRequest) returns (MemoryBreakdown);
+  // Empties the guest's memory as far as possible right before its host
+  // pauses it: sync, drop caches, optionally compact and zero free pages.
+  // Every step is best effort and reported; a failing step does not fail
+  // the call.
+  rpc PreparePause(PreparePauseRequest) returns (PreparePauseResponse);
 }
 
 message HostnameRequest {}
@@ -231,4 +268,175 @@ message GetVersionInfoResponse {
   string kernel_version = 1;
   // The version of the running FeOS binary.
   string feos_version = 2;
+}
+
+message PingRequest {}
+
+message PingResponse {
+  // Pings served since boot, starting at 1.
+  uint64 tick = 1;
+  // Seconds since boot (CLOCK_BOOTTIME), including time paused.
+  uint64 uptime_seconds = 2;
+  // /proc/sys/kernel/random/boot_id; it changes with every boot.
+  string boot_id = 3;
+}
+
+message SetTimeRequest {
+  google.protobuf.Timestamp time = 1;
+}
+
+message SetTimeResponse {}
+
+message GetTimeRequest {}
+
+message GetTimeResponse {
+  google.protobuf.Timestamp time = 1;
+}
+
+message SetNetworkConfigRequest {
+  // Interface name, e.g. "eth0".
+  string interface = 1;
+  // Address with prefix length, e.g. "192.168.100.10/24".
+  string ipv4_cidr = 2;
+  // Default gateway, e.g. "192.168.100.1".
+  string gateway = 3;
+  // Resolvers, in order. FeOS writes them to /etc/resolv.conf and to
+  // /run/feos/resolv.conf, which containers link to.
+  repeated string dns = 4;
+  // Kernel hostname. Left alone when empty.
+  string hostname = 5;
+}
+
+message SetNetworkConfigResponse {
+  // Containers whose /etc/resolv.conf could not be linked to the pushed
+  // resolvers again. The push itself took effect.
+  repeated ResolverFailure resolver_failed = 1;
+}
+
+message ResolverFailure {
+  string container_id = 1;
+  string reason = 2;
+}
+
+message GetNetworkConfigRequest {}
+
+message GetNetworkConfigResponse {
+  // Whether a configuration has been pushed since boot. The other fields
+  // repeat the last push and are empty when there was none.
+  bool configured = 1;
+  string interface = 2;
+  string ipv4_cidr = 3;
+  string gateway = 4;
+  repeated string dns = 5;
+  string hostname = 6;
+}
+
+message FreezeFilesystemRequest {
+  // A mount point; empty means the data root, /var/lib/feos.
+  string mountpoint = 1;
+}
+
+message FreezeFilesystemResponse {
+  // The block device behind the mount point, e.g. "vda".
+  string device = 1;
+}
+
+message ThawFilesystemRequest {
+  // A mount point; empty means the data root, /var/lib/feos.
+  string mountpoint = 1;
+}
+
+message ThawFilesystemResponse {
+  string device = 1;
+}
+
+message GetMemoryBreakdownRequest {
+  // Include the resident memory of every process (walks /proc).
+  bool with_processes = 1;
+  // Include the largest slab caches from /proc/slabinfo.
+  bool with_slabs = 2;
+  // Include every /proc/meminfo entry in `meminfo_kb`.
+  bool with_raw_meminfo = 3;
+}
+
+// Resident memory of one process, from /proc/<pid>/status.
+message ProcessMemory {
+  uint32 pid = 1;
+  string name = 2;
+  uint64 rss_kb = 3;
+  uint64 rss_anon_kb = 4;
+  uint64 rss_file_kb = 5;
+  uint64 rss_shmem_kb = 6;
+}
+
+// One slab cache, by what it costs.
+message SlabCache {
+  string name = 1;
+  uint64 size_kb = 2;
+  uint64 objects = 3;
+}
+
+// All sizes in KiB, as in /proc/meminfo.
+message MemoryBreakdown {
+  // From /proc/meminfo.
+  uint64 mem_total_kb = 1;
+  uint64 mem_free_kb = 2;
+  uint64 mem_available_kb = 3;
+  uint64 buffers_kb = 4;
+  uint64 cached_kb = 5;
+  uint64 anon_pages_kb = 6;
+  uint64 mapped_kb = 7;
+  uint64 shmem_kb = 8;
+  uint64 slab_kb = 9;
+  uint64 s_reclaimable_kb = 10;
+  uint64 s_unreclaim_kb = 11;
+  uint64 kernel_stack_kb = 12;
+  uint64 page_tables_kb = 13;
+  uint64 percpu_kb = 14;
+  uint64 vmalloc_used_kb = 15;
+  uint64 dirty_kb = 16;
+  uint64 writeback_kb = 17;
+  // "System RAM" in /proc/iomem: the address space a snapshot persists.
+  uint64 system_ram_kb = 18;
+  // The kernel image sections in /proc/iomem.
+  uint64 kernel_image_kb = 19;
+  // system_ram - mem_total - kernel_image: the struct page array, early
+  // reservations and firmware holes. Not in /proc/meminfo, but in every
+  // snapshot.
+  uint64 memmap_reserved_kb = 20;
+  // mem_total minus free and reclaimable memory: content no purge drops.
+  uint64 unreclaimable_kb = 21;
+  repeated ProcessMemory processes = 22;
+  repeated SlabCache top_slabs = 23;
+  map<string, uint64> meminfo_kb = 24;
+}
+
+message PreparePauseRequest {
+  // Skip sync(2). drop_caches cannot free dirty pages, so syncing is the
+  // default.
+  bool skip_sync = 1;
+  // Skip writing 3 to /proc/sys/vm/drop_caches.
+  bool skip_drop_caches = 2;
+  // Write 1 to /proc/sys/vm/compact_memory after dropping caches. Free page
+  // reporting only reports free blocks of page_reporting_order and above.
+  bool compact = 3;
+  // Lower page_reporting_order so that free page reporting also reports
+  // small blocks; 0 reports every free page. Left alone when unset.
+  optional uint32 page_reporting_order = 4;
+  // Seconds to wait before returning, so that free page reporting can hand
+  // the free pages to the host.
+  uint32 settle_seconds = 5;
+  // Fill free memory with zeroes. Without a balloon or free page reporting
+  // this is the only way to keep stale page content out of a full snapshot.
+  bool zero_free_pages = 6;
+}
+
+message PreparePauseResponse {
+  MemoryBreakdown before = 1;
+  MemoryBreakdown after = 2;
+  // What ran and how it went, e.g. "drop_caches=3 ok (12 ms)".
+  repeated string steps = 3;
+  uint64 duration_ms = 4;
+  // Memory zeroed by `zero_free_pages`, in KiB.
+  uint64 zeroed_kb = 5;
 }

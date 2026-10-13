@@ -20,6 +20,15 @@ pub enum HostError {
 
     #[error("Failed to create log reader: {0}")]
     LogReader(String),
+
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
+
+    #[error("{0}")]
+    Failed(String),
 }
 
 impl From<HostError> for Status {
@@ -32,7 +41,9 @@ impl From<HostError> for Status {
             HostError::Hostname(_) | HostError::PowerOperation(_) => {
                 Status::internal("An internal host error occurred")
             }
-            HostError::LogReader(msg) => Status::internal(msg),
+            HostError::LogReader(msg) | HostError::Failed(msg) => Status::internal(msg),
+            HostError::InvalidArgument(msg) => Status::invalid_argument(msg),
+            HostError::NotFound(msg) => Status::not_found(msg),
         }
     }
 }

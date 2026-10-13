@@ -3,15 +3,20 @@
 
 use crate::Command;
 use feos_proto::host_service::{
-    host_service_server::HostService, FeosLogEntry, GetCpuInfoRequest, GetCpuInfoResponse,
-    GetKernelStatsRequest, GetKernelStatsResponse, GetNetworkInfoRequest, GetNetworkInfoResponse,
-    GetVersionInfoRequest, GetVersionInfoResponse, HostnameRequest, HostnameResponse,
-    KernelLogEntry, MemoryRequest, MemoryResponse, RebootRequest, RebootResponse, ShutdownRequest,
-    ShutdownResponse, StreamFeosLogsRequest, StreamKernelLogsRequest, UpgradeFeosBinaryRequest,
+    host_service_server::HostService, FeosLogEntry, FreezeFilesystemRequest,
+    FreezeFilesystemResponse, GetCpuInfoRequest, GetCpuInfoResponse, GetKernelStatsRequest,
+    GetKernelStatsResponse, GetMemoryBreakdownRequest, GetNetworkConfigRequest,
+    GetNetworkConfigResponse, GetNetworkInfoRequest, GetNetworkInfoResponse, GetTimeRequest,
+    GetTimeResponse, GetVersionInfoRequest, GetVersionInfoResponse, HostnameRequest,
+    HostnameResponse, KernelLogEntry, MemoryBreakdown, MemoryRequest, MemoryResponse, PingRequest,
+    PingResponse, PreparePauseRequest, PreparePauseResponse, RebootRequest, RebootResponse,
+    SetNetworkConfigRequest, SetNetworkConfigResponse, SetTimeRequest, SetTimeResponse,
+    ShutdownRequest, ShutdownResponse, StreamFeosLogsRequest, StreamKernelLogsRequest,
+    ThawFilesystemRequest, ThawFilesystemResponse, UpgradeFeosBinaryRequest,
     UpgradeFeosBinaryResponse,
 };
 use feos_utils::dispatch::dispatch_and_wait;
-use log::info;
+use log::{debug, info};
 use std::pin::Pin;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream};
@@ -142,5 +147,93 @@ impl HostService for HostApiHandler {
     ) -> Result<Response<GetVersionInfoResponse>, Status> {
         info!("HostApi: Received GetVersionInfo request.");
         dispatch_and_wait(&self.dispatcher_tx, Command::GetVersionInfo).await
+    }
+
+    async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
+        // Hosts ping often; keep it out of the info log.
+        debug!("HostApi: Received Ping request.");
+        dispatch_and_wait(&self.dispatcher_tx, Command::Ping).await
+    }
+
+    async fn set_time(
+        &self,
+        request: Request<SetTimeRequest>,
+    ) -> Result<Response<SetTimeResponse>, Status> {
+        info!("HostApi: Received SetTime request.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::SetTime(request.into_inner(), resp_tx)
+        })
+        .await
+    }
+
+    async fn get_time(
+        &self,
+        _request: Request<GetTimeRequest>,
+    ) -> Result<Response<GetTimeResponse>, Status> {
+        debug!("HostApi: Received GetTime request.");
+        dispatch_and_wait(&self.dispatcher_tx, Command::GetTime).await
+    }
+
+    async fn set_network_config(
+        &self,
+        request: Request<SetNetworkConfigRequest>,
+    ) -> Result<Response<SetNetworkConfigResponse>, Status> {
+        info!("HostApi: Received SetNetworkConfig request.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::SetNetworkConfig(request.into_inner(), resp_tx)
+        })
+        .await
+    }
+
+    async fn get_network_config(
+        &self,
+        _request: Request<GetNetworkConfigRequest>,
+    ) -> Result<Response<GetNetworkConfigResponse>, Status> {
+        info!("HostApi: Received GetNetworkConfig request.");
+        dispatch_and_wait(&self.dispatcher_tx, Command::GetNetworkConfig).await
+    }
+
+    async fn freeze_filesystem(
+        &self,
+        request: Request<FreezeFilesystemRequest>,
+    ) -> Result<Response<FreezeFilesystemResponse>, Status> {
+        info!("HostApi: Received FreezeFilesystem request.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::FreezeFilesystem(request.into_inner(), resp_tx)
+        })
+        .await
+    }
+
+    async fn thaw_filesystem(
+        &self,
+        request: Request<ThawFilesystemRequest>,
+    ) -> Result<Response<ThawFilesystemResponse>, Status> {
+        info!("HostApi: Received ThawFilesystem request.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::ThawFilesystem(request.into_inner(), resp_tx)
+        })
+        .await
+    }
+
+    async fn get_memory_breakdown(
+        &self,
+        request: Request<GetMemoryBreakdownRequest>,
+    ) -> Result<Response<MemoryBreakdown>, Status> {
+        info!("HostApi: Received GetMemoryBreakdown request.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::GetMemoryBreakdown(request.into_inner(), resp_tx)
+        })
+        .await
+    }
+
+    async fn prepare_pause(
+        &self,
+        request: Request<PreparePauseRequest>,
+    ) -> Result<Response<PreparePauseResponse>, Status> {
+        info!("HostApi: Received PreparePause request.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::PreparePause(request.into_inner(), resp_tx)
+        })
+        .await
     }
 }

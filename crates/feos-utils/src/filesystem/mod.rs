@@ -7,5 +7,9 @@ mod mount;
 mod r#move;
 
 pub use data_volume::mount_data_volume;
+
+/// Where FeOS keeps its state: images, containers, databases. A guest mounts
+/// its data volume here; a host keeps it in RAM.
+pub const DATA_ROOT: &str = "/var/lib/feos";
 pub use mount::mount_virtual_filesystems;
 pub use r#move::{get_root_fstype, move_root};

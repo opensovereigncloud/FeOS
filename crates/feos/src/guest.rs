@@ -10,7 +10,7 @@
 
 use feos_proto::lifecycle_service::lifecycle_service_client::LifecycleServiceClient;
 use feos_proto::lifecycle_service::{hello, Hello};
-use feos_utils::filesystem::mount_data_volume;
+use feos_utils::filesystem::{mount_data_volume, DATA_ROOT};
 use feos_utils::vsock::{API_PORT, UPLINK_PORT};
 use hyper_util::rt::TokioIo;
 use log::{debug, info, warn};
@@ -21,10 +21,6 @@ use tokio_vsock::{
 };
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
-
-/// Where FeOS keeps images and containers. In the guest the data volume is
-/// mounted here, so they survive pause and resume.
-const DATA_ROOT: &str = "/var/lib/feos";
 
 /// Backoff for failed connects to the host, which only happen while no
 /// manager listens (a manager rollout, or no manager at all). A call that

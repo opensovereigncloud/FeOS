@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::worker::network::PushedNetworkConfig;
 use crate::{worker, Command, RestartSignal};
 use feos_utils::feos_logger::LogHandle;
 use log::info;
@@ -10,6 +11,9 @@ pub struct HostServiceDispatcher {
     rx: mpsc::Receiver<Command>,
     restart_tx: mpsc::Sender<RestartSignal>,
     log_handle: LogHandle,
+    /// Pings served since boot.
+    pings: u64,
+    pushed_network_config: PushedNetworkConfig,
 }
 
 impl HostServiceDispatcher {
@@ -22,6 +26,8 @@ impl HostServiceDispatcher {
             rx,
             restart_tx,
             log_handle,
+            pings: 0,
+            pushed_network_config: PushedNetworkConfig::default(),
         }
     }
 
@@ -63,6 +69,40 @@ impl HostServiceDispatcher {
                 }
                 Command::Reboot(req, responder) => {
                     tokio::spawn(worker::handle_reboot(req, responder));
+                }
+                Command::Ping(responder) => {
+                    self.pings += 1;
+                    tokio::spawn(worker::info::handle_ping(self.pings, responder));
+                }
+                Command::SetTime(req, responder) => {
+                    tokio::spawn(worker::clock::handle_set_time(req, responder));
+                }
+                Command::GetTime(responder) => {
+                    tokio::spawn(worker::clock::handle_get_time(responder));
+                }
+                Command::SetNetworkConfig(req, responder) => {
+                    let pushed = self.pushed_network_config.clone();
+                    tokio::spawn(worker::network::handle_set_network_config(
+                        req, pushed, responder,
+                    ));
+                }
+                Command::GetNetworkConfig(responder) => {
+                    let pushed = self.pushed_network_config.clone();
+                    tokio::spawn(worker::network::handle_get_network_config(
+                        pushed, responder,
+                    ));
+                }
+                Command::FreezeFilesystem(req, responder) => {
+                    tokio::spawn(worker::filesystem::handle_freeze(req, responder));
+                }
+                Command::ThawFilesystem(req, responder) => {
+                    tokio::spawn(worker::filesystem::handle_thaw(req, responder));
+                }
+                Command::GetMemoryBreakdown(req, responder) => {
+                    tokio::spawn(worker::memory::handle_get_memory_breakdown(req, responder));
+                }
+                Command::PreparePause(req, responder) => {
+                    tokio::spawn(worker::memory::handle_prepare_pause(req, responder));
                 }
             }
         }

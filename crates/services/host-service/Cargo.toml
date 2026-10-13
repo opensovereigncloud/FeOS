@@ -16,7 +16,7 @@ digest = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
-nix = { workspace = true , features = ["hostname", "reboot"] }
+nix = { workspace = true , features = ["hostname", "reboot", "mman", "time", "ioctl"] }
 log = { workspace = true }
 prost-types = { workspace = true }
 thiserror = { workspace = true }
@@ -25,6 +25,9 @@ hyper-util = { workspace = true }
 sntpc = { version = "0.7", features = ["tokio-socket", "utils"], optional = true }
 chrono = { workspace = true }
 libc = { workspace = true }
+
+rtnetlink = { workspace = true }
+futures = { workspace = true }
 
 hyper-rustls = "0.27.2"
 http-body-util = "0.1.2"

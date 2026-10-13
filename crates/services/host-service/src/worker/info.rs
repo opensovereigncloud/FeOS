@@ -4,7 +4,7 @@
 use crate::error::HostError;
 use feos_proto::host_service::{
     CpuInfo, GetCpuInfoResponse, GetNetworkInfoResponse, GetVersionInfoResponse, HostnameResponse,
-    MemInfo, MemoryResponse, NetDev,
+    MemInfo, MemoryResponse, NetDev, PingResponse,
 };
 use log::{error, info, warn};
 use nix::unistd;
@@ -340,5 +340,23 @@ pub async fn handle_get_version_info(
         error!(
             "HostWorker: Failed to send response for GetVersionInfo. API handler may have timed out."
         );
+    }
+}
+
+pub async fn handle_ping(tick: u64, responder: oneshot::Sender<Result<PingResponse, HostError>>) {
+    let uptime_seconds = nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME)
+        .map(|t| t.tv_sec() as u64)
+        .unwrap_or(0);
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .await
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let response = PingResponse {
+        tick,
+        uptime_seconds,
+        boot_id,
+    };
+    if responder.send(Ok(response)).is_err() {
+        error!("HostWorker: Failed to send response for Ping.");
     }
 }

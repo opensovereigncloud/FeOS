@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod clock;
+pub mod filesystem;
 pub mod info;
 pub mod kernel_stats;
+pub mod memory;
+pub mod network;
 pub mod ops;
 pub mod power;
 #[cfg(feature = "ntp")]

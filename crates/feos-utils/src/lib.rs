@@ -7,5 +7,6 @@ pub mod filesystem;
 pub mod host;
 #[cfg(feature = "host")]
 pub mod network;
+pub mod resolver;
 pub mod version;
 pub mod vsock;

@@ -3,9 +3,13 @@
 
 use crate::error::HostError;
 use feos_proto::host_service::{
-    FeosLogEntry, GetCpuInfoResponse, GetKernelStatsResponse, GetNetworkInfoResponse,
-    GetVersionInfoResponse, HostnameResponse, KernelLogEntry, MemoryResponse, RebootRequest,
-    RebootResponse, ShutdownRequest, ShutdownResponse, UpgradeFeosBinaryRequest,
+    FeosLogEntry, FreezeFilesystemRequest, FreezeFilesystemResponse, GetCpuInfoResponse,
+    GetKernelStatsResponse, GetMemoryBreakdownRequest, GetNetworkConfigResponse,
+    GetNetworkInfoResponse, GetTimeResponse, GetVersionInfoResponse, HostnameResponse,
+    KernelLogEntry, MemoryBreakdown, MemoryResponse, PingResponse, PreparePauseRequest,
+    PreparePauseResponse, RebootRequest, RebootResponse, SetNetworkConfigRequest,
+    SetNetworkConfigResponse, SetTimeRequest, SetTimeResponse, ShutdownRequest, ShutdownResponse,
+    ThawFilesystemRequest, ThawFilesystemResponse, UpgradeFeosBinaryRequest,
     UpgradeFeosBinaryResponse,
 };
 use std::path::PathBuf;
@@ -38,6 +42,33 @@ pub enum Command {
     Reboot(
         RebootRequest,
         oneshot::Sender<Result<RebootResponse, HostError>>,
+    ),
+    Ping(oneshot::Sender<Result<PingResponse, HostError>>),
+    SetTime(
+        SetTimeRequest,
+        oneshot::Sender<Result<SetTimeResponse, HostError>>,
+    ),
+    GetTime(oneshot::Sender<Result<GetTimeResponse, HostError>>),
+    SetNetworkConfig(
+        SetNetworkConfigRequest,
+        oneshot::Sender<Result<SetNetworkConfigResponse, HostError>>,
+    ),
+    GetNetworkConfig(oneshot::Sender<Result<GetNetworkConfigResponse, HostError>>),
+    FreezeFilesystem(
+        FreezeFilesystemRequest,
+        oneshot::Sender<Result<FreezeFilesystemResponse, HostError>>,
+    ),
+    ThawFilesystem(
+        ThawFilesystemRequest,
+        oneshot::Sender<Result<ThawFilesystemResponse, HostError>>,
+    ),
+    GetMemoryBreakdown(
+        GetMemoryBreakdownRequest,
+        oneshot::Sender<Result<MemoryBreakdown, HostError>>,
+    ),
+    PreparePause(
+        PreparePauseRequest,
+        oneshot::Sender<Result<PreparePauseResponse, HostError>>,
     ),
 }
 
