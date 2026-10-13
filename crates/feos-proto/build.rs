@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_dir}/feos/image/v1/image.proto"),
                 format!("{proto_dir}/feos/container/v1/container.proto"),
                 format!("{proto_dir}/feos/task/v1/task.proto"),
+                format!("{proto_dir}/feos/lifecycle/v1/lifecycle.proto"),
             ],
             &[proto_dir],
         )?;

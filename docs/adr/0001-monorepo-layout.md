@@ -48,9 +48,8 @@ the codebase and in `git blame`, not only in the history.
    implementation is clearly better, for example image unpacking, it
    replaces the internals; the crate, its API and its structure stay.
 5. **Two profiles of `feos`, selected with cargo features.** `host` (the
-   default) is FeOS as a bare-metal hypervisor OS. Without it, `feos` builds
-   as the guest profile, PID 1 in a microVM that its host configures. Features
-   stay additive.
+   default) is FeOS as a bare-metal hypervisor OS; `guest` is PID 1 in a
+   microVM that its host configures. Features stay additive.
 
 ## Alternatives considered
 

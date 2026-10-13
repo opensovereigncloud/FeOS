@@ -34,13 +34,18 @@ docs/                   documentation and ADRs
   hypervisor. It configures itself from the network (DHCPv6, router
   advertisements, NTP), sets up SR-IOV and hugepages, runs the VM service and
   serves the public API on TCP `[::]:1337`.
-- **guest** (`--no-default-features`): FeOS as PID 1 in a microVM whose host
-  configures it. None of the host-only code or dependencies are in this
-  binary.
+- **guest** (`--no-default-features --features guest`): FeOS as PID 1 in a
+  microVM whose host configures it. Its API listens on vsock port 10000, not
+  on TCP, and once it is ready it dials the host (vsock port 10001) and holds
+  a `LifecycleService.Attach` call open. A data volume, if the VM has one,
+  holds images and containers. None of the host-only code or dependencies
+  are in this binary.
 
 Both serve the public API on `/run/feos/api.sock`. Features are additive: code
 that only the host needs sits behind `#[cfg(feature = "host")]`, in `feos` and
-in the crates it enables (`feos-utils/host`, `host-service/ntp`).
+in the crates it enables (`feos-utils/host`, `host-service/ntp`); code that only
+the guest needs behind `#[cfg(feature = "guest")]`. With both features, `feos`
+builds and does both, which is only useful for development.
 
 ## Building, linting, testing
 

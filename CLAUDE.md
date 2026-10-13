@@ -12,9 +12,10 @@ Hard rules:
   shelling out to userspace tools, no glibc-specific behaviour.
 - **PID 1 must not die.** No panics on the PID 1 path; return errors, log,
   keep serving.
-- **Both profiles must build.** `make clippy` lints the host profile and the
-  guest profile (`cargo clippy -p feos --no-default-features`). Host-only code
-  goes behind `#[cfg(feature = "host")]`.
+- **Both profiles must build.** `make clippy` lints the host profile, the
+  guest profile (`-p feos --no-default-features --features guest`) and both
+  together. Host-only code goes behind `#[cfg(feature = "host")]`, guest-only
+  code behind `#[cfg(feature = "guest")]`; features stay additive.
 - **Release builds per package** (`-p`), never `--workspace`.
 - **Keep authorship.** Use `git mv` to move files, and do not reformat code you
   are not otherwise changing.

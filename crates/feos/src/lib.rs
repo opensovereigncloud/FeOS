@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(feature = "guest")]
+mod guest;
 mod setup;
 
 use anyhow::Result;
@@ -15,7 +17,8 @@ use tokio::{fs, net::UnixListener, sync::mpsc};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
-/// The public gRPC API on a local Unix socket, served in every profile.
+/// The public gRPC API on a local Unix socket, served in every profile. The
+/// guest profile serves the same API on vsock, the host profile on TCP.
 pub const API_SOCKET: &str = "/run/feos/api.sock";
 
 pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
@@ -74,7 +77,17 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     let api_unix_socket_server = Server::builder()
         .add_service(container_service.clone())
         .add_service(host_service.clone())
+        .add_service(image_service.clone())
         .serve_with_incoming(api_uds_stream);
+
+    #[cfg(feature = "guest")]
+    let vsock_server = Server::builder()
+        .add_service(container_service.clone())
+        .add_service(host_service.clone())
+        .add_service(image_service.clone())
+        .serve_with_incoming(guest::vsock_incoming()?);
+    #[cfg(not(feature = "guest"))]
+    let vsock_server = std::future::pending::<Result<(), tonic::transport::Error>>();
 
     #[cfg(feature = "host")]
     let tcp_addr: std::net::SocketAddr = "[::]:1337".parse().unwrap();
@@ -102,13 +115,24 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
         .serve_with_incoming(task_uds_stream);
 
     info!("Main: Public gRPC Server listening on Unix socket {API_SOCKET}");
+    #[cfg(feature = "guest")]
+    info!(
+        "Main: Public gRPC Server listening on vsock port {}",
+        feos_utils::vsock::API_PORT
+    );
     #[cfg(feature = "host")]
     info!("Main: Public gRPC Server listening on {tcp_addr}");
     info!("Main: Internal ImageService listening on Unix socket {IMAGE_SERVICE_SOCKET}");
     info!("Main: Internal TaskService listening on Unix socket {TASK_SERVICE_SOCKET}");
 
+    // Tell the host that the guest is ready. The listeners are bound, so the
+    // host's first call lands in their backlog.
+    #[cfg(feature = "guest")]
+    tokio::spawn(guest::run_uplink());
+
     tokio::pin!(
         api_unix_socket_server,
+        vsock_server,
         tcp_server,
         image_unix_socket_server,
         task_unix_socket_server
@@ -121,6 +145,12 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
             res = &mut api_unix_socket_server => {
                 if let Err(e) = res {
                     error!("API unix socket server failed: {e}");
+                }
+                break;
+            },
+            res = &mut vsock_server => {
+                if let Err(e) = res {
+                    error!("vsock server failed: {e}");
                 }
                 break;
             },

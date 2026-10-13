@@ -20,7 +20,7 @@ FeOS is a revolutionary init system for Linux, designed specifically for hypervi
 **gRPC API**: Exposes a gRPC API for external orchestrators to manage VMs, Containers, and MicroVMs.
 
 ## For Developers
-FeOS is a monorepo: all Rust crates live in one Cargo workspace under `crates/`, the gRPC APIs under `proto/`. FeOS builds in two profiles: the **host** profile for bare-metal hypervisors (the default) and the **guest** profile for PID 1 in a microVM (`--no-default-features`). See [docs/adr/0001-monorepo-layout.md](docs/adr/0001-monorepo-layout.md) for the reasoning.
+FeOS is a monorepo: all Rust crates live in one Cargo workspace under `crates/`, the gRPC APIs under `proto/`. FeOS builds in two profiles: the **host** profile for bare-metal hypervisors (the default) and the **guest** profile for PID 1 in a microVM (`--no-default-features --features guest`). See [docs/adr/0001-monorepo-layout.md](docs/adr/0001-monorepo-layout.md) for the reasoning.
 
 For detailed information on contributing to FeOS, including development guidelines, setup instructions, and coding standards, please refer to our [Developer Documentation](docs/development.md). This document provides all the necessary information for developers to understand the codebase, contribute effectively, and collaborate with the FeOS community.
 

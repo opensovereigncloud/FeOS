@@ -5,12 +5,13 @@ MUSL_TARGET := x86_64-unknown-linux-musl
 .PHONY: all clippy fmt-check release release-guest run clean cli test test-unit
 
 # feos builds in two profiles: the host profile (the default features) for
-# bare-metal hypervisors, and the guest profile (--no-default-features) for
-# PID 1 in a microVM. Lint and build both.
+# bare-metal hypervisors, and the guest profile for PID 1 in a microVM.
+GUEST_FEATURES := --no-default-features --features guest
 
 clippy: ## Lint the workspace in the host profile and feos in the guest profile.
 	cargo clippy --workspace --all-targets -- -D warnings
-	cargo clippy -p feos --no-default-features --all-targets -- -D warnings
+	cargo clippy -p feos $(GUEST_FEATURES) --all-targets -- -D warnings
+	cargo clippy -p feos --all-features --all-targets -- -D warnings
 
 fmt-check: ## Check formatting.
 	cargo fmt --check
@@ -24,7 +25,7 @@ release: clippy ## Release build of feos in the host profile.
 	cargo build --release --features git-version --target=$(MUSL_TARGET) -p feos
 
 release-guest: clippy ## Release build of feos in the guest profile.
-	cargo build --profile release-guest --no-default-features --features git-version --target=$(MUSL_TARGET) -p feos
+	cargo build --profile release-guest $(GUEST_FEATURES) --features git-version --target=$(MUSL_TARGET) -p feos
 
 run: all ## Run the debug build as root.
 	sudo ./target/$(MUSL_TARGET)/debug/feos

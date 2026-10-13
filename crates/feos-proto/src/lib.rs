@@ -16,3 +16,6 @@ pub mod task_service {
 pub mod container_service {
     tonic::include_proto!("feos.container.v1");
 }
+pub mod lifecycle_service {
+    tonic::include_proto!("feos.lifecycle.v1");
+}

@@ -29,6 +29,7 @@ edition = "2024"
 [workspace.dependencies]
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-stream = { version = "0.1.15", features = ["net"] }
+tokio-vsock = { version = "0.7.2", features = ["tonic013"] }
 tonic = "0.13.0"
 prost = "0.13.5"
 prost-types = "0.13.5"

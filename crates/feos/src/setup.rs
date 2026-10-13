@@ -195,6 +195,9 @@ pub(crate) async fn perform_first_boot_initialization() -> Result<BootInfo> {
     info!("Main: Mounting virtual filesystems...");
     mount_virtual_filesystems();
 
+    #[cfg(feature = "guest")]
+    crate::guest::initialize_guest();
+
     #[cfg(feature = "host")]
     let boot_info = initialize_host_hardware().await?;
     #[cfg(not(feature = "host"))]

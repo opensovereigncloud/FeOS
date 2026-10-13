@@ -39,6 +39,28 @@ pub fn mount_virtual_filesystems() {
     )
     .unwrap_or_else(|e| error!("/dev mount failed: {e}"));
 
+    debug!("Mounting /dev/pts");
+    // devtmpfs comes up without the directory.
+    let _ = std::fs::create_dir_all("/dev/pts");
+    mount(
+        Some(b"devpts".as_ref()),
+        "/dev/pts",
+        Some(b"devpts".as_ref()),
+        MsFlags::empty(),
+        Some(b"ptmxmode=0666".as_ref()),
+    )
+    .unwrap_or_else(|e| error!("/dev/pts mount failed: {e}"));
+
+    debug!("Mounting /run");
+    mount(
+        Some(b"tmpfs".as_ref()),
+        "/run",
+        Some(b"tmpfs".as_ref()),
+        MsFlags::empty(),
+        NONE,
+    )
+    .unwrap_or_else(|e| error!("/run mount failed: {e}"));
+
     debug!("Mounting /var/lib/feos");
     mount(
         Some(b"tmpfs".as_ref()),
