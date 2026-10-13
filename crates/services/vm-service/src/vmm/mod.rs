@@ -3,12 +3,13 @@
 
 use crate::VmEventWrapper;
 use feos_proto::vm_service::{
-    CreateVmRequest, DeleteVmRequest, DeleteVmResponse, PauseVmRequest, PauseVmResponse,
-    PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest,
-    ShutdownVmResponse, StartVmRequest, VmConfig, VmEvent, VmStateChangedEvent,
+    CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GuestNetworkConfig, PauseVmRequest,
+    PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse,
+    ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmEvent, VmStateChangedEvent,
 };
 use prost::Message;
 use prost_types::Any;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use tokio::io::DuplexStream;
 use tokio::sync::{broadcast, mpsc};
@@ -112,6 +113,36 @@ pub fn validate_config(config: &VmConfig) -> Result<(), VmmError> {
         return Err(VmmError::InvalidConfig(
             "a network interface needs a TAP device".to_string(),
         ));
+    }
+    if let Some(network) = &config.guest_network {
+        validate_guest_network(network)?;
+    }
+    Ok(())
+}
+
+fn validate_guest_network(network: &GuestNetworkConfig) -> Result<(), VmmError> {
+    let invalid = |what: &str| Err(VmmError::InvalidConfig(format!("guest network: {what}")));
+    if network.interface.is_empty() {
+        return invalid("no interface");
+    }
+    let prefix_ok = network
+        .ipv4_cidr
+        .split_once('/')
+        .is_some_and(|(address, prefix)| {
+            address.parse::<Ipv4Addr>().is_ok() && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
+        });
+    if !prefix_ok {
+        return invalid(&format!("bad address/prefix {:?}", network.ipv4_cidr));
+    }
+    if network.gateway.parse::<Ipv4Addr>().is_err() {
+        return invalid(&format!("bad gateway {:?}", network.gateway));
+    }
+    if let Some(dns) = network
+        .dns
+        .iter()
+        .find(|dns| dns.parse::<IpAddr>().is_err())
+    {
+        return invalid(&format!("bad resolver {dns:?}"));
     }
     Ok(())
 }

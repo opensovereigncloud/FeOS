@@ -17,6 +17,7 @@ pub mod api;
 pub mod dispatcher;
 pub mod dispatcher_handlers;
 pub mod error;
+pub mod guest;
 pub mod persistence;
 pub mod vmm;
 pub mod worker;

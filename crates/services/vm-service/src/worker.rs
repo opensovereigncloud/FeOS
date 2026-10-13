@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    dispatcher_handlers::get_image_service_client, error::VmServiceError, vmm::Hypervisor,
-    VmEventWrapper,
+    dispatcher_handlers::get_image_service_client, error::VmServiceError, guest::Guests,
+    vmm::Hypervisor, VmEventWrapper,
 };
 use feos_proto::{
     image_service::{ImageState as OciImageState, WatchImageStatusRequest},
@@ -70,6 +70,7 @@ pub async fn handle_create_vm(
     responder: oneshot::Sender<Result<CreateVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
+    guests: Arc<Guests>,
 ) {
     if responder
         .send(Ok(CreateVmResponse {
@@ -121,11 +122,18 @@ pub async fn handle_create_vm(
     }
     info!("VmWorker ({vm_id}): Image '{image_ref}' (uuid: {image_uuid}) is ready.");
 
+    let guest_network = req
+        .config
+        .as_ref()
+        .and_then(|config| config.guest_network.clone());
     let result = hypervisor.create_vm(&vm_id, req, image_uuid).await;
 
     match result {
         Ok(pid) => {
             info!("VmWorker ({vm_id}): Background creation process completed successfully.");
+            if let Err(e) = guests.listen(&vm_id, guest_network) {
+                warn!("VmWorker ({vm_id}): Cannot listen for the guest's uplink: {e}");
+            }
             crate::vmm::broadcast_state_change_event(
                 &broadcast_tx,
                 &vm_id,
@@ -177,8 +185,10 @@ pub async fn handle_start_vm(
     hypervisor: Arc<dyn Hypervisor>,
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
     cancel_bus: Option<broadcast::Receiver<Uuid>>,
+    guests: Arc<Guests>,
 ) {
     let vm_id = req.vm_id.clone();
+    guests.reset(&vm_id);
     let result = hypervisor.start_vm(req).await;
 
     if let Ok(pid) = result {
@@ -249,8 +259,10 @@ pub async fn handle_delete_vm(
     responder: oneshot::Sender<Result<DeleteVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     _broadcast_tx: mpsc::Sender<VmEventWrapper>,
+    guests: Arc<Guests>,
 ) {
     let vm_id = req.vm_id.clone();
+    guests.forget(&vm_id);
     let result = hypervisor.delete_vm(req, process_id).await;
 
     if !image_uuid.is_empty() {
@@ -373,6 +385,7 @@ pub async fn handle_resume_vm(
     responder: oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
+    guests: Arc<Guests>,
 ) {
     let vm_id = req.vm_id.clone();
     let result = hypervisor.resume_vm(req).await;
@@ -389,6 +402,8 @@ pub async fn handle_resume_vm(
             None,
         )
         .await;
+        // The guest's clock stood still while it was paused.
+        guests.resumed(&vm_id).await;
     }
 
     if responder.send(result.map_err(Into::into)).is_err() {

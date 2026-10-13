@@ -3,6 +3,7 @@
 
 use crate::{
     error::VmServiceError,
+    guest::Guests,
     persistence::{repository::VmRepository, VmRecord, VmStatus},
     vmm::Hypervisor,
     worker, VmEventWrapper,
@@ -41,10 +42,11 @@ fn ensure_net_config_device_id(net_config: &mut feos_proto::vm_service::NetConfi
     }
 }
 
-fn vm_info(record: VmRecord) -> VmInfo {
+fn vm_info(record: VmRecord, guests: &Guests) -> VmInfo {
     let vm_id = record.vm_id.to_string();
     VmInfo {
         vsock_path: crate::vsock_path(&vm_id).to_string_lossy().into_owned(),
+        guest: guests.info(&vm_id),
         vm_id,
         state: record.status.state as i32,
         config: Some(record.config),
@@ -168,12 +170,13 @@ async fn prepare_vm_creation(
 async fn get_vm_info(
     repository: &VmRepository,
     req: &GetVmRequest,
+    guests: &Guests,
 ) -> Result<VmInfo, VmServiceError> {
     let vm_id = Uuid::parse_str(&req.vm_id)
         .map_err(|_| VmServiceError::InvalidArgument("Invalid VM ID format.".to_string()))?;
 
     match repository.get_vm(vm_id).await? {
-        Some(record) => Ok(vm_info(record)),
+        Some(record) => Ok(vm_info(record, guests)),
         None => Err(VmServiceError::Vmm(crate::vmm::VmmError::VmNotFound(
             vm_id.to_string(),
         ))),
@@ -201,6 +204,7 @@ pub(crate) async fn handle_create_vm_command(
     responder: oneshot::Sender<Result<CreateVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
+    guests: Arc<Guests>,
 ) {
     let result = prepare_vm_creation(repository, &req).await;
 
@@ -213,6 +217,7 @@ pub(crate) async fn handle_create_vm_command(
                 responder,
                 hypervisor,
                 event_bus_tx,
+                guests,
             ));
         }
         Err(e) => {
@@ -230,8 +235,9 @@ pub(crate) async fn handle_get_vm_command(
     repository: &VmRepository,
     req: GetVmRequest,
     responder: oneshot::Sender<Result<VmInfo, VmServiceError>>,
+    guests: &Guests,
 ) {
-    let result = get_vm_info(repository, &req).await;
+    let result = get_vm_info(repository, &req, guests).await;
 
     if responder.send(result).is_err() {
         error!("VmDispatcher: Failed to send response for GetVm.");
@@ -377,6 +383,7 @@ pub(crate) async fn handle_delete_vm_command(
     responder: oneshot::Sender<Result<DeleteVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
+    guests: Arc<Guests>,
 ) {
     let vm_id = match Uuid::parse_str(&req.vm_id) {
         Ok(id) => id,
@@ -411,6 +418,7 @@ pub(crate) async fn handle_delete_vm_command(
                 responder,
                 hypervisor,
                 event_bus_tx,
+                guests,
             ));
         }
         Ok(None) => {
@@ -428,6 +436,7 @@ pub(crate) async fn handle_delete_vm_command(
                 responder,
                 hypervisor,
                 event_bus_tx,
+                guests,
             ));
         }
         Err(e) => {
@@ -506,9 +515,13 @@ pub(crate) async fn handle_list_vms_command(
     repository: &VmRepository,
     _req: ListVmsRequest,
     responder: oneshot::Sender<Result<ListVmsResponse, VmServiceError>>,
+    guests: &Guests,
 ) {
     let result = repository.list_all_vms().await.map(|records| {
-        let vms = records.into_iter().map(vm_info).collect();
+        let vms = records
+            .into_iter()
+            .map(|record| vm_info(record, guests))
+            .collect();
         ListVmsResponse { vms }
     });
 
@@ -524,6 +537,7 @@ pub(crate) async fn handle_start_vm_command(
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
     healthcheck_cancel_bus_tx: &broadcast::Sender<Uuid>,
+    guests: Arc<Guests>,
 ) {
     let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
         Ok(result) => result,
@@ -550,6 +564,7 @@ pub(crate) async fn handle_start_vm_command(
         hypervisor,
         event_bus_tx,
         cancel_bus,
+        guests,
     ));
 }
 
@@ -621,6 +636,7 @@ pub(crate) async fn handle_resume_vm_command(
     responder: oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
+    guests: Arc<Guests>,
 ) {
     let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
         Ok(result) => result,
@@ -643,6 +659,7 @@ pub(crate) async fn handle_resume_vm_command(
         responder,
         hypervisor,
         event_bus_tx,
+        guests,
     ));
 }
 
@@ -696,10 +713,20 @@ pub(crate) async fn perform_startup_sanity_check(
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
     healthcheck_cancel_bus: &broadcast::Sender<Uuid>,
+    guests: &Arc<Guests>,
 ) {
     info!("VmDispatcher: Running initial sanity check...");
     match repository.list_all_vms().await {
         Ok(vms) => {
+            // A guest that runs on attaches again once it is listened for.
+            for vm in &vms {
+                let vm_id = vm.vm_id.to_string();
+                if crate::vm_dir(&vm_id).is_dir()
+                    && let Err(e) = guests.listen(&vm_id, vm.config.guest_network.clone())
+                {
+                    warn!("VmDispatcher (Sanity Check): Cannot listen for the guest of VM {vm_id}: {e}");
+                }
+            }
             if vms.is_empty() {
                 info!("VmDispatcher (Sanity Check): No VMs found in persistence, check complete.");
             } else {

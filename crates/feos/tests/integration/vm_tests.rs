@@ -1,23 +1,26 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::fixtures::{verify_vm_socket_cleanup, wait_for_target_state, VmGuard};
+use super::fixtures::{
+    verify_vm_socket_cleanup, wait_for_guest_attached, wait_for_target_state, VmGuard,
+};
 use super::{ensure_server, get_public_clients, vm_test_image};
 use anyhow::{Context, Result};
 use feos_proto::host_service::{
-    host_service_client::HostServiceClient, GetVersionInfoRequest, PingRequest,
+    host_service_client::HostServiceClient, GetNetworkConfigRequest, GetTimeRequest,
+    GetVersionInfoRequest, PingRequest,
 };
 use feos_proto::vm_service::{
     stream_vm_console_request as console_input, AttachConsoleMessage, CpuConfig, CreateVmRequest,
-    DeleteVmRequest, DiskConfig, GetVmRequest, MemoryConfig, PauseVmRequest, PingVmRequest,
-    ResumeVmRequest, ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest,
-    StreamVmEventsRequest, VmConfig, VmState,
+    DeleteVmRequest, DiskConfig, GetVmRequest, GuestNetworkConfig, MemoryConfig, NetConfig,
+    PauseVmRequest, PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest,
+    StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig, VmConfig, VmState,
 };
 use feos_utils::vsock::API_PORT;
 use log::info;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use vm_service::vm_dir;
@@ -35,6 +38,8 @@ async fn test_create_and_start_vm() -> Result<()> {
     let disk_dir = tempfile::tempdir()?;
     let disk = disk_dir.path().join("data.img");
     std::fs::File::create(&disk)?.set_len(64 << 20)?;
+    // Firecracker, running as root, creates the TAP device.
+    let tap_name = format!("fct{}", std::process::id());
 
     let vm_config = VmConfig {
         cpus: Some(CpuConfig { vcpu_count: 2 }),
@@ -47,7 +52,17 @@ async fn test_create_and_start_vm() -> Result<()> {
             path: disk.to_string_lossy().into_owned(),
             ..Default::default()
         }],
-        net: vec![],
+        net: vec![NetConfig {
+            tap: Some(TapConfig { tap_name }),
+            ..Default::default()
+        }],
+        guest_network: Some(GuestNetworkConfig {
+            interface: "eth0".to_string(),
+            ipv4_cidr: "10.99.0.2/24".to_string(),
+            gateway: "10.99.0.1".to_string(),
+            dns: vec!["10.99.0.53".to_string()],
+            hostname: "feos-test".to_string(),
+        }),
     };
     let create_req = CreateVmRequest {
         config: Some(vm_config),
@@ -93,6 +108,56 @@ async fn test_create_and_start_vm() -> Result<()> {
     .await
     .expect("Timed out waiting for VM to become running")?;
     info!("VM is in RUNNING state");
+
+    let guest = timeout(
+        Duration::from_secs(30),
+        wait_for_guest_attached(&mut stream),
+    )
+    .await
+    .expect("Timed out waiting for the guest to attach")?;
+    assert_eq!(guest.attach_seq, 0, "A boot's first attach");
+    assert!(
+        guest.push_error.is_empty(),
+        "Push failed: {}",
+        guest.push_error
+    );
+    let first_boot = guest.boot_id;
+
+    // The guest has no RTC and no NTP: its clock and its network are what
+    // the VM service pushed when it attached.
+    let vsock_path = vm_client
+        .get_vm(GetVmRequest {
+            vm_id: vm_id.clone(),
+        })
+        .await?
+        .into_inner()
+        .vsock_path;
+    let mut guest_host =
+        HostServiceClient::new(feos_utils::vsock::channel(&vsock_path, API_PORT).await?);
+    let network = guest_host
+        .get_network_config(GetNetworkConfigRequest {})
+        .await?
+        .into_inner();
+    assert!(network.configured);
+    assert_eq!(network.interface, "eth0");
+    assert_eq!(network.ipv4_cidr, "10.99.0.2/24");
+    assert_eq!(network.dns, vec!["10.99.0.53".to_string()]);
+    assert_eq!(network.hostname, "feos-test");
+    let guest_time: SystemTime = guest_host
+        .get_time(GetTimeRequest {})
+        .await?
+        .into_inner()
+        .time
+        .context("GetTime returned no time")?
+        .try_into()?;
+    let skew = SystemTime::now()
+        .duration_since(guest_time)
+        .unwrap_or_else(|e| e.duration());
+    assert!(
+        skew < Duration::from_secs(5),
+        "The guest's clock is {skew:?} off"
+    );
+    info!("The guest got its network and its clock, {skew:?} off");
 
     info!("Sending ShutdownVm request for vm_id: {vm_id}");
     let shutdown_req = ShutdownVmRequest {
@@ -170,6 +235,15 @@ async fn test_create_and_start_vm() -> Result<()> {
     .expect("Timed out waiting for VM to become running again")?;
     info!("VM is in RUNNING state again");
 
+    let guest = timeout(
+        Duration::from_secs(30),
+        wait_for_guest_attached(&mut stream),
+    )
+    .await
+    .expect("Timed out waiting for the guest to attach again")?;
+    assert_ne!(guest.boot_id, first_boot, "A new boot has a new boot ID");
+    assert_eq!(guest.attach_seq, 0);
+
     info!("Sending PauseVm request for vm_id: {vm_id}");
     let pause_req = PauseVmRequest {
         vm_id: vm_id.clone(),
@@ -210,6 +284,13 @@ async fn test_create_and_start_vm() -> Result<()> {
         VmState::try_from(info_res.state).unwrap(),
         VmState::Running,
         "VM state from GetVm should be RUNNING"
+    );
+    let guest = info_res.guest.clone().context("GetVm reports no guest")?;
+    assert!(guest.attached);
+    assert!(
+        guest.push_error.is_empty(),
+        "Push failed: {}",
+        guest.push_error
     );
 
     info!("Pinging VMM for vm_id: {vm_id}");
@@ -306,6 +387,7 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
         image_ref,
         disks: vec![],
         net: vec![],
+        guest_network: None,
     };
     let create_req = CreateVmRequest {
         config: Some(vm_config),

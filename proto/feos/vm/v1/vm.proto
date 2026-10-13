@@ -128,6 +128,24 @@ message VmConfig {
   // Ignition was passed in SMBIOS OEM strings, which Firecracker lacks.
   reserved 6;
   reserved "ignition";
+  // The network configuration of a FeOS guest, which has no DHCP. The VM
+  // service pushes it into the guest, with the wall time, whenever the
+  // guest attaches to its lifecycle uplink and after every resume. Without
+  // it, only the time is pushed.
+  GuestNetworkConfig guest_network = 7;
+}
+
+message GuestNetworkConfig {
+  // Interface in the guest, e.g. "eth0".
+  string interface = 1;
+  // Address with prefix length, e.g. "10.200.0.2/16".
+  string ipv4_cidr = 2;
+  // Default gateway, e.g. "10.200.0.1".
+  string gateway = 3;
+  // Resolvers, in order.
+  repeated string dns = 4;
+  // Kernel hostname. Left alone when empty.
+  string hostname = 5;
 }
 
 message CpuConfig {
@@ -185,7 +203,35 @@ message VmInfo {
   // "CONNECT P\n". The guest reaches the host at CID 2, port P, through
   // the Unix socket <vsock_path>_P.
   string vsock_path = 4;
+  // The FeOS guest, as its lifecycle uplink reports it. Unset until a guest
+  // has attached in the VM's current boot.
+  GuestInfo guest = 5;
 }
+
+// A FeOS guest dials its host on vsock port 10001 and holds a
+// feos.lifecycle.v1.LifecycleService call open for as long as it runs.
+message GuestInfo {
+  // Whether the guest holds its call open now.
+  bool attached = 1;
+  // /proc/sys/kernel/random/boot_id of the guest; a new boot changes it.
+  string boot_id = 2;
+  // Attaches within this boot: 0 is the boot's first.
+  uint64 attach_seq = 3;
+  string feos_version = 4;
+  // Why the last push of the time or the network configuration failed;
+  // empty when it worked.
+  string push_error = 5;
+}
+
+// VmEvent data: a FeOS guest attached and was pushed the time and its
+// network configuration. After a cold boot this is when the guest serves.
+message GuestAttachedEvent {
+  GuestInfo guest = 1;
+}
+
+// VmEvent data: the guest's call ended. The guest is gone, or lost its
+// call and attaches again.
+message GuestDetachedEvent {}
 
 message PingVmRequest {
   string vm_id = 1;

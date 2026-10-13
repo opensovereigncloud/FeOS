@@ -8,9 +8,10 @@ use crossterm::tty::IsTty;
 use feos_proto::vm_service::{
     stream_vm_console_request as console_input, vm_service_client::VmServiceClient,
     AttachConsoleMessage, ConsoleData, CpuConfig, CreateVmRequest, DeleteVmRequest, DiskConfig,
-    GetVmRequest, ListVmsRequest, MemoryConfig, NetConfig, PauseVmRequest, PingVmRequest,
-    ResumeVmRequest, ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest,
-    StreamVmEventsRequest, TapConfig, VmConfig, VmState, VmStateChangedEvent,
+    GetVmRequest, GuestAttachedEvent, GuestNetworkConfig, ListVmsRequest, MemoryConfig, NetConfig,
+    PauseVmRequest, PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest,
+    StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig, VmConfig, VmState,
+    VmStateChangedEvent,
 };
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,32 +37,7 @@ pub struct VmArgs {
 #[derive(Subcommand, Debug)]
 pub enum VmCommand {
     /// Create a new virtual machine with specified configuration
-    Create {
-        #[arg(
-            long,
-            required = true,
-            help = "OCI image with the kernel, and an initramfs or a root disk"
-        )]
-        image_ref: String,
-
-        #[arg(long, default_value_t = 1, help = "Number of virtual CPUs to allocate")]
-        vcpus: u32,
-
-        #[arg(long, default_value_t = 1024, help = "Memory size in MiB")]
-        memory: u64,
-
-        #[arg(long, help = "Optional custom VM identifier")]
-        vm_id: Option<String>,
-
-        #[arg(long, help = "TAP device for a network interface (repeatable)")]
-        tap: Vec<String>,
-
-        #[arg(long, help = "Path to a data disk image (repeatable)")]
-        disk: Vec<String>,
-
-        #[arg(long, help = "Enable hugepages for memory allocation")]
-        hugepages: bool,
-    },
+    Create(CreateVmOptions),
     /// Start an existing virtual machine
     Start {
         #[arg(required = true, help = "VM identifier")]
@@ -100,32 +76,7 @@ pub enum VmCommand {
         vm_id: String,
     },
     /// Create and start a virtual machine in one operation
-    CreateAndStart {
-        #[arg(
-            long,
-            required = true,
-            help = "OCI image with the kernel, and an initramfs or a root disk"
-        )]
-        image_ref: String,
-
-        #[arg(long, default_value_t = 1, help = "Number of virtual CPUs to allocate")]
-        vcpus: u32,
-
-        #[arg(long, default_value_t = 1024, help = "Memory size in MiB")]
-        memory: u64,
-
-        #[arg(long, help = "Optional custom VM identifier")]
-        vm_id: Option<String>,
-
-        #[arg(long, help = "TAP device for a network interface (repeatable)")]
-        tap: Vec<String>,
-
-        #[arg(long, help = "Path to a data disk image (repeatable)")]
-        disk: Vec<String>,
-
-        #[arg(long, help = "Enable hugepages for memory allocation")]
-        hugepages: bool,
-    },
+    CreateAndStart(CreateVmOptions),
     /// Watch virtual machine state change events
     Events {
         #[arg(
@@ -141,41 +92,66 @@ pub enum VmCommand {
     },
 }
 
-#[derive(Debug, Clone)]
-struct CreateVmOptions {
+#[derive(Args, Debug, Clone)]
+pub struct CreateVmOptions {
+    #[arg(
+        long,
+        required = true,
+        help = "OCI image with the kernel, and an initramfs or a root disk"
+    )]
     image_ref: String,
+
+    #[arg(long, default_value_t = 1, help = "Number of virtual CPUs to allocate")]
     vcpus: u32,
+
+    #[arg(long, default_value_t = 1024, help = "Memory size in MiB")]
     memory: u64,
+
+    #[arg(long, help = "Optional custom VM identifier")]
     vm_id: Option<String>,
-    taps: Vec<String>,
-    disks: Vec<String>,
+
+    #[arg(long, help = "TAP device for a network interface (repeatable)")]
+    tap: Vec<String>,
+
+    #[arg(long, help = "Path to a data disk image (repeatable)")]
+    disk: Vec<String>,
+
+    #[arg(long, help = "Enable hugepages for memory allocation")]
     hugepages: bool,
+
+    #[arg(
+        long,
+        requires = "guest_gateway",
+        help = "FeOS guest: address with prefix length, e.g. 10.200.0.2/16"
+    )]
+    guest_ip: Option<String>,
+
+    #[arg(long, requires = "guest_ip", help = "FeOS guest: default gateway")]
+    guest_gateway: Option<String>,
+
+    #[arg(
+        long,
+        requires = "guest_ip",
+        help = "FeOS guest: resolver (repeatable)"
+    )]
+    guest_dns: Vec<String>,
+
+    #[arg(
+        long,
+        default_value = "eth0",
+        help = "FeOS guest: interface that gets the address"
+    )]
+    guest_interface: String,
+
+    #[arg(long, requires = "guest_ip", help = "FeOS guest: hostname")]
+    hostname: Option<String>,
 }
 
 pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
     let mut client = VmServiceClient::new(crate::transport::channel(&args.address).await?);
 
     match args.command {
-        VmCommand::Create {
-            image_ref,
-            vcpus,
-            memory,
-            vm_id,
-            tap,
-            disk,
-            hugepages,
-        } => {
-            let opts = CreateVmOptions {
-                image_ref,
-                vcpus,
-                memory,
-                vm_id,
-                taps: tap,
-                disks: disk,
-                hugepages,
-            };
-            create_vm(&mut client, opts).await?
-        }
+        VmCommand::Create(opts) => create_vm(&mut client, opts).await?,
         VmCommand::Start { vm_id } => start_vm(&mut client, vm_id).await?,
         VmCommand::Info { vm_id } => get_vm_info(&mut client, vm_id).await?,
         VmCommand::List => list_vms(&mut client).await?,
@@ -184,26 +160,7 @@ pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
         VmCommand::Pause { vm_id } => pause_vm(&mut client, vm_id).await?,
         VmCommand::Resume { vm_id } => resume_vm(&mut client, vm_id).await?,
         VmCommand::Delete { vm_id } => delete_vm(&mut client, vm_id).await?,
-        VmCommand::CreateAndStart {
-            image_ref,
-            vcpus,
-            memory,
-            vm_id,
-            tap,
-            disk,
-            hugepages,
-        } => {
-            let opts = CreateVmOptions {
-                image_ref,
-                vcpus,
-                memory,
-                vm_id,
-                taps: tap,
-                disks: disk,
-                hugepages,
-            };
-            create_and_start_vm(&mut client, opts).await?
-        }
+        VmCommand::CreateAndStart(opts) => create_and_start_vm(&mut client, opts).await?,
         VmCommand::Events { vm_id } => watch_events(&mut client, vm_id).await?,
         VmCommand::Console { vm_id } => console_vm(&mut client, vm_id).await?,
     }
@@ -213,7 +170,7 @@ pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
 
 fn create_vm_request(opts: CreateVmOptions) -> CreateVmRequest {
     let net = opts
-        .taps
+        .tap
         .into_iter()
         .map(|tap_name| NetConfig {
             tap: Some(TapConfig { tap_name }),
@@ -221,13 +178,20 @@ fn create_vm_request(opts: CreateVmOptions) -> CreateVmRequest {
         })
         .collect();
     let disks = opts
-        .disks
+        .disk
         .into_iter()
         .map(|path| DiskConfig {
             path,
             ..Default::default()
         })
         .collect();
+    let guest_network = opts.guest_ip.map(|ipv4_cidr| GuestNetworkConfig {
+        interface: opts.guest_interface,
+        ipv4_cidr,
+        gateway: opts.guest_gateway.unwrap_or_default(),
+        dns: opts.guest_dns,
+        hostname: opts.hostname.unwrap_or_default(),
+    });
     CreateVmRequest {
         config: Some(VmConfig {
             cpus: Some(CpuConfig {
@@ -240,6 +204,7 @@ fn create_vm_request(opts: CreateVmOptions) -> CreateVmRequest {
             image_ref: opts.image_ref,
             disks,
             net,
+            guest_network,
         }),
         vm_id: opts.vm_id,
     }
@@ -407,6 +372,33 @@ async fn get_vm_info(client: &mut VmServiceClient<Channel>, vm_id: String) -> Re
                 }
             }
         }
+        if let Some(network) = config.guest_network {
+            println!(
+                "    Guest network: {} {} via {}",
+                network.interface, network.ipv4_cidr, network.gateway
+            );
+            if !network.dns.is_empty() {
+                println!("      DNS: {}", network.dns.join(", "));
+            }
+            if !network.hostname.is_empty() {
+                println!("      Hostname: {}", network.hostname);
+            }
+        }
+    }
+    if let Some(guest) = response.guest {
+        let state = if guest.attached {
+            "attached"
+        } else {
+            "detached"
+        };
+        println!("  Guest: FeOS {} ({state})", guest.feos_version);
+        println!(
+            "    Boot ID: {} (attach {})",
+            guest.boot_id, guest.attach_seq
+        );
+        if !guest.push_error.is_empty() {
+            println!("    Push failed: {}", guest.push_error);
+        }
     }
     Ok(())
 }
@@ -511,6 +503,19 @@ async fn watch_events(client: &mut VmServiceClient<Channel>, vm_id: Option<Strin
                                 .unwrap_or(VmState::Unspecified),
                             state_change.reason
                         );
+                    } else if data.type_url.contains("feos.vm.v1.GuestAttachedEvent") {
+                        let guest = GuestAttachedEvent::decode(&*data.value)?
+                            .guest
+                            .unwrap_or_default();
+                        println!(
+                            "  Guest attached: FeOS {}, boot {} (attach {})",
+                            guest.feos_version, guest.boot_id, guest.attach_seq
+                        );
+                        if !guest.push_error.is_empty() {
+                            println!("  Push failed: {}", guest.push_error);
+                        }
+                    } else if data.type_url.contains("feos.vm.v1.GuestDetachedEvent") {
+                        println!("  Guest detached");
                     } else {
                         println!("  Data Type: {}", data.type_url);
                     }

@@ -9,6 +9,7 @@ use crate::{
         handle_stream_vm_events_command, perform_startup_sanity_check,
     },
     error::VmServiceError,
+    guest::Guests,
     persistence::repository::VmRepository,
     vmm::{factory, Hypervisor, VmmType},
     worker, Command, VmEventWrapper,
@@ -28,6 +29,7 @@ pub struct VmServiceDispatcher {
     hypervisor: Arc<dyn Hypervisor>,
     repository: VmRepository,
     healthcheck_cancel_bus: broadcast::Sender<Uuid>,
+    guests: Arc<Guests>,
 }
 
 impl VmServiceDispatcher {
@@ -36,6 +38,7 @@ impl VmServiceDispatcher {
         let (status_channel_tx, _) = broadcast::channel(32);
         let (healthcheck_cancel_bus, _) = broadcast::channel::<Uuid>(32);
         let hypervisor = Arc::from(factory(VmmType::Firecracker));
+        let guests = Guests::new(event_bus_tx.clone());
         info!("VmDispatcher: Connecting to persistence layer at {db_url}...");
         let repository = VmRepository::connect(db_url).await?;
         info!("VmDispatcher: Persistence layer connected successfully.");
@@ -47,6 +50,7 @@ impl VmServiceDispatcher {
             hypervisor,
             repository,
             healthcheck_cancel_bus,
+            guests,
         })
     }
 
@@ -56,6 +60,7 @@ impl VmServiceDispatcher {
             self.hypervisor.clone(),
             self.event_bus_tx.clone(),
             &self.healthcheck_cancel_bus,
+            &self.guests,
         )
         .await;
 
@@ -67,28 +72,29 @@ impl VmServiceDispatcher {
                     let hypervisor = self.hypervisor.clone();
                     let event_bus_tx = self.event_bus_tx.clone();
                     let status_channel_tx = self.status_channel_tx.clone();
+                    let guests = self.guests.clone();
 
                     match cmd {
                         Command::CreateVm(req, responder) => {
-                            handle_create_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
+                            handle_create_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, guests).await;
                         }
                         Command::StartVm(req, responder) => {
-                            handle_start_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, &self.healthcheck_cancel_bus).await;
+                            handle_start_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, &self.healthcheck_cancel_bus, guests).await;
                         }
                         Command::GetVm(req, responder) => {
-                            handle_get_vm_command(&self.repository, req, responder).await;
+                            handle_get_vm_command(&self.repository, req, responder, &guests).await;
                         }
                         Command::StreamVmEvents(req, stream_tx) => {
                             handle_stream_vm_events_command(&self.repository, req, stream_tx, status_channel_tx).await;
                         }
                         Command::DeleteVm(req, responder) => {
-                            handle_delete_vm_command(&self.repository, &self.healthcheck_cancel_bus, req, responder, hypervisor, event_bus_tx).await;
+                            handle_delete_vm_command(&self.repository, &self.healthcheck_cancel_bus, req, responder, hypervisor, event_bus_tx, guests).await;
                         }
                         Command::StreamVmConsole(input_stream, output_tx) => {
                             handle_stream_vm_console_command(&self.repository, *input_stream, output_tx, hypervisor).await;
                         }
                         Command::ListVms(req, responder) => {
-                            handle_list_vms_command(&self.repository, req, responder).await;
+                            handle_list_vms_command(&self.repository, req, responder, &guests).await;
                         }
                         Command::PingVm(req, responder) => {
                             tokio::spawn(worker::handle_ping_vm(req, responder, hypervisor));
@@ -100,7 +106,7 @@ impl VmServiceDispatcher {
                             handle_pause_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
                         }
                         Command::ResumeVm(req, responder) => {
-                            handle_resume_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
+                            handle_resume_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, guests).await;
                         }
                     }
                 },
@@ -145,11 +151,20 @@ impl VmServiceDispatcher {
             }
         }
 
-        if let Some(data) = &event.data
-            && data.type_url.contains("VmStateChangedEvent")
-        {
-            self.handle_vm_state_changed_event(data, vm_id_uuid, &event.vm_id, event_to_forward)
+        match &event.data {
+            Some(data) if data.type_url.contains("VmStateChangedEvent") => {
+                self.handle_vm_state_changed_event(
+                    data,
+                    vm_id_uuid,
+                    &event.vm_id,
+                    event_to_forward,
+                )
                 .await;
+            }
+            // Other events change no record.
+            _ => {
+                let _ = self.status_channel_tx.send(event_to_forward);
+            }
         }
     }
 

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use feos_proto::vm_service::{VmEvent, VmState, VmStateChangedEvent};
+use feos_proto::vm_service::{
+    GuestAttachedEvent, GuestInfo, VmEvent, VmState, VmStateChangedEvent,
+};
 use log::{error, info, warn};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -86,6 +88,37 @@ pub async fn wait_for_target_state(
     }
     Err(anyhow::anyhow!(
         "Event stream ended before VM reached {target_state:?} state."
+    ))
+}
+
+/// Waits until a FeOS guest attaches to its uplink; returns what it reported.
+pub async fn wait_for_guest_attached(stream: &mut tonic::Streaming<VmEvent>) -> Result<GuestInfo> {
+    while let Some(event) = stream.next().await {
+        let Some(data) = event?.data else {
+            continue;
+        };
+        match data.type_url.as_str() {
+            "type.googleapis.com/feos.vm.v1.GuestAttachedEvent" => {
+                let guest = GuestAttachedEvent::decode(&*data.value)?
+                    .guest
+                    .unwrap_or_default();
+                info!(
+                    "The guest attached: boot {}, attach {}",
+                    guest.boot_id, guest.attach_seq
+                );
+                return Ok(guest);
+            }
+            "type.googleapis.com/feos.vm.v1.VmStateChangedEvent" => {
+                let state_change = VmStateChangedEvent::decode(&*data.value)?;
+                if state_change.new_state == VmState::Crashed as i32 {
+                    anyhow::bail!("VM entered Crashed state: {}", state_change.reason);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(anyhow::anyhow!(
+        "Event stream ended before the guest attached."
     ))
 }
 
