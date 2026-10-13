@@ -23,5 +23,5 @@ log = { workspace = true }
 tower = { workspace = true }
 thiserror = { workspace = true }
 hyper = {workspace = true}
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
 sqlx = { workspace = true }

@@ -54,7 +54,6 @@ log = { workspace = true }
 tokio-stream = { workspace = true }
 prost = { workspace = true }
 hyper-util = { workspace = true }
-once_cell = { workspace = true }
 tower = { workspace = true }
 tempfile = { workspace = true }
 
