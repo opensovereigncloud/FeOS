@@ -1,14 +1,14 @@
 [workspace]
 members = [
-    "feos",
-    "feos/services/vm-service",
-    "feos/services/host-service",
-    "feos/services/image-service",
-    "feos/services/task-service",
-    "feos/services/container-service",
-    "cli",
-    "feos/proto",
-    "feos/utils",
+    "crates/feos",
+    "crates/feos-proto",
+    "crates/feos-utils",
+    "crates/feosctl",
+    "crates/services/container-service",
+    "crates/services/host-service",
+    "crates/services/image-service",
+    "crates/services/task-service",
+    "crates/services/vm-service",
 ]
 resolver = "2"
 
@@ -56,4 +56,12 @@ hyper = "1.7.0"
 hyper-util = { version = "0.1.17", features = ["full"] }
 termcolor = "1.1"
 once_cell = "1.19"
-feos-proto = { path = "feos/proto" }
+
+# Workspace crates
+feos-proto = { path = "crates/feos-proto" }
+feos-utils = { path = "crates/feos-utils" }
+container-service = { path = "crates/services/container-service" }
+host-service = { path = "crates/services/host-service" }
+image-service = { path = "crates/services/image-service" }
+task-service = { path = "crates/services/task-service" }
+vm-service = { path = "crates/services/vm-service" }

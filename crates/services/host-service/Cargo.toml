@@ -7,7 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-feos-utils = { path = "../../utils" }
+feos-utils = { workspace = true }
 feos-proto = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }

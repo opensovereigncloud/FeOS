@@ -15,12 +15,12 @@ name = "main_server"
 path = "src/lib.rs"
 
 [dependencies]
-feos-utils = { path = "utils" }
-vm-service = { path = "services/vm-service" }
-host-service = { path = "services/host-service" }
-image-service = { path = "services/image-service" }
-task-service = { path = "services/task-service" }
-container-service = { path = "services/container-service" }
+feos-utils = { workspace = true }
+vm-service = { workspace = true }
+host-service = { workspace = true }
+image-service = { workspace = true }
+task-service = { workspace = true }
+container-service = { workspace = true }
 feos-proto = { workspace = true }
 
 # Workspace dependencies
@@ -46,10 +46,10 @@ chrono = { workspace = true }
 termcolor = { workspace = true }
 
 [dev-dependencies]
-feos-utils = { path = "utils" }
-vm-service = { path = "services/vm-service" }
-image-service = { path = "services/image-service"}
-host-service = { path = "services/host-service"}
+feos-utils = { workspace = true }
+vm-service = { workspace = true }
+image-service = { workspace = true }
+host-service = { workspace = true }
 anyhow = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true }
