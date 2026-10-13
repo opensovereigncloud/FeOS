@@ -10,9 +10,10 @@ use feos_proto::host_service::{
     ShutdownResponse, StreamFeosLogsRequest, StreamKernelLogsRequest, UpgradeFeosBinaryRequest,
     UpgradeFeosBinaryResponse,
 };
+use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
 use std::pin::Pin;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tonic::{Request, Response, Status};
 
@@ -23,30 +24,6 @@ pub struct HostApiHandler {
 impl HostApiHandler {
     pub fn new(dispatcher_tx: mpsc::Sender<Command>) -> Self {
         Self { dispatcher_tx }
-    }
-}
-
-async fn dispatch_and_wait<T, E>(
-    dispatcher: &mpsc::Sender<Command>,
-    command_constructor: impl FnOnce(oneshot::Sender<Result<T, E>>) -> Command,
-) -> Result<Response<T>, Status>
-where
-    E: Into<Status>,
-{
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let cmd = command_constructor(resp_tx);
-
-    dispatcher
-        .send(cmd)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to send command to dispatcher: {e}")))?;
-
-    match resp_rx.await {
-        Ok(Ok(result)) => Ok(Response::new(result)),
-        Ok(Err(e)) => Err(e.into()),
-        Err(_) => Err(Status::internal(
-            "Dispatcher task dropped response channel.",
-        )),
     }
 }
 

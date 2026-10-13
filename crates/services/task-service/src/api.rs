@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::TaskError;
 use crate::Command;
 use feos_proto::task_service::{
     task_service_server::TaskService, CreateRequest, CreateResponse, DeleteRequest, DeleteResponse,
     KillRequest, KillResponse, StartRequest, StartResponse, WaitRequest, WaitResponse,
 };
+use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 pub struct TaskApiHandler {
@@ -18,31 +18,6 @@ pub struct TaskApiHandler {
 impl TaskApiHandler {
     pub fn new(dispatcher_tx: mpsc::Sender<Command>) -> Self {
         Self { dispatcher_tx }
-    }
-}
-
-/// Helper function to create a command, send it to the dispatcher, and await the response.
-async fn dispatch_and_wait<T, F>(
-    dispatcher: &mpsc::Sender<Command>,
-    command_constructor: F,
-) -> Result<Response<T>, Status>
-where
-    F: FnOnce(oneshot::Sender<Result<T, TaskError>>) -> Command,
-{
-    let (resp_tx, resp_rx) = oneshot::channel();
-    let cmd = command_constructor(resp_tx);
-
-    dispatcher
-        .send(cmd)
-        .await
-        .map_err(|e| Status::internal(format!("Failed to send command to dispatcher: {e}")))?;
-
-    match resp_rx.await {
-        Ok(Ok(result)) => Ok(Response::new(result)),
-        Ok(Err(e)) => Err(e.into()),
-        Err(_) => Err(Status::internal(
-            "Dispatcher task dropped response channel.",
-        )),
     }
 }
 

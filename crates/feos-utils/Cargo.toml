@@ -12,6 +12,7 @@ log = { workspace = true, features = ["std"] }
 nix = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
+tonic = { workspace = true }
 termcolor = { workspace = true }
 dhcproto = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

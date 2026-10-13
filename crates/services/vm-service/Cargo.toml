@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 feos-proto = { workspace = true }
+feos-utils = { workspace = true }
 image-service = { workspace = true }
 cloud-hypervisor-client = { version = "0.3.3"}
 hyperlocal = "0.9.1"

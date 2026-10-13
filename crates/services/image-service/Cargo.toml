@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 feos-proto = { workspace = true }
+feos-utils = { workspace = true }
 oci-distribution = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
