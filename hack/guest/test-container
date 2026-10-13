@@ -135,7 +135,8 @@ grep -q "notes.txt" <<<"$(tool fd notes /work)" || fail "tool fd"
 grep -q "nameserver ${DNS}" <<<"$(tool read /etc/resolv.conf)" || fail "tool read of the managed resolv.conf"
 tool write /etc/resolv.conf </dev/null 2>/dev/null && fail "tool wrote the managed resolv.conf"
 [ "$(cexec cat /work/notes.txt)" = "$(printf 'alpha\ngamma')" ] || fail "tool changes not visible in the container"
-log "tools read, write, edit, rg and fd in the container"
+grep -q "Example Domain" <<<"$(tool webfetch https://example.com/)" || fail "tool webfetch"
+log "tools read, write, edit, rg, fd and webfetch in the container"
 
 WATCH_LOG="${RUN_DIR}/watch.log"
 "${FEOSCTL}" watch --address "vsock:${VSOCK}" --container main /work >"${WATCH_LOG}" 2>&1 &

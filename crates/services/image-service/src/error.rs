@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use oci_distribution::{errors::OciDistributionError, ParseError};
+use oci_client::{errors::OciDistributionError, ParseError};
 use tonic::Status;
 
 #[derive(Debug, thiserror::Error)]

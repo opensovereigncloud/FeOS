@@ -13,9 +13,7 @@ log = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
-# webfetch: rustls, statically linkable against musl.
-ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
-url = "2"
+reqwest = { workspace = true }
 # Readable-content extraction, a Rust port of trafilatura.
 trafilatura = "0.3"
 # rg and fd: ripgrep's and fd's own engines, in-process.

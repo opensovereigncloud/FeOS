@@ -7,7 +7,7 @@
 //! (feos_utils::container_fs):
 //! the tool surface is image-independent — it works against a scratch image.
 //!
-//!   webfetch  HTTP fetch (ureq/rustls) + readable extraction (trafilatura-rs)
+//!   webfetch  HTTP fetch (reqwest/rustls) + readable extraction (trafilatura-rs)
 //!   read/ls   in-process, lossy-utf8 read with offset/limit (a PNG/JPEG/
 //!             GIF/WebP comes back whole as bytes instead), sorted listing
 //!   write/edit in-process, exact-replace edit semantics (unique oldText)
@@ -30,7 +30,6 @@ use feos_proto::tool_service::{
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use nix::libc;
 use tonic::{Request, Response, Status};
-use ureq::ResponseExt;
 
 use feos_utils::container_fs as toolfs;
 
@@ -55,37 +54,59 @@ pub struct ToolApiHandler;
 
 // ------------------------------------------------------------ webfetch (Ws)
 
-fn fetch(url: &str) -> Result<(u16, String, String), String> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(REQ_TIMEOUT))
-        .http_status_as_error(false)
+async fn fetch(url: &str) -> Result<(u16, String, String), String> {
+    let client = reqwest::Client::builder()
+        .timeout(REQ_TIMEOUT)
+        .user_agent(UA)
         .build()
-        .new_agent();
-    let mut resp = agent
+        .map_err(|e| format!("fetch: {}", chain(&e)))?;
+    let mut resp = client
         .get(url)
-        .header("user-agent", UA)
-        .call()
-        .map_err(|e| format!("fetch: {e}"))?;
+        .send()
+        .await
+        .map_err(|e| format!("fetch: {}", chain(&e)))?;
     let status = resp.status().as_u16();
-    let final_url = resp.get_uri().to_string();
-    let body = resp
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY as u64)
-        .read_to_string()
-        .map_err(|e| format!("read body: {e}"))?;
-    Ok((status, final_url, body))
+    let final_url = resp.url().to_string();
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("read body: {}", chain(&e)))?
+    {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(format!("read body: larger than {MAX_BODY} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((
+        status,
+        final_url,
+        String::from_utf8_lossy(&body).into_owned(),
+    ))
+}
+
+/// An error with its causes: reqwest's own message leaves out what went
+/// wrong underneath, such as a failed name lookup.
+fn chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 /// "Temporary failure in name resolution" is the resolver telling us to
 /// come back, and musl's is a single UDP query to one nameserver at a
 /// time — one dropped packet on a fresh guest is enough. Retrying a
 /// transient lookup failure is the whole of the fix.
-fn fetch_retrying(url: &str) -> Result<(u16, String, String), String> {
+async fn fetch_retrying(url: &str) -> Result<(u16, String, String), String> {
     const ATTEMPTS: u32 = 3;
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
-        match fetch(url) {
+        match fetch(url).await {
             Ok(t) => return Ok(t),
             Err(e) => {
                 let transient = e.contains("Try again")
@@ -96,15 +117,15 @@ fn fetch_retrying(url: &str) -> Result<(u16, String, String), String> {
                     break;
                 }
                 log::warn!("webfetch {url}: attempt {attempt} ({last}), retrying");
-                std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+                tokio::time::sleep(Duration::from_millis(300 * attempt as u64)).await;
             }
         }
     }
     Err(last)
 }
 
-fn webfetch_sync(url: &str) -> (WebfetchResponse, i32) {
-    let (status, final_url, html) = match fetch_retrying(url) {
+async fn webfetch(url: &str) -> (WebfetchResponse, i32) {
+    let (status, final_url, html) = match fetch_retrying(url).await {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -127,13 +148,19 @@ fn webfetch_sync(url: &str) -> (WebfetchResponse, i32) {
             1,
         );
     }
-    let opts = trafilatura::Options::default()
-        .with_fallback(true)
-        .with_links(true);
-    match trafilatura::extract(&html, &opts) {
-        Ok(res) => {
-            let title = res.metadata.title;
-            let text = res.content_text;
+    // Extraction is CPU work: keep it off the async workers.
+    let extracted = tokio::task::spawn_blocking(move || {
+        let opts = trafilatura::Options::default()
+            .with_fallback(true)
+            .with_links(true);
+        trafilatura::extract(&html, &opts)
+            .map(|res| (res.metadata.title, res.content_text))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("extraction task: {e}")));
+    match extracted {
+        Ok((title, text)) => {
             if text.trim().is_empty() {
                 (
                     WebfetchResponse {
@@ -808,7 +835,7 @@ impl ToolService for ToolApiHandler {
         request: Request<WebfetchRequest>,
     ) -> Result<Response<WebfetchResponse>, Status> {
         let url = request.into_inner().url;
-        let parsed = url::Url::parse(&url)
+        let parsed = reqwest::Url::parse(&url)
             .map_err(|_| Status::invalid_argument(format!("invalid url {url:?}")))?;
         let scheme = parsed.scheme();
         if (scheme != "http" && scheme != "https") || parsed.host_str().is_none() {
@@ -816,13 +843,8 @@ impl ToolService for ToolApiHandler {
                 "invalid url {url:?} (http/https only)"
             )));
         }
-        // ureq/extraction are blocking (no async TLS in the static musl
-        // guest) — move to the blocking pool. The gRPC deadline bounds the
-        // whole thing; ureq additionally caps the request itself.
-        let resp = tokio::task::spawn_blocking(move || webfetch_sync(&url).0)
-            .await
-            .map_err(|e| Status::internal(format!("webfetch worker: {e}")))?;
-        Ok(Response::new(resp))
+        // The gRPC deadline bounds the whole call; REQ_TIMEOUT the request.
+        Ok(Response::new(webfetch(&url).await.0))
     }
 
     async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {

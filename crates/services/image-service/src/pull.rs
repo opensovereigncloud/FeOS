@@ -18,9 +18,9 @@
 use crate::error::ImageServiceError;
 use crate::unpack::unpack_layer;
 use log::{info, warn};
-use oci_distribution::manifest::{self, OciDescriptor};
-use oci_distribution::secrets::RegistryAuth;
-use oci_distribution::{client::ClientConfig, Client, Reference};
+use oci_client::manifest::{self, OciDescriptor};
+use oci_client::secrets::RegistryAuth;
+use oci_client::{client::ClientConfig, Client, Reference};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};

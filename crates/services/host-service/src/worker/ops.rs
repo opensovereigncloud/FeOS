@@ -2,18 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{error::HostError, RestartSignal};
-use digest::Digest;
 use feos_proto::host_service::{
     FeosLogEntry, KernelLogEntry, UpgradeFeosBinaryRequest, UpgradeFeosBinaryResponse,
 };
 use feos_utils::feos_logger::LogHandle;
-use http_body_util::{BodyExt, Empty};
-use hyper::body::Bytes;
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use log::{error, info, warn};
 use prost_types::Timestamp;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::fs::Permissions;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -121,17 +116,7 @@ pub async fn handle_stream_kernel_logs(grpc_tx: mpsc::Sender<Result<KernelLogEnt
 async fn download_file(url: &str, temp_file_writer: &mut std::fs::File) -> Result<(), String> {
     info!("HostWorker: Starting download from {url}");
 
-    let https = HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .map_err(|e| format!("Could not load native root certificates: {e}"))?
-        .https_or_http()
-        .enable_http1()
-        .build();
-
-    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-    let uri = url.parse::<hyper::Uri>().map_err(|e| e.to_string())?;
-    let mut res = client
-        .get(uri)
+    let mut res = reqwest::get(url)
         .await
         .map_err(|e| format!("HTTP GET request failed: {e}"))?;
 
@@ -140,13 +125,14 @@ async fn download_file(url: &str, temp_file_writer: &mut std::fs::File) -> Resul
         return Err(format!("Download failed with status: {}", res.status()));
     }
 
-    while let Some(next) = res.frame().await {
-        let frame = next.map_err(|e| format!("Error reading response frame: {e}"))?;
-        if let Some(chunk) = frame.data_ref() {
-            temp_file_writer
-                .write_all(chunk)
-                .map_err(|e| format!("Failed to write chunk to temp file: {e}"))?;
-        }
+    while let Some(chunk) = res
+        .chunk()
+        .await
+        .map_err(|e| format!("Error reading response: {e}"))?
+    {
+        temp_file_writer
+            .write_all(&chunk)
+            .map_err(|e| format!("Failed to write chunk to temp file: {e}"))?;
     }
 
     info!("HostWorker: Download completed successfully.");
@@ -224,7 +210,7 @@ pub async fn handle_upgrade(
             }
         }
     }
-    let actual_checksum = hex::encode(hasher.finalize());
+    let actual_checksum = format!("{:x}", hasher.finalize());
 
     if actual_checksum != req.sha256_sum {
         error!(

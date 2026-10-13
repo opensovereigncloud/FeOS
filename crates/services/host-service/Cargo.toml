@@ -11,8 +11,6 @@ feos-utils = { workspace = true }
 feos-proto = { workspace = true }
 tempfile = { workspace = true }
 sha2 = { workspace = true }
-hex = { workspace = true }
-digest = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
@@ -20,8 +18,6 @@ nix = { workspace = true , features = ["hostname", "reboot", "mman", "time", "io
 log = { workspace = true }
 prost-types = { workspace = true }
 thiserror = { workspace = true }
-hyper = {workspace = true}
-hyper-util = { workspace = true }
 sntpc = { version = "0.7", features = ["tokio-socket", "utils"], optional = true }
 chrono = { workspace = true }
 libc = { workspace = true }
@@ -29,9 +25,7 @@ libc = { workspace = true }
 rtnetlink = { workspace = true }
 futures = { workspace = true }
 
-# ring, like reqwest: one crypto provider, and no C build of aws-lc.
-hyper-rustls = { version = "0.27.2", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
-http-body-util = "0.1.2"
+reqwest = { workspace = true }
 
 [features]
 # Clock sync over NTP, for hosts that have to find out the time themselves.
