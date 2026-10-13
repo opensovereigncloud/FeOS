@@ -24,13 +24,21 @@ pub mod vmm;
 pub mod worker;
 
 pub const DEFAULT_VM_DB_URL: &str = "sqlite:/var/lib/feos/vms.db";
-/// A directory per VM: its configuration, its sockets and its logs.
+/// The jailer's chroot base: a jail per VM in `firecracker/<id>/`.
 pub const VM_DIR: &str = "/var/lib/feos/vms";
 pub const FIRECRACKER_BIN: &str = "firecracker";
+pub const JAILER_BIN: &str = "jailer";
 pub const IMAGE_DIR: &str = "/var/lib/feos/images";
 
+/// The VM's jail: its chroot and what the VM service keeps outside of it.
+pub fn jail_dir(vm_id: &str) -> PathBuf {
+    Path::new(VM_DIR).join(FIRECRACKER_BIN).join(vm_id)
+}
+
+/// The VM's directory, the chroot its Firecracker runs in: its
+/// configuration, its sockets, its logs and its snapshot.
 pub fn vm_dir(vm_id: &str) -> PathBuf {
-    Path::new(VM_DIR).join(vm_id)
+    jail_dir(vm_id).join("root")
 }
 
 /// The host end of the VM's vsock device.

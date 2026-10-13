@@ -26,7 +26,7 @@ The virtual machine has a virtio-net NIC attached which will be connected to a L
 With the make target `virsh-start` the VM will be created and started. `virsh-console` brings you into the serial console of the VM (you can exit it with `Ctrl+]`). To stop and destroy the VM call `make virsh-stop` - you'll probably want to concatenate those commands to `make virsh-start virsh-console virsh-stop`. This will start the VM, opens the serial console and waits for you to hit `Ctrl+]` to exit the serial console and destroy the VM.
 
 ### make run
-To test feos locally, you can execute `make run` to compile and run feos locally as a non-PID 1 process. The VM service needs `firecracker` in your path (`make firecracker` downloads it to `target/firecracker/`).
+To test feos locally, you can execute `make run` to compile and run feos locally as a non-PID 1 process. The VM service needs `firecracker` and its `jailer` in your path (`make firecracker` downloads them to `target/firecracker/`), and root.
 
     make run
 

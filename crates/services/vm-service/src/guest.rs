@@ -35,6 +35,7 @@ use prost::Message;
 use prost_types::Any;
 use std::collections::HashMap;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, SystemTime};
@@ -103,6 +104,9 @@ impl Guests {
             Err(e) => return Err(e),
         }
         let listener = UnixListener::bind(&path)?;
+        // Firecracker connects as the VM's user. The jail's directory is
+        // that user's alone.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))?;
 
         let (stop, mut stopped) = watch::channel(false);
         let uplink = Uplink {
@@ -390,7 +394,7 @@ mod tests {
     fn the_uplink_is_beside_the_vsock_socket() {
         assert_eq!(
             uplink_path("vm"),
-            PathBuf::from("/var/lib/feos/vms/vm/v.sock_10001")
+            PathBuf::from("/var/lib/feos/vms/firecracker/vm/root/v.sock_10001")
         );
     }
 }

@@ -25,6 +25,10 @@ const ZERO_PAGE: [u8; PAGE] = [0; PAGE];
 /// How much of the memory file is read at a time.
 const CHUNK: usize = 1 << 20;
 
+/// Where Firecracker, in its jail, sees the snapshot.
+pub const JAILED_VMSTATE: &str = "/snapshot/vmstate";
+pub const JAILED_MEMORY: &str = "/snapshot/memory";
+
 pub fn dir(vm_id: &str) -> PathBuf {
     vm_dir(vm_id).join("snapshot")
 }

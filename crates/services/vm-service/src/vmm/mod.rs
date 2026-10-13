@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 mod fc_api;
 pub mod firecracker;
+pub mod jail;
 pub mod snapshot;
 
 #[derive(Debug, thiserror::Error)]
@@ -200,9 +201,9 @@ pub enum VmmType {
 
 pub fn factory(vmm_type: VmmType) -> Box<dyn Hypervisor> {
     match vmm_type {
-        VmmType::Firecracker => {
-            let binary = Path::new(super::FIRECRACKER_BIN).to_path_buf();
-            Box::new(firecracker::FirecrackerAdapter::new(binary))
-        }
+        VmmType::Firecracker => Box::new(firecracker::FirecrackerAdapter::new(
+            Path::new(super::FIRECRACKER_BIN).to_path_buf(),
+            Path::new(super::JAILER_BIN).to_path_buf(),
+        )),
     }
 }

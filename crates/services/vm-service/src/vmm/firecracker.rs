@@ -19,8 +19,8 @@
 //! snapshot and ends the process; restoring it starts a process that loads
 //! the snapshot.
 
-use super::{fc_api, snapshot, Hypervisor, VmmError};
-use crate::{vm_dir, vsock_path, VmEventWrapper, IMAGE_DIR};
+use super::{fc_api, jail, snapshot, Hypervisor, VmmError};
+use crate::{jail_dir, vm_dir, vsock_path, VmEventWrapper, IMAGE_DIR, VM_DIR};
 use feos_proto::vm_service::{
     BalloonStats, CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetBalloonResponse,
     PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
@@ -65,6 +65,11 @@ const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const CONSOLE_POLL: Duration = Duration::from_millis(50);
 /// How much of Firecracker's log an error carries.
 const LOG_TAIL_LINES: usize = 5;
+/// Files in the VM's directory, the jail's root.
+const CONFIG: &str = "config.json";
+const API_SOCKET: &str = "fc.sock";
+const VSOCK: &str = "v.sock";
+const VMM_LOG: &str = "vmm.log";
 
 /// How a VMM process ended: its exit code, 128 + the signal when signalled,
 /// or `None` when it was not this process's child and the code is unknown.
@@ -73,16 +78,21 @@ type Exit = Option<i32>;
 type ExitWatch = watch::Receiver<Option<Exit>>;
 
 pub struct FirecrackerAdapter {
-    binary: PathBuf,
+    firecracker: PathBuf,
+    jailer: PathBuf,
     /// The exits of the VMM processes this service watches, by VM ID.
     exits: Mutex<HashMap<String, ExitWatch>>,
+    /// Serializes the allocation of the jails' user IDs.
+    jails: Mutex<()>,
 }
 
 impl FirecrackerAdapter {
-    pub fn new(binary: PathBuf) -> Self {
+    pub fn new(firecracker: PathBuf, jailer: PathBuf) -> Self {
         Self {
-            binary,
+            firecracker,
+            jailer,
             exits: Mutex::new(HashMap::new()),
+            jails: Mutex::new(()),
         }
     }
 
@@ -161,7 +171,7 @@ fn is_child(pid: i32) -> bool {
 }
 
 fn api_socket(vm_id: &str) -> PathBuf {
-    vm_dir(vm_id).join("fc.sock")
+    vm_dir(vm_id).join(API_SOCKET)
 }
 
 fn read_pid(vm_id: &str) -> Option<i32> {
@@ -180,9 +190,13 @@ fn log_tail(path: &Path, offset: u64) -> String {
     lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
 }
 
-/// The Firecracker configuration of a VM. The image carries the kernel and
-/// may carry an initramfs and a root disk.
-fn firecracker_config(vm_id: &str, config: &VmConfig, image: &Path) -> Result<Value, VmmError> {
+/// The Firecracker configuration of a VM, with the paths Firecracker sees
+/// in its jail, and the files to link into the jail. The image carries the
+/// kernel and may carry an initramfs and a root disk.
+fn firecracker_config(
+    config: &VmConfig,
+    image: &Path,
+) -> Result<(Value, Vec<jail::Link>), VmmError> {
     let kernel = image.join("vmlinuz");
     if !kernel.exists() {
         return Err(VmmError::InvalidConfig(format!(
@@ -190,10 +204,20 @@ fn firecracker_config(vm_id: &str, config: &VmConfig, image: &Path) -> Result<Va
             config.image_ref
         )));
     }
-    let mut boot_source = json!({"kernel_image_path": kernel, "boot_args": BOOT_ARGS});
+    let mut links = Vec::new();
+    let mut link = |source: PathBuf, name: String, disk: bool| {
+        let link = jail::Link { source, name, disk };
+        let jailed = link.jailed();
+        links.push(link);
+        jailed
+    };
+    let mut boot_source = json!({
+        "kernel_image_path": link(kernel, "vmlinuz".to_string(), false),
+        "boot_args": BOOT_ARGS,
+    });
     let initramfs = image.join("initramfs");
     if initramfs.exists() {
-        boot_source["initrd_path"] = json!(initramfs);
+        boot_source["initrd_path"] = json!(link(initramfs, "initramfs".to_string(), false));
     }
 
     // Writeback: Firecracker passes the guest's flushes on to the host,
@@ -203,7 +227,7 @@ fn firecracker_config(vm_id: &str, config: &VmConfig, image: &Path) -> Result<Va
     if rootfs.exists() {
         drives.push(json!({
             "drive_id": "rootfs",
-            "path_on_host": rootfs,
+            "path_on_host": link(rootfs, "rootfs.img".to_string(), true),
             "is_root_device": true,
             "is_read_only": false,
             "cache_type": "Writeback",
@@ -216,7 +240,7 @@ fn firecracker_config(vm_id: &str, config: &VmConfig, image: &Path) -> Result<Va
         };
         drives.push(json!({
             "drive_id": id,
-            "path_on_host": disk.path,
+            "path_on_host": link(PathBuf::from(&disk.path), format!("{id}.img"), true),
             "is_root_device": false,
             "is_read_only": disk.readonly,
             "cache_type": "Writeback",
@@ -263,7 +287,7 @@ fn firecracker_config(vm_id: &str, config: &VmConfig, image: &Path) -> Result<Va
         "drives": drives,
         "network-interfaces": interfaces,
         "machine-config": machine,
-        "vsock": {"guest_cid": GUEST_CID, "uds_path": vsock_path(vm_id)},
+        "vsock": {"guest_cid": GUEST_CID, "uds_path": format!("/{VSOCK}")},
     });
     if let Some(balloon) = config.memory.and_then(|memory| memory.balloon) {
         fc["balloon"] = json!({
@@ -273,7 +297,30 @@ fn firecracker_config(vm_id: &str, config: &VmConfig, image: &Path) -> Result<Va
             "stats_polling_interval_s": balloon.stats_interval_s,
         });
     }
-    Ok(fc)
+    Ok((fc, links))
+}
+
+/// The TAP devices of a VM.
+fn tap_names(config: &VmConfig) -> Vec<String> {
+    config
+        .net
+        .iter()
+        .filter_map(|nic| nic.tap.as_ref().map(|tap| tap.tap_name.clone()))
+        .collect()
+}
+
+/// Where `name` is: a path, or an executable in $PATH.
+fn find_executable(name: &Path) -> PathBuf {
+    if name.components().count() > 1 {
+        return name.to_path_buf();
+    }
+    std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or_else(|| name.to_path_buf())
 }
 
 fn internal(what: &str) -> impl FnOnce(io::Error) -> VmmError + '_ {
@@ -327,8 +374,13 @@ impl Spawned {
 impl FirecrackerAdapter {
     /// Starts Firecracker for the VM. With a configuration file it boots
     /// the VM at once; without one it waits for calls on its API.
-    fn spawn(&self, vm_id: &str, config: Option<&Path>) -> Result<Spawned, VmmError> {
+    fn spawn(&self, vm_id: &str, config: Option<&str>) -> Result<Spawned, VmmError> {
         let dir = vm_dir(vm_id);
+        jail::prepare(vm_id).map_err(internal("prepare the jail"))?;
+        let uid = jail::Manifest::load(vm_id)
+            .map_err(internal("read the jail's manifest"))?
+            .uid
+            .to_string();
         // Firecracker binds both sockets and fails if they exist.
         let api = api_socket(vm_id);
         for socket in [&api, &vsock_path(vm_id)] {
@@ -357,7 +409,7 @@ impl FirecrackerAdapter {
                 .open(&serial_path),
         }
         .map_err(internal("open the serial log"))?;
-        let vmm_log_path = dir.join("vmm.log");
+        let vmm_log_path = dir.join(VMM_LOG);
         let vmm_log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -366,14 +418,24 @@ impl FirecrackerAdapter {
         let log_offset = vmm_log.metadata().map(|m| m.len()).unwrap_or(0);
         let stderr = vmm_log.try_clone().map_err(internal("open the VMM log"))?;
 
-        let mut command = Command::new(&self.binary);
-        command.arg("--id").arg(vm_id).arg("--api-sock").arg(&api);
+        // The jailer becomes Firecracker: the same process, with the same
+        // standard streams. It passes the ID on.
+        let mut command = Command::new(find_executable(&self.jailer));
+        command
+            .arg("--id")
+            .arg(vm_id)
+            .arg("--exec-file")
+            .arg(find_executable(&self.firecracker))
+            .args(["--uid", &uid, "--gid", &uid])
+            .arg("--chroot-base-dir")
+            .arg(VM_DIR)
+            .args(["--cgroup-version", "2", "--"])
+            .args(["--api-sock", &format!("/{API_SOCKET}")]);
         if let Some(config) = config {
             command.arg("--config-file").arg(config);
         }
         command
-            .arg("--log-path")
-            .arg(&vmm_log_path)
+            .args(["--log-path", &format!("/{VMM_LOG}")])
             .stdin(console_in)
             .stdout(serial)
             .stderr(stderr);
@@ -386,11 +448,9 @@ impl FirecrackerAdapter {
         // would race it.
         let child = command
             .spawn()
-            .map_err(|e| VmmError::ProcessSpawnFailed(format!("{}: {e}", self.binary.display())))?;
+            .map_err(|e| VmmError::ProcessSpawnFailed(format!("{}: {e}", self.jailer.display())))?;
+        // The jailer records the pid in the jail.
         let pid = child.id() as i32;
-        if let Err(e) = std::fs::write(dir.join("firecracker.pid"), pid.to_string()) {
-            warn!("FirecrackerAdapter ({vm_id}): Failed to record pid {pid}: {e}");
-        }
         let exit = self.watch_process(vm_id, pid, Some(child));
         info!("FirecrackerAdapter ({vm_id}): Started Firecracker (pid {pid})");
         Ok(Spawned {
@@ -421,14 +481,26 @@ impl Hypervisor for FirecrackerAdapter {
         let config = req
             .config
             .ok_or_else(|| VmmError::InvalidConfig("VmConfig is required".to_string()))?;
-        let fc_config = firecracker_config(vm_id, &config, &Path::new(IMAGE_DIR).join(image_uuid))?;
+        let (fc_config, links) =
+            firecracker_config(&config, &Path::new(IMAGE_DIR).join(image_uuid))?;
 
         let dir = vm_dir(vm_id);
         std::fs::create_dir_all(&dir).map_err(internal("create the VM directory"))?;
+        {
+            let _jails = self.jails.lock().unwrap_or_else(|e| e.into_inner());
+            let manifest = jail::Manifest {
+                uid: jail::allocate_uid().map_err(internal("allocate a user ID"))?,
+                links,
+                taps: tap_names(&config),
+                created_taps: Vec::new(),
+            };
+            manifest
+                .save(vm_id)
+                .map_err(internal("write the jail's manifest"))?;
+        }
         let fc_config = serde_json::to_vec_pretty(&fc_config)
             .map_err(|e| VmmError::Internal(format!("serialize the configuration: {e}")))?;
-        std::fs::write(dir.join("config.json"), fc_config)
-            .map_err(internal("write the configuration"))?;
+        std::fs::write(dir.join(CONFIG), fc_config).map_err(internal("write the configuration"))?;
         match unistd::mkfifo(&dir.join("console.in"), Mode::S_IRUSR | Mode::S_IWUSR) {
             Ok(()) | Err(nix::Error::EEXIST) => {}
             Err(e) => return Err(VmmError::Internal(format!("create the console FIFO: {e}"))),
@@ -443,14 +515,13 @@ impl Hypervisor for FirecrackerAdapter {
 
     async fn start_vm(&self, req: StartVmRequest) -> Result<i64, VmmError> {
         let vm_id = req.vm_id.as_str();
-        let config = vm_dir(vm_id).join("config.json");
-        if !config.exists() {
+        if !vm_dir(vm_id).join(CONFIG).exists() {
             return Err(VmmError::VmNotFound(vm_id.to_string()));
         }
         // A cold boot: the memory in a snapshot is gone for good.
         snapshot::remove(vm_id).map_err(internal("remove the snapshot"))?;
 
-        let mut vmm = self.spawn(vm_id, Some(&config))?;
+        let mut vmm = self.spawn(vm_id, Some(&format!("/{CONFIG}")))?;
         let api = api_socket(vm_id);
         let booted = async {
             loop {
@@ -488,10 +559,12 @@ impl Hypervisor for FirecrackerAdapter {
             snapshot::remove(vm_id).map_err(internal("remove the old snapshot"))?;
             std::fs::create_dir_all(snapshot::dir(vm_id))
                 .map_err(internal("create the snapshot directory"))?;
+            jail::give(vm_id, &snapshot::dir(vm_id))
+                .map_err(internal("hand the snapshot directory to the VM"))?;
             let body = json!({
                 "snapshot_type": "Full",
-                "snapshot_path": snapshot::vmstate(vm_id),
-                "mem_file_path": snapshot::memory(vm_id),
+                "snapshot_path": snapshot::JAILED_VMSTATE,
+                "mem_file_path": snapshot::JAILED_MEMORY,
             });
             fc_api::request_within(
                 &api,
@@ -569,8 +642,8 @@ impl Hypervisor for FirecrackerAdapter {
             // The vCPUs start only once the load worked, so that a failure
             // up to here leaves the snapshot good.
             let body = json!({
-                "snapshot_path": snapshot::vmstate(vm_id),
-                "mem_backend": {"backend_type": "File", "backend_path": snapshot::memory(vm_id)},
+                "snapshot_path": snapshot::JAILED_VMSTATE,
+                "mem_backend": {"backend_type": "File", "backend_path": snapshot::JAILED_MEMORY},
                 "resume_vm": false,
             });
             fc_api::request_within(&api, "PUT", "/snapshot/load", Some(&body), SNAPSHOT_TIMEOUT)
@@ -676,13 +749,14 @@ impl Hypervisor for FirecrackerAdapter {
     }
 
     fn is_vmm_process(&self, vm_id: &str, pid: i64) -> bool {
-        // A pid from a record may belong to another process by now.
+        // A pid from a record may belong to another process by now. The
+        // jailer and the Firecracker it becomes carry the VM's ID.
         let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             return false;
         };
-        let api = api_socket(vm_id);
-        let api = api.as_os_str().as_encoded_bytes();
-        cmdline.split(|&b| b == 0).any(|arg| arg == api)
+        let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+        args.windows(2)
+            .any(|pair| pair[0] == b"--id" && pair[1] == vm_id.as_bytes())
     }
 
     async fn delete_vm(
@@ -709,7 +783,8 @@ impl Hypervisor for FirecrackerAdapter {
         }
         self.exits().remove(vm_id);
 
-        match std::fs::remove_dir_all(vm_dir(vm_id)) {
+        jail::release(vm_id);
+        match std::fs::remove_dir_all(jail_dir(vm_id)) {
             Ok(()) => info!("FirecrackerAdapter ({vm_id}): Removed the VM directory"),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => warn!("FirecrackerAdapter ({vm_id}): Failed to remove the VM directory: {e}"),
@@ -869,8 +944,6 @@ mod tests {
         BalloonConfig, CpuConfig, DiskConfig, MemoryConfig, NetConfig, TapConfig,
     };
 
-    const VM_ID: &str = "6f2c1e8e-6c1f-4e6e-9a51-0d1c5b1a2f3e";
-
     fn image(files: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for file in files {
@@ -883,28 +956,26 @@ mod tests {
     fn an_image_without_a_kernel_is_refused() {
         let image = image(&["initramfs"]);
         let config = VmConfig::default();
-        assert!(firecracker_config(VM_ID, &config, image.path()).is_err());
+        assert!(firecracker_config(&config, image.path()).is_err());
     }
 
     #[test]
     fn a_kernel_and_an_initramfs_boot_with_defaults() {
         let image = image(&["vmlinuz", "initramfs"]);
-        let fc = firecracker_config(VM_ID, &VmConfig::default(), image.path()).unwrap();
+        let (fc, links) = firecracker_config(&VmConfig::default(), image.path()).unwrap();
         assert_eq!(fc["boot-source"]["boot_args"], BOOT_ARGS);
-        assert!(fc["boot-source"]["initrd_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("initramfs"));
+        assert_eq!(fc["boot-source"]["kernel_image_path"], "/vmlinuz");
+        assert_eq!(fc["boot-source"]["initrd_path"], "/initramfs");
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[1].source, image.path().join("initramfs"));
+        assert!(!links[1].disk);
         assert_eq!(fc["drives"], json!([]));
         assert_eq!(
             fc["machine-config"],
             json!({"vcpu_count": 1, "mem_size_mib": 512})
         );
         assert_eq!(fc["vsock"]["guest_cid"], 3);
-        assert_eq!(
-            fc["vsock"]["uds_path"],
-            format!("/var/lib/feos/vms/{VM_ID}/v.sock")
-        );
+        assert_eq!(fc["vsock"]["uds_path"], "/v.sock");
     }
 
     #[test]
@@ -931,12 +1002,18 @@ mod tests {
             }],
             ..Default::default()
         };
-        let fc = firecracker_config(VM_ID, &config, image.path()).unwrap();
+        let (fc, links) = firecracker_config(&config, image.path()).unwrap();
         let drives = fc["drives"].as_array().unwrap();
         assert_eq!(drives[0]["drive_id"], "rootfs");
+        assert_eq!(drives[0]["path_on_host"], "/rootfs.img");
         assert_eq!(drives[0]["is_root_device"], true);
         assert_eq!(drives[1]["drive_id"], "disk0");
+        assert_eq!(drives[1]["path_on_host"], "/disk0.img");
         assert_eq!(drives[1]["is_read_only"], true);
+        let disk = links.iter().find(|link| link.name == "disk0.img").unwrap();
+        assert_eq!(disk.source, PathBuf::from("/data.img"));
+        assert!(disk.disk);
+        assert_eq!(tap_names(&config), vec!["tap0".to_string()]);
         assert_eq!(drives[1]["cache_type"], "Writeback");
         assert_eq!(
             fc["network-interfaces"],
@@ -964,12 +1041,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let fc = firecracker_config(VM_ID, &config, image.path()).unwrap();
+        let (fc, _) = firecracker_config(&config, image.path()).unwrap();
         assert_eq!(
             fc["balloon"],
             json!({"amount_mib": 16, "deflate_on_oom": true, "free_page_reporting": true, "stats_polling_interval_s": 1})
         );
-        let fc = firecracker_config(VM_ID, &VmConfig::default(), image.path()).unwrap();
+        let (fc, _) = firecracker_config(&VmConfig::default(), image.path()).unwrap();
         assert!(fc.get("balloon").is_none());
     }
 
@@ -980,7 +1057,17 @@ mod tests {
             net: vec![NetConfig::default()],
             ..Default::default()
         };
-        assert!(firecracker_config(VM_ID, &config, image.path()).is_err());
+        assert!(firecracker_config(&config, image.path()).is_err());
+    }
+
+    #[test]
+    fn executables_are_found_in_the_path() {
+        let sh = find_executable(Path::new("sh"));
+        assert!(sh.is_absolute() && sh.ends_with("sh"));
+        assert_eq!(
+            find_executable(Path::new("/opt/firecracker")),
+            PathBuf::from("/opt/firecracker")
+        );
     }
 
     #[test]

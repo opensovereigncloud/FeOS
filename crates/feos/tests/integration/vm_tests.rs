@@ -39,7 +39,7 @@ async fn test_create_and_start_vm() -> Result<()> {
     let disk_dir = tempfile::tempdir()?;
     let disk = disk_dir.path().join("data.img");
     std::fs::File::create(&disk)?.set_len(64 << 20)?;
-    // Firecracker, running as root, creates the TAP device.
+    // The VM service creates the TAP device and hands it to the VM's user.
     let tap_name = format!("fct{}", std::process::id());
 
     let vm_config = VmConfig {
@@ -60,7 +60,9 @@ async fn test_create_and_start_vm() -> Result<()> {
             ..Default::default()
         }],
         net: vec![NetConfig {
-            tap: Some(TapConfig { tap_name }),
+            tap: Some(TapConfig {
+                tap_name: tap_name.clone(),
+            }),
             ..Default::default()
         }],
         guest_network: Some(GuestNetworkConfig {
@@ -337,6 +339,16 @@ async fn test_create_and_start_vm() -> Result<()> {
     info!("VMM Ping successful, PID: {}", ping_res.pid);
     guard.set_pid(ping_res.pid as i32);
 
+    // Firecracker runs jailed, as a user of the VM's own.
+    let status = std::fs::read_to_string(format!("/proc/{}/status", ping_res.pid))?;
+    let uid: u32 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|uids| uids.split_whitespace().next())
+        .and_then(|uid| uid.parse().ok())
+        .context("No Uid in /proc/<pid>/status")?;
+    assert_ne!(uid, 0, "Firecracker runs as root");
+
     // The guest is FeOS: its API answers behind the VM's vsock.
     let vsock_path = info_res.vsock_path;
     info!("Pinging the guest through {vsock_path}");
@@ -400,6 +412,12 @@ async fn test_create_and_start_vm() -> Result<()> {
     info!("DeleteVm call successful");
 
     verify_vm_socket_cleanup(&vm_id);
+    assert!(
+        !std::path::Path::new("/sys/class/net")
+            .join(&tap_name)
+            .exists(),
+        "The TAP device the VM service created is gone with the VM"
+    );
 
     guard.disable_cleanup();
     Ok(())
