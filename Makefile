@@ -33,7 +33,7 @@ check-license: addlicense ## Check license headers in all Rust files.
 include hack/hack.mk
 
 cli:
-	cargo build --package feos-cli --release
+	cargo build --package feosctl --release
 
 ##@ Tools
 

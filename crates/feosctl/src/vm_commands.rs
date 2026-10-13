@@ -372,7 +372,7 @@ async fn create_and_start_vm(
     wait_for_vm_state(client, &vm_id, VmState::Running).await?;
     println!("🎉 VM '{vm_id}' is now running successfully!");
 
-    println!("Use 'feos-cli vm console {vm_id}' to connect to the VM console.");
+    println!("Use 'feosctl vm console {vm_id}' to connect to the VM console.");
 
     Ok(())
 }
@@ -495,10 +495,10 @@ async fn create_vm(client: &mut VmServiceClient<Channel>, opts: CreateVmOptions)
     let response = client.create_vm(request).await?.into_inner();
     println!("VM creation initiated. VM ID: {}", response.vm_id);
     println!(
-        "Use 'feos-cli vm events {}' to watch its progress.",
+        "Use 'feosctl vm events {}' to watch its progress.",
         response.vm_id
     );
-    println!("Then 'feos-cli vm start {}' to start it.", response.vm_id);
+    println!("Then 'feosctl vm start {}' to start it.", response.vm_id);
 
     Ok(())
 }

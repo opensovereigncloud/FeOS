@@ -824,25 +824,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "feos-cli"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "crossterm",
- "env_logger",
- "feos-proto",
- "hyper-util",
- "log",
- "prost",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower",
-]
-
-[[package]]
 name = "feos-proto"
 version = "0.5.0"
 dependencies = [
@@ -869,6 +850,25 @@ dependencies = [
  "socket2 0.6.0",
  "termcolor",
  "tokio",
+]
+
+[[package]]
+name = "feosctl"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "crossterm",
+ "env_logger",
+ "feos-proto",
+ "hyper-util",
+ "log",
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
 ]
 
 [[package]]

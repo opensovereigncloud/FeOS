@@ -1,5 +1,5 @@
 [package]
-name = "feos-cli"
+name = "feosctl"
 version.workspace = true
 edition.workspace = true
 description = "A gRPC CLI for the FeOS control plane"

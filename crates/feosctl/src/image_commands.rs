@@ -84,7 +84,7 @@ async fn pull_image(client: &mut ImageServiceClient<Channel>, image_ref: String)
     let response = client.pull_image(request).await?.into_inner();
     println!("Image pull initiated. UUID: {}", response.image_uuid);
     println!(
-        "Use 'feos-cli image watch {}' to see progress.",
+        "Use 'feosctl image watch {}' to see progress.",
         response.image_uuid
     );
     Ok(())

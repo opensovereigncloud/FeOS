@@ -132,7 +132,7 @@ async fn create_container(
         response.container_id
     );
     println!(
-        "Use 'feos-cli container list' to check its status and 'feos-cli container start {}' to run it.",
+        "Use 'feosctl container list' to check its status and 'feosctl container start {}' to run it.",
         response.container_id
     );
 
