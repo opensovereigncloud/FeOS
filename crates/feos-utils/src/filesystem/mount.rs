@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use log::debug;
+use log::{debug, error};
 use nix::mount::{mount, MsFlags};
 
+/// Mounts the virtual filesystems PID 1 needs. A failed mount is logged, not
+/// fatal: PID 1 must not die, or the kernel panics.
 pub fn mount_virtual_filesystems() {
     const NONE: Option<&'static [u8]> = None;
 
@@ -15,7 +17,7 @@ pub fn mount_virtual_filesystems() {
         MsFlags::empty(),
         NONE,
     )
-    .unwrap_or_else(|e| panic!("/proc mount failed: {e}"));
+    .unwrap_or_else(|e| error!("/proc mount failed: {e}"));
 
     debug!("Mounting /sys");
     mount(
@@ -25,7 +27,7 @@ pub fn mount_virtual_filesystems() {
         MsFlags::empty(),
         NONE,
     )
-    .unwrap_or_else(|e| panic!("/sys mount failed: {e}"));
+    .unwrap_or_else(|e| error!("/sys mount failed: {e}"));
 
     debug!("Mounting /dev");
     mount(
@@ -35,7 +37,7 @@ pub fn mount_virtual_filesystems() {
         MsFlags::empty(),
         NONE,
     )
-    .unwrap_or_else(|e| panic!("/dev mount failed: {e}"));
+    .unwrap_or_else(|e| error!("/dev mount failed: {e}"));
 
     debug!("Mounting /var/lib/feos");
     mount(
@@ -45,7 +47,7 @@ pub fn mount_virtual_filesystems() {
         MsFlags::empty(),
         NONE,
     )
-    .unwrap_or_else(|e| panic!("/var/lib/feos mount failed: {e}"));
+    .unwrap_or_else(|e| error!("/var/lib/feos mount failed: {e}"));
 
     debug!("Mounting /sys/fs/cgroup");
     mount(
@@ -55,5 +57,5 @@ pub fn mount_virtual_filesystems() {
         MsFlags::empty(),
         NONE,
     )
-    .unwrap_or_else(|e| panic!("/sys/fs/cgroup mount failed: {e}"));
+    .unwrap_or_else(|e| error!("/sys/fs/cgroup mount failed: {e}"));
 }

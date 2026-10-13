@@ -107,33 +107,48 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     info!("Main: Internal ImageService listening on Unix socket {IMAGE_SERVICE_SOCKET}");
     info!("Main: Internal TaskService listening on Unix socket {TASK_SERVICE_SOCKET}");
 
-    tokio::select! {
-        res = api_unix_socket_server => {
-            if let Err(e) = res {
-                error!("API unix socket server failed: {e}");
-            }
-        },
-        res = tcp_server => {
-            if let Err(e) = res {
-                error!("TCP server failed: {e}");
-            }
-        },
-        res = image_unix_socket_server => {
-             if let Err(e) = res {
-                error!("Image unix socket server failed: {e}");
-            }
-        },
-        res = task_unix_socket_server => {
-             if let Err(e) = res {
-                error!("Task unix socket server failed: {e}");
-            }
-        },
-        Some(RestartSignal(new_binary_path)) = restart_rx.recv() => {
-            if let Err(e) = handle_upgrade(&new_binary_path) {
-                error!("Upgrade failed: {e}");
-            }
-        }
-    };
+    tokio::pin!(
+        api_unix_socket_server,
+        tcp_server,
+        image_unix_socket_server,
+        task_unix_socket_server
+    );
 
-    Ok(())
+    // Serve until one of the servers stops. A failed upgrade leaves the
+    // running binary serving.
+    loop {
+        tokio::select! {
+            res = &mut api_unix_socket_server => {
+                if let Err(e) = res {
+                    error!("API unix socket server failed: {e}");
+                }
+                break;
+            },
+            res = &mut tcp_server => {
+                if let Err(e) = res {
+                    error!("TCP server failed: {e}");
+                }
+                break;
+            },
+            res = &mut image_unix_socket_server => {
+                if let Err(e) = res {
+                    error!("Image unix socket server failed: {e}");
+                }
+                break;
+            },
+            res = &mut task_unix_socket_server => {
+                if let Err(e) = res {
+                    error!("Task unix socket server failed: {e}");
+                }
+                break;
+            },
+            Some(RestartSignal(new_binary_path)) = restart_rx.recv() => {
+                if let Err(e) = handle_upgrade(&new_binary_path) {
+                    error!("Upgrade failed: {e}");
+                }
+            }
+        };
+    }
+
+    anyhow::bail!("a gRPC server stopped serving")
 }

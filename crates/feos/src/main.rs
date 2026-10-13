@@ -6,11 +6,11 @@ use clap::Parser;
 use feos_utils::filesystem::{get_root_fstype, move_root};
 use main_server::run_server;
 use nix::sys::prctl;
-use nix::unistd::execv;
+use nix::unistd::{execv, pause};
 use std::env;
 use std::ffi::CString;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(author, version, about, long_about = None)]
 struct ServerArgs {
     #[arg(long, hide = true)]
@@ -19,7 +19,34 @@ struct ServerArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = ServerArgs::parse();
+    let result = run().await;
+
+    if std::process::id() == 1 {
+        // PID 1 must never exit: the kernel panics when it does. Idle
+        // instead, so the console and the processes that still run stay
+        // usable.
+        if let Err(e) = &result {
+            eprintln!("[feos] {e:#}");
+        }
+        eprintln!("[feos] FeOS stopped serving; PID 1 idles to keep the kernel alive.");
+        loop {
+            pause();
+        }
+    }
+
+    result
+}
+
+async fn run() -> Result<()> {
+    // The kernel hands unknown command-line words to init. As PID 1, ignore
+    // what clap cannot parse instead of exiting.
+    let args = ServerArgs::try_parse().unwrap_or_else(|e| {
+        if std::process::id() != 1 {
+            e.exit();
+        }
+        eprintln!("[feos] Ignoring arguments: {e}");
+        ServerArgs::default()
+    });
 
     if std::process::id() == 1 {
         let root_fstype = get_root_fstype().unwrap_or_else(|e| {
