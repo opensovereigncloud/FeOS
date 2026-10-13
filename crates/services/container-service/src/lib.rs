@@ -19,8 +19,6 @@ pub mod persistence;
 pub mod runtime;
 pub mod worker;
 
-pub const DEFAULT_CONTAINER_DB_URL: &str = "sqlite:/var/lib/feos/containers.db";
-
 pub enum Command {
     CreateContainer(
         CreateContainerRequest,

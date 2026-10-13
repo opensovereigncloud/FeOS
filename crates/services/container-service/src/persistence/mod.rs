@@ -8,22 +8,16 @@ pub mod repository;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
-    #[error("A database error occurred")]
-    Database(#[from] sqlx::Error),
+    #[error("Failed to access a container record: {0}")]
+    Io(#[from] std::io::Error),
 
-    #[error("Database migration failed")]
-    Migration(#[from] sqlx::migrate::MigrateError),
+    #[error("Malformed container record: {0}")]
+    Format(#[from] serde_json::Error),
 
-    #[error("Failed to decode ContainerConfig blob")]
-    Decode(#[from] prost::DecodeError),
-
-    #[error("Failed to encode ContainerConfig blob")]
-    Encode(#[from] prost::EncodeError),
-
-    #[error("Invalid state string '{0}' in database")]
+    #[error("Invalid state string '{0}' in a container record")]
     InvalidStateString(String),
 
-    #[error("Invalid UUID '{0}' in database")]
+    #[error("Invalid UUID '{0}' in a container record")]
     InvalidUuid(String),
 }
 

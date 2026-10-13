@@ -4,7 +4,7 @@
 use anyhow::Result;
 use container_service::{
     api::ContainerApiHandler, dispatcher::Dispatcher as ContainerDispatcher,
-    Command as ContainerCommand, DEFAULT_CONTAINER_DB_URL,
+    Command as ContainerCommand,
 };
 #[cfg(feature = "host")]
 use feos_proto::vm_service::vm_service_server::VmServiceServer;
@@ -33,6 +33,7 @@ use image_service::{
 use log::warn;
 use log::{error, info};
 use nix::libc;
+#[cfg(feature = "host")]
 use std::env;
 use std::ffi::CString;
 #[cfg(feature = "host")]
@@ -40,7 +41,9 @@ use std::net::Ipv6Addr;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use tokio::fs::{self, File};
+use tokio::fs;
+#[cfg(feature = "host")]
+use tokio::fs::File;
 use tokio::sync::mpsc;
 #[cfg(feature = "host")]
 use vm_service::{
@@ -87,22 +90,8 @@ pub(crate) async fn initialize_container_service(
 ) -> Result<ContainerServiceServer<ContainerApiHandler>> {
     info!("Main: Initializing Container Service...");
 
-    let db_url = env::var("CONTAINER_DATABASE_URL").unwrap_or_else(|_| {
-        info!("Main: CONTAINER_DATABASE_URL not set, using default '{DEFAULT_CONTAINER_DB_URL}'");
-        DEFAULT_CONTAINER_DB_URL.to_string()
-    });
-    if let Some(db_path_str) = db_url.strip_prefix("sqlite:") {
-        let db_path = Path::new(db_path_str);
-        if let Some(db_dir) = db_path.parent() {
-            fs::create_dir_all(db_dir).await?;
-        }
-        if !db_path.exists() {
-            File::create(db_path).await?;
-        }
-    }
-
     let (container_tx, container_rx) = mpsc::channel::<ContainerCommand>(32);
-    let container_dispatcher = ContainerDispatcher::new(container_rx, &db_url).await?;
+    let container_dispatcher = ContainerDispatcher::new(container_rx).await?;
     tokio::spawn(async move {
         container_dispatcher.run().await;
     });

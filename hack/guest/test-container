@@ -164,6 +164,7 @@ log "port forwarding reaches a server on the container's loopback"
 ctl kube set-listeners 6443 >/dev/null
 grep -q "502 Bad Gateway" <<<"$(cexec wget -qO- http://127.0.0.1:6443/ 2>&1 || true)" \
   || fail "no 502 without a kube proxy"
+rm -f "${VSOCK}_10002"
 python3 - "${VSOCK}_10002" <<'PY' &
 import socket, sys
 server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -180,8 +181,8 @@ while True:
     conn.close()
 PY
 KUBE_PID=$!
-sleep 0.3
-out="$(cexec wget -qO- http://127.0.0.1:6443/)"
+for _ in $(seq 50); do [ -S "${VSOCK}_10002" ] && break; sleep 0.1; done
+out="$(cexec wget -qO- http://127.0.0.1:6443/ || true)"
 kill "${KUBE_PID}" 2>/dev/null || true
 [ "${out}" = "kube 6443" ] || fail "kube offloading: ${out}"
 log "kube listeners reach the host's proxy with the port in the preamble"

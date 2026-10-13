@@ -59,20 +59,16 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
 
     let db_path = temp_dir.path().join("vms.db");
     let db_url = format!("sqlite:{}", db_path.to_str().unwrap());
-    let container_db_path = temp_dir.path().join("containers.db");
-    let container_db_url = format!("sqlite:{}", container_db_path.to_str().unwrap());
 
     // SAFETY: not strictly sound: the test harness runs tests on several
     // threads, and another thread may read the environment concurrently.
     // TODO: pass the database URLs to run_server instead of the environment.
     unsafe {
         env::set_var("DATABASE_URL", &db_url);
-        env::set_var("CONTAINER_DATABASE_URL", &container_db_url);
         // FeOS runs inside this test binary; the task service needs the real one.
         env::set_var("FEOS_TASK_SERVICE_BINARY", env!("CARGO_BIN_EXE_feos"));
     }
     info!("Using temporary database for tests: {db_url}");
-    info!("Using temporary container database for tests: {container_db_url}");
 
     if let Err(e) = prctl::set_child_subreaper(true) {
         log::error!("Failed to set as child subreaper, container tests will fail: {e}");

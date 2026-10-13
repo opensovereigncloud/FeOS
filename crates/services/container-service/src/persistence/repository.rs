@@ -1,29 +1,45 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+//! Container records, one `container.json` in each container's directory.
+//!
+//! A record lives next to what it describes: deleting the container's
+//! directory deletes its record, and on a guest's data volume the record
+//! survives a reboot together with the container's writable layer, which is
+//! what adoption needs. Every write goes to a temporary file that is renamed
+//! over the record, so a reader never sees half of one.
+
 use crate::persistence::{ContainerRecord, ContainerStatus, PersistenceError};
 use feos_proto::container_service::{ContainerConfig, ContainerState};
 use log::info;
-use prost::Message;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use uuid::Uuid;
+
+const RECORD: &str = "container.json";
+const RECORD_TMP: &str = ".container.json.tmp";
 
 #[derive(Clone)]
 pub struct ContainerRepository {
-    pool: SqlitePool,
+    root: PathBuf,
+    /// Serializes read-modify-write updates of records.
+    writes: Arc<Mutex<()>>,
 }
 
-#[derive(sqlx::FromRow, Debug)]
-struct DbContainerRow {
+/// The record as it is stored.
+#[derive(Serialize, Deserialize)]
+struct StoredRecord {
     container_id: String,
     image_uuid: String,
     state: String,
     pid: Option<i64>,
-    config_blob: Vec<u8>,
-}
-
-fn parse_uuid(s: &str) -> Result<Uuid, PersistenceError> {
-    Uuid::parse_str(s).map_err(|_| PersistenceError::InvalidUuid(s.to_string()))
+    image_ref: String,
+    command: Vec<String>,
+    env: HashMap<String, String>,
 }
 
 fn string_to_container_state(s: &str) -> Result<ContainerState, PersistenceError> {
@@ -47,74 +63,93 @@ fn container_state_to_string(state: ContainerState) -> &'static str {
     }
 }
 
+impl StoredRecord {
+    fn from_record(record: &ContainerRecord) -> Self {
+        Self {
+            container_id: record.container_id.clone(),
+            image_uuid: record.image_uuid.to_string(),
+            state: container_state_to_string(record.status.state).to_string(),
+            pid: record.status.process_id,
+            image_ref: record.config.image_ref.clone(),
+            command: record.config.command.clone(),
+            env: record.config.env.clone(),
+        }
+    }
+
+    fn into_record(self) -> Result<ContainerRecord, PersistenceError> {
+        Ok(ContainerRecord {
+            image_uuid: Uuid::parse_str(&self.image_uuid)
+                .map_err(|_| PersistenceError::InvalidUuid(self.image_uuid.clone()))?,
+            status: ContainerStatus {
+                state: string_to_container_state(&self.state)?,
+                process_id: self.pid,
+            },
+            config: ContainerConfig {
+                image_ref: self.image_ref,
+                command: self.command,
+                env: self.env,
+            },
+            container_id: self.container_id,
+        })
+    }
+}
+
 impl ContainerRepository {
-    pub async fn connect(db_url: &str) -> Result<Self, PersistenceError> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(db_url)
-            .await?;
+    /// Records live in `<root>/<container ID>/container.json`.
+    pub async fn connect(root: impl Into<PathBuf>) -> Result<Self, PersistenceError> {
+        let root = root.into();
+        tokio::fs::create_dir_all(&root).await?;
+        info!("Persistence: Container records in {}", root.display());
+        Ok(Self {
+            root,
+            writes: Arc::new(Mutex::new(())),
+        })
+    }
 
-        info!("Persistence: Running container-service database migrations...");
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        info!("Persistence: Database migrations completed for container-service.");
+    fn record_path(&self, container_id: &str) -> PathBuf {
+        self.root.join(container_id).join(RECORD)
+    }
 
-        Ok(Self { pool })
+    async fn read(path: &Path) -> Result<Option<ContainerRecord>, PersistenceError> {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => serde_json::from_slice::<StoredRecord>(&bytes)?
+                .into_record()
+                .map(Some),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn write(&self, record: &ContainerRecord) -> Result<(), PersistenceError> {
+        let dir = self.root.join(&record.container_id);
+        tokio::fs::create_dir_all(&dir).await?;
+        let json = serde_json::to_vec_pretty(&StoredRecord::from_record(record))?;
+        let tmp = dir.join(RECORD_TMP);
+        tokio::fs::write(&tmp, json).await?;
+        tokio::fs::rename(&tmp, dir.join(RECORD)).await?;
+        Ok(())
     }
 
     pub async fn get_container(
         &self,
         container_id: &str,
     ) -> Result<Option<ContainerRecord>, PersistenceError> {
-        let row_opt = sqlx::query_as::<_, DbContainerRow>(
-            "SELECT container_id, image_uuid, state, pid, config_blob FROM containers WHERE container_id = ?1",
-        )
-        .bind(container_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = row_opt {
-            let config = ContainerConfig::decode(&*row.config_blob)?;
-            let state = string_to_container_state(&row.state)?;
-
-            let record = ContainerRecord {
-                container_id: row.container_id,
-                image_uuid: parse_uuid(&row.image_uuid)?,
-                status: ContainerStatus {
-                    state,
-                    process_id: row.pid,
-                },
-                config,
-            };
-            Ok(Some(record))
-        } else {
-            Ok(None)
-        }
+        Self::read(&self.record_path(container_id)).await
     }
 
     pub async fn list_all_containers(&self) -> Result<Vec<ContainerRecord>, PersistenceError> {
-        let rows = sqlx::query_as::<_, DbContainerRow>(
-            "SELECT container_id, image_uuid, state, pid, config_blob FROM containers",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut records = Vec::with_capacity(rows.len());
-        for row in rows {
-            let config = ContainerConfig::decode(&*row.config_blob)?;
-            let state = string_to_container_state(&row.state)?;
-
-            let record = ContainerRecord {
-                container_id: row.container_id,
-                image_uuid: parse_uuid(&row.image_uuid)?,
-                status: ContainerStatus {
-                    state,
-                    process_id: row.pid,
-                },
-                config,
-            };
-            records.push(record);
+        let mut records = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&self.root).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(records),
+            Err(e) => return Err(e.into()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            if let Some(record) = Self::read(&entry.path().join(RECORD)).await? {
+                records.push(record);
+            }
         }
-
+        records.sort_by(|a, b| a.container_id.cmp(&b.container_id));
         Ok(records)
     }
 
@@ -122,26 +157,8 @@ impl ContainerRepository {
         &self,
         container: &ContainerRecord,
     ) -> Result<(), PersistenceError> {
-        let mut config_blob = Vec::new();
-        container.config.encode(&mut config_blob)?;
-
-        let state_str = container_state_to_string(container.status.state);
-
-        sqlx::query(
-            r#"
-            INSERT OR REPLACE INTO containers (container_id, image_uuid, state, pid, config_blob)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            "#,
-        )
-        .bind(&container.container_id)
-        .bind(container.image_uuid.to_string())
-        .bind(state_str)
-        .bind(container.status.process_id)
-        .bind(config_blob)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        let _guard = self.writes.lock().await;
+        self.write(container).await
     }
 
     pub async fn update_container_state(
@@ -149,21 +166,13 @@ impl ContainerRepository {
         container_id: &str,
         new_state: ContainerState,
     ) -> Result<bool, PersistenceError> {
-        let state_str = container_state_to_string(new_state);
-
-        let result = sqlx::query(
-            r#"
-            UPDATE containers
-            SET state = ?1
-            WHERE container_id = ?2
-            "#,
-        )
-        .bind(state_str)
-        .bind(container_id)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected() > 0)
+        let _guard = self.writes.lock().await;
+        let Some(mut record) = self.get_container(container_id).await? else {
+            return Ok(false);
+        };
+        record.status.state = new_state;
+        self.write(&record).await?;
+        Ok(true)
     }
 
     pub async fn update_container_pid(
@@ -171,26 +180,92 @@ impl ContainerRepository {
         container_id: &str,
         pid: i64,
     ) -> Result<(), PersistenceError> {
-        sqlx::query("UPDATE containers SET pid = ?1 WHERE container_id = ?2")
-            .bind(pid)
-            .bind(container_id)
-            .execute(&self.pool)
-            .await?;
+        let _guard = self.writes.lock().await;
+        if let Some(mut record) = self.get_container(container_id).await? {
+            record.status.process_id = Some(pid);
+            self.write(&record).await?;
+        }
         Ok(())
     }
 
+    /// Removes the record; the container's directory is its owner's to
+    /// remove.
     pub async fn delete_container(&self, container_id: &str) -> Result<(), PersistenceError> {
-        let result = sqlx::query("DELETE FROM containers WHERE container_id = ?1")
-            .bind(container_id)
-            .execute(&self.pool)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            log::warn!(
-                "Attempted to delete container {container_id} from DB, but no record was found."
-            );
+        let _guard = self.writes.lock().await;
+        match tokio::fs::remove_file(self.record_path(container_id)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                log::warn!(
+                    "Attempted to delete the record of container {container_id}, but there was none."
+                );
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
         }
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(id: &str) -> ContainerRecord {
+        ContainerRecord {
+            container_id: id.to_string(),
+            image_uuid: Uuid::new_v4(),
+            status: ContainerStatus {
+                state: ContainerState::PullingImage,
+                process_id: None,
+            },
+            config: ContainerConfig {
+                image_ref: "docker.io/library/busybox:1.36".to_string(),
+                command: vec!["sleep".to_string(), "1".to_string()],
+                env: HashMap::from([("A".to_string(), "1".to_string())]),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn records_round_trip_and_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ContainerRepository::connect(dir.path()).await.unwrap();
+        let main = record("main");
+        repo.save_container(&main).await.unwrap();
+        repo.save_container(&record("other")).await.unwrap();
+
+        repo.update_container_pid("main", 42).await.unwrap();
+        assert!(repo
+            .update_container_state("main", ContainerState::Running)
+            .await
+            .unwrap());
+        let got = repo.get_container("main").await.unwrap().unwrap();
+        assert_eq!(got.image_uuid, main.image_uuid);
+        assert_eq!(got.status.state, ContainerState::Running);
+        assert_eq!(got.status.process_id, Some(42));
+        assert_eq!(got.config, main.config);
+
+        let ids: Vec<_> = repo
+            .list_all_containers()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.container_id)
+            .collect();
+        assert_eq!(ids, ["main", "other"]);
+
+        repo.delete_container("main").await.unwrap();
+        assert!(repo.get_container("main").await.unwrap().is_none());
+        assert!(!repo
+            .update_container_state("main", ContainerState::Stopped)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn directories_without_a_record_are_not_containers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("stray")).unwrap();
+        let repo = ContainerRepository::connect(dir.path()).await.unwrap();
+        assert!(repo.list_all_containers().await.unwrap().is_empty());
     }
 }

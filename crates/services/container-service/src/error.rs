@@ -35,12 +35,7 @@ impl From<ContainerServiceError> for Status {
     fn from(err: ContainerServiceError) -> Self {
         log::error!("ContainerServiceError: {err}");
         match err {
-            ContainerServiceError::Persistence(PersistenceError::Database(ref e))
-                if matches!(e, sqlx::Error::RowNotFound) =>
-            {
-                Status::not_found("Record not found in database")
-            }
-            ContainerServiceError::Persistence(_) => Status::internal("A database error occurred"),
+            ContainerServiceError::Persistence(e) => Status::internal(e.to_string()),
             ContainerServiceError::ImageService(msg) => {
                 Status::unavailable(format!("Image service unavailable: {msg}"))
             }

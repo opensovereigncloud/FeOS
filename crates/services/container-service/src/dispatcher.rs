@@ -8,6 +8,7 @@ use crate::{
     worker, Command,
 };
 use feos_proto::container_service::{ContainerInfo, ContainerState, ListContainersResponse};
+use feos_utils::filesystem::CONTAINERS_DIR;
 use log::{info, warn};
 use std::{path::Path, sync::Arc};
 use task_service::RUNTIME_STATE_DIR;
@@ -45,13 +46,8 @@ pub(crate) fn runtime_knows(id: &str) -> bool {
 }
 
 impl Dispatcher {
-    pub async fn new(
-        rx: mpsc::Receiver<Command>,
-        db_url: &str,
-    ) -> Result<Self, ContainerServiceError> {
-        info!("Dispatcher: Connecting to persistence layer at {db_url}...");
-        let repository = ContainerRepository::connect(db_url).await?;
-        info!("Dispatcher: Persistence layer connected successfully.");
+    pub async fn new(rx: mpsc::Receiver<Command>) -> Result<Self, ContainerServiceError> {
+        let repository = ContainerRepository::connect(CONTAINERS_DIR).await?;
         Self::reconcile(&repository).await;
         let adapter = Arc::new(ContainerAdapter::new());
         Ok(Self {
