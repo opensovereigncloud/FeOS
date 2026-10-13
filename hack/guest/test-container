@@ -1,0 +1,141 @@
+#!/bin/bash
+# Boot the FeOS guest with a network and a data volume, push the network
+# configuration, pull an image in the guest, and run a container: exec,
+# resolvers, toolbox, exit codes. Then reboot and adopt the container, and
+# check that its writable layer survived.
+#
+#   hack/guest/test-container [image]
+#
+# Needs sudo for the host network (a bridge, a TAP device and NAT, all
+# removed on exit), /dev/kvm, Firecracker (make firecracker), the guest
+# (make guest) and internet access for the pull.
+set -euo pipefail
+export PATH="$PATH:/sbin:/usr/sbin"
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+GUEST_DIR="${REPO_ROOT}/target/guest"
+RUN_DIR="${GUEST_DIR}/run-container"
+FC="${FC:-${REPO_ROOT}/target/firecracker/firecracker}"
+KERNEL="${KERNEL:-${GUEST_DIR}/vmlinuz}"
+INITRD="${INITRD:-${GUEST_DIR}/initramfs.cpio.zst}"
+VSOCK="${RUN_DIR}/v.sock"
+DATA_IMG="${RUN_DIR}/data.img"
+FEOSCTL="${REPO_ROOT}/target/debug/feosctl"
+IMAGE="${1:-docker.io/library/busybox:1.36}"
+TIMEOUT=60
+
+BRIDGE=feos-br0
+TAP=feos-tap0
+HOST_IP=192.168.102.1
+GUEST_IP=192.168.102.10
+SUBNET=192.168.102.0/24
+DNS=1.1.1.1
+
+log() { printf '[test-container] %s\n' "$*"; }
+fail() { log "FAIL: $*"; tail -40 "${SERIAL_LOG:-/dev/null}" >&2 || true; exit 1; }
+
+for f in "${FC}" "${KERNEL}" "${INITRD}"; do
+  [ -e "$f" ] || { log "missing $f"; exit 1; }
+done
+log "building feosctl"
+cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" -p feosctl
+
+mkdir -p "${RUN_DIR}"
+rm -f "${DATA_IMG}"
+truncate -s 1G "${DATA_IMG}"
+mkfs.ext4 -q -F "${DATA_IMG}"
+
+egress_if() { ip route show default | awk '/default/ {print $5; exit}'; }
+EGRESS="$(egress_if)"
+cleanup_net() {
+  sudo iptables -t nat -D POSTROUTING -s "${SUBNET}" -o "${EGRESS}" -j MASQUERADE 2>/dev/null || true
+  sudo ip link del "${TAP}" 2>/dev/null || true
+  sudo ip link del "${BRIDGE}" 2>/dev/null || true
+}
+FC_PID=""
+stop_vm() {
+  [ -n "${FC_PID}" ] || return 0
+  ${SUDO} kill "${FC_PID}" 2>/dev/null || true
+  wait "${FC_PID}" 2>/dev/null || true
+  FC_PID=""
+}
+SUDO=""
+[ -w /dev/kvm ] || SUDO="sudo"
+trap 'stop_vm; cleanup_net' EXIT
+
+cleanup_net
+log "host network: ${BRIDGE} + ${TAP}, NAT via ${EGRESS}"
+sudo ip link add name "${BRIDGE}" type bridge
+sudo ip addr add "${HOST_IP}/24" dev "${BRIDGE}"
+sudo ip link set "${BRIDGE}" up
+sudo ip tuntap add dev "${TAP}" mode tap
+sudo ip link set "${TAP}" master "${BRIDGE}"
+sudo ip link set "${TAP}" up
+sudo sysctl -qw net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -s "${SUBNET}" -o "${EGRESS}" -j MASQUERADE
+
+cat > "${RUN_DIR}/config.json" <<JSON
+{
+  "boot-source": {
+    "kernel_image_path": "${KERNEL}",
+    "initrd_path": "${INITRD}",
+    "boot_args": "console=ttyS0 reboot=k panic=1 quiet"
+  },
+  "drives": [{"drive_id": "data", "path_on_host": "${DATA_IMG}", "is_root_device": false, "is_read_only": false}],
+  "network-interfaces": [{"iface_id": "eth0", "guest_mac": "06:00:AC:CB:02:0A", "host_dev_name": "${TAP}"}],
+  "machine-config": {"vcpu_count": 2, "mem_size_mib": 512},
+  "vsock": {"guest_cid": 3, "uds_path": "${VSOCK}"}
+}
+JSON
+
+boot() {
+  SERIAL_LOG="${RUN_DIR}/serial-$1.log"
+  rm -f "${VSOCK}" "${SERIAL_LOG}"
+  ${SUDO} "${FC}" --no-api --config-file "${RUN_DIR}/config.json" >"${SERIAL_LOG}" 2>&1 &
+  FC_PID=$!
+  local end=$((SECONDS + TIMEOUT))
+  until grep -q "listening on vsock port" "${SERIAL_LOG}" 2>/dev/null; do
+    [ ${SECONDS} -lt ${end} ] || fail "API not up within ${TIMEOUT}s"
+    kill -0 "${FC_PID}" 2>/dev/null || fail "Firecracker exited"
+    sleep 0.2
+  done
+  [ -z "${SUDO}" ] || ${SUDO} chmod 0666 "${VSOCK}"
+  ctl host set-network --interface eth0 --ipv4 "${GUEST_IP}/24" --gateway "${HOST_IP}" \
+    --dns "${DNS}" --hostname feos-test >/dev/null
+  log "booted ($1), network pushed"
+}
+
+ctl() { "${FEOSCTL}" "$1" --address "vsock:${VSOCK}" "${@:2}"; }
+cexec() { ctl container exec main -- "$@"; }
+
+boot first
+log "creating container main from ${IMAGE}"
+ctl container create --image-ref "${IMAGE}" --id main --cmd "sleep 3600"
+ctl container start main
+ctl container info main | grep -q "State: Running" || fail "container not running"
+
+out="$(cexec echo hello)"
+[ "${out}" = "hello" ] || fail "exec echo: ${out}"
+grep -q "nameserver ${DNS}" <<<"$(cexec cat /etc/resolv.conf)" || fail "resolvers not linked"
+cexec ls /feos-tools/bin/coreutils >/dev/null || fail "toolbox missing"
+set +e
+cexec sh -c 'echo to-stderr >&2; exit 3' 2>/dev/null
+code=$?
+set -e
+[ "${code}" = 3 ] || fail "exit code ${code}, expected 3"
+cexec sh -c 'echo kept > /persist'
+log "exec, resolvers, toolbox and exit codes work"
+
+# A host freezes the data volume before it stops a guest it wants to adopt
+# later; freezing writes back what is in the guest's page cache.
+ctl host freeze >/dev/null
+stop_vm
+boot second
+ctl container create --id main --adopt >/dev/null || fail "adopt"
+ctl container start main
+[ "$(cexec cat /persist)" = "kept" ] || fail "writable layer lost across the reboot"
+log "adopted the container after a reboot; its writable layer survived"
+
+ctl container delete main
+ctl container list | grep -q main && fail "container still listed after delete"
+log "PASS"
