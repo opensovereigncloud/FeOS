@@ -3,11 +3,12 @@
 
 use crate::error::VmServiceError;
 use feos_proto::vm_service::{
-    CreateVmRequest, CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest,
-    ListVmsRequest, ListVmsResponse, PauseVmRequest, PauseVmResponse, PingVmRequest,
-    PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
-    StartVmRequest, StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse,
-    StreamVmEventsRequest, VmEvent, VmInfo,
+    CreateVmRequest, CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetBalloonRequest,
+    GetBalloonResponse, GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest,
+    PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse,
+    ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse, StreamVmConsoleRequest,
+    StreamVmConsoleResponse, StreamVmEventsRequest, UpdateBalloonRequest, UpdateBalloonResponse,
+    VmEvent, VmInfo,
 };
 use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
@@ -85,6 +86,14 @@ pub enum Command {
         ResumeVmRequest,
         oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     ),
+    UpdateBalloon(
+        UpdateBalloonRequest,
+        oneshot::Sender<Result<UpdateBalloonResponse, VmServiceError>>,
+    ),
+    GetBalloon(
+        GetBalloonRequest,
+        oneshot::Sender<Result<GetBalloonResponse, VmServiceError>>,
+    ),
 }
 
 impl std::fmt::Debug for Command {
@@ -103,6 +112,8 @@ impl std::fmt::Debug for Command {
             Command::ShutdownVm(req, _) => f.debug_tuple("ShutdownVm").field(req).finish(),
             Command::PauseVm(req, _) => f.debug_tuple("PauseVm").field(req).finish(),
             Command::ResumeVm(req, _) => f.debug_tuple("ResumeVm").field(req).finish(),
+            Command::UpdateBalloon(req, _) => f.debug_tuple("UpdateBalloon").field(req).finish(),
+            Command::GetBalloon(req, _) => f.debug_tuple("GetBalloon").field(req).finish(),
         }
     }
 }

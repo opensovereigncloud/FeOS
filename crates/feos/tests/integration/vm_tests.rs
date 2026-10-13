@@ -11,10 +11,11 @@ use feos_proto::host_service::{
     GetVersionInfoRequest, PingRequest,
 };
 use feos_proto::vm_service::{
-    stream_vm_console_request as console_input, AttachConsoleMessage, CpuConfig, CreateVmRequest,
-    DeleteVmRequest, DiskConfig, GetVmRequest, GuestNetworkConfig, MemoryConfig, NetConfig,
-    PauseVmRequest, PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest,
-    StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig, VmConfig, VmState,
+    stream_vm_console_request as console_input, AttachConsoleMessage, BalloonConfig, CpuConfig,
+    CreateVmRequest, DeleteVmRequest, DiskConfig, GetBalloonRequest, GetVmRequest,
+    GuestNetworkConfig, MemoryConfig, NetConfig, PauseVmRequest, PingVmRequest, ResumeVmRequest,
+    ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig,
+    UpdateBalloonRequest, VmConfig, VmState,
 };
 use feos_utils::vsock::API_PORT;
 use log::info;
@@ -46,6 +47,12 @@ async fn test_create_and_start_vm() -> Result<()> {
         memory: Some(MemoryConfig {
             size_mib: 512,
             hugepages: false,
+            balloon: Some(BalloonConfig {
+                amount_mib: 0,
+                deflate_on_oom: true,
+                free_page_reporting: true,
+                stats_interval_s: 1,
+            }),
         }),
         image_ref,
         disks: vec![DiskConfig {
@@ -158,6 +165,35 @@ async fn test_create_and_start_vm() -> Result<()> {
         "The guest's clock is {skew:?} off"
     );
     info!("The guest got its network and its clock, {skew:?} off");
+
+    for amount_mib in [64, 0] {
+        info!("Setting the balloon to {amount_mib} MiB");
+        vm_client
+            .update_balloon(UpdateBalloonRequest {
+                vm_id: vm_id.clone(),
+                amount_mib,
+            })
+            .await?;
+        let balloon = timeout(Duration::from_secs(15), async {
+            loop {
+                let balloon = vm_client
+                    .get_balloon(GetBalloonRequest {
+                        vm_id: vm_id.clone(),
+                    })
+                    .await?
+                    .into_inner();
+                if balloon.actual_mib == amount_mib {
+                    return anyhow::Ok(balloon);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("Timed out waiting for the balloon")?;
+        assert_eq!(balloon.target_mib, amount_mib);
+        let stats = balloon.stats.context("The balloon has statistics")?;
+        assert!(stats.total_memory > 0);
+    }
 
     info!("Sending ShutdownVm request for vm_id: {vm_id}");
     let shutdown_req = ShutdownVmRequest {
@@ -383,6 +419,7 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
         memory: Some(MemoryConfig {
             size_mib: 256,
             hugepages: false,
+            balloon: None,
         }),
         image_ref,
         disks: vec![],

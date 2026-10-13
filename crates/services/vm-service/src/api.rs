@@ -4,10 +4,11 @@
 use crate::Command;
 use feos_proto::vm_service::{
     vm_service_server::VmService, CreateVmRequest, CreateVmResponse, DeleteVmRequest,
-    DeleteVmResponse, GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest,
-    PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse,
-    ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse, StreamVmConsoleRequest,
-    StreamVmConsoleResponse, StreamVmEventsRequest, VmEvent, VmInfo,
+    DeleteVmResponse, GetBalloonRequest, GetBalloonResponse, GetVmRequest, ListVmsRequest,
+    ListVmsResponse, PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse,
+    ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
+    StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest,
+    UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo,
 };
 use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
@@ -155,6 +156,27 @@ impl VmService for VmApiHandler {
         info!("VmApi: Received ResumeVm request.");
         dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
             Command::ResumeVm(request.into_inner(), resp_tx)
+        })
+        .await
+    }
+
+    async fn update_balloon(
+        &self,
+        request: Request<UpdateBalloonRequest>,
+    ) -> Result<Response<UpdateBalloonResponse>, Status> {
+        info!("VmApi: Received UpdateBalloon request.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::UpdateBalloon(request.into_inner(), resp_tx)
+        })
+        .await
+    }
+
+    async fn get_balloon(
+        &self,
+        request: Request<GetBalloonRequest>,
+    ) -> Result<Response<GetBalloonResponse>, Status> {
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::GetBalloon(request.into_inner(), resp_tx)
         })
         .await
     }

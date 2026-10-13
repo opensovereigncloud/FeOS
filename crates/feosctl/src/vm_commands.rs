@@ -7,11 +7,11 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::tty::IsTty;
 use feos_proto::vm_service::{
     stream_vm_console_request as console_input, vm_service_client::VmServiceClient,
-    AttachConsoleMessage, ConsoleData, CpuConfig, CreateVmRequest, DeleteVmRequest, DiskConfig,
-    GetVmRequest, GuestAttachedEvent, GuestNetworkConfig, ListVmsRequest, MemoryConfig, NetConfig,
-    PauseVmRequest, PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest,
-    StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig, VmConfig, VmState,
-    VmStateChangedEvent,
+    AttachConsoleMessage, BalloonConfig, ConsoleData, CpuConfig, CreateVmRequest, DeleteVmRequest,
+    DiskConfig, GetBalloonRequest, GetVmRequest, GuestAttachedEvent, GuestNetworkConfig,
+    ListVmsRequest, MemoryConfig, NetConfig, PauseVmRequest, PingVmRequest, ResumeVmRequest,
+    ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig,
+    UpdateBalloonRequest, VmConfig, VmState, VmStateChangedEvent,
 };
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -77,6 +77,14 @@ pub enum VmCommand {
     },
     /// Create and start a virtual machine in one operation
     CreateAndStart(CreateVmOptions),
+    /// Show the balloon of a virtual machine, or set its target size
+    Balloon {
+        #[arg(required = true, help = "VM identifier")]
+        vm_id: String,
+
+        #[arg(long, value_name = "MIB", help = "Set the balloon's target size")]
+        set: Option<u32>,
+    },
     /// Watch virtual machine state change events
     Events {
         #[arg(
@@ -121,6 +129,29 @@ pub struct CreateVmOptions {
 
     #[arg(
         long,
+        value_name = "MIB",
+        help = "Add a balloon that takes this much memory at boot; it deflates when the guest runs out"
+    )]
+    balloon: Option<u32>,
+
+    #[arg(
+        long,
+        requires = "balloon",
+        help = "The guest reports freed memory to the host through the balloon"
+    )]
+    free_page_reporting: bool,
+
+    #[arg(
+        long,
+        requires = "balloon",
+        value_name = "SECONDS",
+        default_value_t = 0,
+        help = "Interval of the balloon's memory statistics; 0 disables them"
+    )]
+    balloon_stats: u32,
+
+    #[arg(
+        long,
         requires = "guest_gateway",
         help = "FeOS guest: address with prefix length, e.g. 10.200.0.2/16"
     )]
@@ -161,6 +192,7 @@ pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
         VmCommand::Resume { vm_id } => resume_vm(&mut client, vm_id).await?,
         VmCommand::Delete { vm_id } => delete_vm(&mut client, vm_id).await?,
         VmCommand::CreateAndStart(opts) => create_and_start_vm(&mut client, opts).await?,
+        VmCommand::Balloon { vm_id, set } => balloon(&mut client, vm_id, set).await?,
         VmCommand::Events { vm_id } => watch_events(&mut client, vm_id).await?,
         VmCommand::Console { vm_id } => console_vm(&mut client, vm_id).await?,
     }
@@ -200,6 +232,12 @@ fn create_vm_request(opts: CreateVmOptions) -> CreateVmRequest {
             memory: Some(MemoryConfig {
                 size_mib: opts.memory,
                 hugepages: opts.hugepages,
+                balloon: opts.balloon.map(|amount_mib| BalloonConfig {
+                    amount_mib,
+                    deflate_on_oom: true,
+                    free_page_reporting: opts.free_page_reporting,
+                    stats_interval_s: opts.balloon_stats,
+                }),
             }),
             image_ref: opts.image_ref,
             disks,
@@ -474,6 +512,44 @@ async fn delete_vm(client: &mut VmServiceClient<Channel>, vm_id: String) -> Resu
     };
     client.delete_vm(request).await?.into_inner();
     println!("Successfully deleted VM: {vm_id}");
+    Ok(())
+}
+
+async fn balloon(
+    client: &mut VmServiceClient<Channel>,
+    vm_id: String,
+    set: Option<u32>,
+) -> Result<()> {
+    if let Some(amount_mib) = set {
+        client
+            .update_balloon(UpdateBalloonRequest {
+                vm_id: vm_id.clone(),
+                amount_mib,
+            })
+            .await?;
+        println!("Balloon target of VM {vm_id} set to {amount_mib} MiB");
+        return Ok(());
+    }
+    let balloon = client
+        .get_balloon(GetBalloonRequest { vm_id })
+        .await?
+        .into_inner();
+    println!("Target: {} MiB", balloon.target_mib);
+    let Some(stats) = balloon.stats else {
+        println!("No statistics: the balloon was created without them.");
+        return Ok(());
+    };
+    let mib = |bytes: u64| bytes >> 20;
+    println!("Actual: {} MiB", balloon.actual_mib);
+    println!("Guest memory:");
+    println!("  Total:     {} MiB", mib(stats.total_memory));
+    println!("  Free:      {} MiB", mib(stats.free_memory));
+    println!("  Available: {} MiB", mib(stats.available_memory));
+    println!("  Caches:    {} MiB", mib(stats.disk_caches));
+    println!(
+        "  Faults:    {} major, {} minor; OOM kills: {}",
+        stats.major_faults, stats.minor_faults, stats.oom_kill
+    );
     Ok(())
 }
 

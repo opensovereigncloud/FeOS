@@ -12,11 +12,11 @@ use feos_proto::{
     image_service::{image_service_client::ImageServiceClient, PullImageRequest},
     vm_service::{
         stream_vm_console_request as console_input, AttachConsoleMessage, CreateVmRequest,
-        CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest, ListVmsRequest,
-        ListVmsResponse, PauseVmRequest, PauseVmResponse, ResumeVmRequest, ResumeVmResponse,
-        ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
-        StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest, VmEvent, VmInfo,
-        VmState, VmStateChangedEvent,
+        CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetBalloonRequest, GetBalloonResponse,
+        GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest, PauseVmResponse,
+        ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
+        StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest,
+        UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo, VmState, VmStateChangedEvent,
     },
 };
 use hyper_util::rt::TokioIo;
@@ -661,6 +661,63 @@ pub(crate) async fn handle_resume_vm_command(
         event_bus_tx,
         guests,
     ));
+}
+
+/// Checks that the VM is running or paused and has a balloon.
+async fn check_balloon_vm(repository: &VmRepository, vm_id: &str) -> Result<(), VmServiceError> {
+    let (_vm_id, record) = parse_vm_id_and_get_record(vm_id, repository).await?;
+    let state = record.status.state;
+    if !matches!(state, VmState::Running | VmState::Paused) {
+        return Err(VmServiceError::InvalidState(format!(
+            "Cannot reach the balloon of a VM in {state:?} state. Must be in Running or Paused."
+        )));
+    }
+    if record
+        .config
+        .memory
+        .and_then(|memory| memory.balloon)
+        .is_none()
+    {
+        return Err(VmServiceError::InvalidState(
+            "The VM has no balloon.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn handle_update_balloon_command(
+    repository: &VmRepository,
+    req: UpdateBalloonRequest,
+    responder: oneshot::Sender<Result<UpdateBalloonResponse, VmServiceError>>,
+    hypervisor: Arc<dyn Hypervisor>,
+) {
+    if let Err(e) = check_balloon_vm(repository, &req.vm_id).await {
+        let _ = responder.send(Err(e));
+        return;
+    }
+    tokio::spawn(async move {
+        let result = hypervisor
+            .update_balloon(&req.vm_id, req.amount_mib)
+            .await
+            .map(|()| UpdateBalloonResponse {});
+        let _ = responder.send(result.map_err(Into::into));
+    });
+}
+
+pub(crate) async fn handle_get_balloon_command(
+    repository: &VmRepository,
+    req: GetBalloonRequest,
+    responder: oneshot::Sender<Result<GetBalloonResponse, VmServiceError>>,
+    hypervisor: Arc<dyn Hypervisor>,
+) {
+    if let Err(e) = check_balloon_vm(repository, &req.vm_id).await {
+        let _ = responder.send(Err(e));
+        return;
+    }
+    tokio::spawn(async move {
+        let result = hypervisor.get_balloon(&req.vm_id).await;
+        let _ = responder.send(result.map_err(Into::into));
+    });
 }
 
 pub(crate) async fn check_and_cleanup_vms(

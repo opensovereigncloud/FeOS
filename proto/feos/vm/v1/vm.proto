@@ -39,6 +39,11 @@ service VMService {
   rpc PauseVm(PauseVmRequest) returns (PauseVmResponse);
   // Resumes a paused Virtual Machine.
   rpc ResumeVm(ResumeVmRequest) returns (ResumeVmResponse);
+  // Sets the target size of the balloon of a running or paused VM. The
+  // guest inflates or deflates it on its own time.
+  rpc UpdateBalloon(UpdateBalloonRequest) returns (UpdateBalloonResponse);
+  // Reports the balloon's size and, if it has statistics, the guest's memory.
+  rpc GetBalloon(GetBalloonRequest) returns (GetBalloonResponse);
 }
 
 // Request stream from client to server for StreamVmConsole
@@ -158,6 +163,22 @@ message CpuConfig {
 message MemoryConfig {
   uint64 size_mib = 1; // Memory size in Megabytes (MiB).
   bool hugepages = 2;
+  // A virtio balloon, through which the guest gives memory back to the
+  // host. Firecracker adds it at boot only.
+  BalloonConfig balloon = 3;
+}
+
+message BalloonConfig {
+  // How much memory the balloon takes from the guest at boot.
+  uint32 amount_mib = 1;
+  // Whether the balloon deflates when the guest runs out of memory.
+  bool deflate_on_oom = 2;
+  // The guest reports the memory it frees to the host, which drops it: the
+  // VMM shrinks, and so does a snapshot of the VM.
+  bool free_page_reporting = 3;
+  // Seconds between updates of the guest's memory statistics; 0 disables
+  // them. Statistics cannot be enabled after boot.
+  uint32 stats_interval_s = 4;
 }
 
 message DiskConfig {
@@ -268,6 +289,37 @@ message PauseVmRequest {
 
 message ResumeVmRequest {
   string vm_id = 1;
+}
+
+message UpdateBalloonRequest {
+  string vm_id = 1;
+  uint32 amount_mib = 2;
+}
+
+message UpdateBalloonResponse {}
+
+message GetBalloonRequest {
+  string vm_id = 1;
+}
+
+message GetBalloonResponse {
+  uint32 target_mib = 1;
+  // How much the balloon holds; set only with statistics.
+  uint32 actual_mib = 2;
+  // The guest's memory, as of its last statistics update; unset without
+  // statistics.
+  BalloonStats stats = 3;
+}
+
+// Sizes in bytes.
+message BalloonStats {
+  uint64 total_memory = 1;
+  uint64 free_memory = 2;
+  uint64 available_memory = 3;
+  uint64 disk_caches = 4;
+  uint64 major_faults = 5;
+  uint64 minor_faults = 6;
+  uint64 oom_kill = 7;
 }
 
 message StartVmResponse {}

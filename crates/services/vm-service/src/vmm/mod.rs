@@ -3,9 +3,10 @@
 
 use crate::VmEventWrapper;
 use feos_proto::vm_service::{
-    CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GuestNetworkConfig, PauseVmRequest,
-    PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse,
-    ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmEvent, VmStateChangedEvent,
+    CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetBalloonResponse, GuestNetworkConfig,
+    PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
+    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmEvent,
+    VmStateChangedEvent,
 };
 use prost::Message;
 use prost_types::Any;
@@ -98,6 +99,9 @@ pub trait Hypervisor: Send + Sync {
     async fn shutdown_vm(&self, req: ShutdownVmRequest) -> Result<ShutdownVmResponse, VmmError>;
     async fn pause_vm(&self, req: PauseVmRequest) -> Result<PauseVmResponse, VmmError>;
     async fn resume_vm(&self, req: ResumeVmRequest) -> Result<ResumeVmResponse, VmmError>;
+    /// Sets the balloon's target size.
+    async fn update_balloon(&self, vm_id: &str, amount_mib: u32) -> Result<(), VmmError>;
+    async fn get_balloon(&self, vm_id: &str) -> Result<GetBalloonResponse, VmmError>;
 }
 
 /// Checks what a VMM cannot check before it boots the VM.

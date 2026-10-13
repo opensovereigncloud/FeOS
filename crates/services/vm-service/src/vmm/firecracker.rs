@@ -19,9 +19,10 @@
 use super::{fc_api, Hypervisor, VmmError};
 use crate::{vm_dir, vsock_path, VmEventWrapper, IMAGE_DIR};
 use feos_proto::vm_service::{
-    CreateVmRequest, DeleteVmRequest, DeleteVmResponse, PauseVmRequest, PauseVmResponse,
-    PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest,
-    ShutdownVmResponse, StartVmRequest, VmConfig, VmState, VmStateChangedEvent,
+    BalloonStats, CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetBalloonResponse,
+    PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
+    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmState,
+    VmStateChangedEvent,
 };
 use log::{info, warn};
 use nix::sys::signal::{kill, Signal};
@@ -250,13 +251,22 @@ fn firecracker_config(vm_id: &str, config: &VmConfig, image: &Path) -> Result<Va
         machine["huge_pages"] = json!("2M");
     }
 
-    Ok(json!({
+    let mut fc = json!({
         "boot-source": boot_source,
         "drives": drives,
         "network-interfaces": interfaces,
         "machine-config": machine,
         "vsock": {"guest_cid": GUEST_CID, "uds_path": vsock_path(vm_id)},
-    }))
+    });
+    if let Some(balloon) = config.memory.and_then(|memory| memory.balloon) {
+        fc["balloon"] = json!({
+            "amount_mib": balloon.amount_mib,
+            "deflate_on_oom": balloon.deflate_on_oom,
+            "free_page_reporting": balloon.free_page_reporting,
+            "stats_polling_interval_s": balloon.stats_interval_s,
+        });
+    }
+    Ok(fc)
 }
 
 fn internal(what: &str) -> impl FnOnce(io::Error) -> VmmError + '_ {
@@ -614,12 +624,48 @@ impl Hypervisor for FirecrackerAdapter {
         fc_api::request(&api_socket(&req.vm_id), "PATCH", "/vm", Some(&body)).await?;
         Ok(ResumeVmResponse {})
     }
+
+    async fn update_balloon(&self, vm_id: &str, amount_mib: u32) -> Result<(), VmmError> {
+        let body = json!({"amount_mib": amount_mib});
+        fc_api::request(&api_socket(vm_id), "PATCH", "/balloon", Some(&body)).await?;
+        Ok(())
+    }
+
+    async fn get_balloon(&self, vm_id: &str) -> Result<GetBalloonResponse, VmmError> {
+        let api = api_socket(vm_id);
+        // Only the statistics know how much the balloon holds.
+        if let Ok(Some(stats)) = fc_api::request(&api, "GET", "/balloon/statistics", None).await {
+            let field = |name: &str| stats[name].as_u64().unwrap_or(0);
+            return Ok(GetBalloonResponse {
+                target_mib: field("target_mib") as u32,
+                actual_mib: field("actual_mib") as u32,
+                stats: Some(BalloonStats {
+                    total_memory: field("total_memory"),
+                    free_memory: field("free_memory"),
+                    available_memory: field("available_memory"),
+                    disk_caches: field("disk_caches"),
+                    major_faults: field("major_faults"),
+                    minor_faults: field("minor_faults"),
+                    oom_kill: field("oom_kill"),
+                }),
+            });
+        }
+        let balloon = fc_api::request(&api, "GET", "/balloon", None)
+            .await?
+            .unwrap_or_default();
+        Ok(GetBalloonResponse {
+            target_mib: balloon["amount_mib"].as_u64().unwrap_or(0) as u32,
+            ..Default::default()
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feos_proto::vm_service::{CpuConfig, DiskConfig, MemoryConfig, NetConfig, TapConfig};
+    use feos_proto::vm_service::{
+        BalloonConfig, CpuConfig, DiskConfig, MemoryConfig, NetConfig, TapConfig,
+    };
 
     const VM_ID: &str = "6f2c1e8e-6c1f-4e6e-9a51-0d1c5b1a2f3e";
 
@@ -667,6 +713,7 @@ mod tests {
             memory: Some(MemoryConfig {
                 size_mib: 1024,
                 hugepages: true,
+                balloon: None,
             }),
             disks: vec![DiskConfig {
                 path: "/data.img".to_string(),
@@ -697,6 +744,31 @@ mod tests {
             fc["machine-config"],
             json!({"vcpu_count": 2, "mem_size_mib": 1024, "huge_pages": "2M"})
         );
+    }
+
+    #[test]
+    fn a_balloon_is_configured_at_boot() {
+        let image = image(&["vmlinuz"]);
+        let config = VmConfig {
+            memory: Some(MemoryConfig {
+                size_mib: 256,
+                hugepages: false,
+                balloon: Some(BalloonConfig {
+                    amount_mib: 16,
+                    deflate_on_oom: true,
+                    free_page_reporting: true,
+                    stats_interval_s: 1,
+                }),
+            }),
+            ..Default::default()
+        };
+        let fc = firecracker_config(VM_ID, &config, image.path()).unwrap();
+        assert_eq!(
+            fc["balloon"],
+            json!({"amount_mib": 16, "deflate_on_oom": true, "free_page_reporting": true, "stats_polling_interval_s": 1})
+        );
+        let fc = firecracker_config(VM_ID, &VmConfig::default(), image.path()).unwrap();
+        assert!(fc.get("balloon").is_none());
     }
 
     #[test]
