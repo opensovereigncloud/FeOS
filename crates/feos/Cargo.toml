@@ -29,21 +29,11 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
-env_logger = { workspace = true }
 nix = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 dotenvy = { workspace = true }
 prost = { workspace = true }
-prost-types = { workspace = true }
 libc = { workspace = true }
-rtnetlink = { workspace = true }
-netlink-packet-route = { workspace = true }
-pnet = { workspace = true }
-dhcproto = { workspace = true }
-socket2 = { workspace = true }
-futures = { workspace = true }
-chrono = { workspace = true }
-termcolor = { workspace = true }
 
 [dev-dependencies]
 feos-utils = { workspace = true }
@@ -55,7 +45,6 @@ nix = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 log = { workspace = true }
-env_logger = { workspace = true }
 tokio-stream = { workspace = true }
 prost = { workspace = true }
 hyper-util = { workspace = true }

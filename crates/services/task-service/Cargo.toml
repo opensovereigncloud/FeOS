@@ -9,10 +9,7 @@ workspace = true
 [dependencies]
 feos-proto = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 tonic = { workspace = true }
-anyhow = { workspace = true }
 log = { workspace = true }
-prost = { workspace = true }
 thiserror = { workspace = true }
 nix = { workspace = true, features = ["signal", "process"] }
