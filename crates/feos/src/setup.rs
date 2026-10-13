@@ -48,7 +48,7 @@ use tokio::sync::mpsc;
 #[cfg(feature = "host")]
 use vm_service::{
     api::VmApiHandler, dispatcher::VmServiceDispatcher, Command as VmCommand, DEFAULT_VM_DB_URL,
-    VM_API_SOCKET_DIR, VM_CONSOLE_DIR,
+    VM_DIR,
 };
 
 #[cfg(feature = "host")]
@@ -66,13 +66,9 @@ pub(crate) struct BootInfo {
 
 #[cfg(feature = "host")]
 pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmServiceServer<VmApiHandler>> {
-    info!("Main: Ensuring VM socket directory '{VM_API_SOCKET_DIR}' exists...");
-    fs::create_dir_all(VM_API_SOCKET_DIR).await?;
-    info!("Main: Directory check complete. Path '{VM_API_SOCKET_DIR}' is ready.");
-
-    info!("Main: Ensuring VM console directory '{VM_CONSOLE_DIR}' exists...");
-    fs::create_dir_all(VM_CONSOLE_DIR).await?;
-    info!("Main: Directory check complete. Path '{VM_CONSOLE_DIR}' is ready.");
+    info!("Main: Ensuring VM directory '{VM_DIR}' exists...");
+    fs::create_dir_all(VM_DIR).await?;
+    info!("Main: Directory check complete. Path '{VM_DIR}' is ready.");
 
     let (vm_tx, vm_rx) = mpsc::channel::<VmCommand>(32);
     let vm_dispatcher = VmServiceDispatcher::new(vm_rx, db_url).await?;

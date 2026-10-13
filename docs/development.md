@@ -22,7 +22,7 @@ crates/
                         push, filesystem freezing, memory
     image-service/      OCI image pulls and the image store
     task-service/       the container runtime (libcontainer), its own process
-    vm-service/         VMs through a Hypervisor trait (cloud-hypervisor)
+    vm-service/         VMs through a Hypervisor trait (Firecracker)
     tool-service/       guest: agent file and web tools on a container's files
     watch-service/      guest: inotify subscriptions on a container's files
     forward-service/    guest: port forwarding, kube and SSH credential offloading
@@ -38,7 +38,8 @@ docs/                   documentation and ADRs
 - **host** (the default features): FeOS as the OS of a bare-metal
   hypervisor. It configures itself from the network (DHCPv6, router
   advertisements, NTP), sets up SR-IOV and hugepages, runs the VM service and
-  serves the public API on TCP `[::]:1337`.
+  serves the public API on TCP `[::]:1337`. VMs run in Firecracker
+  ([ADR 0003](adr/0003-firecracker.md)).
 - **guest** (`--no-default-features --features guest`): FeOS as PID 1 in a
   microVM whose host configures it. Its API listens on vsock port 10000, not
   on TCP, and once it is ready it dials the host (vsock port 10001) and holds
@@ -74,6 +75,8 @@ use) and `protoc`.
     make test-guest            # boot the guest under Firecracker and talk to it
     make test-guest-container  # run containers in the guest; needs sudo for a
                                # bridge, a TAP device and NAT
+    make test-vm               # the VM service against Firecracker, with the
+                               # guest as VM image; needs docker
 
 Build release artifacts per package (`cargo build -p <crate>`), never with
 `--workspace`: a workspace build unifies the features of all crates into every

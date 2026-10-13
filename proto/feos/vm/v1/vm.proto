@@ -4,17 +4,16 @@ package feos.vm.v1;
 
 import "google/protobuf/any.proto";
 
-// VMService is a service that manages multiple Cloud Hypervisor
-// instances. It abstracts the underlying REST API of each individual VMM process,
-// allowing a client to create, control, and delete virtual machines and their
-// devices without dealing with process management or API sockets.
+// VMService is a service that manages Firecracker microVMs. Each VM runs
+// in a Firecracker process of its own; the service hides the processes and
+// their API sockets, allowing a client to create, control, and delete
+// virtual machines without dealing with process management.
 service VMService {
   // Creates a new Virtual Machine but does not boot it.
-  // This starts a cloud-hypervisor process, sets up its initial resources,
-  // and makes it ready for booting. The returned 'vm_id' must be used for
-  // all subsequent operations on this VM.
+  // This pulls the VM's image and prepares its configuration. The returned
+  // 'vm_id' must be used for all subsequent operations on this VM.
   rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
-  // Starts a previously created Virtual Machine.
+  // Boots a created or stopped Virtual Machine in a new Firecracker process.
   rpc StartVm(StartVmRequest) returns (StartVmResponse);
   // Retrieves detailed information about a specific Virtual Machine.
   rpc GetVm(GetVmRequest) returns (VmInfo);
@@ -31,20 +30,15 @@ service VMService {
   rpc ListVms(ListVmsRequest) returns (ListVmsResponse);
   // Pings the VMM process for a specific VM to check for liveness.
   rpc PingVm(PingVmRequest) returns (PingVmResponse);
-  // Shuts down a running Virtual Machine by sending an ACPI shutdown signal.
+  // Shuts down a running Virtual Machine: sends the guest Ctrl-Alt-Del and
+  // waits until it has rebooted, which ends its Firecracker process. The
+  // guest needs an i8042 keyboard driver and has to treat Ctrl-Alt-Del as
+  // a request to shut down; FeOS does.
   rpc ShutdownVm(ShutdownVmRequest) returns (ShutdownVmResponse);
   // Pauses a running Virtual Machine.
   rpc PauseVm(PauseVmRequest) returns (PauseVmResponse);
   // Resumes a paused Virtual Machine.
   rpc ResumeVm(ResumeVmRequest) returns (ResumeVmResponse);
-  // Hot-plugs a new disk to a running VM.
-  rpc AttachDisk(AttachDiskRequest) returns (AttachDiskResponse);
-  // Hot-unplugs a disk from a running VM.
-  rpc DetachDisk(DetachDiskRequest) returns (DetachDiskResponse);
-  // Hot-plugs a new network interface to a running VM.
-  rpc AttachNic(AttachNicRequest) returns (AttachNicResponse);
-  // Hot-unplugs a network interface from a running VM.
-  rpc DetachNic(DetachNicRequest) returns (DetachNicResponse);
 }
 
 // Request stream from client to server for StreamVmConsole
@@ -124,17 +118,23 @@ message VmConfig {
   CpuConfig cpus = 1;
   MemoryConfig memory = 2;
   // The full reference to the OCI image, including the registry and tag.
+  // The image carries the kernel (vmlinuz) and may carry an initramfs and a
+  // root disk (rootfs), which becomes /dev/vda.
   string image_ref = 3;
-  // Additional data disks to attach to the VM. The root filesystem is
-  // expected to be part of the OCI image specified by vm_image_uuid.
+  // Additional data disks to attach to the VM. Firecracker cannot attach
+  // disks to a running VM.
   repeated DiskConfig disks = 4;
   repeated NetConfig net = 5;
-  optional string ignition = 6;
+  // Ignition was passed in SMBIOS OEM strings, which Firecracker lacks.
+  reserved 6;
+  reserved "ignition";
 }
 
 message CpuConfig {
-  uint32 boot_vcpus = 1;
-  uint32 max_vcpus = 2;
+  uint32 vcpu_count = 1;
+  // Firecracker cannot add vCPUs to a running VM.
+  reserved 2;
+  reserved "max_vcpus";
 }
 
 message MemoryConfig {
@@ -143,29 +143,27 @@ message MemoryConfig {
 }
 
 message DiskConfig {
+  // Firecracker's drive ID: letters, digits and "_". Defaults to "disk<n>".
   string device_id = 1;
-  oneof backend {
-    string path = 2; // Path on the host to the disk image file.
-    VfioPciConfig vfio_pci = 3;
-  }
+  string path = 2; // Path on the host to the disk image file.
+  // Firecracker has no PCI passthrough (VFIO).
+  reserved 3;
+  reserved "vfio_pci";
   bool readonly = 4;
 }
 
 message NetConfig {
+  // Firecracker's interface ID: letters, digits and "_". Defaults to "eth<n>".
   string device_id = 1;
-  oneof backend {
-    TapConfig tap = 2;
-    VfioPciConfig vfio_pci = 3;
-  }
+  TapConfig tap = 2;
+  // Firecracker has no PCI passthrough (VFIO).
+  reserved 3;
+  reserved "vfio_pci";
   string mac_address = 4;
 }
 
 message TapConfig {
   string tap_name = 1;
-}
-
-message VfioPciConfig {
-  string bdf = 1; // e.g., "0000:03:00.0"
 }
 
 enum VmState {
@@ -182,6 +180,11 @@ message VmInfo {
   string vm_id = 1;
   VmState state = 2;
   VmConfig config = 3;
+  // The host end of the VM's vsock device, a Unix socket (Firecracker's
+  // hybrid vsock). To reach port P in the guest, connect and send
+  // "CONNECT P\n". The guest reaches the host at CID 2, port P, through
+  // the Unix socket <vsock_path>_P.
+  string vsock_path = 4;
 }
 
 message PingVmRequest {
@@ -221,36 +224,6 @@ message ResumeVmRequest {
   string vm_id = 1;
 }
 
-message AttachDiskRequest {
-  string vm_id = 1;
-  DiskConfig disk = 2;
-}
-
-message AttachDiskResponse {
-  string device_id = 1;
-}
-
-message DetachDiskRequest {
-  string vm_id = 1;
-  string device_id = 2;
-}
-
-message AttachNicRequest {
-  string vm_id = 1;
-  NetConfig nic = 2;
-}
-
-message AttachNicResponse {
-  string device_id = 1;
-}
-
-message DetachNicRequest {
-  string vm_id = 1;
-  string device_id = 2;
-}
-
-message DetachNicResponse {}
-
 message StartVmResponse {}
 
 message DeleteVmResponse {}
@@ -261,4 +234,3 @@ message PauseVmResponse {}
 
 message ResumeVmResponse {}
 
-message DetachDiskResponse {}

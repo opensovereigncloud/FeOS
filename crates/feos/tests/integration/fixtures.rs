@@ -9,7 +9,7 @@ use nix::unistd::Pid;
 use prost::Message;
 use std::path::Path;
 use tokio_stream::StreamExt;
-use vm_service::VM_API_SOCKET_DIR;
+use vm_service::vm_dir;
 
 pub struct VmGuard {
     pub vm_id: String,
@@ -45,13 +45,13 @@ impl Drop for VmGuard {
             info!("Killing process with PID: {pid}");
             let _ = kill(pid, Signal::SIGKILL);
         }
-        let socket_path = format!("{}/{}", VM_API_SOCKET_DIR, self.vm_id);
-        if let Err(e) = std::fs::remove_file(&socket_path) {
+        let dir = vm_dir(&self.vm_id);
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("Could not remove socket file '{socket_path}': {e}");
+                warn!("Could not remove VM directory '{}': {e}", dir.display());
             }
         } else {
-            info!("Removed socket file '{socket_path}'");
+            info!("Removed VM directory '{}'", dir.display());
         }
     }
 }
@@ -90,10 +90,11 @@ pub async fn wait_for_target_state(
 }
 
 pub fn verify_vm_socket_cleanup(vm_id: &str) {
-    let socket_path = format!("{VM_API_SOCKET_DIR}/{vm_id}");
+    let dir = vm_dir(vm_id);
     assert!(
-        !Path::new(&socket_path).exists(),
-        "Socket file '{socket_path}' should not exist after DeleteVm"
+        !Path::new(&dir).exists(),
+        "VM directory '{}' should not exist after DeleteVm",
+        dir.display()
     );
-    info!("Verified VM API socket is deleted: {socket_path}");
+    info!("Verified the VM directory is deleted: {}", dir.display());
 }

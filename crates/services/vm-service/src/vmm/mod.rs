@@ -3,20 +3,20 @@
 
 use crate::VmEventWrapper;
 use feos_proto::vm_service::{
-    AttachDiskRequest, AttachDiskResponse, AttachNicRequest, AttachNicResponse, CreateVmRequest,
-    DeleteVmRequest, DeleteVmResponse, DetachDiskRequest, DetachDiskResponse, DetachNicRequest,
-    DetachNicResponse, GetVmRequest, PauseVmRequest, PauseVmResponse, PingVmRequest,
-    PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
-    StartVmRequest, StartVmResponse, VmEvent, VmInfo, VmStateChangedEvent,
+    CreateVmRequest, DeleteVmRequest, DeleteVmResponse, PauseVmRequest, PauseVmResponse,
+    PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest,
+    ShutdownVmResponse, StartVmRequest, VmConfig, VmEvent, VmStateChangedEvent,
 };
 use prost::Message;
 use prost_types::Any;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use tokio::io::DuplexStream;
 use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
 use uuid::Uuid;
 
-pub mod ch_adapter;
+mod fc_api;
+pub mod firecracker;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VmmError {
@@ -59,6 +59,8 @@ impl From<VmmError> for Status {
 
 #[tonic::async_trait]
 pub trait Hypervisor: Send + Sync {
+    /// Prepares a VM from its request and its pulled image. Returns the pid
+    /// of a VMM process if creating the VM started one.
     async fn create_vm(
         &self,
         vm_id: &str,
@@ -66,8 +68,11 @@ pub trait Hypervisor: Send + Sync {
         image_uuid: String,
     ) -> Result<Option<i64>, VmmError>;
 
-    async fn start_vm(&self, req: StartVmRequest) -> Result<StartVmResponse, VmmError>;
+    /// Boots the VM; returns the pid of its VMM process.
+    async fn start_vm(&self, req: StartVmRequest) -> Result<i64, VmmError>;
 
+    /// Watches a running VM until its VMM process ends, and reports how it
+    /// ended, unless the VM's ID arrives on the cancel bus first.
     async fn healthcheck_vm(
         &self,
         vm_id: String,
@@ -75,7 +80,8 @@ pub trait Hypervisor: Send + Sync {
         cancel_bus: broadcast::Receiver<Uuid>,
     );
 
-    async fn get_vm(&self, req: GetVmRequest) -> Result<VmInfo, VmmError>;
+    /// Whether `pid` is the VMM process of the VM, and alive.
+    fn is_vmm_process(&self, vm_id: &str, pid: i64) -> bool;
 
     async fn delete_vm(
         &self,
@@ -83,16 +89,31 @@ pub trait Hypervisor: Send + Sync {
         process_id: Option<i64>,
     ) -> Result<DeleteVmResponse, VmmError>;
 
-    async fn get_console_socket_path(&self, vm_id: &str) -> Result<PathBuf, VmmError>;
+    /// The VM's serial console: reading gives its output from now on,
+    /// writing is its input.
+    async fn open_console(&self, vm_id: &str) -> Result<DuplexStream, VmmError>;
 
     async fn ping_vm(&self, req: PingVmRequest) -> Result<PingVmResponse, VmmError>;
     async fn shutdown_vm(&self, req: ShutdownVmRequest) -> Result<ShutdownVmResponse, VmmError>;
     async fn pause_vm(&self, req: PauseVmRequest) -> Result<PauseVmResponse, VmmError>;
     async fn resume_vm(&self, req: ResumeVmRequest) -> Result<ResumeVmResponse, VmmError>;
-    async fn attach_disk(&self, req: AttachDiskRequest) -> Result<AttachDiskResponse, VmmError>;
-    async fn detach_disk(&self, req: DetachDiskRequest) -> Result<DetachDiskResponse, VmmError>;
-    async fn attach_nic(&self, req: AttachNicRequest) -> Result<AttachNicResponse, VmmError>;
-    async fn detach_nic(&self, req: DetachNicRequest) -> Result<DetachNicResponse, VmmError>;
+}
+
+/// Checks what a VMM cannot check before it boots the VM.
+pub fn validate_config(config: &VmConfig) -> Result<(), VmmError> {
+    if config.disks.iter().any(|disk| disk.path.is_empty()) {
+        return Err(VmmError::InvalidConfig("a disk needs a path".to_string()));
+    }
+    if config
+        .net
+        .iter()
+        .any(|nic| nic.tap.as_ref().is_none_or(|tap| tap.tap_name.is_empty()))
+    {
+        return Err(VmmError::InvalidConfig(
+            "a network interface needs a TAP device".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn broadcast_state_change_event(
@@ -122,14 +143,14 @@ pub async fn broadcast_state_change_event(
 }
 
 pub enum VmmType {
-    CloudHypervisor,
+    Firecracker,
 }
 
 pub fn factory(vmm_type: VmmType) -> Box<dyn Hypervisor> {
     match vmm_type {
-        VmmType::CloudHypervisor => {
-            let ch_binary_path = Path::new(super::VM_CH_BIN).to_path_buf();
-            Box::new(ch_adapter::CloudHypervisorAdapter::new(ch_binary_path))
+        VmmType::Firecracker => {
+            let binary = Path::new(super::FIRECRACKER_BIN).to_path_buf();
+            Box::new(firecracker::FirecrackerAdapter::new(binary))
         }
     }
 }

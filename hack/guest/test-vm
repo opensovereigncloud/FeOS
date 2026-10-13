@@ -1,0 +1,65 @@
+#!/bin/bash
+# Run the VM service against Firecracker: the VM integration tests boot the
+# FeOS guest, pulled from a local registry, shut it down, crash it and
+# delete it.
+#
+#   hack/guest/test-vm [test name filter...]
+#
+# The tests run as root in a privileged container, so that FeOS's
+# directories (/var/lib/feos, /run/feos) stay in there, in the network
+# namespace of the registry's container, so that FeOS's API port stays in
+# there too. Needs docker, /dev/kvm, Firecracker (make firecracker) and
+# the guest (make guest).
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+TARGET="x86_64-unknown-linux-musl"
+REGISTRY_IMAGE="registry:2.8.3"
+REGISTRY_NAME="feos-test-vm-registry"
+REGISTRY_PORT=5000
+TEST_IMAGE_REF="127.0.0.1:${REGISTRY_PORT}/feos/guest:test"
+RUNNER_IMAGE="debian:13"
+FILTERS=("$@")
+[ ${#FILTERS[@]} -gt 0 ] || FILTERS=(vm_tests image_tests::test_image_lifecycle)
+
+log() { printf '[test-vm] %s\n' "$*"; }
+
+for f in target/firecracker/firecracker target/guest/vmlinuz target/guest/initramfs.cpio.zst; do
+  [ -e "${REPO_ROOT}/${f}" ] || { log "missing ${f}"; exit 1; }
+done
+
+# Static binaries run in any container.
+log "building the integration tests for ${TARGET}"
+TEST_BIN=$(cargo test --manifest-path "${REPO_ROOT}/Cargo.toml" -p feos \
+  --test integration_tests --target "${TARGET}" --no-run --message-format=json |
+  python3 -I -c '
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("reason") == "compiler-artifact" and msg["target"]["name"] == "integration_tests" and msg.get("executable"):
+        print(msg["executable"])')
+[ -x "${TEST_BIN}" ] || { log "no test binary"; exit 1; }
+
+cleanup() { docker rm -f "${REGISTRY_NAME}" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+cleanup
+log "starting a registry on 127.0.0.1:${REGISTRY_PORT}"
+docker run -d --name "${REGISTRY_NAME}" -p "127.0.0.1:${REGISTRY_PORT}:5000" \
+  "${REGISTRY_IMAGE}" >/dev/null
+for _ in $(seq 50); do
+  curl -fsS "http://127.0.0.1:${REGISTRY_PORT}/v2/" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+"${REPO_ROOT}/hack/guest/push-image" "${TEST_IMAGE_REF}"
+
+log "running ${FILTERS[*]}"
+# --init: FeOS takes PID 1 for the init system and sets the machine up.
+docker run --rm --privileged --init \
+  --network "container:${REGISTRY_NAME}" \
+  -v "${REPO_ROOT}:${REPO_ROOT}:ro" \
+  -e TEST_IMAGE_REF="${TEST_IMAGE_REF}" \
+  -e PATH="${REPO_ROOT}/target/firecracker:/usr/sbin:/usr/bin:/sbin:/bin" \
+  -e RUST_LOG=info \
+  "${RUNNER_IMAGE}" \
+  "${TEST_BIN}" --nocapture "${FILTERS[@]}"
+log "PASS"

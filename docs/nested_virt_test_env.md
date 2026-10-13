@@ -1,6 +1,6 @@
 # Nested Virtualization Test Environment Setup Guide
 
-This guide explains how to set up a development environment on a Linux host to run FeOS in a KVM virtual machine, where FeOS can, in turn, manage its own nested virtual machines. This is essential for testing the `vm-service` and its interaction with hypervisors like cloud-hypervisor.
+This guide explains how to set up a development environment on a Linux host to run FeOS in a KVM virtual machine, where FeOS can, in turn, manage its own nested virtual machines. This is how to test the `vm-service` on FeOS as the host, starting Firecracker VMs.
 
 The setup involves four key services running on the host and serving the main FeOS VM running on the `vm-br0` bridge:
 1.  **radvd**: Provides IPv6 router advertisements for stateful address configuration.

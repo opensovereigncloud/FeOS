@@ -3,13 +3,13 @@
 
 use crate::error::VmServiceError;
 use feos_proto::vm_service::{
-    AttachDiskRequest, AttachDiskResponse, AttachNicRequest, AttachNicResponse, CreateVmRequest,
-    CreateVmResponse, DeleteVmRequest, DeleteVmResponse, DetachDiskRequest, DetachDiskResponse,
-    DetachNicRequest, DetachNicResponse, GetVmRequest, ListVmsRequest, ListVmsResponse,
-    PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
-    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
-    StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest, VmEvent, VmInfo,
+    CreateVmRequest, CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest,
+    ListVmsRequest, ListVmsResponse, PauseVmRequest, PauseVmResponse, PingVmRequest,
+    PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
+    StartVmRequest, StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse,
+    StreamVmEventsRequest, VmEvent, VmInfo,
 };
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Status, Streaming};
 
@@ -22,10 +22,19 @@ pub mod vmm;
 pub mod worker;
 
 pub const DEFAULT_VM_DB_URL: &str = "sqlite:/var/lib/feos/vms.db";
-pub const VM_API_SOCKET_DIR: &str = "/tmp/feos/vm_api_sockets";
-pub const VM_CH_BIN: &str = "cloud-hypervisor";
+/// A directory per VM: its configuration, its sockets and its logs.
+pub const VM_DIR: &str = "/var/lib/feos/vms";
+pub const FIRECRACKER_BIN: &str = "firecracker";
 pub const IMAGE_DIR: &str = "/var/lib/feos/images";
-pub const VM_CONSOLE_DIR: &str = "/tmp/feos/consoles";
+
+pub fn vm_dir(vm_id: &str) -> PathBuf {
+    Path::new(VM_DIR).join(vm_id)
+}
+
+/// The host end of the VM's vsock device.
+pub fn vsock_path(vm_id: &str) -> PathBuf {
+    vm_dir(vm_id).join("v.sock")
+}
 
 #[derive(Debug, Clone)]
 pub struct VmEventWrapper {
@@ -75,22 +84,6 @@ pub enum Command {
         ResumeVmRequest,
         oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     ),
-    AttachDisk(
-        AttachDiskRequest,
-        oneshot::Sender<Result<AttachDiskResponse, VmServiceError>>,
-    ),
-    DetachDisk(
-        DetachDiskRequest,
-        oneshot::Sender<Result<DetachDiskResponse, VmServiceError>>,
-    ),
-    AttachNic(
-        AttachNicRequest,
-        oneshot::Sender<Result<AttachNicResponse, VmServiceError>>,
-    ),
-    DetachNic(
-        DetachNicRequest,
-        oneshot::Sender<Result<DetachNicResponse, VmServiceError>>,
-    ),
 }
 
 impl std::fmt::Debug for Command {
@@ -109,10 +102,6 @@ impl std::fmt::Debug for Command {
             Command::ShutdownVm(req, _) => f.debug_tuple("ShutdownVm").field(req).finish(),
             Command::PauseVm(req, _) => f.debug_tuple("PauseVm").field(req).finish(),
             Command::ResumeVm(req, _) => f.debug_tuple("ResumeVm").field(req).finish(),
-            Command::AttachDisk(req, _) => f.debug_tuple("AttachDisk").field(req).finish(),
-            Command::DetachDisk(req, _) => f.debug_tuple("DetachDisk").field(req).finish(),
-            Command::AttachNic(req, _) => f.debug_tuple("AttachNic").field(req).finish(),
-            Command::DetachNic(req, _) => f.debug_tuple("DetachNic").field(req).finish(),
         }
     }
 }

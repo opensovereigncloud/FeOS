@@ -6,12 +6,11 @@ use clap::{Args, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::tty::IsTty;
 use feos_proto::vm_service::{
-    net_config, stream_vm_console_request as console_input, vm_service_client::VmServiceClient,
-    AttachConsoleMessage, AttachDiskRequest, AttachNicRequest, ConsoleData, CpuConfig,
-    CreateVmRequest, DeleteVmRequest, DetachDiskRequest, DetachNicRequest, DiskConfig,
+    stream_vm_console_request as console_input, vm_service_client::VmServiceClient,
+    AttachConsoleMessage, ConsoleData, CpuConfig, CreateVmRequest, DeleteVmRequest, DiskConfig,
     GetVmRequest, ListVmsRequest, MemoryConfig, NetConfig, PauseVmRequest, PingVmRequest,
     ResumeVmRequest, ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest,
-    StreamVmEventsRequest, TapConfig, VfioPciConfig, VmConfig, VmState, VmStateChangedEvent,
+    StreamVmEventsRequest, TapConfig, VmConfig, VmState, VmStateChangedEvent,
 };
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,7 +40,7 @@ pub enum VmCommand {
         #[arg(
             long,
             required = true,
-            help = "Container image reference to use for the VM"
+            help = "OCI image with the kernel, and an initramfs or a root disk"
         )]
         image_ref: String,
 
@@ -54,17 +53,14 @@ pub enum VmCommand {
         #[arg(long, help = "Optional custom VM identifier")]
         vm_id: Option<String>,
 
-        #[arg(
-            long,
-            help = "PCI device BDF to passthrough for networking (e.g., 0000:03:00.0)"
-        )]
-        pci_device: Vec<String>,
+        #[arg(long, help = "TAP device for a network interface (repeatable)")]
+        tap: Vec<String>,
+
+        #[arg(long, help = "Path to a data disk image (repeatable)")]
+        disk: Vec<String>,
 
         #[arg(long, help = "Enable hugepages for memory allocation")]
         hugepages: bool,
-
-        #[arg(long, help = "Path to ignition file or the content itself")]
-        ignition: Option<String>,
     },
     /// Start an existing virtual machine
     Start {
@@ -108,7 +104,7 @@ pub enum VmCommand {
         #[arg(
             long,
             required = true,
-            help = "Container image reference to use for the VM"
+            help = "OCI image with the kernel, and an initramfs or a root disk"
         )]
         image_ref: String,
 
@@ -121,17 +117,14 @@ pub enum VmCommand {
         #[arg(long, help = "Optional custom VM identifier")]
         vm_id: Option<String>,
 
-        #[arg(
-            long,
-            help = "PCI device BDF to passthrough for networking (e.g., 0000:03:00.0)"
-        )]
-        pci_device: Vec<String>,
+        #[arg(long, help = "TAP device for a network interface (repeatable)")]
+        tap: Vec<String>,
+
+        #[arg(long, help = "Path to a data disk image (repeatable)")]
+        disk: Vec<String>,
 
         #[arg(long, help = "Enable hugepages for memory allocation")]
         hugepages: bool,
-
-        #[arg(long, help = "Path to ignition file or the content itself")]
-        ignition: Option<String>,
     },
     /// Watch virtual machine state change events
     Events {
@@ -146,52 +139,6 @@ pub enum VmCommand {
         #[arg(required = true, help = "VM identifier")]
         vm_id: String,
     },
-    /// Attach a disk to a running virtual machine
-    AttachDisk {
-        #[arg(long, required = true, help = "VM identifier")]
-        vm_id: String,
-        #[arg(long, required = true, help = "Path to the disk image file")]
-        path: String,
-    },
-    /// Detach a disk from a virtual machine
-    DetachDisk {
-        #[arg(long, required = true, help = "VM identifier")]
-        vm_id: String,
-        #[arg(
-            long,
-            required = true,
-            help = "Device identifier of the disk to detach"
-        )]
-        device_id: String,
-    },
-    /// Attach a network interface to a VM
-    AttachNic {
-        #[arg(long, required = true, help = "VM identifier")]
-        vm_id: String,
-        #[arg(
-            long,
-            help = "Name of the TAP device to attach",
-            conflicts_with = "pci_device"
-        )]
-        tap_name: Option<String>,
-        #[arg(
-            long,
-            help = "PCI device BDF to passthrough for networking (e.g., 0000:03:00.0)",
-            conflicts_with = "tap_name"
-        )]
-        pci_device: Option<String>,
-        #[arg(long, help = "MAC address for the new interface")]
-        mac_address: Option<String>,
-        #[arg(long, help = "Custom device identifier for the new interface")]
-        device_id: Option<String>,
-    },
-    /// Detach a network interface from a VM
-    DetachNic {
-        #[arg(long, required = true, help = "VM identifier")]
-        vm_id: String,
-        #[arg(long, required = true, help = "Device identifier of the NIC to detach")]
-        device_id: String,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -200,9 +147,9 @@ struct CreateVmOptions {
     vcpus: u32,
     memory: u64,
     vm_id: Option<String>,
-    pci_devices: Vec<String>,
+    taps: Vec<String>,
+    disks: Vec<String>,
     hugepages: bool,
-    ignition: Option<String>,
 }
 
 pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
@@ -214,18 +161,18 @@ pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
             vcpus,
             memory,
             vm_id,
-            pci_device,
+            tap,
+            disk,
             hugepages,
-            ignition,
         } => {
             let opts = CreateVmOptions {
                 image_ref,
                 vcpus,
                 memory,
                 vm_id,
-                pci_devices: pci_device,
+                taps: tap,
+                disks: disk,
                 hugepages,
-                ignition,
             };
             create_vm(&mut client, opts).await?
         }
@@ -242,111 +189,75 @@ pub async fn handle_vm_command(args: VmArgs) -> Result<()> {
             vcpus,
             memory,
             vm_id,
-            pci_device,
+            tap,
+            disk,
             hugepages,
-            ignition,
         } => {
             let opts = CreateVmOptions {
                 image_ref,
                 vcpus,
                 memory,
                 vm_id,
-                pci_devices: pci_device,
+                taps: tap,
+                disks: disk,
                 hugepages,
-                ignition,
             };
             create_and_start_vm(&mut client, opts).await?
         }
         VmCommand::Events { vm_id } => watch_events(&mut client, vm_id).await?,
         VmCommand::Console { vm_id } => console_vm(&mut client, vm_id).await?,
-        VmCommand::AttachDisk { vm_id, path } => attach_disk(&mut client, vm_id, path).await?,
-        VmCommand::DetachDisk { vm_id, device_id } => {
-            detach_disk(&mut client, vm_id, device_id).await?
-        }
-        VmCommand::AttachNic {
-            vm_id,
-            tap_name,
-            pci_device,
-            mac_address,
-            device_id,
-        } => {
-            attach_nic(
-                &mut client,
-                vm_id,
-                tap_name,
-                pci_device,
-                mac_address,
-                device_id,
-            )
-            .await?
-        }
-        VmCommand::DetachNic { vm_id, device_id } => {
-            detach_nic(&mut client, vm_id, device_id).await?
-        }
     }
 
     Ok(())
+}
+
+fn create_vm_request(opts: CreateVmOptions) -> CreateVmRequest {
+    let net = opts
+        .taps
+        .into_iter()
+        .map(|tap_name| NetConfig {
+            tap: Some(TapConfig { tap_name }),
+            ..Default::default()
+        })
+        .collect();
+    let disks = opts
+        .disks
+        .into_iter()
+        .map(|path| DiskConfig {
+            path,
+            ..Default::default()
+        })
+        .collect();
+    CreateVmRequest {
+        config: Some(VmConfig {
+            cpus: Some(CpuConfig {
+                vcpu_count: opts.vcpus,
+            }),
+            memory: Some(MemoryConfig {
+                size_mib: opts.memory,
+                hugepages: opts.hugepages,
+            }),
+            image_ref: opts.image_ref,
+            disks,
+            net,
+        }),
+        vm_id: opts.vm_id,
+    }
 }
 
 async fn create_and_start_vm(
     client: &mut VmServiceClient<Channel>,
     opts: CreateVmOptions,
 ) -> Result<()> {
-    let CreateVmOptions {
-        image_ref,
-        vcpus,
-        memory,
-        vm_id,
-        pci_devices,
-        hugepages,
-        ignition,
-    } = opts;
-
-    println!("� Starting create and start operation for VM with image: {image_ref}");
+    println!(
+        "� Starting create and start operation for VM with image: {}",
+        opts.image_ref
+    );
 
     // Step 1: Create the VM
     println!("� Step 1: Creating VM...");
 
-    let ignition_data = if let Some(ignition_str) = ignition {
-        if tokio::fs::metadata(&ignition_str).await.is_ok() {
-            Some(tokio::fs::read_to_string(ignition_str).await?)
-        } else {
-            Some(ignition_str)
-        }
-    } else {
-        None
-    };
-
-    let net_configs = pci_devices
-        .iter()
-        .map(|bdf| {
-            println!("   Adding PCI device: {bdf}");
-            NetConfig {
-                backend: Some(net_config::Backend::VfioPci(VfioPciConfig {
-                    bdf: bdf.clone(),
-                })),
-                ..Default::default()
-            }
-        })
-        .collect();
-
-    let request = CreateVmRequest {
-        config: Some(VmConfig {
-            cpus: Some(CpuConfig {
-                boot_vcpus: vcpus,
-                max_vcpus: vcpus,
-            }),
-            memory: Some(MemoryConfig {
-                size_mib: memory,
-                hugepages,
-            }),
-            image_ref: image_ref.clone(),
-            net: net_configs,
-            ignition: ignition_data,
-            ..Default::default()
-        }),
-        vm_id: vm_id.clone(),
-    };
+    let request = create_vm_request(opts);
 
     let response = client.create_vm(request).await?.into_inner();
     let vm_id = response.vm_id;
@@ -436,56 +347,9 @@ async fn wait_for_vm_state(
 }
 
 async fn create_vm(client: &mut VmServiceClient<Channel>, opts: CreateVmOptions) -> Result<()> {
-    let CreateVmOptions {
-        image_ref,
-        vcpus,
-        memory,
-        vm_id,
-        pci_devices,
-        hugepages,
-        ignition,
-    } = opts;
+    println!("Requesting VM creation with image: {}...", opts.image_ref);
 
-    println!("Requesting VM creation with image: {image_ref}...");
-
-    let ignition_data = if let Some(ignition_str) = ignition {
-        if tokio::fs::metadata(&ignition_str).await.is_ok() {
-            Some(tokio::fs::read_to_string(ignition_str).await?)
-        } else {
-            Some(ignition_str)
-        }
-    } else {
-        None
-    };
-
-    let net_configs = pci_devices
-        .into_iter()
-        .map(|bdf| {
-            println!("Adding PCI device: {bdf}");
-            NetConfig {
-                backend: Some(net_config::Backend::VfioPci(VfioPciConfig { bdf })),
-                ..Default::default()
-            }
-        })
-        .collect();
-
-    let request = CreateVmRequest {
-        config: Some(VmConfig {
-            cpus: Some(CpuConfig {
-                boot_vcpus: vcpus,
-                max_vcpus: vcpus,
-            }),
-            memory: Some(MemoryConfig {
-                size_mib: memory,
-                hugepages,
-            }),
-            image_ref,
-            net: net_configs,
-            ignition: ignition_data,
-            ..Default::default()
-        }),
-        vm_id,
-    };
+    let request = create_vm_request(opts);
 
     let response = client.create_vm(request).await?.into_inner();
     println!("VM creation initiated. VM ID: {}", response.vm_id);
@@ -518,27 +382,28 @@ async fn get_vm_info(client: &mut VmServiceClient<Channel>, vm_id: String) -> Re
         "  State: {:?}",
         VmState::try_from(response.state).unwrap_or(VmState::Unspecified)
     );
+    println!("  vsock: {}", response.vsock_path);
     if let Some(config) = response.config {
         println!("  Config:");
         println!("    Image Ref: {}", config.image_ref);
         if let Some(cpus) = config.cpus {
-            println!("    vCPUs: {}", cpus.boot_vcpus);
+            println!("    vCPUs: {}", cpus.vcpu_count);
         }
         if let Some(mem) = config.memory {
             println!("    Memory: {} MiB", mem.size_mib);
         }
+        if !config.disks.is_empty() {
+            println!("    Disks:");
+            for disk in &config.disks {
+                let mode = if disk.readonly { " (read-only)" } else { "" };
+                println!("      {} {}{mode}", disk.device_id, disk.path);
+            }
+        }
         if !config.net.is_empty() {
             println!("    Network Devices:");
             for (i, net_conf) in config.net.iter().enumerate() {
-                if let Some(backend) = &net_conf.backend {
-                    match backend {
-                        net_config::Backend::VfioPci(pci) => {
-                            println!("      Device {}: PCI Passthrough - {}", i, pci.bdf);
-                        }
-                        net_config::Backend::Tap(tap) => {
-                            println!("      Device {}: TAP - {}", i, tap.tap_name);
-                        }
-                    }
+                if let Some(tap) = &net_conf.tap {
+                    println!("      Device {}: TAP - {}", i, tap.tap_name);
                 }
             }
         }
@@ -752,89 +617,5 @@ async fn console_vm(client: &mut VmServiceClient<Channel>, vm_id: String) -> Res
         _ = input_task => {},
     }
 
-    Ok(())
-}
-
-async fn attach_disk(
-    client: &mut VmServiceClient<Channel>,
-    vm_id: String,
-    path: String,
-) -> Result<()> {
-    let request = AttachDiskRequest {
-        vm_id: vm_id.clone(),
-        disk: Some(DiskConfig {
-            backend: Some(feos_proto::vm_service::disk_config::Backend::Path(path)),
-            ..Default::default()
-        }),
-    };
-    let response = client.attach_disk(request).await?.into_inner();
-    println!(
-        "Disk attach request sent for VM: {}. Assigned device_id: {}",
-        vm_id, response.device_id
-    );
-    Ok(())
-}
-
-async fn detach_disk(
-    client: &mut VmServiceClient<Channel>,
-    vm_id: String,
-    device_id: String,
-) -> Result<()> {
-    let request = DetachDiskRequest {
-        vm_id: vm_id.clone(),
-        device_id: device_id.clone(),
-    };
-    client.detach_disk(request).await?;
-    println!("Disk detach request sent for device {device_id} on VM {vm_id}");
-    Ok(())
-}
-
-async fn attach_nic(
-    client: &mut VmServiceClient<Channel>,
-    vm_id: String,
-    tap_name: Option<String>,
-    pci_device: Option<String>,
-    mac_address: Option<String>,
-    device_id: Option<String>,
-) -> Result<()> {
-    let backend = if let Some(tap) = tap_name {
-        Some(net_config::Backend::Tap(TapConfig { tap_name: tap }))
-    } else if let Some(bdf) = pci_device {
-        Some(net_config::Backend::VfioPci(VfioPciConfig { bdf }))
-    } else {
-        anyhow::bail!("Either --tap-name or --pci-device must be specified.");
-    };
-
-    let nic = NetConfig {
-        device_id: device_id.unwrap_or_default(),
-        mac_address: mac_address.unwrap_or_default(),
-        backend,
-    };
-
-    let request = AttachNicRequest {
-        vm_id: vm_id.clone(),
-        nic: Some(nic),
-    };
-
-    let response = client.attach_nic(request).await?.into_inner();
-    println!(
-        "NIC attach request sent for VM: {}. Assigned device_id: {}",
-        vm_id, response.device_id
-    );
-
-    Ok(())
-}
-
-async fn detach_nic(
-    client: &mut VmServiceClient<Channel>,
-    vm_id: String,
-    device_id: String,
-) -> Result<()> {
-    let request = DetachNicRequest {
-        vm_id: vm_id.clone(),
-        device_id: device_id.clone(),
-    };
-    client.detach_nic(request).await?;
-    println!("NIC detach request sent for device {device_id} on VM {vm_id}");
     Ok(())
 }

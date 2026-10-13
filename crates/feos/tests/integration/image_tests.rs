@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ensure_server, get_image_service_client, skip_if_ch_binary_missing, TEST_IMAGE_REF};
+use super::{ensure_server, get_image_service_client, TEST_CONTAINER_IMAGE_REF, TEST_IMAGE_REF};
 use anyhow::Result;
 use feos_proto::image_service::{
     DeleteImageRequest, ImageState, ImageStatusResponse, ListImagesRequest, PullImageRequest,
@@ -17,13 +17,13 @@ use tonic::Status;
 
 #[tokio::test]
 async fn test_image_lifecycle() -> Result<()> {
-    if skip_if_ch_binary_missing() {
+    let Some(image_ref) = TEST_IMAGE_REF.clone() else {
+        log::warn!("Skipping test because TEST_IMAGE_REF names no VM image.");
         return Ok(());
-    }
+    };
     ensure_server().await;
     let mut image_client = get_image_service_client().await?;
 
-    let image_ref = TEST_IMAGE_REF.clone();
     info!("Pulling image: {image_ref}");
     let pull_req = PullImageRequest {
         image_ref: image_ref.clone(),
@@ -58,7 +58,8 @@ async fn test_image_lifecycle() -> Result<()> {
     let image_path = Path::new(IMAGE_DIR).join(&image_uuid);
     info!("Verifying filesystem path: {}", image_path.display());
     assert!(image_path.exists(), "Image directory should exist");
-    assert!(image_path.join("disk.image").exists());
+    // A VM image carries at least its kernel.
+    assert!(image_path.join("vmlinuz").exists());
     assert!(image_path.join("metadata.json").exists());
 
     info!("Deleting image: {image_uuid}");
@@ -89,13 +90,10 @@ async fn test_image_lifecycle() -> Result<()> {
 
 #[tokio::test]
 async fn test_container_image_lifecycle() -> Result<()> {
-    if skip_if_ch_binary_missing() {
-        return Ok(());
-    }
     ensure_server().await;
     let mut image_client = get_image_service_client().await?;
 
-    let image_ref = "ghcr.io:5000/appvia/hello-world/hello-world".to_string();
+    let image_ref = TEST_CONTAINER_IMAGE_REF.clone();
     info!("Pulling container image: {image_ref}");
     let pull_req = PullImageRequest {
         image_ref: image_ref.clone(),

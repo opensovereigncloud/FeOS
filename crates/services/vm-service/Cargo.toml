@@ -10,8 +10,6 @@ workspace = true
 feos-proto = { workspace = true }
 feos-utils = { workspace = true }
 image-service = { workspace = true }
-cloud-hypervisor-client = { version = "0.3.3"}
-hyperlocal = "0.9.1"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
@@ -22,6 +20,9 @@ uuid = { workspace = true }
 log = { workspace = true }
 tower = { workspace = true }
 thiserror = { workspace = true }
-hyper = {workspace = true}
-hyper-util = { workspace = true, features = ["client-legacy", "http1"] }
+hyper-util = { workspace = true }
+serde_json = { workspace = true }
 sqlx = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

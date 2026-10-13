@@ -10,10 +10,8 @@ use crate::{
 use feos_proto::{
     image_service::{image_service_client::ImageServiceClient, PullImageRequest},
     vm_service::{
-        net_config, stream_vm_console_request as console_input, AttachConsoleMessage,
-        AttachDiskRequest, AttachDiskResponse, AttachNicRequest, AttachNicResponse,
-        CreateVmRequest, CreateVmResponse, DeleteVmRequest, DeleteVmResponse, DetachDiskRequest,
-        DetachDiskResponse, DetachNicRequest, DetachNicResponse, GetVmRequest, ListVmsRequest,
+        stream_vm_console_request as console_input, AttachConsoleMessage, CreateVmRequest,
+        CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest, ListVmsRequest,
         ListVmsResponse, PauseVmRequest, PauseVmResponse, ResumeVmRequest, ResumeVmResponse,
         ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
         StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest, VmEvent, VmInfo,
@@ -23,7 +21,6 @@ use feos_proto::{
 use hyper_util::rt::TokioIo;
 use image_service::IMAGE_SERVICE_SOCKET;
 use log::{error, info, warn};
-use nix::unistd::Pid;
 use prost::Message;
 use prost_types::Any;
 use std::{path::PathBuf, sync::Arc};
@@ -38,16 +35,19 @@ use uuid::Uuid;
 
 fn ensure_net_config_device_id(net_config: &mut feos_proto::vm_service::NetConfig) {
     if net_config.device_id.is_empty()
-        && let Some(backend) = &net_config.backend
+        && let Some(tap) = &net_config.tap
     {
-        match backend {
-            net_config::Backend::Tap(tap) => {
-                net_config.device_id = tap.tap_name.clone();
-            }
-            net_config::Backend::VfioPci(pci) => {
-                net_config.device_id = format!("/sys/bus/pci/devices/{}", pci.bdf);
-            }
-        }
+        net_config.device_id = tap.tap_name.clone();
+    }
+}
+
+fn vm_info(record: VmRecord) -> VmInfo {
+    let vm_id = record.vm_id.to_string();
+    VmInfo {
+        vsock_path: crate::vsock_path(&vm_id).to_string_lossy().into_owned(),
+        vm_id,
+        state: record.status.state as i32,
+        config: Some(record.config),
     }
 }
 
@@ -126,6 +126,11 @@ async fn prepare_vm_creation(
         )));
     }
 
+    if let Some(config) = &req.config {
+        crate::vmm::validate_config(config)
+            .map_err(|e| VmServiceError::InvalidArgument(e.to_string()))?;
+    }
+
     let image_uuid_str = initiate_image_pull_for_vm(req).await?;
     let image_uuid = Uuid::parse_str(&image_uuid_str)
         .map_err(|e| VmServiceError::ImageService(format!("Failed to parse image UUID: {e}")))?;
@@ -138,6 +143,11 @@ async fn prepare_vm_creation(
         .net
         .iter_mut()
         .for_each(ensure_net_config_device_id);
+    for (index, disk) in vm_config.disks.iter_mut().enumerate() {
+        if disk.device_id.is_empty() {
+            disk.device_id = format!("disk{index}");
+        }
+    }
 
     let record = VmRecord {
         vm_id,
@@ -163,11 +173,7 @@ async fn get_vm_info(
         .map_err(|_| VmServiceError::InvalidArgument("Invalid VM ID format.".to_string()))?;
 
     match repository.get_vm(vm_id).await? {
-        Some(record) => Ok(VmInfo {
-            vm_id: record.vm_id.to_string(),
-            state: record.status.state as i32,
-            config: Some(record.config),
-        }),
+        Some(record) => Ok(vm_info(record)),
         None => Err(VmServiceError::Vmm(crate::vmm::VmmError::VmNotFound(
             vm_id.to_string(),
         ))),
@@ -502,14 +508,7 @@ pub(crate) async fn handle_list_vms_command(
     responder: oneshot::Sender<Result<ListVmsResponse, VmServiceError>>,
 ) {
     let result = repository.list_all_vms().await.map(|records| {
-        let vms = records
-            .into_iter()
-            .map(|record| VmInfo {
-                vm_id: record.vm_id.to_string(),
-                state: record.status.state as i32,
-                config: Some(record.config),
-            })
-            .collect();
+        let vms = records.into_iter().map(vm_info).collect();
         ListVmsResponse { vms }
     });
 
@@ -542,11 +541,8 @@ pub(crate) async fn handle_start_vm_command(
         return;
     }
 
-    let cancel_bus = if current_state == VmState::Stopped {
-        None
-    } else {
-        Some(healthcheck_cancel_bus_tx.subscribe())
-    };
+    // Every boot is a new VMM process to watch.
+    let cancel_bus = Some(healthcheck_cancel_bus_tx.subscribe());
 
     tokio::spawn(worker::handle_start_vm(
         req,
@@ -650,195 +646,47 @@ pub(crate) async fn handle_resume_vm_command(
     ));
 }
 
-pub(crate) async fn handle_attach_disk_command(
-    repository: &VmRepository,
-    req: AttachDiskRequest,
-    responder: oneshot::Sender<Result<AttachDiskResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
-        Ok(result) => result,
-        Err(e) => {
-            let _ = responder.send(Err(e));
-            return;
-        }
-    };
-
-    let current_state = record.status.state;
-    if !matches!(
-        current_state,
-        VmState::Created | VmState::Running | VmState::Paused | VmState::Stopped
-    ) {
-        let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-            "Cannot attach disk to VM in {current_state:?} state."
-        ))));
-        return;
-    }
-
-    tokio::spawn(worker::handle_attach_disk(req, responder, hypervisor));
-}
-
-pub(crate) async fn handle_detach_disk_command(
-    repository: &VmRepository,
-    req: DetachDiskRequest,
-    responder: oneshot::Sender<Result<DetachDiskResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
-        Ok(result) => result,
-        Err(e) => {
-            let _ = responder.send(Err(e));
-            return;
-        }
-    };
-
-    let current_state = record.status.state;
-    if !matches!(
-        current_state,
-        VmState::Created | VmState::Running | VmState::Paused | VmState::Stopped
-    ) {
-        let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-            "Cannot detach disk from VM in {current_state:?} state."
-        ))));
-        return;
-    }
-
-    tokio::spawn(worker::handle_detach_disk(req, responder, hypervisor));
-}
-
-pub(crate) async fn handle_attach_nic_command(
-    repository: &VmRepository,
-    req: AttachNicRequest,
-    responder: oneshot::Sender<Result<AttachNicResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let (_vm_id, mut record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
-        Ok(result) => result,
-        Err(e) => {
-            let _ = responder.send(Err(e));
-            return;
-        }
-    };
-
-    let current_state = record.status.state;
-    if matches!(current_state, VmState::Creating | VmState::Crashed) {
-        let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-            "Cannot attach NIC to VM in {current_state:?} state."
-        ))));
-        return;
-    }
-
-    let mut new_nic_config = match req.nic.clone() {
-        Some(nic) => nic,
-        None => {
-            let _ = responder.send(Err(VmServiceError::InvalidArgument(
-                "NetConfig is required in AttachNicRequest".to_string(),
-            )));
-            return;
-        }
-    };
-
-    ensure_net_config_device_id(&mut new_nic_config);
-
-    record.config.net.push(new_nic_config);
-
-    if let Err(e) = repository.save_vm(&record).await {
-        let _ = responder.send(Err(e.into()));
-        return;
-    }
-
-    tokio::spawn(worker::handle_attach_nic(req, responder, hypervisor));
-}
-
-pub(crate) async fn handle_detach_nic_command(
-    repository: &VmRepository,
-    req: DetachNicRequest,
-    responder: oneshot::Sender<Result<DetachNicResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let (_vm_id, mut record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
-        Ok(result) => result,
-        Err(e) => {
-            let _ = responder.send(Err(e));
-            return;
-        }
-    };
-
-    let current_state = record.status.state;
-    if matches!(current_state, VmState::Creating | VmState::Crashed) {
-        let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-            "Cannot detach NIC from VM in {current_state:?} state."
-        ))));
-        return;
-    }
-
-    let initial_len = record.config.net.len();
-    record
-        .config
-        .net
-        .retain(|nic| nic.device_id != req.device_id);
-
-    if record.config.net.len() == initial_len {
-        let _ = responder.send(Err(VmServiceError::InvalidArgument(format!(
-            "NIC with device_id '{}' not found in VM configuration.",
-            req.device_id
-        ))));
-        return;
-    }
-
-    if let Err(e) = repository.save_vm(&record).await {
-        let _ = responder.send(Err(e.into()));
-        return;
-    }
-
-    tokio::spawn(worker::handle_detach_nic(req, responder, hypervisor));
-}
-
 pub(crate) async fn check_and_cleanup_vms(
-    repository: &VmRepository,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
     healthcheck_cancel_bus: &broadcast::Sender<Uuid>,
     vms: Vec<VmRecord>,
 ) {
     for vm in vms {
-        if let Some(pid) = vm.status.process_id {
-            let pid_obj = Pid::from_raw(pid as i32);
-            let process_exists = nix::sys::signal::kill(pid_obj, None).is_ok();
+        // Only a running or paused VM has a VMM process.
+        if !matches!(vm.status.state, VmState::Running | VmState::Paused) {
+            continue;
+        }
+        let vm_id = vm.vm_id.to_string();
+        let alive = vm
+            .status
+            .process_id
+            .is_some_and(|pid| hypervisor.is_vmm_process(&vm_id, pid));
 
-            if process_exists {
-                info!("VmDispatcher (Sanity Check): Found running VM {} (PID: {}) from previous session. Starting health monitor.", vm.vm_id, pid);
-                let cancel_bus = healthcheck_cancel_bus.subscribe();
-                worker::start_healthcheck_monitor(
-                    vm.vm_id.to_string(),
-                    hypervisor.clone(),
-                    event_bus_tx.clone(),
-                    cancel_bus,
-                );
-            } else {
-                warn!("VmDispatcher (Sanity Check): Found VM {} in DB with PID {}, but process does not exist. Cleaning up.", vm.vm_id, pid);
-                let (resp_tx, resp_rx) = oneshot::channel();
-                let req = DeleteVmRequest {
-                    vm_id: vm.vm_id.to_string(),
-                };
-                let vm_id_for_log = vm.vm_id;
-
-                handle_delete_vm_command(
-                    repository,
-                    healthcheck_cancel_bus,
-                    req,
-                    resp_tx,
-                    hypervisor.clone(),
-                    event_bus_tx.clone(),
-                )
-                .await;
-
-                match resp_rx.await {
-                    Ok(Ok(_)) => info!("VmDispatcher (Sanity Check): Successfully cleaned up zombie VM {vm_id_for_log}."),
-                    Ok(Err(status)) => error!("VmDispatcher (Sanity Check): Failed to clean up zombie VM {vm_id_for_log}: {status}"),
-                    Err(_) => error!("VmDispatcher (Sanity Check): Cleanup task for zombie VM {vm_id_for_log} did not return a response."),
-                }
-            }
+        if alive {
+            info!("VmDispatcher (Sanity Check): Found running VM {vm_id} from previous session. Starting health monitor.");
+            let cancel_bus = healthcheck_cancel_bus.subscribe();
+            worker::start_healthcheck_monitor(
+                vm_id,
+                hypervisor.clone(),
+                event_bus_tx.clone(),
+                cancel_bus,
+            );
+        } else {
+            // The host restarted, or the VMM died while nobody watched. The
+            // VM keeps its disks and can be started again.
+            warn!("VmDispatcher (Sanity Check): VM {vm_id} was {:?}, but its VMM process is gone. Marking it stopped.", vm.status.state);
+            crate::vmm::broadcast_state_change_event(
+                &event_bus_tx,
+                &vm_id,
+                "vm-service",
+                VmStateChangedEvent {
+                    new_state: VmState::Stopped as i32,
+                    reason: "The VMM process was gone when the VM service started".to_string(),
+                },
+                None,
+            )
+            .await;
         }
     }
 }
@@ -859,14 +707,7 @@ pub(crate) async fn perform_startup_sanity_check(
                     "VmDispatcher (Sanity Check): Found {} VMs in persistence, checking status...",
                     vms.len()
                 );
-                check_and_cleanup_vms(
-                    repository,
-                    hypervisor,
-                    event_bus_tx,
-                    healthcheck_cancel_bus,
-                    vms,
-                )
-                .await;
+                check_and_cleanup_vms(hypervisor, event_bus_tx, healthcheck_cancel_bus, vms).await;
                 info!("VmDispatcher (Sanity Check): Check complete.");
             }
         }

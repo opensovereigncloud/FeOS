@@ -3,8 +3,6 @@ SHELL := /bin/bash
 include hack/build-container/make.mk
 include hack/kernel/make.mk
 include hack/initramfs/make.mk
-include hack/cloud-hypervisor/make.mk
-include hack/cloud-hypervisor-firmware/make.mk
 include hack/uki/make.mk
 include hack/firecracker/make.mk
 include hack/guest/make.mk
@@ -32,6 +30,3 @@ network:
 	sudo ip link set up dev vm-br0
 	sudo ip addr add fe80::1/64 dev vm-br0
 	sudo ip addr add 169.254.42.1/24 dev vm-br0
-
-run-vm:
-	sudo cloud-hypervisor --cpus boot=4 --memory size=1024M --net tap=tap0 --serial tty --kernel target/kernel/vmlinuz --initramfs target/initramfs.zst --cmdline "$(shell cat target/cmdline)"

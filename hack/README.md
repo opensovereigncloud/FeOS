@@ -26,7 +26,7 @@ The virtual machine has a virtio-net NIC attached which will be connected to a L
 With the make target `virsh-start` the VM will be created and started. `virsh-console` brings you into the serial console of the VM (you can exit it with `Ctrl+]`). To stop and destroy the VM call `make virsh-stop` - you'll probably want to concatenate those commands to `make virsh-start virsh-console virsh-stop`. This will start the VM, opens the serial console and waits for you to hit `Ctrl+]` to exit the serial console and destroy the VM.
 
 ### make run
-To test feos locally, you can execute `make run` to compile and run feos locally as a non-PID 1 process. You will still need cloud-hypervisor in your path.
+To test feos locally, you can execute `make run` to compile and run feos locally as a non-PID 1 process. The VM service needs `firecracker` in your path (`make firecracker` downloads it to `target/firecracker/`).
 
     make run
 
@@ -61,24 +61,27 @@ container after a reboot.
 
 ## Nested Virtualization Test Environment
 
-For integration tests of the `vm-service`, FeOS needs to run within a virtual machine that itself can run other VMs (e.g., cloud-hypervisor). This requires a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.
+`make test-vm` runs the integration tests of the `vm-service` against Firecracker, with the guest profile as the VM image. To run FeOS within a virtual machine that itself runs VMs, as on a real host, you need a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.
 
 For detailed instructions, please see the **[Nested Virtualization Test Environment Setup Guide](../docs/nested_virt_test_env.md)**.
 
-## Cloud-Hypervisor
-If you want to run FeOS within a [cloud-hypervisor](https://www.cloudhypervisor.org/) VM get some inspiration from this bash snippet:
+## Firecracker
+To boot the host image under [Firecracker](https://firecracker-microvm.github.io/) (`make firecracker`), give it a configuration like this one. Firecracker has no nested virtualization, so FeOS cannot run VMs in there.
 
     sudo ip tuntap add mode tap name tap0
     sudo ip link set tap0 up
     sudo ip link set tap0 master vm-br0
-    
-    cloud-hypervisor \
-        --cpus boot=4 \
-        --memory size=1024M \
-        --net tap=tap0 \
-        --serial tty \
-        --kernel target/kernel/vmlinuz \
-        --initramfs target/initramfs.zst \
-        --cmdline "`cat target/cmdline`"
 
-
+    cat > target/run-vm.json <<JSON
+    {
+      "boot-source": {
+        "kernel_image_path": "target/kernel/vmlinuz",
+        "initrd_path": "target/initramfs.zst",
+        "boot_args": "$(cat target/cmdline)"
+      },
+      "drives": [],
+      "machine-config": {"vcpu_count": 4, "mem_size_mib": 1024},
+      "network-interfaces": [{"iface_id": "eth0", "host_dev_name": "tap0"}]
+    }
+    JSON
+    sudo target/firecracker/firecracker --no-api --config-file target/run-vm.json

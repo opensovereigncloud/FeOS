@@ -1,0 +1,58 @@
+#!/bin/bash
+# Push the guest kernel and initramfs as a FeOS VM image to a registry on
+# this machine, which image-service reaches over plain HTTP.
+#
+#   hack/guest/push-image 127.0.0.1:5000/feos/guest:test
+#
+# Needs target/guest/{vmlinuz,initramfs.cpio.zst} (make guest).
+set -euo pipefail
+
+REF="${1:?usage: push-image <host:port/repository:tag>}"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+GUEST_DIR="${REPO_ROOT}/target/guest"
+
+REGISTRY="${REF%%/*}"
+NAME="${REF#*/}"
+TAG="${NAME##*:}"
+NAME="${NAME%:*}"
+BASE="http://${REGISTRY}/v2/${NAME}"
+
+# The layer media types image-service stores as vmlinuz and initramfs.
+KERNEL_TYPE="application/vnd.ironcore.image.vmlinuz.v1alpha1.vmlinuz"
+INITRAMFS_TYPE="application/vnd.ironcore.image.initramfs.v1alpha1.initramfs"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "${TMP}"' EXIT
+printf '{}' >"${TMP}/config"
+
+# Uploads a file as a blob and prints its descriptor.
+push_blob() {
+  local file="$1" media_type="$2" digest size location
+  digest="sha256:$(sha256sum "${file}" | cut -d' ' -f1)"
+  size=$(stat -c %s "${file}")
+  if ! curl -fs -o /dev/null -I "${BASE}/blobs/${digest}"; then
+    location=$(curl -fsS -X POST -D - -o /dev/null "${BASE}/blobs/uploads/" |
+      tr -d '\r' | sed -n 's/^[Ll]ocation: //p')
+    case "${location}" in
+      /*) location="http://${REGISTRY}${location}" ;;
+    esac
+    case "${location}" in
+      *\?*) location="${location}&digest=${digest}" ;;
+      *) location="${location}?digest=${digest}" ;;
+    esac
+    curl -fsS -X PUT -H "Content-Type: application/octet-stream" \
+      --data-binary "@${file}" "${location}" >/dev/null
+  fi
+  printf '{"mediaType":"%s","digest":"%s","size":%d}' "${media_type}" "${digest}" "${size}"
+}
+
+config=$(push_blob "${TMP}/config" "application/vnd.oci.empty.v1+json")
+kernel=$(push_blob "${GUEST_DIR}/vmlinuz" "${KERNEL_TYPE}")
+initramfs=$(push_blob "${GUEST_DIR}/initramfs.cpio.zst" "${INITRAMFS_TYPE}")
+
+cat >"${TMP}/manifest" <<JSON
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":${config},"layers":[${kernel},${initramfs}]}
+JSON
+curl -fsS -X PUT -H "Content-Type: application/vnd.oci.image.manifest.v1+json" \
+  --data-binary "@${TMP}/manifest" "${BASE}/manifests/${TAG}" >/dev/null
+echo "[push-image] pushed ${REF}"

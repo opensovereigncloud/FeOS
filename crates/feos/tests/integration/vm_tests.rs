@@ -2,44 +2,52 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::fixtures::{verify_vm_socket_cleanup, wait_for_target_state, VmGuard};
-use super::{ensure_server, get_public_clients, skip_if_ch_binary_missing, TEST_IMAGE_REF};
+use super::{ensure_server, get_public_clients, vm_test_image};
 use anyhow::{Context, Result};
-use feos_proto::vm_service::{
-    net_config, stream_vm_console_request as console_input, AttachConsoleMessage, AttachNicRequest,
-    CpuConfig, CreateVmRequest, DeleteVmRequest, DetachNicRequest, GetVmRequest, MemoryConfig,
-    NetConfig, PauseVmRequest, PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest,
-    StreamVmConsoleRequest, StreamVmEventsRequest, TapConfig, VmConfig, VmState,
+use feos_proto::host_service::{
+    host_service_client::HostServiceClient, GetVersionInfoRequest, PingRequest,
 };
+use feos_proto::vm_service::{
+    stream_vm_console_request as console_input, AttachConsoleMessage, CpuConfig, CreateVmRequest,
+    DeleteVmRequest, DiskConfig, GetVmRequest, MemoryConfig, PauseVmRequest, PingVmRequest,
+    ResumeVmRequest, ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest,
+    StreamVmEventsRequest, VmConfig, VmState,
+};
+use feos_utils::vsock::API_PORT;
 use log::info;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
+use vm_service::vm_dir;
 
 #[tokio::test]
 async fn test_create_and_start_vm() -> Result<()> {
-    if skip_if_ch_binary_missing() {
+    let Some(image_ref) = vm_test_image() else {
         return Ok(());
-    }
+    };
 
     ensure_server().await;
     let (mut vm_client, _, _) = get_public_clients().await?;
 
-    let image_ref = TEST_IMAGE_REF.clone();
+    // An empty data disk: the guest finds it, fails to mount it, and says so.
+    let disk_dir = tempfile::tempdir()?;
+    let disk = disk_dir.path().join("data.img");
+    std::fs::File::create(&disk)?.set_len(64 << 20)?;
+
     let vm_config = VmConfig {
-        cpus: Some(CpuConfig {
-            boot_vcpus: 2,
-            max_vcpus: 2,
-        }),
+        cpus: Some(CpuConfig { vcpu_count: 2 }),
         memory: Some(MemoryConfig {
-            size_mib: 2048,
+            size_mib: 512,
             hugepages: false,
         }),
         image_ref,
-        disks: vec![],
+        disks: vec![DiskConfig {
+            path: disk.to_string_lossy().into_owned(),
+            ..Default::default()
+        }],
         net: vec![],
-        ignition: None,
     };
     let create_req = CreateVmRequest {
         config: Some(vm_config),
@@ -212,66 +220,60 @@ async fn test_create_and_start_vm() -> Result<()> {
     info!("VMM Ping successful, PID: {}", ping_res.pid);
     guard.set_pid(ping_res.pid as i32);
 
-    info!("Attaching NIC 'test-nic' to vm_id: {vm_id}");
-    let attach_nic_req = AttachNicRequest {
-        vm_id: vm_id.clone(),
-        nic: Some(NetConfig {
-            device_id: "test".to_string(),
-            backend: Some(net_config::Backend::Tap(TapConfig {
-                tap_name: "test".to_string(),
-            })),
-            ..Default::default()
-        }),
-    };
-    let attach_res = vm_client.attach_nic(attach_nic_req).await?.into_inner();
-    assert_eq!(attach_res.device_id, "test");
-    info!(
-        "AttachNic call successful, device_id: {}",
-        attach_res.device_id
-    );
+    // The guest is FeOS: its API answers behind the VM's vsock.
+    let vsock_path = info_res.vsock_path;
+    info!("Pinging the guest through {vsock_path}");
+    let guest_ping = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(channel) = feos_utils::vsock::channel(&vsock_path, API_PORT).await
+                && let Ok(ping) = HostServiceClient::new(channel).ping(PingRequest {}).await
+            {
+                return ping.into_inner();
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Timed out waiting for the guest's API");
+    info!("The guest answered, uptime {}s", guest_ping.uptime_seconds);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    info!("Verifying NIC was attached with GetVm");
-    let get_req_after_attach = GetVmRequest {
-        vm_id: vm_id.clone(),
-    };
-    let info_res_after_attach = vm_client.get_vm(get_req_after_attach).await?.into_inner();
-    let nic_found = info_res_after_attach
-        .config
-        .expect("VM should have a config")
-        .net
-        .iter()
-        .any(|nic| nic.device_id == "test");
-    assert!(nic_found, "Attached NIC 'test' was not found in VM config");
-    info!("Successfully verified NIC attachment.");
-
-    info!("Detaching NIC 'test' from vm_id: {vm_id}");
-    let detach_nic_req = DetachNicRequest {
-        vm_id: vm_id.clone(),
-        device_id: "test".to_string(),
-    };
-    vm_client.detach_nic(detach_nic_req).await?;
-    info!("DetachNic call successful");
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    info!("Verifying NIC was removed with GetVm");
-    let get_req_after_remove = GetVmRequest {
-        vm_id: vm_id.clone(),
-    };
-    let info_res_after_remove = vm_client.get_vm(get_req_after_remove).await?.into_inner();
-    let nic_still_present = info_res_after_remove
-        .config
-        .expect("VM should have a config")
-        .net
-        .iter()
-        .any(|nic| nic.device_id == "test");
+    let serial_log = std::fs::read_to_string(vm_dir(&vm_id).join("serial.log"))?;
     assert!(
-        !nic_still_present,
-        "Removed NIC 'test' was still found in VM config"
+        serial_log.contains("data volume /dev/vda"),
+        "The guest should have found its data disk"
     );
-    info!("Successfully verified NIC removal.");
+
+    info!("Reading the console while the guest logs a call");
+    let (console_tx, console_rx) = tokio::sync::mpsc::channel(1);
+    console_tx
+        .send(StreamVmConsoleRequest {
+            payload: Some(console_input::Payload::Attach(AttachConsoleMessage {
+                vm_id: vm_id.clone(),
+            })),
+        })
+        .await?;
+    let mut console = vm_client
+        .stream_vm_console(tokio_stream::wrappers::ReceiverStream::new(console_rx))
+        .await?
+        .into_inner();
+    // The console shows output from the moment it is attached.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let guest = feos_utils::vsock::channel(&vsock_path, API_PORT).await?;
+    HostServiceClient::new(guest)
+        .get_version_info(GetVersionInfoRequest {})
+        .await?;
+    let mut output = String::new();
+    timeout(Duration::from_secs(10), async {
+        while !output.contains("GetVersionInfo") {
+            match console.next().await {
+                Some(Ok(chunk)) => output.push_str(&String::from_utf8_lossy(&chunk.output)),
+                other => panic!("The console ended: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("The guest's log line did not show on the console");
+    drop(console_tx);
 
     info!("Deleting VM: {vm_id}");
     let delete_req = DeleteVmRequest {
@@ -288,27 +290,22 @@ async fn test_create_and_start_vm() -> Result<()> {
 
 #[tokio::test]
 async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
-    if skip_if_ch_binary_missing() {
+    let Some(image_ref) = vm_test_image() else {
         return Ok(());
-    }
+    };
 
     ensure_server().await;
     let (mut vm_client, _, _) = get_public_clients().await?;
 
-    let image_ref = TEST_IMAGE_REF.clone();
     let vm_config = VmConfig {
-        cpus: Some(CpuConfig {
-            boot_vcpus: 1,
-            max_vcpus: 1,
-        }),
+        cpus: Some(CpuConfig { vcpu_count: 1 }),
         memory: Some(MemoryConfig {
-            size_mib: 1024,
+            size_mib: 256,
             hugepages: false,
         }),
         image_ref,
         disks: vec![],
         net: vec![],
-        ignition: None,
     };
     let create_req = CreateVmRequest {
         config: Some(vm_config),

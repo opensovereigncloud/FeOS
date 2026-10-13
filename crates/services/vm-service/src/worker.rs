@@ -8,20 +8,17 @@ use crate::{
 use feos_proto::{
     image_service::{ImageState as OciImageState, WatchImageStatusRequest},
     vm_service::{
-        stream_vm_console_request as console_input, AttachDiskRequest, AttachDiskResponse,
-        AttachNicRequest, AttachNicResponse, ConsoleData, CreateVmRequest, CreateVmResponse,
-        DeleteVmRequest, DeleteVmResponse, DetachDiskRequest, DetachDiskResponse, DetachNicRequest,
-        DetachNicResponse, GetVmRequest, PauseVmRequest, PauseVmResponse, PingVmRequest,
+        stream_vm_console_request as console_input, ConsoleData, CreateVmRequest, CreateVmResponse,
+        DeleteVmRequest, DeleteVmResponse, PauseVmRequest, PauseVmResponse, PingVmRequest,
         PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
         StartVmRequest, StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse,
-        StreamVmEventsRequest, VmEvent, VmInfo, VmState, VmStateChangedEvent,
+        StreamVmEventsRequest, VmEvent, VmState, VmStateChangedEvent,
     },
 };
 use log::{error, info, warn};
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
+    io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
     sync::{broadcast, mpsc, oneshot},
 };
 use tokio_stream::StreamExt;
@@ -184,7 +181,7 @@ pub async fn handle_start_vm(
     let vm_id = req.vm_id.clone();
     let result = hypervisor.start_vm(req).await;
 
-    if result.is_ok() {
+    if let Ok(pid) = result {
         crate::vmm::broadcast_state_change_event(
             &broadcast_tx,
             &vm_id,
@@ -193,7 +190,7 @@ pub async fn handle_start_vm(
                 new_state: VmState::Running as i32,
                 reason: "Start command successful".to_string(),
             },
-            None,
+            Some(pid),
         )
         .await;
 
@@ -202,19 +199,9 @@ pub async fn handle_start_vm(
         }
     }
 
+    let result = result.map(|_pid| StartVmResponse {});
     if responder.send(result.map_err(Into::into)).is_err() {
         error!("VmWorker: Failed to send response for StartVm.");
-    }
-}
-
-pub async fn handle_get_vm(
-    req: GetVmRequest,
-    responder: oneshot::Sender<Result<VmInfo, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let result = hypervisor.get_vm(req).await;
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmWorker: Failed to send response for GetVm.");
     }
 }
 
@@ -303,15 +290,15 @@ pub async fn spawn_console_bridge(
     output_tx: mpsc::Sender<Result<StreamVmConsoleResponse, Status>>,
     hypervisor: Arc<dyn Hypervisor>,
 ) {
-    let socket_path = match hypervisor.get_console_socket_path(&vm_id).await {
-        Ok(path) => path,
+    let console = match hypervisor.open_console(&vm_id).await {
+        Ok(console) => console,
         Err(e) => {
             let _ = output_tx.send(Err(e.into())).await;
             return;
         }
     };
 
-    bridge_console_streams(socket_path, input_stream, output_tx).await;
+    bridge_console_streams(vm_id, console, input_stream, output_tx).await;
 }
 
 pub async fn handle_ping_vm(
@@ -409,72 +396,13 @@ pub async fn handle_resume_vm(
     }
 }
 
-pub async fn handle_attach_disk(
-    req: AttachDiskRequest,
-    responder: oneshot::Sender<Result<AttachDiskResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let result = hypervisor.attach_disk(req).await;
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmWorker: Failed to send response for AttachDisk.");
-    }
-}
-
-pub async fn handle_detach_disk(
-    req: DetachDiskRequest,
-    responder: oneshot::Sender<Result<DetachDiskResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let result = hypervisor.detach_disk(req).await;
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmWorker: Failed to send response for DetachDisk.");
-    }
-}
-
-pub async fn handle_attach_nic(
-    req: AttachNicRequest,
-    responder: oneshot::Sender<Result<AttachNicResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let result = hypervisor.attach_nic(req).await;
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmWorker: Failed to send response for AttachNic.");
-    }
-}
-
-pub async fn handle_detach_nic(
-    req: DetachNicRequest,
-    responder: oneshot::Sender<Result<DetachNicResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    let result = hypervisor.detach_nic(req).await;
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmWorker: Failed to send response for DetachNic.");
-    }
-}
-
 async fn bridge_console_streams(
-    socket_path: PathBuf,
+    vm_id: String,
+    console: DuplexStream,
     mut grpc_input: Streaming<StreamVmConsoleRequest>,
     grpc_output: mpsc::Sender<Result<StreamVmConsoleResponse, Status>>,
 ) {
-    let vm_id = socket_path
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap_or("unknown")
-        .to_string();
-
-    let socket = match UnixStream::connect(&socket_path).await {
-        Ok(s) => s,
-        Err(e) => {
-            let err_msg = format!("Failed to connect to console socket at {socket_path:?}: {e}");
-            let _ = grpc_output.send(Err(Status::unavailable(err_msg))).await;
-            return;
-        }
-    };
-
-    let (mut socket_reader, mut socket_writer) = tokio::io::split(socket);
+    let (mut socket_reader, mut socket_writer) = tokio::io::split(console);
     let grpc_output_clone = grpc_output.clone();
     let read_task_vm_id = vm_id.clone();
 

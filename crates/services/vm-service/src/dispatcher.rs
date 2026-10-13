@@ -3,12 +3,10 @@
 
 use crate::{
     dispatcher_handlers::{
-        handle_attach_disk_command, handle_attach_nic_command, handle_create_vm_command,
-        handle_delete_vm_command, handle_detach_disk_command, handle_detach_nic_command,
-        handle_get_vm_command, handle_list_vms_command, handle_pause_vm_command,
-        handle_resume_vm_command, handle_shutdown_vm_command, handle_start_vm_command,
-        handle_stream_vm_console_command, handle_stream_vm_events_command,
-        perform_startup_sanity_check,
+        handle_create_vm_command, handle_delete_vm_command, handle_get_vm_command,
+        handle_list_vms_command, handle_pause_vm_command, handle_resume_vm_command,
+        handle_shutdown_vm_command, handle_start_vm_command, handle_stream_vm_console_command,
+        handle_stream_vm_events_command, perform_startup_sanity_check,
     },
     error::VmServiceError,
     persistence::repository::VmRepository,
@@ -37,7 +35,7 @@ impl VmServiceDispatcher {
         let (event_bus_tx, event_bus_rx_for_dispatcher) = mpsc::channel(32);
         let (status_channel_tx, _) = broadcast::channel(32);
         let (healthcheck_cancel_bus, _) = broadcast::channel::<Uuid>(32);
-        let hypervisor = Arc::from(factory(VmmType::CloudHypervisor));
+        let hypervisor = Arc::from(factory(VmmType::Firecracker));
         info!("VmDispatcher: Connecting to persistence layer at {db_url}...");
         let repository = VmRepository::connect(db_url).await?;
         info!("VmDispatcher: Persistence layer connected successfully.");
@@ -103,18 +101,6 @@ impl VmServiceDispatcher {
                         }
                         Command::ResumeVm(req, responder) => {
                             handle_resume_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx).await;
-                        }
-                        Command::AttachDisk(req, responder) => {
-                            handle_attach_disk_command(&self.repository, req, responder, hypervisor).await;
-                        }
-                        Command::DetachDisk(req, responder) => {
-                            handle_detach_disk_command(&self.repository, req, responder, hypervisor).await;
-                        }
-                        Command::AttachNic(req, responder) => {
-                            handle_attach_nic_command(&self.repository, req, responder, hypervisor).await;
-                        }
-                        Command::DetachNic(req, responder) => {
-                            handle_detach_nic_command(&self.repository, req, responder, hypervisor).await;
                         }
                     }
                 },

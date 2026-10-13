@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tokio::sync::OnceCell as TokioOnceCell;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use vm_service::VM_CH_BIN;
+use vm_service::FIRECRACKER_BIN;
 
 pub mod container_tests;
 pub mod fixtures;
@@ -30,11 +30,13 @@ pub mod image_tests;
 pub mod vm_tests;
 
 pub const PUBLIC_SERVER_ADDRESS: &str = "http://[::1]:1337";
-pub const DEFAULT_TEST_IMAGE_REF: &str = "ghcr.io/ironcore-dev/os-images/gardenlinux-ch-dev";
 pub const DEFAULT_TEST_CONTAINER_IMAGE_REF: &str = "docker.io/library/busybox:1.36";
 
-pub static TEST_IMAGE_REF: Lazy<String> =
-    Lazy::new(|| env::var("TEST_IMAGE_REF").unwrap_or_else(|_| DEFAULT_TEST_IMAGE_REF.to_string()));
+/// The FeOS guest as a VM image: the VM tests talk to its API over vsock and
+/// shut it down with Ctrl-Alt-Del. `make test-vm` pushes one to a local
+/// registry and runs the VM tests against it.
+pub static TEST_IMAGE_REF: Lazy<Option<String>> =
+    Lazy::new(|| env::var("TEST_IMAGE_REF").ok().filter(|r| !r.is_empty()));
 pub static TEST_CONTAINER_IMAGE_REF: Lazy<String> = Lazy::new(|| {
     env::var("TEST_CONTAINER_IMAGE_REF")
         .unwrap_or_else(|_| DEFAULT_TEST_CONTAINER_IMAGE_REF.to_string())
@@ -124,18 +126,22 @@ pub async fn get_image_service_client() -> Result<ImageServiceClient<Channel>> {
     Ok(ImageServiceClient::new(channel))
 }
 
-pub fn check_ch_binary() -> bool {
+pub fn check_firecracker_binary() -> bool {
     Command::new("which")
-        .arg(VM_CH_BIN)
+        .arg(FIRECRACKER_BIN)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-pub fn skip_if_ch_binary_missing() -> bool {
-    if !check_ch_binary() {
-        log::warn!("Skipping test because '{VM_CH_BIN}' binary was not found in PATH.");
-        return true;
+/// The VM image to test with, unless the test has to be skipped.
+pub fn vm_test_image() -> Option<String> {
+    if !check_firecracker_binary() {
+        log::warn!("Skipping test because '{FIRECRACKER_BIN}' binary was not found in PATH.");
+        return None;
     }
-    false
+    if TEST_IMAGE_REF.is_none() {
+        log::warn!("Skipping test because TEST_IMAGE_REF names no VM image.");
+    }
+    TEST_IMAGE_REF.clone()
 }
