@@ -26,7 +26,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::task;
 
@@ -162,13 +162,23 @@ fn send_router_solicitation(interface: &NetworkInterface, tx: &mut dyn datalink:
     }
 }
 
+// Router solicitation timing from RFC 4861, section 10.
+const MAX_RTR_SOLICITATIONS: u32 = 3;
+const RTR_SOLICITATION_INTERVAL: Duration = Duration::from_secs(4);
+
+/// Solicits a router advertisement on the interface and returns the router's
+/// address. Returns None if no router answers in time, so boot goes on
+/// without DHCPv6 instead of waiting forever.
 pub fn is_dhcpv6_needed(interface_name: String, ignore_ra_flag: bool) -> Option<Ipv6Addr> {
-    let mut sender_ipv6_address: Option<Ipv6Addr> = None;
     let interfaces = datalink::interfaces();
     let interface = interfaces
         .into_iter()
         .find(|iface| iface.name == interface_name)?;
-    let (mut tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+    let config = datalink::Config {
+        read_timeout: Some(Duration::from_secs(1)),
+        ..Default::default()
+    };
+    let (mut tx, mut rx) = match datalink::channel(&interface, config) {
         Ok(Ethernet(tx, rx)) => (tx, rx),
         _ => return None,
     };
@@ -176,23 +186,39 @@ pub fn is_dhcpv6_needed(interface_name: String, ignore_ra_flag: bool) -> Option<
     info!("Sending Router Solicitation ...");
     sleep(Duration::from_secs(5));
     send_router_solicitation(&interface, &mut *tx);
+    let mut solicitations = 1;
+    let mut next_solicitation = Instant::now() + RTR_SOLICITATION_INTERVAL;
 
-    while let Ok(raw_packet) = rx.next() {
+    loop {
+        let raw_packet = match rx.next() {
+            Ok(raw_packet) => raw_packet,
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => &[],
+            Err(e) => {
+                error!("Failed to receive router advertisements: {e}");
+                return None;
+            }
+        };
         if let Some(eth_packet) = EthernetPacket::new(raw_packet)
             && eth_packet.get_ethertype() == EtherTypes::Ipv6
             && let Some(ipv6_packet) = Ipv6Packet::new(eth_packet.payload())
+            && let Some(icmp_packet) = Icmpv6Packet::new(ipv6_packet.payload())
+            && icmp_packet.get_icmpv6_type() == Icmpv6Types::RouterAdvert
+            && let Some(ra_packet) = RouterAdvertPacket::new(ipv6_packet.payload())
+            && ((ra_packet.get_flags() & 0xC0) == 0xC0 || ignore_ra_flag)
         {
-            sender_ipv6_address = Some(ipv6_packet.get_source());
-            if let Some(icmp_packet) = Icmpv6Packet::new(ipv6_packet.payload())
-                && icmp_packet.get_icmpv6_type() == Icmpv6Types::RouterAdvert
-                && let Some(ra_packet) = RouterAdvertPacket::new(ipv6_packet.payload())
-                && ((ra_packet.get_flags() & 0xC0) == 0xC0 || ignore_ra_flag)
-            {
-                break;
+            return Some(ipv6_packet.get_source());
+        }
+
+        if Instant::now() >= next_solicitation {
+            if solicitations == MAX_RTR_SOLICITATIONS {
+                warn!("No router advertisement on {interface_name}, skipping DHCPv6");
+                return None;
             }
+            send_router_solicitation(&interface, &mut *tx);
+            solicitations += 1;
+            next_solicitation = Instant::now() + RTR_SOLICITATION_INTERVAL;
         }
     }
-    sender_ipv6_address
 }
 
 #[derive(Debug)]
@@ -211,10 +237,8 @@ pub struct Dhcpv6Result {
 pub async fn run_dhcpv6_client(
     interface_name: String,
 ) -> Result<Dhcpv6Result, Box<dyn std::error::Error + Send + Sync>> {
-    let chaddr = vec![
-        29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
-    ];
-    let random_xid: [u8; 3] = [0x12, 0x34, 0x56];
+    let chaddr = duid_ll(&interface_name).ok_or("Interface has no MAC address")?;
+    let random_xid: [u8; 3] = rand::random();
     let multicast_address = "[FF02::1:2]:547".parse::<SocketAddr>().unwrap();
     let mut ia_addr_confirm: Option<DhcpOption> = None;
     let mut ia_pd_confirm: Option<IAPrefix> = None;
@@ -450,6 +474,19 @@ pub async fn run_dhcpv6_client(
     }
 
     Err("No valid address received".into())
+}
+
+/// DUID-LL (RFC 8415, section 11.4) from the interface's MAC address, so that
+/// every host sends its own client identifier.
+fn duid_ll(interface_name: &str) -> Option<Vec<u8>> {
+    let mac = datalink::interfaces()
+        .into_iter()
+        .find(|iface| iface.name == interface_name)?
+        .mac?;
+    // DUID type 3 (link-layer address), hardware type 1 (Ethernet).
+    let mut duid = vec![0x00, 0x03, 0x00, 0x01];
+    duid.extend_from_slice(&mac.octets());
+    Some(duid)
 }
 
 pub async fn set_ipv6_address(

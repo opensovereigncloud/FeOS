@@ -145,7 +145,8 @@ async fn get_device_information(pci: &str, field: &str) -> Result<String, io::Er
 pub async fn configure_network_devices() -> Result<Option<(Ipv6Addr, u8, Vec<Ipv6Addr>)>, String> {
     let ignore_ra_flag = true; // Till the RA has the correct flags (O or M), ignore the flag
     let interface_name = String::from(INTERFACE_NAME);
-    let (connection, handle, _) = new_connection().unwrap();
+    let (connection, handle, _) =
+        new_connection().map_err(|e| format!("Failed to open a netlink connection: {e}"))?;
     let mut result_option: Option<(Ipv6Addr, u8, Vec<Ipv6Addr>)> = None;
     tokio::spawn(connection);
 
@@ -191,7 +192,13 @@ pub async fn configure_network_devices() -> Result<Option<(Ipv6Addr, u8, Vec<Ipv
         }
     }
 
-    if let Some(ipv6_gateway) = is_dhcpv6_needed(interface_name.clone(), ignore_ra_flag) {
+    // Router discovery blocks on a raw socket; keep it off the async workers.
+    let ra_interface = interface_name.clone();
+    let ra_gateway =
+        tokio::task::spawn_blocking(move || is_dhcpv6_needed(ra_interface, ignore_ra_flag))
+            .await
+            .map_err(|e| format!("Router discovery failed: {e}"))?;
+    if let Some(ipv6_gateway) = ra_gateway {
         sleep(Duration::from_secs(4)).await;
         match run_dhcpv6_client(interface_name.clone()).await {
             Ok(result) => {

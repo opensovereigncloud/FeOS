@@ -218,12 +218,13 @@ async fn initialize_host_hardware() -> Result<BootInfo> {
 
     info!("Main: Configuring network devices...");
     let mut ntp_servers = Vec::new();
-    if let Some((delegated_prefix, delegated_prefix_length, servers)) = configure_network_devices()
-        .await
-        .expect("could not configure network devices")
-    {
-        info!("Main: Delegated prefix: {delegated_prefix}/{delegated_prefix_length}");
-        ntp_servers = servers;
+    match configure_network_devices().await {
+        Ok(Some((delegated_prefix, delegated_prefix_length, servers))) => {
+            info!("Main: Delegated prefix: {delegated_prefix}/{delegated_prefix_length}");
+            ntp_servers = servers;
+        }
+        Ok(None) => {}
+        Err(e) => error!("Main: Could not configure network devices: {e}"),
     }
 
     if !is_on_vm {
