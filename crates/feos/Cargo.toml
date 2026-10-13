@@ -36,7 +36,6 @@ tower = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true }
-dotenvy = { workspace = true }
 prost = { workspace = true }
 libc = { workspace = true }
 

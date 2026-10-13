@@ -46,8 +46,6 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
         warn!("Not running as root! (uid: {})", Uid::current());
     }
 
-    dotenvy::dotenv().ok();
-
     let mut boot_info = BootInfo::default();
 
     if !restarted_after_upgrade {
