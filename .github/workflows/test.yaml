@@ -13,6 +13,10 @@ jobs:
     - name: Install Protobuf Compiler
       run: sudo apt-get update && sudo apt-get install protobuf-compiler curl -y
 
+    - name: Install Rust Toolchain
+      # Installs the toolchain rust-toolchain.toml pins.
+      run: rustup toolchain install
+
     - name: Set up cargo cache
       uses: actions/cache@v4
       continue-on-error: false
@@ -58,5 +62,6 @@ jobs:
         sudo -E bash -c ' \
           export PATH="$HOME/.cargo/bin:$PATH"; \
           export CARGO_HOME="$HOME/.cargo"; \
+          export RUSTUP_HOME="$HOME/.rustup"; \
           make test \
         '

@@ -18,8 +18,13 @@ jobs:
     - name: Install Protobuf Compiler
       run: sudo apt-get update && sudo apt-get install protobuf-compiler -y
 
+    - name: Install Rust Toolchain
+      # Installs the toolchain rust-toolchain.toml pins.
+      run: rustup toolchain install
+
     - name: Run Tests
-      run: make test
+      # The integration tests need root and run in the test workflow.
+      run: make test-unit
 
     - name: Build build-container
       run: make build-container
@@ -47,4 +52,4 @@ jobs:
         body_path: docs/changelog/FeOS-${{ github.ref_name }}.md
         files: |
           target/feos-${{ github.ref_name }}-x86_64.efi
-          keys/FeOS.crt
+          keys/feos.crt

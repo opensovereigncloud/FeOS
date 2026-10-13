@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - master
-      - fix_test
     tags:
     - '*'
     paths-ignore:
@@ -27,14 +26,14 @@ jobs:
       id: meta
       with:
         images: |
-          ghcr.io/ironcore-dev/feos/feos
+          ghcr.io/${{ github.repository }}/feos
         tags: |
           type=ref,event=branch
           type=ref,event=pr
           type=semver,pattern={{version}}
           type=semver,pattern={{major}}.{{minor}}
         flavor: |
-          latest=${{ github.ref == 'refs/heads/main' }}
+          latest=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
     - name: Install Protobuf Compiler
       run: sudo apt-get update && sudo apt-get install protobuf-compiler -y
@@ -48,6 +47,10 @@ jobs:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install Rust Toolchain
+      # Installs the toolchain rust-toolchain.toml pins.
+      run: rustup toolchain install
 
     - name: Set up cargo cache
       uses: actions/cache@v4
@@ -94,6 +97,7 @@ jobs:
         sudo -E bash -c ' \
           export PATH="$HOME/.cargo/bin:$PATH"; \
           export CARGO_HOME="$HOME/.cargo"; \
+          export RUSTUP_HOME="$HOME/.rustup"; \
           make test; \
           make clean
         '
@@ -118,9 +122,7 @@ jobs:
 
     - name: Build UKI
       run: |
-        CMDLINE="console=tty0 console=ttyS0,115200 earlyprintk=ttyS0,115200 consoleblank=0"
-        echo "CMDLINE=CMDLINE" >> $GITHUB_ENV
-        echo $CMDLINE >> target/cmdline
+        echo "console=tty0 console=ttyS0,115200 earlyprintk=ttyS0,115200 consoleblank=0" > target/cmdline
         mkdir keys
         echo "${{ secrets.SECUREBOOT_PRIVATEKEY }}" > keys/secureboot.key
         echo "${{ secrets.SECUREBOOT_CERTIFICATE }}" > keys/secureboot.pem
@@ -129,8 +131,8 @@ jobs:
 
     - name: Create Config JSON
       run: |
-        command_line=$(${{ env.CMDLINE }} | tr -d '\n' | tr -d '\r') 
-        echo "{\"commandLine\": \"$command_line\", \"os-release\": \"$OS_VERSION\"}" > config.json
+        jq -n --arg cmdline "$(cat target/cmdline)" --arg version "${{ github.ref_name }}" \
+          '{commandLine: $cmdline, "os-release": $version}' > config.json
 
     - name: Build rootfs img
       run: |

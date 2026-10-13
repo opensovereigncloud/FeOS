@@ -1,26 +1,45 @@
-IPAM ?=
+MUSL_TARGET := x86_64-unknown-linux-musl
 
 ##@ Development
 
-.PHONY: all clippy release run clean cli test
+.PHONY: all clippy fmt-check release release-guest run clean cli test test-unit
 
-clippy:
-	cargo clippy
+# feos builds in two profiles: the host profile (the default features) for
+# bare-metal hypervisors, and the guest profile (--no-default-features) for
+# PID 1 in a microVM. Lint and build both.
 
-all: clippy
-	cargo build --target=x86_64-unknown-linux-musl --all
+clippy: ## Lint the workspace in the host profile and feos in the guest profile.
+	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy -p feos --no-default-features --all-targets -- -D warnings
 
-release: clippy
-	cargo build --release --features git-version --target=x86_64-unknown-linux-musl --all
+fmt-check: ## Check formatting.
+	cargo fmt --check
 
-run: all
-	sudo ./target/debug/feos --ipam $(IPAM)
+all: clippy ## Debug build of the workspace for musl.
+	cargo build --target=$(MUSL_TARGET) --workspace
+
+# Release artifacts are built per package with -p, never with --workspace:
+# that would unify the features of all crates into every binary.
+release: clippy ## Release build of feos in the host profile.
+	cargo build --release --features git-version --target=$(MUSL_TARGET) -p feos
+
+release-guest: clippy ## Release build of feos in the guest profile.
+	cargo build --profile release-guest --no-default-features --features git-version --target=$(MUSL_TARGET) -p feos
+
+run: all ## Run the debug build as root.
+	sudo ./target/$(MUSL_TARGET)/debug/feos
 
 clean:
 	rm -rf target
 
-test: clippy
-	cargo test
+test: clippy ## All tests. The integration tests need root.
+	cargo test --workspace
+
+test-unit: ## Unit tests only; they run without root.
+	cargo test --workspace --lib --bins
+
+cli: ## Release build of feosctl.
+	cargo build --package feosctl --release
 
 .PHONY: add-license
 add-license: addlicense ## Add license headers to all Rust files.
@@ -31,9 +50,6 @@ check-license: addlicense ## Check license headers in all Rust files.
 	find . -name '*.rs' -exec "$(ADDLICENSE)" -check -c 'IronCore authors' {} +
 
 include hack/hack.mk
-
-cli:
-	cargo build --package feosctl --release
 
 ##@ Tools
 
