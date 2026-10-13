@@ -3,7 +3,8 @@
 
 //! ToolService: agent tool primitives implemented natively in FeOS
 //! (not inside the sandbox container). All of them operate on the *payload
-//! container's* rootfs, confined via openat2(RESOLVE_BENEATH) (fs.rs):
+//! container's* rootfs, confined via openat2(RESOLVE_BENEATH)
+//! (feos_utils::container_fs):
 //! the tool surface is image-independent — it works against a scratch image.
 //!
 //!   webfetch  HTTP fetch (ureq/rustls) + readable extraction (trafilatura-rs)
@@ -31,7 +32,7 @@ use nix::libc;
 use tonic::{Request, Response, Status};
 use ureq::ResponseExt;
 
-use crate::fs as toolfs;
+use feos_utils::container_fs as toolfs;
 
 const MAX_BODY: usize = 2 * 1024 * 1024; // webfetch: cap the parsed HTML
 const REQ_TIMEOUT: Duration = Duration::from_secs(30);

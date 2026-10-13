@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! openat2-confined filesystem access for the ToolService file primitives.
+//! openat2-confined access to a container's root filesystem, for the tool
+//! and watch services.
 //!
 //! Every file op is anchored at a dirfd of the container's rootfs and
 //! resolved with RESOLVE_BENEATH, so neither lexical "..", nor symlinks
@@ -29,13 +30,13 @@ use nix::fcntl::{OFlag, ResolveFlag};
 use nix::libc;
 use nix::sys::stat::Mode;
 
-use feos_utils::filesystem::CONTAINERS_DIR;
-pub(crate) use feos_utils::fs::openat2_confined;
-use feos_utils::resolver;
+use crate::filesystem::CONTAINERS_DIR;
+use crate::fs::openat2_confined;
+use crate::resolver;
 
 /// What a write to the managed /etc/resolv.conf gets; inside the container
 /// the same write fails with EROFS.
-pub(crate) const READ_ONLY: &str = "/etc/resolv.conf is managed by FeOS and read-only: \
+pub const READ_ONLY: &str = "/etc/resolv.conf is managed by FeOS and read-only: \
      it links to /run/feos/resolv.conf, the resolvers the host pushed";
 
 fn container_dir(name: &str) -> PathBuf {
@@ -223,7 +224,7 @@ mod tests {
     /// other absolute link, take the ordinary path.
     #[test]
     fn managed_resolver_is_decided_before_the_open() {
-        use feos_utils::resolver::CONTAINER_RESOLVER as PAYLOAD_RESOLVER;
+        use crate::resolver::CONTAINER_RESOLVER as PAYLOAD_RESOLVER;
         use std::io::Read;
         use std::os::unix::fs::symlink;
         let base =

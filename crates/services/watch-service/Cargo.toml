@@ -1,0 +1,16 @@
+[package]
+name = "watch-service"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-proto = { workspace = true }
+feos-utils = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true, features = ["inotify"] }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }

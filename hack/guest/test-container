@@ -137,6 +137,16 @@ tool write /etc/resolv.conf </dev/null 2>/dev/null && fail "tool wrote the manag
 [ "$(cexec cat /work/notes.txt)" = "$(printf 'alpha\ngamma')" ] || fail "tool changes not visible in the container"
 log "tools read, write, edit, rg and fd in the container"
 
+WATCH_LOG="${RUN_DIR}/watch.log"
+"${FEOSCTL}" watch --address "vsock:${VSOCK}" --container main /work >"${WATCH_LOG}" 2>&1 &
+WATCH_PID=$!
+for _ in $(seq 50); do grep -q "^watching" "${WATCH_LOG}" && break; sleep 0.1; done
+cexec touch /work/new-file
+for _ in $(seq 50); do grep -q "CREATED /work/new-file" "${WATCH_LOG}" && break; sleep 0.1; done
+kill "${WATCH_PID}" 2>/dev/null || true
+grep -q "CREATED /work/new-file" "${WATCH_LOG}" || fail "watch saw no event: $(cat "${WATCH_LOG}")"
+log "watch reports a file created in the container"
+
 # A host freezes the data volume before it stops a guest it wants to adopt
 # later; freezing writes back what is in the guest's page cache.
 ctl host freeze >/dev/null

@@ -5,7 +5,6 @@
 //! FeOS and confined to a container's root filesystem, so that it works
 //! whatever the image contains, even a scratch image.
 
-mod fs;
 mod tools;
 
 pub use tools::ToolApiHandler;

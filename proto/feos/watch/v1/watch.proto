@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package feos.watch.v1;
+
+// WatchService turns the guest's inotify into a subscription API. A
+// platform client showing a workspace subscribes to the
+// directories it displays and is told when they change, instead of
+// polling twenty directories through four hops on a timer.
+//
+// The shape is PortForwardService's: one bidirectional stream per
+// subscriber, and the stream IS the lease. Nothing in the
+// guest times a watch out — the stream ending, for any reason the
+// transport notices, releases every inotify watch it held. There is
+// therefore no "unsubscribe" RPC and no cleanup path that can be skipped.
+service WatchService {
+  // Subscribe to a set of paths and receive their events.
+  //
+  // The first request frame must carry `open` (which container's rootfs
+  // the paths are resolved in); every later frame carries `subscribe`
+  // with the COMPLETE path set, which replaces the previous one
+  // (reconcile, never deltas, so a client and the guest
+  // have no incremental state to disagree about).
+  //
+  // Each `subscribe` is answered with exactly one `ack`, sent only after
+  // the watches are in place. That ordering is the protocol's half of
+  // "register, then list": a client that lists first and
+  // subscribes after loses everything in between, so it waits for the
+  // ack and lists then.
+  rpc Watch(stream WatchRequest) returns (stream WatchResponse);
+}
+
+message WatchRequest {
+  oneof frame {
+    Open open = 1;
+    Subscribe subscribe = 2;
+  }
+}
+
+// Open names the container whose rootfs the paths below are resolved in.
+// Paths are container-rooted and confined with openat2(RESOLVE_BENEATH)
+// exactly like the ToolService file primitives.
+message Open {
+  string container = 1; // empty → "main"
+}
+
+// Subscribe carries the complete path set — not a delta. Paths that
+// cannot be watched come back in `ack.failed`; the rest of the set is
+// still applied, because one bad path in a tree view must not take the
+// subscription down.
+//
+// A path naming a file is never watched directly: the
+// guest watches its parent directory and filters by basename, which is
+// what survives the write-temp-then-rename that every editor and build
+// tool does. Since inotify deduplicates per inode, subscribing to a file
+// whose directory is already subscribed costs no extra watch.
+message Subscribe {
+  repeated string paths = 1;
+}
+
+message WatchResponse {
+  oneof frame {
+    Ack ack = 1;
+    EventBatch events = 2;
+  }
+}
+
+// Ack reports the reconciled state of one `subscribe`.
+message Ack {
+  // Id of the last event emitted on this stream before the new path set
+  // took effect: every event after this one reflects the acked set. It
+  // is the cursor a client holds while it takes its listing.
+  uint64 cursor = 1;
+  // The subscribed paths now being watched, echoed as the client spelled
+  // them.
+  repeated string watching = 2;
+  // Paths that could not be watched, with the reason.
+  repeated PathError failed = 3;
+  // inotify watches held guest-wide, and the cap they count against
+  //. The kernel's own ceiling is 8192 per uid for the
+  // entire microVM, so the cap is deliberately well below it.
+  uint32 watches = 4;
+  uint32 watch_limit = 5;
+}
+
+message PathError {
+  string path = 1;
+  string error = 2;
+}
+
+// EventBatch is what coalescing produces: everything that happened in a
+// ~150 ms window, deduplicated. An `npm install` must not
+// become one frame per file through vsock.
+message EventBatch {
+  repeated Event events = 1;
+}
+
+message Event {
+  // Monotonically increasing within one stream, starting at 1 and never
+  // reused: the replay cursor for the layer above (e.g. an SSE `id:` and
+  // the client's `Last-Event-ID`).
+  uint64 id = 1;
+  EventKind kind = 2;
+  // Container-rooted path of the watched directory the event came from,
+  // e.g. "/workspace/src". Empty on EVENT_KIND_STALE.
+  string dir = 3;
+  // Basename within `dir`; empty for events about the directory itself.
+  // The full container-rooted path is `dir` + "/" + `name`.
+  string name = 4;
+  // The entry is a directory (inotify's IN_ISDIR).
+  bool is_dir = 5;
+  // Ties an EVENT_KIND_MOVED_FROM to the EVENT_KIND_MOVED_TO of the same
+  // rename; 0 otherwise.
+  uint32 cookie = 6;
+  // EVENT_KIND_STALE only: the subscribed paths whose contents can no
+  // longer be trusted. The client's answer is to re-read them — every
+  // client must implement this, it is not an edge case.
+  repeated string stale_paths = 7;
+}
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_CREATED = 1;
+  EVENT_KIND_DELETED = 2;
+  EVENT_KIND_MODIFIED = 3;
+  EVENT_KIND_ATTRIB = 4;
+  EVENT_KIND_MOVED_FROM = 5;
+  EVENT_KIND_MOVED_TO = 6;
+  // Events were lost, or the paths in `stale_paths` no longer mean what
+  // they meant: the kernel queue overflowed, a watched directory was
+  // renamed or deleted (watches bind to inodes, not paths — a directory
+  // recreated at the same path is not watched, which is what every
+  // `git checkout` does), or the guest had to drop a batch it could not
+  // carry. The client re-reads those paths and sends its path set again;
+  // the guest never re-arms behind its back.
+  EVENT_KIND_STALE = 7;
+}

@@ -10,6 +10,7 @@ mod image_commands;
 mod tool_commands;
 mod transport;
 mod vm_commands;
+mod watch_commands;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -26,6 +27,7 @@ enum Service {
     Container(container_commands::ContainerArgs),
     /// Agent tools on a container's files, in a guest
     Tool(tool_commands::ToolArgs),
+    Watch(watch_commands::WatchArgs),
 }
 
 #[tokio::main]
@@ -43,6 +45,7 @@ async fn main() -> Result<()> {
         Service::Image(args) => image_commands::handle_image_command(args).await?,
         Service::Container(args) => container_commands::handle_container_command(args).await?,
         Service::Tool(args) => tool_commands::handle_tool_command(args).await?,
+        Service::Watch(args) => watch_commands::handle_watch_command(args).await?,
     }
 
     Ok(())

@@ -11,6 +11,7 @@
 use feos_proto::lifecycle_service::lifecycle_service_client::LifecycleServiceClient;
 use feos_proto::lifecycle_service::{hello, Hello};
 use feos_proto::tool_service::tool_service_server::ToolServiceServer;
+use feos_proto::watch_service::watch_service_server::WatchServiceServer;
 use feos_utils::filesystem::{mount_data_volume, DATA_ROOT};
 use feos_utils::vsock::{API_PORT, UPLINK_PORT};
 use hyper_util::rt::TokioIo;
@@ -24,6 +25,7 @@ use tonic::transport::server::Router;
 use tonic::transport::{Endpoint, Uri};
 use tool_service::ToolApiHandler;
 use tower::service_fn;
+use watch_service::WatchApiHandler;
 
 /// Backoff for failed connects to the host, which only happen while no
 /// manager listens (a manager rollout, or no manager at all). A call that
@@ -45,17 +47,22 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub(crate) struct GuestServices {
     tool: ToolServiceServer<ToolApiHandler>,
+    // One inotify instance and one refcount table for every listener.
+    watch: WatchServiceServer<WatchApiHandler>,
 }
 
 impl GuestServices {
     pub(crate) fn new() -> Self {
         Self {
             tool: ToolServiceServer::new(ToolApiHandler),
+            watch: WatchServiceServer::new(WatchApiHandler::default()),
         }
     }
 
     pub(crate) fn add_to(&self, router: Router) -> Router {
-        router.add_service(self.tool.clone())
+        router
+            .add_service(self.tool.clone())
+            .add_service(self.watch.clone())
     }
 }
 
