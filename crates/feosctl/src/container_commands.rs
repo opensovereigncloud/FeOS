@@ -4,9 +4,9 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use feos_proto::container_service::{
-    container_service_client::ContainerServiceClient, ContainerConfig, ContainerState,
-    CreateContainerRequest, DeleteContainerRequest, GetContainerRequest, ListContainersRequest,
-    StartContainerRequest, StopContainerRequest,
+    container_service_client::ContainerServiceClient, exec_stream_frame, ContainerConfig,
+    ContainerState, CreateContainerRequest, DeleteContainerRequest, ExecRequest,
+    GetContainerRequest, ListContainersRequest, StartContainerRequest, StopContainerRequest,
 };
 use tonic::transport::Channel;
 
@@ -31,13 +31,20 @@ pub enum ContainerCommand {
     Create {
         #[arg(
             long,
-            required = true,
+            required_unless_present = "adopt",
+            default_value = "",
             help = "Container image reference (e.g., docker.io/library/alpine:latest)"
         )]
         image_ref: String,
 
-        #[arg(long, help = "Optional custom container identifier (UUID)")]
+        #[arg(
+            long,
+            help = "Optional container identifier (letters, digits, -, _, .)"
+        )]
         id: Option<String>,
+
+        #[arg(long, help = "Adopt the container of this ID from before a reboot")]
+        adopt: bool,
 
         #[arg(
             long,
@@ -71,10 +78,28 @@ pub enum ContainerCommand {
     },
     /// List all containers
     List,
-    /// Delete a container
+    /// Delete a container; a running one is killed first
     Delete {
         #[arg(required = true, help = "Container identifier")]
         id: String,
+    },
+    /// Run a command in a running container
+    Exec {
+        #[arg(required = true, help = "Container identifier")]
+        id: String,
+
+        #[arg(long, short = 'w', help = "Working directory in the container")]
+        workdir: Option<String>,
+
+        #[arg(
+            long,
+            help = "Set environment variables (e.g., --env KEY1=VALUE1)",
+            value_parser = parse_key_val
+        )]
+        env: Vec<(String, String)>,
+
+        #[arg(required = true, last = true, help = "Command and arguments, after --")]
+        command: Vec<String>,
     },
 }
 
@@ -91,14 +116,30 @@ pub async fn handle_container_command(args: ContainerArgs) -> Result<()> {
         ContainerCommand::Create {
             image_ref,
             id,
+            adopt,
             cmd,
             env,
-        } => create_container(&mut client, image_ref, id, cmd, env).await?,
+        } => create_container(&mut client, image_ref, id, adopt, cmd, env).await?,
         ContainerCommand::Start { id } => start_container(&mut client, id).await?,
         ContainerCommand::Stop { id } => stop_container(&mut client, id).await?,
         ContainerCommand::Info { id } => get_container_info(&mut client, id).await?,
         ContainerCommand::List => list_containers(&mut client).await?,
         ContainerCommand::Delete { id } => delete_container(&mut client, id).await?,
+        ContainerCommand::Exec {
+            id,
+            workdir,
+            env,
+            command,
+        } => {
+            let request = ExecRequest {
+                container_id: id,
+                command,
+                env: env.into_iter().collect(),
+                working_dir: workdir.unwrap_or_default(),
+            };
+            let code = exec(&mut client, request).await?;
+            std::process::exit(code);
+        }
     }
 
     Ok(())
@@ -108,6 +149,7 @@ async fn create_container(
     client: &mut ContainerServiceClient<Channel>,
     image_ref: String,
     id: Option<String>,
+    adopt: bool,
     cmd: Vec<String>,
     env: Vec<(String, String)>,
 ) -> Result<()> {
@@ -122,15 +164,16 @@ async fn create_container(
     let request = CreateContainerRequest {
         config: Some(config),
         container_id: id,
+        adopt,
     };
 
     let response = client.create_container(request).await?.into_inner();
+    println!("Container created. Container ID: {}", response.container_id);
+    if !response.resolver_error.is_empty() {
+        println!("Resolvers not linked: {}", response.resolver_error);
+    }
     println!(
-        "Container creation initiated. Container ID: {}",
-        response.container_id
-    );
-    println!(
-        "Use 'feosctl container list' to check its status and 'feosctl container start {}' to run it.",
+        "Use 'feosctl container start {}' to run it.",
         response.container_id
     );
 
@@ -228,4 +271,25 @@ async fn delete_container(client: &mut ContainerServiceClient<Channel>, id: Stri
     client.delete_container(request).await?;
     println!("Successfully deleted container: {id}");
     Ok(())
+}
+
+/// Streams the command's output to this process's stdout and stderr and
+/// returns its exit code.
+async fn exec(client: &mut ContainerServiceClient<Channel>, request: ExecRequest) -> Result<i32> {
+    use std::io::Write;
+    let mut frames = client.exec(request).await?.into_inner();
+    while let Some(frame) = frames.message().await? {
+        match frame.frame {
+            Some(exec_stream_frame::Frame::Stdout(bytes)) => {
+                std::io::stdout().write_all(&bytes)?;
+                std::io::stdout().flush()?;
+            }
+            Some(exec_stream_frame::Frame::Stderr(bytes)) => {
+                std::io::stderr().write_all(&bytes)?;
+            }
+            Some(exec_stream_frame::Frame::ExitCode(code)) => return Ok(code),
+            None => {}
+        }
+    }
+    anyhow::bail!("the exec stream ended without an exit code")
 }

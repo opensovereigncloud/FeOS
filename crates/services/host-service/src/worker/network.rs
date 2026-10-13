@@ -8,8 +8,9 @@
 
 use crate::error::HostError;
 use feos_proto::host_service::{
-    GetNetworkConfigResponse, SetNetworkConfigRequest, SetNetworkConfigResponse,
+    GetNetworkConfigResponse, ResolverFailure, SetNetworkConfigRequest, SetNetworkConfigResponse,
 };
+use feos_utils::filesystem::CONTAINERS_DIR;
 use feos_utils::resolver;
 use futures::TryStreamExt;
 use log::{error, info};
@@ -72,18 +73,26 @@ async fn set_network_config(
         .map_err(|_| HostError::InvalidArgument(format!("bad gateway: {:?}", req.gateway)))?;
 
     configure_interface(&req.interface, address, prefix_len, gateway).await?;
-    resolver::publish(
-        &req.dns,
-        &[Path::new(resolver::SHARED_DIR), Path::new("/etc")],
-    )
-    .map_err(|e| HostError::Failed(format!("resolvers: {e}")))?;
+    // A container that cannot be linked to the resolvers again does not fail
+    // the push; the host learns which one and why.
+    let dns = req.dns.clone();
+    let resolver_failed = tokio::task::spawn_blocking(move || {
+        resolver::publish(&dns, Path::new("/etc"), Path::new(CONTAINERS_DIR))
+    })
+    .await
+    .map_err(|e| HostError::Failed(format!("resolvers: {e}")))?
+    .map_err(|e| HostError::Failed(format!("resolvers: {e}")))?
+    .into_iter()
+    .map(|(container_id, reason)| ResolverFailure {
+        container_id,
+        reason,
+    })
+    .collect();
     if !req.hostname.is_empty() {
         nix::unistd::sethostname(&req.hostname)
             .map_err(|e| HostError::Failed(format!("sethostname: {e}")))?;
     }
-    Ok(SetNetworkConfigResponse {
-        resolver_failed: Vec::new(),
-    })
+    Ok(SetNetworkConfigResponse { resolver_failed })
 }
 
 fn parse_ipv4_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), HostError> {

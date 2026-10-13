@@ -4,10 +4,13 @@
 use crate::error::ContainerServiceError;
 use feos_proto::container_service::{
     ContainerInfo, CreateContainerRequest, CreateContainerResponse, DeleteContainerRequest,
-    DeleteContainerResponse, GetContainerRequest, ListContainersRequest, ListContainersResponse,
-    StartContainerRequest, StartContainerResponse, StopContainerRequest, StopContainerResponse,
+    DeleteContainerResponse, ExecRequest, GetContainerRequest, ListContainersRequest,
+    ListContainersResponse, StartContainerRequest, StartContainerResponse, StopContainerRequest,
+    StopContainerResponse,
 };
+use feos_proto::task_service::ExecFrame;
 use tokio::sync::oneshot;
+use tonic::Streaming;
 
 pub mod api;
 pub mod dispatcher;
@@ -43,6 +46,10 @@ pub enum Command {
         DeleteContainerRequest,
         oneshot::Sender<Result<DeleteContainerResponse, ContainerServiceError>>,
     ),
+    Exec(
+        ExecRequest,
+        oneshot::Sender<Result<Streaming<ExecFrame>, ContainerServiceError>>,
+    ),
 }
 
 impl std::fmt::Debug for Command {
@@ -58,6 +65,7 @@ impl std::fmt::Debug for Command {
             Command::DeleteContainer(req, _) => {
                 f.debug_tuple("DeleteContainer").field(req).finish()
             }
+            Command::Exec(req, _) => f.debug_tuple("Exec").field(req).finish(),
         }
     }
 }

@@ -4,21 +4,14 @@
 use crate::{
     error::ContainerServiceError,
     persistence::{repository::ContainerRepository, ContainerRecord},
-    runtime::adapter::ContainerAdapter,
+    runtime::{adapter::ContainerAdapter, bundle},
     worker, Command,
 };
-use feos_proto::{
-    container_service::{ContainerInfo, ContainerState, ListContainersResponse},
-    image_service::{image_service_client::ImageServiceClient, PullImageRequest},
-};
-use hyper_util::rt::TokioIo;
-use image_service::IMAGE_SERVICE_SOCKET;
+use feos_proto::container_service::{ContainerInfo, ContainerState, ListContainersResponse};
 use log::{info, warn};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::Path, sync::Arc};
+use task_service::RUNTIME_STATE_DIR;
 use tokio::sync::mpsc;
-use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
-use uuid::Uuid;
 
 pub struct Dispatcher {
     rx: mpsc::Receiver<Command>,
@@ -26,42 +19,29 @@ pub struct Dispatcher {
     adapter: Arc<ContainerAdapter>,
 }
 
-async fn get_image_service_client() -> Result<ImageServiceClient<Channel>, ContainerServiceError> {
-    let socket_path = PathBuf::from(IMAGE_SERVICE_SOCKET);
-    Endpoint::try_from("http://[::1]:50051")
-        .unwrap()
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let socket_path = socket_path.clone();
-            async move {
-                tokio::net::UnixStream::connect(socket_path)
-                    .await
-                    .map(TokioIo::new)
-            }
-        }))
-        .await
-        .map(ImageServiceClient::new)
-        .map_err(|e| ContainerServiceError::ImageService(e.to_string()))
+/// Container IDs name directories: 1 to 64 letters, digits, "-", "_" and
+/// ".", and not "." or "..".
+pub(crate) fn validate_container_id(id: &str) -> Result<(), ContainerServiceError> {
+    let valid = !id.is_empty()
+        && id.len() <= 64
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(ContainerServiceError::InvalidArgument(format!(
+            "invalid container ID {id:?}"
+        )))
+    }
 }
 
-async fn initiate_image_pull(image_ref: &str) -> Result<String, ContainerServiceError> {
-    info!("Dispatcher: Requesting image pull for {image_ref}");
-    let mut client = get_image_service_client().await?;
-
-    let response = client
-        .pull_image(PullImageRequest {
-            image_ref: image_ref.to_string(),
-            exclusive: false,
-        })
-        .await
-        .map_err(|status| {
-            ContainerServiceError::ImageService(format!(
-                "PullImage RPC failed for {image_ref}: {status}"
-            ))
-        })?;
-
-    let image_uuid = response.into_inner().image_uuid;
-    info!("Dispatcher: Image pull for {image_ref} initiated. UUID: {image_uuid}");
-    Ok(image_uuid)
+/// Whether the runtime knows the container: its state lives in RAM, so after
+/// a reboot it knows none.
+pub(crate) fn runtime_knows(id: &str) -> bool {
+    Path::new(RUNTIME_STATE_DIR).join(id).exists()
 }
 
 impl Dispatcher {
@@ -72,12 +52,43 @@ impl Dispatcher {
         info!("Dispatcher: Connecting to persistence layer at {db_url}...");
         let repository = ContainerRepository::connect(db_url).await?;
         info!("Dispatcher: Persistence layer connected successfully.");
+        Self::reconcile(&repository).await;
         let adapter = Arc::new(ContainerAdapter::new());
         Ok(Self {
             rx,
             repository,
             adapter,
         })
+    }
+
+    /// Records from before a reboot: on a data volume they survive it, the
+    /// containers do not. A container the runtime does not know is stopped;
+    /// one whose creation was cut short is removed.
+    async fn reconcile(repository: &ContainerRepository) {
+        let records = match repository.list_all_containers().await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!("Dispatcher: Failed to list containers to reconcile: {e}");
+                return;
+            }
+        };
+        for record in records {
+            let id = &record.container_id;
+            match record.status.state {
+                ContainerState::PullingImage => {
+                    info!("Dispatcher: Removing container {id}, whose creation was cut short");
+                    let _ = bundle::remove(id);
+                    let _ = repository.delete_container(id).await;
+                }
+                ContainerState::Created | ContainerState::Running if !runtime_knows(id) => {
+                    info!("Dispatcher: Container {id} did not survive the reboot; stopped");
+                    let _ = repository
+                        .update_container_state(id, ContainerState::Stopped)
+                        .await;
+                }
+                _ => {}
+            }
+        }
     }
 
     pub async fn run(mut self) {
@@ -94,16 +105,13 @@ impl Dispatcher {
         info!("Dispatcher: Channel closed, shutting down.");
     }
 
-    async fn get_container_record(
+    pub(crate) async fn get_container_record(
         repo: &ContainerRepository,
         id_str: &str,
     ) -> Result<ContainerRecord, ContainerServiceError> {
-        let container_id = Uuid::parse_str(id_str).map_err(|_| {
-            ContainerServiceError::InvalidArgument("Invalid UUID format".to_string())
-        })?;
-
-        repo.get_container(container_id).await?.ok_or_else(|| {
-            ContainerServiceError::InvalidArgument(format!("Container '{id_str}' not found"))
+        validate_container_id(id_str)?;
+        repo.get_container(id_str).await?.ok_or_else(|| {
+            ContainerServiceError::NotFound(format!("Container '{id_str}' not found"))
         })
     }
 
@@ -114,55 +122,8 @@ impl Dispatcher {
     ) -> Result<(), ContainerServiceError> {
         match cmd {
             Command::CreateContainer(req, responder) => {
-                let container_id =
-                    if let Some(id_str) = req.container_id.as_deref().filter(|s| !s.is_empty()) {
-                        Uuid::parse_str(id_str).map_err(|_| {
-                            ContainerServiceError::InvalidArgument(
-                                "Invalid container_id UUID format.".to_string(),
-                            )
-                        })?
-                    } else {
-                        Uuid::new_v4()
-                    };
-
-                if repository.get_container(container_id).await?.is_some() {
-                    let _ = responder.send(Err(ContainerServiceError::AlreadyExists(
-                        container_id.to_string(),
-                    )));
-                    return Ok(());
-                }
-
-                let config = req.config.clone().ok_or_else(|| {
-                    ContainerServiceError::InvalidArgument(
-                        "ContainerConfig is required".to_string(),
-                    )
-                })?;
-                let image_ref = config.image_ref.clone();
-
-                let image_uuid_str = initiate_image_pull(&image_ref).await?;
-                let image_uuid = Uuid::parse_str(&image_uuid_str).map_err(|e| {
-                    ContainerServiceError::ImageService(format!("Invalid image UUID: {e}"))
-                })?;
-
-                let record = crate::persistence::ContainerRecord {
-                    container_id,
-                    image_uuid,
-                    status: crate::persistence::ContainerStatus {
-                        state: ContainerState::PullingImage,
-                        process_id: None,
-                    },
-                    config,
-                };
-                repository.save_container(&record).await?;
-
-                tokio::spawn(worker::handle_create_container(
-                    container_id,
-                    image_uuid,
-                    image_ref,
-                    responder,
-                    repository.clone(),
-                    adapter.clone(),
-                ));
+                let result = worker::create_container(req, &repository, &adapter).await;
+                let _ = responder.send(result);
             }
             Command::StartContainer(req, responder) => {
                 let record = Self::get_container_record(&repository, &req.container_id).await;
@@ -203,18 +164,12 @@ impl Dispatcher {
                 }
             }
             Command::DeleteContainer(req, responder) => {
-                let record = Self::get_container_record(&repository, &req.container_id).await;
-                match record {
-                    Ok(rec) if rec.status.state != ContainerState::Running => {
+                match Self::get_container_record(&repository, &req.container_id).await {
+                    // The runtime kills a running container first.
+                    Ok(_) => {
                         tokio::spawn(worker::handle_delete_container(
                             req, responder, repository, adapter,
                         ));
-                    }
-                    Ok(rec) => {
-                        let _ = responder.send(Err(ContainerServiceError::InvalidState(format!(
-                            "Cannot delete container in state {:?}. Stop it first.",
-                            rec.status.state
-                        ))));
                     }
                     Err(e) => {
                         let _ = responder.send(Err(e));
@@ -225,7 +180,7 @@ impl Dispatcher {
                 let result = Self::get_container_record(&repository, &req.container_id)
                     .await
                     .map(|rec| ContainerInfo {
-                        container_id: rec.container_id.to_string(),
+                        container_id: rec.container_id,
                         state: rec.status.state as i32,
                         config: Some(rec.config),
                         pid: rec.status.process_id,
@@ -241,7 +196,7 @@ impl Dispatcher {
                         let containers = records
                             .into_iter()
                             .map(|rec| ContainerInfo {
-                                container_id: rec.container_id.to_string(),
+                                container_id: rec.container_id,
                                 state: rec.status.state as i32,
                                 config: Some(rec.config),
                                 pid: rec.status.process_id,
@@ -253,7 +208,39 @@ impl Dispatcher {
                     .map_err(ContainerServiceError::Persistence);
                 let _ = responder.send(result);
             }
+            Command::Exec(req, responder) => {
+                let record = Self::get_container_record(&repository, &req.container_id).await;
+                match record {
+                    Ok(rec) if rec.status.state == ContainerState::Running => {
+                        tokio::spawn(worker::handle_exec(req, responder, adapter));
+                    }
+                    Ok(rec) => {
+                        let _ = responder.send(Err(ContainerServiceError::InvalidState(format!(
+                            "Cannot exec in container in state {:?}",
+                            rec.status.state
+                        ))));
+                    }
+                    Err(e) => {
+                        let _ = responder.send(Err(e));
+                    }
+                }
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_ids_are_directory_names() {
+        for id in ["main", "a-b_c.1", "6f2c1e8e-6c1f-4e6e-9a51-0d1c5b1a2f3e"] {
+            assert!(validate_container_id(id).is_ok(), "{id}");
+        }
+        for id in ["", ".", "..", "a/b", "a b", &"x".repeat(65)] {
+            assert!(validate_container_id(id).is_err(), "{id}");
+        }
     }
 }

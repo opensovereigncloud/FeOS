@@ -9,6 +9,7 @@ workspace = true
 [dependencies]
 feos-proto = { workspace = true }
 feos-utils = { workspace = true }
+nix = { workspace = true }
 image-service = { workspace = true }
 task-service = { workspace = true }
 sqlx = { workspace = true }
@@ -23,6 +24,9 @@ prost = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [build-dependencies]
 sqlx.workspace = true

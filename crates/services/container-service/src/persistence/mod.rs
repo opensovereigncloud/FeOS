@@ -22,6 +22,9 @@ pub enum PersistenceError {
 
     #[error("Invalid state string '{0}' in database")]
     InvalidStateString(String),
+
+    #[error("Invalid UUID '{0}' in database")]
+    InvalidUuid(String),
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +35,7 @@ pub struct ContainerStatus {
 
 #[derive(Debug, Clone)]
 pub struct ContainerRecord {
-    pub container_id: Uuid,
+    pub container_id: String,
     pub image_uuid: Uuid,
     pub status: ContainerStatus,
     pub config: ContainerConfig,

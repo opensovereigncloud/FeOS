@@ -7,12 +7,17 @@ import "google/protobuf/any.proto";
 // ContainerService manages the lifecycle of containers. It provides an
 // external-facing API for clients to create, run, and manage containers,
 // abstracting the underlying details of shims and runtimes like youki.
+//
+// A container's root filesystem is an overlay: the image's files below, the
+// container's writes above, in the container's directory on the data root.
+// Containers share the host's network namespace. Every container sees the
+// FeOS toolbox (static coreutils) at /feos-tools, on its PATH after the
+// image's own directories, and the share directory read-only at /run/feos;
+// its /etc/resolv.conf links to the resolvers the host pushed.
 service ContainerService {
   // Creates a new container from an OCI image but does not start it.
-  // This call is asynchronous. It will first trigger an image pull if the
-  // image is not available locally. The service returns a container_id immediately.
-  // Clients can then use StreamContainerEvents to track the progress from
-  // "PULLING_IMAGE" to "CREATED".
+  // The image is pulled first if it is not present; the call returns once
+  // the container is created, or fails with the reason it could not be.
   rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
 
   // Starts a previously created container.
@@ -28,8 +33,14 @@ service ContainerService {
   rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
 
   // Deletes a container, cleaning up all associated resources including its
-  // root filesystem. The container must be in a stopped state.
+  // root filesystem. A running container is killed first.
   rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse);
+
+  // Runs a command in a running container, like `docker exec` without a
+  // terminal and without stdin. stdout and stderr stream as frames; the last
+  // frame is the exit code. Ending the call kills the command's process
+  // group.
+  rpc Exec(ExecRequest) returns (stream ExecStreamFrame);
 
   // Streams logs (stdout and stderr) from a running or stopped container.
   rpc StreamContainerLogs(StreamContainerLogsRequest) returns (stream LogEntry);
@@ -54,14 +65,44 @@ message ContainerConfig {
 message CreateContainerRequest {
   // The configuration for the container.
   ContainerConfig config = 1;
-  // An optional client-provided ID for the container. If not provided, a
-  // UUID will be generated.
+  // An optional client-provided ID for the container: 1 to 64 characters of
+  // letters, digits, "-", "_" and ".". If not provided, a UUID will be
+  // generated.
   optional string container_id = 2;
+  // Adopt the container of this ID from before a reboot: its writable
+  // layer and logs on the data root are kept, its mounts, runtime spec and
+  // runtime state are built anew. An empty config keeps the image, command
+  // and environment it was created with; set fields replace them. Without a
+  // container to adopt, this is a plain create.
+  bool adopt = 3;
 }
 
 message CreateContainerResponse {
   // The unique ID of the newly created container.
   string container_id = 1;
+  // Adopt only: why the container's /etc/resolv.conf could not be linked to
+  // the pushed resolvers. The container is adopted all the same. Empty when
+  // the link is in place; a plain create fails instead.
+  string resolver_error = 2;
+}
+
+message ExecRequest {
+  string container_id = 1;
+  // argv; a bare first element is looked up in the container's PATH.
+  repeated string command = 2;
+  // Environment on top of the container's own.
+  map<string, string> env = 3;
+  // Working directory; "/" when empty or missing.
+  string working_dir = 4;
+}
+
+message ExecStreamFrame {
+  oneof frame {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    // The exit code, 128 + the signal when signalled. Always the last frame.
+    int32 exit_code = 3;
+  }
 }
 
 message StartContainerRequest {

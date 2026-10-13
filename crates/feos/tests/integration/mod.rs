@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tokio::sync::OnceCell as TokioOnceCell;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use vm_service::{CONT_YOUKI_BIN, VM_CH_BIN};
+use vm_service::VM_CH_BIN;
 
 pub mod container_tests;
 pub mod fixtures;
@@ -138,22 +138,6 @@ pub fn check_ch_binary() -> bool {
 
 pub fn skip_if_ch_binary_missing() -> bool {
     if !check_ch_binary() {
-        log::warn!("Skipping test because '{VM_CH_BIN}' binary was not found in PATH.");
-        return true;
-    }
-    false
-}
-
-pub fn check_youki_binary() -> bool {
-    Command::new("which")
-        .arg(CONT_YOUKI_BIN)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-pub fn skip_if_youki_binary_missing() -> bool {
-    if !check_youki_binary() {
         log::warn!("Skipping test because '{VM_CH_BIN}' binary was not found in PATH.");
         return true;
     }

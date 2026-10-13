@@ -3,17 +3,19 @@
 
 use crate::Command;
 use feos_proto::container_service::{
-    container_service_server::ContainerService, ContainerEvent, ContainerInfo,
+    container_service_server::ContainerService, exec_stream_frame, ContainerEvent, ContainerInfo,
     CreateContainerRequest, CreateContainerResponse, DeleteContainerRequest,
-    DeleteContainerResponse, GetContainerRequest, ListContainersRequest, ListContainersResponse,
-    LogEntry, StartContainerRequest, StartContainerResponse, StopContainerRequest,
-    StopContainerResponse, StreamContainerEventsRequest, StreamContainerLogsRequest,
+    DeleteContainerResponse, ExecRequest, ExecStreamFrame, GetContainerRequest,
+    ListContainersRequest, ListContainersResponse, LogEntry, StartContainerRequest,
+    StartContainerResponse, StopContainerRequest, StopContainerResponse,
+    StreamContainerEventsRequest, StreamContainerLogsRequest,
 };
+use feos_proto::task_service::exec_frame;
 use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
 use std::pin::Pin;
 use tokio::sync::mpsc;
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 pub struct ContainerApiHandler {
@@ -31,6 +33,7 @@ impl ContainerService for ContainerApiHandler {
     type StreamContainerLogsStream = Pin<Box<dyn Stream<Item = Result<LogEntry, Status>> + Send>>;
     type StreamContainerEventsStream =
         Pin<Box<dyn Stream<Item = Result<ContainerEvent, Status>> + Send>>;
+    type ExecStream = Pin<Box<dyn Stream<Item = Result<ExecStreamFrame, Status>> + Send>>;
 
     async fn create_container(
         &self,
@@ -110,5 +113,29 @@ impl ContainerService for ContainerApiHandler {
         _request: Request<StreamContainerEventsRequest>,
     ) -> Result<Response<Self::StreamContainerEventsStream>, Status> {
         Err(Status::unimplemented("Not yet implemented"))
+    }
+
+    async fn exec(
+        &self,
+        request: Request<ExecRequest>,
+    ) -> Result<Response<Self::ExecStream>, Status> {
+        info!("ContainerApi: Received Exec request.");
+        let frames = dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::Exec(request.into_inner(), resp_tx)
+        })
+        .await?
+        .into_inner();
+        // Dropping this stream drops the task service's, which ends the
+        // command.
+        let frames = frames.map(|frame| {
+            frame.map(|frame| ExecStreamFrame {
+                frame: frame.frame.map(|frame| match frame {
+                    exec_frame::Frame::Stdout(bytes) => exec_stream_frame::Frame::Stdout(bytes),
+                    exec_frame::Frame::Stderr(bytes) => exec_stream_frame::Frame::Stderr(bytes),
+                    exec_frame::Frame::ExitCode(code) => exec_stream_frame::Frame::ExitCode(code),
+                }),
+            })
+        });
+        Ok(Response::new(Box::pin(frames)))
     }
 }

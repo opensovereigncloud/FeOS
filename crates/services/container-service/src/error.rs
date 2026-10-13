@@ -26,6 +26,9 @@ pub enum ContainerServiceError {
 
     #[error("Invalid container state for operation: {0}")]
     InvalidState(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
 }
 
 impl From<ContainerServiceError> for Status {
@@ -50,6 +53,7 @@ impl From<ContainerServiceError> for Status {
             ContainerServiceError::InvalidArgument(msg) => Status::invalid_argument(msg),
             ContainerServiceError::AlreadyExists(msg) => Status::already_exists(msg),
             ContainerServiceError::InvalidState(msg) => Status::failed_precondition(msg),
+            ContainerServiceError::NotFound(msg) => Status::not_found(msg),
         }
     }
 }

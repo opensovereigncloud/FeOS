@@ -22,6 +22,10 @@ struct DbContainerRow {
     config_blob: Vec<u8>,
 }
 
+fn parse_uuid(s: &str) -> Result<Uuid, PersistenceError> {
+    Uuid::parse_str(s).map_err(|_| PersistenceError::InvalidUuid(s.to_string()))
+}
+
 fn string_to_container_state(s: &str) -> Result<ContainerState, PersistenceError> {
     match s {
         "PULLING_IMAGE" => Ok(ContainerState::PullingImage),
@@ -59,12 +63,12 @@ impl ContainerRepository {
 
     pub async fn get_container(
         &self,
-        container_id: Uuid,
+        container_id: &str,
     ) -> Result<Option<ContainerRecord>, PersistenceError> {
         let row_opt = sqlx::query_as::<_, DbContainerRow>(
             "SELECT container_id, image_uuid, state, pid, config_blob FROM containers WHERE container_id = ?1",
         )
-        .bind(container_id.to_string())
+        .bind(container_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -73,8 +77,8 @@ impl ContainerRepository {
             let state = string_to_container_state(&row.state)?;
 
             let record = ContainerRecord {
-                container_id: Uuid::parse_str(&row.container_id).unwrap(),
-                image_uuid: Uuid::parse_str(&row.image_uuid).unwrap(),
+                container_id: row.container_id,
+                image_uuid: parse_uuid(&row.image_uuid)?,
                 status: ContainerStatus {
                     state,
                     process_id: row.pid,
@@ -100,8 +104,8 @@ impl ContainerRepository {
             let state = string_to_container_state(&row.state)?;
 
             let record = ContainerRecord {
-                container_id: Uuid::parse_str(&row.container_id).unwrap(),
-                image_uuid: Uuid::parse_str(&row.image_uuid).unwrap(),
+                container_id: row.container_id,
+                image_uuid: parse_uuid(&row.image_uuid)?,
                 status: ContainerStatus {
                     state,
                     process_id: row.pid,
@@ -129,7 +133,7 @@ impl ContainerRepository {
             VALUES (?1, ?2, ?3, ?4, ?5)
             "#,
         )
-        .bind(container.container_id.to_string())
+        .bind(&container.container_id)
         .bind(container.image_uuid.to_string())
         .bind(state_str)
         .bind(container.status.process_id)
@@ -142,7 +146,7 @@ impl ContainerRepository {
 
     pub async fn update_container_state(
         &self,
-        container_id: Uuid,
+        container_id: &str,
         new_state: ContainerState,
     ) -> Result<bool, PersistenceError> {
         let state_str = container_state_to_string(new_state);
@@ -155,7 +159,7 @@ impl ContainerRepository {
             "#,
         )
         .bind(state_str)
-        .bind(container_id.to_string())
+        .bind(container_id)
         .execute(&self.pool)
         .await?;
 
@@ -164,20 +168,20 @@ impl ContainerRepository {
 
     pub async fn update_container_pid(
         &self,
-        container_id: Uuid,
+        container_id: &str,
         pid: i64,
     ) -> Result<(), PersistenceError> {
         sqlx::query("UPDATE containers SET pid = ?1 WHERE container_id = ?2")
             .bind(pid)
-            .bind(container_id.to_string())
+            .bind(container_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    pub async fn delete_container(&self, container_id: Uuid) -> Result<(), PersistenceError> {
+    pub async fn delete_container(&self, container_id: &str) -> Result<(), PersistenceError> {
         let result = sqlx::query("DELETE FROM containers WHERE container_id = ?1")
-            .bind(container_id.to_string())
+            .bind(container_id)
             .execute(&self.pool)
             .await?;
 

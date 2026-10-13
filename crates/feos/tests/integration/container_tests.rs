@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    ensure_server, get_public_clients, skip_if_youki_binary_missing, TEST_CONTAINER_IMAGE_REF,
-};
+use super::{ensure_server, get_public_clients, TEST_CONTAINER_IMAGE_REF};
 use anyhow::Result;
 use feos_proto::container_service::{
-    ContainerConfig, ContainerState, CreateContainerRequest, DeleteContainerRequest,
-    GetContainerRequest, StartContainerRequest, StopContainerRequest,
+    exec_stream_frame, ContainerConfig, ContainerState, CreateContainerRequest,
+    DeleteContainerRequest, ExecRequest, GetContainerRequest, StartContainerRequest,
+    StopContainerRequest,
 };
 use log::info;
 use std::time::Duration;
@@ -43,9 +42,6 @@ async fn wait_for_container_state(
 
 #[tokio::test]
 async fn test_create_and_start_container() -> Result<()> {
-    if skip_if_youki_binary_missing() {
-        return Ok(());
-    }
     ensure_server().await;
     let (_, _, mut container_client) = get_public_clients().await?;
 
@@ -59,27 +55,25 @@ async fn test_create_and_start_container() -> Result<()> {
     let create_req = CreateContainerRequest {
         config: Some(container_config),
         container_id: None,
+        adopt: false,
     };
 
     info!("Sending CreateContainer request");
-    let create_res = container_client
-        .create_container(create_req)
-        .await?
-        .into_inner();
-    let container_id = create_res.container_id;
-    info!("Container creation initiated with ID: {container_id}");
-
-    timeout(
+    let create_res = timeout(
         Duration::from_secs(180),
-        wait_for_container_state(
-            &mut container_client,
-            &container_id,
-            ContainerState::Created,
-        ),
+        container_client.create_container(create_req),
     )
     .await
-    .expect("Timed out waiting for container to become created")?;
-    info!("Container is in CREATED state");
+    .expect("Timed out creating the container")?
+    .into_inner();
+    let container_id = create_res.container_id;
+    info!("Container created with ID: {container_id}");
+    wait_for_container_state(
+        &mut container_client,
+        &container_id,
+        ContainerState::Created,
+    )
+    .await?;
 
     let start_req = StartContainerRequest {
         container_id: container_id.clone(),
@@ -98,6 +92,26 @@ async fn test_create_and_start_container() -> Result<()> {
     .await
     .expect("Timed out waiting for container to become running")?;
     info!("Container is in RUNNING state");
+
+    let mut frames = container_client
+        .exec(ExecRequest {
+            container_id: container_id.clone(),
+            command: vec!["echo".to_string(), "hello from exec".to_string()],
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let (mut stdout, mut exit_code) = (Vec::new(), None);
+    while let Some(frame) = frames.message().await? {
+        match frame.frame {
+            Some(exec_stream_frame::Frame::Stdout(bytes)) => stdout.extend(bytes),
+            Some(exec_stream_frame::Frame::ExitCode(code)) => exit_code = Some(code),
+            _ => {}
+        }
+    }
+    assert_eq!(String::from_utf8_lossy(&stdout), "hello from exec\n");
+    assert_eq!(exit_code, Some(0));
+    info!("Exec in the container worked");
 
     let stop_req = StopContainerRequest {
         container_id: container_id.clone(),
