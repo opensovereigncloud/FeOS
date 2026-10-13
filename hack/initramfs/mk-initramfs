@@ -10,12 +10,11 @@ ROOTFS_DIR=${thisDir}/../../target/rootfs
 
 [ ! -d "${TARGET_DIR}" ] && echo "Directory: '$TARGET_DIR' does not exist." && exit 1
 
-source utils.sh
 source ../kernel/config.sh
 
 pushd $ROOTFS_DIR 
 echo "Create initramfs folder structure"
-mkdir -pv {etc,var,lib64,lib,run,tmp} var/lib/feos usr/{bin,lib,sbin,local} lib/x86_64-linux-gnu usr/lib/x86_64-linux-gnu usr/local/ssl
+mkdir -pv {etc,var,lib,run,tmp} var/lib/feos usr/{bin,lib,sbin,local} usr/local/ssl
 
 mkdir -pv {proc,dev,sys}
 
@@ -31,8 +30,8 @@ cat <<EOF >>etc/resolv.conf
 nameserver 2001:4860:4860::6464
 EOF
 
-echo "Install libraries for FeOS (copy from host)"
-install_libs $ROOTFS_DIR/bin/feos
+# FeOS is linked statically and needs no shared libraries, only CA
+# certificates for its TLS clients.
 cp -ra /etc/ssl/certs usr/local/ssl/
 
 echo "Create initramfs (non-compressed)"

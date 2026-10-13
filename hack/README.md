@@ -17,7 +17,7 @@ This directory includes scripts to run FeOS as the pid 1 process within a VM.
     # exit VM console with Ctrl+]
 
 
-As FeOS is dynamically compiled, we need to copy all linked libraries into the initramfs. To get a consistent result across different build machines, a build container based on Debian is used (`make build-container`) to build FeOS. Also the libraries will be copied from this container into the initramfs (`make initramfs`).
+FeOS is a statically linked musl binary, so the initramfs needs no shared libraries. To get a consistent result across different build machines, the kernel, FeOS and the initramfs are built in a Debian-based build container (`make build-container`) that carries the Rust toolchain pinned in `rust-toolchain.toml`.
 
 The Linux kernel is built from source (`make kernel`) with a custom kernel config. You can specify the used kernel version in `hack/kernel/config.sh` and modify the kernel config using `make menuconfig`.
 
