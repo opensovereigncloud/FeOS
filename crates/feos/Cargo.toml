@@ -36,7 +36,6 @@ tower = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
 dotenvy = { workspace = true }
 prost = { workspace = true }
 libc = { workspace = true }

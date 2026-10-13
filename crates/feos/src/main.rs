@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
-use clap::Parser;
 use feos_utils::filesystem::{get_root_fstype, move_root};
 use main_server::{run_server, run_task_service};
 use nix::sys::prctl;
@@ -10,16 +9,33 @@ use nix::unistd::{execv, pause};
 use std::env;
 use std::ffi::CString;
 
-#[derive(Parser, Debug, Default)]
-#[command(author, version, about, long_about = None)]
+/// FeOS's own arguments: the ones it passes itself, and --version. The
+/// kernel hands unknown command-line words to init, so anything else is
+/// ignored.
+#[derive(Debug, Default)]
 struct ServerArgs {
-    #[arg(long, hide = true)]
     restarted_after_upgrade: bool,
 
     /// Run the task service, the process FeOS starts for the container
     /// runtime.
-    #[arg(long, hide = true)]
     task_service: bool,
+
+    version: bool,
+}
+
+impl ServerArgs {
+    fn parse(args: impl IntoIterator<Item = String>) -> Self {
+        let mut parsed = Self::default();
+        for arg in args {
+            match arg.as_str() {
+                "--restarted-after-upgrade" => parsed.restarted_after_upgrade = true,
+                "--task-service" => parsed.task_service = true,
+                "--version" => parsed.version = true,
+                _ => {}
+            }
+        }
+        parsed
+    }
 }
 
 #[tokio::main]
@@ -43,15 +59,11 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    // The kernel hands unknown command-line words to init. As PID 1, ignore
-    // what clap cannot parse instead of exiting.
-    let args = ServerArgs::try_parse().unwrap_or_else(|e| {
-        if std::process::id() != 1 {
-            e.exit();
-        }
-        eprintln!("[feos] Ignoring arguments: {e}");
-        ServerArgs::default()
-    });
+    let args = ServerArgs::parse(env::args().skip(1));
+    if args.version && std::process::id() != 1 {
+        println!("feos {}", feos_utils::version::full_version_string());
+        return Ok(());
+    }
 
     if args.task_service {
         return run_task_service().await;
@@ -86,4 +98,25 @@ async fn run() -> Result<()> {
     feos_utils::reaper::spawn();
 
     run_server(args.restarted_after_upgrade).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_flags_are_recognized_and_the_rest_ignored() {
+        let args = ServerArgs::parse(
+            [
+                "quiet",
+                "--task-service",
+                "--restarted-after-upgrade",
+                "x=1",
+            ]
+            .map(String::from),
+        );
+        assert!(args.task_service && args.restarted_after_upgrade && !args.version);
+        let args = ServerArgs::parse(["--help"].map(String::from));
+        assert!(!args.task_service && !args.restarted_after_upgrade);
+    }
 }
