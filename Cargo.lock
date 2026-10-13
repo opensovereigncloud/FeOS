@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "container-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "feos-proto",
  "feos-utils",
@@ -927,7 +927,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "feos"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "container-service",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "feos-proto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -965,7 +965,7 @@ dependencies = [
 
 [[package]]
 name = "feos-utils"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "dhcproto",
@@ -987,7 +987,7 @@ dependencies = [
 
 [[package]]
 name = "feosctl"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "forward-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "feos-proto",
  "feos-utils",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "host-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "feos-proto",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "image-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "feos-proto",
  "feos-utils",
@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "task-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "feos-proto",
  "feos-utils",
@@ -4232,7 +4232,7 @@ dependencies = [
 
 [[package]]
 name = "tool-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "feos-proto",
  "feos-utils",
@@ -4479,7 +4479,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vm-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cloud-hypervisor-client",
  "feos-proto",
@@ -4637,7 +4637,7 @@ dependencies = [
 
 [[package]]
 name = "watch-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "feos-proto",
  "feos-utils",
