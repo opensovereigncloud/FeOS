@@ -49,6 +49,8 @@ message ImageInfo {
   string digest = 4;
   // Compressed size of the config and the layers. Set once READY.
   uint64 size_bytes = 5;
+  // Pulled with `exclusive`: no other pull is handed this image.
+  bool exclusive = 6;
 }
 
 message PullImageRequest {

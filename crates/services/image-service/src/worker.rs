@@ -74,10 +74,11 @@ impl Orchestrator {
                     }
                 };
                 // Images are immutable: a pull of a reference that is there
-                // or on its way joins it.
+                // or on its way joins it, unless either pull is exclusive.
                 if !exclusive
                     && let Some(existing) = self.store.values().find(|info| {
-                        info.image_ref == image_ref
+                        !info.exclusive
+                            && info.image_ref == image_ref
                             && matches!(
                                 ImageState::try_from(info.state),
                                 Ok(ImageState::Ready | ImageState::Downloading)
@@ -103,6 +104,7 @@ impl Orchestrator {
                         image_uuid: image_uuid.clone(),
                         image_ref: image_ref.clone(),
                         state: ImageState::Downloading as i32,
+                        exclusive,
                         ..Default::default()
                     },
                 );
@@ -128,14 +130,17 @@ impl Orchestrator {
                 pulled,
             } => {
                 info!("Orchestrator: Finalizing pull for {image_uuid}");
+                let mut exclusive = false;
                 if let Some(info) = self.store.get_mut(&image_uuid) {
                     info.digest = pulled.digest.clone();
                     info.size_bytes = pulled.size_bytes;
+                    exclusive = info.exclusive;
                 }
                 let (responder, resp_rx) = oneshot::channel();
                 let file_cmd = FileCommand::StoreImage {
                     image_uuid: image_uuid.clone(),
                     image_ref,
+                    exclusive,
                     pulled,
                     responder,
                 };

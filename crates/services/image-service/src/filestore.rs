@@ -18,6 +18,8 @@ struct ImageMetadata {
     digest: String,
     #[serde(default)]
     size_bytes: u64,
+    #[serde(default)]
+    exclusive: bool,
 }
 
 pub struct FileStore {
@@ -57,13 +59,20 @@ impl FileStore {
             FileCommand::StoreImage {
                 image_uuid,
                 image_ref,
+                exclusive,
                 pulled,
                 responder,
             } => {
                 info!("FileStore: Storing image {image_uuid}");
                 let final_dir = Path::new(IMAGE_DIR).join(&image_uuid);
+                let metadata = ImageMetadata {
+                    image_ref,
+                    digest: pulled.digest.clone(),
+                    size_bytes: pulled.size_bytes,
+                    exclusive,
+                };
                 let result =
-                    Self::store_image_impl(&pull_dir(&image_uuid), &final_dir, pulled, &image_ref)
+                    Self::store_image_impl(&pull_dir(&image_uuid), &final_dir, pulled, &metadata)
                         .await;
                 let _ = responder.send(result);
             }
@@ -92,17 +101,12 @@ impl FileStore {
         pull_dir: &Path,
         final_dir: &Path,
         pulled: Pulled,
-        image_ref: &str,
+        metadata: &ImageMetadata,
     ) -> Result<(), std::io::Error> {
         fs::write(pull_dir.join("config.json"), &pulled.config).await?;
 
-        let metadata = ImageMetadata {
-            image_ref: image_ref.to_string(),
-            digest: pulled.digest,
-            size_bytes: pulled.size_bytes,
-        };
         let metadata_json =
-            serde_json::to_string_pretty(&metadata).map_err(std::io::Error::other)?;
+            serde_json::to_string_pretty(metadata).map_err(std::io::Error::other)?;
         fs::write(pull_dir.join("metadata.json"), metadata_json).await?;
 
         let _ = fs::remove_dir_all(final_dir).await;
@@ -149,6 +153,7 @@ impl FileStore {
                                 state: ImageState::Ready as i32,
                                 digest: metadata.digest,
                                 size_bytes: metadata.size_bytes,
+                                exclusive: metadata.exclusive,
                             };
                             store.insert(uuid.to_string(), image_info);
                         } else {

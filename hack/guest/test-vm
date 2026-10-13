@@ -5,6 +5,8 @@
 #
 #   hack/guest/test-vm [test name filter...]
 #
+# A filter selects other integration tests too: "integration" runs all.
+#
 # The tests run as root in a privileged container, so that FeOS's
 # directories (/var/lib/feos, /run/feos) stay in there, in the network
 # namespace of the registry's container, so that FeOS's API port stays in
@@ -54,12 +56,22 @@ done
 
 log "running ${FILTERS[*]}"
 # --init: FeOS takes PID 1 for the init system and sets the machine up.
+# /var/lib/feos is a volume: the containers' overlay roots cannot have
+# their upper layer on the container's own overlayfs.
 docker run --rm --privileged --init \
   --network "container:${REGISTRY_NAME}" \
+  -v /var/lib/feos \
   -v "${REPO_ROOT}:${REPO_ROOT}:ro" \
   -e TEST_IMAGE_REF="${TEST_IMAGE_REF}" \
   -e PATH="${REPO_ROOT}/target/firecracker:/usr/sbin:/usr/bin:/sbin:/bin" \
   -e RUST_LOG=info \
   "${RUNNER_IMAGE}" \
-  "${TEST_BIN}" --nocapture "${FILTERS[@]}"
+  sh -c '
+    # Container cgroups go below the root of the cgroup namespace, which
+    # then may hold no processes: move these to a child, as dind does.
+    mkdir /sys/fs/cgroup/init
+    xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || :
+    sed -e "s/ / +/g" -e "s/^/+/" /sys/fs/cgroup/cgroup.controllers \
+      > /sys/fs/cgroup/cgroup.subtree_control
+    exec "$@"' sh "${TEST_BIN}" --nocapture "${FILTERS[@]}"
 log "PASS"

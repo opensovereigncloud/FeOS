@@ -88,6 +88,7 @@ pub enum FileCommand {
     StoreImage {
         image_uuid: String,
         image_ref: String,
+        exclusive: bool,
         pulled: pull::Pulled,
         responder: oneshot::Sender<Result<(), std::io::Error>>,
     },

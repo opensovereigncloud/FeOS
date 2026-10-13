@@ -95,9 +95,11 @@ async fn test_container_image_lifecycle() -> Result<()> {
 
     let image_ref = TEST_CONTAINER_IMAGE_REF.clone();
     info!("Pulling container image: {image_ref}");
+    // Exclusive: the container tests share this reference, and deleting a
+    // shared image would take their root filesystems away.
     let pull_req = PullImageRequest {
         image_ref: image_ref.clone(),
-        exclusive: false,
+        exclusive: true,
     };
     let pull_res = image_client.pull_image(pull_req).await?.into_inner();
     let image_uuid = pull_res.image_uuid;
@@ -124,6 +126,19 @@ async fn test_container_image_lifecycle() -> Result<()> {
         .find(|i| i.image_uuid == image_uuid)
         .expect("Image UUID should be in the list after pulling");
     assert_eq!(found_image.state, ImageState::Ready as i32);
+    assert!(found_image.exclusive);
+
+    let shared = image_client
+        .pull_image(PullImageRequest {
+            image_ref: image_ref.clone(),
+            exclusive: false,
+        })
+        .await?
+        .into_inner();
+    assert_ne!(
+        shared.image_uuid, image_uuid,
+        "A shared pull must not be handed an exclusive image"
+    );
 
     let image_path = Path::new(IMAGE_DIR).join(&image_uuid);
     info!(
