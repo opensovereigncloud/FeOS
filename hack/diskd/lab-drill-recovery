@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# User-recovery drill: create a device, run fio on it, SIGKILL diskd,
+# start it again, and check that it recovered the device and that fio
+# saw no error. Prints PASS or FAIL. Needs the lab daemon (lab-up), fio
+# and sudo. Usage: hack/diskd/lab-drill-recovery [pod-id]
+set -uo pipefail
+
+thisDir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+ROOT="$(cd "${thisDir}/../.." && pwd)"
+STATE=$(readlink -f "${DISKD_STATE:-${ROOT}/target/diskd/state}")
+BIN="${DISKD_BIN:-${ROOT}/target/release/diskd}"
+CTL=(sudo "${ROOT}/target/release/diskctl" --socket "${STATE}/diskd.sock")
+POD="${1:-drill}"
+
+fail() { echo "[drill] FAIL: $*" >&2; exit 1; }
+
+[ -S "${STATE}/diskd.sock" ] || fail "daemon not running: hack/diskd/lab-up first"
+command -v fio >/dev/null || fail "fio not found"
+
+# A fresh device over a small ext4 base image, built once.
+"${CTL[@]}" stop "${POD}" >/dev/null 2>&1 || true
+IMG="${ROOT}/target/diskd/imported/drill-base.raw"
+if [ ! -f "${IMG}" ]; then
+  mkdir -p "$(dirname "${IMG}")"
+  truncate -s 256M "${IMG}"
+  /sbin/mkfs.ext4 -q -L drill-base "${IMG}"
+fi
+L0=$("${CTL[@]}" import-base "${IMG}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["layer_id"])')
+OUT=$("${CTL[@]}" create "${POD}" "${L0}")
+DEV=$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["dev_path"])')
+echo "[drill] device ${DEV} up"
+
+# Load, then SIGKILL the daemon.
+FIO_OUT=$(mktemp)
+sudo -n fio --name=drill --filename="${DEV}" --rw=randrw --rwmixread=70 \
+  --bs=4k --size=128M --direct=1 --runtime=25 --time_based=1 >"${FIO_OUT}" 2>&1 &
+FIO_PID=$!
+sleep 3
+D=$(pgrep -xf "${BIN} --state-dir ${STATE}.*" | tail -1)
+[ -n "${D}" ] || fail "daemon pid not found"
+sudo -n kill -9 "${D}" || fail "kill"
+echo "[drill] daemon ${D} killed under load; waiting for quiesce"
+sleep 2
+
+# Restart: diskd must recover the device and fio go on.
+"${thisDir}/lab-up" >"${STATE}/../lab-up-drill.log" 2>&1 || { cat "${STATE}/../lab-up-drill.log"; fail "lab-up"; }
+wait "${FIO_PID}" || fail "fio exited $? (see ${FIO_OUT})"
+
+if grep -qE "err= ?[1-9]|fio: pid=0, err" "${FIO_OUT}"; then
+  echo "[drill] FAIL: fio reported errors"
+  grep -E "read:|write:|err" "${FIO_OUT}" | head -6
+  exit 1
+fi
+grep -E "read:|write:" "${FIO_OUT}" | head -4
+
+ERRORS=$("${CTL[@]}" stats "${POD}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["devices"][0]["errors"])')
+echo "[drill] device-side error count: ${ERRORS}"
+[ "${ERRORS}" = "0" ] || fail "device errors ${ERRORS}"
+rm -f "${FIO_OUT}"
+echo "[drill] PASS — daemon SIGKILL + user recovery, fio clean"

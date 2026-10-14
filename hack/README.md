@@ -77,6 +77,21 @@ off through `feosctl host shutdown`.
 `~/.config/feos/apt/r2.env` and signs with the key in
 `~/.config/feos/apt/gnupg`; both stay on the machine that publishes.
 
+## diskd
+
+The disk daemon ([docs/architecture/disk.md](../docs/architecture/disk.md))
+has its labs in `hack/diskd/`. They need the ublk driver, sudo and fio;
+the state is in `target/diskd/`:
+
+    make diskd               # static diskd and diskctl
+    make diskd-lab-up        # start a lab diskd under sudo
+    make diskd-lab           # the lab tests against it
+    make diskd-lab-drill     # SIGKILL diskd under fio; it must recover
+    make diskd-lab-down      # stop it
+
+S3 is used when `S3_BUCKET` and `AWS_*` are in the environment; the lab
+tests that need it skip otherwise. Nothing reads credentials from files.
+
 ## Nested Virtualization Test Environment
 
 `make test-pods` runs the pod integration tests against Firecracker, with feos-guest installed as its package would. To run FeOS within a virtual machine that itself runs microVMs, as on a real host, you need a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.
