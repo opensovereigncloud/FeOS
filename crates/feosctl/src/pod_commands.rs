@@ -96,24 +96,8 @@ pub struct CreatePodOptions {
     #[arg(long, value_parser = parse_key_val, help = "KEY=value for the pod (repeatable)")]
     label: Vec<(String, String)>,
 
-    #[arg(long, help = "TAP device on the node for the pod's network")]
-    tap: Option<String>,
-
-    #[arg(long, requires = "tap", help = "The guest's MAC address")]
-    mac: Option<String>,
-
-    #[arg(
-        long,
-        requires = "tap",
-        help = "The guest's address, e.g. 10.201.0.2/24"
-    )]
-    ipv4: Option<String>,
-
-    #[arg(long, requires = "tap", help = "The guest's gateway")]
-    gateway: Option<String>,
-
-    #[arg(long, requires = "tap", help = "A resolver for the guest (repeatable)")]
-    dns: Vec<String>,
+    #[arg(long, help = "No network: the pod can pull no image then")]
+    no_network: bool,
 
     #[arg(long, help = "Wait until the pod runs")]
     wait: bool,
@@ -195,13 +179,7 @@ pub async fn handle_pod_command(args: PodArgs) -> Result<()> {
 }
 
 fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
-    let network = opts.tap.map(|tap_name| PodNetwork {
-        tap_name,
-        mac_address: opts.mac.unwrap_or_default(),
-        ipv4_cidr: opts.ipv4.unwrap_or_default(),
-        gateway: opts.gateway.unwrap_or_default(),
-        dns: opts.dns,
-    });
+    let network = opts.no_network.then_some(PodNetwork { none: true });
     CreatePodRequest {
         pod_id: opts
             .pod_id
@@ -327,14 +305,9 @@ fn print_pod(pod: &PodInfo) {
             }
         );
     }
-    if let Some(network) = &spec.network {
-        println!(
-            "  Network: {} on {}, gateway {}, DNS {}",
-            network.ipv4_cidr,
-            network.tap_name,
-            network.gateway,
-            network.dns.join(" ")
-        );
+    match pod.ipv4_address.as_str() {
+        "" => println!("  Network: none"),
+        address => println!("  Address: {address}"),
     }
     for (key, value) in &spec.labels {
         println!("  Label: {key}={value}");
@@ -497,21 +470,7 @@ mod tests {
     #[test]
     fn a_create_takes_its_command_after_the_options() {
         let cli = Cli::try_parse_from([
-            "pod",
-            "create",
-            "--image",
-            "busybox",
-            "--tap",
-            "pod0",
-            "--ipv4",
-            "10.201.0.2/24",
-            "--dns",
-            "1.1.1.1",
-            "--env",
-            "A=b",
-            "--",
-            "sleep",
-            "infinity",
+            "pod", "create", "--image", "busybox", "--env", "A=b", "--", "sleep", "infinity",
         ])
         .unwrap();
         let PodCommand::Create(opts) = cli.command else {
@@ -521,7 +480,7 @@ mod tests {
         let spec = request.spec.unwrap();
         assert_eq!(spec.containers[0].command, ["sleep", "infinity"]);
         assert_eq!(spec.containers[0].env["A"], "b");
-        assert_eq!(spec.network.unwrap().dns, ["1.1.1.1"]);
+        assert_eq!(spec.network, None, "a pod has a network by default");
         assert!(uuid::Uuid::parse_str(&request.pod_id).is_ok());
     }
 
@@ -540,15 +499,12 @@ mod tests {
     }
 
     #[test]
-    fn a_network_needs_a_tap() {
-        assert!(Cli::try_parse_from([
-            "pod",
-            "create",
-            "--image",
-            "busybox",
-            "--ipv4",
-            "10.0.0.2/24"
-        ])
-        .is_err());
+    fn a_pod_may_have_no_network() {
+        let cli = Cli::try_parse_from(["pod", "create", "--no-network"]).unwrap();
+        let PodCommand::Create(opts) = cli.command else {
+            panic!("not a create");
+        };
+        let spec = create_pod_request(*opts).spec.unwrap();
+        assert_eq!(spec.network, Some(PodNetwork { none: true }));
     }
 }

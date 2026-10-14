@@ -112,7 +112,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     let vms = initialize_vm_service(&setup_database().await?).await?;
     let services = Services {
         #[cfg(feature = "host")]
-        pods: initialize_pod_service(vms)?,
+        pods: initialize_pod_service(vms).await?,
         container: initialize_container_service().await?,
         host: initialize_host_service(options.self_upgrade.then_some(restart_tx), log_handle),
         image: initialize_image_service().await?,

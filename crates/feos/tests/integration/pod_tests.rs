@@ -18,10 +18,11 @@ use feos_proto::pod_service::{
 };
 use feos_utils::vsock::API_PORT;
 use log::info;
-use microvm_service::vmm::jail::{self, tap};
+use microvm_service::vmm::jail;
 use microvm_service::{vm_dir, vsock_path};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use pod_service::network;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
@@ -144,23 +145,17 @@ async fn test_pod_lifecycle() -> Result<()> {
     ensure_server().await;
     let (mut pods, _, _) = get_public_clients().await?;
 
-    // The pod's TAP device does not exist: the microVM layer creates it and
-    // removes it with the pod.
-    let tap_name = format!("fct{}", std::process::id());
+    // feosd gives the pod its network: a TAP device on the pods' bridge,
+    // and an address.
     let pod_id = new_pod_id();
+    let tap_name = network::tap_name(&pod_id);
     let spec = PodSpec {
         resources: Some(Resources {
             vcpus: 2,
             memory_mib: 512,
         }),
         containers: vec![],
-        network: Some(PodNetwork {
-            tap_name: tap_name.clone(),
-            ipv4_cidr: "10.99.0.2/24".to_string(),
-            gateway: "10.99.0.1".to_string(),
-            dns: vec!["10.99.0.53".to_string()],
-            ..Default::default()
-        }),
+        network: None,
         labels: [("test".to_string(), "lifecycle".to_string())].into(),
     };
     let create = CreatePodRequest {
@@ -202,11 +197,33 @@ async fn test_pod_lifecycle() -> Result<()> {
         .get_network_config(GetNetworkConfigRequest {})
         .await?
         .into_inner();
+    let address: std::net::Ipv4Addr = pod.ipv4_address.parse()?;
+    assert_eq!(
+        address.octets()[..2],
+        [10, 200],
+        "{address} is not the pods'"
+    );
     assert!(network.configured);
     assert_eq!(network.interface, "eth0");
-    assert_eq!(network.ipv4_cidr, "10.99.0.2/24");
-    assert_eq!(network.dns, vec!["10.99.0.53".to_string()]);
+    assert_eq!(network.ipv4_cidr, format!("{address}/16"));
+    assert_eq!(network.gateway, "10.200.0.1");
+    assert_eq!(
+        network.dns,
+        vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+    );
     assert_eq!(network.hostname, pod_id);
+    // An isolated port of the pods' bridge.
+    let port = Path::new("/sys/class/net").join(&tap_name);
+    let bridge = std::fs::read_link(port.join("master"))?;
+    assert!(
+        bridge.ends_with(network::BRIDGE),
+        "{tap_name} is on {}",
+        bridge.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(port.join("brport/isolated"))?.trim(),
+        "1"
+    );
     let skew = guest_clock_skew(&pod_id).await?;
     assert!(
         skew < Duration::from_secs(5),
@@ -328,7 +345,7 @@ async fn test_pod_lifecycle() -> Result<()> {
     verify_microvm_cleanup(&pod_id);
     assert!(
         !Path::new("/sys/class/net").join(&tap_name).exists(),
-        "The TAP device the microVM layer created is gone with the pod"
+        "The pod's TAP device is gone with the pod"
     );
     assert!(
         !jail::cgroup(&pod_id).exists(),
@@ -358,6 +375,8 @@ async fn test_pod_crash() -> Result<()> {
                 vcpus: 1,
                 memory_mib: 256,
             }),
+            // A pod with no network at all.
+            network: Some(PodNetwork { none: true }),
             ..Default::default()
         }),
     })
@@ -418,22 +437,16 @@ async fn test_pod_suspend_and_resume() -> Result<()> {
     ensure_server().await;
     let (mut pods, _, _) = get_public_clients().await?;
 
-    // A TAP device of the caller's: the microVM layer hands it to the
-    // pod's user, and leaves it when the pod goes.
-    let tap_name = format!("fcs{}", std::process::id());
-    tap::ensure(&tap_name, 0)?;
-
+    // The microVM layer hands the pod's TAP device to the pod's user, on
+    // every restore.
     let pod_id = new_pod_id();
+    let tap_name = network::tap_name(&pod_id);
     pods.create_pod(CreatePodRequest {
         pod_id: pod_id.clone(),
         spec: Some(PodSpec {
             resources: Some(Resources {
                 vcpus: 1,
                 memory_mib: 256,
-            }),
-            network: Some(PodNetwork {
-                tap_name: tap_name.clone(),
-                ..Default::default()
             }),
             ..Default::default()
         }),
@@ -520,10 +533,9 @@ async fn test_pod_suspend_and_resume() -> Result<()> {
     .await?;
     verify_microvm_cleanup(&pod_id);
     assert!(
-        Path::new("/sys/class/net").join(&tap_name).exists(),
-        "The caller's TAP device outlives the pod"
+        !Path::new("/sys/class/net").join(&tap_name).exists(),
+        "The pod's TAP device is gone with the pod"
     );
-    tap::delete(&tap_name)?;
     guard.disable_cleanup();
     Ok(())
 }

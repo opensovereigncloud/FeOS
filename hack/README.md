@@ -69,9 +69,9 @@ downloads, pinned by sha256 (`hack/packages/`):
     make publish-apt     # builds HEAD as a dev version and publishes it to apt.fecode.dev
 
 `make test-packages` boots a pod from the installed guest, restarts feosd
-under it, runs a pod with a TAP device and NAT in the container (busybox
-from Docker Hub, so it needs internet access), execs in it through
-feosd, suspends, resumes, stops and starts it, and powers the container
+under it, runs pods on feosd's network (busybox from Docker Hub, so it
+needs internet access), checks that they reach neither each other nor the
+node, execs in one through feosd, suspends, resumes, stops and starts it, and powers the container
 off through `feosctl host shutdown`.
 `make publish-apt` reads the bucket's credentials from
 `~/.config/feos/apt/r2.env` and signs with the key in

@@ -57,8 +57,8 @@ pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmApiHandler> 
 
 /// The pods, on top of the VM service.
 #[cfg(feature = "host")]
-pub(crate) fn initialize_pod_service(vms: VmApiHandler) -> Result<pod_service::Pods> {
-    let pods = pod_service::Pods::new(vms, Path::new(pod_service::POD_DIR))?;
+pub(crate) async fn initialize_pod_service(vms: VmApiHandler) -> Result<pod_service::Pods> {
+    let pods = pod_service::Pods::new(vms, Path::new(pod_service::POD_DIR)).await?;
     info!("Main: Pod Service is configured.");
     Ok(pods)
 }

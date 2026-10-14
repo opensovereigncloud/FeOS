@@ -18,6 +18,9 @@ prost-types = { workspace = true }
 tower = { workspace = true }
 uuid = { workspace = true }
 log = { workspace = true }
+rtnetlink = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

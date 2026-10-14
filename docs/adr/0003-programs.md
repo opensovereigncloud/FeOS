@@ -89,6 +89,6 @@ running.
   Go manager doing what has not moved yet:
   1. pods on top of the VM service (ADR 0004);
   2. the Valkey transport, events and telemetry (ADR 0006);
-  3. network isolation and the guest's DNS;
+  3. network isolation and the guest's DNS (ADR 0010);
   4. the Kubernetes and SSH proxies and port forwarding;
   5. hibernation, with the disk daemon (ADR 0008).

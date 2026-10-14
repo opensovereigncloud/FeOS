@@ -10,6 +10,7 @@
 //! again where it ended. What changes a pod runs under its lock; a stop or
 //! a delete ends a bring-up first.
 
+use crate::network::{self, Attachment};
 use crate::spec;
 use crate::store::Store;
 use feos_proto::container_service::{
@@ -61,6 +62,7 @@ pub struct Pods {
 struct Inner {
     vms: VmApiHandler,
     store: Store,
+    addresses: network::Addresses,
     pods: Mutex<HashMap<String, Pod>>,
     events: broadcast::Sender<PodEvent>,
 }
@@ -73,9 +75,10 @@ struct Pod {
 }
 
 impl Pods {
-    /// The pods kept in `dir`. Those that were coming up come up now; the
-    /// others follow their microVMs from here on.
-    pub fn new(vms: VmApiHandler, dir: &Path) -> io::Result<Self> {
+    /// The pods kept in `dir`, on the pods' network. Those that were
+    /// coming up come up now; the others follow their microVMs from here
+    /// on.
+    pub async fn new(vms: VmApiHandler, dir: &Path) -> io::Result<Self> {
         let store = Store::open(dir)?;
         let kept = store.load()?;
         let (events, _) = broadcast::channel(256);
@@ -83,6 +86,7 @@ impl Pods {
             inner: Arc::new(Inner {
                 vms,
                 store,
+                addresses: network::Addresses::new(dir),
                 pods: Mutex::new(HashMap::new()),
                 events,
             }),
@@ -102,6 +106,8 @@ impl Pods {
             );
         }
         info!("Pods: {} kept", pods.pods().len());
+        network::set_up_bridge().await?;
+        pods.apply_network()?;
         for pod_id in pending {
             pods.spawn_bring_up(&pod_id);
         }
@@ -123,10 +129,22 @@ impl Pods {
                     )))
                 };
             }
+            let ipv4_address = if spec::has_network(&spec) {
+                let used = pods.values().filter_map(|pod| attachment(&pod.info));
+                let used = used.map(|attachment| attachment.address).collect();
+                self.inner
+                    .addresses
+                    .allocate(&used)
+                    .map_err(|e| Status::resource_exhausted(format!("no address: {e}")))?
+                    .to_string()
+            } else {
+                String::new()
+            };
             let info = PodInfo {
                 pod_id: pod_id.clone(),
                 spec: Some(spec),
                 state: PodState::Pending as i32,
+                ipv4_address,
                 ..Default::default()
             };
             self.inner
@@ -144,6 +162,10 @@ impl Pods {
             info
         };
         info!("Pods: {pod_id} created");
+        // The pod's rules stand before its TAP device carries a frame.
+        if let Err(e) = self.apply_network() {
+            warn!("Pods: Failed to set the pods' rules: {e}");
+        }
         self.announce(&info, false);
         self.spawn_bring_up(&pod_id);
         Ok(info)
@@ -198,12 +220,19 @@ impl Pods {
     pub async fn delete(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         self.delete_vm(pod_id).await?;
+        if let Some(attachment) = attachment(&self.info(pod_id)?) {
+            network::detach(&attachment)
+                .map_err(|e| Status::internal(format!("delete {}: {e}", attachment.tap)))?;
+        }
         self.inner
             .store
             .remove(pod_id)
             .map_err(|e| Status::internal(format!("forget pod {pod_id}: {e}")))?;
         if let Some(pod) = self.pods().remove(pod_id) {
             self.announce(&pod.info, true);
+        }
+        if let Err(e) = self.apply_network() {
+            warn!("Pods: Failed to set the pods' rules: {e}");
         }
         info!("Pods: {pod_id} deleted");
         Ok(())
@@ -226,6 +255,7 @@ impl Pods {
     pub async fn resume(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.lock(pod_id).await?;
         self.expect_state(pod_id, PodState::Suspended)?;
+        self.attach(pod_id).await?;
         let request = Request::new(ResumeVmRequest {
             vm_id: pod_id.to_string(),
         });
@@ -425,11 +455,12 @@ impl Pods {
     /// Gets the pod's microVM running, from whatever state it is in.
     async fn boot(&self, pod_id: &str, spec: &PodSpec) -> Result<(), Status> {
         let vm_id = pod_id.to_string();
+        let attachment = self.attach(pod_id).await?;
         loop {
             match self.vm(pod_id).await?.map(|vm| vm.state()) {
                 None => {
                     let request = Request::new(CreateVmRequest {
-                        config: Some(spec::vm_config(pod_id, spec)),
+                        config: Some(spec::vm_config(pod_id, spec, attachment.as_ref())),
                         vm_id: Some(vm_id.clone()),
                     });
                     self.inner.vms.create_vm(request).await?;
@@ -493,6 +524,28 @@ impl Pods {
             }
             sleep(POLL).await;
         }
+    }
+
+    /// Puts the pod's TAP device on the bridge, if the pod has a network:
+    /// before every boot and resume, which find it as they left it.
+    async fn attach(&self, pod_id: &str) -> Result<Option<Attachment>, Status> {
+        let Some(attachment) = attachment(&self.info(pod_id)?) else {
+            return Ok(None);
+        };
+        network::attach(&attachment)
+            .await
+            .map_err(|e| Status::internal(format!("attach {}: {e}", attachment.tap)))?;
+        Ok(Some(attachment))
+    }
+
+    /// Replaces the pods' rules with the ones for the pods there are.
+    fn apply_network(&self) -> io::Result<()> {
+        let attachments: Vec<Attachment> = self
+            .pods()
+            .values()
+            .filter_map(|pod| attachment(&pod.info))
+            .collect();
+        network::apply(&attachments)
     }
 
     /// Waits until the VM service records the microVM in `state`: it
@@ -643,6 +696,12 @@ impl Pods {
             self.set_state(&event.vm_id, state, &reason);
         }
     }
+}
+
+/// The pod's place on the bridge, if it has an address.
+fn attachment(info: &PodInfo) -> Option<Attachment> {
+    let address = info.ipv4_address.parse().ok()?;
+    Some(Attachment::new(&info.pod_id, address))
 }
 
 /// A channel to the API of the pod's guest.

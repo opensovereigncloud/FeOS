@@ -5,6 +5,7 @@
 //! pod's services to its guest.
 
 pub mod forward;
+pub mod network;
 mod pods;
 mod spec;
 mod store;

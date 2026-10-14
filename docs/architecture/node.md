@@ -59,7 +59,8 @@ On a distribution all of this is the operating system's
 
 | Path | Holds |
 |---|---|
-| `/var/lib/feos/pods/<id>.pb` | a pod: its spec, its state and why (a `feos.pod.v1.PodInfo`) |
+| `/var/lib/feos/pods/<id>.pb` | a pod: its spec, its state and why, its address (a `feos.pod.v1.PodInfo`) |
+| `/var/lib/feos/pods/next-address` | where the next pod's address is looked for |
 | `/var/lib/feos/vms.db` | the microVM records (SQLite) |
 | `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
 | `/var/lib/feos/images/` | pulled images, a `metadata.json` each |
@@ -78,9 +79,35 @@ A pod ([ADR 0004](../adr/0004-pods.md)) is a microVM
 with the pod's ID, booted from the newest installed guest, and the
 containers its spec names, which the guest runs with the names as their
 IDs. Its spec gives vCPUs and memory, the containers (image, command,
-environment) and a network: a TAP device the caller made, and the guest's
-address, gateway and resolvers. The microVM has a balloon with free page
-reporting.
+environment) and whether it has a network. The microVM has a balloon with
+free page reporting.
+
+### The pods' network
+
+Every pod has a network unless its spec says `none`
+([ADR 0010](../adr/0010-pod-network.md)). The pods share the bridge
+`feos-pods`, which carries their gateway, `10.200.0.1/16`. `feosd` gives a
+pod an address of `10.200.0.0/16` when it is created, keeps it in the
+pod's record, and derives the MAC address from it (`06:00:ac` and the
+address's last three bytes); the next address comes from a cursor in
+`/var/lib/feos/pods/next-address`, so a freed one comes round last. Before
+every boot and resume it makes the pod's TAP device, `pod-<8 hex digits of
+the ID>`, an isolated port of the bridge and brings it up. The guest is
+pushed its address, the gateway and the resolvers `8.8.8.8` and
+`1.1.1.1`. Deleting the pod deletes the TAP device.
+
+`feosd` writes two nftables tables over netlink, `inet feos` and `bridge
+feos`, and replaces both whenever a pod comes or goes:
+
+| Chain | What it does |
+|---|---|
+| `inet feos input` | drops what comes in from the bridge: pods do not reach the node |
+| `inet feos forward` | drops what goes from the bridge to private, CGNAT, link-local, loopback, "this network", multicast and reserved addresses |
+| `inet feos postrouting` | masquerades what leaves the pods' subnet for elsewhere |
+| `bridge feos prerouting` | per pod's TAP: only its MAC, its IPv4 source address, ARP with both, nothing but IPv4 and ARP |
+
+Other tables still apply: where Docker or a firewall sets the `FORWARD`
+policy to drop, pods reach nothing until it lets the bridge out.
 
 - **Create** records the pod as `PENDING` and brings it up in the
   background: create and start the microVM, wait for the guest to attach

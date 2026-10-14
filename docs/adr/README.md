@@ -19,6 +19,7 @@ the ADRs say why it works that way.
 | [0007](0007-guest.md) | Guest | `feos-guest`: vsock, configuration pushed by the host, the API mapping, libcontainer in its own process | Accepted | partly: guest RPCs still in `HostService` |
 | [0008](0008-suspend-and-restore.md) | Node | Balloon with free page reporting, full snapshots, two-step restore, version pinning | Accepted | yes |
 | [0009](0009-node-os-and-packages.md) | Operations | Debian and Garden Linux first, `.deb` packages, Firecracker side by side, `feosd` under systemd | Proposed | partly: the packages, the unit and the apt repository; no Garden Linux feature, no release workflow |
+| [0010](0010-pod-network.md) | Node | `feosd` gives every pod its network: a bridge of isolated ports, an address of `10.200.0.0/16`, NAT, nftables rules that keep pods from each other, the node and private networks and pin their addresses | Proposed | yes; no egress exceptions, ingress or traffic observation |
 
 ## Rules
 

@@ -3,6 +3,7 @@
 
 //! A pod's spec: what is valid, and the microVM it becomes.
 
+use crate::network::{self, Attachment};
 use feos_proto::microvm::{
     BalloonConfig, CpuConfig, GuestNetworkConfig, MemoryConfig, NetConfig, TapConfig, VmConfig,
 };
@@ -70,20 +71,12 @@ pub fn normalize(mut spec: PodSpec) -> Result<PodSpec, Status> {
         }
     }
 
-    if let Some(network) = &spec.network {
-        if network.tap_name.is_empty() {
-            return Err(Status::invalid_argument(
-                "the pod's network needs a TAP device",
-            ));
-        }
-        if !network.ipv4_cidr.is_empty() && !network.ipv4_cidr.contains('/') {
-            return Err(Status::invalid_argument(format!(
-                "{:?} has no prefix length",
-                network.ipv4_cidr
-            )));
-        }
-    }
     Ok(spec)
+}
+
+/// Whether the pod has a network: unless its spec says none.
+pub fn has_network(spec: &PodSpec) -> bool {
+    !spec.network.as_ref().is_some_and(|network| network.none)
 }
 
 /// The container names the guest takes as container IDs.
@@ -99,8 +92,8 @@ fn valid_name(name: &str) -> bool {
 
 /// The pod's microVM: the newest guest installed on the node, with a
 /// balloon that reports free pages, so that a suspend writes what the
-/// guest uses.
-pub fn vm_config(pod_id: &str, spec: &PodSpec) -> VmConfig {
+/// guest uses, and the pod's TAP device and address if it has a network.
+pub fn vm_config(pod_id: &str, spec: &PodSpec, attachment: Option<&Attachment>) -> VmConfig {
     let resources = spec.resources.unwrap_or_default();
     let mut config = VmConfig {
         cpus: Some(CpuConfig {
@@ -117,24 +110,21 @@ pub fn vm_config(pod_id: &str, spec: &PodSpec) -> VmConfig {
         }),
         ..Default::default()
     };
-    if let Some(network) = &spec.network {
+    if let Some(attachment) = attachment {
         config.net.push(NetConfig {
             device_id: INTERFACE.to_string(),
             tap: Some(TapConfig {
-                tap_name: network.tap_name.clone(),
+                tap_name: attachment.tap.clone(),
             }),
-            mac_address: network.mac_address.clone(),
+            mac_address: network::mac_string(attachment.mac()),
         });
-        // Without an address, the guest gets the device alone.
-        if !network.ipv4_cidr.is_empty() {
-            config.guest_network = Some(GuestNetworkConfig {
-                interface: INTERFACE.to_string(),
-                ipv4_cidr: network.ipv4_cidr.clone(),
-                gateway: network.gateway.clone(),
-                dns: network.dns.clone(),
-                hostname: pod_id.to_string(),
-            });
-        }
+        config.guest_network = Some(GuestNetworkConfig {
+            interface: INTERFACE.to_string(),
+            ipv4_cidr: format!("{}/{}", attachment.address, network::PREFIX_LEN),
+            gateway: network::GATEWAY.to_string(),
+            dns: network::DNS.iter().map(|dns| dns.to_string()).collect(),
+            hostname: pod_id.to_string(),
+        });
     }
     config
 }
@@ -186,9 +176,16 @@ mod tests {
             memory_mib: 64,
         });
         assert!(normalize(small).is_err());
-        let mut no_tap = spec(vec![container("main")]);
-        no_tap.network = Some(PodNetwork::default());
-        assert!(normalize(no_tap).is_err());
+    }
+
+    #[test]
+    fn a_pod_has_a_network_unless_it_says_none() {
+        let mut spec = spec(vec![]);
+        assert!(has_network(&spec));
+        spec.network = Some(PodNetwork { none: false });
+        assert!(has_network(&spec));
+        spec.network = Some(PodNetwork { none: true });
+        assert!(!has_network(&spec));
     }
 
     #[test]
@@ -205,24 +202,20 @@ mod tests {
 
     #[test]
     fn the_network_becomes_eth0() {
-        let mut spec = normalize(spec(vec![container("main")])).unwrap();
-        spec.network = Some(PodNetwork {
-            tap_name: "pod0".to_string(),
-            ipv4_cidr: "10.201.0.2/24".to_string(),
-            gateway: "10.201.0.1".to_string(),
-            dns: vec!["1.1.1.1".to_string()],
-            ..Default::default()
-        });
-        let config = vm_config("11111111-2222-3333-4444-555555555555", &spec);
-        assert_eq!(config.net[0].tap.as_ref().unwrap().tap_name, "pod0");
+        let spec = normalize(spec(vec![container("main")])).unwrap();
+        let id = "11111111-2222-3333-4444-555555555555";
+        let attachment = Attachment::new(id, std::net::Ipv4Addr::new(10, 200, 0, 9));
+        let config = vm_config(id, &spec, Some(&attachment));
+        assert_eq!(config.net[0].tap.as_ref().unwrap().tap_name, "pod-11111111");
+        assert_eq!(config.net[0].mac_address, "06:00:ac:c8:00:09");
         let guest = config.guest_network.unwrap();
         assert_eq!(guest.interface, "eth0");
-        assert_eq!(guest.hostname, "11111111-2222-3333-4444-555555555555");
+        assert_eq!(guest.ipv4_cidr, "10.200.0.9/16");
+        assert_eq!(guest.gateway, "10.200.0.1");
+        assert_eq!(guest.hostname, id);
         assert_eq!(config.memory.unwrap().size_mib, 512);
 
-        spec.network.as_mut().unwrap().ipv4_cidr.clear();
-        let config = vm_config("11111111-2222-3333-4444-555555555555", &spec);
-        assert_eq!(config.net.len(), 1);
-        assert!(config.guest_network.is_none(), "an address-less network");
+        let config = vm_config(id, &spec, None);
+        assert!(config.net.is_empty() && config.guest_network.is_none());
     }
 }

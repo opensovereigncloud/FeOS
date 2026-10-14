@@ -64,17 +64,16 @@ message ContainerSpec {
   map<string, string> env = 4;
 }
 
-// The pod's network, until feosd makes one itself: a TAP device on the
-// node, made by the caller, and the guest's address behind it. Without it,
-// the pod has no network and can pull no image.
+// Every pod has a network (ADR 0010): an address on the node's pod
+// bridge, isolated from the other pods, the node and private networks,
+// with NAT to the outside. feosd makes the TAP device and picks the
+// address.
 message PodNetwork {
-  string tap_name = 1;
-  // The guest's MAC address; Firecracker picks one when empty.
-  string mac_address = 2;
-  // Address with prefix length, e.g. "10.200.0.2/16".
-  string ipv4_cidr = 3;
-  string gateway = 4;
-  repeated string dns = 5;
+  // A TAP device and an address the caller chose: feosd makes both now.
+  reserved 1 to 5;
+  reserved "tap_name", "mac_address", "ipv4_cidr", "gateway", "dns";
+  // No network at all: the pod can pull no image then.
+  bool none = 6;
 }
 
 enum PodState {
@@ -102,6 +101,8 @@ message PodInfo {
   repeated ContainerStatus containers = 5;
   // The pod's microVM; unset unless it runs.
   MicroVm microvm = 6;
+  // The pod's address, for its life; empty without a network.
+  string ipv4_address = 7;
 }
 
 message MicroVm {

@@ -50,6 +50,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 feos-utils = { workspace = true }
+pod-service = { workspace = true }
 uuid = { workspace = true }
 microvm-service = { workspace = true }
 image-service = { workspace = true }

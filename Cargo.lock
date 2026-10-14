@@ -2736,10 +2736,13 @@ version = "0.6.0"
 dependencies = [
  "feos-proto",
  "feos-utils",
+ "futures",
+ "libc",
  "log",
  "microvm-service",
  "prost",
  "prost-types",
+ "rtnetlink",
  "tempfile",
  "tokio",
  "tokio-stream",
