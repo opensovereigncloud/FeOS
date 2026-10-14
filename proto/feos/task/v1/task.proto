@@ -2,12 +2,12 @@ syntax = "proto3";
 
 package feos.task.v1;
 
-// TaskService is an internal-only API implemented by the `feos --task-service`
-// process, which PID 1 starts and restarts. It provides a low-level interface
-// for the container-service to manage the lifecycle of a single container
-// with youki's libcontainer. Running the runtime in a process of its own
-// keeps a runtime failure away from PID 1; the process is the subreaper of
-// the containers.
+// TaskService is an internal-only API implemented by the `--task-service`
+// process, which feosd or feos-guest starts and restarts. It provides a
+// low-level interface for the container-service to manage the lifecycle of a
+// single container with youki's libcontainer. Running the runtime in a
+// process of its own keeps a runtime failure away from feosd and the guest's
+// PID 1; the process is the subreaper of the containers.
 service TaskService {
   // Creates the container's environment based on an OCI bundle but does not
   // start the user-specified process.

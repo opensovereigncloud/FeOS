@@ -26,7 +26,7 @@ pub struct VmArgs {
         long,
         global = true,
         env = "FEOS_ADDRESS",
-        default_value = "http://[::1]:1337"
+        default_value = "unix:/run/feos/api.sock"
     )]
     pub address: String,
 

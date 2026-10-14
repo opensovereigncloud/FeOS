@@ -7,7 +7,7 @@ initramfs: target/firecracker/firecracker container-release
 	cp target/kernel/vmlinuz target/rootfs/usr/share/feos/vmlinuz
 	rm -f target/rootfs/bin/feos
 	cp target/x86_64-unknown-linux-musl/release/feos-host-init target/rootfs/usr/sbin/feos-host-init
-	cp target/x86_64-unknown-linux-musl/release/feos target/rootfs/usr/sbin/feosd
+	cp target/x86_64-unknown-linux-musl/release/feosd target/rootfs/usr/sbin/feosd
 	sudo chown -R `whoami` target/rootfs/etc/feos/
 	cd target/rootfs && rm -f init && ln -s usr/sbin/feos-host-init init
 	docker run --rm -u $${UID} -v "`pwd`:/feos" feos-builder bash -c "cd hack/initramfs && ./mk-initramfs"

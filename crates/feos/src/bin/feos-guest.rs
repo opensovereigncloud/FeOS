@@ -1,23 +1,25 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+//! feos-guest: PID 1 in a pod's microVM.
+
 use anyhow::Result;
 use feos_utils::filesystem::{get_root_fstype, move_root};
-use main_server::{run_server, run_task_service};
+use main_server::{run_server, run_task_service, ServerOptions};
 use nix::sys::prctl;
 use nix::unistd::{execv, pause};
 use std::env;
 use std::ffi::CString;
 
-/// FeOS's own arguments: the ones it passes itself, and --version. The
-/// kernel hands unknown command-line words to init, so anything else is
+/// feos-guest's own arguments: the ones it passes itself, and --version.
+/// The kernel hands unknown command-line words to init, so anything else is
 /// ignored.
 #[derive(Debug, Default)]
 struct ServerArgs {
     restarted_after_upgrade: bool,
 
-    /// Run the task service, the process FeOS starts for the container
-    /// runtime.
+    /// Run the task service, the process feos-guest starts for the
+    /// container runtime.
     task_service: bool,
 
     version: bool,
@@ -47,9 +49,9 @@ async fn main() -> Result<()> {
         // instead, so the console and the processes that still run stay
         // usable.
         if let Err(e) = &result {
-            eprintln!("[feos] {e:#}");
+            eprintln!("[feos-guest] {e:#}");
         }
-        eprintln!("[feos] FeOS stopped serving; PID 1 idles to keep the kernel alive.");
+        eprintln!("[feos-guest] feos-guest stopped serving; PID 1 idles to keep the kernel alive.");
         loop {
             pause();
         }
@@ -61,7 +63,7 @@ async fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let args = ServerArgs::parse(env::args().skip(1));
     if args.version && std::process::id() != 1 {
-        println!("feos {}", feos_utils::version::full_version_string());
+        println!("feos-guest {}", feos_utils::version::full_version_string());
         return Ok(());
     }
 
@@ -71,25 +73,25 @@ async fn run() -> Result<()> {
 
     if std::process::id() == 1 {
         let root_fstype = get_root_fstype().unwrap_or_else(|e| {
-            eprintln!("[feos] Failed to get root fstype: {e}");
+            eprintln!("[feos-guest] Failed to get root fstype: {e}");
             String::new()
         });
 
         if root_fstype == "rootfs" {
-            move_root().map_err(|e| anyhow::anyhow!("[feos] move_root failed: {e}"))?;
+            move_root().map_err(|e| anyhow::anyhow!("[feos-guest] move_root failed: {e}"))?;
 
             let argv: Vec<CString> = env::args()
                 .map(|arg| CString::new(arg).unwrap_or_default())
                 .collect();
-            let _ =
-                execv(&argv[0], &argv).map_err(|e| anyhow::anyhow!("[feos] execv failed: {e}"))?;
+            let _ = execv(&argv[0], &argv)
+                .map_err(|e| anyhow::anyhow!("[feos-guest] execv failed: {e}"))?;
 
             return Err(anyhow::anyhow!("execv failed to replace process"));
         }
     } else {
         prctl::set_child_subreaper(true).map_err(|e| {
             anyhow::anyhow!(
-                "[feos] Failed to set as child subreaper when running as not PID 1: {e}"
+                "[feos-guest] Failed to set as child subreaper when running as not PID 1: {e}"
             )
         })?;
     }
@@ -97,7 +99,8 @@ async fn run() -> Result<()> {
     // PID 1 and subreapers inherit orphans; reap them.
     feos_utils::reaper::spawn();
 
-    run_server(args.restarted_after_upgrade).await
+    // A guest replaces its own binary in an upgrade: nothing else owns it.
+    run_server(ServerOptions::new(args.restarted_after_upgrade, true)).await
 }
 
 #[cfg(test)]

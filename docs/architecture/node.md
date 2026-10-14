@@ -8,20 +8,18 @@ What runs on a node and how. The decisions behind it:
 [ADR 0009](../adr/0009-node-os-and-packages.md) (operating system and
 packages).
 
-Today the node agent is `feos` built with the `host` feature; it becomes
-`feosd`. Parts that are decided but not built are marked as such.
+Parts that are decided but not built are marked as such.
 
 ## Processes
 
 - **`feos-host-init`**: PID 1 when FeOS is the node's operating system. It
-  sets the machine up, starts `feosd` (today still the `feos` binary,
-  installed as `/usr/sbin/feosd`) and starts it again when it ends.
-- **`feos`** (to become `feosd`): the API, the VM service, the container
-  and image services. As an ordinary process it becomes the subreaper of
-  its children.
-- **`feos --task-service`**: the container runtime (libcontainer) in a
-  process of its own, started and restarted by the main process. Its pid is
-  in `/run/feos/task-service.pid`.
+  sets the machine up, starts `feosd` and starts it again when it ends.
+- **`feosd`**: the node agent: the API, the VM service, the container and
+  image services. It runs under systemd or `feos-host-init`, never as
+  PID 1.
+- **`feosd --task-service`**: the container runtime (libcontainer) in a
+  process of its own, started and restarted by `feosd`. Its pid is in
+  `/run/feos/task-service.pid`.
 - **The jailer and Firecracker**, one process per running VM.
 
 ## Machine setup: feos-host-init
@@ -38,6 +36,24 @@ to `/dev/kmsg`.
 
 On a distribution all of this is the operating system's
 ([ADR 0009](../adr/0009-node-os-and-packages.md)).
+
+## feosd
+
+`feosd [--tcp ADDRESS] [--self-upgrade]` sets nothing of the machine up.
+
+- It serves the API on `/run/feos/api.sock` and, with `--tcp`, on TCP,
+  without authentication ([api.md](api.md)). If a group `feos` exists, it
+  owns the socket, mode 0660: its members can do on the node what root
+  can.
+- Once its listeners are bound, it sends `READY=1` to `$NOTIFY_SOCKET` if
+  systemd set one.
+- `HostService.Reboot` and `Shutdown` send PID 1 `SIGRTMIN+5` and
+  `SIGRTMIN+4`. `UpgradeFeosBinary` replaces the binary and runs it with
+  the same pid only with `--self-upgrade`; without, the call fails with
+  `FAILED_PRECONDITION`.
+- It is the subreaper of its children. VMs and the task service outlive
+  it: a `feosd` that starts again takes the running VMs over and keeps the
+  running task service.
 
 ## Directories
 
@@ -96,9 +112,12 @@ mount namespace of its own, as a user of the VM's own, which owns the
 VM's disks and TAP devices. The VM service creates TAP devices that do not
 exist and deletes them with the VM.
 
-Every VM has a cgroup of its own, `/sys/fs/cgroup/vms/<id>`, with
-`cpu.weight` 100 per vCPU and no caps. Decided, not built: the cgroup
-moves below the cgroup `feosd` is given, so that systemd can delegate it.
+Every VM has a cgroup of its own, `vms/<id>` below the cgroup `feosd` is
+given, with `cpu.weight` 100 per vCPU and no caps: `/sys/fs/cgroup/vms/<id>`
+under `feos-host-init`, `/sys/fs/cgroup/system.slice/feosd.service/vms/<id>`
+under systemd. A cgroup whose children use controllers may hold no
+processes, so `feosd` moves into the leaf `feosd` of its cgroup, where
+systemd starts it already with `DelegateSubgroup=feosd`.
 
 ### The guest
 
@@ -119,7 +138,7 @@ and compact its memory, and waits until the VMM stops shrinking.
 
 ## Firecracker
 
-`feos` finds `jailer` and `firecracker` in its `PATH`. The tests download
+`feosd` finds `jailer` and `firecracker` in its `PATH`. The tests download
 Firecracker v1.17.0, pinned by sha256. Decided, not built: packaged
 versions side by side in `/usr/lib/feos/firecracker/<version>/`, of which
 each VM uses the one it was booted with

@@ -15,7 +15,7 @@
 //!
 //! The VM's user also owns its TAP devices, which the VM service creates if
 //! they do not exist. The jailer puts Firecracker into a cgroup of the VM's
-//! own, `vms/<id>`. Outside the chroot, `jail.json` records the user, the
+//! own, `vms/<id>` below the cgroup feosd is given. Outside the chroot, `jail.json` records the user, the
 //! VM's share of the CPU, where the files come from and which TAP devices
 //! the VM service created, so that a start can link them again and a
 //! deletion can undo it all.
@@ -30,13 +30,15 @@ use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// The first VM's user and group ID.
 const UID_BASE: u32 = 1_000_000;
 const MANIFEST: &str = "jail.json";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-/// The cgroup below the root that holds a cgroup per VM.
-pub const PARENT_CGROUP: &str = "vms";
+/// The cgroup feosd is given, below which `vms/` holds a cgroup per VM,
+/// relative to the root of the hierarchy. Unset, it is the root.
+static CGROUP_BASE: OnceLock<String> = OnceLock::new();
 
 /// A file Firecracker opens: where it comes from, and its name in the
 /// chroot.
@@ -79,9 +81,23 @@ pub fn cgroup_values(cpu_weight: u64) -> Vec<String> {
     ]
 }
 
+/// Sets the cgroup feosd is given, once, before the first VM starts.
+pub fn set_cgroup_base(base: &str) {
+    let _ = CGROUP_BASE.set(base.trim_matches('/').to_string());
+}
+
+/// The cgroup that holds a cgroup per VM, relative to the root of the
+/// hierarchy, as the jailer's --parent-cgroup takes it.
+pub fn parent_cgroup() -> String {
+    match CGROUP_BASE.get().map(String::as_str) {
+        None | Some("") => "vms".to_string(),
+        Some(base) => format!("{base}/vms"),
+    }
+}
+
 /// The VM's cgroup.
 pub fn cgroup(vm_id: &str) -> PathBuf {
-    Path::new(CGROUP_ROOT).join(PARENT_CGROUP).join(vm_id)
+    Path::new(CGROUP_ROOT).join(parent_cgroup()).join(vm_id)
 }
 
 /// What the VM service keeps about a jail.

@@ -32,17 +32,16 @@ Decided, not built:
 
 ## Listeners
 
-On a node (`feos` built with `host`, to become `feosd`):
+On a node (`feosd`):
 
 | Listener | Services |
 |---|---|
-| TCP `[::]:1337` | Vm, Container, Host |
-| `/run/feos/api.sock` | Container, Host, Image |
+| `/run/feos/api.sock`, and TCP with `--tcp` | Vm, Container, Host, Image |
 | `/run/feos/image.sock` | Image, internal |
 | `/run/feos/task.sock` | Task, internal, in the task service process |
 | `<vm dir>/v.sock_10001`, per VM | Lifecycle, for the guest's uplink |
 
-In a pod (`feos` built with `guest`, to become `feos-guest`):
+In a pod (`feos-guest`):
 
 | Listener | Services |
 |---|---|
@@ -52,10 +51,10 @@ In a pod (`feos` built with `guest`, to become `feos-guest`):
 The guest dials the host on vsock port 10001 (the uplink) and pipes
 Kubernetes and SSH connections to vsock ports 10002 and 10003.
 
-Decided, not built ([ADR 0006](../adr/0006-control-transport.md)): every
-public listener serves the same services; `feosd` listens on
-`/run/feos/api.sock` always, on Valkey when configured, and on TCP only
-when configured.
+Every public listener serves the same services. TCP has no
+authentication; `feos-host-init` starts `feosd` with `--tcp [::]:1337`.
+Decided, not built
+([ADR 0006](../adr/0006-control-transport.md)): a listener on Valkey.
 
 ## Compatibility
 

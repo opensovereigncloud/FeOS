@@ -13,6 +13,7 @@ use feos_proto::{
     host_service::host_service_server::HostServiceServer,
     image_service::image_service_server::ImageServiceServer,
 };
+#[cfg(feature = "guest")]
 use feos_utils::filesystem::mount_virtual_filesystems;
 use host_service::{
     api::HostApiHandler, dispatcher::HostServiceDispatcher, Command as HostCommand, RestartSignal,
@@ -74,7 +75,7 @@ pub(crate) async fn initialize_container_service(
 }
 
 pub(crate) fn initialize_host_service(
-    restart_tx: mpsc::Sender<RestartSignal>,
+    restart_tx: Option<mpsc::Sender<RestartSignal>>,
     log_handle: feos_utils::feos_logger::LogHandle,
 ) -> HostServiceServer<HostApiHandler> {
     let (host_tx, host_rx) = mpsc::channel::<HostCommand>(32);
@@ -123,6 +124,8 @@ pub(crate) async fn initialize_image_service() -> Result<ImageServiceServer<Imag
     Ok(image_service)
 }
 
+/// The guest's setup as PID 1 of its VM.
+#[cfg(feature = "guest")]
 pub(crate) fn perform_first_boot_initialization() {
     info!("Main: Performing first-boot initialization...");
     info!("Main: Mounting virtual filesystems...");

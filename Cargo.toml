@@ -21,11 +21,6 @@ uninlined_format_args = "warn"
 # tonic::Status is 176 bytes; every gRPC handler returns it.
 result_large_err = "allow"
 
-# The guest profile of feos builds into its own directory, so that it does not
-# overwrite the host profile's binary: target/<triple>/release-guest/feos.
-[profile.release-guest]
-inherits = "release"
-
 [workspace.package]
 version = "0.6.0"
 edition = "2024"

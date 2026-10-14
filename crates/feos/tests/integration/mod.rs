@@ -67,8 +67,8 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
     // TODO: pass the database URLs to run_server instead of the environment.
     unsafe {
         env::set_var("DATABASE_URL", &db_url);
-        // FeOS runs inside this test binary; the task service needs the real one.
-        env::set_var("FEOS_TASK_SERVICE_BINARY", env!("CARGO_BIN_EXE_feos"));
+        // feosd runs inside this test binary; the task service needs the real one.
+        env::set_var("FEOS_TASK_SERVICE_BINARY", env!("CARGO_BIN_EXE_feosd"));
     }
     info!("Using temporary database for tests: {db_url}");
 
@@ -82,7 +82,11 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
         .expect("Failed to create a new Tokio runtime for the server");
 
     runtime.spawn(async move {
-        if let Err(e) = main_server::run_server(false).await {
+        let options = main_server::ServerOptions {
+            tcp: Some("[::]:1337".parse().expect("an address")),
+            ..Default::default()
+        };
+        if let Err(e) = main_server::run_server(options).await {
             panic!("Test server failed to run: {e}");
         }
     });

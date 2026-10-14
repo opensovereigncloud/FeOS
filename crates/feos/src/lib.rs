@@ -1,28 +1,74 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(feature = "host")]
+pub mod cgroup;
 #[cfg(feature = "guest")]
 mod guest;
 mod setup;
 mod task_supervisor;
 
 use anyhow::{Context, Result};
-use host_service::RestartSignal;
-use image_service::IMAGE_SERVICE_SOCKET;
+use container_service::api::ContainerApiHandler;
+#[cfg(feature = "host")]
+use feos_proto::vm_service::vm_service_server::VmServiceServer;
+use feos_proto::{
+    container_service::container_service_server::ContainerServiceServer,
+    host_service::host_service_server::HostServiceServer,
+    image_service::image_service_server::ImageServiceServer,
+};
+use host_service::{api::HostApiHandler, RestartSignal};
+use image_service::{api::ImageApiHandler, IMAGE_SERVICE_SOCKET};
 use log::{error, info, warn};
-use nix::unistd::Uid;
+use nix::unistd::{chown, Group, Uid};
 use setup::*;
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::Path;
 use task_service::TASK_SERVICE_SOCKET;
 use tokio::{fs, net::UnixListener, sync::mpsc};
 use tokio_stream::wrappers::UnixListenerStream;
+use tonic::transport::server::Router;
 use tonic::transport::Server;
+#[cfg(feature = "host")]
+use vm_service::api::VmApiHandler;
 
-/// The public gRPC API on a local Unix socket, served in every profile. The
-/// guest profile serves the same API on vsock, the host profile on TCP.
+/// The public gRPC API on a local Unix socket, served by feosd and
+/// feos-guest. feos-guest serves the same API on vsock, feosd on TCP if
+/// asked to.
 pub const API_SOCKET: &str = "/run/feos/api.sock";
+/// The group that may use the API socket, if it exists. The feosd package
+/// creates it.
+const API_GROUP: &str = "feos";
 
-pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
+/// How feosd or feos-guest serves.
+#[derive(Debug, Default)]
+pub struct ServerOptions {
+    /// This process is the one an upgrade exec'd: the one-time setup ran.
+    pub restarted_after_upgrade: bool,
+    /// UpgradeFeosBinary may replace this binary. A package manager owns
+    /// feosd's binary unless feos-host-init runs it.
+    pub self_upgrade: bool,
+    /// Serves the API on TCP too, without authentication: for labs.
+    #[cfg(feature = "host")]
+    pub tcp: Option<std::net::SocketAddr>,
+}
+
+impl ServerOptions {
+    /// Options without the TCP listener.
+    pub fn new(restarted_after_upgrade: bool, self_upgrade: bool) -> Self {
+        Self {
+            restarted_after_upgrade,
+            self_upgrade,
+            #[cfg(feature = "host")]
+            tcp: None,
+        }
+    }
+}
+
+pub async fn run_server(options: ServerOptions) -> Result<()> {
     println!(
         "
     ███████╗███████╗ ██████╗ ███████╗
@@ -46,81 +92,80 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
         warn!("Not running as root! (uid: {})", Uid::current());
     }
 
+    // feos-guest is PID 1 of its VM and sets it up; feosd sets nothing up.
+    #[cfg(feature = "guest")]
     if std::process::id() == 1 {
         feos_utils::host::power::take_over_ctrl_alt_del();
-    }
-
-    if !restarted_after_upgrade {
-        if std::process::id() == 1 {
+        if options.restarted_after_upgrade {
+            info!("Main: Skipping one-time initialization on restart after upgrade.");
+        } else {
             perform_first_boot_initialization();
         }
-    } else {
-        info!("Main: Skipping one-time initialization on restart after upgrade.");
     }
 
     let (restart_tx, mut restart_rx) = mpsc::channel::<RestartSignal>(1);
 
-    #[cfg(feature = "host")]
-    let vm_service = initialize_vm_service(&setup_database().await?).await?;
-    let container_service = initialize_container_service().await?;
-
-    let host_service = initialize_host_service(restart_tx.clone(), log_handle);
-
-    let image_service = initialize_image_service().await?;
+    let services = Services {
+        #[cfg(feature = "host")]
+        vm: initialize_vm_service(&setup_database().await?).await?,
+        container: initialize_container_service().await?,
+        host: initialize_host_service(options.self_upgrade.then_some(restart_tx), log_handle),
+        image: initialize_image_service().await?,
+        #[cfg(feature = "guest")]
+        guest: guest::GuestServices::new(),
+    };
     task_supervisor::start().await;
 
-    #[cfg(feature = "guest")]
-    let guest_services = guest::GuestServices::new();
-
+    // Every listener serves the same services.
     let api_uds_stream = bind_unix_socket(API_SOCKET).await?;
-    let api_router = Server::builder()
-        .add_service(container_service.clone())
-        .add_service(host_service.clone())
-        .add_service(image_service.clone());
-    #[cfg(feature = "guest")]
-    let api_router = guest_services.add_to(api_router);
-    let api_unix_socket_server = api_router.serve_with_incoming(api_uds_stream);
-
-    #[cfg(feature = "guest")]
-    let vsock_server = guest_services
-        .add_to(
-            Server::builder()
-                .add_service(container_service.clone())
-                .add_service(host_service.clone())
-                .add_service(image_service.clone()),
-        )
-        .serve_with_incoming(guest::vsock_incoming()?);
-    #[cfg(not(feature = "guest"))]
-    let vsock_server = std::future::pending::<Result<(), tonic::transport::Error>>();
-
-    #[cfg(feature = "host")]
-    let tcp_addr: std::net::SocketAddr = "[::]:1337".parse().unwrap();
-    #[cfg(feature = "host")]
-    let tcp_server = Server::builder()
-        .add_service(vm_service)
-        .add_service(container_service)
-        .add_service(host_service)
-        .serve(tcp_addr);
-    #[cfg(not(feature = "host"))]
-    let tcp_server = std::future::pending::<Result<(), tonic::transport::Error>>();
-
-    let image_uds_stream = bind_unix_socket(IMAGE_SERVICE_SOCKET).await?;
-    let image_unix_socket_server = Server::builder()
-        .add_service(image_service)
-        .serve_with_incoming(image_uds_stream);
-
+    allow_group(API_SOCKET);
+    let api_unix_socket_server = services.router().serve_with_incoming(api_uds_stream);
     info!("Main: Public gRPC Server listening on Unix socket {API_SOCKET}");
+
+    #[cfg(feature = "guest")]
+    let vsock_server = services
+        .router()
+        .serve_with_incoming(guest::vsock_incoming()?);
     #[cfg(feature = "guest")]
     info!(
         "Main: Public gRPC Server listening on vsock port {}",
         feos_utils::vsock::API_PORT
     );
+    #[cfg(not(feature = "guest"))]
+    let vsock_server = std::future::pending::<Result<(), tonic::transport::Error>>();
+
     #[cfg(feature = "host")]
-    info!("Main: Public gRPC Server listening on {tcp_addr}");
+    let tcp_server = {
+        let incoming = match options.tcp {
+            Some(addr) => {
+                let listener = tokio::net::TcpListener::bind(addr)
+                    .await
+                    .with_context(|| format!("bind {addr}"))?;
+                info!("Main: Public gRPC Server listening on {addr}, without authentication");
+                Some(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            }
+            None => None,
+        };
+        let router = services.router();
+        async move {
+            match incoming {
+                Some(incoming) => router.serve_with_incoming(incoming).await,
+                None => std::future::pending().await,
+            }
+        }
+    };
+    #[cfg(not(feature = "host"))]
+    let tcp_server = std::future::pending::<Result<(), tonic::transport::Error>>();
+
+    let image_uds_stream = bind_unix_socket(IMAGE_SERVICE_SOCKET).await?;
+    let image_unix_socket_server = Server::builder()
+        .add_service(services.image.clone())
+        .serve_with_incoming(image_uds_stream);
     info!("Main: Internal ImageService listening on Unix socket {IMAGE_SERVICE_SOCKET}");
 
-    // Tell the host that the guest is ready. The listeners are bound, so the
-    // host's first call lands in their backlog.
+    // The listeners are bound: calls land in their backlog from here on.
+    notify_ready();
+    // Tell the host that the guest is ready.
     #[cfg(feature = "guest")]
     tokio::spawn(guest::run_uplink());
 
@@ -170,7 +215,68 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     anyhow::bail!("a gRPC server stopped serving")
 }
 
-/// The task service process, `feos --task-service`, which run_server starts.
+/// The public API's services, one instance each for every listener.
+struct Services {
+    #[cfg(feature = "host")]
+    vm: VmServiceServer<VmApiHandler>,
+    container: ContainerServiceServer<ContainerApiHandler>,
+    host: HostServiceServer<HostApiHandler>,
+    image: ImageServiceServer<ImageApiHandler>,
+    #[cfg(feature = "guest")]
+    guest: guest::GuestServices,
+}
+
+impl Services {
+    fn router(&self) -> Router {
+        let router = Server::builder()
+            .add_service(self.container.clone())
+            .add_service(self.host.clone())
+            .add_service(self.image.clone());
+        #[cfg(feature = "host")]
+        let router = router.add_service(self.vm.clone());
+        #[cfg(feature = "guest")]
+        let router = self.guest.add_to(router);
+        router
+    }
+}
+
+/// Lets the group `feos` use a socket, if the group exists.
+fn allow_group(path: &str) {
+    let Ok(Some(group)) = Group::from_name(API_GROUP) else {
+        return;
+    };
+    if let Err(e) = chown(path, None, Some(group.gid)) {
+        warn!("Main: Failed to give {path} to group {API_GROUP}: {e}");
+        return;
+    }
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660)) {
+        warn!("Main: Failed to open {path} to group {API_GROUP}: {e}");
+    }
+}
+
+/// Tells systemd that feosd serves (sd_notify READY=1): one datagram to
+/// $NOTIFY_SOCKET, without libsystemd. Nothing to do without it.
+fn notify_ready() {
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let socket = socket.as_bytes();
+    // "@" names a socket in the abstract namespace.
+    let address = match socket.strip_prefix(b"@") {
+        Some(name) => SocketAddr::from_abstract_name(name),
+        None => SocketAddr::from_pathname(Path::new(std::ffi::OsStr::from_bytes(socket))),
+    };
+    let sent = address.and_then(|address| {
+        let datagram = UnixDatagram::unbound()?;
+        datagram.send_to_addr(b"READY=1", &address)
+    });
+    if let Err(e) = sent {
+        warn!("Main: Failed to notify systemd: {e}");
+    }
+}
+
+/// The task service process, `feosd --task-service` or `feos-guest
+/// --task-service`, which run_server starts.
 pub async fn run_task_service() -> Result<()> {
     feos_utils::feos_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)

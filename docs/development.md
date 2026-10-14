@@ -12,7 +12,10 @@ other languages get their own top-level directory when they arrive.
 
 ```
 crates/
-  feos/                 PID 1: boot, wiring of the services, the task supervisor
+  feos/                 feosd and feos-guest: their startup, the wiring of
+                        the services, the task supervisor
+  feos-host-init/       PID 1 of a node whose operating system is FeOS:
+                        machine setup (network, NTP, hugepages, SR-IOV)
   feos-proto/           generated gRPC code for proto/
   feos-utils/           shared building blocks: logger, mounts, reaper, vsock,
                         resolvers, confined container file access, dispatch
@@ -33,45 +36,48 @@ hack/                   kernel, initramfs, UKI, guest image and VM tooling
 docs/                   documentation and ADRs
 ```
 
-## Profiles
+## Binaries
 
-`feos` builds in two profiles, selected with cargo features:
+Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
 
-- **host** (the default features): FeOS as the OS of a bare-metal
-  hypervisor. It configures itself from the network (DHCPv6, router
-  advertisements, NTP), sets up SR-IOV and hugepages, runs the VM service and
-  serves the public API on TCP `[::]:1337`. VMs run in Firecracker, in its
-  jailer ([ADR 0005](adr/0005-firecracker.md),
+- **`feosd`** (`crates/feos`, feature `host`, the default): the node agent,
+  under systemd or `feos-host-init`, never PID 1. It runs the VM service
+  and serves the public API on `/run/feos/api.sock`, and on TCP with
+  `--tcp`. VMs run in Firecracker, in its jailer
+  ([ADR 0005](adr/0005-firecracker.md),
   [ADR 0008](adr/0008-suspend-and-restore.md)).
-- **guest** (`--no-default-features --features guest`): FeOS as PID 1 in a
-  microVM whose host configures it. Its API listens on vsock port 10000, not
-  on TCP, and once it is ready it dials the host (vsock port 10001) and holds
-  a `LifecycleService.Attach` call open. A data volume, if the VM has one,
-  holds images and containers. It also serves the tool, watch, port forward,
-  kube and SSH services for the agent in its containers. None of the
-  host-only code or dependencies are in this binary.
+- **`feos-guest`** (`crates/feos`, `--no-default-features --features
+  guest`): PID 1 in a microVM whose host configures it. Its API listens on
+  vsock port 10000, not on TCP, and once it is ready it dials the host
+  (vsock port 10001) and holds a `LifecycleService.Attach` call open. A data
+  volume, if the VM has one, holds images and containers. It also serves
+  the tool, watch, port forward, kube and SSH services for the agent in its
+  containers. None of the node's code or dependencies are in this binary.
+- **`feos-host-init`** (`crates/feos-host-init`): PID 1 when FeOS is the
+  node's operating system. It sets the machine up and runs `feosd`.
+- **`feosctl`** (`crates/feosctl`): the client.
 
-PID 1 runs the container runtime in a process of its own, `feos
---task-service`, and starts it again when it exits. See
+`feosd` and `feos-guest` run the container runtime in a process of their
+own, `--task-service`, and start it again when it exits. See
 [ADR 0007](adr/0007-guest.md) for the guest's API.
 
 Both serve the public API on `/run/feos/api.sock`. Features are additive: code
-that only the host needs sits behind `#[cfg(feature = "host")]`, in `feos` and
-in the crates it enables (`feos-utils/host`, `host-service/ntp`); code that only
-the guest needs behind `#[cfg(feature = "guest")]`. With both features, `feos`
-builds and does both, which is only useful for development.
+that only `feosd` needs sits behind `#[cfg(feature = "host")]`; code that only
+the guest needs behind `#[cfg(feature = "guest")]`. With both features,
+`crates/feos` builds both binaries and its library does both, which is only
+useful for development.
 
 ## Building, linting, testing
 
 You need the toolchain from `rust-toolchain.toml` (rustup installs it on first
 use) and `protoc`.
 
-    make clippy          # lint both profiles, -D warnings
+    make clippy          # lint feosd's and feos-guest's features, -D warnings
     make fmt-check
     make test-unit       # unit tests, no root needed
     make test            # all tests; the integration tests need root
-    make release         # host profile:  target/x86_64-unknown-linux-musl/release/feos
-    make release-guest   # guest profile: target/x86_64-unknown-linux-musl/release-guest/feos
+    make release         # target/x86_64-unknown-linux-musl/release/{feosd,feos-host-init}
+    make release-guest   # target/x86_64-unknown-linux-musl/release/feos-guest
     make cli             # feosctl
 
     make guest                 # guest kernel and initramfs: target/guest/

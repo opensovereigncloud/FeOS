@@ -6,9 +6,17 @@ edition.workspace = true
 [lints]
 workspace = true
 
+# The node agent.
 [[bin]]
-name = "feos"
-path = "src/main.rs"
+name = "feosd"
+path = "src/bin/feosd.rs"
+required-features = ["host"]
+
+# PID 1 in a pod's microVM.
+[[bin]]
+name = "feos-guest"
+path = "src/bin/feos-guest.rs"
+required-features = ["guest"]
 
 [lib]
 name = "main_server"
@@ -58,10 +66,11 @@ tempfile = { workspace = true }
 [features]
 default = ["host"]
 git-version = ["feos-utils/git-version"]
-# The node agent: the VM service and the public gRPC API on TCP.
+# feosd, the node agent: the VM service, and the API on TCP if asked.
 host = ["dep:vm-service"]
-# Guest profile: PID 1 in a microVM. The API listens on vsock, FeOS tells
-# the host when it is ready, and a data volume holds images and containers.
+# feos-guest, PID 1 in a pod's microVM. The API listens on vsock, the guest
+# tells the host when it is ready, and a data volume holds images and
+# containers.
 guest = [
     "host-service/guest",
     "dep:tokio-vsock",

@@ -6,10 +6,13 @@ use crate::{worker, Command, RestartSignal};
 use feos_utils::feos_logger::LogHandle;
 use log::info;
 use tokio::sync::mpsc;
+use tonic::Status;
 
 pub struct HostServiceDispatcher {
     rx: mpsc::Receiver<Command>,
-    restart_tx: mpsc::Sender<RestartSignal>,
+    /// Where an upgrade hands the new binary over; None where this FeOS
+    /// must not replace its own binary.
+    restart_tx: Option<mpsc::Sender<RestartSignal>>,
     log_handle: LogHandle,
     /// Pings served since boot.
     pings: u64,
@@ -19,7 +22,7 @@ pub struct HostServiceDispatcher {
 impl HostServiceDispatcher {
     pub fn new(
         rx: mpsc::Receiver<Command>,
-        restart_tx: mpsc::Sender<RestartSignal>,
+        restart_tx: Option<mpsc::Sender<RestartSignal>>,
         log_handle: LogHandle,
     ) -> Self {
         Self {
@@ -53,10 +56,17 @@ impl HostServiceDispatcher {
                 Command::GetVersionInfo(responder) => {
                     tokio::spawn(worker::handle_get_version_info(responder));
                 }
-                Command::UpgradeFeosBinary(req, responder) => {
-                    let restart_tx = self.restart_tx.clone();
-                    tokio::spawn(worker::handle_upgrade(restart_tx, req, responder));
-                }
+                Command::UpgradeFeosBinary(req, responder) => match self.restart_tx.clone() {
+                    Some(restart_tx) => {
+                        tokio::spawn(worker::handle_upgrade(restart_tx, req, responder));
+                    }
+                    None => {
+                        let _ = responder.send(Err(Status::failed_precondition(
+                            "this FeOS does not replace its own binary: a package \
+                             manager owns it (feosd does with --self-upgrade)",
+                        )));
+                    }
+                },
                 Command::StreamKernelLogs(stream_tx) => {
                     tokio::spawn(worker::handle_stream_kernel_logs(stream_tx));
                 }

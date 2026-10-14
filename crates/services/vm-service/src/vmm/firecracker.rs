@@ -437,7 +437,8 @@ impl FirecrackerAdapter {
             .arg("--chroot-base-dir")
             .arg(VM_DIR)
             .args(["--cgroup-version", "2"])
-            .args(["--parent-cgroup", jail::PARENT_CGROUP]);
+            .arg("--parent-cgroup")
+            .arg(jail::parent_cgroup());
         for value in jail::cgroup_values(manifest.cpu_weight) {
             command.arg("--cgroup").arg(value);
         }

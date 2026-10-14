@@ -3,8 +3,8 @@
 
 //! Where feosctl reaches FeOS. An address is one of:
 //!
-//! - `http://[::1]:1337`: the TCP API of a host;
-//! - `unix:/run/feos/api.sock`: the local API socket;
+//! - `unix:/run/feos/api.sock`: the local API socket, the default;
+//! - `http://[::1]:1337`: the API of a node on TCP (`feosd --tcp`);
 //! - `vsock:/path/to/v.sock`: a guest behind a Firecracker vsock socket.
 
 use anyhow::{Context, Result};

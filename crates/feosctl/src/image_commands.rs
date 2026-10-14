@@ -12,12 +12,11 @@ use tonic::transport::Channel;
 
 #[derive(Args, Debug)]
 pub struct ImageArgs {
-    /// The image service is not on the TCP API, hence the local socket.
     #[arg(
         short,
         long,
         global = true,
-        env = "FEOS_IMAGE_ADDRESS",
+        env = "FEOS_ADDRESS",
         default_value = "unix:/run/feos/api.sock"
     )]
     pub address: String,

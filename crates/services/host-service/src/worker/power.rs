@@ -6,14 +6,42 @@ use feos_proto::host_service::{RebootRequest, RebootResponse, ShutdownRequest, S
 use log::{error, info};
 use tokio::sync::oneshot;
 
-/// Firecracker cannot power a VM off: the guest would halt and its VMM run
-/// on. A guest that reboots ends its VMM instead.
+/// A guest is PID 1 and powers its VM down itself. Firecracker cannot
+/// power a VM off: the guest would halt and its VMM run on. A guest that
+/// reboots ends its VMM instead.
 #[cfg(feature = "guest")]
-const SHUTDOWN: fn() -> Result<std::convert::Infallible, nix::Error> =
-    feos_utils::host::power::reboot;
+fn shut_down() -> Result<(), nix::Error> {
+    feos_utils::host::power::reboot().map(|never| match never {})
+}
+
+#[cfg(feature = "guest")]
+fn reboot() -> Result<(), nix::Error> {
+    feos_utils::host::power::reboot().map(|never| match never {})
+}
+
+/// feosd asks PID 1, systemd or feos-host-init, which both power off on
+/// SIGRTMIN+4 and reboot on SIGRTMIN+5.
 #[cfg(not(feature = "guest"))]
-const SHUTDOWN: fn() -> Result<std::convert::Infallible, nix::Error> =
-    feos_utils::host::power::shutdown;
+fn shut_down() -> Result<(), nix::Error> {
+    signal_pid1(4)
+}
+
+#[cfg(not(feature = "guest"))]
+fn reboot() -> Result<(), nix::Error> {
+    signal_pid1(5)
+}
+
+#[cfg(not(feature = "guest"))]
+fn signal_pid1(rtmin_offset: i32) -> Result<(), nix::Error> {
+    // nix's Signal has no real-time signals.
+    // SAFETY: kill(2) takes any pid and signal number.
+    let sent = unsafe { libc::kill(1, libc::SIGRTMIN() + rtmin_offset) };
+    if sent == 0 {
+        Ok(())
+    } else {
+        Err(nix::Error::last())
+    }
+}
 
 pub async fn handle_shutdown(
     _req: ShutdownRequest,
@@ -30,11 +58,8 @@ pub async fn handle_shutdown(
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     info!("HostWorker: Executing system shutdown.");
-    match SHUTDOWN() {
-        Ok(infallible) => match infallible {},
-        Err(e) => {
-            error!("HostWorker: CRITICAL - Failed to execute system shutdown: {e}");
-        }
+    if let Err(e) = shut_down() {
+        error!("HostWorker: CRITICAL - Failed to execute system shutdown: {e}");
     }
 }
 
@@ -51,10 +76,7 @@ pub async fn handle_reboot(
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     info!("HostWorker: Executing system reboot.");
-    match feos_utils::host::power::reboot() {
-        Ok(infallible) => match infallible {},
-        Err(e) => {
-            error!("HostWorker: CRITICAL - Failed to execute system reboot: {e}");
-        }
+    if let Err(e) = reboot() {
+        error!("HostWorker: CRITICAL - Failed to execute system reboot: {e}");
     }
 }

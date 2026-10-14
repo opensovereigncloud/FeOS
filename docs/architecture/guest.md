@@ -2,8 +2,8 @@ The Guest
 =========
 
 What runs inside a pod's microVM. The decisions behind it:
-[ADR 0007](../adr/0007-guest.md). Today the guest is `feos` built with the
-`guest` feature; it becomes `feos-guest`.
+[ADR 0007](../adr/0007-guest.md). The guest is `feos-guest`, `crates/feos`
+built with the `guest` feature.
 
 ## Boot
 
