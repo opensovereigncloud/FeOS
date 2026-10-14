@@ -70,9 +70,9 @@ new line.
 
 - No PCI passthrough (GPUs, NVMe and SR-IOV VFs into VMs), no firmware
   boot, so no operating systems other than Linux, no hotplug, no live
-  migration. Hugepages still back VM memory when a VM asks for them.
-- The VM service hands disk files and TAP devices to the VM's user by
-  changing their owner.
+  migration, no huge pages.
+- The microVM layer hands TAP devices to the microVM's user by changing
+  their owner.
 - Caps per VM, for VMs that overcommit the node, need a way to ask for
   them, storage below `/var/lib/feos` for a memory cap, and a kernel with
   `CONFIG_CFS_BANDWIDTH` for a CPU cap (`cpu.max`), which FeOS's kernel

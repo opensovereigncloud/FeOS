@@ -57,8 +57,9 @@ as it was (ADR 0007).
 
 ## Consequences
 
-- Pods with huge pages cannot be suspended: Firecracker restores hugetlbfs
-  memory only through a userfaultfd handler.
+- Pods have no huge pages: Firecracker restores hugetlbfs memory only
+  through a userfaultfd handler, and backs neither an initramfs nor a
+  balloon with it.
 - A suspended pod's disks must stay as they are until it is restored.
 - Where `/var/lib/feos` is a tmpfs, as under `feos-host-init`, a snapshot
   stays in memory: suspending frees only what was free in the guest, and a

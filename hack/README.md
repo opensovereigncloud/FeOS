@@ -26,7 +26,7 @@ The virtual machine has a virtio-net NIC attached which will be connected to a L
 With the make target `virsh-start` the VM will be created and started. `virsh-console` brings you into the serial console of the VM (you can exit it with `Ctrl+]`). To stop and destroy the VM call `make virsh-stop` - you'll probably want to concatenate those commands to `make virsh-start virsh-console virsh-stop`. This will start the VM, opens the serial console and waits for you to hit `Ctrl+]` to exit the serial console and destroy the VM.
 
 ### make run
-To test feosd locally, you can execute `make run` to compile and run feosd as root. The VM service needs `firecracker` and its `jailer` in your path (`make firecracker` downloads them to `target/firecracker/`).
+To test feosd locally, you can execute `make run` to compile and run feosd as root. Pods need `firecracker` and its `jailer` in your path (`make firecracker` downloads them to `target/firecracker/`).
 
     make run
 
@@ -68,7 +68,7 @@ downloads, pinned by sha256 (`hack/packages/`):
     make test-packages   # installs them on Debian 13 with systemd, in docker, and checks feosd
     make publish-apt     # builds HEAD as a dev version and publishes it to apt.fecode.dev
 
-`make test-packages` boots a VM from the installed guest, restarts feosd
+`make test-packages` boots a pod from the installed guest, restarts feosd
 under it, runs a pod with a TAP device and NAT in the container (busybox
 from Docker Hub, so it needs internet access), execs in it through
 feosd, suspends, resumes, stops and starts it, and powers the container
@@ -84,7 +84,7 @@ off through `feosctl host shutdown`.
 For detailed instructions, please see the **[Nested Virtualization Test Environment Setup Guide](../docs/guides/test-environment.md)**.
 
 ## Firecracker
-To boot the host image under [Firecracker](https://firecracker-microvm.github.io/) (`make firecracker`), give it a configuration like this one. Firecracker has no nested virtualization, so FeOS cannot run VMs in there. FeOS reserves up to 2 GiB of huge pages at boot, in at most a quarter of the memory; `hugepages=` on the kernel's command line sets the number instead.
+To boot the host image under [Firecracker](https://firecracker-microvm.github.io/) (`make firecracker`), give it a configuration like this one. Firecracker has no nested virtualization, so FeOS cannot run pods in there.
 
     sudo ip tuntap add mode tap name tap0
     sudo ip link set tap0 up

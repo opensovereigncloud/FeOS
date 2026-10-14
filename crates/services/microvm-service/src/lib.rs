@@ -3,12 +3,11 @@
 
 use crate::error::VmServiceError;
 use feos_proto::microvm::{
-    CreateVmRequest, CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetBalloonRequest,
-    GetBalloonResponse, GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest,
-    PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse,
-    ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse, StreamVmConsoleRequest,
-    StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse,
-    UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo,
+    CreateVmRequest, CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest,
+    PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest,
+    ShutdownVmResponse, StartVmRequest, StartVmResponse, StreamVmConsoleRequest,
+    StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse, VmEvent,
+    VmInfo,
 };
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -30,7 +29,6 @@ pub const DEFAULT_VM_DB_URL: &str = "sqlite:/var/lib/feos/vms.db";
 pub const VM_DIR: &str = "/var/lib/feos/vms";
 pub const FIRECRACKER_BIN: &str = "firecracker";
 pub const JAILER_BIN: &str = "jailer";
-pub const IMAGE_DIR: &str = "/var/lib/feos/images";
 
 /// The VM's jail: its chroot and what the VM service keeps outside of it.
 pub fn jail_dir(vm_id: &str) -> PathBuf {
@@ -79,10 +77,6 @@ pub enum Command {
         ConsoleInput,
         mpsc::Sender<Result<StreamVmConsoleResponse, Status>>,
     ),
-    ListVms(
-        ListVmsRequest,
-        oneshot::Sender<Result<ListVmsResponse, VmServiceError>>,
-    ),
     PingVm(
         PingVmRequest,
         oneshot::Sender<Result<PingVmResponse, VmServiceError>>,
@@ -91,10 +85,6 @@ pub enum Command {
         ShutdownVmRequest,
         oneshot::Sender<Result<ShutdownVmResponse, VmServiceError>>,
     ),
-    PauseVm(
-        PauseVmRequest,
-        oneshot::Sender<Result<PauseVmResponse, VmServiceError>>,
-    ),
     ResumeVm(
         ResumeVmRequest,
         oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
@@ -102,14 +92,6 @@ pub enum Command {
     SuspendVm(
         SuspendVmRequest,
         oneshot::Sender<Result<SuspendVmResponse, VmServiceError>>,
-    ),
-    UpdateBalloon(
-        UpdateBalloonRequest,
-        oneshot::Sender<Result<UpdateBalloonResponse, VmServiceError>>,
-    ),
-    GetBalloon(
-        GetBalloonRequest,
-        oneshot::Sender<Result<GetBalloonResponse, VmServiceError>>,
     ),
 }
 
@@ -124,14 +106,10 @@ impl std::fmt::Debug for Command {
             Command::StreamVmConsole(_, _) => {
                 f.write_str("StreamVmConsole(<gRPC Stream>, <mpsc::Sender>)")
             }
-            Command::ListVms(req, _) => f.debug_tuple("ListVms").field(req).finish(),
             Command::PingVm(req, _) => f.debug_tuple("PingVm").field(req).finish(),
             Command::ShutdownVm(req, _) => f.debug_tuple("ShutdownVm").field(req).finish(),
-            Command::PauseVm(req, _) => f.debug_tuple("PauseVm").field(req).finish(),
             Command::ResumeVm(req, _) => f.debug_tuple("ResumeVm").field(req).finish(),
             Command::SuspendVm(req, _) => f.debug_tuple("SuspendVm").field(req).finish(),
-            Command::UpdateBalloon(req, _) => f.debug_tuple("UpdateBalloon").field(req).finish(),
-            Command::GetBalloon(req, _) => f.debug_tuple("GetBalloon").field(req).finish(),
         }
     }
 }

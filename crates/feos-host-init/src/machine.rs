@@ -1,38 +1,21 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The machine's setup: hugepages, the network, SR-IOV and the clock, and
+//! The machine's setup: the network, SR-IOV and the clock, and
 //! the power signals.
 
-use crate::hugepages::configure_hugepages;
 use crate::network::{configure_network_devices, configure_sriov};
 use crate::ntp::TimeSyncWorker;
 use log::{error, info, warn};
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 
-/// 2 MiB pages for the VMs that ask for hugepages, at most.
-const HUGEPAGES_NUM: u32 = 1024;
-/// The share of the machine's memory they take at most: on a small node,
-/// all 1024 would leave the kernel nothing.
-const HUGEPAGES_MEMORY_SHARE: u64 = 4;
 /// SR-IOV virtual functions per physical function.
 const VFS_NUM: u32 = 125;
 
 /// Sets the machine up. A failed step is logged and the next one taken: the
 /// node may still be useful, and PID 1 must not die.
 pub async fn set_up() {
-    info!("Configuring hugepages...");
-    let cmdline = tokio::fs::read_to_string("/proc/cmdline")
-        .await
-        .unwrap_or_default();
-    let meminfo = tokio::fs::read_to_string("/proc/meminfo")
-        .await
-        .unwrap_or_default();
-    if let Err(e) = configure_hugepages(hugepages_to_reserve(&cmdline, &meminfo)).await {
-        warn!("Failed to configure hugepages: {e}");
-    }
-
     let is_on_vm = is_running_on_vm().await.unwrap_or_else(|e| {
         error!("Error checking VM status: {e}");
         false // Default to false in case of error
@@ -60,25 +43,6 @@ pub async fn set_up() {
     tokio::spawn(async move {
         time_worker.run().await;
     });
-}
-
-/// How many hugepages to reserve: none if the kernel's command line sets
-/// `hugepages=` (the kernel reserved them at boot), else up to
-/// HUGEPAGES_NUM in a quarter of the memory.
-fn hugepages_to_reserve(cmdline: &str, meminfo: &str) -> Option<u32> {
-    if cmdline
-        .split_whitespace()
-        .any(|arg| arg.starts_with("hugepages="))
-    {
-        return None;
-    }
-    let total_kib: u64 = meminfo
-        .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))
-        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
-        .unwrap_or(0);
-    let pages = total_kib / HUGEPAGES_MEMORY_SHARE / 2048;
-    Some(pages.min(u64::from(HUGEPAGES_NUM)) as u32)
 }
 
 pub async fn is_running_on_vm() -> Result<bool, Box<dyn std::error::Error>> {
@@ -128,30 +92,5 @@ pub fn take_over_power_signals() {
             };
             error!("Failed to power the machine down: {e}");
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hugepages_take_a_quarter_of_the_memory_at_most() {
-        let meminfo = |gib: u64| format!("MemTotal:       {} kB\nMemFree: 1 kB\n", gib << 20);
-        assert_eq!(hugepages_to_reserve("", &meminfo(64)), Some(1024));
-        assert_eq!(hugepages_to_reserve("", &meminfo(8)), Some(1024));
-        assert_eq!(hugepages_to_reserve("", &meminfo(4)), Some(512));
-        assert_eq!(hugepages_to_reserve("", &meminfo(1)), Some(128));
-        assert_eq!(hugepages_to_reserve("", ""), Some(0));
-    }
-
-    #[test]
-    fn the_kernel_command_line_decides_when_it_names_them() {
-        let meminfo = "MemTotal: 67108864 kB\n";
-        assert_eq!(
-            hugepages_to_reserve("console=ttyS0 hugepages=16", meminfo),
-            None
-        );
-        assert_eq!(hugepages_to_reserve("hugepages=0\n", meminfo), None);
     }
 }

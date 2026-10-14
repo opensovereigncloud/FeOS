@@ -25,10 +25,8 @@
 use super::{fc_api, installed, jail, snapshot, Hypervisor, VmmError};
 use crate::{jail_dir, vm_dir, vsock_path, VmEventWrapper, VM_DIR};
 use feos_proto::microvm::{
-    BalloonStats, CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetBalloonResponse,
-    PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
-    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmState,
-    VmStateChangedEvent,
+    CreateVmRequest, DeleteVmRequest, DeleteVmResponse, PingVmRequest, PingVmResponse,
+    ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmState, VmStateChangedEvent,
 };
 use log::{info, warn};
 use nix::sys::signal::{kill, Signal};
@@ -193,9 +191,9 @@ fn log_tail(path: &Path, offset: u64) -> String {
     lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
 }
 
-/// The Firecracker configuration of a VM, with the paths Firecracker sees
-/// in its jail, and the files to link into the jail. The image carries the
-/// kernel and may carry an initramfs and a root disk.
+/// The Firecracker configuration of a microVM, with the paths Firecracker
+/// sees in its jail, and the files to link into the jail. The guest's
+/// directory carries the kernel and its initramfs.
 fn firecracker_config(
     config: &VmConfig,
     image: &Path,
@@ -203,8 +201,8 @@ fn firecracker_config(
     let kernel = image.join("vmlinuz");
     if !kernel.exists() {
         return Err(VmmError::InvalidConfig(format!(
-            "image {} has no kernel",
-            config.image_ref
+            "{} has no kernel",
+            image.display()
         )));
     }
     let mut links = Vec::new();
@@ -221,33 +219,6 @@ fn firecracker_config(
     let initramfs = image.join("initramfs");
     if initramfs.exists() {
         boot_source["initrd_path"] = json!(link(initramfs, "initramfs".to_string(), false));
-    }
-
-    // Writeback: Firecracker passes the guest's flushes on to the host,
-    // where its default drops them.
-    let mut drives = Vec::new();
-    let rootfs = image.join("disk.image");
-    if rootfs.exists() {
-        drives.push(json!({
-            "drive_id": "rootfs",
-            "path_on_host": link(rootfs, "rootfs.img".to_string(), true),
-            "is_root_device": true,
-            "is_read_only": false,
-            "cache_type": "Writeback",
-        }));
-    }
-    for (index, disk) in config.disks.iter().enumerate() {
-        let id = match disk.device_id.as_str() {
-            "" => format!("disk{index}"),
-            id => id.to_string(),
-        };
-        drives.push(json!({
-            "drive_id": id,
-            "path_on_host": link(PathBuf::from(&disk.path), format!("{id}.img"), true),
-            "is_root_device": false,
-            "is_read_only": disk.readonly,
-            "cache_type": "Writeback",
-        }));
     }
 
     let mut interfaces = Vec::new();
@@ -271,14 +242,11 @@ fn firecracker_config(
     }
 
     let (vcpus, memory_mib) = machine_size(config);
-    let mut machine = json!({"vcpu_count": vcpus, "mem_size_mib": memory_mib});
-    if config.memory.is_some_and(|memory| memory.hugepages) {
-        machine["huge_pages"] = json!("2M");
-    }
+    let machine = json!({"vcpu_count": vcpus, "mem_size_mib": memory_mib});
 
     let mut fc = json!({
         "boot-source": boot_source,
-        "drives": drives,
+        "drives": [],
         "network-interfaces": interfaces,
         "machine-config": machine,
         "vsock": {"guest_cid": GUEST_CID, "uds_path": format!("/{VSOCK}")},
@@ -961,60 +929,12 @@ impl Hypervisor for FirecrackerAdapter {
         }
         ended.map(|()| ShutdownVmResponse {})
     }
-
-    async fn pause_vm(&self, req: PauseVmRequest) -> Result<PauseVmResponse, VmmError> {
-        let body = json!({"state": "Paused"});
-        fc_api::request(&api_socket(&req.vm_id), "PATCH", "/vm", Some(&body)).await?;
-        Ok(PauseVmResponse {})
-    }
-
-    async fn resume_vm(&self, req: ResumeVmRequest) -> Result<ResumeVmResponse, VmmError> {
-        let body = json!({"state": "Resumed"});
-        fc_api::request(&api_socket(&req.vm_id), "PATCH", "/vm", Some(&body)).await?;
-        Ok(ResumeVmResponse {})
-    }
-
-    async fn update_balloon(&self, vm_id: &str, amount_mib: u32) -> Result<(), VmmError> {
-        let body = json!({"amount_mib": amount_mib});
-        fc_api::request(&api_socket(vm_id), "PATCH", "/balloon", Some(&body)).await?;
-        Ok(())
-    }
-
-    async fn get_balloon(&self, vm_id: &str) -> Result<GetBalloonResponse, VmmError> {
-        let api = api_socket(vm_id);
-        // Only the statistics know how much the balloon holds.
-        if let Ok(Some(stats)) = fc_api::request(&api, "GET", "/balloon/statistics", None).await {
-            let field = |name: &str| stats[name].as_u64().unwrap_or(0);
-            return Ok(GetBalloonResponse {
-                target_mib: field("target_mib") as u32,
-                actual_mib: field("actual_mib") as u32,
-                stats: Some(BalloonStats {
-                    total_memory: field("total_memory"),
-                    free_memory: field("free_memory"),
-                    available_memory: field("available_memory"),
-                    disk_caches: field("disk_caches"),
-                    major_faults: field("major_faults"),
-                    minor_faults: field("minor_faults"),
-                    oom_kill: field("oom_kill"),
-                }),
-            });
-        }
-        let balloon = fc_api::request(&api, "GET", "/balloon", None)
-            .await?
-            .unwrap_or_default();
-        Ok(GetBalloonResponse {
-            target_mib: balloon["amount_mib"].as_u64().unwrap_or(0) as u32,
-            ..Default::default()
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feos_proto::microvm::{
-        BalloonConfig, CpuConfig, DiskConfig, MemoryConfig, NetConfig, TapConfig,
-    };
+    use feos_proto::microvm::{BalloonConfig, CpuConfig, MemoryConfig, NetConfig, TapConfig};
 
     fn image(files: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1051,20 +971,14 @@ mod tests {
     }
 
     #[test]
-    fn the_root_disk_comes_first_and_devices_get_ids() {
-        let image = image(&["vmlinuz", "disk.image"]);
+    fn the_size_and_the_network_are_configured() {
+        let image = image(&["vmlinuz", "initramfs"]);
         let config = VmConfig {
             cpus: Some(CpuConfig { vcpu_count: 2 }),
             memory: Some(MemoryConfig {
                 size_mib: 1024,
-                hugepages: true,
                 balloon: None,
             }),
-            disks: vec![DiskConfig {
-                path: "/data.img".to_string(),
-                readonly: true,
-                ..Default::default()
-            }],
             net: vec![NetConfig {
                 tap: Some(TapConfig {
                     tap_name: "tap0".to_string(),
@@ -1074,26 +988,16 @@ mod tests {
             }],
             ..Default::default()
         };
-        let (fc, links) = firecracker_config(&config, image.path()).unwrap();
-        let drives = fc["drives"].as_array().unwrap();
-        assert_eq!(drives[0]["drive_id"], "rootfs");
-        assert_eq!(drives[0]["path_on_host"], "/rootfs.img");
-        assert_eq!(drives[0]["is_root_device"], true);
-        assert_eq!(drives[1]["drive_id"], "disk0");
-        assert_eq!(drives[1]["path_on_host"], "/disk0.img");
-        assert_eq!(drives[1]["is_read_only"], true);
-        let disk = links.iter().find(|link| link.name == "disk0.img").unwrap();
-        assert_eq!(disk.source, PathBuf::from("/data.img"));
-        assert!(disk.disk);
+        let (fc, _) = firecracker_config(&config, image.path()).unwrap();
+        assert_eq!(fc["drives"], json!([]));
         assert_eq!(tap_names(&config), vec!["tap0".to_string()]);
-        assert_eq!(drives[1]["cache_type"], "Writeback");
         assert_eq!(
             fc["network-interfaces"],
             json!([{"iface_id": "eth0", "host_dev_name": "tap0", "guest_mac": "02:00:00:00:00:01"}])
         );
         assert_eq!(
             fc["machine-config"],
-            json!({"vcpu_count": 2, "mem_size_mib": 1024, "huge_pages": "2M"})
+            json!({"vcpu_count": 2, "mem_size_mib": 1024})
         );
     }
 
@@ -1103,7 +1007,6 @@ mod tests {
         let config = VmConfig {
             memory: Some(MemoryConfig {
                 size_mib: 256,
-                hugepages: false,
                 balloon: Some(BalloonConfig {
                     amount_mib: 16,
                     deflate_on_oom: true,

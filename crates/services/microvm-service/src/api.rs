@@ -4,12 +4,10 @@
 use crate::{Command, ConsoleInput};
 use feos_proto::microvm::{
     micro_vm_service_server::MicroVmService, CreateVmRequest, CreateVmResponse, DeleteVmRequest,
-    DeleteVmResponse, GetBalloonRequest, GetBalloonResponse, GetVmRequest, ListVmsRequest,
-    ListVmsResponse, PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse,
-    ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
-    StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest,
-    SuspendVmRequest, SuspendVmResponse, UpdateBalloonRequest, UpdateBalloonResponse, VmEvent,
-    VmInfo,
+    DeleteVmResponse, GetVmRequest, PingVmRequest, PingVmResponse, ResumeVmRequest,
+    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
+    StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest,
+    SuspendVmResponse, VmEvent, VmInfo,
 };
 use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
@@ -113,17 +111,6 @@ impl MicroVmService for VmApiHandler {
         Ok(Response::new(Box::pin(output_stream)))
     }
 
-    async fn list_vms(
-        &self,
-        request: Request<ListVmsRequest>,
-    ) -> Result<Response<ListVmsResponse>, Status> {
-        info!("VmApi: Received ListVms request.");
-        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
-            Command::ListVms(request.into_inner(), resp_tx)
-        })
-        .await
-    }
-
     async fn ping_vm(
         &self,
         request: Request<PingVmRequest>,
@@ -146,17 +133,6 @@ impl MicroVmService for VmApiHandler {
         .await
     }
 
-    async fn pause_vm(
-        &self,
-        request: Request<PauseVmRequest>,
-    ) -> Result<Response<PauseVmResponse>, Status> {
-        info!("VmApi: Received PauseVm request.");
-        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
-            Command::PauseVm(request.into_inner(), resp_tx)
-        })
-        .await
-    }
-
     async fn resume_vm(
         &self,
         request: Request<ResumeVmRequest>,
@@ -175,27 +151,6 @@ impl MicroVmService for VmApiHandler {
         info!("VmApi: Received SuspendVm request.");
         dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
             Command::SuspendVm(request.into_inner(), resp_tx)
-        })
-        .await
-    }
-
-    async fn update_balloon(
-        &self,
-        request: Request<UpdateBalloonRequest>,
-    ) -> Result<Response<UpdateBalloonResponse>, Status> {
-        info!("VmApi: Received UpdateBalloon request.");
-        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
-            Command::UpdateBalloon(request.into_inner(), resp_tx)
-        })
-        .await
-    }
-
-    async fn get_balloon(
-        &self,
-        request: Request<GetBalloonRequest>,
-    ) -> Result<Response<GetBalloonResponse>, Status> {
-        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
-            Command::GetBalloon(request.into_inner(), resp_tx)
         })
         .await
     }

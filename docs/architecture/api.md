@@ -9,8 +9,8 @@ plane, and between `feosd` and `feos-guest`. They live in
 
 | Package | What it is for | Served by today |
 |---|---|---|
-| `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, events | `feosd` |
-| `feos.vm.v1` | VMs: create, start, shut down, pause, suspend, resume, balloon, console, events | `feosd` |
+| `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, console, events | `feosd` |
+| `feos.microvm.v1` | the pods' microVMs, internal to `feosd`, served on no listener | – |
 | `feos.container.v1` | containers: create, start, stop, delete, exec, logs, events | `feosd`, `feos-guest` |
 | `feos.image.v1` | OCI image pulls and the image store | `feosd`, `feos-guest` |
 | `feos.host.v1` | the machine: hostname, memory, CPU, network, version, logs, power, upgrade; and, for now, the guest's pushed time and network, freezing and `PreparePause` | `feosd`, `feos-guest` |
@@ -27,8 +27,6 @@ Decided, not built:
   `SetNetworkConfig`, `GetNetworkConfig`, `FreezeFilesystem`,
   `ThawFilesystem` and `PreparePause` out of `HostService`; only
   `feos-guest` serves it ([ADR 0007](../adr/0007-guest.md)).
-- `feos.vm.v1` on a socket of its own, for operators
-  ([ADR 0004](../adr/0004-pods.md)).
 
 ## Listeners
 
@@ -36,7 +34,7 @@ On a node (`feosd`):
 
 | Listener | Services |
 |---|---|
-| `/run/feos/api.sock`, and TCP with `--tcp` | Pod, Vm, Container, Host, Image; and a pod's Container, Image, Tool and Watch |
+| `/run/feos/api.sock`, and TCP with `--tcp` | Pod, Container, Host, Image; and a pod's Container, Image, Tool and Watch |
 | `/run/feos/image.sock` | Image, internal |
 | `/run/feos/task.sock` | Task, internal, in the task service process |
 | `<vm dir>/v.sock_10001`, per VM | Lifecycle, for the guest's uplink |

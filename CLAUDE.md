@@ -25,5 +25,5 @@ Hard rules:
 
 Before you commit: `make fmt-check clippy test-unit`. When you change what
 runs in the guest, also `make guest test-guest test-guest-container` (needs
-/dev/kvm, and sudo for the test network). When you change the VM service,
-also `make test-pods` (needs docker).
+/dev/kvm, and sudo for the test network). When you change the pod or
+microVM service, also `make test-pods` (needs docker).

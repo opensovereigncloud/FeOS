@@ -14,21 +14,19 @@ Parts that are decided but not built are marked as such.
 
 - **`feos-host-init`**: PID 1 when FeOS is the node's operating system. It
   sets the machine up, starts `feosd` and starts it again when it ends.
-- **`feosd`**: the node agent: the API, the VM service, the container and
+- **`feosd`**: the node agent: the API, the pod and microVM services, the container and
   image services. It runs under systemd or `feos-host-init`, never as
   PID 1.
 - **`feosd --task-service`**: the container runtime (libcontainer) in a
   process of its own, started and restarted by `feosd`. Its pid is in
   `/run/feos/task-service.pid`.
-- **The jailer and Firecracker**, one process per running VM.
+- **The jailer and Firecracker**, one process per running pod.
 
 ## Machine setup: feos-host-init
 
 `feos-host-init` moves its root off the initramfs, mounts `/proc`, `/sys`,
 `/dev`, `/dev/pts`, `/run`, a tmpfs at `/var/lib/feos` and the cgroup
-filesystem, reserves hugepages (1024 of 2 MiB, in at most a quarter of
-the memory, unless the kernel's command line has `hugepages=`), configures
-SR-IOV VFs, configures the network
+filesystem, configures SR-IOV VFs, configures the network
 from router advertisements and DHCPv6, and keeps the clock with NTP from
 the servers DHCPv6 names. It takes Ctrl-Alt-Del over (a SIGINT makes it
 sync and reboot), reboots on `SIGRTMIN+5` and powers off on `SIGRTMIN+4`,
@@ -53,8 +51,8 @@ On a distribution all of this is the operating system's
   `SIGRTMIN+4`. `UpgradeFeosBinary` replaces the binary and runs it with
   the same pid only with `--self-upgrade`; without, the call fails with
   `FAILED_PRECONDITION`.
-- It is the subreaper of its children. VMs and the task service outlive
-  it: a `feosd` that starts again takes the running VMs over and keeps the
+- It is the subreaper of its children. Pods and the task service outlive
+  it: a `feosd` that starts again takes the running pods over and keeps the
   running task service.
 
 ## Directories
@@ -62,8 +60,8 @@ On a distribution all of this is the operating system's
 | Path | Holds |
 |---|---|
 | `/var/lib/feos/pods/<id>.pb` | a pod: its spec, its state and why (a `feos.pod.v1.PodInfo`) |
-| `/var/lib/feos/vms.db` | the VM records (SQLite) |
-| `/var/lib/feos/vms/firecracker/<id>/` | the VM's jail: `jail.json` and the chroot `root/` |
+| `/var/lib/feos/vms.db` | the microVM records (SQLite) |
+| `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
 | `/var/lib/feos/images/` | pulled images, a `metadata.json` each |
 | `/var/lib/feos/containers/` | the host's containers, a `container.json` each |
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
@@ -76,7 +74,7 @@ directory on disk on a distribution.
 
 ## A pod
 
-A pod ([ADR 0004](../adr/0004-pods.md)) is a microVM of the VM service
+A pod ([ADR 0004](../adr/0004-pods.md)) is a microVM
 with the pod's ID, booted from the newest installed guest, and the
 containers its spec names, which the guest runs with the names as their
 IDs. Its spec gives vCPUs and memory, the containers (image, command,
@@ -104,10 +102,12 @@ reporting.
 What changes a pod runs under a lock of the pod's. `GetPod` asks the guest
 for the containers' states while the pod runs.
 
-## A VM
+## A pod's microVM
 
-A VM's directory, `/var/lib/feos/vms/firecracker/<id>/root/`, is the
-chroot its Firecracker runs in:
+The microVM layer under the pods (`crates/services/microvm-service`,
+internal `feos.microvm.v1`) runs the microVMs; FeOS runs no VMs of their
+own. A microVM's directory, `/var/lib/feos/vms/firecracker/<id>/root/`, is
+the chroot its Firecracker runs in:
 
 | File | What it is |
 |---|---|
@@ -118,62 +118,63 @@ chroot its Firecracker runs in:
 | `serial.log` | the serial console's output since the last boot (Firecracker's stdout) |
 | `vmm.log` | Firecracker's own log |
 | `firecracker.pid`, `firecracker`, `dev/` | the jailer's |
-| `vmlinuz`, `initramfs`, `rootfs.img`, `<drive>.img` | the image's files and the data disks, linked in |
-| `snapshot/` | the snapshot of a suspended VM: `vmstate` and `memory` |
+| `vmlinuz`, `initramfs` | the installed guest's files, linked in |
+| `snapshot/` | the snapshot of a suspended microVM: `vmstate` and `memory` |
 
 `jail.json`, beside the chroot, records what a start links in and what a
 deletion undoes.
 
 ### Lifecycle
 
-- **Create** pulls the VM's image (an OCI image with `vmlinuz`, optionally
-  an initramfs and a root disk) and writes `config.json`. A VM without an
-  `image_ref` takes the newest installed guest instead and keeps that
-  version: its jail links that version's files. No process starts.
-- **Start** runs the jailer, which starts Firecracker, which boots the VM at
-  once. The process ends when the guest reboots or shuts down: exit code 0
-  makes the VM stopped, anything else crashed.
+- **Create** takes the newest installed guest and keeps that version: its
+  jail links that version's files. It writes `config.json`; no process
+  starts.
+- **Start** runs the jailer, which starts Firecracker, which boots the
+  microVM at once. The process ends when the guest reboots or shuts down:
+  exit code 0 makes the microVM stopped, anything else crashed.
 - **Shutdown** sends Ctrl-Alt-Del and waits for the process to end.
-- **Pause and resume** stop and continue the vCPUs.
 - **Suspend** writes a snapshot, ends the process and punches holes over
-  the pages of zeroes. **Resume** of a suspended VM loads the snapshot with
-  the vCPUs stopped, then resumes them and removes the snapshot.
-- **Delete** stops the VM, removes what `jail.json` records, its TAP
+  the pages of zeroes. **Resume** loads the snapshot with the vCPUs
+  stopped, then resumes them and removes the snapshot.
+- **Delete** stops the microVM, removes what `jail.json` records, its TAP
   devices and its directory.
+
+The layer records a change of state after the call that made it returns;
+the pod service waits for it. A microVM has no data disks (the disk daemon
+brings volumes) and no huge pages, which Firecracker backs neither an
+initramfs nor a balloon with.
 
 ### Jail, user and cgroup
 
-Firecracker runs in the jailer: chrooted into the VM's directory, in a
-mount namespace of its own, as a user of the VM's own, which owns the
-VM's disks and TAP devices. The VM service creates TAP devices that do not
-exist and deletes them with the VM.
+Firecracker runs in the jailer: chrooted into the microVM's directory, in
+a mount namespace of its own, as a user of the microVM's own, which owns
+its TAP devices. The layer creates TAP devices that do not exist and
+deletes them with the microVM.
 
-Every VM has a cgroup of its own, `vms/<id>` below the cgroup `feosd` is
+Every microVM has a cgroup of its own, `vms/<id>` below the cgroup `feosd` is
 given, with `cpu.weight` 100 per vCPU and no caps: `/sys/fs/cgroup/vms/<id>`
 under `feos-host-init`, `/sys/fs/cgroup/system.slice/feosd.service/vms/<id>`
 under systemd. A cgroup whose children use controllers may hold no
 processes, so `feosd` moves into the leaf `feosd` of its cgroup, where
 systemd starts it already with `DelegateSubgroup=feosd`. `feosd` creates
-the VM's cgroup and enables `cpu` and `memory` in its own cgroup and in
-`vms/`, never above; the jailer only moves Firecracker into the VM's
-cgroup.
+the microVM's cgroup and enables `cpu` and `memory` in its own cgroup and
+in `vms/`, never above; the jailer only moves Firecracker into it.
 
 ### The guest
 
-The VM service listens on `v.sock_10001` from the VM's creation to its
-deletion and again after a restart of the service. When the guest attaches
-(after a boot, or when its call was lost) and after every resume, the VM
-service pushes the wall time and, if the VM has one, its network
+The layer listens on `v.sock_10001` from the microVM's creation to its
+deletion and again after a restart of `feosd`. When the guest attaches
+(after a boot, or when its call was lost) and after every resume, it
+pushes the wall time and, if the pod has an address, its network
 configuration through the guest's API. After a resume it pings the guest
-once instead of waiting for the uplink. `VmInfo.guest` reports the guest;
-a `GuestAttachedEvent` follows each attach.
+once instead of waiting for the uplink.
 
 ### Balloon
 
-A VM may have a virtio balloon (`MemoryConfig.balloon`), with free page
-reporting and statistics. `UpdateBalloon` and `GetBalloon` set and read
-it. With `purge_guest`, a suspend first asks the guest to drop its caches
-and compact its memory, and waits until the VMM stops shrinking.
+A pod's microVM has a virtio balloon with free page reporting: the guest
+hands the memory it frees back. A suspend first asks the guest to drop
+its caches and compact its memory, and waits until the VMM stops
+shrinking.
 
 ## Firecracker
 
@@ -203,13 +204,13 @@ packages from https://apt.fecode.dev
 `feosd` depends on `feos-firecracker` and `feos-guest`, which depend on the
 newest versioned packages, as `linux-image-amd64` does on the newest
 kernel: an upgrade installs a new Firecracker or guest beside the old
-ones, which the VMs booted with them keep using. `50feosd` keeps every
+ones, which the pods booted with them keep using. `50feosd` keeps every
 version from `apt autoremove`; a version nothing uses is removed with
 `apt remove`.
 
 `feosd.service` is `Type=notify`, with `Delegate=yes`,
 `DelegateSubgroup=feosd` and `KillMode=process`: a restart or an upgrade
-stops `feosd` alone, and the next one takes the VMs over.
+stops `feosd` alone, and the next one takes the pods over.
 `StateDirectory=feos` makes `/var/lib/feos` a directory on disk.
 `FEOSD_ARGS` in `/etc/default/feosd` passes options, such as `--tcp`.
 Installing the package enables the unit the first time and starts it, or

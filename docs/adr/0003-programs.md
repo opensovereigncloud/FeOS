@@ -34,7 +34,7 @@ the binary chooses at runtime.
 | `feosctl` | `crates/feosctl` | as the client, anywhere |
 
 - `feos-host-init` sets the machine up: mounts, the network over DHCPv6
-  and router advertisements, NTP, hugepages, SR-IOV VFs. It takes
+  and router advertisements, NTP, SR-IOV VFs. It takes
   Ctrl-Alt-Del over, reaps orphans, starts `feosd` and starts it again
   when it ends. It serves no API and logs to `/dev/kmsg`. It reboots and
   powers off on systemd's signals (`SIGRTMIN+5`, `SIGRTMIN+4`), so `feosd`

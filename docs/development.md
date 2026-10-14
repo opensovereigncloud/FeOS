@@ -15,7 +15,7 @@ crates/
   feos/                 feosd and feos-guest: their startup, the wiring of
                         the services, the task supervisor
   feos-host-init/       PID 1 of a node whose operating system is FeOS:
-                        machine setup (network, NTP, hugepages, SR-IOV)
+                        machine setup (network, NTP, SR-IOV)
   feos-proto/           generated gRPC code for proto/
   feos-utils/           shared building blocks: logger, mounts, reaper, vsock,
                         resolvers, confined container file access, dispatch
@@ -25,10 +25,10 @@ crates/
     host-service/       host information, logs, power, upgrade, time, network
                         push, filesystem freezing, memory
     image-service/      OCI image pulls and the image store
-    pod-service/        pods on top of the VM service, and the forwarding
+    pod-service/        pods on top of the microVM layer, and the forwarding
                         of a pod's services to its guest
     task-service/       the container runtime (libcontainer), its own process
-    vm-service/         VMs through a Hypervisor trait (Firecracker, jailed):
+    microvm-service/    the pods' microVMs, internal: Firecracker, jailed;
                         snapshots, balloon, the guest's uplink and pushes
     tool-service/       guest: agent file and web tools on a container's files
     watch-service/      guest: inotify subscriptions on a container's files
@@ -43,16 +43,16 @@ docs/                   documentation and ADRs
 Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
 
 - **`feosd`** (`crates/feos`, feature `host`, the default): the node agent,
-  under systemd or `feos-host-init`, never PID 1. It runs the VM and pod
-  services and serves the public API on `/run/feos/api.sock`, and on TCP
-  with `--tcp`. VMs run in Firecracker, in its jailer
+  under systemd or `feos-host-init`, never PID 1. It runs pods and serves
+  the public API on `/run/feos/api.sock`, and on TCP with `--tcp`. A pod's
+  microVM runs in Firecracker, in its jailer
   ([ADR 0005](adr/0005-firecracker.md),
   [ADR 0008](adr/0008-suspend-and-restore.md)).
 - **`feos-guest`** (`crates/feos`, `--no-default-features --features
   guest`): PID 1 in a microVM whose host configures it. Its API listens on
   vsock port 10000, not on TCP, and once it is ready it dials the host
   (vsock port 10001) and holds a `LifecycleService.Attach` call open. A data
-  volume, if the VM has one, holds images and containers. It also serves
+  volume, if the microVM has one, holds images and containers. It also serves
   the tool, watch, port forward, kube and SSH services for the agent in its
   containers. None of the node's code or dependencies are in this binary.
 - **`feos-host-init`** (`crates/feos-host-init`): PID 1 when FeOS is the

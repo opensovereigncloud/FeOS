@@ -8,31 +8,20 @@ use crate::{
     vmm::Hypervisor,
     worker, VmEventWrapper,
 };
-use feos_proto::{
-    image_service::{image_service_client::ImageServiceClient, PullImageRequest},
-    microvm::{
-        stream_vm_console_request as console_input, AttachConsoleMessage, CreateVmRequest,
-        CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetBalloonRequest, GetBalloonResponse,
-        GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest, PauseVmResponse,
-        ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
-        StartVmResponse, StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest,
-        SuspendVmResponse, UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo, VmState,
-        VmStateChangedEvent,
-    },
+use feos_proto::microvm::{
+    stream_vm_console_request as console_input, AttachConsoleMessage, CreateVmRequest,
+    CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest, ResumeVmRequest,
+    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
+    StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse, VmEvent,
+    VmInfo, VmState, VmStateChangedEvent,
 };
-use hyper_util::rt::TokioIo;
-use image_service::IMAGE_SERVICE_SOCKET;
 use log::{error, info, warn};
 use prost::Message;
 use prost_types::Any;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::StreamExt;
-use tonic::{
-    transport::{Channel, Endpoint, Error as TonicTransportError, Uri},
-    Status,
-};
-use tower::service_fn;
+use tonic::Status;
 use uuid::Uuid;
 
 fn ensure_net_config_device_id(net_config: &mut feos_proto::microvm::NetConfig) {
@@ -54,67 +43,10 @@ fn vm_info(record: VmRecord, guests: &Guests) -> VmInfo {
     }
 }
 
-pub(crate) async fn get_image_service_client(
-) -> Result<ImageServiceClient<Channel>, TonicTransportError> {
-    let socket_path = PathBuf::from(IMAGE_SERVICE_SOCKET);
-    Endpoint::try_from("http://[::1]:50051")
-        .unwrap()
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let socket_path = socket_path.clone();
-            async move {
-                tokio::net::UnixStream::connect(socket_path)
-                    .await
-                    .map(TokioIo::new)
-            }
-        }))
-        .await
-        .map(ImageServiceClient::new)
-}
-
-/// Pulls the VM's image, and returns its UUID. A VM without an image_ref
-/// boots the newest installed guest instead: no pull, and an empty UUID.
-async fn initiate_image_pull_for_vm(req: &CreateVmRequest) -> Result<String, VmServiceError> {
-    let image_ref = match req.config.as_ref() {
-        Some(config) if !config.image_ref.is_empty() => config.image_ref.clone(),
-        Some(_) if crate::vmm::installed::newest_guest().is_some() => return Ok(String::new()),
-        Some(_) => {
-            return Err(VmServiceError::InvalidArgument(format!(
-                "VmConfig has no image_ref, and no guest is installed in {}",
-                crate::vmm::installed::GUEST_DIR
-            )));
-        }
-        None => {
-            return Err(VmServiceError::InvalidArgument(
-                "VmConfig is required".to_string(),
-            ));
-        }
-    };
-
-    info!("VmDispatcher: Requesting image pull for {image_ref}");
-    let mut client = get_image_service_client()
-        .await
-        .map_err(|e| VmServiceError::ImageService(format!("Could not connect: {e}")))?;
-
-    let response = client
-        .pull_image(PullImageRequest {
-            image_ref: image_ref.clone(),
-            // The VM writes to the image's disk.
-            exclusive: true,
-        })
-        .await
-        .map_err(|status| {
-            VmServiceError::ImageService(format!("PullImage RPC failed for {image_ref}: {status}"))
-        })?;
-
-    let image_uuid = response.into_inner().image_uuid;
-    info!("VmDispatcher: Image pull for {image_ref} initiated. UUID: {image_uuid}");
-    Ok(image_uuid)
-}
-
 async fn prepare_vm_creation(
     repository: &VmRepository,
     req: &CreateVmRequest,
-) -> Result<(Uuid, String), VmServiceError> {
+) -> Result<Uuid, VmServiceError> {
     let vm_id_res: Result<(Uuid, bool), VmServiceError> =
         if let Some(id_str) = req.vm_id.as_deref().filter(|s| !s.is_empty()) {
             match Uuid::parse_str(id_str) {
@@ -143,14 +75,12 @@ async fn prepare_vm_creation(
             .map_err(|e| VmServiceError::InvalidArgument(e.to_string()))?;
     }
 
-    let image_uuid_str = initiate_image_pull_for_vm(req).await?;
-    // The nil UUID: an installed guest, no pulled image.
-    let image_uuid = match image_uuid_str.as_str() {
-        "" => Uuid::nil(),
-        uuid => Uuid::parse_str(uuid).map_err(|e| {
-            VmServiceError::ImageService(format!("Failed to parse image UUID: {e}"))
-        })?,
-    };
+    if crate::vmm::installed::newest_guest().is_none() {
+        return Err(VmServiceError::InvalidArgument(format!(
+            "no guest is installed in {}",
+            crate::vmm::installed::GUEST_DIR
+        )));
+    }
 
     let mut vm_config = req.config.clone().ok_or(VmServiceError::InvalidArgument(
         "VmConfig is required in CreateVmRequest".to_string(),
@@ -160,15 +90,11 @@ async fn prepare_vm_creation(
         .net
         .iter_mut()
         .for_each(ensure_net_config_device_id);
-    for (index, disk) in vm_config.disks.iter_mut().enumerate() {
-        if disk.device_id.is_empty() {
-            disk.device_id = format!("disk{index}");
-        }
-    }
 
     let record = VmRecord {
         vm_id,
-        image_uuid,
+        // A microVM boots the installed guest: no image of its own.
+        image_uuid: Uuid::nil(),
         status: VmStatus {
             state: VmState::Creating,
             last_msg: "VM creation initiated".to_string(),
@@ -179,7 +105,7 @@ async fn prepare_vm_creation(
 
     repository.save_vm(&record).await?;
     info!("VmDispatcher: Saved initial record for VM {vm_id}");
-    Ok((vm_id, image_uuid_str))
+    Ok(vm_id)
 }
 
 async fn get_vm_info(
@@ -224,11 +150,10 @@ pub(crate) async fn handle_create_vm_command(
     let result = prepare_vm_creation(repository, &req).await;
 
     match result {
-        Ok((vm_id, image_uuid_str)) => {
+        Ok(vm_id) => {
             tokio::spawn(worker::handle_create_vm(
                 vm_id.to_string(),
                 req,
-                image_uuid_str,
                 responder,
                 hypervisor,
                 event_bus_tx,
@@ -413,12 +338,6 @@ pub(crate) async fn handle_delete_vm_command(
 
     match repository.get_vm(vm_id).await {
         Ok(Some(record)) => {
-            // An installed guest is not the VM's to delete.
-            let image_uuid_to_delete = if record.image_uuid.is_nil() {
-                String::new()
-            } else {
-                record.image_uuid.to_string()
-            };
             let process_id_to_kill = record.status.process_id;
 
             if let Err(e) = repository.delete_vm(vm_id).await {
@@ -434,7 +353,6 @@ pub(crate) async fn handle_delete_vm_command(
 
             tokio::spawn(worker::handle_delete_vm(
                 req,
-                image_uuid_to_delete,
                 process_id_to_kill,
                 responder,
                 hypervisor,
@@ -452,7 +370,6 @@ pub(crate) async fn handle_delete_vm_command(
 
             tokio::spawn(worker::handle_delete_vm(
                 req,
-                String::new(),
                 None,
                 responder,
                 hypervisor,
@@ -530,25 +447,6 @@ pub(crate) async fn handle_stream_vm_console_command(
     ));
 }
 
-pub(crate) async fn handle_list_vms_command(
-    repository: &VmRepository,
-    _req: ListVmsRequest,
-    responder: oneshot::Sender<Result<ListVmsResponse, VmServiceError>>,
-    guests: &Guests,
-) {
-    let result = repository.list_all_vms().await.map(|records| {
-        let vms = records
-            .into_iter()
-            .map(|record| vm_info(record, guests))
-            .collect();
-        ListVmsResponse { vms }
-    });
-
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmDispatcher: Failed to send response for ListVms.");
-    }
-}
-
 pub(crate) async fn handle_start_vm_command(
     repository: &VmRepository,
     req: StartVmRequest,
@@ -621,37 +519,6 @@ pub(crate) async fn handle_shutdown_vm_command(
     ));
 }
 
-pub(crate) async fn handle_pause_vm_command(
-    repository: &VmRepository,
-    req: PauseVmRequest,
-    responder: oneshot::Sender<Result<PauseVmResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-    event_bus_tx: mpsc::Sender<VmEventWrapper>,
-) {
-    let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
-        Ok(result) => result,
-        Err(e) => {
-            let _ = responder.send(Err(e));
-            return;
-        }
-    };
-
-    let current_state = record.status.state;
-    if current_state != VmState::Running {
-        let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-            "Cannot pause VM in {current_state:?} state. Must be in Running."
-        ))));
-        return;
-    }
-
-    tokio::spawn(worker::handle_pause_vm(
-        req,
-        responder,
-        hypervisor,
-        event_bus_tx,
-    ));
-}
-
 pub(crate) async fn handle_resume_vm_command(
     repository: &VmRepository,
     req: ResumeVmRequest,
@@ -670,15 +537,6 @@ pub(crate) async fn handle_resume_vm_command(
     };
 
     match record.status.state {
-        VmState::Paused => {
-            tokio::spawn(worker::handle_resume_vm(
-                req,
-                responder,
-                hypervisor,
-                event_bus_tx,
-                guests,
-            ));
-        }
         // A new VMM process to watch.
         VmState::Suspended => {
             tokio::spawn(worker::handle_restore_vm(
@@ -692,7 +550,7 @@ pub(crate) async fn handle_resume_vm_command(
         }
         current_state => {
             let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-                "Cannot resume VM in {current_state:?} state. Must be in Paused or Suspended."
+                "Cannot resume VM in {current_state:?} state. Must be in Suspended."
             ))));
         }
     }
@@ -715,20 +573,13 @@ pub(crate) async fn handle_suspend_vm_command(
     };
 
     let current_state = record.status.state;
-    if !matches!(current_state, VmState::Running | VmState::Paused) {
+    if current_state != VmState::Running {
         let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-            "Cannot suspend VM in {current_state:?} state. Must be in Running or Paused."
+            "Cannot suspend VM in {current_state:?} state. Must be in Running."
         ))));
         return;
     }
     let memory = record.config.memory.unwrap_or_default();
-    // Firecracker restores hugetlbfs memory only through userfaultfd.
-    if memory.hugepages {
-        let _ = responder.send(Err(VmServiceError::InvalidState(
-            "Cannot suspend a VM with huge pages yet.".to_string(),
-        )));
-        return;
-    }
     let free_page_reporting = memory
         .balloon
         .is_some_and(|balloon| balloon.free_page_reporting);
@@ -741,63 +592,6 @@ pub(crate) async fn handle_suspend_vm_command(
         guests,
         free_page_reporting,
     ));
-}
-
-/// Checks that the VM is running or paused and has a balloon.
-async fn check_balloon_vm(repository: &VmRepository, vm_id: &str) -> Result<(), VmServiceError> {
-    let (_vm_id, record) = parse_vm_id_and_get_record(vm_id, repository).await?;
-    let state = record.status.state;
-    if !matches!(state, VmState::Running | VmState::Paused) {
-        return Err(VmServiceError::InvalidState(format!(
-            "Cannot reach the balloon of a VM in {state:?} state. Must be in Running or Paused."
-        )));
-    }
-    if record
-        .config
-        .memory
-        .and_then(|memory| memory.balloon)
-        .is_none()
-    {
-        return Err(VmServiceError::InvalidState(
-            "The VM has no balloon.".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) async fn handle_update_balloon_command(
-    repository: &VmRepository,
-    req: UpdateBalloonRequest,
-    responder: oneshot::Sender<Result<UpdateBalloonResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    if let Err(e) = check_balloon_vm(repository, &req.vm_id).await {
-        let _ = responder.send(Err(e));
-        return;
-    }
-    tokio::spawn(async move {
-        let result = hypervisor
-            .update_balloon(&req.vm_id, req.amount_mib)
-            .await
-            .map(|()| UpdateBalloonResponse {});
-        let _ = responder.send(result.map_err(Into::into));
-    });
-}
-
-pub(crate) async fn handle_get_balloon_command(
-    repository: &VmRepository,
-    req: GetBalloonRequest,
-    responder: oneshot::Sender<Result<GetBalloonResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-) {
-    if let Err(e) = check_balloon_vm(repository, &req.vm_id).await {
-        let _ = responder.send(Err(e));
-        return;
-    }
-    tokio::spawn(async move {
-        let result = hypervisor.get_balloon(&req.vm_id).await;
-        let _ = responder.send(result.map_err(Into::into));
-    });
 }
 
 pub(crate) async fn check_and_cleanup_vms(

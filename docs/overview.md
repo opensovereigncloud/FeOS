@@ -31,7 +31,7 @@ should scale to zero.
 Both products run on one unit: the **pod**, a Firecracker microVM that runs
 `feos-guest` and one or more containers in it.
 
-- The VM is the boundary between tenants; the container is the boundary
+- The microVM is the boundary between tenants; the container is the boundary
   around the workload inside it.
 - A pod can be suspended to a snapshot and resumed: in place, and later on
   another node.

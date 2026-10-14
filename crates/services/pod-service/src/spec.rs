@@ -108,7 +108,6 @@ pub fn vm_config(pod_id: &str, spec: &PodSpec) -> VmConfig {
         }),
         memory: Some(MemoryConfig {
             size_mib: resources.memory_mib,
-            hugepages: false,
             balloon: Some(BalloonConfig {
                 amount_mib: 0,
                 deflate_on_oom: true,
@@ -116,7 +115,6 @@ pub fn vm_config(pod_id: &str, spec: &PodSpec) -> VmConfig {
                 stats_interval_s: 0,
             }),
         }),
-        image_ref: String::new(),
         ..Default::default()
     };
     if let Some(network) = &spec.network {
@@ -216,7 +214,6 @@ mod tests {
             ..Default::default()
         });
         let config = vm_config("11111111-2222-3333-4444-555555555555", &spec);
-        assert_eq!(config.image_ref, "");
         assert_eq!(config.net[0].tap.as_ref().unwrap().tap_name, "pod0");
         let guest = config.guest_network.unwrap();
         assert_eq!(guest.interface, "eth0");

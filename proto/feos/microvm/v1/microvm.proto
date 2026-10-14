@@ -10,9 +10,8 @@ import "google/protobuf/any.proto";
 // process of its own, jailed; the layer hides the processes and their API
 // sockets.
 service MicroVmService {
-  // Creates a new Virtual Machine but does not boot it.
-  // This pulls the VM's image and prepares its configuration. The returned
-  // 'vm_id' must be used for all subsequent operations on this VM.
+  // Creates a microVM from the newest installed guest, but does not boot
+  // it. The returned 'vm_id' names it in all other calls.
   rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
   // Boots a created or stopped Virtual Machine in a new Firecracker process.
   // Booting a suspended VM discards its snapshot.
@@ -28,8 +27,6 @@ service MicroVmService {
   // with the VM ID, then streams user input. The server streams back the
   // VM's console output.
   rpc StreamVmConsole (stream StreamVmConsoleRequest) returns (stream StreamVmConsoleResponse);
-  // Lists all Virtual Machines currently managed by this service.
-  rpc ListVms(ListVmsRequest) returns (ListVmsResponse);
   // Pings the VMM process for a specific VM to check for liveness.
   rpc PingVm(PingVmRequest) returns (PingVmResponse);
   // Shuts down a running Virtual Machine: sends the guest Ctrl-Alt-Del and
@@ -37,23 +34,14 @@ service MicroVmService {
   // guest needs an i8042 keyboard driver and has to treat Ctrl-Alt-Del as
   // a request to shut down; FeOS does.
   rpc ShutdownVm(ShutdownVmRequest) returns (ShutdownVmResponse);
-  // Pauses a running Virtual Machine.
-  rpc PauseVm(PauseVmRequest) returns (PauseVmResponse);
-  // Resumes a paused Virtual Machine, or restores a suspended one from its
-  // snapshot in a new Firecracker process. A FeOS guest is pushed the time
+  // Restores a suspended microVM from its snapshot in a new Firecracker
+  // process. A FeOS guest is pushed the time
   // and its network configuration before this returns.
   rpc ResumeVm(ResumeVmRequest) returns (ResumeVmResponse);
   // Writes the state and the memory of a running or paused Virtual Machine
   // to a snapshot in its directory and ends its Firecracker process. The
-  // suspended VM holds no memory until ResumeVm restores it. Its disks must
-  // stay as they are until then. VMs with huge pages cannot be suspended
-  // yet: restoring them needs a userfaultfd memory backend.
+  // suspended VM holds no memory until ResumeVm restores it.
   rpc SuspendVm(SuspendVmRequest) returns (SuspendVmResponse);
-  // Sets the target size of the balloon of a running or paused VM. The
-  // guest inflates or deflates it on its own time.
-  rpc UpdateBalloon(UpdateBalloonRequest) returns (UpdateBalloonResponse);
-  // Reports the balloon's size and, if it has statistics, the guest's memory.
-  rpc GetBalloon(GetBalloonRequest) returns (GetBalloonResponse);
 }
 
 // Request stream from client to server for StreamVmConsole
@@ -132,15 +120,12 @@ message GetVmRequest {
 message VmConfig {
   CpuConfig cpus = 1;
   MemoryConfig memory = 2;
-  // The full reference to the OCI image, including the registry and tag.
-  // The image carries the kernel (vmlinuz) and may carry an initramfs and a
-  // root disk (rootfs), which becomes /dev/vda. Empty, the VM boots the
-  // newest guest installed on the node (/usr/lib/feos/guest/<version>/),
-  // and keeps that version.
-  string image_ref = 3;
-  // Additional data disks to attach to the VM. Firecracker cannot attach
-  // disks to a running VM.
-  repeated DiskConfig disks = 4;
+  // A microVM boots the newest guest installed on the node
+  // (/usr/lib/feos/guest/<version>/), and keeps that version. OCI images
+  // with a kernel of their own and data disks were for VMs; the records
+  // in vms.db may still carry them.
+  reserved 3, 4;
+  reserved "image_ref", "disks";
   repeated NetConfig net = 5;
   // Ignition was passed in SMBIOS OEM strings, which Firecracker lacks.
   reserved 6;
@@ -174,7 +159,9 @@ message CpuConfig {
 
 message MemoryConfig {
   uint64 size_mib = 1; // Memory size in Megabytes (MiB).
-  bool hugepages = 2;
+  // Firecracker backs neither an initramfs nor a balloon with huge pages.
+  reserved 2;
+  reserved "hugepages";
   // A virtio balloon, through which the guest gives memory back to the
   // host. Firecracker adds it at boot only.
   BalloonConfig balloon = 3;
@@ -191,16 +178,6 @@ message BalloonConfig {
   // Seconds between updates of the guest's memory statistics; 0 disables
   // them. Statistics cannot be enabled after boot.
   uint32 stats_interval_s = 4;
-}
-
-message DiskConfig {
-  // Firecracker's drive ID: letters, digits and "_". Defaults to "disk<n>".
-  string device_id = 1;
-  string path = 2; // Path on the host to the disk image file.
-  // Firecracker has no PCI passthrough (VFIO).
-  reserved 3;
-  reserved "vfio_pci";
-  bool readonly = 4;
 }
 
 message NetConfig {
@@ -287,17 +264,7 @@ message StartVmRequest {
   string vm_id = 1;
 }
 
-message ListVmsRequest {}
-
-message ListVmsResponse {
-  repeated VmInfo vms = 1;
-}
-
 message ShutdownVmRequest {
-  string vm_id = 1;
-}
-
-message PauseVmRequest {
   string vm_id = 1;
 }
 
@@ -319,44 +286,11 @@ message SuspendVmResponse {
   uint64 memory_bytes = 1;
 }
 
-message UpdateBalloonRequest {
-  string vm_id = 1;
-  uint32 amount_mib = 2;
-}
-
-message UpdateBalloonResponse {}
-
-message GetBalloonRequest {
-  string vm_id = 1;
-}
-
-message GetBalloonResponse {
-  uint32 target_mib = 1;
-  // How much the balloon holds; set only with statistics.
-  uint32 actual_mib = 2;
-  // The guest's memory, as of its last statistics update; unset without
-  // statistics.
-  BalloonStats stats = 3;
-}
-
-// Sizes in bytes.
-message BalloonStats {
-  uint64 total_memory = 1;
-  uint64 free_memory = 2;
-  uint64 available_memory = 3;
-  uint64 disk_caches = 4;
-  uint64 major_faults = 5;
-  uint64 minor_faults = 6;
-  uint64 oom_kill = 7;
-}
-
 message StartVmResponse {}
 
 message DeleteVmResponse {}
 
 message ShutdownVmResponse {}
-
-message PauseVmResponse {}
 
 message ResumeVmResponse {}
 

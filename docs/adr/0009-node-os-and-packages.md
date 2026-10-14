@@ -64,8 +64,8 @@ lists them. Its nodes are not changed with apt at runtime.
   restart or an upgrade stops `feosd` alone; the pods keep running, and
   the new `feosd` takes them over, as containerd's shims outlive
   containerd.
-- `feosd` sets nothing of the machine up. Network, time, hugepages and
-  SR-IOV VFs are the operating system's: systemd-networkd, timesyncd or
+- `feosd` sets nothing of the machine up. Network, time and SR-IOV VFs
+  are the operating system's: systemd-networkd, timesyncd or
   chrony, the kernel command line.
 - `/var/lib/feos` is the unit's state directory, on disk. That is what
   makes suspend free memory (ADR 0008).

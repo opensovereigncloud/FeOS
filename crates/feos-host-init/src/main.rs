@@ -2,12 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! feos-host-init: PID 1 when FeOS is the node's operating system. It sets
-//! the machine up (mounts, hugepages, the network, SR-IOV, the clock),
+//! the machine up (mounts, the network, SR-IOV, the clock),
 //! takes Ctrl-Alt-Del and the power signals over, reaps orphans, and starts
 //! feosd and starts it again when it ends. It serves no API and logs to the
 //! kernel's log.
 
-mod hugepages;
 mod kmsg;
 mod machine;
 mod network;

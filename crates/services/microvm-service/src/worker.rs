@@ -1,22 +1,16 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    dispatcher_handlers::get_image_service_client, error::VmServiceError, guest::Guests,
-    vmm::Hypervisor, VmEventWrapper,
-};
-use feos_proto::{
-    image_service::{ImageState as OciImageState, WatchImageStatusRequest},
-    microvm::{
-        stream_vm_console_request as console_input, ConsoleData, CreateVmRequest, CreateVmResponse,
-        DeleteVmRequest, DeleteVmResponse, PauseVmRequest, PauseVmResponse, PingVmRequest,
-        PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
-        StartVmRequest, StartVmResponse, StreamVmConsoleResponse, StreamVmEventsRequest,
-        SuspendVmRequest, SuspendVmResponse, VmEvent, VmState, VmStateChangedEvent,
-    },
+use crate::{error::VmServiceError, guest::Guests, vmm::Hypervisor, VmEventWrapper};
+use feos_proto::microvm::{
+    stream_vm_console_request as console_input, ConsoleData, CreateVmRequest, CreateVmResponse,
+    DeleteVmRequest, DeleteVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
+    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
+    StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse, VmEvent,
+    VmState, VmStateChangedEvent,
 };
 use log::{error, info, warn};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
@@ -26,82 +20,25 @@ use tokio_stream::StreamExt;
 use tonic::Status;
 use uuid::Uuid;
 
-async fn wait_for_image_ready(image_uuid: &str, image_ref: &str) -> Result<(), VmServiceError> {
-    let mut client = get_image_service_client()
-        .await
-        .map_err(|e| VmServiceError::ImageService(format!("Failed to connect: {e}")))?;
-
-    let mut stream = client
-        .watch_image_status(WatchImageStatusRequest {
-            image_uuid: image_uuid.to_string(),
-        })
-        .await
-        .map_err(|e| {
-            VmServiceError::ImageService(format!(
-                "WatchImageStatus RPC failed for {image_uuid}: {e}"
-            ))
-        })?
-        .into_inner();
-
-    while let Some(status_res) = stream.next().await {
-        let status = status_res.map_err(|e| {
-            VmServiceError::ImageService(format!("Image stream error for {image_uuid}: {e}"))
-        })?;
-        let state = OciImageState::try_from(status.state).unwrap_or(OciImageState::Unspecified);
-        match state {
-            OciImageState::Ready => return Ok(()),
-            OciImageState::PullFailed => {
-                return Err(VmServiceError::ImageService(format!(
-                    "Image pull failed for {image_ref} (uuid: {image_uuid}): {}",
-                    status.message
-                )))
-            }
-            _ => continue,
-        }
-    }
-    Err(VmServiceError::ImageService(format!(
-        "Image watch stream for {image_uuid} ended before reaching a terminal state."
-    )))
-}
-
-/// The directory the VM is made from: its pulled image once it is ready,
-/// or, without an image, the newest installed guest. The VM links its files
-/// and keeps that version.
-async fn image_dir(
-    vm_id: &str,
-    req: &CreateVmRequest,
-    image_uuid: &str,
-) -> Result<PathBuf, VmServiceError> {
-    if image_uuid.is_empty() {
-        let guest = crate::vmm::installed::newest_guest().ok_or_else(|| {
-            VmServiceError::InvalidArgument(format!(
-                "no guest is installed in {}",
-                crate::vmm::installed::GUEST_DIR
-            ))
-        })?;
-        info!(
-            "VmWorker ({vm_id}): Booting the installed guest {}",
-            guest.display()
-        );
-        return Ok(guest);
-    }
-    let image_ref = req
-        .config
-        .as_ref()
-        .map(|c| c.image_ref.clone())
-        .unwrap_or_default();
+/// The newest installed guest: the microVM links its files and keeps that
+/// version.
+fn guest_dir(vm_id: &str) -> Result<PathBuf, VmServiceError> {
+    let guest = crate::vmm::installed::newest_guest().ok_or_else(|| {
+        VmServiceError::InvalidArgument(format!(
+            "no guest is installed in {}",
+            crate::vmm::installed::GUEST_DIR
+        ))
+    })?;
     info!(
-        "VmWorker ({vm_id}): Waiting for image '{image_ref}' (uuid: {image_uuid}) to be ready..."
+        "VmWorker ({vm_id}): Booting the installed guest {}",
+        guest.display()
     );
-    wait_for_image_ready(image_uuid, &image_ref).await?;
-    info!("VmWorker ({vm_id}): Image '{image_ref}' (uuid: {image_uuid}) is ready.");
-    Ok(Path::new(crate::IMAGE_DIR).join(image_uuid))
+    Ok(guest)
 }
 
 pub async fn handle_create_vm(
     vm_id: String,
     req: CreateVmRequest,
-    image_uuid: String,
     responder: oneshot::Sender<Result<CreateVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
@@ -130,7 +67,7 @@ pub async fn handle_create_vm(
     )
     .await;
 
-    let image_dir = match image_dir(&vm_id, &req, &image_uuid).await {
+    let image_dir = match guest_dir(&vm_id) {
         Ok(dir) => dir,
         Err(e) => {
             let error_msg = e.to_string();
@@ -282,7 +219,6 @@ pub async fn handle_stream_vm_events(
 
 pub async fn handle_delete_vm(
     req: DeleteVmRequest,
-    image_uuid: String,
     process_id: Option<i64>,
     responder: oneshot::Sender<Result<DeleteVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
@@ -292,32 +228,6 @@ pub async fn handle_delete_vm(
     let vm_id = req.vm_id.clone();
     guests.forget(&vm_id);
     let result = hypervisor.delete_vm(req, process_id).await;
-
-    if !image_uuid.is_empty() {
-        info!("VmWorker ({vm_id}): Attempting to delete associated image with UUID: {image_uuid}");
-        match get_image_service_client().await {
-            Ok(mut client) => {
-                let delete_req = feos_proto::image_service::DeleteImageRequest {
-                    image_uuid: image_uuid.clone(),
-                };
-                if let Err(status) = client.delete_image(delete_req).await {
-                    warn!(
-                        "VmWorker ({vm_id}): Failed to delete image {image_uuid}: {message}. This may be expected if the image is shared or already deleted.",
-                        message = status.message()
-                    );
-                } else {
-                    info!(
-                        "VmWorker ({vm_id}): Successfully requested deletion of image {image_uuid}"
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("VmWorker ({vm_id}): Could not connect to ImageService to delete image {image_uuid}: {e}");
-            }
-        }
-    } else {
-        info!("VmWorker ({vm_id}): No image UUID provided, skipping image deletion.");
-    }
 
     if responder.send(result.map_err(Into::into)).is_err() {
         error!("VmWorker: Failed to send response for DeleteVm.");
@@ -377,65 +287,6 @@ pub async fn handle_shutdown_vm(
 
     if responder.send(result.map_err(Into::into)).is_err() {
         error!("VmWorker: Failed to send response for ShutdownVm.");
-    }
-}
-
-pub async fn handle_pause_vm(
-    req: PauseVmRequest,
-    responder: oneshot::Sender<Result<PauseVmResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-    broadcast_tx: mpsc::Sender<VmEventWrapper>,
-) {
-    let vm_id = req.vm_id.clone();
-    let result = hypervisor.pause_vm(req).await;
-
-    if result.is_ok() {
-        crate::vmm::broadcast_state_change_event(
-            &broadcast_tx,
-            &vm_id,
-            "microvm-service",
-            VmStateChangedEvent {
-                new_state: VmState::Paused as i32,
-                reason: "Pause command successful".to_string(),
-            },
-            None,
-        )
-        .await;
-    }
-
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmWorker: Failed to send response for PauseVm.");
-    }
-}
-
-pub async fn handle_resume_vm(
-    req: ResumeVmRequest,
-    responder: oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
-    hypervisor: Arc<dyn Hypervisor>,
-    broadcast_tx: mpsc::Sender<VmEventWrapper>,
-    guests: Arc<Guests>,
-) {
-    let vm_id = req.vm_id.clone();
-    let result = hypervisor.resume_vm(req).await;
-
-    if result.is_ok() {
-        crate::vmm::broadcast_state_change_event(
-            &broadcast_tx,
-            &vm_id,
-            "microvm-service",
-            VmStateChangedEvent {
-                new_state: VmState::Running as i32,
-                reason: "Resume command successful".to_string(),
-            },
-            None,
-        )
-        .await;
-        // The guest's clock stood still while it was paused.
-        guests.resumed(&vm_id).await;
-    }
-
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmWorker: Failed to send response for ResumeVm.");
     }
 }
 
