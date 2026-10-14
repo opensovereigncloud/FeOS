@@ -1,4 +1,6 @@
 MUSL_TARGET := x86_64-unknown-linux-musl
+# FeOS's version: the workspace's.
+FEOS_VERSION ?= $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
 ##@ Development
 

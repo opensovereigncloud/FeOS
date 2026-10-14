@@ -898,3 +898,135 @@ async fn test_suspend_and_restore_vm() -> Result<()> {
     guard.disable_cleanup();
     Ok(())
 }
+
+/// Installs `files` as a package would, in `dir/<version>/`, by hard link
+/// or copy.
+fn install(dir: &Path, version: &str, files: &[(&Path, &str)]) -> Result<std::path::PathBuf> {
+    let dir = dir.join(version);
+    std::fs::create_dir_all(&dir)?;
+    for (source, name) in files {
+        let target = dir.join(name);
+        if !target.exists() && std::fs::hard_link(source, &target).is_err() {
+            std::fs::copy(source, &target)?;
+        }
+    }
+    Ok(dir)
+}
+
+#[tokio::test]
+async fn test_vm_from_the_installed_guest() -> Result<()> {
+    // The guest and Firecracker the VM tests use, installed as their
+    // packages lay them out.
+    if vm_test_image().is_none() {
+        return Ok(());
+    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let guest = install(
+        Path::new(vm_service::vmm::installed::GUEST_DIR),
+        "0.0.1-test",
+        &[
+            (&repo.join("target/guest/vmlinuz"), "vmlinuz"),
+            (&repo.join("target/guest/initramfs.cpio.zst"), "initramfs"),
+        ],
+    )?;
+    let firecracker = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("firecracker"))
+        .find(|path| path.is_file())
+        .context("firecracker in PATH")?;
+    let firecracker_dir = install(
+        Path::new(vm_service::vmm::installed::FIRECRACKER_DIR),
+        "1.17.0",
+        &[
+            (&firecracker, "firecracker"),
+            (&firecracker.with_file_name("jailer"), "jailer"),
+        ],
+    )?;
+
+    ensure_server().await;
+    let (mut vm_client, _, _) = get_public_clients().await?;
+    let vm_id = vm_client
+        .create_vm(CreateVmRequest {
+            config: Some(VmConfig {
+                cpus: Some(CpuConfig { vcpu_count: 1 }),
+                memory: Some(MemoryConfig {
+                    size_mib: 256,
+                    hugepages: false,
+                    balloon: None,
+                }),
+                image_ref: String::new(),
+                ..Default::default()
+            }),
+            vm_id: None,
+        })
+        .await?
+        .into_inner()
+        .vm_id;
+    let mut guard = VmGuard::new(vm_id.clone());
+    let mut stream = vm_client
+        .stream_vm_events(StreamVmEventsRequest {
+            vm_id: Some(vm_id.clone()),
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    timeout(
+        Duration::from_secs(60),
+        wait_for_target_state(&mut stream, VmState::Created),
+    )
+    .await
+    .expect("Timed out waiting for VM to become created")?;
+    vm_client
+        .start_vm(StartVmRequest {
+            vm_id: vm_id.clone(),
+        })
+        .await?;
+    timeout(
+        Duration::from_secs(30),
+        wait_for_guest_attached(&mut stream),
+    )
+    .await
+    .expect("Timed out waiting for the guest to attach")?;
+    let pid = vm_client
+        .ping_vm(PingVmRequest {
+            vm_id: vm_id.clone(),
+        })
+        .await?
+        .into_inner()
+        .pid;
+    guard.set_pid(pid as i32);
+
+    // The VM links the installed guest's files and records the installed
+    // Firecracker it booted with.
+    let manifest = jail::Manifest::load(&vm_id)?;
+    assert!(
+        manifest
+            .links
+            .iter()
+            .any(|link| link.source == guest.join("vmlinuz")),
+        "The VM does not boot {}: {manifest:?}",
+        guest.display()
+    );
+    assert_eq!(
+        manifest.vmm.map(|vmm| vmm.firecracker),
+        Some(firecracker_dir.join("firecracker"))
+    );
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+    assert!(
+        exe.ends_with("firecracker"),
+        "pid {pid} runs {}",
+        exe.display()
+    );
+
+    vm_client
+        .delete_vm(DeleteVmRequest {
+            vm_id: vm_id.clone(),
+        })
+        .await?;
+    verify_vm_socket_cleanup(&vm_id);
+    assert!(
+        guest.join("vmlinuz").exists(),
+        "Deleting the VM leaves the installed guest"
+    );
+    guard.disable_cleanup();
+    Ok(())
+}

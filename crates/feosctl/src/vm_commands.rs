@@ -112,8 +112,8 @@ pub enum VmCommand {
 pub struct CreateVmOptions {
     #[arg(
         long,
-        required = true,
-        help = "OCI image with the kernel, and an initramfs or a root disk"
+        default_value = "",
+        help = "OCI image with the kernel, and an initramfs or a root disk; without, the newest guest installed on the node"
     )]
     image_ref: String,
 
@@ -263,7 +263,7 @@ async fn create_and_start_vm(
 ) -> Result<()> {
     println!(
         "� Starting create and start operation for VM with image: {}",
-        opts.image_ref
+        image_name(&opts.image_ref)
     );
 
     // Step 1: Create the VM
@@ -358,8 +358,19 @@ async fn wait_for_vm_state(
     anyhow::bail!("Event stream ended before reaching target state: {target_state:?}")
 }
 
+/// What a VM boots, for the user.
+fn image_name(image_ref: &str) -> &str {
+    match image_ref {
+        "" => "the installed guest",
+        image_ref => image_ref,
+    }
+}
+
 async fn create_vm(client: &mut VmServiceClient<Channel>, opts: CreateVmOptions) -> Result<()> {
-    println!("Requesting VM creation with image: {}...", opts.image_ref);
+    println!(
+        "Requesting VM creation with image: {}...",
+        image_name(&opts.image_ref)
+    );
 
     let request = create_vm_request(opts);
 

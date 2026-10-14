@@ -17,6 +17,7 @@ use feos_proto::{
     },
 };
 use log::{error, info, warn};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
@@ -64,6 +65,40 @@ async fn wait_for_image_ready(image_uuid: &str, image_ref: &str) -> Result<(), V
     )))
 }
 
+/// The directory the VM is made from: its pulled image once it is ready,
+/// or, without an image, the newest installed guest. The VM links its files
+/// and keeps that version.
+async fn image_dir(
+    vm_id: &str,
+    req: &CreateVmRequest,
+    image_uuid: &str,
+) -> Result<PathBuf, VmServiceError> {
+    if image_uuid.is_empty() {
+        let guest = crate::vmm::installed::newest_guest().ok_or_else(|| {
+            VmServiceError::InvalidArgument(format!(
+                "no guest is installed in {}",
+                crate::vmm::installed::GUEST_DIR
+            ))
+        })?;
+        info!(
+            "VmWorker ({vm_id}): Booting the installed guest {}",
+            guest.display()
+        );
+        return Ok(guest);
+    }
+    let image_ref = req
+        .config
+        .as_ref()
+        .map(|c| c.image_ref.clone())
+        .unwrap_or_default();
+    info!(
+        "VmWorker ({vm_id}): Waiting for image '{image_ref}' (uuid: {image_uuid}) to be ready..."
+    );
+    wait_for_image_ready(image_uuid, &image_ref).await?;
+    info!("VmWorker ({vm_id}): Image '{image_ref}' (uuid: {image_uuid}) is ready.");
+    Ok(Path::new(crate::IMAGE_DIR).join(image_uuid))
+}
+
 pub async fn handle_create_vm(
     vm_id: String,
     req: CreateVmRequest,
@@ -96,38 +131,31 @@ pub async fn handle_create_vm(
     )
     .await;
 
-    let image_ref = req
-        .config
-        .as_ref()
-        .map(|c| c.image_ref.clone())
-        .unwrap_or_default();
-
-    info!(
-        "VmWorker ({vm_id}): Waiting for image '{image_ref}' (uuid: {image_uuid}) to be ready..."
-    );
-    if let Err(e) = wait_for_image_ready(&image_uuid, &image_ref).await {
-        let error_msg = e.to_string();
-        error!("VmWorker ({vm_id}): {error_msg}");
-        crate::vmm::broadcast_state_change_event(
-            &broadcast_tx,
-            &vm_id,
-            "vm-service",
-            VmStateChangedEvent {
-                new_state: VmState::Crashed as i32,
-                reason: error_msg,
-            },
-            None,
-        )
-        .await;
-        return;
-    }
-    info!("VmWorker ({vm_id}): Image '{image_ref}' (uuid: {image_uuid}) is ready.");
+    let image_dir = match image_dir(&vm_id, &req, &image_uuid).await {
+        Ok(dir) => dir,
+        Err(e) => {
+            let error_msg = e.to_string();
+            error!("VmWorker ({vm_id}): {error_msg}");
+            crate::vmm::broadcast_state_change_event(
+                &broadcast_tx,
+                &vm_id,
+                "vm-service",
+                VmStateChangedEvent {
+                    new_state: VmState::Crashed as i32,
+                    reason: error_msg,
+                },
+                None,
+            )
+            .await;
+            return;
+        }
+    };
 
     let guest_network = req
         .config
         .as_ref()
         .and_then(|config| config.guest_network.clone());
-    let result = hypervisor.create_vm(&vm_id, req, image_uuid).await;
+    let result = hypervisor.create_vm(&vm_id, req, image_dir).await;
 
     match result {
         Ok(pid) => {

@@ -100,10 +100,20 @@ pub fn cgroup(vm_id: &str) -> PathBuf {
     Path::new(CGROUP_ROOT).join(parent_cgroup()).join(vm_id)
 }
 
+/// The Firecracker and jailer a boot of the VM runs. A snapshot can only
+/// be loaded by the Firecracker that wrote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Vmm {
+    pub firecracker: PathBuf,
+    pub jailer: PathBuf,
+}
+
 /// What the VM service keeps about a jail.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Manifest {
     pub uid: u32,
+    /// What the VM's last boot ran; None before its first.
+    pub vmm: Option<Vmm>,
     /// The VM's `cpu.weight`; 0 for a VM from before cgroups.
     pub cpu_weight: u64,
     pub links: Vec<Link>,
@@ -123,8 +133,13 @@ impl Manifest {
             .iter()
             .map(|link| json!({"source": link.source, "name": link.name, "disk": link.disk}))
             .collect();
+        let vmm = self
+            .vmm
+            .as_ref()
+            .map(|vmm| json!({"firecracker": vmm.firecracker, "jailer": vmm.jailer}));
         let manifest = json!({
             "uid": self.uid,
+            "vmm": vmm,
             "cpu_weight": self.cpu_weight,
             "links": links,
             "taps": self.taps,
@@ -162,6 +177,13 @@ impl Manifest {
                 .as_u64()
                 .and_then(|uid| u32::try_from(uid).ok())
                 .ok_or_else(|| io::Error::other("jail.json has no uid"))?,
+            vmm: manifest["vmm"]["firecracker"]
+                .as_str()
+                .zip(manifest["vmm"]["jailer"].as_str())
+                .map(|(firecracker, jailer)| Vmm {
+                    firecracker: PathBuf::from(firecracker),
+                    jailer: PathBuf::from(jailer),
+                }),
             cpu_weight: manifest["cpu_weight"].as_u64().unwrap_or(0),
             links,
             taps: strings(&manifest["taps"]),
@@ -413,6 +435,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = Manifest {
             uid: UID_BASE + 3,
+            vmm: Some(Vmm {
+                firecracker: PathBuf::from("/usr/lib/feos/firecracker/1.17.0/firecracker"),
+                jailer: PathBuf::from("/usr/lib/feos/firecracker/1.17.0/jailer"),
+            }),
             cpu_weight: cpu_weight(2),
             links: vec![
                 Link {
@@ -433,6 +459,13 @@ mod tests {
         manifest.write(&path).unwrap();
         assert_eq!(Manifest::read(&path).unwrap(), manifest);
         assert_eq!(manifest.links[1].jailed(), "/disk0.img");
+        // A VM that never booted has no VMM yet.
+        let fresh = Manifest {
+            vmm: None,
+            ..manifest
+        };
+        fresh.write(&path).unwrap();
+        assert_eq!(Manifest::read(&path).unwrap(), fresh);
     }
 
     #[test]

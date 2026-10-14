@@ -22,8 +22,8 @@
 //! snapshot and ends the process; restoring it starts a process that loads
 //! the snapshot.
 
-use super::{fc_api, jail, snapshot, Hypervisor, VmmError};
-use crate::{jail_dir, vm_dir, vsock_path, VmEventWrapper, IMAGE_DIR, VM_DIR};
+use super::{fc_api, installed, jail, snapshot, Hypervisor, VmmError};
+use crate::{jail_dir, vm_dir, vsock_path, VmEventWrapper, VM_DIR};
 use feos_proto::vm_service::{
     BalloonStats, CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetBalloonResponse,
     PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
@@ -381,9 +381,29 @@ impl Spawned {
 }
 
 impl FirecrackerAdapter {
+    /// The Firecracker a boot runs: the newest installed, or the one in
+    /// $PATH where none is.
+    fn vmm_for_boot(&self) -> jail::Vmm {
+        match installed::newest_firecracker() {
+            Some(dir) => jail::Vmm {
+                firecracker: dir.join(crate::FIRECRACKER_BIN),
+                jailer: dir.join(crate::JAILER_BIN),
+            },
+            None => jail::Vmm {
+                firecracker: find_executable(&self.firecracker),
+                jailer: find_executable(&self.jailer),
+            },
+        }
+    }
+
     /// Starts Firecracker for the VM. With a configuration file it boots
     /// the VM at once; without one it waits for calls on its API.
-    fn spawn(&self, vm_id: &str, config: Option<&str>) -> Result<Spawned, VmmError> {
+    fn spawn(
+        &self,
+        vm_id: &str,
+        vmm: &jail::Vmm,
+        config: Option<&str>,
+    ) -> Result<Spawned, VmmError> {
         let dir = vm_dir(vm_id);
         jail::prepare(vm_id).map_err(internal("prepare the jail"))?;
         let manifest = jail::Manifest::load(vm_id).map_err(internal("read the jail's manifest"))?;
@@ -427,12 +447,12 @@ impl FirecrackerAdapter {
 
         // The jailer becomes Firecracker: the same process, with the same
         // standard streams. It passes the ID on.
-        let mut command = Command::new(find_executable(&self.jailer));
+        let mut command = Command::new(&vmm.jailer);
         command
             .arg("--id")
             .arg(vm_id)
             .arg("--exec-file")
-            .arg(find_executable(&self.firecracker))
+            .arg(&vmm.firecracker)
             .args(["--uid", &uid, "--gid", &uid])
             .arg("--chroot-base-dir")
             .arg(VM_DIR)
@@ -462,7 +482,7 @@ impl FirecrackerAdapter {
         // would race it.
         let child = command
             .spawn()
-            .map_err(|e| VmmError::ProcessSpawnFailed(format!("{}: {e}", self.jailer.display())))?;
+            .map_err(|e| VmmError::ProcessSpawnFailed(format!("{}: {e}", vmm.jailer.display())))?;
         // The jailer records the pid in the jail.
         let pid = child.id() as i32;
         let exit = self.watch_process(vm_id, pid, Some(child));
@@ -490,13 +510,12 @@ impl Hypervisor for FirecrackerAdapter {
         &self,
         vm_id: &str,
         req: CreateVmRequest,
-        image_uuid: String,
+        image_dir: PathBuf,
     ) -> Result<Option<i64>, VmmError> {
         let config = req
             .config
             .ok_or_else(|| VmmError::InvalidConfig("VmConfig is required".to_string()))?;
-        let (fc_config, links) =
-            firecracker_config(&config, &Path::new(IMAGE_DIR).join(image_uuid))?;
+        let (fc_config, links) = firecracker_config(&config, &image_dir)?;
 
         let dir = vm_dir(vm_id);
         std::fs::create_dir_all(&dir).map_err(internal("create the VM directory"))?;
@@ -505,6 +524,7 @@ impl Hypervisor for FirecrackerAdapter {
             let (vcpus, _) = machine_size(&config);
             let manifest = jail::Manifest {
                 uid: jail::allocate_uid().map_err(internal("allocate a user ID"))?,
+                vmm: None,
                 cpu_weight: jail::cpu_weight(vcpus),
                 links,
                 taps: tap_names(&config),
@@ -537,7 +557,19 @@ impl Hypervisor for FirecrackerAdapter {
         // A cold boot: the memory in a snapshot is gone for good.
         snapshot::remove(vm_id).map_err(internal("remove the snapshot"))?;
 
-        let mut vmm = self.spawn(vm_id, Some(&format!("/{CONFIG}")))?;
+        // The newest Firecracker, which a snapshot of this boot needs again.
+        let booted = self.vmm_for_boot();
+        let mut manifest =
+            jail::Manifest::load(vm_id).map_err(internal("read the jail's manifest"))?;
+        manifest.vmm = Some(booted.clone());
+        manifest
+            .save(vm_id)
+            .map_err(internal("write the jail's manifest"))?;
+        info!(
+            "FirecrackerAdapter ({vm_id}): Booting with {}",
+            booted.firecracker.display()
+        );
+        let mut vmm = self.spawn(vm_id, &booted, Some(&format!("/{CONFIG}")))?;
         let api = api_socket(vm_id);
         let booted = async {
             loop {
@@ -641,7 +673,20 @@ impl Hypervisor for FirecrackerAdapter {
         let saved = snapshot::Host::load(vm_id)
             .map_err(|e| VmmError::SnapshotUnusable(format!("host record: {e}")))?;
 
-        let mut vmm = self.spawn(vm_id, None)?;
+        // The Firecracker that wrote the snapshot.
+        let recorded = jail::Manifest::load(vm_id)
+            .map_err(internal("read the jail's manifest"))?
+            .vmm
+            .unwrap_or_else(|| self.vmm_for_boot());
+        for binary in [&recorded.firecracker, &recorded.jailer] {
+            if !binary.is_file() {
+                return Err(VmmError::SnapshotUnusable(format!(
+                    "{} wrote the snapshot and is not installed any more",
+                    binary.display()
+                )));
+            }
+        }
+        let mut vmm = self.spawn(vm_id, &recorded, None)?;
         let api = api_socket(vm_id);
         let listening = async {
             while fc_api::request(&api, "GET", "/", None).await.is_err() {

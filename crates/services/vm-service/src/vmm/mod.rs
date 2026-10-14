@@ -11,7 +11,7 @@ use feos_proto::vm_service::{
 use prost::Message;
 use prost_types::Any;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::DuplexStream;
 use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 mod fc_api;
 pub mod firecracker;
+pub mod installed;
 pub mod jail;
 pub mod snapshot;
 
@@ -67,13 +68,14 @@ impl From<VmmError> for Status {
 
 #[tonic::async_trait]
 pub trait Hypervisor: Send + Sync {
-    /// Prepares a VM from its request and its pulled image. Returns the pid
-    /// of a VMM process if creating the VM started one.
+    /// Prepares a VM from its request and its image's directory: a pulled
+    /// image, or an installed guest. Returns the pid of a VMM process if
+    /// creating the VM started one.
     async fn create_vm(
         &self,
         vm_id: &str,
         req: CreateVmRequest,
-        image_uuid: String,
+        image_dir: PathBuf,
     ) -> Result<Option<i64>, VmmError>;
 
     /// Boots the VM, discarding a snapshot it has; returns the pid of its

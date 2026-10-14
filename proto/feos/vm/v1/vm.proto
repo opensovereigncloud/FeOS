@@ -133,7 +133,9 @@ message VmConfig {
   MemoryConfig memory = 2;
   // The full reference to the OCI image, including the registry and tag.
   // The image carries the kernel (vmlinuz) and may carry an initramfs and a
-  // root disk (rootfs), which becomes /dev/vda.
+  // root disk (rootfs), which becomes /dev/vda. Empty, the VM boots the
+  // newest guest installed on the node (/usr/lib/feos/guest/<version>/),
+  // and keeps that version.
   string image_ref = 3;
   // Additional data disks to attach to the VM. Firecracker cannot attach
   // disks to a running VM.

@@ -65,6 +65,8 @@ On a distribution all of this is the operating system's
 | `/var/lib/feos/containers/` | the host's containers, a `container.json` each |
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
 | `/run/feos/` | the API sockets, the task service's pid, the runtime state of containers |
+| `/usr/lib/feos/firecracker/<version>/` | Firecracker and its jailer, a version each, side by side |
+| `/usr/lib/feos/guest/<version>/` | the guest's `vmlinuz` and `initramfs`, a version each, side by side |
 
 `/var/lib/feos` is a tmpfs when FeOS is the node's operating system and a
 directory on disk on a distribution.
@@ -92,8 +94,9 @@ deletion undoes.
 ### Lifecycle
 
 - **Create** pulls the VM's image (an OCI image with `vmlinuz`, optionally
-  an initramfs and a root disk) and writes `config.json`. No process
-  starts.
+  an initramfs and a root disk) and writes `config.json`. A VM without an
+  `image_ref` takes the newest installed guest instead and keeps that
+  version: its jail links that version's files. No process starts.
 - **Start** runs the jailer, which starts Firecracker, which boots the VM at
   once. The process ends when the guest reboots or shuts down: exit code 0
   makes the VM stopped, anything else crashed.
@@ -138,8 +141,11 @@ and compact its memory, and waits until the VMM stops shrinking.
 
 ## Firecracker
 
-`feosd` finds `jailer` and `firecracker` in its `PATH`. The tests download
-Firecracker v1.17.0, pinned by sha256. Decided, not built: packaged
-versions side by side in `/usr/lib/feos/firecracker/<version>/`, of which
-each VM uses the one it was booted with
-([ADR 0009](../adr/0009-node-os-and-packages.md)).
+Firecracker versions are installed side by side in
+`/usr/lib/feos/firecracker/<version>/`, as the packages lay them out
+([ADR 0009](../adr/0009-node-os-and-packages.md)). A boot runs the newest
+version that has `firecracker` and `jailer`, or, where none is installed,
+the ones in `PATH`; `jail.json` records which. A restore runs what the
+snapshot's boot ran, and fails with `FAILED_PRECONDITION` if that is not
+installed any more. The tests download Firecracker v1.17.0, pinned by
+sha256.

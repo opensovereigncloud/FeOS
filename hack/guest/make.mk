@@ -1,4 +1,6 @@
 GUEST_KERNEL_VERSION = $(shell sed -n 's/^export KERNEL_VERSION=//p' hack/guest/kernel/config.sh)
+# The guest's version, where it is installed: /usr/lib/feos/guest/<version>/.
+GUEST_VERSION ?= $(FEOS_VERSION)
 
 .PHONY: guest guest-kernel guest-kernel-config guest-rootfs test-guest test-guest-container test-vm
 

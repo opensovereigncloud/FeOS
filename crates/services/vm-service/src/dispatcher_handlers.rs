@@ -71,12 +71,21 @@ pub(crate) async fn get_image_service_client(
         .map(ImageServiceClient::new)
 }
 
+/// Pulls the VM's image, and returns its UUID. A VM without an image_ref
+/// boots the newest installed guest instead: no pull, and an empty UUID.
 async fn initiate_image_pull_for_vm(req: &CreateVmRequest) -> Result<String, VmServiceError> {
     let image_ref = match req.config.as_ref() {
         Some(config) if !config.image_ref.is_empty() => config.image_ref.clone(),
-        _ => {
+        Some(_) if crate::vmm::installed::newest_guest().is_some() => return Ok(String::new()),
+        Some(_) => {
+            return Err(VmServiceError::InvalidArgument(format!(
+                "VmConfig has no image_ref, and no guest is installed in {}",
+                crate::vmm::installed::GUEST_DIR
+            )));
+        }
+        None => {
             return Err(VmServiceError::InvalidArgument(
-                "VmConfig with a non-empty image_ref is required".to_string(),
+                "VmConfig is required".to_string(),
             ));
         }
     };
@@ -135,8 +144,13 @@ async fn prepare_vm_creation(
     }
 
     let image_uuid_str = initiate_image_pull_for_vm(req).await?;
-    let image_uuid = Uuid::parse_str(&image_uuid_str)
-        .map_err(|e| VmServiceError::ImageService(format!("Failed to parse image UUID: {e}")))?;
+    // The nil UUID: an installed guest, no pulled image.
+    let image_uuid = match image_uuid_str.as_str() {
+        "" => Uuid::nil(),
+        uuid => Uuid::parse_str(uuid).map_err(|e| {
+            VmServiceError::ImageService(format!("Failed to parse image UUID: {e}"))
+        })?,
+    };
 
     let mut vm_config = req.config.clone().ok_or(VmServiceError::InvalidArgument(
         "VmConfig is required in CreateVmRequest".to_string(),
@@ -398,7 +412,12 @@ pub(crate) async fn handle_delete_vm_command(
 
     match repository.get_vm(vm_id).await {
         Ok(Some(record)) => {
-            let image_uuid_to_delete = record.image_uuid.to_string();
+            // An installed guest is not the VM's to delete.
+            let image_uuid_to_delete = if record.image_uuid.is_nil() {
+                String::new()
+            } else {
+                record.image_uuid.to_string()
+            };
             let process_id_to_kill = record.status.process_id;
 
             if let Err(e) = repository.delete_vm(vm_id).await {
