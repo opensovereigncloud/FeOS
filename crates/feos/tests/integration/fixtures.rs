@@ -7,9 +7,12 @@ use feos_proto::vm_service::{
 };
 use log::{error, info, warn};
 use nix::sys::signal::{kill, Signal};
+use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 use nix::unistd::Pid;
 use prost::Message;
-use std::path::Path;
+use std::fs::File;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use tokio_stream::StreamExt;
 use vm_service::vm_dir;
 
@@ -130,4 +133,76 @@ pub fn verify_vm_socket_cleanup(vm_id: &str) {
         dir.display()
     );
     info!("Verified the VM directory is deleted: {}", dir.display());
+}
+
+/// A loop device over a file: a disk that is a block device. It goes when
+/// the last process that opened it closes it.
+pub struct LoopDevice {
+    pub path: PathBuf,
+    _device: File,
+}
+
+#[repr(C)]
+struct LoopInfo64 {
+    device: u64,
+    inode: u64,
+    rdevice: u64,
+    offset: u64,
+    size_limit: u64,
+    number: u32,
+    encrypt_type: u32,
+    encrypt_key_size: u32,
+    flags: u32,
+    file_name: [u8; 64],
+    crypt_name: [u8; 64],
+    encrypt_key: [u8; 32],
+    init: [u64; 2],
+}
+
+#[repr(C)]
+struct LoopConfig {
+    fd: u32,
+    block_size: u32,
+    info: LoopInfo64,
+    reserved: [u64; 8],
+}
+
+const LOOP_MAJOR: u64 = 7;
+const LO_FLAGS_AUTOCLEAR: u32 = 4;
+nix::ioctl_none_bad!(loop_ctl_get_free, 0x4C82);
+nix::ioctl_write_ptr_bad!(loop_configure, 0x4C0A, LoopConfig);
+
+impl LoopDevice {
+    pub fn new(backing: &Path) -> Result<Self> {
+        let control = File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/loop-control")?;
+        // SAFETY: the fd is the loop control device; the call takes no argument.
+        let number = unsafe { loop_ctl_get_free(control.as_raw_fd()) }?;
+        let path = PathBuf::from(format!("/dev/loop{number}"));
+        // A container's /dev only has the devices there were when it started.
+        match mknod(
+            &path,
+            SFlag::S_IFBLK,
+            Mode::from_bits_truncate(0o660),
+            makedev(LOOP_MAJOR, number as u64),
+        ) {
+            Ok(()) | Err(nix::Error::EEXIST) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let backing = File::options().read(true).write(true).open(backing)?;
+        let device = File::options().read(true).write(true).open(&path)?;
+        // SAFETY: all zeroes is a valid loop_config.
+        let mut config: LoopConfig = unsafe { std::mem::zeroed() };
+        config.fd = backing.as_raw_fd() as u32;
+        config.info.flags = LO_FLAGS_AUTOCLEAR;
+        // SAFETY: the fd is the loop device and config outlives the call.
+        unsafe { loop_configure(device.as_raw_fd(), &config) }?;
+        info!("{} is a loop device now", path.display());
+        Ok(Self {
+            path,
+            _device: device,
+        })
+    }
 }

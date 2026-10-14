@@ -264,7 +264,7 @@ fn remove(path: &Path) -> io::Result<()> {
 }
 
 /// TAP devices, through the TUN driver's ioctls.
-mod tap {
+pub mod tap {
     use nix::fcntl::{open, OFlag};
     use nix::sys::stat::Mode;
     use std::io;

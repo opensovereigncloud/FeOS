@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::fixtures::{
-    verify_vm_socket_cleanup, wait_for_guest_attached, wait_for_target_state, VmGuard,
+    verify_vm_socket_cleanup, wait_for_guest_attached, wait_for_target_state, LoopDevice, VmGuard,
 };
 use super::{ensure_server, get_public_clients, vm_test_image};
 use anyhow::{Context, Result};
@@ -21,10 +21,24 @@ use feos_utils::vsock::API_PORT;
 use log::info;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use vm_service::vm_dir;
+use vm_service::vmm::jail::tap;
+
+/// The user a process runs as.
+fn process_uid(pid: i64) -> Result<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|uids| uids.split_whitespace().next())
+        .and_then(|uid| uid.parse().ok())
+        .context("No Uid in /proc/<pid>/status")
+}
 
 #[tokio::test]
 async fn test_create_and_start_vm() -> Result<()> {
@@ -340,14 +354,7 @@ async fn test_create_and_start_vm() -> Result<()> {
     guard.set_pid(ping_res.pid as i32);
 
     // Firecracker runs jailed, as a user of the VM's own.
-    let status = std::fs::read_to_string(format!("/proc/{}/status", ping_res.pid))?;
-    let uid: u32 = status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|uids| uids.split_whitespace().next())
-        .and_then(|uid| uid.parse().ok())
-        .context("No Uid in /proc/<pid>/status")?;
-    assert_ne!(uid, 0, "Firecracker runs as root");
+    assert_ne!(process_uid(ping_res.pid)?, 0, "Firecracker runs as root");
 
     // The guest is FeOS: its API answers behind the VM's vsock.
     let vsock_path = info_res.vsock_path;
@@ -413,9 +420,7 @@ async fn test_create_and_start_vm() -> Result<()> {
 
     verify_vm_socket_cleanup(&vm_id);
     assert!(
-        !std::path::Path::new("/sys/class/net")
-            .join(&tap_name)
-            .exists(),
+        !Path::new("/sys/class/net").join(&tap_name).exists(),
         "The TAP device the VM service created is gone with the VM"
     );
 
@@ -432,6 +437,12 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
     ensure_server().await;
     let (mut vm_client, _, _) = get_public_clients().await?;
 
+    // A data disk that is a block device: the jail gets a node of its own.
+    let disk_dir = tempfile::tempdir()?;
+    let disk_file = disk_dir.path().join("data.img");
+    std::fs::File::create(&disk_file)?.set_len(64 << 20)?;
+    let disk = LoopDevice::new(&disk_file)?;
+
     let vm_config = VmConfig {
         cpus: Some(CpuConfig { vcpu_count: 1 }),
         memory: Some(MemoryConfig {
@@ -440,7 +451,10 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
             balloon: None,
         }),
         image_ref,
-        disks: vec![],
+        disks: vec![DiskConfig {
+            path: disk.path.to_string_lossy().into_owned(),
+            ..Default::default()
+        }],
         net: vec![],
         guest_network: None,
     };
@@ -493,6 +507,22 @@ async fn test_vm_healthcheck_and_crash_recovery() -> Result<()> {
     info!("VMM Ping successful, PID: {}", ping_res.pid);
     let pid_to_kill = Pid::from_raw(ping_res.pid as i32);
     guard.set_pid(ping_res.pid as i32);
+
+    let node = std::fs::metadata(vm_dir(&vm_id).join("disk0.img"))?;
+    assert!(node.file_type().is_block_device());
+    assert_eq!(node.rdev(), std::fs::metadata(&disk.path)?.rdev());
+    assert_eq!(node.uid(), process_uid(ping_res.pid)?);
+    timeout(Duration::from_secs(30), async {
+        while !std::fs::read_to_string(vm_dir(&vm_id).join("serial.log"))
+            .unwrap_or_default()
+            .contains("data volume /dev/vda")
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("The guest did not find its data disk");
+    info!("The guest found its data disk, {}", disk.path.display());
 
     info!("Forcefully killing hypervisor process with PID: {pid_to_kill}");
     kill(pid_to_kill, Signal::SIGKILL).context("Failed to kill hypervisor process")?;
@@ -564,6 +594,11 @@ async fn test_suspend_and_restore_vm() -> Result<()> {
     ensure_server().await;
     let (mut vm_client, _, _) = get_public_clients().await?;
 
+    // A TAP device of the caller's: the VM service hands it to the VM's
+    // user, and leaves it when the VM goes.
+    let tap_name = format!("fcs{}", std::process::id());
+    tap::ensure(&tap_name, 0)?;
+
     let vm_config = VmConfig {
         cpus: Some(CpuConfig { vcpu_count: 1 }),
         memory: Some(MemoryConfig {
@@ -578,7 +613,12 @@ async fn test_suspend_and_restore_vm() -> Result<()> {
         }),
         image_ref,
         disks: vec![],
-        net: vec![],
+        net: vec![NetConfig {
+            tap: Some(TapConfig {
+                tap_name: tap_name.clone(),
+            }),
+            ..Default::default()
+        }],
         guest_network: None,
     };
     let vm_id = vm_client
@@ -693,6 +733,16 @@ async fn test_suspend_and_restore_vm() -> Result<()> {
             !vm_dir(&vm_id).join("snapshot").exists(),
             "A restored VM's snapshot is gone"
         );
+        let pid = vm_client
+            .ping_vm(PingVmRequest {
+                vm_id: vm_id.clone(),
+            })
+            .await?
+            .into_inner()
+            .pid;
+        let owner =
+            std::fs::read_to_string(Path::new("/sys/class/net").join(&tap_name).join("owner"))?;
+        assert_eq!(owner.trim(), process_uid(pid)?.to_string());
 
         // The same boot, with its memory: the ping count goes on.
         let pong = ping(vsock_path.clone()).await?;
@@ -773,6 +823,11 @@ async fn test_suspend_and_restore_vm() -> Result<()> {
         })
         .await?;
     verify_vm_socket_cleanup(&vm_id);
+    assert!(
+        Path::new("/sys/class/net").join(&tap_name).exists(),
+        "The caller's TAP device outlives the VM"
+    );
+    tap::delete(&tap_name)?;
     guard.disable_cleanup();
     Ok(())
 }
