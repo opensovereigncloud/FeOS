@@ -63,7 +63,7 @@ container after a reboot.
 
 `make test-vm` runs the integration tests of the `vm-service` against Firecracker, with the guest profile as the VM image. To run FeOS within a virtual machine that itself runs VMs, as on a real host, you need a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.
 
-For detailed instructions, please see the **[Nested Virtualization Test Environment Setup Guide](../docs/nested_virt_test_env.md)**.
+For detailed instructions, please see the **[Nested Virtualization Test Environment Setup Guide](../docs/guides/test-environment.md)**.
 
 ## Firecracker
 To boot the host image under [Firecracker](https://firecracker-microvm.github.io/) (`make firecracker`), give it a configuration like this one. Firecracker has no nested virtualization, so FeOS cannot run VMs in there. FeOS takes 2 GiB for huge pages at boot, so the VM needs more memory than that.

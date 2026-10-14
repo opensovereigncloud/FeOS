@@ -25,7 +25,7 @@ FeOS is a monorepo: all Rust crates live in one Cargo workspace under `crates/`,
 For detailed information on contributing to FeOS, including development guidelines, setup instructions, and coding standards, please refer to our [Developer Documentation](docs/development.md). This document provides all the necessary information for developers to understand the codebase, contribute effectively, and collaborate with the FeOS community.
 
 ## Installation and Setup
-Just download the Unified Kernel Image (UKI) from the [Releases](https://github.com/maltej/feos/releases) page and boot it with UEFI. You can do that in a VM by providing the UKI as a Kernel, via PXE boot or [boot from USB stick](docs/boot-image/uki.md#boot-from-usb-stick).
+Just download the Unified Kernel Image (UKI) from the [Releases](https://github.com/maltej/feos/releases) page and boot it with UEFI. You can do that in a VM by providing the UKI as a Kernel, via PXE boot or [boot from USB stick](docs/guides/boot-uki.md#boot-from-usb-stick).
 
 ## Licensing
 Copyright 2025 SAP SE or an SAP affiliate company and IronCore contributors. Please see our [LICENSE](LICENSE) for
