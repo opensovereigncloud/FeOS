@@ -12,6 +12,11 @@ other languages get their own top-level directory when they arrive.
 
 ```
 crates/
+  disk-store/           diskd's chunk store: chunks, layer manifests, seal, the
+                        local cache, S3 tiering, the sweeper
+  diskctl/              diskd's command-line client, for development
+  diskd/                the disk daemon: pods' disks as ublk devices, memory
+                        through userfaultfd
   feos/                 feosd and feos-guest: their startup, the wiring of
                         the services, the task supervisor
   feos-host-init/       PID 1 of a node whose operating system is FeOS:
@@ -58,6 +63,15 @@ Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
 - **`feos-host-init`** (`crates/feos-host-init`): PID 1 when FeOS is the
   node's operating system. It sets the machine up and runs `feosd`.
 - **`feosctl`** (`crates/feosctl`): the client.
+- **`diskd`** (`crates/diskd`): the disk daemon, one per node next to
+  `feosd`, as root. It serves pods' disks as ublk block devices over a
+  content-addressed chunk store tiered to S3, and their memory through
+  userfaultfd, on `<state-dir>/diskd.sock`
+  ([ADR 0011](adr/0011-disk-daemon.md), [architecture/disk.md](architecture/disk.md)).
+  `feosd` does not use it yet.
+- **`diskctl`** (`crates/diskctl`): diskd's client, for development and
+  the lab tests. diskd's API is internal to the node, so it is not part
+  of `feosctl`.
 
 `feosd` and `feos-guest` run the container runtime in a process of their
 own, `--task-service`, and start it again when it exits. See
@@ -88,6 +102,10 @@ use) and `protoc`.
                                # bridge, a TAP device and NAT
     make test-pods             # pods against Firecracker, with the guest
                                # installed; needs docker
+
+    make diskd                 # static diskd and diskctl
+    make diskd-lab             # diskd's lab tests: ublk, recovery, writes,
+                               # flatten, S3; needs sudo and fio, S3 from the env
 
 Build release artifacts per package (`cargo build -p <crate>`), never with
 `--workspace`: a workspace build unifies the features of all crates into every
