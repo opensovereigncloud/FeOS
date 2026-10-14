@@ -1,8 +1,9 @@
 FeOS Developer Documentation
 ============================
 
-See also [/hack/README.md](/hack/README.md) for building and booting FeOS
-images, and [/docs/adr](/docs/adr) for the decisions behind the layout.
+See [overview.md](overview.md) for what FeOS is, [architecture/](architecture/)
+for how it works, [/hack/README.md](/hack/README.md) for building and booting
+FeOS images, and [/docs/adr](/docs/adr) for the decisions behind it.
 
 ## Repository layout
 
@@ -40,8 +41,8 @@ docs/                   documentation and ADRs
   hypervisor. It configures itself from the network (DHCPv6, router
   advertisements, NTP), sets up SR-IOV and hugepages, runs the VM service and
   serves the public API on TCP `[::]:1337`. VMs run in Firecracker, in its
-  jailer ([ADR 0003](adr/0003-firecracker.md),
-  [ADR 0004](adr/0004-vm-half-of-the-manager.md)).
+  jailer ([ADR 0005](adr/0005-firecracker.md),
+  [ADR 0008](adr/0008-suspend-and-restore.md)).
 - **guest** (`--no-default-features --features guest`): FeOS as PID 1 in a
   microVM whose host configures it. Its API listens on vsock port 10000, not
   on TCP, and once it is ready it dials the host (vsock port 10001) and holds
@@ -52,7 +53,7 @@ docs/                   documentation and ADRs
 
 PID 1 runs the container runtime in a process of its own, `feos
 --task-service`, and starts it again when it exits. See
-[ADR 0002](adr/0002-guest-profile.md) for the guest's API.
+[ADR 0007](adr/0007-guest.md) for the guest's API.
 
 Both serve the public API on `/run/feos/api.sock`. Features are additive: code
 that only the host needs sits behind `#[cfg(feature = "host")]`, in `feos` and
