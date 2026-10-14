@@ -15,8 +15,12 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Install Protobuf Compiler
-      run: sudo apt-get update && sudo apt-get install protobuf-compiler -y
+    - name: Install Build Dependencies
+      # The host image carries the guest, which builds natively.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler musl-tools cpio zstd file \
+          flex bison bc libelf-dev libssl-dev
 
     - name: Install Rust Toolchain
       # Installs the toolchain rust-toolchain.toml pins.

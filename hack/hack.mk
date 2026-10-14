@@ -8,10 +8,12 @@ include hack/firecracker/make.mk
 include hack/guest/make.mk
 include hack/packages/make.mk
 
+# The build container builds into target/container: build scripts that the
+# host built would not run on the container's older glibc.
 container-release:
 #	make cargo index cache
 	mkdir -p target/cargo
-	docker run --rm -u $${UID} -v "`pwd`/target/cargo:/.cargo" -v "`pwd`:/feos" feos-builder bash -c "cd /feos && CARGO_HOME=/.cargo make release"
+	docker run --rm -u $${UID} -v "`pwd`/target/cargo:/.cargo" -v "`pwd`:/feos" feos-builder bash -c "cd /feos && CARGO_HOME=/.cargo CARGO_TARGET_DIR=/feos/target/container make release"
 
 virsh-start:
 	./hack/libvirt/init.sh libvirt-kvm.xml
