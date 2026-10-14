@@ -120,7 +120,10 @@ given, with `cpu.weight` 100 per vCPU and no caps: `/sys/fs/cgroup/vms/<id>`
 under `feos-host-init`, `/sys/fs/cgroup/system.slice/feosd.service/vms/<id>`
 under systemd. A cgroup whose children use controllers may hold no
 processes, so `feosd` moves into the leaf `feosd` of its cgroup, where
-systemd starts it already with `DelegateSubgroup=feosd`.
+systemd starts it already with `DelegateSubgroup=feosd`. `feosd` creates
+the VM's cgroup and enables `cpu` and `memory` in its own cgroup and in
+`vms/`, never above; the jailer only moves Firecracker into the VM's
+cgroup.
 
 ### The guest
 

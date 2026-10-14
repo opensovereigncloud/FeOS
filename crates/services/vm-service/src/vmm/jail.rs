@@ -14,8 +14,9 @@
 //! - its configuration, its log, its sockets and its snapshot
 //!
 //! The VM's user also owns its TAP devices, which the VM service creates if
-//! they do not exist. The jailer puts Firecracker into a cgroup of the VM's
-//! own, `vms/<id>` below the cgroup feosd is given. Outside the chroot, `jail.json` records the user, the
+//! they do not exist. The VM service readies a cgroup of the VM's own,
+//! `vms/<id>` below the cgroup feosd is given, and the jailer moves
+//! Firecracker into it. Outside the chroot, `jail.json` records the user, the
 //! VM's share of the CPU, where the files come from and which TAP devices
 //! the VM service created, so that a start can link them again and a
 //! deletion can undo it all.
@@ -65,39 +66,58 @@ pub fn cpu_weight(vcpus: u32) -> u64 {
     (100 * u64::from(vcpus)).clamp(1, 10_000)
 }
 
-/// The jailer's `--cgroup` values for a VM with `cpu_weight`, none for a
-/// VM from before cgroups. `memory.max=max` turns the memory controller on
-/// for the VM's cgroup, which then accounts its memory, without a cap:
-/// where /var/lib/feos is a tmpfs, what the VM writes to its disks and its
-/// snapshot in there is charged to it, and a cap would kill the VM when its
-/// guest fills its disk.
-pub fn cgroup_values(cpu_weight: u64) -> Vec<String> {
-    if cpu_weight == 0 {
-        return Vec::new();
-    }
-    vec![
-        format!("cpu.weight={cpu_weight}"),
-        "memory.max=max".to_string(),
-    ]
-}
-
 /// Sets the cgroup feosd is given, once, before the first VM starts.
 pub fn set_cgroup_base(base: &str) {
     let _ = CGROUP_BASE.set(base.trim_matches('/').to_string());
 }
 
 /// The cgroup that holds a cgroup per VM, relative to the root of the
-/// hierarchy, as the jailer's --parent-cgroup takes it.
-pub fn parent_cgroup() -> String {
+/// hierarchy.
+fn vms_cgroup() -> String {
     match CGROUP_BASE.get().map(String::as_str) {
         None | Some("") => "vms".to_string(),
         Some(base) => format!("{base}/vms"),
     }
 }
 
+/// The VM's cgroup relative to the root of the hierarchy, as the jailer's
+/// --parent-cgroup takes it.
+pub fn jailer_cgroup(vm_id: &str) -> String {
+    format!("{}/{vm_id}", vms_cgroup())
+}
+
 /// The VM's cgroup.
 pub fn cgroup(vm_id: &str) -> PathBuf {
-    Path::new(CGROUP_ROOT).join(parent_cgroup()).join(vm_id)
+    Path::new(CGROUP_ROOT).join(jailer_cgroup(vm_id))
+}
+
+/// Readies the VM's cgroup before a start, for the jailer to move
+/// Firecracker into. VMs share the CPU by `cpu_weight`, and the memory
+/// controller accounts each VM's memory, without a cap: where
+/// /var/lib/feos is a tmpfs, what the VM writes to its disks and its
+/// snapshot in there is charged to it, and a cap would kill the VM when its
+/// guest fills its disk. A VM from before cgroups, `cpu_weight` 0, gets
+/// none.
+///
+/// feosd enables the controllers itself, in the cgroup it was given and
+/// below. The jailer, given cgroup values, would enable them in every
+/// ancestor up to the root, and under systemd those are systemd's.
+pub fn prepare_cgroup(vm_id: &str, cpu_weight: u64) -> io::Result<()> {
+    if cpu_weight == 0 {
+        return Ok(());
+    }
+    let base = Path::new(CGROUP_ROOT).join(CGROUP_BASE.get().map(String::as_str).unwrap_or(""));
+    let vms = Path::new(CGROUP_ROOT).join(vms_cgroup());
+    let vm = cgroup(vm_id);
+    let write = |path: PathBuf, value: &str| {
+        fs::write(&path, value)
+            .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+    };
+    fs::create_dir_all(&vm)?;
+    for parent in [&base, &vms] {
+        write(parent.join("cgroup.subtree_control"), "+cpu +memory")?;
+    }
+    write(vm.join("cpu.weight"), &cpu_weight.to_string())
 }
 
 /// The Firecracker and jailer a boot of the VM runs. A snapshot can only
@@ -470,14 +490,9 @@ mod tests {
 
     #[test]
     fn vms_share_the_cpu_by_their_vcpus() {
-        assert_eq!(
-            cgroup_values(cpu_weight(2)),
-            vec!["cpu.weight=200".to_string(), "memory.max=max".to_string()]
-        );
+        assert_eq!(cpu_weight(2), 200);
         assert_eq!(cpu_weight(0), 1);
         assert_eq!(cpu_weight(1000), 10_000);
-        // A manifest from before cgroups puts the VM in none.
-        assert!(cgroup_values(0).is_empty());
     }
 
     #[test]

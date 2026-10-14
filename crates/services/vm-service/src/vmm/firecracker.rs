@@ -407,6 +407,8 @@ impl FirecrackerAdapter {
         let dir = vm_dir(vm_id);
         jail::prepare(vm_id).map_err(internal("prepare the jail"))?;
         let manifest = jail::Manifest::load(vm_id).map_err(internal("read the jail's manifest"))?;
+        jail::prepare_cgroup(vm_id, manifest.cpu_weight)
+            .map_err(internal("prepare the VM's cgroup"))?;
         let uid = manifest.uid.to_string();
         // Firecracker binds both sockets and fails if they exist.
         let api = api_socket(vm_id);
@@ -456,13 +458,11 @@ impl FirecrackerAdapter {
             .args(["--uid", &uid, "--gid", &uid])
             .arg("--chroot-base-dir")
             .arg(VM_DIR)
+            // With no --cgroup values, the jailer moves into this cgroup
+            // and changes nothing else.
             .args(["--cgroup-version", "2"])
             .arg("--parent-cgroup")
-            .arg(jail::parent_cgroup());
-        for value in jail::cgroup_values(manifest.cpu_weight) {
-            command.arg("--cgroup").arg(value);
-        }
-        command
+            .arg(jail::jailer_cgroup(vm_id))
             .arg("--")
             .args(["--api-sock", &format!("/{API_SOCKET}")]);
         if let Some(config) = config {
