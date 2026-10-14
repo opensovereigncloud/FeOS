@@ -38,3 +38,7 @@ pub mod kube_service {
 pub mod ssh_service {
     tonic::include_proto!("feos.ssh.v1");
 }
+/// diskd's API, on the node.
+pub mod disk_service {
+    tonic::include_proto!("feos.disk.v1");
+}

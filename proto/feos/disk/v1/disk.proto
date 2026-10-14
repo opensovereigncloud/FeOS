@@ -1,0 +1,321 @@
+syntax = "proto3";
+
+package feos.disk.v1;
+
+// diskd's API (ADR 0011), on a unix socket of the node. A pod's disk is a
+// chain of sealed, content-addressed layers and a mutable top, served as
+// /dev/ublkb<N>. Layers live in the node's chunk cache and, when S3 is
+// configured, in an object store. Internal: feosd will be its client,
+// diskctl is the one for development.
+service DiskService {
+  // Chunks a raw image file into a base layer, L0.
+  rpc ImportBase(ImportBaseRequest) returns (Layer);
+  // Starts a device for a pod over a chain and a fresh top, and links it
+  // at <state>/live/<pod>/disk.
+  rpc CreateDisk(CreateDiskRequest) returns (Device);
+  // Starts the device of a pod whose disk this node has, or with head_key
+  // one whose head another node uploaded.
+  rpc OpenDisk(OpenDiskRequest) returns (Device);
+  // Stops the device and keeps its top.
+  rpc StopDisk(StopDiskRequest) returns (Empty);
+  // Seals a stopped pod's top into a new layer, merged with the pod's own
+  // layer below it (flatten on seal): a pod's chain is its shared layers
+  // and at most one layer of its own. With upload, the chunks, the layer
+  // and then the pod's head go to S3.
+  rpc Seal(SealRequest) returns (Layer);
+  // Seals the frozen top of a running device into a layer on L0, for
+  // other pods to start from. Nothing about the pod changes. Fails with
+  // FAILED_PRECONDITION when the device was written to during the seal:
+  // the guest's filesystem was not frozen. Without upload the caller
+  // pushes the layer later.
+  rpc Bake(BakeRequest) returns (Layer);
+  // Seals a plain file, such as a memory dump, into a flat layer: every
+  // chunk that is not zero is data.
+  rpc SealFile(SealFileRequest) returns (Layer);
+  // Forgets a stopped pod's device row.
+  rpc RemoveDevice(RemoveDeviceRequest) returns (RemoveDeviceResponse);
+  // Writes a chain into a raw file.
+  rpc Materialize(MaterializeRequest) returns (Empty);
+  // Uploads a layer: its chunks, then its manifest.
+  rpc Push(LayerRef) returns (Empty);
+  // Downloads a layer's manifest, and with warm its chunks.
+  rpc Pull(LayerRef) returns (Empty);
+  // Drops chunks from the cache that can be fetched again.
+  rpc Evict(EvictRequest) returns (EvictStats);
+  // Counters and latency histograms per device and memory handler.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  // Checks manifests against chunks, locally and in S3, and lists garbage.
+  rpc Fsck(FsckRequest) returns (FsckReport);
+  // Deletes what the object store holds that nothing reaches any more.
+  // The caller knows what is live, so it names the heads and layers
+  // still in use; diskd walks snapshots/, layers/ and chunks/ once each
+  // and deletes what neither the live set nor a surviving head's chain
+  // reaches. Nothing younger than the grace is touched: an upload in
+  // flight writes chunks, then the layer, then the head, so until it ends
+  // its objects look unreferenced.
+  rpc Sweep(SweepRequest) returns (SweepReport);
+  // Puts a local file into the object store, or gets one into a local
+  // file, so that all S3 traffic of a node runs through diskd. The caller
+  // chooses the key, e.g. snapshots/<pod>/<epoch>/vmstate.
+  rpc PutObject(PutObjectRequest) returns (Empty);
+  rpc GetObject(GetObjectRequest) returns (Empty);
+  // Serves a pod's guest memory from a memory layer, read through: diskd
+  // binds a Firecracker UFFD backend socket and fills the guest's page
+  // faults chunk by chunk from the cache and S3, so the microVM resumes
+  // before its memory is downloaded.
+  rpc OpenMemory(OpenMemoryRequest) returns (Memory);
+  // Detaches the memory handler. Idempotent; the handler also ends when
+  // Firecracker closes the socket.
+  rpc CloseMemory(CloseMemoryRequest) returns (Empty);
+}
+
+message Empty {}
+
+message PutObjectRequest {
+  string key = 1;
+  // A file on the node.
+  string path = 2;
+}
+message GetObjectRequest {
+  string key = 1;
+  // Written atomically: a temporary file, then a rename.
+  string path = 2;
+}
+
+message ImportBaseRequest {
+  // A raw image file on the node.
+  string path = 1;
+  // 0 is the default, 64 KiB.
+  uint32 chunk_size = 2;
+}
+
+message Layer {
+  string layer_id = 1;
+  uint64 entries = 2;
+  uint64 chunks_new = 3;
+  uint64 chunks_inherited = 4;
+  uint64 chunks_zeroed = 5;
+  uint64 chunks_pool_hit = 6;
+  uint64 bytes_new = 7;
+  double seal_seconds = 8;
+  // The bytes the layer's data entries carry. Unlike bytes_new, it does
+  // not shrink when chunks dedup against other layers.
+  uint64 logical_bytes = 9;
+}
+
+message CreateDiskRequest {
+  string pod_id = 1;
+  // Layer ids, L0 first; the last is the parent of the fresh top.
+  repeated string chain = 2;
+  // The disk's size in bytes; 0 takes the chain's.
+  uint64 logical_size = 3;
+}
+
+message OpenDiskRequest {
+  string pod_id = 1;
+  // The S3 key of a head (snapshots/<pod>/<epoch>/head.json): pull it and
+  // its manifests, record the pod here and start the device over its
+  // chain with a fresh top.
+  string head_key = 2;
+}
+
+message BakeRequest {
+  string pod_id = 1;
+  bool upload = 2;
+}
+
+message SealFileRequest {
+  // A file on the node.
+  string path = 1;
+  bool upload = 2;
+  // 0 is the default for memory layers, 256 KiB.
+  uint32 chunk_size = 3;
+}
+
+message StopDiskRequest {
+  string pod_id = 1;
+}
+
+message SealRequest {
+  string pod_id = 1;
+  bool upload = 2;
+}
+
+message MaterializeRequest {
+  // Layer ids, L0 first.
+  repeated string chain = 1;
+  string out_path = 2;
+}
+
+message LayerRef {
+  string layer_id = 1;
+  // Pull: also fetch every chunk now instead of on first read.
+  bool warm = 2;
+}
+
+message EvictRequest {
+  Target target = 1;
+  // Also evict chunks of layers that were not pushed: they are nowhere
+  // else.
+  bool force = 2;
+  enum Target {
+    ALL = 0;
+    BUDGET = 1;
+  }
+}
+
+message EvictStats {
+  uint64 removed_entries = 1;
+  uint64 freed_bytes = 2;
+}
+
+message Device {
+  string pod_id = 1;
+  // /dev/ublkb<N>
+  string dev_path = 2;
+  // <state>/live/<pod>/disk, a symlink to dev_path.
+  string link_path = 3;
+  uint64 size_bytes = 4;
+}
+
+message StatsRequest {
+  // Empty for all devices.
+  string pod_id = 1;
+}
+
+message Histogram {
+  // "read", "write", "flush", ...
+  string name = 1;
+  // 32 buckets; bucket i counts operations that took [2^i, 2^(i+1)) µs.
+  repeated uint64 buckets = 2;
+  double p50_us = 3;
+  double p99_us = 4;
+}
+
+message DeviceStats {
+  string pod_id = 1;
+  string dev_path = 2;
+  uint64 reads = 3;
+  uint64 writes = 4;
+  uint64 flushes = 5;
+  uint64 discards = 6;
+  uint64 read_bytes = 7;
+  uint64 write_bytes = 8;
+  uint64 cache_hits = 9;
+  uint64 cache_misses = 10;
+  uint64 s3_fetches = 11;
+  uint64 s3_fetch_bytes = 12;
+  uint64 errors = 13;
+  repeated Histogram histograms = 14;
+}
+
+message StatsResponse {
+  repeated DeviceStats devices = 1;
+  // The node's chunk cache.
+  uint64 cache_bytes = 2;
+  uint64 cache_entries = 3;
+  // The node's S3 requests, whole-object PUTs and GETs.
+  uint64 s3_puts = 4;
+  uint64 s3_put_bytes = 5;
+  uint64 s3_gets = 6;
+  uint64 s3_get_bytes = 7;
+  // One per pod whose memory diskd serves.
+  repeated MemoryStats memories = 8;
+}
+
+message FsckRequest {
+  // Also probe S3 for chunks missing locally.
+  bool check_s3 = 1;
+}
+
+message FsckReport {
+  repeated string complete_layers = 1;
+  repeated string dangling_layers = 2;
+  repeated string garbage_chunks = 3;
+  uint64 garbage_bytes = 4;
+}
+
+message SweepRequest {
+  // S3 keys of the heads still in use.
+  repeated string live_heads = 1;
+  // Layer ids still in use outside a head, such as baked layers.
+  repeated string live_layers = 2;
+  // Objects younger than this are never deleted; 0 is 24 hours.
+  uint64 grace_seconds = 3;
+  // Report what would be deleted, delete nothing.
+  bool dry_run = 4;
+  // A soft limit on the sweep's duration; 0 is 15 minutes. A sweep that
+  // runs out stops after its current pass, which is safe: each pass only
+  // deletes what is unreachable.
+  uint64 budget_seconds = 5;
+  // Tests only: no grace at all. Never against a bucket in use, where the
+  // grace protects uploads in flight.
+  bool no_grace = 6;
+}
+
+message SweepReport {
+  uint64 snapshot_objects_deleted = 1;
+  uint64 layers_deleted = 2;
+  uint64 chunks_deleted = 3;
+  uint64 bytes_deleted = 4;
+  // Objects listed, per prefix.
+  uint64 snapshot_objects_seen = 5;
+  uint64 layers_seen = 6;
+  uint64 chunks_seen = 7;
+  bool budget_exhausted = 8;
+  // The keys deleted, or with dry_run the keys that would be.
+  repeated string deleted_keys = 9;
+}
+
+message OpenMemoryRequest {
+  string pod_id = 1;
+  // A flat memory layer; its manifest is pulled from S3 if the node does
+  // not have it.
+  string layer = 2;
+  // Where to bind the UFFD backend socket. Firecracker connects to it on
+  // PUT /snapshot/load with backend_type "Uffd" and passes the
+  // userfaultfd and the layout of the guest's memory.
+  string socket_path = 3;
+}
+
+message Memory {
+  string pod_id = 1;
+  string socket_path = 2;
+  uint64 logical_size = 3;
+  uint32 chunk_size = 4;
+  // The layer's data chunks: what a materialize would have downloaded.
+  uint64 chunks_total = 5;
+}
+
+message CloseMemoryRequest {
+  string pod_id = 1;
+}
+
+// What the memory handler of one pod did.
+message MemoryStats {
+  string pod_id = 1;
+  // Firecracker completed the handshake.
+  bool attached = 2;
+  // Page faults read from the userfaultfd.
+  uint64 faults = 3;
+  uint64 chunks_served = 4;
+  uint64 chunks_zeroed = 5;
+  uint64 bytes_served = 6;
+  uint64 cache_hits = 7;
+  uint64 cache_misses = 8;
+  uint64 s3_fetches = 9;
+  uint64 s3_fetch_bytes = 10;
+  // UFFD_EVENT_REMOVE events: the balloon's free page reporting.
+  uint64 removes = 11;
+  uint64 errors = 12;
+  uint64 chunks_total = 13;
+  // Pages served as zero pages because the guest had reported them free.
+  // Served from the snapshot instead, their old contents would be carried
+  // into every later checkpoint.
+  uint64 pages_reclaimed = 14;
+}
+
+message RemoveDeviceRequest {
+  string pod_id = 1;
+}
+message RemoveDeviceResponse {}

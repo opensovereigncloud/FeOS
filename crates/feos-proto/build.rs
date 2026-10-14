@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_dir}/feos/portforward/v1/portforward.proto"),
                 format!("{proto_dir}/feos/kube/v1/kube.proto"),
                 format!("{proto_dir}/feos/ssh/v1/ssh.proto"),
+                format!("{proto_dir}/feos/disk/v1/disk.proto"),
             ],
             &[proto_dir],
         )?;
