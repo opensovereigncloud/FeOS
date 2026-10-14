@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="10 10 80 80" width="80" height="80">
+  <!-- The tab's favicon: no background, so the logo's colours follow the
+       browser's scheme (the light theme's, or the dark theme's). -->
+  <style>
+    .you { stroke: #0891a5 }
+    .agent { stroke: #c400a8 }
+    @media (prefers-color-scheme: dark) {
+      .you { stroke: #1fb4c8 }
+      .agent { stroke: #e04cc6 }
+    }
+  </style>
+  <g fill="none" stroke-width="5.76" stroke-linecap="round" stroke-linejoin="round">
+    <polyline class="you" points="25.52,38.48 50.00,15.44 86.00,50.00"/>
+    <polyline class="agent" points="74.48,61.52 50.00,84.56 14.00,50.00"/>
+  </g>
+</svg>

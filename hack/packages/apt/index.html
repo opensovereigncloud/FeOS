@@ -1,0 +1,481 @@
+<!doctype html>
+<!-- The page of https://apt.fecode.dev, which publish-apt uploads with the
+     favicons beside it: how Debian takes the repository. In
+     FeCode's design (its colours, fonts and logo). -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FeOS apt repository</title>
+    <meta name="description" content="How Debian takes FeOS's apt repository." />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#151b23" media="(prefers-color-scheme: dark)" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=JetBrains+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      /* FeCode's tokens: cyan is what you do, magenta the other side. */
+      :root {
+        --bg: #f5f7fa;
+        --surface: #ffffff;
+        --surface-2: #eef2f7;
+        --line: #e0e6ee;
+        --line-strong: #c8d1de;
+        --ink: #1d2430;
+        --ink-2: #47526a;
+        --ink-3: #66718a;
+        --you: #0891a5;
+        --you-ink: #066d7d;
+        --you-soft: #e2f4f7;
+        --agent: #c400a8;
+        --warn-soft: #fdf0d9;
+        --warn-line: #f1d9a8;
+        --warn-deep: #5c3500;
+        --ok: #17794a;
+        --c-comment: #7a8599;
+        --shade: 29 36 48;
+        --sans: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+        --mono: 'JetBrains Mono', ui-monospace, monospace;
+        --brand: 'Share Tech Mono', var(--mono);
+        --r: 12px;
+        --r-sm: 8px;
+        --shadow: 0 1px 2px rgb(var(--shade) / 0.04), 0 8px 24px rgb(var(--shade) / 0.06);
+        color-scheme: light;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0e1319;
+          --surface: #151b23;
+          --surface-2: #1d2530;
+          --line: #27303c;
+          --line-strong: #3a4553;
+          --ink: #e5eaf1;
+          --ink-2: #b2bccb;
+          --ink-3: #8894a7;
+          --you: #1fb4c8;
+          --you-ink: #62d2e2;
+          --you-soft: #0e2c33;
+          --agent: #e04cc6;
+          --warn-soft: #30230f;
+          --warn-line: #5a4418;
+          --warn-deep: #f2cd92;
+          --ok: #45c285;
+          --c-comment: #7f8ba0;
+          --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 8px 24px rgb(0 0 0 / 0.35);
+          color-scheme: dark;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+      }
+      body {
+        background: var(--bg);
+        color: var(--ink);
+        font-family: var(--sans);
+        font-size: 15px;
+        line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      h1,
+      h2,
+      h3,
+      p,
+      ul,
+      ol {
+        margin: 0;
+      }
+      ul {
+        padding: 0;
+        list-style: none;
+      }
+      a {
+        color: var(--you-ink);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      :focus-visible {
+        outline: 2px solid var(--you);
+        outline-offset: 2px;
+        border-radius: 4px;
+      }
+      code {
+        font-family: var(--mono);
+        font-size: 0.86em;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 1px 5px;
+        overflow-wrap: break-word;
+      }
+      /* JetBrains Mono would join -< and the like into arrows. */
+      code,
+      pre,
+      .fingerprint {
+        font-variant-ligatures: none;
+      }
+
+      .topbar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        height: 52px;
+        padding: 0 16px;
+        background: var(--surface);
+        border-bottom: 1px solid var(--line);
+        min-width: 0;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        font-family: var(--brand);
+        font-size: 19px;
+        letter-spacing: 0.08em;
+        color: var(--ink);
+      }
+      .brand:hover {
+        text-decoration: none;
+      }
+      .brand b {
+        font-weight: 400;
+        color: var(--you);
+      }
+      .logo-shape {
+        width: 24px;
+        height: 24px;
+      }
+      .topbar-host {
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--ink-3);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
+      }
+      .topbar-fill {
+        flex: 1;
+      }
+      .topbar a.quiet {
+        font-size: 14px;
+        color: var(--ink-2);
+        white-space: nowrap;
+      }
+
+      main {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 40px 16px 24px;
+      }
+      .eyebrow {
+        font-family: var(--brand);
+        font-size: 14px;
+        letter-spacing: 0.08em;
+        color: var(--you-ink);
+      }
+      h1 {
+        margin-top: 6px;
+        font-size: 30px;
+        font-weight: 600;
+        line-height: 1.2;
+        letter-spacing: -0.01em;
+      }
+      .lead {
+        margin-top: 12px;
+        font-size: 17px;
+        color: var(--ink-2);
+      }
+      .facts {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 18px;
+      }
+      .facts li {
+        padding: 3px 11px;
+        border: 1px solid var(--line-strong);
+        border-radius: 99px;
+        background: var(--surface);
+        font-size: 13px;
+        color: var(--ink-2);
+      }
+
+      section {
+        margin-top: 36px;
+      }
+      h2 {
+        font-size: 19px;
+        font-weight: 600;
+        line-height: 1.3;
+      }
+      section > p,
+      section > .card {
+        margin-top: 12px;
+      }
+      .steps {
+        padding: 0;
+        list-style: none;
+        display: grid;
+        gap: 14px;
+        margin-top: 16px;
+        counter-reset: step;
+      }
+      .card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        box-shadow: var(--shadow);
+        padding: 18px 20px;
+        min-width: 0;
+      }
+      .step h3 {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 16px;
+        font-weight: 600;
+      }
+      .step h3::before {
+        counter-increment: step;
+        content: counter(step);
+        display: inline-grid;
+        place-items: center;
+        flex: none;
+        width: 26px;
+        height: 26px;
+        border-radius: 99px;
+        background: var(--you-soft);
+        color: var(--you-ink);
+        font-family: var(--brand);
+        font-size: 15px;
+      }
+      .card > * + * {
+        margin-top: 10px;
+      }
+      .card p {
+        color: var(--ink-2);
+      }
+
+      .code {
+        position: relative;
+      }
+      .code pre {
+        margin: 0;
+        padding: 12px 14px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        border-radius: var(--r-sm);
+        overflow-x: auto;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.6;
+        color: var(--ink);
+      }
+      .code pre code {
+        background: none;
+        border: 0;
+        padding: 0;
+        font-size: inherit;
+        overflow-wrap: normal;
+      }
+      .code .c {
+        color: var(--c-comment);
+      }
+      .code:has(.copy) pre {
+        padding-right: 76px;
+      }
+      .copy {
+        position: absolute;
+        top: 7px;
+        right: 7px;
+        padding: 4px 10px;
+        border: 1px solid var(--line-strong);
+        border-radius: var(--r-sm);
+        background: var(--surface);
+        color: var(--ink-2);
+        font: 500 12px/1.3 var(--sans);
+        cursor: pointer;
+        transition: background 0.15s, border-color 0.15s, color 0.15s;
+      }
+      .copy:hover {
+        border-color: var(--you);
+        color: var(--you-ink);
+      }
+      .copy.done {
+        border-color: var(--ok);
+        color: var(--ok);
+      }
+
+      .fingerprint {
+        font-family: var(--mono);
+        font-size: 13px;
+        color: var(--ink);
+        word-spacing: 0.2em;
+        overflow-wrap: anywhere;
+      }
+
+
+      footer {
+        max-width: 760px;
+        margin: 24px auto 0;
+        padding: 0 16px 40px;
+      }
+      footer nav {
+        padding-top: 20px;
+        border-top: 1px solid var(--line);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 18px;
+        font-size: 13px;
+        color: var(--ink-3);
+      }
+      footer a {
+        color: var(--ink-2);
+      }
+
+      @media (max-width: 560px) {
+        main {
+          padding-top: 28px;
+        }
+        h1 {
+          font-size: 25px;
+        }
+        .lead {
+          font-size: 16px;
+        }
+        .card {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+        /* Above the command: its first line is too long to share. */
+        .code {
+          display: flex;
+          flex-direction: column;
+        }
+        .code:has(.copy) pre {
+          padding-right: 14px;
+        }
+        .copy {
+          position: static;
+          order: -1;
+          align-self: flex-end;
+          margin-bottom: 6px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">
+        <svg viewBox="0 0 100 100" class="logo-shape" aria-hidden="true">
+          <polyline points="16,34 50,2 100,50" fill="none" stroke="var(--you)" stroke-width="4" />
+          <polyline points="84,66 50,98 0,50" fill="none" stroke="var(--agent)" stroke-width="4" />
+        </svg>
+        <span>Fe<b>OS</b></span>
+      </a>
+      <span class="topbar-host">apt.fecode.dev</span>
+      <span class="topbar-fill"></span>
+      <a class="quiet" href="https://github.com/ironcore-dev/FeOS">Source</a>
+    </header>
+
+    <main>
+      <p class="eyebrow">apt repository</p>
+      <h1>FeOS for Debian</h1>
+      <p class="lead">The apt repository of FeOS's packages, signed, for Debian.</p>
+      <ul class="facts" aria-label="Distribution">
+        <li>Debian 13 (trixie)</li>
+        <li>amd64</li>
+      </ul>
+
+      <section aria-labelledby="setup">
+        <h2 id="setup">Set up the repository</h2>
+        <ol class="steps">
+          <li class="card step">
+            <h3>Trust the signing key</h3>
+            <div class="code">
+              <pre><code>sudo apt install -y curl
+sudo curl -fsSLo /usr/share/keyrings/feos.gpg https://apt.fecode.dev/feos.gpg</code></pre>
+            </div>
+            <p>
+              apt checks every index of this repository against the key. It has the fingerprint
+            </p>
+            <p class="fingerprint">A420 0EF0 7FED 4845 F01C 446D 4CC1 E85A 1600 10A0</p>
+            <p>
+              which <code>gpg --show-keys /usr/share/keyrings/feos.gpg</code> shows. The key is
+              also here <a href="/feos.asc">armored</a>.
+            </p>
+          </li>
+          <li class="card step">
+            <h3>Add the repository</h3>
+            <div class="code">
+              <pre><code>sudo tee /etc/apt/sources.list.d/feos.sources &gt;/dev/null &lt;&lt;'EOF'
+Types: deb
+URIs: https://apt.fecode.dev
+Suites: stable
+Components: main
+Architectures: amd64
+Signed-By: /usr/share/keyrings/feos.gpg
+EOF</code></pre>
+            </div>
+          </li>
+          <li class="card step">
+            <h3>Update the package lists</h3>
+            <div class="code">
+              <pre><code>sudo apt update</code></pre>
+            </div>
+            <p>apt now takes FeOS's packages from this repository.</p>
+          </li>
+        </ol>
+      </section>
+    </main>
+
+    <footer>
+      <nav>
+        <span>FeOS</span>
+        <a href="/feos.asc">Signing key</a>
+        <a href="/dists/stable/InRelease">InRelease</a>
+        <a href="https://github.com/ironcore-dev/FeOS">Source on GitHub</a>
+      </nav>
+    </footer>
+
+    <script>
+      // A copy button on each command.
+      for (const box of document.querySelectorAll('.code')) {
+        const code = box.querySelector('code')
+        const button = document.createElement('button')
+        button.type = 'button'
+        button.className = 'copy'
+        button.textContent = 'Copy'
+        button.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(code.textContent.trimEnd() + '\n')
+            button.textContent = 'Copied'
+            button.classList.add('done')
+          } catch (e) {
+            button.textContent = 'Select it'
+          }
+          setTimeout(() => {
+            button.textContent = 'Copy'
+            button.classList.remove('done')
+          }, 1600)
+        })
+        box.appendChild(button)
+      }
+
+    </script>
+  </body>
+</html>
