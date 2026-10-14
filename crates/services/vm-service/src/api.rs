@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::Command;
+use crate::{Command, ConsoleInput};
 use feos_proto::vm_service::{
     vm_service_server::VmService, CreateVmRequest, CreateVmResponse, DeleteVmRequest,
     DeleteVmResponse, GetBalloonRequest, GetBalloonResponse, GetVmRequest, ListVmsRequest,
@@ -26,6 +26,19 @@ pub struct VmApiHandler {
 impl VmApiHandler {
     pub fn new(dispatcher_tx: mpsc::Sender<Command>) -> Self {
         Self { dispatcher_tx }
+    }
+
+    /// The console of a VM, for a caller in this process.
+    pub async fn console(
+        &self,
+        input: ConsoleInput,
+    ) -> Result<ReceiverStream<Result<StreamVmConsoleResponse, Status>>, Status> {
+        let (output_tx, output_rx) = mpsc::channel(32);
+        self.dispatcher_tx
+            .send(Command::StreamVmConsole(input, output_tx))
+            .await
+            .map_err(|e| Status::internal(format!("Failed to send command to dispatcher: {e}")))?;
+        Ok(ReceiverStream::new(output_rx))
     }
 }
 
@@ -96,14 +109,7 @@ impl VmService for VmApiHandler {
         request: Request<Streaming<StreamVmConsoleRequest>>,
     ) -> Result<Response<Self::StreamVmConsoleStream>, Status> {
         info!("VmApi: Received StreamVmConsole stream request.");
-        let grpc_input_stream = request.into_inner();
-        let (grpc_output_tx, grpc_output_rx) = mpsc::channel(32);
-        let cmd = Command::StreamVmConsole(Box::new(grpc_input_stream), grpc_output_tx);
-        self.dispatcher_tx
-            .send(cmd)
-            .await
-            .map_err(|e| Status::internal(format!("Failed to send command to dispatcher: {e}")))?;
-        let output_stream = ReceiverStream::new(grpc_output_rx);
+        let output_stream = self.console(Box::pin(request.into_inner())).await?;
         Ok(Response::new(Box::pin(output_stream)))
     }
 

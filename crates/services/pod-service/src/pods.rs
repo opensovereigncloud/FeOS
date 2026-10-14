@@ -18,12 +18,14 @@ use feos_proto::container_service::{
     ListContainersRequest, StartContainerRequest,
 };
 use feos_proto::pod_service::{
-    ContainerSpec, ContainerState, ContainerStatus, PodEvent, PodInfo, PodSpec, PodState,
+    ContainerSpec, ContainerState, ContainerStatus, MicroVm, PodConsoleInput, PodConsoleOutput,
+    PodEvent, PodInfo, PodSpec, PodState,
 };
 use feos_proto::vm_service::{
-    vm_service_server::VmService, CreateVmRequest, DeleteVmRequest, GetVmRequest, ResumeVmRequest,
-    ShutdownVmRequest, StartVmRequest, StreamVmEventsRequest, SuspendVmRequest, VmEvent, VmInfo,
-    VmState, VmStateChangedEvent,
+    stream_vm_console_request as console_request, vm_service_server::VmService,
+    AttachConsoleMessage, ConsoleData, CreateVmRequest, DeleteVmRequest, GetVmRequest,
+    PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest,
+    StreamVmEventsRequest, SuspendVmRequest, VmEvent, VmInfo, VmState, VmStateChangedEvent,
 };
 use feos_utils::vsock::{self, API_PORT};
 use log::{info, warn};
@@ -36,7 +38,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, OwnedMutexGuard};
 use tokio::task::AbortHandle;
 use tokio::time::{sleep, timeout, Instant};
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
 use vm_service::api::VmApiHandler;
@@ -46,6 +48,8 @@ use vm_service::vsock_path;
 const GUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often a step looks again while it waits.
 const POLL: Duration = Duration::from_millis(250);
+/// How long the VM service may take to record a change it made.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long GetPod waits for the guest's view of the containers.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -176,10 +180,13 @@ impl Pods {
                 let request = Request::new(ShutdownVmRequest {
                     vm_id: pod_id.to_string(),
                 });
-                if let Err(e) = self.inner.vms.shutdown_vm(request).await {
-                    // A guest that does not go is ended.
-                    warn!("Pods: {pod_id} did not shut down: {}", e.message());
-                    self.delete_vm(pod_id).await?;
+                match self.inner.vms.shutdown_vm(request).await {
+                    Ok(_) => self.settle(pod_id, VmState::Stopped).await?,
+                    Err(e) => {
+                        // A guest that does not go is ended.
+                        warn!("Pods: {pod_id} did not shut down: {}", e.message());
+                        self.delete_vm(pod_id).await?;
+                    }
                 }
             }
             Some(_) => self.delete_vm(pod_id).await?,
@@ -211,6 +218,7 @@ impl Pods {
             purge_guest: true,
         });
         let response = self.inner.vms.suspend_vm(request).await?.into_inner();
+        self.settle(pod_id, VmState::Suspended).await?;
         self.set_state(pod_id, PodState::Suspended, "suspended");
         Ok(response.memory_bytes)
     }
@@ -222,17 +230,54 @@ impl Pods {
             vm_id: pod_id.to_string(),
         });
         self.inner.vms.resume_vm(request).await?;
+        self.settle(pod_id, VmState::Running).await?;
         self.set_state(pod_id, PodState::Running, "");
         Ok(())
     }
 
-    /// The pod, with its containers as the guest reports them if it runs.
+    /// The pod, with its microVM and its containers as the guest reports
+    /// them if it runs.
     pub async fn get(&self, pod_id: &str) -> Result<PodInfo, Status> {
         let mut info = self.info(pod_id)?;
         if info.state() == PodState::Running {
+            info.microvm = self.microvm(pod_id).await;
             info.containers = self.container_status(&info).await;
         }
         Ok(info)
+    }
+
+    /// The serial console of the pod's microVM. The first message names the
+    /// pod.
+    pub async fn console(
+        &self,
+        mut input: impl Stream<Item = Result<PodConsoleInput, Status>> + Send + Unpin + 'static,
+    ) -> Result<impl Stream<Item = Result<PodConsoleOutput, Status>> + Send + 'static, Status> {
+        let first = input.next().await.ok_or_else(|| {
+            Status::invalid_argument("the console's first message names no pod")
+        })??;
+        self.check_reachable(&first.pod_id)?;
+        let data = |input: Vec<u8>| StreamVmConsoleRequest {
+            payload: Some(console_request::Payload::Data(ConsoleData { input })),
+        };
+        let mut start = vec![Ok(StreamVmConsoleRequest {
+            payload: Some(console_request::Payload::Attach(AttachConsoleMessage {
+                vm_id: first.pod_id,
+            })),
+        })];
+        if !first.input.is_empty() {
+            start.push(Ok(data(first.input)));
+        }
+        let rest = input.map(move |message| message.map(|message| data(message.input)));
+        let output = self
+            .inner
+            .vms
+            .console(Box::pin(tokio_stream::iter(start).chain(rest)))
+            .await?;
+        Ok(output.map(|output| {
+            output.map(|output| PodConsoleOutput {
+                output: output.output,
+            })
+        }))
     }
 
     pub fn list(&self) -> Vec<PodInfo> {
@@ -450,6 +495,26 @@ impl Pods {
         }
     }
 
+    /// Waits until the VM service records the microVM in `state`: it
+    /// records a change after the call that made it returned.
+    async fn settle(&self, pod_id: &str, state: VmState) -> Result<(), Status> {
+        let deadline = Instant::now() + SETTLE_TIMEOUT;
+        loop {
+            let actual = self.vm(pod_id).await?.map(|vm| vm.state());
+            if actual == Some(state) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Status::deadline_exceeded(format!(
+                    "the microVM is {}, not {}",
+                    actual.map_or("gone", |actual| actual.as_str_name()),
+                    state.as_str_name()
+                )));
+            }
+            sleep(POLL).await;
+        }
+    }
+
     async fn vm(&self, pod_id: &str) -> Result<Option<VmInfo>, Status> {
         let request = Request::new(GetVmRequest {
             vm_id: pod_id.to_string(),
@@ -459,6 +524,24 @@ impl Pods {
             Err(e) if e.code() == Code::NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// The running microVM, as far as it answers.
+    async fn microvm(&self, pod_id: &str) -> Option<MicroVm> {
+        let vm = self.vm(pod_id).await.ok()??;
+        let request = Request::new(PingVmRequest {
+            vm_id: pod_id.to_string(),
+        });
+        let pid = match self.inner.vms.ping_vm(request).await {
+            Ok(ping) => ping.into_inner().pid,
+            Err(_) => 0,
+        };
+        let guest = vm.guest.unwrap_or_default();
+        Some(MicroVm {
+            pid,
+            guest_version: guest.feos_version,
+            guest_attached: guest.attached,
+        })
     }
 
     async fn delete_vm(&self, pod_id: &str) -> Result<(), Status> {

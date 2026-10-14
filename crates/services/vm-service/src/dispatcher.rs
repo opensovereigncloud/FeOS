@@ -92,7 +92,7 @@ impl VmServiceDispatcher {
                             handle_delete_vm_command(&self.repository, &self.healthcheck_cancel_bus, req, responder, hypervisor, event_bus_tx, guests).await;
                         }
                         Command::StreamVmConsole(input_stream, output_tx) => {
-                            handle_stream_vm_console_command(&self.repository, *input_stream, output_tx, hypervisor).await;
+                            handle_stream_vm_console_command(&self.repository, input_stream, output_tx, hypervisor).await;
                         }
                         Command::ListVms(req, responder) => {
                             handle_list_vms_command(&self.repository, req, responder, &guests).await;

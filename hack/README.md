@@ -79,7 +79,7 @@ off through `feosctl host shutdown`.
 
 ## Nested Virtualization Test Environment
 
-`make test-vm` runs the integration tests of the `vm-service` against Firecracker, with feos-guest as the VM image. To run FeOS within a virtual machine that itself runs VMs, as on a real host, you need a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.
+`make test-pods` runs the pod integration tests against Firecracker, with feos-guest installed as its package would. To run FeOS within a virtual machine that itself runs microVMs, as on a real host, you need a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.
 
 For detailed instructions, please see the **[Nested Virtualization Test Environment Setup Guide](../docs/guides/test-environment.md)**.
 

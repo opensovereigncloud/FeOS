@@ -11,8 +11,10 @@ use feos_proto::vm_service::{
     UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo,
 };
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use tokio::sync::{mpsc, oneshot};
-use tonic::{Status, Streaming};
+use tokio_stream::Stream;
+use tonic::Status;
 
 pub mod api;
 pub mod dispatcher;
@@ -46,6 +48,9 @@ pub fn vsock_path(vm_id: &str) -> PathBuf {
     vm_dir(vm_id).join("v.sock")
 }
 
+/// What a console's client sends: an attach message, then its input.
+pub type ConsoleInput = Pin<Box<dyn Stream<Item = Result<StreamVmConsoleRequest, Status>> + Send>>;
+
 #[derive(Debug, Clone)]
 pub struct VmEventWrapper {
     pub event: VmEvent,
@@ -71,7 +76,7 @@ pub enum Command {
         oneshot::Sender<Result<DeleteVmResponse, VmServiceError>>,
     ),
     StreamVmConsole(
-        Box<Streaming<StreamVmConsoleRequest>>,
+        ConsoleInput,
         mpsc::Sender<Result<StreamVmConsoleResponse, Status>>,
     ),
     ListVms(

@@ -2,7 +2,7 @@ GUEST_KERNEL_VERSION = $(shell sed -n 's/^export KERNEL_VERSION=//p' hack/guest/
 # The guest's version, where it is installed: /usr/lib/feos/guest/<version>/.
 GUEST_VERSION ?= $(FEOS_VERSION)
 
-.PHONY: guest guest-kernel guest-kernel-config guest-rootfs test-guest test-guest-container test-vm
+.PHONY: guest guest-kernel guest-kernel-config guest-rootfs test-guest test-guest-container test-pods
 
 guest: guest-kernel guest-rootfs ## Build the guest kernel and initramfs into target/guest/.
 
@@ -21,5 +21,5 @@ test-guest: firecracker ## Boot the guest under Firecracker and talk to it over 
 test-guest-container: firecracker ## Run containers in the guest; needs sudo for a bridge, a TAP device and NAT.
 	hack/guest/test-container
 
-test-vm: firecracker ## Run the VM service against Firecracker, with the guest as VM image; needs docker.
-	hack/guest/test-vm
+test-pods: firecracker ## Run pods against Firecracker, with the guest installed; needs docker.
+	hack/guest/test-pods

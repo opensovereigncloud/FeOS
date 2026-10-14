@@ -15,9 +15,9 @@ use feos_proto::{
         CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetBalloonRequest, GetBalloonResponse,
         GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest, PauseVmResponse,
         ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
-        StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest,
-        SuspendVmRequest, SuspendVmResponse, UpdateBalloonRequest, UpdateBalloonResponse, VmEvent,
-        VmInfo, VmState, VmStateChangedEvent,
+        StartVmResponse, StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest,
+        SuspendVmResponse, UpdateBalloonRequest, UpdateBalloonResponse, VmEvent, VmInfo, VmState,
+        VmStateChangedEvent,
     },
 };
 use hyper_util::rt::TokioIo;
@@ -30,7 +30,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::StreamExt;
 use tonic::{
     transport::{Channel, Endpoint, Error as TonicTransportError, Uri},
-    Status, Streaming,
+    Status,
 };
 use tower::service_fn;
 use uuid::Uuid;
@@ -466,9 +466,7 @@ pub(crate) async fn handle_delete_vm_command(
     }
 }
 
-async fn get_attach_message(
-    stream: &mut Streaming<StreamVmConsoleRequest>,
-) -> Result<String, Status> {
+async fn get_attach_message(stream: &mut crate::ConsoleInput) -> Result<String, Status> {
     match stream.next().await {
         Some(Ok(msg)) => match msg.payload {
             Some(console_input::Payload::Attach(AttachConsoleMessage { vm_id })) => Ok(vm_id),
@@ -485,7 +483,7 @@ async fn get_attach_message(
 
 pub(crate) async fn handle_stream_vm_console_command(
     repository: &VmRepository,
-    mut input_stream: Streaming<StreamVmConsoleRequest>,
+    mut input_stream: crate::ConsoleInput,
     output_tx: mpsc::Sender<Result<StreamVmConsoleResponse, Status>>,
     hypervisor: Arc<dyn Hypervisor>,
 ) {

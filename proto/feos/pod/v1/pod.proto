@@ -30,11 +30,15 @@ service PodService {
   rpc SuspendPod(SuspendPodRequest) returns (SuspendPodResponse);
   // Restores a suspended pod, with its containers as they were.
   rpc ResumePod(ResumePodRequest) returns (ResumePodResponse);
+  // The serial console of the pod's microVM: the first message names the
+  // pod, the ones after it carry input.
+  rpc StreamPodConsole(stream PodConsoleInput) returns (stream PodConsoleOutput);
 }
 
 message PodSpec {
   Resources resources = 1;
-  // The containers, created and started in this order.
+  // The containers, created and started in this order. Without any, the
+  // pod's containers are made through its forwarded ContainerService.
   repeated ContainerSpec containers = 2;
   PodNetwork network = 3;
   // The caller's labels, which feosd keeps and returns.
@@ -96,6 +100,17 @@ message PodInfo {
   string reason = 4;
   // The containers as the guest reports them; empty unless the pod runs.
   repeated ContainerStatus containers = 5;
+  // The pod's microVM; unset unless it runs.
+  MicroVm microvm = 6;
+}
+
+message MicroVm {
+  // Firecracker's process.
+  int64 pid = 1;
+  // feos-guest's version, as the guest reports it.
+  string guest_version = 2;
+  // Whether the guest holds its uplink open.
+  bool guest_attached = 3;
 }
 
 message ContainerStatus {
@@ -179,3 +194,13 @@ message ResumePodRequest {
 }
 
 message ResumePodResponse {}
+
+message PodConsoleInput {
+  // The first message's: the pod.
+  string pod_id = 1;
+  bytes input = 2;
+}
+
+message PodConsoleOutput {
+  bytes output = 1;
+}

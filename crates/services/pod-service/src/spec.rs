@@ -48,9 +48,6 @@ pub fn normalize(mut spec: PodSpec) -> Result<PodSpec, Status> {
         )));
     }
 
-    if spec.containers.is_empty() {
-        return Err(Status::invalid_argument("a pod has a container at least"));
-    }
     let mut names = HashSet::new();
     for container in &spec.containers {
         if !valid_name(&container.name) {
@@ -130,13 +127,16 @@ pub fn vm_config(pod_id: &str, spec: &PodSpec) -> VmConfig {
             }),
             mac_address: network.mac_address.clone(),
         });
-        config.guest_network = Some(GuestNetworkConfig {
-            interface: INTERFACE.to_string(),
-            ipv4_cidr: network.ipv4_cidr.clone(),
-            gateway: network.gateway.clone(),
-            dns: network.dns.clone(),
-            hostname: pod_id.to_string(),
-        });
+        // Without an address, the guest gets the device alone.
+        if !network.ipv4_cidr.is_empty() {
+            config.guest_network = Some(GuestNetworkConfig {
+                interface: INTERFACE.to_string(),
+                ipv4_cidr: network.ipv4_cidr.clone(),
+                gateway: network.gateway.clone(),
+                dns: network.dns.clone(),
+                hostname: pod_id.to_string(),
+            });
+        }
     }
     config
 }
@@ -176,7 +176,6 @@ mod tests {
 
     #[test]
     fn bad_specs_are_refused() {
-        assert!(normalize(spec(vec![])).is_err());
         assert!(normalize(spec(vec![container("main"), container("main")])).is_err());
         assert!(normalize(spec(vec![container("a/b")])).is_err());
         assert!(normalize(spec(vec![container("..")])).is_err());
@@ -192,6 +191,11 @@ mod tests {
         let mut no_tap = spec(vec![container("main")]);
         no_tap.network = Some(PodNetwork::default());
         assert!(normalize(no_tap).is_err());
+    }
+
+    #[test]
+    fn a_pod_may_come_without_containers() {
+        assert!(normalize(spec(vec![])).is_ok());
     }
 
     #[test]
@@ -218,5 +222,10 @@ mod tests {
         assert_eq!(guest.interface, "eth0");
         assert_eq!(guest.hostname, "11111111-2222-3333-4444-555555555555");
         assert_eq!(config.memory.unwrap().size_mib, 512);
+
+        spec.network.as_mut().unwrap().ipv4_cidr.clear();
+        let config = vm_config("11111111-2222-3333-4444-555555555555", &spec);
+        assert_eq!(config.net.len(), 1);
+        assert!(config.guest_network.is_none(), "an address-less network");
     }
 }

@@ -18,7 +18,7 @@ use tonic::Status;
 #[tokio::test]
 async fn test_image_lifecycle() -> Result<()> {
     let Some(image_ref) = TEST_IMAGE_REF.clone() else {
-        log::warn!("Skipping test because TEST_IMAGE_REF names no VM image.");
+        log::warn!("Skipping test because TEST_IMAGE_REF names no image.");
         return Ok(());
     };
     ensure_server().await;

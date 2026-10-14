@@ -1,8 +1,8 @@
 #!/bin/bash
 # Install the packages (make packages) on Debian 13 with systemd, in a
 # privileged container, and check feosd under systemd: its group and
-# socket, a VM from the installed guest and Firecracker, the VM's cgroup,
-# a restart that keeps the VM, the refused self-upgrade, what autoremove
+# socket, a pod from the installed guest and Firecracker, its cgroup, a
+# restart that keeps the pod, the refused self-upgrade, what autoremove
 # keeps, a pod with a network and its forwarded services, removal, and a
 # power-off through PID 1.
 #
@@ -93,25 +93,27 @@ log "the group feos may use the API socket"
 leaf="$(in_node sh -c 'cat /proc/$(systemctl show -P MainPID feosd)/cgroup')"
 [ "${leaf}" = "0::/system.slice/feosd.service/feosd" ] || fail "feosd runs in ${leaf}"
 
-vm_id=11111111-2222-3333-4444-555555555555
-in_node feosctl vm create-and-start --vm-id "${vm_id}" --memory 256 >/dev/null ||
-  fail "no VM from the installed guest"
-await "the guest did not attach" bash -c \
-  "in_node feosctl vm info ${vm_id} | contains '(attached)'"
-pid="$(in_node feosctl vm ping "${vm_id}" | sed -n 's/^ *PID: //p')"
-in_node grep -qx "${pid}" "/sys/fs/cgroup/system.slice/feosd.service/vms/${vm_id}/cgroup.procs" ||
-  fail "Firecracker (pid ${pid}) is not in the VM's cgroup"
+# A pod without containers: the installed guest in the installed
+# Firecracker.
+bare=11111111-2222-3333-4444-555555555555
+microvm_pid() { in_node feosctl pod get "$1" | sed -n 's/^  MicroVM: pid \([0-9]*\),.*/\1/p'; }
+export -f microvm_pid
+in_node feosctl pod create --pod-id "${bare}" --memory 256 --wait >/dev/null ||
+  fail "no pod from the installed guest"
+pid="$(microvm_pid "${bare}")"
+in_node grep -qx "${pid}" "/sys/fs/cgroup/system.slice/feosd.service/vms/${bare}/cgroup.procs" ||
+  fail "Firecracker (pid ${pid}) is not in the pod's cgroup"
 in_node grep -q '"firecracker":"/usr/lib/feos/firecracker/' \
-  "/var/lib/feos/vms/firecracker/${vm_id}/jail.json" || fail "the VM does not run the installed Firecracker"
-log "a VM from the installed guest runs, in system.slice/feosd.service/vms/${vm_id}"
+  "/var/lib/feos/vms/firecracker/${bare}/jail.json" || fail "the pod does not run the installed Firecracker"
+log "a pod boots the installed guest, in system.slice/feosd.service/vms/${bare}"
 
 in_node systemctl restart feosd
 await "feosd did not come back" in_node systemctl is-active feosd
-in_node test -d "/proc/${pid}" || fail "the restart ended the VM"
-await "the restarted feosd does not take the VM over" bash -c \
-  "in_node feosctl vm ping ${vm_id} | contains 'PID: ${pid}'"
-in_node feosctl vm info "${vm_id}" | contains "State: Running" || fail "the VM is not running"
-log "the VM outlived a restart of feosd, which took it over"
+in_node test -d "/proc/${pid}" || fail "the restart ended the pod's microVM"
+await "the restarted feosd does not take the pod over" bash -c \
+  "[ \"\$(microvm_pid ${bare})\" = ${pid} ]"
+in_node feosctl pod get "${bare}" | contains "State: RUNNING" || fail "the pod is not running"
+log "the pod outlived a restart of feosd, which took it over"
 
 if in_node feosctl host upgrade http://127.0.0.1/feosd 2>/tmp/upgrade.err; then
   fail "feosd took an upgrade without --self-upgrade"
@@ -129,9 +131,9 @@ in_node apt-mark manual feosd feosctl >/dev/null
   fail "autoremove would remove ${removed}"
 log "autoremove keeps the versions of Firecracker and the guest"
 
-in_node feosctl vm delete "${vm_id}" >/dev/null
-in_node test ! -e "/sys/fs/cgroup/system.slice/feosd.service/vms/${vm_id}" ||
-  fail "the VM's cgroup outlived it"
+in_node feosctl pod delete "${bare}" >/dev/null
+in_node test ! -e "/sys/fs/cgroup/system.slice/feosd.service/vms/${bare}" ||
+  fail "the pod's cgroup outlived it"
 
 # A pod's network: a TAP device and NAT on the node.
 in_node sh -c 'ip tuntap add pod0 mode tap && ip addr add 10.201.0.1/24 dev pod0 &&
@@ -182,7 +184,7 @@ log "a stopped pod comes up again"
 
 in_node feosctl pod delete "${pod}" >/dev/null
 in_node feosctl pod list | contains "${pod}" && fail "the pod outlived its delete"
-in_node feosctl vm list | contains "${pod}" && fail "the pod's microVM outlived its delete"
+in_node test -e "/var/lib/feos/vms/firecracker/${pod}" && fail "the pod's microVM outlived its delete"
 log "a pod is deleted with its microVM"
 
 in_node dpkg -r feosd >/dev/null

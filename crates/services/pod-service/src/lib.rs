@@ -12,16 +12,16 @@ mod store;
 use feos_proto::pod_service::pod_service_server::PodService;
 use feos_proto::pod_service::{
     CreatePodRequest, CreatePodResponse, DeletePodRequest, DeletePodResponse, GetPodRequest,
-    ListPodsRequest, ListPodsResponse, PodEvent, PodInfo, ResumePodRequest, ResumePodResponse,
-    StartPodRequest, StartPodResponse, StopPodRequest, StopPodResponse, StreamPodEventsRequest,
-    SuspendPodRequest, SuspendPodResponse,
+    ListPodsRequest, ListPodsResponse, PodConsoleInput, PodConsoleOutput, PodEvent, PodInfo,
+    ResumePodRequest, ResumePodResponse, StartPodRequest, StartPodResponse, StopPodRequest,
+    StopPodResponse, StreamPodEventsRequest, SuspendPodRequest, SuspendPodResponse,
 };
 pub use pods::Pods;
 use std::pin::Pin;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
-use tonic::{Request, Response, Status};
+use tonic::{Request, Response, Status, Streaming};
 
 /// Where the pods are kept: a file each.
 pub const POD_DIR: &str = "/var/lib/feos/pods";
@@ -29,6 +29,8 @@ pub const POD_DIR: &str = "/var/lib/feos/pods";
 #[tonic::async_trait]
 impl PodService for Pods {
     type StreamPodEventsStream = Pin<Box<dyn Stream<Item = Result<PodEvent, Status>> + Send>>;
+    type StreamPodConsoleStream =
+        Pin<Box<dyn Stream<Item = Result<PodConsoleOutput, Status>> + Send>>;
 
     async fn create_pod(
         &self,
@@ -114,6 +116,14 @@ impl PodService for Pods {
     ) -> Result<Response<SuspendPodResponse>, Status> {
         let memory_bytes = self.suspend(&request.into_inner().pod_id).await?;
         Ok(Response::new(SuspendPodResponse { memory_bytes }))
+    }
+
+    async fn stream_pod_console(
+        &self,
+        request: Request<Streaming<PodConsoleInput>>,
+    ) -> Result<Response<Self::StreamPodConsoleStream>, Status> {
+        let output = self.console(request.into_inner()).await?;
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn resume_pod(

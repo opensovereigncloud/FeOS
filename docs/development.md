@@ -86,8 +86,8 @@ use) and `protoc`.
     make test-guest            # boot the guest under Firecracker and talk to it
     make test-guest-container  # run containers in the guest; needs sudo for a
                                # bridge, a TAP device and NAT
-    make test-vm               # the VM service against Firecracker, with the
-                               # guest as VM image; needs docker
+    make test-pods             # pods against Firecracker, with the guest
+                               # installed; needs docker
 
 Build release artifacts per package (`cargo build -p <crate>`), never with
 `--workspace`: a workspace build unifies the features of all crates into every

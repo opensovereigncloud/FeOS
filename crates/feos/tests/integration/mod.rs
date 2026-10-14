@@ -1,19 +1,19 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use feos_proto::{
     container_service::container_service_client::ContainerServiceClient,
     host_service::host_service_client::HostServiceClient,
     image_service::image_service_client::ImageServiceClient,
-    vm_service::vm_service_client::VmServiceClient,
+    pod_service::pod_service_client::PodServiceClient,
 };
 use hyper_util::rt::TokioIo;
 use image_service::IMAGE_SERVICE_SOCKET;
 use log::{error, info};
 use nix::sys::prctl;
 use std::env;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::{LazyLock as Lazy, OnceLock as SyncOnceCell};
 use std::time::Duration;
@@ -21,20 +21,19 @@ use tokio::net::UnixStream;
 use tokio::sync::OnceCell as TokioOnceCell;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use vm_service::FIRECRACKER_BIN;
+use vm_service::vmm::installed::{FIRECRACKER_DIR, GUEST_DIR};
 
 pub mod container_tests;
 pub mod fixtures;
 pub mod host_tests;
 pub mod image_tests;
-pub mod vm_tests;
+pub mod pod_tests;
 
 pub const PUBLIC_SERVER_ADDRESS: &str = "http://[::1]:1337";
 pub const DEFAULT_TEST_CONTAINER_IMAGE_REF: &str = "docker.io/library/busybox:1.36";
 
-/// The FeOS guest as a VM image: the VM tests talk to its API over vsock and
-/// shut it down with Ctrl-Alt-Del. `make test-vm` pushes one to a local
-/// registry and runs the VM tests against it.
+/// An image in a local registry, which the image test pulls: `make
+/// test-pods` pushes the guest there.
 pub static TEST_IMAGE_REF: Lazy<Option<String>> =
     Lazy::new(|| env::var("TEST_IMAGE_REF").ok().filter(|r| !r.is_empty()));
 pub static TEST_CONTAINER_IMAGE_REF: Lazy<String> = Lazy::new(|| {
@@ -108,14 +107,14 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
 }
 
 pub async fn get_public_clients() -> Result<(
-    VmServiceClient<Channel>,
+    PodServiceClient<Channel>,
     HostServiceClient<Channel>,
     ContainerServiceClient<Channel>,
 )> {
-    let vm_client = VmServiceClient::connect(PUBLIC_SERVER_ADDRESS).await?;
+    let pod_client = PodServiceClient::connect(PUBLIC_SERVER_ADDRESS).await?;
     let host_client = HostServiceClient::connect(PUBLIC_SERVER_ADDRESS).await?;
     let container_client = ContainerServiceClient::connect(PUBLIC_SERVER_ADDRESS).await?;
-    Ok((vm_client, host_client, container_client))
+    Ok((pod_client, host_client, container_client))
 }
 
 pub async fn get_image_service_client() -> Result<ImageServiceClient<Channel>> {
@@ -130,22 +129,52 @@ pub async fn get_image_service_client() -> Result<ImageServiceClient<Channel>> {
     Ok(ImageServiceClient::new(channel))
 }
 
-pub fn check_firecracker_binary() -> bool {
-    Command::new("which")
-        .arg(FIRECRACKER_BIN)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// The guest and Firecracker the pods boot, as their packages install them.
+pub struct Installed {
+    pub guest: PathBuf,
+    pub firecracker: PathBuf,
 }
 
-/// The VM image to test with, unless the test has to be skipped.
-pub fn vm_test_image() -> Option<String> {
-    if !check_firecracker_binary() {
-        log::warn!("Skipping test because '{FIRECRACKER_BIN}' binary was not found in PATH.");
-        return None;
+/// Installs the guest (make guest) and the Firecracker in PATH (make
+/// firecracker) as their packages would, or None if either is missing:
+/// the pod tests are skipped then.
+pub fn installed_guest() -> Result<Option<Installed>> {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let kernel = repo.join("target/guest/vmlinuz");
+    let initramfs = repo.join("target/guest/initramfs.cpio.zst");
+    let firecracker = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .map(|dir| dir.join("firecracker"))
+        .find(|path| path.is_file());
+    let (Some(firecracker), true, true) = (firecracker, kernel.exists(), initramfs.exists()) else {
+        log::warn!("Skipping test: no Firecracker in PATH, or no guest in target/guest.");
+        return Ok(None);
+    };
+    let guest = install(
+        Path::new(GUEST_DIR),
+        "0.0.1-test",
+        &[(&kernel, "vmlinuz"), (&initramfs, "initramfs")],
+    )?;
+    let firecracker = install(
+        Path::new(FIRECRACKER_DIR),
+        "1.17.0",
+        &[
+            (&firecracker, "firecracker"),
+            (&firecracker.with_file_name("jailer"), "jailer"),
+        ],
+    )?;
+    Ok(Some(Installed { guest, firecracker }))
+}
+
+/// Installs `files` as a package would, in `dir/<version>/`, by hard link
+/// or copy.
+fn install(dir: &Path, version: &str, files: &[(&Path, &str)]) -> Result<PathBuf> {
+    let dir = dir.join(version);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    for (source, name) in files {
+        let target = dir.join(name);
+        if !target.exists() && std::fs::hard_link(source, &target).is_err() {
+            std::fs::copy(source, &target)?;
+        }
     }
-    if TEST_IMAGE_REF.is_none() {
-        log::warn!("Skipping test because TEST_IMAGE_REF names no VM image.");
-    }
-    TEST_IMAGE_REF.clone()
+    Ok(dir)
 }

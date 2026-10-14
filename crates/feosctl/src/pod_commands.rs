@@ -4,16 +4,20 @@
 //! Pods on a node (ADR 0004). A pod's containers, images, tools and
 //! watches are reached with `--pod <id>` on those commands.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::tty::IsTty;
 use feos_proto::pod_service::{
     pod_service_client::PodServiceClient, ContainerSpec, ContainerState, CreatePodRequest,
-    DeletePodRequest, GetPodRequest, ListPodsRequest, PodInfo, PodNetwork, PodSpec, PodState,
-    Resources, ResumePodRequest, StartPodRequest, StopPodRequest, StreamPodEventsRequest,
-    SuspendPodRequest,
+    DeletePodRequest, GetPodRequest, ListPodsRequest, PodConsoleInput, PodInfo, PodNetwork,
+    PodSpec, PodState, Resources, ResumePodRequest, StartPodRequest, StopPodRequest,
+    StreamPodEventsRequest, SuspendPodRequest,
 };
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
 
@@ -57,6 +61,8 @@ pub enum PodCommand {
     Suspend { pod_id: String },
     /// Restore a suspended pod
     Resume { pod_id: String },
+    /// Attach to the serial console of a pod's microVM; Ctrl+] leaves
+    Console { pod_id: String },
     /// Watch the pods' state changes
     Events {
         #[arg(help = "Only this pod's")]
@@ -80,11 +86,11 @@ pub struct CreatePodOptions {
 
     #[arg(
         long,
-        help = "The container's image, e.g. docker.io/library/busybox:1.36"
+        help = "The container's image, e.g. docker.io/library/busybox:1.36; without, the pod has no container"
     )]
-    image: String,
+    image: Option<String>,
 
-    #[arg(long, value_parser = parse_key_val, help = "KEY=value for the container (repeatable)")]
+    #[arg(long, requires = "image", value_parser = parse_key_val, help = "KEY=value for the container (repeatable)")]
     env: Vec<(String, String)>,
 
     #[arg(long, value_parser = parse_key_val, help = "KEY=value for the pod (repeatable)")]
@@ -114,6 +120,7 @@ pub struct CreatePodOptions {
 
     #[arg(
         last = true,
+        requires = "image",
         help = "The container's command; the image's when not given"
     )]
     command: Vec<String>,
@@ -181,6 +188,7 @@ pub async fn handle_pod_command(args: PodArgs) -> Result<()> {
                 .await?;
             println!("Pod {pod_id} runs again");
         }
+        PodCommand::Console { pod_id } => console(&mut client, pod_id).await?,
         PodCommand::Events { pod_id } => watch_events(&mut client, pod_id).await?,
     }
     Ok(())
@@ -203,12 +211,16 @@ fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
                 vcpus: opts.vcpus,
                 memory_mib: opts.memory,
             }),
-            containers: vec![ContainerSpec {
-                name: opts.name,
-                image_ref: opts.image,
-                command: opts.command,
-                env: opts.env.into_iter().collect(),
-            }],
+            containers: opts
+                .image
+                .map(|image_ref| ContainerSpec {
+                    name: opts.name,
+                    image_ref,
+                    command: opts.command,
+                    env: opts.env.into_iter().collect(),
+                })
+                .into_iter()
+                .collect(),
             network,
             labels: opts.label.into_iter().collect::<HashMap<_, _>>(),
         }),
@@ -303,6 +315,18 @@ fn print_pod(pod: &PodInfo) {
             resources.vcpus, resources.memory_mib
         );
     }
+    if let Some(microvm) = &pod.microvm {
+        println!(
+            "  MicroVM: pid {}, guest {}{}",
+            microvm.pid,
+            microvm.guest_version,
+            if microvm.guest_attached {
+                " (attached)"
+            } else {
+                ""
+            }
+        );
+    }
     if let Some(network) = &spec.network {
         println!(
             "  Network: {} on {}, gateway {}, DNS {}",
@@ -339,6 +363,77 @@ fn print_pod(pod: &PodInfo) {
             }
         );
     }
+}
+
+/// The console in the terminal, raw, until Ctrl+] or its end.
+async fn console(client: &mut PodServiceClient<Channel>, pod_id: String) -> Result<()> {
+    if !std::io::stdin().is_tty() {
+        bail!("Cannot enter interactive console mode without a TTY.");
+    }
+    let (input_tx, input_rx) = mpsc::channel(10);
+    input_tx
+        .send(PodConsoleInput {
+            pod_id: pod_id.clone(),
+            input: Vec::new(),
+        })
+        .await?;
+    let mut output = client
+        .stream_pod_console(tokio_stream::wrappers::ReceiverStream::new(input_rx))
+        .await?
+        .into_inner();
+    println!("Connected to the console of pod {pod_id}. Press Ctrl+] to leave.");
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            if let Err(e) = disable_raw_mode() {
+                eprintln!("\r\nFailed to disable raw mode: {e}. Please reset your terminal.\r\n");
+            }
+        }
+    }
+    enable_raw_mode().context("Failed to enable terminal raw mode")?;
+    let _guard = RawModeGuard;
+
+    let output_task = tokio::spawn(async move {
+        let mut stdout = tokio::io::stdout();
+        while let Some(message) = output.next().await {
+            match message {
+                Ok(message) => {
+                    if stdout.write_all(&message.output).await.is_err()
+                        || stdout.flush().await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("\r\nThe console ended: {}\r\n", e.message());
+                    break;
+                }
+            }
+        }
+    });
+    let input_task = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buffer = [0u8; 1];
+        // Ctrl+] leaves.
+        while let Ok(1) = stdin.read(&mut buffer).await {
+            if buffer[0] == 29 {
+                break;
+            }
+            let input = PodConsoleInput {
+                pod_id: String::new(),
+                input: buffer.to_vec(),
+            };
+            if input_tx.send(input).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::select! {
+        _ = output_task => {},
+        _ = input_task => {},
+    }
+    Ok(())
 }
 
 async fn watch_events(
@@ -428,6 +523,20 @@ mod tests {
         assert_eq!(spec.containers[0].env["A"], "b");
         assert_eq!(spec.network.unwrap().dns, ["1.1.1.1"]);
         assert!(uuid::Uuid::parse_str(&request.pod_id).is_ok());
+    }
+
+    #[test]
+    fn a_pod_without_an_image_has_no_container() {
+        let cli = Cli::try_parse_from(["pod", "create", "--memory", "256"]).unwrap();
+        let PodCommand::Create(opts) = cli.command else {
+            panic!("not a create");
+        };
+        assert!(create_pod_request(*opts)
+            .spec
+            .unwrap()
+            .containers
+            .is_empty());
+        assert!(Cli::try_parse_from(["pod", "create", "--", "sleep"]).is_err());
     }
 
     #[test]

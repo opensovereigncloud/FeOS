@@ -11,9 +11,8 @@ use feos_proto::{
         stream_vm_console_request as console_input, ConsoleData, CreateVmRequest, CreateVmResponse,
         DeleteVmRequest, DeleteVmResponse, PauseVmRequest, PauseVmResponse, PingVmRequest,
         PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
-        StartVmRequest, StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse,
-        StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse, VmEvent, VmState,
-        VmStateChangedEvent,
+        StartVmRequest, StartVmResponse, StreamVmConsoleResponse, StreamVmEventsRequest,
+        SuspendVmRequest, SuspendVmResponse, VmEvent, VmState, VmStateChangedEvent,
     },
 };
 use log::{error, info, warn};
@@ -24,7 +23,7 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot},
 };
 use tokio_stream::StreamExt;
-use tonic::{Status, Streaming};
+use tonic::Status;
 use uuid::Uuid;
 
 async fn wait_for_image_ready(image_uuid: &str, image_ref: &str) -> Result<(), VmServiceError> {
@@ -327,7 +326,7 @@ pub async fn handle_delete_vm(
 
 pub async fn spawn_console_bridge(
     vm_id: String,
-    input_stream: Streaming<StreamVmConsoleRequest>,
+    input_stream: crate::ConsoleInput,
     output_tx: mpsc::Sender<Result<StreamVmConsoleResponse, Status>>,
     hypervisor: Arc<dyn Hypervisor>,
 ) {
@@ -516,7 +515,7 @@ pub async fn handle_restore_vm(
 async fn bridge_console_streams(
     vm_id: String,
     console: DuplexStream,
-    mut grpc_input: Streaming<StreamVmConsoleRequest>,
+    mut grpc_input: crate::ConsoleInput,
     grpc_output: mpsc::Sender<Result<StreamVmConsoleResponse, Status>>,
 ) {
     let (mut socket_reader, mut socket_writer) = tokio::io::split(console);
