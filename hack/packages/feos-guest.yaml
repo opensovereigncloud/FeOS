@@ -18,6 +18,10 @@ contents:
   - src: target/guest/vmlinuz
     dst: /usr/lib/feos/guest/${GUEST_VERSION}/vmlinuz
     expand: true
+    file_info:
+      mode: 0644
   - src: target/guest/initramfs.cpio.zst
     dst: /usr/lib/feos/guest/${GUEST_VERSION}/initramfs
     expand: true
+    file_info:
+      mode: 0644

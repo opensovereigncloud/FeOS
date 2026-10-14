@@ -2,8 +2,8 @@
 # Install the packages (make packages) on Debian 13 with systemd, in a
 # privileged container, and check feosd under systemd: its group and
 # socket, a VM from the installed guest and Firecracker, the VM's cgroup,
-# a restart that keeps the VM, the refused self-upgrade, removal, and a
-# power-off through PID 1.
+# a restart that keeps the VM, the refused self-upgrade, what autoremove
+# keeps, removal, and a power-off through PID 1.
 #
 #   hack/packages/test-packages
 #
@@ -111,6 +111,17 @@ if in_node feosctl host upgrade http://127.0.0.1/feosd 2>/tmp/upgrade.err; then
   fail "feosd took an upgrade without --self-upgrade"
 fi
 log "feosd refuses to replace its own binary"
+
+# With every package installed as a dependency, autoremove would take all
+# of them but the versions of Firecracker and the guest.
+in_node apt-mark auto feosd feosctl feos-firecracker feos-guest \
+  "$(in_node dpkg-query -W -f '${Package}\n' 'feos-firecracker-*')" \
+  "$(in_node dpkg-query -W -f '${Package}\n' 'feos-guest-*')" >/dev/null
+removed="$(in_node apt-get -s autoremove | sed -n 's/^Remv \([^ ]*\).*/\1/p' | sort | tr '\n' ' ')"
+in_node apt-mark manual feosd feosctl >/dev/null
+[ "${removed}" = "feos-firecracker feos-guest feosctl feosd " ] ||
+  fail "autoremove would remove ${removed}"
+log "autoremove keeps the versions of Firecracker and the guest"
 
 in_node feosctl vm delete "${vm_id}" >/dev/null
 in_node test ! -e "/sys/fs/cgroup/system.slice/feosd.service/vms/${vm_id}" ||

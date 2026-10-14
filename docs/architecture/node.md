@@ -163,7 +163,7 @@ packages from https://apt.fecode.dev
 
 | Package | Contents |
 |---|---|
-| `feosd` | `/usr/sbin/feosd`, `feosd.service`, the group `feos` (sysusers), `/etc/default/feosd` |
+| `feosd` | `/usr/sbin/feosd`, `feosd.service`, the group `feos` (sysusers), `/etc/default/feosd`, `/etc/apt/apt.conf.d/50feosd` |
 | `feosctl` | `/usr/bin/feosctl` |
 | `feos-firecracker-<version>` | `/usr/lib/feos/firecracker/<version>/{firecracker,jailer}` |
 | `feos-guest-<version>` | `/usr/lib/feos/guest/<version>/{vmlinuz,initramfs}` |
@@ -172,7 +172,9 @@ packages from https://apt.fecode.dev
 `feosd` depends on `feos-firecracker` and `feos-guest`, which depend on the
 newest versioned packages, as `linux-image-amd64` does on the newest
 kernel: an upgrade installs a new Firecracker or guest beside the old
-ones, which the VMs booted with them keep using.
+ones, which the VMs booted with them keep using. `50feosd` keeps every
+version from `apt autoremove`; a version nothing uses is removed with
+`apt remove`.
 
 `feosd.service` is `Type=notify`, with `Delegate=yes`,
 `DelegateSubgroup=feosd` and `KillMode=process`: a restart or an upgrade
@@ -184,7 +186,8 @@ restarts it after an upgrade, whenever it is enabled; removing the package
 stops the unit; purging it disables the unit. `/var/lib/feos` stays.
 
 The repository has one suite, `stable`, with the component `main`, and is
-signed by its own key:
+signed by its own key. Its page, https://apt.fecode.dev/index.html (from
+`hack/packages/apt/`), says how Debian takes it:
 
     curl -fsSL https://apt.fecode.dev/feos.gpg -o /usr/share/keyrings/feos.gpg
     echo 'deb [signed-by=/usr/share/keyrings/feos.gpg] https://apt.fecode.dev stable main' \
