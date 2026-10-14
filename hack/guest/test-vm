@@ -56,11 +56,13 @@ done
 
 log "running ${FILTERS[*]}"
 # --init: FeOS takes PID 1 for the init system and sets the machine up.
-# /var/lib/feos is a volume: the containers' overlay roots cannot have
-# their upper layer on the container's own overlayfs.
+# /var/lib/feos is a tmpfs, as when FeOS is the host's PID 1, where the
+# VMs' disks and snapshots live in memory; with device nodes, which the
+# jailer creates in there. The containers' overlay roots could not have their upper layer on
+# the container's own overlayfs either.
 docker run --rm --privileged --init \
   --network "container:${REGISTRY_NAME}" \
-  -v /var/lib/feos \
+  --tmpfs /var/lib/feos:exec,dev \
   -v "${REPO_ROOT}:${REPO_ROOT}:ro" \
   -e TEST_IMAGE_REF="${TEST_IMAGE_REF}" \
   -e PATH="${REPO_ROOT}/target/firecracker:/usr/sbin:/usr/bin:/sbin:/bin" \
