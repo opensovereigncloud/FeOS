@@ -923,6 +923,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "feos-host-init"
+version = "0.6.0"
+dependencies = [
+ "chrono",
+ "dhcproto",
+ "feos-utils",
+ "futures",
+ "libc",
+ "log",
+ "nix 0.30.1",
+ "pnet",
+ "rand 0.9.2",
+ "rtnetlink",
+ "sntpc",
+ "socket2 0.6.0",
+ "tokio",
+]
+
+[[package]]
 name = "feos-proto"
 version = "0.6.0"
 dependencies = [
@@ -937,16 +956,10 @@ name = "feos-utils"
 version = "0.6.0"
 dependencies = [
  "chrono",
- "dhcproto",
- "futures",
  "hyper-util",
  "libc",
  "log",
  "nix 0.30.1",
- "pnet",
- "rand 0.9.2",
- "rtnetlink",
- "socket2 0.6.0",
  "tempfile",
  "termcolor",
  "tokio",
@@ -1406,7 +1419,6 @@ dependencies = [
 name = "host-service"
 version = "0.6.0"
 dependencies = [
- "chrono",
  "feos-proto",
  "feos-utils",
  "futures",
@@ -1417,7 +1429,6 @@ dependencies = [
  "reqwest",
  "rtnetlink",
  "sha2",
- "sntpc",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

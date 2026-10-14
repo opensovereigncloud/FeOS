@@ -14,14 +14,6 @@ use feos_proto::{
     image_service::image_service_server::ImageServiceServer,
 };
 use feos_utils::filesystem::mount_virtual_filesystems;
-#[cfg(feature = "host")]
-use feos_utils::host::info::is_running_on_vm;
-#[cfg(feature = "host")]
-use feos_utils::host::memory::configure_hugepages;
-#[cfg(feature = "host")]
-use feos_utils::network::{configure_network_devices, configure_sriov};
-#[cfg(feature = "host")]
-use host_service::worker::TimeSyncWorker;
 use host_service::{
     api::HostApiHandler, dispatcher::HostServiceDispatcher, Command as HostCommand, RestartSignal,
 };
@@ -29,15 +21,11 @@ use image_service::{
     api::ImageApiHandler, dispatcher::ImageServiceDispatcher, filestore::FileStore,
     worker::Orchestrator, IMAGE_DIR,
 };
-#[cfg(feature = "host")]
-use log::warn;
 use log::{error, info};
 use nix::libc;
 #[cfg(feature = "host")]
 use std::env;
 use std::ffi::CString;
-#[cfg(feature = "host")]
-use std::net::Ipv6Addr;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -50,19 +38,6 @@ use vm_service::{
     api::VmApiHandler, dispatcher::VmServiceDispatcher, Command as VmCommand, DEFAULT_VM_DB_URL,
     VM_DIR,
 };
-
-#[cfg(feature = "host")]
-pub(crate) const VFS_NUM: u32 = 125;
-#[cfg(feature = "host")]
-pub(crate) const HUGEPAGES_NUM: u32 = 1024;
-
-/// What the first-boot initialization learned that the services need later.
-#[derive(Default)]
-pub(crate) struct BootInfo {
-    /// NTP servers announced via DHCPv6.
-    #[cfg(feature = "host")]
-    pub(crate) ntp_servers: Vec<Ipv6Addr>,
-}
 
 #[cfg(feature = "host")]
 pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmServiceServer<VmApiHandler>> {
@@ -101,19 +76,11 @@ pub(crate) async fn initialize_container_service(
 pub(crate) fn initialize_host_service(
     restart_tx: mpsc::Sender<RestartSignal>,
     log_handle: feos_utils::feos_logger::LogHandle,
-    #[cfg_attr(not(feature = "host"), expect(unused_variables))] boot_info: BootInfo,
 ) -> HostServiceServer<HostApiHandler> {
     let (host_tx, host_rx) = mpsc::channel::<HostCommand>(32);
     let host_dispatcher = HostServiceDispatcher::new(host_rx, restart_tx, log_handle);
     tokio::spawn(async move {
         host_dispatcher.run().await;
-    });
-
-    #[cfg(feature = "host")]
-    let time_worker = TimeSyncWorker::new(boot_info.ntp_servers);
-    #[cfg(feature = "host")]
-    tokio::spawn(async move {
-        time_worker.run().await;
     });
 
     let host_api_handler = HostApiHandler::new(host_tx);
@@ -156,54 +123,13 @@ pub(crate) async fn initialize_image_service() -> Result<ImageServiceServer<Imag
     Ok(image_service)
 }
 
-pub(crate) async fn perform_first_boot_initialization() -> Result<BootInfo> {
+pub(crate) fn perform_first_boot_initialization() {
     info!("Main: Performing first-boot initialization...");
     info!("Main: Mounting virtual filesystems...");
     mount_virtual_filesystems();
 
     #[cfg(feature = "guest")]
     crate::guest::initialize_guest();
-
-    #[cfg(feature = "host")]
-    let boot_info = initialize_host_hardware().await?;
-    #[cfg(not(feature = "host"))]
-    let boot_info = BootInfo::default();
-
-    Ok(boot_info)
-}
-
-/// Bare-metal setup: hugepages, network autoconfiguration and SR-IOV.
-#[cfg(feature = "host")]
-async fn initialize_host_hardware() -> Result<BootInfo> {
-    info!("Main: Configuring hugepages...");
-    if let Err(e) = configure_hugepages(HUGEPAGES_NUM).await {
-        warn!("Failed to configure hugepages: {e}");
-    }
-
-    let is_on_vm = is_running_on_vm().await.unwrap_or_else(|e| {
-        error!("Error checking VM status: {e}");
-        false // Default to false in case of error
-    });
-
-    info!("Main: Configuring network devices...");
-    let mut ntp_servers = Vec::new();
-    match configure_network_devices().await {
-        Ok(Some((delegated_prefix, delegated_prefix_length, servers))) => {
-            info!("Main: Delegated prefix: {delegated_prefix}/{delegated_prefix_length}");
-            ntp_servers = servers;
-        }
-        Ok(None) => {}
-        Err(e) => error!("Main: Could not configure network devices: {e}"),
-    }
-
-    if !is_on_vm {
-        info!("configuring sriov...");
-        if let Err(e) = configure_sriov(VFS_NUM).await {
-            warn!("failed to configure sriov: {e}")
-        }
-    }
-
-    Ok(BootInfo { ntp_servers })
 }
 
 #[cfg(feature = "host")]

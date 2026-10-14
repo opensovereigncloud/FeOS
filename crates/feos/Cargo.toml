@@ -58,9 +58,8 @@ tempfile = { workspace = true }
 [features]
 default = ["host"]
 git-version = ["feos-utils/git-version"]
-# Bare-metal hypervisor profile: DHCPv6, NTP, SR-IOV, hugepages, the VM
-# service and the public gRPC API on TCP.
-host = ["dep:vm-service", "feos-utils/host", "host-service/ntp"]
+# The node agent: the VM service and the public gRPC API on TCP.
+host = ["dep:vm-service"]
 # Guest profile: PID 1 in a microVM. The API listens on vsock, FeOS tells
 # the host when it is ready, and a data volume holds images and containers.
 guest = [

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/feos",
+    "crates/feos-host-init",
     "crates/feos-proto",
     "crates/feos-utils",
     "crates/feosctl",

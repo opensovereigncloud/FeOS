@@ -30,25 +30,6 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::task;
 
-pub fn mac_to_ipv6_link_local(mac_address: &[u8]) -> Option<Ipv6Addr> {
-    if mac_address.len() == 6 {
-        let mut bytes = [0u8; 16];
-        bytes[0] = 0xfe;
-        bytes[1] = 0x80;
-        bytes[8] = mac_address[0] ^ 0b00000010;
-        bytes[9] = mac_address[1];
-        bytes[10] = mac_address[2];
-        bytes[11] = 0xff;
-        bytes[12] = 0xfe;
-        bytes[13] = mac_address[3];
-        bytes[14] = mac_address[4];
-        bytes[15] = mac_address[5];
-        Some(Ipv6Addr::from(bytes))
-    } else {
-        None
-    }
-}
-
 pub fn send_neigh_solicitation(
     interface_name: String,
     target_address: &Ipv6Addr,

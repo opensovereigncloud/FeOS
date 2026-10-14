@@ -7,8 +7,6 @@ pub mod feos_logger;
 pub mod filesystem;
 pub mod fs;
 pub mod host;
-#[cfg(feature = "host")]
-pub mod network;
 pub mod reaper;
 pub mod resolver;
 pub mod share;

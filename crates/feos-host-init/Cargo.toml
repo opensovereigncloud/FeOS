@@ -1,0 +1,25 @@
+[package]
+name = "feos-host-init"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-utils = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true, features = ["std"] }
+nix = { workspace = true }
+libc = { workspace = true }
+chrono = { workspace = true }
+sntpc = { version = "0.7", features = ["tokio-socket", "utils"] }
+dhcproto = { workspace = true }
+futures = { workspace = true }
+pnet = { workspace = true }
+rand = { workspace = true }
+rtnetlink = { workspace = true }
+socket2 = { workspace = true }
+
+[features]
+git-version = ["feos-utils/git-version"]

@@ -16,12 +16,6 @@ tonic = { workspace = true }
 hyper-util = { workspace = true }
 tower = { workspace = true }
 termcolor = { workspace = true }
-dhcproto = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-pnet = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
-rtnetlink = { workspace = true, optional = true }
-socket2 = { workspace = true, optional = true }
 libc = { workspace = true }
 
 [dev-dependencies]
@@ -30,12 +24,3 @@ tempfile = { workspace = true }
 [features]
 default = []
 git-version = []
-# Bare-metal host networking: DHCPv6, router advertisements, SR-IOV.
-host = [
-    "dep:dhcproto",
-    "dep:futures",
-    "dep:pnet",
-    "dep:rand",
-    "dep:rtnetlink",
-    "dep:socket2",
-]

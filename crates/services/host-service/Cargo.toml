@@ -18,8 +18,6 @@ nix = { workspace = true , features = ["hostname", "reboot", "mman", "time", "io
 log = { workspace = true }
 prost-types = { workspace = true }
 thiserror = { workspace = true }
-sntpc = { version = "0.7", features = ["tokio-socket", "utils"], optional = true }
-chrono = { workspace = true }
 libc = { workspace = true }
 
 rtnetlink = { workspace = true }
@@ -28,8 +26,6 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 
 [features]
-# Clock sync over NTP, for hosts that have to find out the time themselves.
-ntp = ["dep:sntpc"]
 # A Firecracker guest, which cannot be powered off: shutting down reboots,
 # which ends the VM.
 guest = []

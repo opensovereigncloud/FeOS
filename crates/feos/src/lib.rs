@@ -22,33 +22,6 @@ use tonic::transport::Server;
 /// guest profile serves the same API on vsock, the host profile on TCP.
 pub const API_SOCKET: &str = "/run/feos/api.sock";
 
-/// Ctrl-Alt-Del makes PID 1 reboot cleanly, where the kernel would reboot at
-/// once without writing anything back. It is how a Firecracker host shuts
-/// its guest down: a reboot ends the VM.
-fn handle_ctrl_alt_del() {
-    use tokio::signal::unix::{signal, SignalKind};
-    // With Ctrl-Alt-Del off, the kernel sends PID 1 a SIGINT instead.
-    let mut sigint = match signal(SignalKind::interrupt()) {
-        Ok(sigint) => sigint,
-        Err(e) => {
-            warn!("Main: No SIGINT handler, Ctrl-Alt-Del reboots at once: {e}");
-            return;
-        }
-    };
-    if let Err(e) = nix::sys::reboot::set_cad_enabled(false) {
-        warn!("Main: Failed to take over Ctrl-Alt-Del: {e}");
-        return;
-    }
-    tokio::spawn(async move {
-        sigint.recv().await;
-        info!("Main: Ctrl-Alt-Del, rebooting");
-        // The logger prints from a task of its own.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let Err(e) = feos_utils::host::power::reboot();
-        error!("Main: Failed to reboot: {e}");
-    });
-}
-
 pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     println!(
         "
@@ -74,14 +47,12 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     }
 
     if std::process::id() == 1 {
-        handle_ctrl_alt_del();
+        feos_utils::host::power::take_over_ctrl_alt_del();
     }
-
-    let mut boot_info = BootInfo::default();
 
     if !restarted_after_upgrade {
         if std::process::id() == 1 {
-            boot_info = perform_first_boot_initialization().await?;
+            perform_first_boot_initialization();
         }
     } else {
         info!("Main: Skipping one-time initialization on restart after upgrade.");
@@ -93,7 +64,7 @@ pub async fn run_server(restarted_after_upgrade: bool) -> Result<()> {
     let vm_service = initialize_vm_service(&setup_database().await?).await?;
     let container_service = initialize_container_service().await?;
 
-    let host_service = initialize_host_service(restart_tx.clone(), log_handle, boot_info);
+    let host_service = initialize_host_service(restart_tx.clone(), log_handle);
 
     let image_service = initialize_image_service().await?;
     task_supervisor::start().await;

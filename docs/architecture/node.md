@@ -13,29 +13,31 @@ Today the node agent is `feos` built with the `host` feature; it becomes
 
 ## Processes
 
+- **`feos-host-init`**: PID 1 when FeOS is the node's operating system. It
+  sets the machine up, starts `feosd` (today still the `feos` binary,
+  installed as `/usr/sbin/feosd`) and starts it again when it ends.
 - **`feos`** (to become `feosd`): the API, the VM service, the container
-  and image services. As PID 1 it also sets the machine up; as an ordinary
-  process it skips that and becomes the subreaper of its children. The
-  setup is to move to `feos-host-init`.
+  and image services. As an ordinary process it becomes the subreaper of
+  its children.
 - **`feos --task-service`**: the container runtime (libcontainer) in a
   process of its own, started and restarted by the main process. Its pid is
   in `/run/feos/task-service.pid`.
 - **The jailer and Firecracker**, one process per running VM.
 
-## Machine setup as PID 1
+## Machine setup: feos-host-init
 
-When `feos` is PID 1 (to become `feos-host-init`), it moves its root off
-the initramfs, mounts `/proc`, `/sys`, `/dev`, `/dev/pts`, `/run`, a
-tmpfs at `/var/lib/feos` and the cgroup filesystem, configures hugepages
-and SR-IOV VFs, configures the
-network from router advertisements and DHCPv6, and keeps the clock with
-NTP from the servers DHCPv6 names. It takes Ctrl-Alt-Del over: a SIGINT
-makes it sync and reboot.
+`feos-host-init` moves its root off the initramfs, mounts `/proc`, `/sys`,
+`/dev`, `/dev/pts`, `/run`, a tmpfs at `/var/lib/feos` and the cgroup
+filesystem, configures hugepages and SR-IOV VFs, configures the network
+from router advertisements and DHCPv6, and keeps the clock with NTP from
+the servers DHCPv6 names. It takes Ctrl-Alt-Del over (a SIGINT makes it
+sync and reboot), reboots on `SIGRTMIN+5` and powers off on `SIGRTMIN+4`,
+reaps orphans, and runs `/usr/sbin/feosd --self-upgrade --tcp [::]:1337`,
+which it starts again a second after it ends. It serves no API and logs
+to `/dev/kmsg`.
 
 On a distribution all of this is the operating system's
-([ADR 0009](../adr/0009-node-os-and-packages.md)). Today `feos` still runs
-its NTP worker when it is not PID 1, and then syncs with `pool.ntp.org`;
-that goes with the split.
+([ADR 0009](../adr/0009-node-os-and-packages.md)).
 
 ## Directories
 

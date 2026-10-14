@@ -21,8 +21,9 @@ all: clippy ## Debug build of the workspace for musl.
 
 # Release artifacts are built per package with -p, never with --workspace:
 # that would unify the features of all crates into every binary.
-release: clippy ## Release build of feos in the host profile.
+release: clippy ## Release build of feos in the host profile, and feos-host-init.
 	cargo build --release --features git-version --target=$(MUSL_TARGET) -p feos
+	cargo build --release --features git-version --target=$(MUSL_TARGET) -p feos-host-init
 
 release-guest: clippy ## Release build of feos in the guest profile.
 	cargo build --profile release-guest $(GUEST_FEATURES) --features git-version --target=$(MUSL_TARGET) -p feos
