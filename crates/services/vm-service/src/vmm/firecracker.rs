@@ -270,16 +270,7 @@ fn firecracker_config(
         interfaces.push(interface);
     }
 
-    let vcpus = config
-        .cpus
-        .map(|cpus| cpus.vcpu_count)
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_VCPUS);
-    let memory_mib = config
-        .memory
-        .map(|memory| memory.size_mib)
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_MEMORY_MIB);
+    let (vcpus, memory_mib) = machine_size(config);
     let mut machine = json!({"vcpu_count": vcpus, "mem_size_mib": memory_mib});
     if config.memory.is_some_and(|memory| memory.hugepages) {
         machine["huge_pages"] = json!("2M");
@@ -301,6 +292,21 @@ fn firecracker_config(
         });
     }
     Ok((fc, links))
+}
+
+/// The VM's vCPUs and its memory in MiB.
+fn machine_size(config: &VmConfig) -> (u32, u64) {
+    let vcpus = config
+        .cpus
+        .map(|cpus| cpus.vcpu_count)
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_VCPUS);
+    let memory_mib = config
+        .memory
+        .map(|memory| memory.size_mib)
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MEMORY_MIB);
+    (vcpus, memory_mib)
 }
 
 /// The TAP devices of a VM.
@@ -380,10 +386,8 @@ impl FirecrackerAdapter {
     fn spawn(&self, vm_id: &str, config: Option<&str>) -> Result<Spawned, VmmError> {
         let dir = vm_dir(vm_id);
         jail::prepare(vm_id).map_err(internal("prepare the jail"))?;
-        let uid = jail::Manifest::load(vm_id)
-            .map_err(internal("read the jail's manifest"))?
-            .uid
-            .to_string();
+        let manifest = jail::Manifest::load(vm_id).map_err(internal("read the jail's manifest"))?;
+        let uid = manifest.uid.to_string();
         // Firecracker binds both sockets and fails if they exist.
         let api = api_socket(vm_id);
         for socket in [&api, &vsock_path(vm_id)] {
@@ -432,7 +436,13 @@ impl FirecrackerAdapter {
             .args(["--uid", &uid, "--gid", &uid])
             .arg("--chroot-base-dir")
             .arg(VM_DIR)
-            .args(["--cgroup-version", "2", "--"])
+            .args(["--cgroup-version", "2"])
+            .args(["--parent-cgroup", jail::PARENT_CGROUP]);
+        for value in jail::cgroup_values(manifest.cpu_weight) {
+            command.arg("--cgroup").arg(value);
+        }
+        command
+            .arg("--")
             .args(["--api-sock", &format!("/{API_SOCKET}")]);
         if let Some(config) = config {
             command.arg("--config-file").arg(config);
@@ -491,8 +501,10 @@ impl Hypervisor for FirecrackerAdapter {
         std::fs::create_dir_all(&dir).map_err(internal("create the VM directory"))?;
         {
             let _jails = self.jails.lock().unwrap_or_else(|e| e.into_inner());
+            let (vcpus, _) = machine_size(&config);
             let manifest = jail::Manifest {
                 uid: jail::allocate_uid().map_err(internal("allocate a user ID"))?,
+                cpu_weight: jail::cpu_weight(vcpus),
                 links,
                 taps: tap_names(&config),
                 created_taps: Vec::new(),

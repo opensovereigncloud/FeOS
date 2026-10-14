@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use vm_service::vm_dir;
-use vm_service::vmm::jail::tap;
+use vm_service::vmm::jail::{self, tap};
 
 /// The user a process runs as.
 fn process_uid(pid: i64) -> Result<u32> {
@@ -38,6 +38,28 @@ fn process_uid(pid: i64) -> Result<u32> {
         .and_then(|uids| uids.split_whitespace().next())
         .and_then(|uid| uid.parse().ok())
         .context("No Uid in /proc/<pid>/status")
+}
+
+/// Checks that the VM's Firecracker runs in the VM's cgroup, with the
+/// VM's share of the CPU, and returns the most memory the cgroup has
+/// accounted, in MiB.
+fn check_cgroup(vm_id: &str, pid: i64, vcpus: u32) -> Result<u64> {
+    let cgroup = jail::cgroup(vm_id);
+    let read = |file: &str| -> Result<String> {
+        Ok(std::fs::read_to_string(cgroup.join(file))?
+            .trim()
+            .to_string())
+    };
+    assert!(
+        read("cgroup.procs")?
+            .lines()
+            .any(|line| line == pid.to_string()),
+        "Firecracker (pid {pid}) is not in {}",
+        cgroup.display()
+    );
+    assert_eq!(read("cpu.weight")?, jail::cpu_weight(vcpus).to_string());
+    assert_eq!(read("memory.max")?, "max");
+    Ok(read("memory.peak")?.parse::<u64>()? >> 20)
 }
 
 #[tokio::test]
@@ -353,8 +375,11 @@ async fn test_create_and_start_vm() -> Result<()> {
     info!("VMM Ping successful, PID: {}", ping_res.pid);
     guard.set_pid(ping_res.pid as i32);
 
-    // Firecracker runs jailed, as a user of the VM's own.
+    // Firecracker runs jailed, as a user of the VM's own, in a cgroup of
+    // the VM's own.
     assert_ne!(process_uid(ping_res.pid)?, 0, "Firecracker runs as root");
+    let peak = check_cgroup(&vm_id, ping_res.pid, 2)?;
+    info!("The VM's cgroup accounted at most {peak} MiB");
 
     // The guest is FeOS: its API answers behind the VM's vsock.
     let vsock_path = info_res.vsock_path;
@@ -422,6 +447,10 @@ async fn test_create_and_start_vm() -> Result<()> {
     assert!(
         !Path::new("/sys/class/net").join(&tap_name).exists(),
         "The TAP device the VM service created is gone with the VM"
+    );
+    assert!(
+        !jail::cgroup(&vm_id).exists(),
+        "The VM's cgroup is gone with the VM"
     );
 
     guard.disable_cleanup();
@@ -740,6 +769,8 @@ async fn test_suspend_and_restore_vm() -> Result<()> {
             .await?
             .into_inner()
             .pid;
+        let peak = check_cgroup(&vm_id, pid, 1)?;
+        info!("The VM's cgroup accounted at most {peak} MiB, its snapshot included");
         let owner =
             std::fs::read_to_string(Path::new("/sys/class/net").join(&tap_name).join("owner"))?;
         assert_eq!(owner.trim(), process_uid(pid)?.to_string());

@@ -66,6 +66,16 @@ creates TAP devices that do not exist and deletes them with the VM.
 `jail.json`, beside the chroot, records what a start links in and what a
 deletion undoes.
 
+The jailer puts Firecracker into a cgroup of the VM's own, `vms/<id>`.
+VMs share the CPU in proportion to their vCPUs (`cpu.weight` 100 per
+vCPU), as their vCPU threads would without a cgroup each, and the cgroup
+accounts the VM's memory. It caps neither. A VM uses no more CPU than its
+vCPU threads and Firecracker's own, and no more memory than its guest's,
+Firecracker's and what it writes to tmpfs. Where /var/lib/feos is a tmpfs,
+as when FeOS is the host's PID 1, it holds the VM's disks and its
+snapshot, and what the VM writes there is charged to it: a memory cap
+would kill the VM when its guest fills its disk or when it is suspended.
+
 ## Alternatives considered
 
 - **Waiting for the uplink after a resume**, as the sandbox manager first
@@ -76,6 +86,11 @@ deletion undoes.
   with the sandbox service, if hibernation needs them.
 - **Running Firecracker as root without the jailer**, as the sandbox
   manager does. FeOS is the host's PID 1; a VMM escape would own the host.
+- **A memory cap per VM** (`memory.max` of the guest's memory and an
+  allowance). The snapshot is charged to the VM: with its snapshots in a
+  tmpfs, which the kernel cannot reclaim without swap, the cgroup of a
+  VM with 256 MiB reached 519 MiB. A cap would kill the VM in the middle
+  of a suspend, or when its guest writes to a sparse disk.
 
 ## Consequences
 
@@ -89,5 +104,11 @@ deletion undoes.
 - A suspended VM's disks must stay as they are until it is restored.
 - The VM service hands disk files and TAP devices to a user of the VM's
   own by changing their owner.
-- Firecracker joins no cgroup of its own yet; CPU and memory limits per VM
-  come with the jailer's cgroup options.
+- Where /var/lib/feos is a tmpfs, a snapshot stays in memory: suspending
+  a VM frees only what was free in its guest, and a restored VM keeps the
+  snapshot's pages mapped besides its own until it stops. Suspend saves
+  memory where /var/lib/feos has storage below it.
+- Caps per VM, for VMs that overcommit the host, need a way to ask for
+  them in `VmConfig`. A memory cap also needs storage below
+  /var/lib/feos, and a CPU cap (`cpu.max`) a kernel with
+  `CONFIG_CFS_BANDWIDTH`, which FeOS's kernel config leaves out.

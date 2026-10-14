@@ -14,9 +14,11 @@
 //! - its configuration, its log, its sockets and its snapshot
 //!
 //! The VM's user also owns its TAP devices, which the VM service creates if
-//! they do not exist. Outside the chroot, `jail.json` records the user,
-//! where the files come from and which TAP devices the VM service created,
-//! so that a start can link them again and a deletion can undo it all.
+//! they do not exist. The jailer puts Firecracker into a cgroup of the VM's
+//! own, `vms/<id>`. Outside the chroot, `jail.json` records the user, the
+//! VM's share of the CPU, where the files come from and which TAP devices
+//! the VM service created, so that a start can link them again and a
+//! deletion can undo it all.
 
 use crate::{jail_dir, vm_dir, VM_DIR};
 use log::warn;
@@ -32,6 +34,9 @@ use std::path::{Path, PathBuf};
 /// The first VM's user and group ID.
 const UID_BASE: u32 = 1_000_000;
 const MANIFEST: &str = "jail.json";
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+/// The cgroup below the root that holds a cgroup per VM.
+pub const PARENT_CGROUP: &str = "vms";
 
 /// A file Firecracker opens: where it comes from, and its name in the
 /// chroot.
@@ -50,10 +55,41 @@ impl Link {
     }
 }
 
+/// The share of the CPU that a VM with `vcpus` gets, its `cpu.weight`:
+/// VMs share the CPU in proportion to their vCPUs, as their vCPU threads
+/// would without a cgroup each.
+pub fn cpu_weight(vcpus: u32) -> u64 {
+    // cgroup v2 takes weights from 1 to 10000.
+    (100 * u64::from(vcpus)).clamp(1, 10_000)
+}
+
+/// The jailer's `--cgroup` values for a VM with `cpu_weight`, none for a
+/// VM from before cgroups. `memory.max=max` turns the memory controller on
+/// for the VM's cgroup, which then accounts its memory, without a cap:
+/// where /var/lib/feos is a tmpfs, what the VM writes to its disks and its
+/// snapshot in there is charged to it, and a cap would kill the VM when its
+/// guest fills its disk.
+pub fn cgroup_values(cpu_weight: u64) -> Vec<String> {
+    if cpu_weight == 0 {
+        return Vec::new();
+    }
+    vec![
+        format!("cpu.weight={cpu_weight}"),
+        "memory.max=max".to_string(),
+    ]
+}
+
+/// The VM's cgroup.
+pub fn cgroup(vm_id: &str) -> PathBuf {
+    Path::new(CGROUP_ROOT).join(PARENT_CGROUP).join(vm_id)
+}
+
 /// What the VM service keeps about a jail.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Manifest {
     pub uid: u32,
+    /// The VM's `cpu.weight`; 0 for a VM from before cgroups.
+    pub cpu_weight: u64,
     pub links: Vec<Link>,
     pub taps: Vec<String>,
     /// The TAP devices the VM service created, and deletes with the VM.
@@ -73,6 +109,7 @@ impl Manifest {
             .collect();
         let manifest = json!({
             "uid": self.uid,
+            "cpu_weight": self.cpu_weight,
             "links": links,
             "taps": self.taps,
             "created_taps": self.created_taps,
@@ -109,6 +146,7 @@ impl Manifest {
                 .as_u64()
                 .and_then(|uid| u32::try_from(uid).ok())
                 .ok_or_else(|| io::Error::other("jail.json has no uid"))?,
+            cpu_weight: manifest["cpu_weight"].as_u64().unwrap_or(0),
             links,
             taps: strings(&manifest["taps"]),
             created_taps: strings(&manifest["created_taps"]),
@@ -177,8 +215,15 @@ pub fn prepare(vm_id: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Undoes what `prepare` did outside the jail, for a VM that is gone.
+/// Undoes what `prepare` and the jailer did outside the jail, for a VM
+/// that is gone.
 pub fn release(vm_id: &str) {
+    match fs::remove_dir(cgroup(vm_id)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            warn!("Jail ({vm_id}): Failed to remove its cgroup: {e}")
+        }
+        _ => {}
+    }
     let Ok(manifest) = Manifest::load(vm_id) else {
         return;
     };
@@ -352,6 +397,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = Manifest {
             uid: UID_BASE + 3,
+            cpu_weight: cpu_weight(2),
             links: vec![
                 Link {
                     source: PathBuf::from("/var/lib/feos/images/x/vmlinuz"),
@@ -371,6 +417,18 @@ mod tests {
         manifest.write(&path).unwrap();
         assert_eq!(Manifest::read(&path).unwrap(), manifest);
         assert_eq!(manifest.links[1].jailed(), "/disk0.img");
+    }
+
+    #[test]
+    fn vms_share_the_cpu_by_their_vcpus() {
+        assert_eq!(
+            cgroup_values(cpu_weight(2)),
+            vec!["cpu.weight=200".to_string(), "memory.max=max".to_string()]
+        );
+        assert_eq!(cpu_weight(0), 1);
+        assert_eq!(cpu_weight(1000), 10_000);
+        // A manifest from before cgroups puts the VM in none.
+        assert!(cgroup_values(0).is_empty());
     }
 
     #[test]
