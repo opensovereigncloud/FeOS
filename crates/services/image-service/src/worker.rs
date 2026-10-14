@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    error::ImageServiceError,
     pull::{normalize_ref, pull_image},
     pull_dir, FileCommand, ImageStateEvent, OrchestratorCommand,
 };
@@ -199,8 +200,6 @@ impl Orchestrator {
                 responder,
             } => {
                 info!("Orchestrator: Deleting image {image_uuid}");
-                self.store.remove(&image_uuid);
-
                 let (file_resp_tx, file_resp_rx) = oneshot::channel();
                 let file_cmd = FileCommand::DeleteImage {
                     image_uuid: image_uuid.clone(),
@@ -209,12 +208,18 @@ impl Orchestrator {
 
                 if self.filestore_tx.send(file_cmd).await.is_err() {
                     error!("Orchestrator: Failed to send DeleteImage command to FileStore.");
-                } else if let Ok(Err(e)) = file_resp_rx.await
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    warn!("Orchestrator: FileStore failed to delete {image_uuid}: {e}");
+                } else if let Ok(Err(e)) = file_resp_rx.await {
+                    if e.kind() == std::io::ErrorKind::ResourceBusy {
+                        let _ = responder
+                            .send(Err(ImageServiceError::InUse(image_uuid, e.to_string())));
+                        return;
+                    }
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        warn!("Orchestrator: FileStore failed to delete {image_uuid}: {e}");
+                    }
                 }
 
+                self.store.remove(&image_uuid);
                 self.broadcast_state_change(
                     image_uuid,
                     ImageState::NotFound,

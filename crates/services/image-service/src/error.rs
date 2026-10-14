@@ -21,6 +21,9 @@ pub enum ImageServiceError {
     #[error("Image with ID '{0}' not found")]
     NotFound(String),
 
+    #[error("Image with ID '{0}' is in use: {1}")]
+    InUse(String, String),
+
     #[error("An internal orchestrator error occurred: {0}")]
     Internal(String),
 
@@ -39,6 +42,7 @@ impl From<ImageServiceError> for Status {
                 Status::not_found(format!("Image with ID '{id}' not found"))
             }
             ImageServiceError::OciParse(_) => Status::invalid_argument(err.to_string()),
+            ImageServiceError::InUse(..) => Status::failed_precondition(err.to_string()),
             ImageServiceError::OciPull(_)
             | ImageServiceError::MissingLayer(_)
             | ImageServiceError::Pull(_) => Status::unavailable(err.to_string()),

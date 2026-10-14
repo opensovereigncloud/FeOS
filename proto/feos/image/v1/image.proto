@@ -22,7 +22,9 @@ service ImageService {
   // Lists all images available locally in the service's cache.
   rpc ListImages(ListImagesRequest) returns (ListImagesResponse);
 
-  // Removes a locally cached image.
+  // Removes a locally cached image. Fails with FAILED_PRECONDITION while
+  // the image is in use: while a container's root has it as a layer, or a
+  // VM's jail links its files.
   rpc DeleteImage(DeleteImageRequest) returns (DeleteImageResponse);
 }
 

@@ -8,6 +8,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use tokio::{fs, sync::mpsc};
 
@@ -20,6 +21,52 @@ struct ImageMetadata {
     size_bytes: u64,
     #[serde(default)]
     exclusive: bool,
+}
+
+/// What uses the image in `image_dir`, if anything does: a container's root
+/// is an overlay with the image's rootfs as a layer, and a VM's jail hard
+/// links the image's files. Deleting the image would pull its files out
+/// from under them.
+fn in_use(image_dir: &Path) -> Option<String> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    if let Some(mount_point) = overlay_on(&mountinfo, image_dir) {
+        return Some(format!("the overlay at {mount_point} has it as a layer"));
+    }
+    std::fs::read_dir(image_dir)
+        .ok()?
+        .flatten()
+        .find(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.nlink() > 1)
+        })
+        .map(|entry| {
+            format!(
+                "its {} is linked elsewhere, as into a VM's jail",
+                entry.file_name().to_string_lossy()
+            )
+        })
+}
+
+/// The mount point of an overlay in `mountinfo` that has a layer in `dir`.
+fn overlay_on(mountinfo: &str, dir: &Path) -> Option<String> {
+    mountinfo.lines().find_map(|line| {
+        // "<id> <parent> <dev> <root> <mount point> <options> ... - <type>
+        // <source> <super options>"
+        let (mount, filesystem) = line.split_once(" - ")?;
+        let mut filesystem = filesystem.split(' ');
+        if filesystem.next()? != "overlay" {
+            return None;
+        }
+        let options = filesystem.nth(1)?;
+        let lower = options
+            .split(',')
+            .find_map(|option| option.strip_prefix("lowerdir="))?;
+        lower
+            .split(':')
+            .any(|layer| Path::new(layer).starts_with(dir))
+            .then(|| mount.split(' ').nth(4).unwrap_or_default().to_string())
+    })
 }
 
 pub struct FileStore {
@@ -82,7 +129,10 @@ impl FileStore {
             } => {
                 info!("FileStore: Deleting image {image_uuid}");
                 let image_dir = Path::new(IMAGE_DIR).join(&image_uuid);
-                let result = fs::remove_dir_all(&image_dir).await;
+                let result = match in_use(&image_dir) {
+                    Some(user) => Err(std::io::Error::new(std::io::ErrorKind::ResourceBusy, user)),
+                    None => fs::remove_dir_all(&image_dir).await,
+                };
                 let _ = responder.send(result);
             }
             FileCommand::ScanExistingImages { responder } => {
@@ -170,5 +220,44 @@ impl FileStore {
             store.len()
         );
         store
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MOUNTINFO: &str = "\
+22 1 0:21 / / rw,relatime - tmpfs tmpfs rw,mode=755
+97 22 0:45 / /var/lib/feos/containers/c1/bundle/rootfs rw,relatime - overlay overlay rw,lowerdir=/var/lib/feos/images/aaa/rootfs,upperdir=/var/lib/feos/containers/c1/upper,workdir=/var/lib/feos/containers/c1/work
+98 22 0:46 / /mnt rw,relatime - overlay overlay rw,lowerdir=/x:/var/lib/feos/images/bbb/rootfs,upperdir=/u,workdir=/w
+";
+
+    #[test]
+    fn an_overlay_on_the_image_uses_it() {
+        assert_eq!(
+            overlay_on(MOUNTINFO, Path::new("/var/lib/feos/images/aaa")).as_deref(),
+            Some("/var/lib/feos/containers/c1/bundle/rootfs")
+        );
+        // A lower layer of several.
+        assert_eq!(
+            overlay_on(MOUNTINFO, Path::new("/var/lib/feos/images/bbb")).as_deref(),
+            Some("/mnt")
+        );
+        assert_eq!(
+            overlay_on(MOUNTINFO, Path::new("/var/lib/feos/images/a")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_file_linked_elsewhere_uses_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image");
+        std::fs::create_dir(&image).unwrap();
+        std::fs::write(image.join("vmlinuz"), b"kernel").unwrap();
+        assert_eq!(in_use(&image), None);
+        std::fs::hard_link(image.join("vmlinuz"), dir.path().join("jailed")).unwrap();
+        assert!(in_use(&image).unwrap().contains("vmlinuz"));
     }
 }

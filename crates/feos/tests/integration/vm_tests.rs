@@ -4,12 +4,13 @@
 use super::fixtures::{
     verify_vm_socket_cleanup, wait_for_guest_attached, wait_for_target_state, LoopDevice, VmGuard,
 };
-use super::{ensure_server, get_public_clients, vm_test_image};
+use super::{ensure_server, get_image_service_client, get_public_clients, vm_test_image};
 use anyhow::{Context, Result};
 use feos_proto::host_service::{
     host_service_client::HostServiceClient, GetNetworkConfigRequest, GetTimeRequest,
     GetVersionInfoRequest, PingRequest,
 };
+use feos_proto::image_service::DeleteImageRequest;
 use feos_proto::vm_service::{
     stream_vm_console_request as console_input, AttachConsoleMessage, BalloonConfig, CpuConfig,
     CreateVmRequest, DeleteVmRequest, DiskConfig, GetBalloonRequest, GetVmRequest,
@@ -38,6 +39,19 @@ fn process_uid(pid: i64) -> Result<u32> {
         .and_then(|uids| uids.split_whitespace().next())
         .and_then(|uid| uid.parse().ok())
         .context("No Uid in /proc/<pid>/status")
+}
+
+/// The directory of the image whose kernel the VM's jail links.
+fn vm_image_dir(vm_id: &str) -> Result<std::path::PathBuf> {
+    let kernel = std::fs::metadata(vm_dir(vm_id).join("vmlinuz"))?;
+    std::fs::read_dir(image_service::IMAGE_DIR)?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|dir| {
+            std::fs::metadata(dir.join("vmlinuz"))
+                .is_ok_and(|meta| meta.dev() == kernel.dev() && meta.ino() == kernel.ino())
+        })
+        .context("No image has the VM's kernel")
 }
 
 /// Checks that the VM's Firecracker runs in the VM's cgroup, with the
@@ -381,6 +395,23 @@ async fn test_create_and_start_vm() -> Result<()> {
     let peak = check_cgroup(&vm_id, ping_res.pid, 2)?;
     info!("The VM's cgroup accounted at most {peak} MiB");
 
+    // The jail links the files of the VM's image, which stays as long as
+    // the VM is there.
+    let image_dir = vm_image_dir(&vm_id)?;
+    let status = get_image_service_client()
+        .await?
+        .delete_image(DeleteImageRequest {
+            image_uuid: image_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        })
+        .await
+        .expect_err("The image of a VM cannot be deleted");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    info!("The VM's image is in use: {}", status.message());
+
     // The guest is FeOS: its API answers behind the VM's vsock.
     let vsock_path = info_res.vsock_path;
     info!("Pinging the guest through {vsock_path}");
@@ -452,6 +483,7 @@ async fn test_create_and_start_vm() -> Result<()> {
         !jail::cgroup(&vm_id).exists(),
         "The VM's cgroup is gone with the VM"
     );
+    assert!(!image_dir.exists(), "The VM's image is gone with the VM");
 
     guard.disable_cleanup();
     Ok(())
