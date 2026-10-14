@@ -20,6 +20,8 @@ path = [
     "**/*.rs",
     "**/*.sql",
     "**/*.json",
+    "**/clippy.toml",
+    "**/*.proptest-regressions",
     "proto/**/*.proto"
 ]
 precedence = "aggregate"

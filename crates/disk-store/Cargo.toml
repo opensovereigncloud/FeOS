@@ -1,0 +1,27 @@
+[package]
+name = "disk-store"
+version.workspace = true
+edition.workspace = true
+description = "diskd's chunk store: chunks, layer manifests, seal, local cache, S3 tiering"
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+zstd = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+object_store = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+linked-hash-map = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }

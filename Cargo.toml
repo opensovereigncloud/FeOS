@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/disk-store",
     "crates/feos",
     "crates/feos-host-init",
     "crates/feos-proto",
@@ -65,8 +66,16 @@ thiserror = "2.0.16"
 hyper = "1.7.0"
 hyper-util = { version = "0.1.17", features = ["tokio"] }
 termcolor = "1.1"
+# diskd and its chunk store.
+blake3 = "1"
+zstd = "0.13"
+object_store = { version = "0.12", features = ["aws"] }
+linked-hash-map = "0.5"
+tracing = "0.1"
+proptest = "1"
 
 # Workspace crates
+disk-store = { path = "crates/disk-store" }
 feos-proto = { path = "crates/feos-proto" }
 feos-utils = { path = "crates/feos-utils" }
 container-service = { path = "crates/services/container-service" }
