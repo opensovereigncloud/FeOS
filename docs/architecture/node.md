@@ -218,8 +218,7 @@ restarts it after an upgrade, whenever it is enabled; removing the package
 stops the unit; purging it disables the unit. `/var/lib/feos` stays.
 
 The repository has one suite, `stable`, with the component `main`, and is
-signed by its own key. Its page, https://apt.fecode.dev/index.html (from
-`hack/packages/apt/`), says how Debian takes it:
+signed by its own key:
 
     curl -fsSL https://apt.fecode.dev/feos.gpg -o /usr/share/keyrings/feos.gpg
     echo 'deb [signed-by=/usr/share/keyrings/feos.gpg] https://apt.fecode.dev stable main' \

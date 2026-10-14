@@ -6,11 +6,10 @@
 #   dists/stable/{Release,InRelease,Release.gpg}
 #   dists/stable/main/binary-amd64/Packages{,.gz}
 #   feos.gpg, feos.asc        the repository's signing key
-#   index.html, favicons      the page, from hack/packages/apt/
 #
 #   hack/packages/publish-apt target/packages/*.deb
 #
-# Without packages, it signs the index again and uploads the page.
+# Without packages, it signs the index again.
 #
 # The index keeps what was published before: the versions of Firecracker
 # and the guest install side by side, and nodes need the old ones for
@@ -29,8 +28,6 @@ SUITE=stable
 COMPONENT=main
 ARCH=amd64
 INDEX_DIR="dists/${SUITE}/${COMPONENT}/binary-${ARCH}"
-
-PAGE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/apt" && pwd)"
 
 log() { printf '[publish-apt] %s\n' "$*"; }
 [ -r "${FEOS_APT_ENV}" ] || { log "no credentials in ${FEOS_APT_ENV}"; exit 1; }
@@ -142,8 +139,4 @@ put "${STAGE}/dists/${SUITE}/Release.gpg" "dists/${SUITE}/Release.gpg" applicati
 put "${STAGE}/dists/${SUITE}/InRelease" "dists/${SUITE}/InRelease" "text/plain; charset=utf-8" "${NO_CACHE}"
 put "${STAGE}/feos.gpg" feos.gpg application/pgp-keys "public, max-age=3600"
 put "${STAGE}/feos.asc" feos.asc application/pgp-keys "public, max-age=3600"
-put "${PAGE_DIR}/index.html" index.html "text/html; charset=utf-8" "${NO_CACHE}"
-put "${PAGE_DIR}/favicon.svg" favicon.svg image/svg+xml "public, max-age=86400"
-put "${PAGE_DIR}/favicon.ico" favicon.ico image/x-icon "public, max-age=86400"
-put "${PAGE_DIR}/apple-touch-icon.png" apple-touch-icon.png image/png "public, max-age=86400"
 log "published to ${R2_BUCKET}, signed by ${KEY_ID}"
