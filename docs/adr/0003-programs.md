@@ -102,4 +102,4 @@ and the pods keep running.
   2. the Valkey transport, events and telemetry (ADR 0006);
   3. network isolation and the guest's DNS (ADR 0010);
   4. the Kubernetes and SSH proxies and port forwarding;
-  5. hibernation, with the disk daemon (ADR 0008).
+  5. hibernation, with the disk daemon (ADR 0008, ADR 0011).
