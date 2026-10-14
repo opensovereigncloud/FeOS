@@ -49,6 +49,8 @@ egress_if() { ip route show default | awk '/default/ {print $5; exit}'; }
 EGRESS="$(egress_if)"
 cleanup_net() {
   sudo iptables -t nat -D POSTROUTING -s "${SUBNET}" -o "${EGRESS}" -j MASQUERADE 2>/dev/null || true
+  sudo iptables -D FORWARD -i "${BRIDGE}" -o "${EGRESS}" -j ACCEPT 2>/dev/null || true
+  sudo iptables -D FORWARD -i "${EGRESS}" -o "${BRIDGE}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   sudo ip link del "${TAP}" 2>/dev/null || true
   sudo ip link del "${BRIDGE}" 2>/dev/null || true
 }
@@ -73,6 +75,10 @@ sudo ip link set "${TAP}" master "${BRIDGE}"
 sudo ip link set "${TAP}" up
 sudo sysctl -qw net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s "${SUBNET}" -o "${EGRESS}" -j MASQUERADE
+# Docker sets the FORWARD policy to DROP where it runs, as on GitHub's
+# runners.
+sudo iptables -I FORWARD -i "${BRIDGE}" -o "${EGRESS}" -j ACCEPT
+sudo iptables -I FORWARD -i "${EGRESS}" -o "${BRIDGE}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 cat > "${RUN_DIR}/config.json" <<JSON
 {
