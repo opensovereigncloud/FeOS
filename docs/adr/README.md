@@ -10,10 +10,10 @@ the ADRs say why it works that way.
 
 | # | Area | Decision | Status | Built |
 |---|---|---|---|---|
-| [0001](0001-what-we-build.md) | Foundation | Agent sandboxes and CaaS on isolated pods; FeOS is the node layer, the control plane one or two central services | Accepted | – |
+| [0001](0001-what-we-build.md) | Foundation | Agent sandboxes and CaaS on isolated pods; FeOS is the node layer, the control plane one or two central services; CaaS has its own API, no Kubernetes | Accepted | – |
 | [0002](0002-one-repository.md) | Foundation | One repository for node, control plane and clients, laid out by language; workspace rules; static musl | Accepted | yes |
-| [0003](0003-programs.md) | Node | `feos-host-init`, `feosd`, `feos-guest`, `feosctl`; the sandbox manager becomes `feosd` | Accepted | partly: the binaries; the manager's port has not started |
-| [0004](0004-pods.md) | Node | Pods instead of VMs in the API, and no VMs at all; a pod's services through `feosd`; the guest's API is internal | Accepted | partly: `feos.pod.v1`, the forwarding, no VMs; no credentials or proxies in the spec, the caller makes the pod's TAP |
+| [0003](0003-programs.md) | Node | `feos-host-init`, `feosd`, `feos-guest`, `feosctl`; the sandbox manager's node half becomes `feosd`, its sandboxes go to the control plane | Accepted | partly: the binaries; the manager's port has not started |
+| [0004](0004-pods.md) | Node | Pods instead of VMs in the API, and no VMs at all; one kind of pod for sandboxes, services and jobs, told apart by what an exit means: idle, init, sidecar and main containers, a restart policy, probes; a pod's services through `feosd`; the guest's API is internal | Accepted | partly: `feos.pod.v1`, the forwarding, no VMs; no credentials or proxies in the spec, the caller makes the pod's TAP; no roles, restarts, probes or reaper |
 | [0005](0005-firecracker.md) | Node | Firecracker is the only VMM, every VM in its jailer and a cgroup of its own | Accepted | yes |
 | [0006](0006-control-transport.md) | Node ↔ control plane | `feosd` connects out to Valkey, which carries the same gRPC calls; no inbound port | Proposed | no |
 | [0007](0007-guest.md) | Guest | `feos-guest`: vsock, configuration pushed by the host, the API mapping, libcontainer in its own process | Accepted | partly: guest RPCs still in `HostService` |

@@ -3,9 +3,11 @@ FeOS Overview
 
 This repository builds two products on one platform: **agent sandboxes**
 and a **container as a service** (CaaS). **FeOS** is everything that runs on
-the nodes. One or two central services, the **control plane**, orchestrate
-the nodes for both products. Node and control plane are coupled through
-their APIs, so they live in one repository.
+the nodes: it runs serverless pods, microVMs with containers in them that
+cost no memory while idle and are back in under a second. One or two
+central services, the **control plane**, orchestrate the nodes for both
+products. Node and control plane are coupled through their APIs, so they
+live in one repository.
 
 Why it is built this way: [ADR 0001](adr/0001-what-we-build.md).
 
@@ -37,6 +39,11 @@ Both products run on one unit: the **pod**, a Firecracker microVM that runs
   another node.
 - FeOS knows pods. Whether a pod is an agent's sandbox or a customer's
   service only the control plane knows.
+- What one product needs is a capability of every pod: exec and the tools,
+  watches, port forwards, credential offloading, restarts and health
+  checks. A sandbox's container is an idle one that the agent works in
+  through exec and the tools; a service's runs its image's command
+  ([ADR 0004](adr/0004-pods.md)).
 
 ## Two layers
 

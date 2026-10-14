@@ -12,9 +12,9 @@ development, told apart by `getpid() == 1` throughout its startup.
 The sandbox system adds a manager on every node: about 20,000 lines of Go
 that run the microVMs, keep their records, take commands from the control
 plane, isolate the network and run per-sandbox proxies. Its VM half has
-moved into FeOS's VM service already. An earlier assessment of the merge
-rejected moving the rest into FeOS, because it would have had to live
-inside PID 1.
+moved into FeOS already, as the microVM layer under the pods. An earlier
+assessment of the merge rejected moving the rest into FeOS, because it
+would have had to live inside PID 1.
 
 Nodes are to run FeOS as their operating system or a general-purpose
 distribution under systemd (ADR 0009).
@@ -48,14 +48,22 @@ the binary chooses at runtime.
 - No binary is called `feos`. FeOS is the project's name; it stays in the
   paths (`/run/feos`, `/var/lib/feos`) and in the proto packages.
 
-### The manager becomes feosd
+### The manager's node half becomes feosd
 
-There is no manager next to `feosd`. The sandbox system's manager is
-ported into `feosd`'s crates, in Rust. `feosd` runs pods (ADR 0004), takes
-the control plane's calls (ADR 0006), isolates the pods' network, runs
-their proxies, and suspends and restores them (ADR 0008). Since `feosd` is
-not PID 1, a fault in that code restarts `feosd`, and the pods keep
-running.
+There is no manager next to `feosd`. The sandbox system's manager is split
+along the line of ADR 0001: what concerns pods is ported into `feosd`'s
+crates, in Rust, and what concerns sandboxes goes to the control plane
+(ADR 0004).
+
+- `feosd` runs pods (ADR 0004), takes the control plane's calls
+  (ADR 0006), isolates the pods' network, runs their proxies and port
+  forwards, and suspends and restores them (ADR 0008).
+- The control plane gets the sandbox as an object, the agent's MCP tools
+  mapped onto a pod's tool and exec calls, and the policies that pause and
+  hibernate. `feosd` reports what they need and decides none of it.
+
+Since `feosd` is not PID 1, a fault in the ported code restarts `feosd`,
+and the pods keep running.
 
 ## Alternatives considered
 
@@ -74,6 +82,9 @@ running.
 - **A manager next to `feosd`** that speaks `feos.vm.v1` to `feosd` and the
   guest's API through `vsock_path`. Two programs on every node to version
   against each other, and the guest's API a public one.
+- **The whole manager in `feosd`**, sandboxes included. `feosd` would know
+  one of the two products, and CaaS would need its own semantics next to
+  them in the node agent.
 
 ## Consequences
 
@@ -87,7 +98,7 @@ running.
   itself again, as for the task service.
 - **The order of the port.** Suggested, each step usable on its own, the
   Go manager doing what has not moved yet:
-  1. pods on top of the VM service (ADR 0004);
+  1. pods on top of the microVM layer (ADR 0004), done;
   2. the Valkey transport, events and telemetry (ADR 0006);
   3. network isolation and the guest's DNS (ADR 0010);
   4. the Kubernetes and SSH proxies and port forwarding;

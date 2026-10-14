@@ -33,6 +33,14 @@ Agent sandboxes and CaaS are two products on one platform. What the
 products are, sandboxes with tools and tokens, services with replicas and
 routes, lives in the control plane. The nodes do the same for both.
 
+### CaaS has an API of its own
+
+CaaS is a product of its own, not a Kubernetes. Its API follows what
+Kubernetes does for a pod, its containers, restarts and probes, so that
+images and users find what they know. There is no CRI adapter that lets
+kubelet run pods on FeOS nodes, and no virtual kubelet that makes FeOS a
+node of someone's cluster.
+
 ### The pod is the unit
 
 A node runs **pods**: a Firecracker microVM that runs `feos-guest` and one
@@ -90,12 +98,9 @@ CaaS needs what the sandboxes ruled out for themselves:
   plane's front door to their ports. Services must be reachable: is HTTP
   through a central front door enough, or do services need L4 and
   addresses of their own?
-- **What a service's pod needs**: restart policies, health checks,
-  persistent volumes, images from private registries (the sandboxes pull
-  public images only), several containers in one pod, jobs as well as
-  services.
-- **Kubernetes.** A CaaS API of our own, or one that Kubernetes tooling
-  understands, through a CRI adapter or a virtual kubelet?
+- **What a service's pod needs** beyond ADR 0004 (restarts, health
+  checks, jobs, credentials): persistent volumes and images from private
+  registries (the sandboxes pull public images only).
 
 For both products:
 
@@ -115,6 +120,10 @@ For both products:
 - **Kubernetes with a VM runtime** as the platform, a pod per sandbox. The
   sandbox system measured a constant 1 to 1.5 s added to every resume, and
   suspend and restore are not part of Kubernetes's model.
+- **Kubernetes's API for CaaS**, through a CRI adapter or a virtual
+  kubelet. Users would keep their tooling, but CaaS would take on
+  Kubernetes's model and its releases, and suspend and scale to zero would
+  sit beside them.
 
 ## Consequences
 
