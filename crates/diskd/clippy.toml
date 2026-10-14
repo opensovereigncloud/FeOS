@@ -1,0 +1,9 @@
+# Shared-nothing (ADR 0011): no Mutex or RwLock on diskd's request path.
+# Threads talk to the budget, seal and control actors through channels. A
+# use outside the request path needs an #[allow] and a comment saying why.
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "shared-nothing: pass messages to an actor instead (ADR 0011)" },
+    { path = "std::sync::RwLock", reason = "shared-nothing: pass messages to an actor instead (ADR 0011)" },
+    { path = "parking_lot::Mutex", reason = "shared-nothing: pass messages to an actor instead (ADR 0011)" },
+    { path = "parking_lot::RwLock", reason = "shared-nothing: pass messages to an actor instead (ADR 0011)" },
+]

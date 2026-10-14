@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/disk-store",
+    "crates/diskctl",
+    "crates/diskd",
     "crates/feos",
     "crates/feos-host-init",
     "crates/feos-proto",
@@ -70,8 +72,14 @@ termcolor = "1.1"
 blake3 = "1"
 zstd = "0.13"
 object_store = { version = "0.12", features = ["aws"] }
+# crates.io stops at 0.4.8; the async API diskd uses (UblkCtrlAsync and
+# the typed ops such as read_at_raw and poll_add) is only on main. Re-pin
+# on the next release.
+libublk = { git = "https://github.com/ublk-org/libublk-rs", rev = "0d172817b3737079477337b39538ccdc91766e6e" }
+io-uring = "0.7"
 linked-hash-map = "0.5"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 proptest = "1"
 
 # Workspace crates
