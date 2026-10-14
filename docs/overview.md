@@ -114,10 +114,10 @@ guest's API is internal between `feosd` and `feos-guest`.
 | Part | State |
 |---|---|
 | `feos-guest` | runs containers, tools, watches, port forwarding and credential offloading in a Firecracker guest |
-| `feosd` | runs VMs in Firecracker's jailer, with snapshots, the balloon and the guest's uplink, under systemd or `feos-host-init`; still speaks VMs, not pods |
+| `feosd` | runs pods (`feos.pod.v1`): a microVM in Firecracker's jailer and its containers, with snapshots, the balloon and the guest's uplink, under systemd or `feos-host-init`; forwards a pod's container, image, tool and watch calls to its guest. The pods' network, credentials and proxies are not built: a pod uses a TAP device its caller made |
 | `feos-host-init` | sets the machine up as PID 1 and runs `feosd` |
 | packages | `.deb` packages of `feosd`, `feosctl`, Firecracker and the guest, in a signed apt repository at apt.fecode.dev |
-| Valkey bridge, pods | decided or proposed, not built |
+| Valkey bridge | proposed, not built |
 | control plane, node-side manager | in Go, still in the sandbox system's repository; the manager is being ported into `feosd` |
 | CaaS | not started; its open questions are in ADR 0001 |
 

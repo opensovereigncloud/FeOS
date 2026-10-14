@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, Stream};
 use tonic::{Request, Response, Status, Streaming};
 
+#[derive(Clone)]
 pub struct VmApiHandler {
     dispatcher_tx: mpsc::Sender<Command>,
 }

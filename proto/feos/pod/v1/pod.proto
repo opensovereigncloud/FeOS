@@ -1,0 +1,181 @@
+syntax = "proto3";
+
+package feos.pod.v1;
+
+// Pods on a node (ADR 0004): a microVM that runs feos-guest, and the
+// containers in it. A pod's containers, images, tools and watches are
+// reached through feosd with the APIs they have in the guest: a call that
+// carries the metadata "feos-pod-id" goes unchanged to that pod's guest.
+service PodService {
+  // Creates a pod and brings it up: its microVM boots the newest guest
+  // installed on the node, and its containers are pulled, created and
+  // started in it, in order. The call returns once the pod is recorded; the
+  // pod is POD_STATE_PENDING until it runs, or POD_STATE_FAILED. A create
+  // with the ID of a pod that exists returns that pod if the spec is the
+  // same, and fails with ALREADY_EXISTS if it is not.
+  rpc CreatePod(CreatePodRequest) returns (CreatePodResponse);
+  // Brings a stopped or failed pod up again: a new boot, with its
+  // containers created anew from the spec.
+  rpc StartPod(StartPodRequest) returns (StartPodResponse);
+  // Shuts the pod's microVM down. What the containers wrote is gone: a pod
+  // has no disk yet.
+  rpc StopPod(StopPodRequest) returns (StopPodResponse);
+  // Removes the pod and its microVM, in whatever state.
+  rpc DeletePod(DeletePodRequest) returns (DeletePodResponse);
+  rpc GetPod(GetPodRequest) returns (PodInfo);
+  rpc ListPods(ListPodsRequest) returns (ListPodsResponse);
+  // Streams the pods' state changes as they happen.
+  rpc StreamPodEvents(StreamPodEventsRequest) returns (stream PodEvent);
+  // Writes the running pod to a snapshot on disk and ends its microVM.
+  rpc SuspendPod(SuspendPodRequest) returns (SuspendPodResponse);
+  // Restores a suspended pod, with its containers as they were.
+  rpc ResumePod(ResumePodRequest) returns (ResumePodResponse);
+}
+
+message PodSpec {
+  Resources resources = 1;
+  // The containers, created and started in this order.
+  repeated ContainerSpec containers = 2;
+  PodNetwork network = 3;
+  // The caller's labels, which feosd keeps and returns.
+  map<string, string> labels = 4;
+}
+
+message Resources {
+  // Defaults to 1.
+  uint32 vcpus = 1;
+  // Defaults to 512.
+  uint64 memory_mib = 2;
+}
+
+message ContainerSpec {
+  // The container's ID in the guest: 1 to 64 characters of letters, digits,
+  // "-", "_" and ".", unique in the pod.
+  string name = 1;
+  // The OCI image, e.g. "docker.io/library/alpine:latest". The guest pulls
+  // it.
+  string image_ref = 2;
+  // The command; the image's when empty.
+  repeated string command = 3;
+  map<string, string> env = 4;
+}
+
+// The pod's network, until feosd makes one itself: a TAP device on the
+// node, made by the caller, and the guest's address behind it. Without it,
+// the pod has no network and can pull no image.
+message PodNetwork {
+  string tap_name = 1;
+  // The guest's MAC address; Firecracker picks one when empty.
+  string mac_address = 2;
+  // Address with prefix length, e.g. "10.200.0.2/16".
+  string ipv4_cidr = 3;
+  string gateway = 4;
+  repeated string dns = 5;
+}
+
+enum PodState {
+  POD_STATE_UNSPECIFIED = 0;
+  // Recorded; the microVM boots, or the containers are being pulled,
+  // created and started.
+  POD_STATE_PENDING = 1;
+  // Its containers were started.
+  POD_STATE_RUNNING = 2;
+  // Its microVM is shut down.
+  POD_STATE_STOPPED = 3;
+  // In a snapshot on disk.
+  POD_STATE_SUSPENDED = 4;
+  // Bringing it up failed, or its microVM crashed: PodInfo.reason says why.
+  POD_STATE_FAILED = 5;
+}
+
+message PodInfo {
+  string pod_id = 1;
+  PodSpec spec = 2;
+  PodState state = 3;
+  // Why the pod is in its state, if it is not POD_STATE_RUNNING.
+  string reason = 4;
+  // The containers as the guest reports them; empty unless the pod runs.
+  repeated ContainerStatus containers = 5;
+}
+
+message ContainerStatus {
+  string name = 1;
+  ContainerState state = 2;
+  // Set once the container's process exited.
+  optional int32 exit_code = 3;
+}
+
+enum ContainerState {
+  CONTAINER_STATE_UNSPECIFIED = 0;
+  CONTAINER_STATE_CREATING = 1;
+  CONTAINER_STATE_CREATED = 2;
+  CONTAINER_STATE_RUNNING = 3;
+  CONTAINER_STATE_EXITED = 4;
+}
+
+message CreatePodRequest {
+  // A UUID, chosen by the caller, so that a create delivered twice finds
+  // the pod it made.
+  string pod_id = 1;
+  PodSpec spec = 2;
+}
+
+message CreatePodResponse {
+  PodInfo pod = 1;
+}
+
+message StartPodRequest {
+  string pod_id = 1;
+}
+
+message StartPodResponse {}
+
+message StopPodRequest {
+  string pod_id = 1;
+}
+
+message StopPodResponse {}
+
+message DeletePodRequest {
+  string pod_id = 1;
+}
+
+message DeletePodResponse {}
+
+message GetPodRequest {
+  string pod_id = 1;
+}
+
+message ListPodsRequest {}
+
+message ListPodsResponse {
+  repeated PodInfo pods = 1;
+}
+
+message StreamPodEventsRequest {
+  // Only this pod's events; all pods' when empty.
+  string pod_id = 1;
+}
+
+message PodEvent {
+  string pod_id = 1;
+  PodState state = 2;
+  string reason = 3;
+  // The pod was deleted; state and reason are its last.
+  bool deleted = 4;
+}
+
+message SuspendPodRequest {
+  string pod_id = 1;
+}
+
+message SuspendPodResponse {
+  // The size of the snapshot's memory.
+  uint64 memory_bytes = 1;
+}
+
+message ResumePodRequest {
+  string pod_id = 1;
+}
+
+message ResumePodResponse {}

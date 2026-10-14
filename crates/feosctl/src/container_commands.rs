@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::transport::Conn;
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use feos_proto::container_service::{
@@ -8,7 +9,6 @@ use feos_proto::container_service::{
     ContainerState, CreateContainerRequest, DeleteContainerRequest, ExecRequest,
     GetContainerRequest, ListContainersRequest, StartContainerRequest, StopContainerRequest,
 };
-use tonic::transport::Channel;
 
 #[derive(Args, Debug)]
 pub struct ContainerArgs {
@@ -20,6 +20,10 @@ pub struct ContainerArgs {
         default_value = "unix:/run/feos/api.sock"
     )]
     pub address: String,
+
+    /// A pod on the node at the address: the calls go to its guest.
+    #[arg(long, global = true, env = "FEOS_POD")]
+    pub pod: Option<String>,
 
     #[command(subcommand)]
     command: ContainerCommand,
@@ -110,7 +114,9 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
 }
 
 pub async fn handle_container_command(args: ContainerArgs) -> Result<()> {
-    let mut client = ContainerServiceClient::new(crate::transport::channel(&args.address).await?);
+    let mut client = ContainerServiceClient::new(
+        crate::transport::connect(&args.address, args.pod.as_deref()).await?,
+    );
 
     match args.command {
         ContainerCommand::Create {
@@ -146,7 +152,7 @@ pub async fn handle_container_command(args: ContainerArgs) -> Result<()> {
 }
 
 async fn create_container(
-    client: &mut ContainerServiceClient<Channel>,
+    client: &mut ContainerServiceClient<Conn>,
     image_ref: String,
     id: Option<String>,
     adopt: bool,
@@ -180,7 +186,7 @@ async fn create_container(
     Ok(())
 }
 
-async fn start_container(client: &mut ContainerServiceClient<Channel>, id: String) -> Result<()> {
+async fn start_container(client: &mut ContainerServiceClient<Conn>, id: String) -> Result<()> {
     println!("Requesting to start container: {id}...");
     let request = StartContainerRequest {
         container_id: id.clone(),
@@ -190,7 +196,7 @@ async fn start_container(client: &mut ContainerServiceClient<Channel>, id: Strin
     Ok(())
 }
 
-async fn stop_container(client: &mut ContainerServiceClient<Channel>, id: String) -> Result<()> {
+async fn stop_container(client: &mut ContainerServiceClient<Conn>, id: String) -> Result<()> {
     println!("Requesting to stop container: {id}...");
     let request = StopContainerRequest {
         container_id: id.clone(),
@@ -201,10 +207,7 @@ async fn stop_container(client: &mut ContainerServiceClient<Channel>, id: String
     Ok(())
 }
 
-async fn get_container_info(
-    client: &mut ContainerServiceClient<Channel>,
-    id: String,
-) -> Result<()> {
+async fn get_container_info(client: &mut ContainerServiceClient<Conn>, id: String) -> Result<()> {
     let request = GetContainerRequest {
         container_id: id.clone(),
     };
@@ -235,7 +238,7 @@ async fn get_container_info(
     Ok(())
 }
 
-async fn list_containers(client: &mut ContainerServiceClient<Channel>) -> Result<()> {
+async fn list_containers(client: &mut ContainerServiceClient<Conn>) -> Result<()> {
     let request = ListContainersRequest {};
     let response = client.list_containers(request).await?.into_inner();
 
@@ -263,7 +266,7 @@ async fn list_containers(client: &mut ContainerServiceClient<Channel>) -> Result
     Ok(())
 }
 
-async fn delete_container(client: &mut ContainerServiceClient<Channel>, id: String) -> Result<()> {
+async fn delete_container(client: &mut ContainerServiceClient<Conn>, id: String) -> Result<()> {
     println!("Requesting to delete container: {id}...");
     let request = DeleteContainerRequest {
         container_id: id.clone(),
@@ -275,7 +278,7 @@ async fn delete_container(client: &mut ContainerServiceClient<Channel>, id: Stri
 
 /// Streams the command's output to this process's stdout and stderr and
 /// returns its exit code.
-async fn exec(client: &mut ContainerServiceClient<Channel>, request: ExecRequest) -> Result<i32> {
+async fn exec(client: &mut ContainerServiceClient<Conn>, request: ExecRequest) -> Result<i32> {
     use std::io::Write;
     let mut frames = client.exec(request).await?.into_inner();
     while let Some(frame) = frames.message().await? {

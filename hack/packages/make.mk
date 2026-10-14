@@ -16,6 +16,7 @@ FIRECRACKER_EPOCH = $(shell git log -1 --format=%ct -- hack/firecracker \
 
 packages: firecracker guest package-binaries $(NFPM) ## Build the .deb packages into target/packages/ (ADR 0009).
 	mkdir -p $(PACKAGES_DIR)
+	rm -f $(PACKAGES_DIR)/*.deb
 	for package in feosd feosctl feos-firecracker feos-firecracker-meta feos-guest feos-guest-meta; do \
 		case $$package in \
 			feos-firecracker*) epoch=$(FIRECRACKER_EPOCH) ;; \
@@ -55,6 +56,5 @@ DEV_VERSION := $(FEOS_VERSION)~dev.$(shell date -u +%Y%m%d%H%M).$(shell git rev-
 publish-apt: ## Build the packages of HEAD as a dev version and publish them to apt.fecode.dev.
 	@git diff --quiet HEAD -- crates proto hack Cargo.toml Cargo.lock || \
 		{ echo "publish-apt: commit what the packages hold first"; exit 1; }
-	rm -f $(PACKAGES_DIR)/*.deb
 	$(MAKE) packages FEOS_VERSION=$(DEV_VERSION)
 	hack/packages/publish-apt $(PACKAGES_DIR)/*.deb

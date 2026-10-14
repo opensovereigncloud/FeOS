@@ -6,8 +6,6 @@ use container_service::{
     api::ContainerApiHandler, dispatcher::Dispatcher as ContainerDispatcher,
     Command as ContainerCommand,
 };
-#[cfg(feature = "host")]
-use feos_proto::vm_service::vm_service_server::VmServiceServer;
 use feos_proto::{
     container_service::container_service_server::ContainerServiceServer,
     host_service::host_service_server::HostServiceServer,
@@ -41,7 +39,7 @@ use vm_service::{
 };
 
 #[cfg(feature = "host")]
-pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmServiceServer<VmApiHandler>> {
+pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmApiHandler> {
     info!("Main: Ensuring VM directory '{VM_DIR}' exists...");
     fs::create_dir_all(VM_DIR).await?;
     info!("Main: Directory check complete. Path '{VM_DIR}' is ready.");
@@ -52,10 +50,17 @@ pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmServiceServe
         vm_dispatcher.run().await;
     });
     let vm_api_handler = VmApiHandler::new(vm_tx);
-    let vm_service = VmServiceServer::new(vm_api_handler);
     info!("Main: VM Service is configured.");
 
-    Ok(vm_service)
+    Ok(vm_api_handler)
+}
+
+/// The pods, on top of the VM service.
+#[cfg(feature = "host")]
+pub(crate) fn initialize_pod_service(vms: VmApiHandler) -> Result<pod_service::Pods> {
+    let pods = pod_service::Pods::new(vms, Path::new(pod_service::POD_DIR))?;
+    info!("Main: Pod Service is configured.");
+    Ok(pods)
 }
 
 pub(crate) async fn initialize_container_service(

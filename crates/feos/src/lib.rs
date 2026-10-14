@@ -10,17 +10,22 @@ mod task_supervisor;
 
 use anyhow::{Context, Result};
 use container_service::api::ContainerApiHandler;
-#[cfg(feature = "host")]
-use feos_proto::vm_service::vm_service_server::VmServiceServer;
 use feos_proto::{
     container_service::container_service_server::ContainerServiceServer,
     host_service::host_service_server::HostServiceServer,
     image_service::image_service_server::ImageServiceServer,
 };
+#[cfg(feature = "host")]
+use feos_proto::{
+    pod_service::pod_service_server::PodServiceServer,
+    vm_service::vm_service_server::VmServiceServer,
+};
 use host_service::{api::HostApiHandler, RestartSignal};
 use image_service::{api::ImageApiHandler, IMAGE_SERVICE_SOCKET};
 use log::{error, info, warn};
 use nix::unistd::{chown, Group, Uid};
+#[cfg(feature = "host")]
+use pod_service::{forward::ForwardLayer, Pods};
 use setup::*;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
@@ -32,6 +37,9 @@ use tokio::{fs, net::UnixListener, sync::mpsc};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::server::Router;
 use tonic::transport::Server;
+use tower::layer::util::Identity;
+#[cfg(feature = "host")]
+use tower::layer::util::Stack;
 #[cfg(feature = "host")]
 use vm_service::api::VmApiHandler;
 
@@ -105,9 +113,13 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
 
     let (restart_tx, mut restart_rx) = mpsc::channel::<RestartSignal>(1);
 
+    #[cfg(feature = "host")]
+    let vms = initialize_vm_service(&setup_database().await?).await?;
     let services = Services {
         #[cfg(feature = "host")]
-        vm: initialize_vm_service(&setup_database().await?).await?,
+        pods: initialize_pod_service(vms.clone())?,
+        #[cfg(feature = "host")]
+        vm: VmServiceServer::new(vms),
         container: initialize_container_service().await?,
         host: initialize_host_service(options.self_upgrade.then_some(restart_tx), log_handle),
         image: initialize_image_service().await?,
@@ -219,6 +231,8 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
 struct Services {
     #[cfg(feature = "host")]
     vm: VmServiceServer<VmApiHandler>,
+    #[cfg(feature = "host")]
+    pods: Pods,
     container: ContainerServiceServer<ContainerApiHandler>,
     host: HostServiceServer<HostApiHandler>,
     image: ImageServiceServer<ImageApiHandler>,
@@ -226,14 +240,26 @@ struct Services {
     guest: guest::GuestServices,
 }
 
+/// feosd forwards the calls for a pod's guest (ADR 0004).
+#[cfg(feature = "host")]
+type Layers = Stack<ForwardLayer, Identity>;
+#[cfg(not(feature = "host"))]
+type Layers = Identity;
+
 impl Services {
-    fn router(&self) -> Router {
-        let router = Server::builder()
+    fn router(&self) -> Router<Layers> {
+        #[cfg(feature = "host")]
+        let mut server = Server::builder().layer(ForwardLayer::new(self.pods.clone()));
+        #[cfg(not(feature = "host"))]
+        let mut server = Server::builder();
+        let router = server
             .add_service(self.container.clone())
             .add_service(self.host.clone())
             .add_service(self.image.clone());
         #[cfg(feature = "host")]
-        let router = router.add_service(self.vm.clone());
+        let router = router
+            .add_service(self.vm.clone())
+            .add_service(PodServiceServer::new(self.pods.clone()));
         #[cfg(feature = "guest")]
         let router = self.guest.add_to(router);
         router

@@ -3,11 +3,12 @@
 # privileged container, and check feosd under systemd: its group and
 # socket, a VM from the installed guest and Firecracker, the VM's cgroup,
 # a restart that keeps the VM, the refused self-upgrade, what autoremove
-# keeps, removal, and a power-off through PID 1.
+# keeps, a pod with a network and its forwarded services, removal, and a
+# power-off through PID 1.
 #
 #   hack/packages/test-packages
 #
-# Needs docker and /dev/kvm.
+# Needs docker, /dev/kvm, and internet access for the pod's image.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -34,7 +35,11 @@ in_node() {
     'mkdir -p /sys/fs/cgroup/exec && echo $$ >/sys/fs/cgroup/exec/cgroup.procs && exec "$@"' \
     sh "$@"
 }
-export -f in_node
+# Whether the input has a match. Unlike grep -q, it reads all of the
+# input: a writer whose pipe closes early fails, and with it, under
+# pipefail, the pipeline.
+contains() { grep "$@" >/dev/null; }
+export -f in_node contains
 export NAME
 # Waits until the command succeeds.
 await() {
@@ -54,7 +59,8 @@ debs=("${PACKAGES_DIR}"/*.deb)
 log "building ${IMAGE}: Debian 13 with systemd"
 docker build -q -t "${IMAGE}" - >/dev/null <<'EOF'
 FROM debian:13
-RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv && \
+RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv \
+      iproute2 nftables && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
@@ -68,14 +74,14 @@ docker run -d --name "${NAME}" --privileged --cgroupns=private \
   --tmpfs /run --tmpfs /run/lock -v /var/lib/feos "${IMAGE}" >/dev/null
 # Some units fail in a container: degraded is up, too.
 await "systemd did not come up" bash -c \
-  "in_node systemctl is-system-running --wait | grep -qE '^(running|degraded)'"
+  "in_node systemctl is-system-running --wait | contains -E '^(running|degraded)'"
 
 log "installing ${debs[*]##*/}"
 docker cp "${PACKAGES_DIR}/." "${NAME}:/opt/packages/"
 in_node sh -c 'dpkg -i /opt/packages/*.deb' >/dev/null
 # Type=notify: active once feosd's listeners are bound.
 await "feosd is not active" in_node systemctl is-active feosd
-in_node feosctl host version-info | grep -q "FeOS Version" || fail "no version"
+in_node feosctl host version-info | contains "FeOS Version" || fail "no version"
 log "feosd is active and answers on its socket"
 
 [ "$(in_node stat -c '%G %a' /run/feos/api.sock)" = "feos 660" ] ||
@@ -91,7 +97,7 @@ vm_id=11111111-2222-3333-4444-555555555555
 in_node feosctl vm create-and-start --vm-id "${vm_id}" --memory 256 >/dev/null ||
   fail "no VM from the installed guest"
 await "the guest did not attach" bash -c \
-  "in_node feosctl vm info ${vm_id} | grep -q '(attached)'"
+  "in_node feosctl vm info ${vm_id} | contains '(attached)'"
 pid="$(in_node feosctl vm ping "${vm_id}" | sed -n 's/^ *PID: //p')"
 in_node grep -qx "${pid}" "/sys/fs/cgroup/system.slice/feosd.service/vms/${vm_id}/cgroup.procs" ||
   fail "Firecracker (pid ${pid}) is not in the VM's cgroup"
@@ -103,8 +109,8 @@ in_node systemctl restart feosd
 await "feosd did not come back" in_node systemctl is-active feosd
 in_node test -d "/proc/${pid}" || fail "the restart ended the VM"
 await "the restarted feosd does not take the VM over" bash -c \
-  "in_node feosctl vm ping ${vm_id} | grep -q 'PID: ${pid}'"
-in_node feosctl vm info "${vm_id}" | grep -q "State: Running" || fail "the VM is not running"
+  "in_node feosctl vm ping ${vm_id} | contains 'PID: ${pid}'"
+in_node feosctl vm info "${vm_id}" | contains "State: Running" || fail "the VM is not running"
 log "the VM outlived a restart of feosd, which took it over"
 
 if in_node feosctl host upgrade http://127.0.0.1/feosd 2>/tmp/upgrade.err; then
@@ -126,6 +132,58 @@ log "autoremove keeps the versions of Firecracker and the guest"
 in_node feosctl vm delete "${vm_id}" >/dev/null
 in_node test ! -e "/sys/fs/cgroup/system.slice/feosd.service/vms/${vm_id}" ||
   fail "the VM's cgroup outlived it"
+
+# A pod's network: a TAP device and NAT on the node.
+in_node sh -c 'ip tuntap add pod0 mode tap && ip addr add 10.201.0.1/24 dev pod0 &&
+  ip link set pod0 up && echo 1 >/proc/sys/net/ipv4/ip_forward &&
+  nft add table ip feos-test &&
+  nft add chain ip feos-test post "{ type nat hook postrouting priority 100; }" &&
+  nft add rule ip feos-test post ip saddr 10.201.0.0/24 masquerade'
+pod=22222222-3333-4444-5555-666666666666
+pod_state() { in_node feosctl pod get "${pod}" | sed -n 's/^  State: //p'; }
+in_pod() { in_node feosctl container --pod "${pod}" exec main -- "$@"; }
+in_node feosctl pod create --pod-id "${pod}" --image docker.io/library/busybox:1.36 \
+  --tap pod0 --ipv4 10.201.0.2/24 --gateway 10.201.0.1 --dns 1.1.1.1 --wait \
+  -- sleep 3600 >/dev/null || fail "the pod did not come up: $(in_node feosctl pod get "${pod}")"
+in_node feosctl pod get "${pod}" | contains "main (docker.io/library/busybox:1.36): running" ||
+  fail "the pod's container does not run"
+[ "$(in_pod echo forwarded)" = forwarded ] || fail "no exec in the pod through feosd"
+in_node feosctl image --pod "${pod}" list | contains busybox || fail "the pod's images are not listed"
+if in_node feosctl container exec main -- true 2>/dev/null; then
+  fail "a call without the pod reached the pod"
+fi
+log "a pod pulled its image and runs; feosd forwards its services"
+
+in_node feosctl pod create --pod-id "${pod}" --image docker.io/library/busybox:1.36 \
+  --tap pod0 --ipv4 10.201.0.2/24 --gateway 10.201.0.1 --dns 1.1.1.1 -- sleep 3600 >/dev/null ||
+  fail "a create of the same pod again failed"
+if in_node feosctl pod create --pod-id "${pod}" --image docker.io/library/alpine:3 >/dev/null 2>&1; then
+  fail "a create of the pod with another spec went through"
+fi
+
+in_pod sh -c 'echo kept >/tmp/mark'
+in_node feosctl pod suspend "${pod}" >/dev/null || fail "no suspend"
+[ "$(pod_state)" = SUSPENDED ] || fail "the pod is $(pod_state), not suspended"
+in_node feosctl pod resume "${pod}" >/dev/null || fail "no resume"
+[ "$(in_pod cat /tmp/mark)" = kept ] || fail "the pod lost its memory in a suspend"
+log "a pod suspends and resumes with its containers"
+
+in_node systemctl restart feosd
+await "feosd did not come back" in_node systemctl is-active feosd
+[ "$(pod_state)" = RUNNING ] || fail "after a restart of feosd, the pod is $(pod_state)"
+[ "$(in_pod cat /tmp/mark)" = kept ] || fail "the pod did not outlive a restart of feosd"
+log "the pod outlived a restart of feosd"
+
+in_node feosctl pod stop "${pod}" >/dev/null || fail "no stop"
+[ "$(pod_state)" = STOPPED ] || fail "the pod is $(pod_state), not stopped"
+in_node feosctl pod start --wait "${pod}" >/dev/null || fail "the pod did not come up again"
+[ "$(in_pod echo again)" = again ] || fail "no exec after a start"
+log "a stopped pod comes up again"
+
+in_node feosctl pod delete "${pod}" >/dev/null
+in_node feosctl pod list | contains "${pod}" && fail "the pod outlived its delete"
+in_node feosctl vm list | contains "${pod}" && fail "the pod's microVM outlived its delete"
+log "a pod is deleted with its microVM"
 
 in_node dpkg -r feosd >/dev/null
 if in_node systemctl is-active feosd >/dev/null 2>&1; then fail "feosd runs after its removal"; fi

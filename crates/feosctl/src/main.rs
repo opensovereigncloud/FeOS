@@ -8,6 +8,7 @@ mod container_commands;
 mod forward_commands;
 mod host_commands;
 mod image_commands;
+mod pod_commands;
 mod tool_commands;
 mod transport;
 mod vm_commands;
@@ -23,6 +24,8 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Service {
     Vm(vm_commands::VmArgs),
+    /// Pods: a microVM and its containers
+    Pod(pod_commands::PodArgs),
     Host(host_commands::HostArgs),
     Image(image_commands::ImageArgs),
     Container(container_commands::ContainerArgs),
@@ -45,6 +48,7 @@ async fn main() -> Result<()> {
 
     match cli.service {
         Service::Vm(args) => vm_commands::handle_vm_command(args).await?,
+        Service::Pod(args) => pod_commands::handle_pod_command(args).await?,
         Service::Host(args) => host_commands::handle_host_command(args).await?,
         Service::Image(args) => image_commands::handle_image_command(args).await?,
         Service::Container(args) => container_commands::handle_container_command(args).await?,

@@ -1,0 +1,23 @@
+[package]
+name = "pod-service"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-proto = { workspace = true }
+feos-utils = { workspace = true }
+vm-service = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tower = { workspace = true }
+uuid = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 format!("{proto_dir}/feos/vm/v1/vm.proto"),
+                format!("{proto_dir}/feos/pod/v1/pod.proto"),
                 format!("{proto_dir}/feos/host/v1/host.proto"),
                 format!("{proto_dir}/feos/image/v1/image.proto"),
                 format!("{proto_dir}/feos/container/v1/container.proto"),

@@ -9,6 +9,7 @@ members = [
     "crates/services/forward-service",
     "crates/services/host-service",
     "crates/services/image-service",
+    "crates/services/pod-service",
     "crates/services/task-service",
     "crates/services/tool-service",
     "crates/services/watch-service",
@@ -72,6 +73,7 @@ container-service = { path = "crates/services/container-service" }
 forward-service = { path = "crates/services/forward-service" }
 host-service = { path = "crates/services/host-service" }
 image-service = { path = "crates/services/image-service" }
+pod-service = { path = "crates/services/pod-service" }
 task-service = { path = "crates/services/task-service" }
 tool-service = { path = "crates/services/tool-service" }
 watch-service = { path = "crates/services/watch-service" }

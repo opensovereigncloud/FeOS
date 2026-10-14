@@ -61,6 +61,7 @@ On a distribution all of this is the operating system's
 
 | Path | Holds |
 |---|---|
+| `/var/lib/feos/pods/<id>.pb` | a pod: its spec, its state and why (a `feos.pod.v1.PodInfo`) |
 | `/var/lib/feos/vms.db` | the VM records (SQLite) |
 | `/var/lib/feos/vms/firecracker/<id>/` | the VM's jail: `jail.json` and the chroot `root/` |
 | `/var/lib/feos/images/` | pulled images, a `metadata.json` each |
@@ -72,6 +73,36 @@ On a distribution all of this is the operating system's
 
 `/var/lib/feos` is a tmpfs when FeOS is the node's operating system and a
 directory on disk on a distribution.
+
+## A pod
+
+A pod ([ADR 0004](../adr/0004-pods.md)) is a microVM of the VM service
+with the pod's ID, booted from the newest installed guest, and the
+containers its spec names, which the guest runs with the names as their
+IDs. Its spec gives vCPUs and memory, the containers (image, command,
+environment) and a network: a TAP device the caller made, and the guest's
+address, gateway and resolvers. The microVM has a balloon with free page
+reporting.
+
+- **Create** records the pod as `PENDING` and brings it up in the
+  background: create and start the microVM, wait for the guest to attach
+  (60 s at most), then create (which pulls) and start the containers, in
+  order. The pod is then `RUNNING`, or `FAILED` with the reason. Each step
+  looks at what is there first, so a bring-up that a restart of `feosd`
+  cut off is taken up again where it ended. A create with the ID of a pod
+  that exists returns that pod if the spec is the same, and fails with
+  `ALREADY_EXISTS` if not.
+- **Stop** ends a bring-up, shuts the microVM down, or removes it if it
+  does not go or is not running; **Start** brings a stopped or failed pod
+  up anew. A pod has no disk yet: what its containers wrote is gone.
+- **Suspend** and **Resume** suspend and resume the microVM, with
+  `purge_guest`; the containers come back as they were.
+- **Delete** ends a bring-up and removes the microVM and the record.
+- A running pod whose microVM crashes is `FAILED`; one whose microVM stops
+  is `STOPPED`.
+
+What changes a pod runs under a lock of the pod's. `GetPod` asks the guest
+for the containers' states while the pod runs.
 
 ## A VM
 

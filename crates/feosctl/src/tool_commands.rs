@@ -20,6 +20,10 @@ pub struct ToolArgs {
     )]
     pub address: String,
 
+    /// A pod on the node at the address: the calls go to its guest.
+    #[arg(long, global = true, env = "FEOS_POD")]
+    pub pod: Option<String>,
+
     /// The container whose root the paths are in.
     #[arg(short, long, global = true, default_value = "main")]
     pub container: String,
@@ -70,7 +74,9 @@ pub enum ToolCommand {
 }
 
 pub async fn handle_tool_command(args: ToolArgs) -> Result<()> {
-    let mut client = ToolServiceClient::new(crate::transport::channel(&args.address).await?);
+    let mut client = ToolServiceClient::new(
+        crate::transport::connect(&args.address, args.pod.as_deref()).await?,
+    );
     let container = args.container;
     let error = match args.command {
         ToolCommand::Read {

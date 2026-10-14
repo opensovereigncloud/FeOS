@@ -25,6 +25,8 @@ crates/
     host-service/       host information, logs, power, upgrade, time, network
                         push, filesystem freezing, memory
     image-service/      OCI image pulls and the image store
+    pod-service/        pods on top of the VM service, and the forwarding
+                        of a pod's services to its guest
     task-service/       the container runtime (libcontainer), its own process
     vm-service/         VMs through a Hypervisor trait (Firecracker, jailed):
                         snapshots, balloon, the guest's uplink and pushes
@@ -41,9 +43,9 @@ docs/                   documentation and ADRs
 Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
 
 - **`feosd`** (`crates/feos`, feature `host`, the default): the node agent,
-  under systemd or `feos-host-init`, never PID 1. It runs the VM service
-  and serves the public API on `/run/feos/api.sock`, and on TCP with
-  `--tcp`. VMs run in Firecracker, in its jailer
+  under systemd or `feos-host-init`, never PID 1. It runs the VM and pod
+  services and serves the public API on `/run/feos/api.sock`, and on TCP
+  with `--tcp`. VMs run in Firecracker, in its jailer
   ([ADR 0005](adr/0005-firecracker.md),
   [ADR 0008](adr/0008-suspend-and-restore.md)).
 - **`feos-guest`** (`crates/feos`, `--no-default-features --features

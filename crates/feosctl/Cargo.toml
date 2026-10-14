@@ -23,6 +23,7 @@ tower = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 env_logger = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 
 # CLI specific dependencies
 crossterm = "0.29"

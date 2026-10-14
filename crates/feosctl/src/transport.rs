@@ -6,13 +6,53 @@
 //! - `unix:/run/feos/api.sock`: the local API socket, the default;
 //! - `http://[::1]:1337`: the API of a node on TCP (`feosd --tcp`);
 //! - `vsock:/path/to/v.sock`: a guest behind a Firecracker vsock socket.
+//!
+//! With `--pod <id>`, the calls to a node carry the metadata `feos-pod-id`,
+//! and feosd forwards them to that pod's guest (ADR 0004).
 
 use anyhow::{Context, Result};
 use hyper_util::rt::TokioIo;
 use std::path::PathBuf;
+use std::task::{Context as TaskContext, Poll};
 use tokio::net::UnixStream;
+use tonic::body::Body;
+use tonic::codegen::http::{HeaderValue, Request, Response};
 use tonic::transport::{Channel, Endpoint, Uri};
-use tower::service_fn;
+use tower::{service_fn, Service};
+
+/// A connection whose calls name a pod, if one is given.
+#[derive(Clone)]
+pub struct Conn {
+    channel: Channel,
+    pod: Option<HeaderValue>,
+}
+
+pub async fn connect(address: &str, pod: Option<&str>) -> Result<Conn> {
+    let pod = pod
+        .map(|pod| HeaderValue::from_str(pod).with_context(|| format!("Invalid pod ID {pod}")))
+        .transpose()?;
+    Ok(Conn {
+        channel: channel(address).await?,
+        pod,
+    })
+}
+
+impl Service<Request<Body>> for Conn {
+    type Response = Response<Body>;
+    type Error = tonic::transport::Error;
+    type Future = <Channel as Service<Request<Body>>>::Future;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        self.channel.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        if let Some(pod) = &self.pod {
+            request.headers_mut().insert("feos-pod-id", pod.clone());
+        }
+        self.channel.call(request)
+    }
+}
 
 pub async fn channel(address: &str) -> Result<Channel> {
     if let Some(path) = address.strip_prefix("vsock:") {

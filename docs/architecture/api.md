@@ -9,6 +9,7 @@ plane, and between `feosd` and `feos-guest`. They live in
 
 | Package | What it is for | Served by today |
 |---|---|---|
+| `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, events | `feosd` |
 | `feos.vm.v1` | VMs: create, start, shut down, pause, suspend, resume, balloon, console, events | `feosd` |
 | `feos.container.v1` | containers: create, start, stop, delete, exec, logs, events | `feosd`, `feos-guest` |
 | `feos.image.v1` | OCI image pulls and the image store | `feosd`, `feos-guest` |
@@ -26,9 +27,8 @@ Decided, not built:
   `SetNetworkConfig`, `GetNetworkConfig`, `FreezeFilesystem`,
   `ThawFilesystem` and `PreparePause` out of `HostService`; only
   `feos-guest` serves it ([ADR 0007](../adr/0007-guest.md)).
-- `feos.pod.v1.PodService` replaces `feos.vm.v1` for clients, and a pod's
-  guest services are reached through `feosd` with the metadata
-  `feos-pod-id` ([ADR 0004](../adr/0004-pods.md), proposed).
+- `feos.vm.v1` on a socket of its own, for operators
+  ([ADR 0004](../adr/0004-pods.md)).
 
 ## Listeners
 
@@ -36,7 +36,7 @@ On a node (`feosd`):
 
 | Listener | Services |
 |---|---|
-| `/run/feos/api.sock`, and TCP with `--tcp` | Vm, Container, Host, Image |
+| `/run/feos/api.sock`, and TCP with `--tcp` | Pod, Vm, Container, Host, Image; and a pod's Container, Image, Tool and Watch |
 | `/run/feos/image.sock` | Image, internal |
 | `/run/feos/task.sock` | Task, internal, in the task service process |
 | `<vm dir>/v.sock_10001`, per VM | Lifecycle, for the guest's uplink |
@@ -50,6 +50,12 @@ In a pod (`feos-guest`):
 
 The guest dials the host on vsock port 10001 (the uplink) and pipes
 Kubernetes and SSH connections to vsock ports 10002 and 10003.
+
+A call to `feosd` that carries the metadata `feos-pod-id` goes unchanged
+to that pod's guest, on vsock port 10000, if it is for the guest's
+Container, Image, Tool or Watch service and the pod is pending or running
+([ADR 0004](../adr/0004-pods.md)); for any other service it fails with
+`UNIMPLEMENTED`. `feosctl` sends it with `--pod <id>`.
 
 Every public listener serves the same services. TCP has no
 authentication; `feos-host-init` starts `feosd` with `--tcp [::]:1337`.

@@ -20,6 +20,10 @@ pub struct WatchArgs {
     )]
     pub address: String,
 
+    /// A pod on the node at the address: the calls go to its guest.
+    #[arg(long, global = true, env = "FEOS_POD")]
+    pub pod: Option<String>,
+
     /// The container whose root the paths are in.
     #[arg(short, long, default_value = "main")]
     pub container: String,
@@ -30,7 +34,9 @@ pub struct WatchArgs {
 }
 
 pub async fn handle_watch_command(args: WatchArgs) -> Result<()> {
-    let mut client = WatchServiceClient::new(crate::transport::channel(&args.address).await?);
+    let mut client = WatchServiceClient::new(
+        crate::transport::connect(&args.address, args.pod.as_deref()).await?,
+    );
     let (tx, rx) = tokio::sync::mpsc::channel(4);
     tx.send(WatchRequest {
         frame: Some(watch_request::Frame::Open(Open {

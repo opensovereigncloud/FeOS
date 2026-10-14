@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::transport::Conn;
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use feos_proto::image_service::{
@@ -8,7 +9,6 @@ use feos_proto::image_service::{
     PullImageRequest, WatchImageStatusRequest,
 };
 use tokio_stream::StreamExt;
-use tonic::transport::Channel;
 
 #[derive(Args, Debug)]
 pub struct ImageArgs {
@@ -20,6 +20,10 @@ pub struct ImageArgs {
         default_value = "unix:/run/feos/api.sock"
     )]
     pub address: String,
+
+    /// A pod on the node at the address: the calls go to its guest.
+    #[arg(long, global = true, env = "FEOS_POD")]
+    pub pod: Option<String>,
 
     #[command(subcommand)]
     command: ImageCommand,
@@ -50,7 +54,9 @@ pub enum ImageCommand {
 }
 
 pub async fn handle_image_command(args: ImageArgs) -> Result<()> {
-    let mut client = ImageServiceClient::new(crate::transport::channel(&args.address).await?);
+    let mut client = ImageServiceClient::new(
+        crate::transport::connect(&args.address, args.pod.as_deref()).await?,
+    );
 
     match args.command {
         ImageCommand::Pull { image_ref } => pull_image(&mut client, image_ref).await?,
@@ -62,7 +68,7 @@ pub async fn handle_image_command(args: ImageArgs) -> Result<()> {
     Ok(())
 }
 
-async fn pull_image(client: &mut ImageServiceClient<Channel>, image_ref: String) -> Result<()> {
+async fn pull_image(client: &mut ImageServiceClient<Conn>, image_ref: String) -> Result<()> {
     println!("Requesting image pull for: {image_ref}...");
     let request = PullImageRequest {
         image_ref,
@@ -77,7 +83,7 @@ async fn pull_image(client: &mut ImageServiceClient<Channel>, image_ref: String)
     Ok(())
 }
 
-async fn list_images(client: &mut ImageServiceClient<Channel>) -> Result<()> {
+async fn list_images(client: &mut ImageServiceClient<Conn>) -> Result<()> {
     let request = ListImagesRequest {};
     let response = client.list_images(request).await?.into_inner();
     if response.images.is_empty() {
@@ -99,7 +105,7 @@ async fn list_images(client: &mut ImageServiceClient<Channel>) -> Result<()> {
     Ok(())
 }
 
-async fn watch_image(client: &mut ImageServiceClient<Channel>, image_uuid: String) -> Result<()> {
+async fn watch_image(client: &mut ImageServiceClient<Conn>, image_uuid: String) -> Result<()> {
     println!("Watching status for image: {image_uuid}. Press Ctrl+C to stop.");
     let request = WatchImageStatusRequest {
         image_uuid: image_uuid.clone(),
@@ -130,7 +136,7 @@ async fn watch_image(client: &mut ImageServiceClient<Channel>, image_uuid: Strin
     Ok(())
 }
 
-async fn delete_image(client: &mut ImageServiceClient<Channel>, image_uuid: String) -> Result<()> {
+async fn delete_image(client: &mut ImageServiceClient<Conn>, image_uuid: String) -> Result<()> {
     let request = DeleteImageRequest {
         image_uuid: image_uuid.clone(),
     };

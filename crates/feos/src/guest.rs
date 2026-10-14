@@ -73,7 +73,7 @@ impl GuestServices {
         }
     }
 
-    pub(crate) fn add_to(&self, router: Router) -> Router {
+    pub(crate) fn add_to<L>(&self, router: Router<L>) -> Router<L> {
         router
             .add_service(self.tool.clone())
             .add_service(self.watch.clone())

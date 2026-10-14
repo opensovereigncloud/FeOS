@@ -4,6 +4,9 @@
 pub mod vm_service {
     tonic::include_proto!("feos.vm.v1");
 }
+pub mod pod_service {
+    tonic::include_proto!("feos.pod.v1");
+}
 pub mod host_service {
     tonic::include_proto!("feos.host.v1");
 }

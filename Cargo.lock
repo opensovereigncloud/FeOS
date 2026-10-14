@@ -909,6 +909,7 @@ dependencies = [
  "libc",
  "log",
  "nix 0.30.1",
+ "pod-service",
  "prost",
  "task-service",
  "tempfile",
@@ -986,6 +987,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower",
+ "uuid",
 ]
 
 [[package]]
@@ -2704,6 +2706,24 @@ dependencies = [
  "pnet_base",
  "pnet_packet",
  "pnet_sys",
+]
+
+[[package]]
+name = "pod-service"
+version = "0.6.0"
+dependencies = [
+ "feos-proto",
+ "feos-utils",
+ "log",
+ "prost",
+ "prost-types",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "uuid",
+ "vm-service",
 ]
 
 [[package]]
