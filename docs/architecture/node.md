@@ -26,7 +26,9 @@ Parts that are decided but not built are marked as such.
 
 `feos-host-init` moves its root off the initramfs, mounts `/proc`, `/sys`,
 `/dev`, `/dev/pts`, `/run`, a tmpfs at `/var/lib/feos` and the cgroup
-filesystem, configures hugepages and SR-IOV VFs, configures the network
+filesystem, reserves hugepages (1024 of 2 MiB, in at most a quarter of
+the memory, unless the kernel's command line has `hugepages=`), configures
+SR-IOV VFs, configures the network
 from router advertisements and DHCPv6, and keeps the clock with NTP from
 the servers DHCPv6 names. It takes Ctrl-Alt-Del over (a SIGINT makes it
 sync and reboot), reboots on `SIGRTMIN+5` and powers off on `SIGRTMIN+4`,

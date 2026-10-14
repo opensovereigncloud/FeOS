@@ -81,7 +81,7 @@ under it, and powers the container off through `feosctl host shutdown`.
 For detailed instructions, please see the **[Nested Virtualization Test Environment Setup Guide](../docs/guides/test-environment.md)**.
 
 ## Firecracker
-To boot the host image under [Firecracker](https://firecracker-microvm.github.io/) (`make firecracker`), give it a configuration like this one. Firecracker has no nested virtualization, so FeOS cannot run VMs in there. FeOS takes 2 GiB for huge pages at boot, so the VM needs more memory than that.
+To boot the host image under [Firecracker](https://firecracker-microvm.github.io/) (`make firecracker`), give it a configuration like this one. Firecracker has no nested virtualization, so FeOS cannot run VMs in there. FeOS reserves up to 2 GiB of huge pages at boot, in at most a quarter of the memory; `hugepages=` on the kernel's command line sets the number instead.
 
     sudo ip tuntap add mode tap name tap0
     sudo ip link set tap0 up

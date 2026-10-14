@@ -9,7 +9,17 @@ use tokio::fs;
 const HUGEPAGE_FS_TYPE: &[u8] = b"hugetlbfs";
 const HUGEPAGE_MOUNT_POINT: &str = "/dev/hugepages";
 
-pub async fn configure_hugepages(num_pages: u32) -> io::Result<()> {
+/// Reserves `num_pages` hugepages, or leaves the kernel's reservation as it
+/// is if None, and mounts hugetlbfs.
+pub async fn configure_hugepages(num_pages: Option<u32>) -> io::Result<()> {
+    match num_pages {
+        Some(num_pages) => reserve_hugepages(num_pages).await?,
+        None => info!("The kernel's command line reserves the hugepages"),
+    }
+    mount_hugepages().await
+}
+
+async fn reserve_hugepages(num_pages: u32) -> io::Result<()> {
     let nr_hugepages_path = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
 
     info!("Attempting to allocate {num_pages} hugepages...");
@@ -26,7 +36,10 @@ pub async fn configure_hugepages(num_pages: u32) -> io::Result<()> {
     } else {
         info!("System successfully allocated {allocated_pages} hugepages.");
     }
+    Ok(())
+}
 
+async fn mount_hugepages() -> io::Result<()> {
     if !is_mounted(HUGEPAGE_MOUNT_POINT).await {
         info!("Mounting hugetlbfs at {HUGEPAGE_MOUNT_POINT}...");
         fs::create_dir_all(HUGEPAGE_MOUNT_POINT).await?;
