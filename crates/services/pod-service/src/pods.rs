@@ -415,6 +415,9 @@ impl Pods {
 
     async fn wait_for_guest(&self, pod_id: &str) -> Result<(), Status> {
         let deadline = Instant::now() + GUEST_TIMEOUT;
+        // The VM service records the start of a microVM after StartVm
+        // returns: until it runs, a stopped one has not started yet.
+        let mut started = false;
         loop {
             let vm = self
                 .vm(pod_id)
@@ -429,7 +432,8 @@ impl Pods {
                 }
                 return Ok(());
             }
-            if matches!(vm.state(), VmState::Stopped | VmState::Crashed) {
+            started |= vm.state() == VmState::Running;
+            if started && matches!(vm.state(), VmState::Stopped | VmState::Crashed) {
                 return Err(Status::aborted(format!(
                     "the microVM ended while it booted: {}",
                     vm.state().as_str_name()
@@ -437,8 +441,9 @@ impl Pods {
             }
             if Instant::now() >= deadline {
                 return Err(Status::deadline_exceeded(format!(
-                    "the guest did not attach within {}s",
-                    GUEST_TIMEOUT.as_secs()
+                    "the guest did not attach within {}s; the microVM is {}",
+                    GUEST_TIMEOUT.as_secs(),
+                    vm.state().as_str_name()
                 )));
             }
             sleep(POLL).await;
