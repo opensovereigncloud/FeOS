@@ -6,6 +6,7 @@ include hack/initramfs/make.mk
 include hack/uki/make.mk
 include hack/firecracker/make.mk
 include hack/guest/make.mk
+include hack/packages/make.mk
 
 container-release:
 #	make cargo index cache

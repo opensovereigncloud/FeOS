@@ -152,3 +152,44 @@ the ones in `PATH`; `jail.json` records which. A restore runs what the
 snapshot's boot ran, and fails with `FAILED_PRECONDITION` if that is not
 installed any more. The tests download Firecracker v1.17.0, pinned by
 sha256.
+
+## Packages
+
+On Debian 13 and Garden Linux, `feosd` and what it runs come as `.deb`
+packages from https://apt.fecode.dev
+([ADR 0009](../adr/0009-node-os-and-packages.md)):
+
+| Package | Contents |
+|---|---|
+| `feosd` | `/usr/sbin/feosd`, `feosd.service`, the group `feos` (sysusers), `/etc/default/feosd` |
+| `feosctl` | `/usr/bin/feosctl` |
+| `feos-firecracker-<version>` | `/usr/lib/feos/firecracker/<version>/{firecracker,jailer}` |
+| `feos-guest-<version>` | `/usr/lib/feos/guest/<version>/{vmlinuz,initramfs}` |
+| `feos-firecracker`, `feos-guest` | nothing; they depend on the newest versioned package |
+
+`feosd` depends on `feos-firecracker` and `feos-guest`, which depend on the
+newest versioned packages, as `linux-image-amd64` does on the newest
+kernel: an upgrade installs a new Firecracker or guest beside the old
+ones, which the VMs booted with them keep using.
+
+`feosd.service` is `Type=notify`, with `Delegate=yes`,
+`DelegateSubgroup=feosd` and `KillMode=process`: a restart or an upgrade
+stops `feosd` alone, and the next one takes the VMs over.
+`StateDirectory=feos` makes `/var/lib/feos` a directory on disk.
+`FEOSD_ARGS` in `/etc/default/feosd` passes options, such as `--tcp`.
+Installing the package enables the unit the first time and starts it, or
+restarts it after an upgrade, whenever it is enabled; removing the package
+stops the unit; purging it disables the unit. `/var/lib/feos` stays.
+
+The repository has one suite, `stable`, with the component `main`, and is
+signed by its own key:
+
+    curl -fsSL https://apt.fecode.dev/feos.gpg -o /usr/share/keyrings/feos.gpg
+    echo 'deb [signed-by=/usr/share/keyrings/feos.gpg] https://apt.fecode.dev stable main' \
+      > /etc/apt/sources.list.d/feos.list
+    apt-get update && apt-get install feosd feosctl
+
+`make publish-apt` builds the packages of `HEAD` as
+`<version>~dev.<UTC time>.<commit>`, below the release they lead to, and
+`hack/packages/publish-apt` uploads them to the bucket behind the
+repository, keeping what was published before.

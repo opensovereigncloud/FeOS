@@ -1,0 +1,5 @@
+# Arguments of feosd (feosd.service). For example, to serve the API on TCP
+# too, without authentication, for a lab:
+#
+#   FEOSD_ARGS="--tcp [::]:1337"
+FEOSD_ARGS=""

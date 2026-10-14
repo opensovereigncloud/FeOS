@@ -1,0 +1,19 @@
+# nfpm configuration of feos-firecracker, which depends on the newest
+# Firecracker package, as linux-image-amd64 does on the newest kernel: an
+# upgrade installs a new version beside the old ones.
+name: feos-firecracker
+arch: amd64
+platform: linux
+version: ${FIRECRACKER_VERSION}
+section: admin
+priority: optional
+maintainer: IronCore authors <ospo@sap.com>
+vendor: SAP SE
+homepage: https://github.com/ironcore-dev/FeOS
+license: Apache-2.0
+description: |-
+  Firecracker for feosd (the newest version)
+  Depends on the newest feos-firecracker-<version> package. Older versions
+  stay installed for the VMs suspended with them.
+depends:
+  - feos-firecracker-${FIRECRACKER_VERSION}

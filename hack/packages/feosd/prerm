@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stops feosd when the package goes, not when it is upgraded. Its VMs keep
+# running (KillMode=process); delete them first.
+set -e
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl stop feosd.service || true
+fi

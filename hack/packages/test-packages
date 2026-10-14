@@ -1,0 +1,132 @@
+#!/bin/bash
+# Install the packages (make packages) on Debian 13 with systemd, in a
+# privileged container, and check feosd under systemd: its group and
+# socket, a VM from the installed guest and Firecracker, the VM's cgroup,
+# a restart that keeps the VM, the refused self-upgrade, removal, and a
+# power-off through PID 1.
+#
+#   hack/packages/test-packages
+#
+# Needs docker and /dev/kvm.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+PACKAGES_DIR="${REPO_ROOT}/target/packages"
+IMAGE="feos-test-packages"
+NAME="feos-test-packages"
+TIMEOUT=60
+
+log() { printf '[test-packages] %s\n' "$*"; }
+fail() {
+  log "FAIL: $*"
+  docker exec "${NAME}" journalctl -u feosd --no-pager -n 40 2>/dev/null || true
+  docker exec "${NAME}" sh -c 'for c in . system.slice system.slice/feosd.service; do
+    echo "$c: controllers $(cat /sys/fs/cgroup/$c/cgroup.controllers), subtree $(cat /sys/fs/cgroup/$c/cgroup.subtree_control)"
+  done; journalctl -b --no-pager | grep -i -E "controller|cgroup" | head -10' 2>/dev/null || true
+  exit 1
+}
+# Runs a command on the node. docker exec starts it in the root of the
+# container's cgroup namespace, which, unlike a host's root, may hold no
+# processes while systemd enables controllers below it: it moves into a
+# cgroup of its own first.
+in_node() {
+  docker exec "${NAME}" sh -c \
+    'mkdir -p /sys/fs/cgroup/exec && echo $$ >/sys/fs/cgroup/exec/cgroup.procs && exec "$@"' \
+    sh "$@"
+}
+export -f in_node
+export NAME
+# Waits until the command succeeds.
+await() {
+  local what="$1"
+  shift
+  for _ in $(seq $((TIMEOUT * 2))); do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  fail "${what}"
+}
+
+shopt -s nullglob
+debs=("${PACKAGES_DIR}"/*.deb)
+[ ${#debs[@]} -ge 6 ] || { log "missing packages; run make packages"; exit 1; }
+
+log "building ${IMAGE}: Debian 13 with systemd"
+docker build -q -t "${IMAGE}" - >/dev/null <<'EOF'
+FROM debian:13
+RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
+EOF
+
+cleanup() { docker rm -f "${NAME}" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+cleanup
+# /var/lib/feos is a volume: on a distribution it is on disk.
+docker run -d --name "${NAME}" --privileged --cgroupns=private \
+  --tmpfs /run --tmpfs /run/lock -v /var/lib/feos "${IMAGE}" >/dev/null
+# Some units fail in a container: degraded is up, too.
+await "systemd did not come up" bash -c \
+  "in_node systemctl is-system-running --wait | grep -qE '^(running|degraded)'"
+
+log "installing ${debs[*]##*/}"
+docker cp "${PACKAGES_DIR}/." "${NAME}:/opt/packages/"
+in_node sh -c 'dpkg -i /opt/packages/*.deb' >/dev/null
+# Type=notify: active once feosd's listeners are bound.
+await "feosd is not active" in_node systemctl is-active feosd
+in_node feosctl host version-info | grep -q "FeOS Version" || fail "no version"
+log "feosd is active and answers on its socket"
+
+[ "$(in_node stat -c '%G %a' /run/feos/api.sock)" = "feos 660" ] ||
+  fail "the API socket is not the group feos's"
+in_node useradd -m -G feos tester
+in_node su tester -c 'feosctl host hostname' >/dev/null || fail "a member of feos cannot use the API"
+log "the group feos may use the API socket"
+
+leaf="$(in_node sh -c 'cat /proc/$(systemctl show -P MainPID feosd)/cgroup')"
+[ "${leaf}" = "0::/system.slice/feosd.service/feosd" ] || fail "feosd runs in ${leaf}"
+
+vm_id=11111111-2222-3333-4444-555555555555
+in_node feosctl vm create-and-start --vm-id "${vm_id}" --memory 256 >/dev/null ||
+  fail "no VM from the installed guest"
+await "the guest did not attach" bash -c \
+  "in_node feosctl vm info ${vm_id} | grep -q '(attached)'"
+pid="$(in_node feosctl vm ping "${vm_id}" | sed -n 's/^ *PID: //p')"
+in_node grep -qx "${pid}" "/sys/fs/cgroup/system.slice/feosd.service/vms/${vm_id}/cgroup.procs" ||
+  fail "Firecracker (pid ${pid}) is not in the VM's cgroup"
+in_node grep -q '"firecracker":"/usr/lib/feos/firecracker/' \
+  "/var/lib/feos/vms/firecracker/${vm_id}/jail.json" || fail "the VM does not run the installed Firecracker"
+log "a VM from the installed guest runs, in system.slice/feosd.service/vms/${vm_id}"
+
+in_node systemctl restart feosd
+await "feosd did not come back" in_node systemctl is-active feosd
+in_node test -d "/proc/${pid}" || fail "the restart ended the VM"
+await "the restarted feosd does not take the VM over" bash -c \
+  "in_node feosctl vm ping ${vm_id} | grep -q 'PID: ${pid}'"
+in_node feosctl vm info "${vm_id}" | grep -q "State: Running" || fail "the VM is not running"
+log "the VM outlived a restart of feosd, which took it over"
+
+if in_node feosctl host upgrade http://127.0.0.1/feosd 2>/tmp/upgrade.err; then
+  fail "feosd took an upgrade without --self-upgrade"
+fi
+log "feosd refuses to replace its own binary"
+
+in_node feosctl vm delete "${vm_id}" >/dev/null
+in_node test ! -e "/sys/fs/cgroup/system.slice/feosd.service/vms/${vm_id}" ||
+  fail "the VM's cgroup outlived it"
+
+in_node dpkg -r feosd >/dev/null
+if in_node systemctl is-active feosd >/dev/null 2>&1; then fail "feosd runs after its removal"; fi
+in_node sh -c 'dpkg -i /opt/packages/feosd_*.deb' >/dev/null
+await "feosd is not active again" in_node systemctl is-active feosd
+log "removing the package stops feosd, installing it starts it"
+
+in_node feosctl host shutdown >/dev/null || true
+for _ in $(seq $((TIMEOUT * 2))); do
+  [ "$(docker inspect -f '{{.State.Running}}' "${NAME}")" = false ] && break
+  sleep 0.5
+done
+[ "$(docker inspect -f '{{.State.Running}}' "${NAME}")" = false ] || fail "systemd did not power off"
+log "Shutdown powers the node off through systemd"
+log "PASS"

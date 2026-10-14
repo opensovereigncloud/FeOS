@@ -1,0 +1,17 @@
+#!/bin/sh
+# feosd's group, and its unit: enabled on the first install, and started,
+# or restarted after an upgrade, whenever it is enabled. A restart keeps
+# the VMs running.
+set -e
+if [ "$1" = configure ]; then
+    systemd-sysusers feosd.conf >/dev/null 2>&1 || true
+    if [ -z "$2" ]; then
+        systemctl enable feosd.service >/dev/null 2>&1 || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if systemctl is-enabled --quiet feosd.service; then
+            systemctl restart feosd.service
+        fi
+    fi
+fi

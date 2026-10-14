@@ -59,6 +59,21 @@ pulls a busybox image in the guest and runs a container: exec, the tools,
 watches, port forwarding, kube and SSH offloading, and the adoption of the
 container after a reboot.
 
+## Packages
+
+The `.deb` packages of ADR 0009 build with nfpm, which `make packages`
+downloads, pinned by sha256 (`hack/packages/`):
+
+    make packages        # target/packages/*.deb: feosd, feosctl, Firecracker, the guest
+    make test-packages   # installs them on Debian 13 with systemd, in docker, and checks feosd
+    make publish-apt     # builds HEAD as a dev version and publishes it to apt.fecode.dev
+
+`make test-packages` boots a VM from the installed guest, restarts feosd
+under it, and powers the container off through `feosctl host shutdown`.
+`make publish-apt` reads the bucket's credentials from
+`~/.config/feos/apt/r2.env` and signs with the key in
+`~/.config/feos/apt/gnupg`; both stay on the machine that publishes.
+
 ## Nested Virtualization Test Environment
 
 `make test-vm` runs the integration tests of the `vm-service` against Firecracker, with feos-guest as the VM image. To run FeOS within a virtual machine that itself runs VMs, as on a real host, you need a special host setup involving nested virtualization and a set of network services to support the FeOS guest environment.

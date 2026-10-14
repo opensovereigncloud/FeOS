@@ -1,0 +1,19 @@
+# nfpm configuration of feos-guest, which depends on the newest guest
+# package, as linux-image-amd64 does on the newest kernel: an upgrade
+# installs a new version beside the old ones.
+name: feos-guest
+arch: amd64
+platform: linux
+version: ${GUEST_VERSION}
+section: admin
+priority: optional
+maintainer: IronCore authors <ospo@sap.com>
+vendor: SAP SE
+homepage: https://github.com/ironcore-dev/FeOS
+license: Apache-2.0
+description: |-
+  FeOS guest for feosd's microVMs (the newest version)
+  Depends on the newest feos-guest-<version> package. Older versions stay
+  installed for the VMs booted with them.
+depends:
+  - feos-guest-${GUEST_NAME} (= ${GUEST_VERSION})

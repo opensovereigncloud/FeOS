@@ -1,0 +1,27 @@
+[Unit]
+Description=FeOS node agent
+Documentation=https://github.com/ironcore-dev/FeOS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/default/feosd
+ExecStart=/usr/sbin/feosd $FEOSD_ARGS
+Restart=always
+RestartSec=1
+# feosd puts VMs into cgroups of their own below the unit's cgroup and runs
+# from the leaf feosd, since a cgroup whose children use controllers holds
+# no processes. A restart or an upgrade stops feosd alone: VMs and the task
+# service keep running, and the next feosd takes them over.
+Delegate=yes
+DelegateSubgroup=feosd
+KillMode=process
+# /var/lib/feos: images, VMs, snapshots. It stays when feosd stops.
+StateDirectory=feos
+LimitNOFILE=1048576
+TasksMax=infinity
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target
