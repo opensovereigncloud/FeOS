@@ -877,32 +877,43 @@ impl Hypervisor for FirecrackerAdapter {
     async fn shutdown_vm(&self, req: ShutdownVmRequest) -> Result<ShutdownVmResponse, VmmError> {
         let vm_id = req.vm_id.as_str();
         let mut exit = self.exit_watch(vm_id)?;
+        // An end that was asked for, which the caller reports: the health
+        // check must not report it too. It watches again if the guest
+        // stays.
+        let watched = self.exits().remove(vm_id);
         let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
         let keys = json!({"action_type": "SendCtrlAltDel"});
-        loop {
-            // A guest that is still booting has no keyboard driver yet and
-            // misses the keys: they are sent until it goes.
-            let sent = fc_api::request(&api_socket(vm_id), "PUT", "/actions", Some(&keys)).await;
-            if exit.borrow().is_some() {
-                break;
-            }
-            sent?;
-            let wait = CTRL_ALT_DEL_REPEAT
-                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-            if tokio::time::timeout(wait, exit.wait_for(Option::is_some))
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(VmmError::ApiOperationFailed(format!(
-                    "the guest did not shut down within {}s of Ctrl-Alt-Del",
-                    SHUTDOWN_TIMEOUT.as_secs()
-                )));
+        let ended = async {
+            loop {
+                // A guest that is still booting has no keyboard driver yet
+                // and misses the keys: they are sent until it goes.
+                let sent =
+                    fc_api::request(&api_socket(vm_id), "PUT", "/actions", Some(&keys)).await;
+                if exit.borrow().is_some() {
+                    return Ok(());
+                }
+                sent?;
+                let wait = CTRL_ALT_DEL_REPEAT
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                if tokio::time::timeout(wait, exit.wait_for(Option::is_some))
+                    .await
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(VmmError::ApiOperationFailed(format!(
+                        "the guest did not shut down within {}s of Ctrl-Alt-Del",
+                        SHUTDOWN_TIMEOUT.as_secs()
+                    )));
+                }
             }
         }
-        Ok(ShutdownVmResponse {})
+        .await;
+        if let (Err(_), Some(watched)) = (&ended, watched) {
+            self.exits().insert(vm_id.to_string(), watched);
+        }
+        ended.map(|()| ShutdownVmResponse {})
     }
 
     async fn pause_vm(&self, req: PauseVmRequest) -> Result<PauseVmResponse, VmmError> {

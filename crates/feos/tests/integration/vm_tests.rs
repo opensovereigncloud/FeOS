@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::fixtures::{
-    verify_vm_socket_cleanup, wait_for_guest_attached, wait_for_target_state, LoopDevice, VmGuard,
+    next_state_change, verify_vm_socket_cleanup, wait_for_guest_attached, wait_for_target_state,
+    LoopDevice, VmGuard,
 };
 use super::{ensure_server, get_image_service_client, get_public_clients, vm_test_image};
 use anyhow::{Context, Result};
@@ -315,12 +316,15 @@ async fn test_create_and_start_vm() -> Result<()> {
     info!("Sending StartVm request again for vm_id: {vm_id}");
     vm_client.start_vm(start_req).await?;
 
-    timeout(
-        Duration::from_secs(30),
-        wait_for_target_state(&mut stream, VmState::Running),
-    )
-    .await
-    .expect("Timed out waiting for VM to become running again")?;
+    // A shutdown is one Stopped: the next state is the boot's.
+    let next = timeout(Duration::from_secs(30), next_state_change(&mut stream))
+        .await
+        .expect("Timed out waiting for VM to become running again")?;
+    assert_eq!(
+        next.new_state,
+        VmState::Running as i32,
+        "Expected Running after the shutdown's Stopped, got {next:?}"
+    );
     info!("VM is in RUNNING state again");
 
     let guest = timeout(

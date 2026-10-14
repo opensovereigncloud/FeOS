@@ -94,6 +94,20 @@ pub async fn wait_for_target_state(
     ))
 }
 
+/// The next state change on the stream, whatever it is.
+pub async fn next_state_change(
+    stream: &mut tonic::Streaming<VmEvent>,
+) -> Result<VmStateChangedEvent> {
+    while let Some(event) = stream.next().await {
+        if let Some(data) = event?.data
+            && data.type_url == "type.googleapis.com/feos.vm.v1.VmStateChangedEvent"
+        {
+            return Ok(VmStateChangedEvent::decode(&*data.value)?);
+        }
+    }
+    Err(anyhow::anyhow!("Event stream ended"))
+}
+
 /// Waits until a FeOS guest attaches to its uplink; returns what it reported.
 pub async fn wait_for_guest_attached(stream: &mut tonic::Streaming<VmEvent>) -> Result<GuestInfo> {
     while let Some(event) = stream.next().await {
