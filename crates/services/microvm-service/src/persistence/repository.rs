@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::persistence::{PersistenceError, VmRecord, VmStatus};
-use feos_proto::vm_service::{VmConfig, VmState};
+use feos_proto::microvm::{VmConfig, VmState};
 use log::info;
 use prost::Message;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};

@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     prctl::set_child_subreaper(true).context("become a subreaper")?;
     feos_utils::reaper::spawn();
     match main_server::cgroup::enter_leaf() {
-        Ok(base) => vm_service::vmm::jail::set_cgroup_base(&base),
+        Ok(base) => microvm_service::vmm::jail::set_cgroup_base(&base),
         Err(e) => eprintln!("feosd: Failed to move into a leaf of its cgroup: {e}"),
     }
 

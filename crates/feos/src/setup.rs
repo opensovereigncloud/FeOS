@@ -21,6 +21,11 @@ use image_service::{
     worker::Orchestrator, IMAGE_DIR,
 };
 use log::{error, info};
+#[cfg(feature = "host")]
+use microvm_service::{
+    api::VmApiHandler, dispatcher::VmServiceDispatcher, Command as VmCommand, DEFAULT_VM_DB_URL,
+    VM_DIR,
+};
 use nix::libc;
 #[cfg(feature = "host")]
 use std::env;
@@ -32,11 +37,6 @@ use tokio::fs;
 #[cfg(feature = "host")]
 use tokio::fs::File;
 use tokio::sync::mpsc;
-#[cfg(feature = "host")]
-use vm_service::{
-    api::VmApiHandler, dispatcher::VmServiceDispatcher, Command as VmCommand, DEFAULT_VM_DB_URL,
-    VM_DIR,
-};
 
 #[cfg(feature = "host")]
 pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmApiHandler> {

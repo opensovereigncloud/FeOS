@@ -26,7 +26,7 @@ use feos_proto::lifecycle_service::lifecycle_service_server::{
     LifecycleService, LifecycleServiceServer,
 };
 use feos_proto::lifecycle_service::{Hello, HostMessage};
-use feos_proto::vm_service::{
+use feos_proto::microvm::{
     GuestAttachedEvent, GuestDetachedEvent, GuestInfo, GuestNetworkConfig, VmEvent,
 };
 use feos_utils::vsock::{API_PORT, UPLINK_PORT};
@@ -309,7 +309,7 @@ impl Guests {
             id: Uuid::new_v4().to_string(),
             component_id: "guest-uplink".to_string(),
             data: Some(Any {
-                type_url: format!("type.googleapis.com/feos.vm.v1.{type_name}"),
+                type_url: format!("type.googleapis.com/feos.microvm.v1.{type_name}"),
                 value: data,
             }),
         };

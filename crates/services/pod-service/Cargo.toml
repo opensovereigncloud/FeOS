@@ -9,7 +9,7 @@ workspace = true
 [dependencies]
 feos-proto = { workspace = true }
 feos-utils = { workspace = true }
-vm-service = { workspace = true }
+microvm-service = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }

@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod vm_service {
-    tonic::include_proto!("feos.vm.v1");
+/// Internal: between the pod service and the microVM layer, in feosd.
+pub mod microvm {
+    tonic::include_proto!("feos.microvm.v1");
 }
 pub mod pod_service {
     tonic::include_proto!("feos.pod.v1");

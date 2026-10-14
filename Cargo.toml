@@ -13,7 +13,7 @@ members = [
     "crates/services/task-service",
     "crates/services/tool-service",
     "crates/services/watch-service",
-    "crates/services/vm-service",
+    "crates/services/microvm-service",
 ]
 resolver = "3"
 
@@ -77,4 +77,4 @@ pod-service = { path = "crates/services/pod-service" }
 task-service = { path = "crates/services/task-service" }
 tool-service = { path = "crates/services/tool-service" }
 watch-service = { path = "crates/services/watch-service" }
-vm-service = { path = "crates/services/vm-service" }
+microvm-service = { path = "crates/services/microvm-service" }

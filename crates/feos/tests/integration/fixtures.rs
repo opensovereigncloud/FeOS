@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use log::{info, warn};
+use microvm_service::vm_dir;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::path::Path;
-use vm_service::vm_dir;
 
 /// Kills a pod's Firecracker and removes its directory if a test ends
 /// before it deleted the pod.

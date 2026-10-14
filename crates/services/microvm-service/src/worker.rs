@@ -7,7 +7,7 @@ use crate::{
 };
 use feos_proto::{
     image_service::{ImageState as OciImageState, WatchImageStatusRequest},
-    vm_service::{
+    microvm::{
         stream_vm_console_request as console_input, ConsoleData, CreateVmRequest, CreateVmResponse,
         DeleteVmRequest, DeleteVmResponse, PauseVmRequest, PauseVmResponse, PingVmRequest,
         PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse,
@@ -121,7 +121,7 @@ pub async fn handle_create_vm(
     crate::vmm::broadcast_state_change_event(
         &broadcast_tx,
         &vm_id,
-        "vm-service",
+        "microvm-service",
         VmStateChangedEvent {
             new_state: VmState::Creating as i32,
             reason: "VM creation process started".to_string(),
@@ -138,7 +138,7 @@ pub async fn handle_create_vm(
             crate::vmm::broadcast_state_change_event(
                 &broadcast_tx,
                 &vm_id,
-                "vm-service",
+                "microvm-service",
                 VmStateChangedEvent {
                     new_state: VmState::Crashed as i32,
                     reason: error_msg,
@@ -165,7 +165,7 @@ pub async fn handle_create_vm(
             crate::vmm::broadcast_state_change_event(
                 &broadcast_tx,
                 &vm_id,
-                "vm-service",
+                "microvm-service",
                 VmStateChangedEvent {
                     new_state: VmState::Created as i32,
                     reason: "Hypervisor process started and VM configured".to_string(),
@@ -180,7 +180,7 @@ pub async fn handle_create_vm(
             crate::vmm::broadcast_state_change_event(
                 &broadcast_tx,
                 &vm_id,
-                "vm-service",
+                "microvm-service",
                 VmStateChangedEvent {
                     new_state: VmState::Crashed as i32,
                     reason: error_msg,
@@ -223,7 +223,7 @@ pub async fn handle_start_vm(
         crate::vmm::broadcast_state_change_event(
             &broadcast_tx,
             &vm_id,
-            "vm-service",
+            "microvm-service",
             VmStateChangedEvent {
                 new_state: VmState::Running as i32,
                 reason: "Start command successful".to_string(),
@@ -365,7 +365,7 @@ pub async fn handle_shutdown_vm(
         crate::vmm::broadcast_state_change_event(
             &broadcast_tx,
             &vm_id,
-            "vm-service",
+            "microvm-service",
             VmStateChangedEvent {
                 new_state: VmState::Stopped as i32,
                 reason: "Shutdown command successful".to_string(),
@@ -393,7 +393,7 @@ pub async fn handle_pause_vm(
         crate::vmm::broadcast_state_change_event(
             &broadcast_tx,
             &vm_id,
-            "vm-service",
+            "microvm-service",
             VmStateChangedEvent {
                 new_state: VmState::Paused as i32,
                 reason: "Pause command successful".to_string(),
@@ -422,7 +422,7 @@ pub async fn handle_resume_vm(
         crate::vmm::broadcast_state_change_event(
             &broadcast_tx,
             &vm_id,
-            "vm-service",
+            "microvm-service",
             VmStateChangedEvent {
                 new_state: VmState::Running as i32,
                 reason: "Resume command successful".to_string(),
@@ -459,7 +459,7 @@ pub async fn handle_suspend_vm(
         crate::vmm::broadcast_state_change_event(
             &broadcast_tx,
             &vm_id,
-            "vm-service",
+            "microvm-service",
             VmStateChangedEvent {
                 new_state: VmState::Suspended as i32,
                 reason: format!(
@@ -493,7 +493,7 @@ pub async fn handle_restore_vm(
         crate::vmm::broadcast_state_change_event(
             &broadcast_tx,
             &vm_id,
-            "vm-service",
+            "microvm-service",
             VmStateChangedEvent {
                 new_state: VmState::Running as i32,
                 reason: "Restored from its snapshot".to_string(),

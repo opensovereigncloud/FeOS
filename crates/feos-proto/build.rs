@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .protoc_arg("--experimental_allow_proto3_optional")
         .compile_protos(
             &[
-                format!("{proto_dir}/feos/vm/v1/vm.proto"),
+                format!("{proto_dir}/feos/microvm/v1/microvm.proto"),
                 format!("{proto_dir}/feos/pod/v1/pod.proto"),
                 format!("{proto_dir}/feos/host/v1/host.proto"),
                 format!("{proto_dir}/feos/image/v1/image.proto"),

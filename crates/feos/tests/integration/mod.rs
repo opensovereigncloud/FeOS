@@ -11,6 +11,7 @@ use feos_proto::{
 use hyper_util::rt::TokioIo;
 use image_service::IMAGE_SERVICE_SOCKET;
 use log::{error, info};
+use microvm_service::vmm::installed::{FIRECRACKER_DIR, GUEST_DIR};
 use nix::sys::prctl;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,6 @@ use tokio::net::UnixStream;
 use tokio::sync::OnceCell as TokioOnceCell;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use vm_service::vmm::installed::{FIRECRACKER_DIR, GUEST_DIR};
 
 pub mod container_tests;
 pub mod fixtures;

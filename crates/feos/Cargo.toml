@@ -24,7 +24,7 @@ path = "src/lib.rs"
 
 [dependencies]
 feos-utils = { workspace = true }
-vm-service = { workspace = true, optional = true }
+microvm-service = { workspace = true, optional = true }
 pod-service = { workspace = true, optional = true }
 host-service = { workspace = true }
 image-service = { workspace = true }
@@ -51,7 +51,7 @@ libc = { workspace = true }
 [dev-dependencies]
 feos-utils = { workspace = true }
 uuid = { workspace = true }
-vm-service = { workspace = true }
+microvm-service = { workspace = true }
 image-service = { workspace = true }
 host-service = { workspace = true }
 anyhow = { workspace = true }
@@ -70,7 +70,7 @@ default = ["host"]
 git-version = ["feos-utils/git-version"]
 # feosd, the node agent: the VM and pod services, and the API on TCP if
 # asked.
-host = ["dep:vm-service", "dep:pod-service"]
+host = ["dep:microvm-service", "dep:pod-service"]
 # feos-guest, PID 1 in a pod's microVM. The API listens on vsock, the guest
 # tells the host when it is ready, and a data volume holds images and
 # containers.

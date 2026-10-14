@@ -10,7 +10,7 @@ use crate::{
 };
 use feos_proto::{
     image_service::{image_service_client::ImageServiceClient, PullImageRequest},
-    vm_service::{
+    microvm::{
         stream_vm_console_request as console_input, AttachConsoleMessage, CreateVmRequest,
         CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetBalloonRequest, GetBalloonResponse,
         GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest, PauseVmResponse,
@@ -35,7 +35,7 @@ use tonic::{
 use tower::service_fn;
 use uuid::Uuid;
 
-fn ensure_net_config_device_id(net_config: &mut feos_proto::vm_service::NetConfig) {
+fn ensure_net_config_device_id(net_config: &mut feos_proto::microvm::NetConfig) {
     if net_config.device_id.is_empty()
         && let Some(tap) = &net_config.tap
     {
@@ -290,9 +290,10 @@ pub(crate) async fn handle_stream_vm_events_command(
                 let initial_event = VmEvent {
                     vm_id: vm_id_str.clone(),
                     id: Uuid::new_v4().to_string(),
-                    component_id: "vm-service-db".to_string(),
+                    component_id: "microvm-service-db".to_string(),
                     data: Some(Any {
-                        type_url: "type.googleapis.com/feos.vm.v1.VmStateChangedEvent".to_string(),
+                        type_url: "type.googleapis.com/feos.microvm.v1.VmStateChangedEvent"
+                            .to_string(),
                         value: state_change_event.encode_to_vec(),
                     }),
                 };
@@ -353,9 +354,9 @@ pub(crate) async fn handle_stream_vm_events_command(
                     let initial_event = VmEvent {
                         vm_id: record.vm_id.to_string(),
                         id: Uuid::new_v4().to_string(),
-                        component_id: "vm-service-db".to_string(),
+                        component_id: "microvm-service-db".to_string(),
                         data: Some(Any {
-                            type_url: "type.googleapis.com/feos.vm.v1.VmStateChangedEvent"
+                            type_url: "type.googleapis.com/feos.microvm.v1.VmStateChangedEvent"
                                 .to_string(),
                             value: state_change_event.encode_to_vec(),
                         }),
@@ -812,7 +813,7 @@ pub(crate) async fn check_and_cleanup_vms(
             crate::vmm::broadcast_state_change_event(
                 &event_bus_tx,
                 &vm_id,
-                "vm-service",
+                "microvm-service",
                 VmStateChangedEvent {
                     new_state: VmState::Stopped as i32,
                     reason: "The snapshot was gone when the VM service started".to_string(),
@@ -847,7 +848,7 @@ pub(crate) async fn check_and_cleanup_vms(
             crate::vmm::broadcast_state_change_event(
                 &event_bus_tx,
                 &vm_id,
-                "vm-service",
+                "microvm-service",
                 VmStateChangedEvent {
                     new_state: VmState::Stopped as i32,
                     reason: "The VMM process was gone when the VM service started".to_string(),

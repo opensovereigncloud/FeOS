@@ -11,7 +11,6 @@ mod image_commands;
 mod pod_commands;
 mod tool_commands;
 mod transport;
-mod vm_commands;
 mod watch_commands;
 
 #[derive(Parser, Debug)]
@@ -23,7 +22,6 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Service {
-    Vm(vm_commands::VmArgs),
     /// Pods: a microVM and its containers
     Pod(pod_commands::PodArgs),
     Host(host_commands::HostArgs),
@@ -47,7 +45,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.service {
-        Service::Vm(args) => vm_commands::handle_vm_command(args).await?,
         Service::Pod(args) => pod_commands::handle_pod_command(args).await?,
         Service::Host(args) => host_commands::handle_host_command(args).await?,
         Service::Image(args) => image_commands::handle_image_command(args).await?,

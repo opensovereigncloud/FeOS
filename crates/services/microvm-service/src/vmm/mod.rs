@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::VmEventWrapper;
-use feos_proto::vm_service::{
+use feos_proto::microvm::{
     CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetBalloonResponse, GuestNetworkConfig,
     PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
     ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmEvent,
@@ -183,7 +183,7 @@ pub async fn broadcast_state_change_event(
         id: Uuid::new_v4().to_string(),
         component_id: component.to_string(),
         data: Some(Any {
-            type_url: "type.googleapis.com/feos.vm.v1.VmStateChangedEvent".to_string(),
+            type_url: "type.googleapis.com/feos.microvm.v1.VmStateChangedEvent".to_string(),
             value: data.encode_to_vec(),
         }),
     };

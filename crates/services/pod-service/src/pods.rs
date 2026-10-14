@@ -17,18 +17,20 @@ use feos_proto::container_service::{
     ContainerState as GuestContainerState, CreateContainerRequest, GetContainerRequest,
     ListContainersRequest, StartContainerRequest,
 };
-use feos_proto::pod_service::{
-    ContainerSpec, ContainerState, ContainerStatus, MicroVm, PodConsoleInput, PodConsoleOutput,
-    PodEvent, PodInfo, PodSpec, PodState,
-};
-use feos_proto::vm_service::{
-    stream_vm_console_request as console_request, vm_service_server::VmService,
+use feos_proto::microvm::{
+    micro_vm_service_server::MicroVmService, stream_vm_console_request as console_request,
     AttachConsoleMessage, ConsoleData, CreateVmRequest, DeleteVmRequest, GetVmRequest,
     PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest,
     StreamVmEventsRequest, SuspendVmRequest, VmEvent, VmInfo, VmState, VmStateChangedEvent,
 };
+use feos_proto::pod_service::{
+    ContainerSpec, ContainerState, ContainerStatus, MicroVm, PodConsoleInput, PodConsoleOutput,
+    PodEvent, PodInfo, PodSpec, PodState,
+};
 use feos_utils::vsock::{self, API_PORT};
 use log::{info, warn};
+use microvm_service::api::VmApiHandler;
+use microvm_service::vsock_path;
 use prost::Message;
 use std::collections::HashMap;
 use std::io;
@@ -41,8 +43,6 @@ use tokio::time::{sleep, timeout, Instant};
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
-use vm_service::api::VmApiHandler;
-use vm_service::vsock_path;
 
 /// How long a booting guest may take to attach.
 const GUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -613,7 +613,10 @@ impl Pods {
         let Some(data) = event.data else {
             return;
         };
-        if !data.type_url.ends_with("feos.vm.v1.VmStateChangedEvent") {
+        if !data
+            .type_url
+            .ends_with("feos.microvm.v1.VmStateChangedEvent")
+        {
             return;
         }
         let Ok(changed) = VmStateChangedEvent::decode(data.value.as_slice()) else {

@@ -15,7 +15,7 @@ use crate::{
     vmm::{factory, Hypervisor, VmmType},
     worker, Command, VmEventWrapper,
 };
-use feos_proto::vm_service::{VmState, VmStateChangedEvent};
+use feos_proto::microvm::{VmState, VmStateChangedEvent};
 use log::{debug, error, info};
 use prost::Message;
 use std::sync::Arc;

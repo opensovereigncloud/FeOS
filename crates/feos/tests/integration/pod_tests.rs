@@ -18,6 +18,8 @@ use feos_proto::pod_service::{
 };
 use feos_utils::vsock::API_PORT;
 use log::info;
+use microvm_service::vmm::jail::{self, tap};
+use microvm_service::{vm_dir, vsock_path};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::path::Path;
@@ -25,8 +27,6 @@ use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tonic::transport::Channel;
-use vm_service::vmm::jail::{self, tap};
-use vm_service::{vm_dir, vsock_path};
 
 /// The user a process runs as.
 fn process_uid(pid: i64) -> Result<u32> {

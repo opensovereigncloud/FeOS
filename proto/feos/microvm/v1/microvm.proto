@@ -1,14 +1,15 @@
 syntax = "proto3";
 
-package feos.vm.v1;
+package feos.microvm.v1;
 
 import "google/protobuf/any.proto";
 
-// VMService is a service that manages Firecracker microVMs. Each VM runs
-// in a Firecracker process of its own; the service hides the processes and
-// their API sockets, allowing a client to create, control, and delete
-// virtual machines without dealing with process management.
-service VMService {
+// The microVM layer of feosd: internal, between the pod service and the
+// pods' microVMs, in one process, and served on no socket (ADR 0004).
+// Clients run pods with feos.pod.v1. Each microVM runs in a Firecracker
+// process of its own, jailed; the layer hides the processes and their API
+// sockets.
+service MicroVmService {
   // Creates a new Virtual Machine but does not boot it.
   // This pulls the VM's image and prepares its configuration. The returned
   // 'vm_id' must be used for all subsequent operations on this VM.

@@ -3,10 +3,10 @@
 
 //! A pod's spec: what is valid, and the microVM it becomes.
 
-use feos_proto::pod_service::{PodSpec, Resources};
-use feos_proto::vm_service::{
+use feos_proto::microvm::{
     BalloonConfig, CpuConfig, GuestNetworkConfig, MemoryConfig, NetConfig, TapConfig, VmConfig,
 };
+use feos_proto::pod_service::{PodSpec, Resources};
 use std::collections::HashSet;
 use tonic::Status;
 use uuid::Uuid;

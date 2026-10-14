@@ -10,15 +10,12 @@ mod task_supervisor;
 
 use anyhow::{Context, Result};
 use container_service::api::ContainerApiHandler;
+#[cfg(feature = "host")]
+use feos_proto::pod_service::pod_service_server::PodServiceServer;
 use feos_proto::{
     container_service::container_service_server::ContainerServiceServer,
     host_service::host_service_server::HostServiceServer,
     image_service::image_service_server::ImageServiceServer,
-};
-#[cfg(feature = "host")]
-use feos_proto::{
-    pod_service::pod_service_server::PodServiceServer,
-    vm_service::vm_service_server::VmServiceServer,
 };
 use host_service::{api::HostApiHandler, RestartSignal};
 use image_service::{api::ImageApiHandler, IMAGE_SERVICE_SOCKET};
@@ -40,8 +37,6 @@ use tonic::transport::Server;
 use tower::layer::util::Identity;
 #[cfg(feature = "host")]
 use tower::layer::util::Stack;
-#[cfg(feature = "host")]
-use vm_service::api::VmApiHandler;
 
 /// The public gRPC API on a local Unix socket, served by feosd and
 /// feos-guest. feos-guest serves the same API on vsock, feosd on TCP if
@@ -117,9 +112,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     let vms = initialize_vm_service(&setup_database().await?).await?;
     let services = Services {
         #[cfg(feature = "host")]
-        pods: initialize_pod_service(vms.clone())?,
-        #[cfg(feature = "host")]
-        vm: VmServiceServer::new(vms),
+        pods: initialize_pod_service(vms)?,
         container: initialize_container_service().await?,
         host: initialize_host_service(options.self_upgrade.then_some(restart_tx), log_handle),
         image: initialize_image_service().await?,
@@ -230,8 +223,6 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
 /// The public API's services, one instance each for every listener.
 struct Services {
     #[cfg(feature = "host")]
-    vm: VmServiceServer<VmApiHandler>,
-    #[cfg(feature = "host")]
     pods: Pods,
     container: ContainerServiceServer<ContainerApiHandler>,
     host: HostServiceServer<HostApiHandler>,
@@ -257,9 +248,7 @@ impl Services {
             .add_service(self.host.clone())
             .add_service(self.image.clone());
         #[cfg(feature = "host")]
-        let router = router
-            .add_service(self.vm.clone())
-            .add_service(PodServiceServer::new(self.pods.clone()));
+        let router = router.add_service(PodServiceServer::new(self.pods.clone()));
         #[cfg(feature = "guest")]
         let router = self.guest.add_to(router);
         router

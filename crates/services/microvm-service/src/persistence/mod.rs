@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use feos_proto::vm_service::{VmConfig, VmState};
+use feos_proto::microvm::{VmConfig, VmState};
 use uuid::Uuid;
 
 pub mod repository;

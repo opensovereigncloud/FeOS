@@ -24,7 +24,7 @@
 
 use super::{fc_api, installed, jail, snapshot, Hypervisor, VmmError};
 use crate::{jail_dir, vm_dir, vsock_path, VmEventWrapper, VM_DIR};
-use feos_proto::vm_service::{
+use feos_proto::microvm::{
     BalloonStats, CreateVmRequest, DeleteVmRequest, DeleteVmResponse, GetBalloonResponse,
     PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest,
     ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmState,
@@ -1012,7 +1012,7 @@ impl Hypervisor for FirecrackerAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feos_proto::vm_service::{
+    use feos_proto::microvm::{
         BalloonConfig, CpuConfig, DiskConfig, MemoryConfig, NetConfig, TapConfig,
     };
 

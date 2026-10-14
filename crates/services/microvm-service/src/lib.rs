@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::VmServiceError;
-use feos_proto::vm_service::{
+use feos_proto::microvm::{
     CreateVmRequest, CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetBalloonRequest,
     GetBalloonResponse, GetVmRequest, ListVmsRequest, ListVmsResponse, PauseVmRequest,
     PauseVmResponse, PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse,

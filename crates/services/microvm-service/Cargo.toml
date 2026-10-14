@@ -1,5 +1,5 @@
 [package]
-name = "vm-service"
+name = "microvm-service"
 version.workspace = true
 edition.workspace = true
 

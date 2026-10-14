@@ -908,6 +908,7 @@ dependencies = [
  "image-service",
  "libc",
  "log",
+ "microvm-service",
  "nix 0.30.1",
  "pod-service",
  "prost",
@@ -920,7 +921,6 @@ dependencies = [
  "tool-service",
  "tower",
  "uuid",
- "vm-service",
  "watch-service",
 ]
 
@@ -2119,6 +2119,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "microvm-service"
+version = "0.6.0"
+dependencies = [
+ "feos-proto",
+ "feos-utils",
+ "hyper-util",
+ "image-service",
+ "libc",
+ "log",
+ "nix 0.30.1",
+ "prost",
+ "prost-types",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2716,6 +2740,7 @@ dependencies = [
  "feos-proto",
  "feos-utils",
  "log",
+ "microvm-service",
  "prost",
  "prost-types",
  "tempfile",
@@ -2724,7 +2749,6 @@ dependencies = [
  "tonic",
  "tower",
  "uuid",
- "vm-service",
 ]
 
 [[package]]
@@ -4433,30 +4457,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vm-service"
-version = "0.6.0"
-dependencies = [
- "feos-proto",
- "feos-utils",
- "hyper-util",
- "image-service",
- "libc",
- "log",
- "nix 0.30.1",
- "prost",
- "prost-types",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower",
- "uuid",
-]
 
 [[package]]
 name = "vsock"

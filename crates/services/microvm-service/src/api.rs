@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{Command, ConsoleInput};
-use feos_proto::vm_service::{
-    vm_service_server::VmService, CreateVmRequest, CreateVmResponse, DeleteVmRequest,
+use feos_proto::microvm::{
+    micro_vm_service_server::MicroVmService, CreateVmRequest, CreateVmResponse, DeleteVmRequest,
     DeleteVmResponse, GetBalloonRequest, GetBalloonResponse, GetVmRequest, ListVmsRequest,
     ListVmsResponse, PauseVmRequest, PauseVmResponse, PingVmRequest, PingVmResponse,
     ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
@@ -43,7 +43,7 @@ impl VmApiHandler {
 }
 
 #[tonic::async_trait]
-impl VmService for VmApiHandler {
+impl MicroVmService for VmApiHandler {
     type StreamVmEventsStream = Pin<Box<dyn Stream<Item = Result<VmEvent, Status>> + Send>>;
     type StreamVmConsoleStream =
         Pin<Box<dyn Stream<Item = Result<StreamVmConsoleResponse, Status>> + Send>>;
