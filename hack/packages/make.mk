@@ -4,12 +4,24 @@ NFPM = target/nfpm/nfpm
 PACKAGES_DIR = target/packages
 # The guest's version in a package name, which takes no ~.
 GUEST_NAME = $(subst ~,-,$(GUEST_VERSION))
+# The times of the files in a package: the last commit that changed what
+# it holds, so that a rebuild of a published version is the same file,
+# which publish-apt requires. Firecracker's packages change with its
+# version and their configuration, the others with every commit.
+SOURCE_EPOCH = $(shell git log -1 --format=%ct)
+FIRECRACKER_EPOCH = $(shell git log -1 --format=%ct -- hack/firecracker \
+	hack/packages/feos-firecracker.yaml hack/packages/feos-firecracker-meta.yaml)
 
 .PHONY: packages package-binaries
 
 packages: firecracker guest package-binaries $(NFPM) ## Build the .deb packages into target/packages/ (ADR 0009).
 	mkdir -p $(PACKAGES_DIR)
 	for package in feosd feosctl feos-firecracker feos-firecracker-meta feos-guest feos-guest-meta; do \
+		case $$package in \
+			feos-firecracker*) epoch=$(FIRECRACKER_EPOCH) ;; \
+			*) epoch=$(SOURCE_EPOCH) ;; \
+		esac; \
+		SOURCE_DATE_EPOCH=$$epoch \
 		FEOS_VERSION=$(FEOS_VERSION) GUEST_VERSION=$(GUEST_VERSION) GUEST_NAME=$(GUEST_NAME) \
 		FIRECRACKER_VERSION=$(FIRECRACKER_VERSION) \
 		MUSL_RELEASE=target/$(MUSL_TARGET)/release \

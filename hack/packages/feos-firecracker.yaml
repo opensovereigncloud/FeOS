@@ -5,6 +5,9 @@ name: feos-firecracker-${FIRECRACKER_VERSION}
 arch: amd64
 platform: linux
 version: ${FIRECRACKER_VERSION}
+# The packaging's revision: a change to the package that keeps Firecracker's
+# version takes a new one.
+release: "1"
 section: admin
 priority: optional
 maintainer: IronCore authors <ospo@sap.com>
