@@ -66,7 +66,7 @@ container after a reboot.
 For detailed instructions, please see the **[Nested Virtualization Test Environment Setup Guide](../docs/nested_virt_test_env.md)**.
 
 ## Firecracker
-To boot the host image under [Firecracker](https://firecracker-microvm.github.io/) (`make firecracker`), give it a configuration like this one. Firecracker has no nested virtualization, so FeOS cannot run VMs in there.
+To boot the host image under [Firecracker](https://firecracker-microvm.github.io/) (`make firecracker`), give it a configuration like this one. Firecracker has no nested virtualization, so FeOS cannot run VMs in there. FeOS takes 2 GiB for huge pages at boot, so the VM needs more memory than that.
 
     sudo ip tuntap add mode tap name tap0
     sudo ip link set tap0 up
@@ -77,11 +77,16 @@ To boot the host image under [Firecracker](https://firecracker-microvm.github.io
       "boot-source": {
         "kernel_image_path": "target/kernel/vmlinuz",
         "initrd_path": "target/initramfs.zst",
-        "boot_args": "$(cat target/cmdline)"
+        "boot_args": "console=ttyS0 reboot=k panic=1"
       },
       "drives": [],
-      "machine-config": {"vcpu_count": 4, "mem_size_mib": 1024},
-      "network-interfaces": [{"iface_id": "eth0", "host_dev_name": "tap0"}]
+      "machine-config": {"vcpu_count": 4, "mem_size_mib": 4096},
+      "network-interfaces": [{"iface_id": "eth0", "host_dev_name": "tap0", "guest_mac": "06:00:ac:10:00:02"}]
     }
     JSON
     sudo target/firecracker/firecracker --no-api --config-file target/run-vm.json
+
+Without a DHCPv6 server on the bridge, FeOS has only the link-local address of that MAC, `fe80::400:acff:fe10:2`. feosctl reaches its API through a forward:
+
+    socat 'TCP6-LISTEN:1338,bind=[::1],fork' 'TCP6:[fe80::400:acff:fe10:2%vm-br0]:1337' &
+    feosctl host version-info --address 'http://[::1]:1338'
