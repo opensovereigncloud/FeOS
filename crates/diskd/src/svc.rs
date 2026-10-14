@@ -63,12 +63,20 @@ fn internal(e: impl std::fmt::Display) -> Status {
 }
 
 /// Upload/download paths run at SCHED_IDLE so S3 I/O never contends with
-/// the pod's own I/O in the other direction. Best-effort: failure (e.g. in a container) is silent.
+/// the pod's own I/O in the other direction. Best-effort: failure (e.g. in
+/// a container) is silent. The raw syscall: musl's sched_setscheduler
+/// only returns ENOSYS.
 pub(crate) fn set_sched_idle() {
-    // SAFETY: thread 0 = calling thread; sched_param outlives the call.
+    // SAFETY: thread 0 = calling thread; sched_param is zeroed plain data
+    // (priority 0, as SCHED_IDLE wants) and outlives the call.
     unsafe {
-        let param = libc::sched_param { sched_priority: 0 };
-        libc::sched_setscheduler(0, 3 /* SCHED_IDLE */, &param);
+        let param: libc::sched_param = std::mem::zeroed();
+        libc::syscall(
+            libc::SYS_sched_setscheduler,
+            0,
+            libc::SCHED_IDLE,
+            &param as *const libc::sched_param,
+        );
     }
 }
 

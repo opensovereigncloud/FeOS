@@ -98,9 +98,11 @@ struct UffdioZeropage {
     zeropage: i64,
 }
 
-const UFFDIO_WAKE: libc::c_ulong = ioc(IOC_READ, 0x02, size_of::<UffdioRange>());
-const UFFDIO_COPY: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, 0x03, size_of::<UffdioCopy>());
-const UFFDIO_ZEROPAGE: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, 0x04, size_of::<UffdioZeropage>());
+const UFFDIO_WAKE: libc::Ioctl = ioc(IOC_READ, 0x02, size_of::<UffdioRange>()) as libc::Ioctl;
+const UFFDIO_COPY: libc::Ioctl =
+    ioc(IOC_READ | IOC_WRITE, 0x03, size_of::<UffdioCopy>()) as libc::Ioctl;
+const UFFDIO_ZEROPAGE: libc::Ioctl =
+    ioc(IOC_READ | IOC_WRITE, 0x04, size_of::<UffdioZeropage>()) as libc::Ioctl;
 
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 const UFFD_EVENT_REMOVE: u8 = 0x15;
@@ -120,8 +122,8 @@ struct UffdMsg {
 }
 
 const _: () = assert!(size_of::<UffdMsg>() == 32);
-const _: () = assert!(UFFDIO_COPY == 0xc028_aa03);
-const _: () = assert!(UFFDIO_ZEROPAGE == 0xc020_aa04);
+const _: () = assert!(UFFDIO_COPY as u32 == 0xc028_aa03);
+const _: () = assert!(UFFDIO_ZEROPAGE as u32 == 0xc020_aa04);
 
 // ------------------------------------------------------------ handshake
 
@@ -1166,13 +1168,26 @@ fn recv_with_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Option<OwnedFd>
 mod tests {
     use super::*;
 
+    /// The handler counts after the ioctl that wakes the faulting thread,
+    /// so a counter can lag the read the test just finished: wait for it.
+    fn settled(counter: &std::sync::atomic::AtomicU64, ok: impl Fn(u64) -> bool) -> u64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let v = counter.load(Ordering::Relaxed);
+            if ok(v) || std::time::Instant::now() > deadline {
+                return v;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn ioctl_numbers_match_the_uapi() {
         // linux/userfaultfd.h, x86_64. Wrong numbers here are an
         // EINVAL per page fault, i.e. a wedged guest.
-        assert_eq!(UFFDIO_COPY, 0xc028_aa03);
-        assert_eq!(UFFDIO_ZEROPAGE, 0xc020_aa04);
-        assert_eq!(UFFDIO_WAKE, 0x8010_aa02);
+        assert_eq!(UFFDIO_COPY as u32, 0xc028_aa03);
+        assert_eq!(UFFDIO_ZEROPAGE as u32, 0xc020_aa04);
+        assert_eq!(UFFDIO_WAKE as u32, 0x8010_aa02);
     }
 
     // ---- a full round trip, with this test playing Firecracker ------
@@ -1183,8 +1198,8 @@ mod tests {
     // anonymous memory, registers it with a userfaultfd and hands both
     // over exactly the way `vmm::persist::create_guest_memory` does.
 
-    const UFFDIO_API: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, 0x3F, 24);
-    const UFFDIO_REGISTER: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, 0x00, 32);
+    const UFFDIO_API: libc::Ioctl = ioc(IOC_READ | IOC_WRITE, 0x3F, 24) as libc::Ioctl;
+    const UFFDIO_REGISTER: libc::Ioctl = ioc(IOC_READ | IOC_WRITE, 0x00, 32) as libc::Ioctl;
     const UFFD_API: u64 = 0xAA;
     const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 3;
     const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
@@ -1371,13 +1386,9 @@ mod tests {
 
         assert_eq!(got.len(), want.len());
         assert!(got == want, "guest RAM differs from the layer's content");
-        assert_eq!(
-            stats.chunks_served.load(Ordering::Relaxed),
-            2,
-            "data chunks"
-        );
+        assert_eq!(settled(&stats.chunks_served, |v| v >= 2), 2, "data chunks");
         assert!(
-            stats.chunks_zeroed.load(Ordering::Relaxed) >= 2,
+            settled(&stats.chunks_zeroed, |v| v >= 2) >= 2,
             "absent + explicit-zero chunks are served without touching the store"
         );
         assert_eq!(stats.errors.load(Ordering::Relaxed), 0);
@@ -1479,7 +1490,7 @@ mod tests {
         );
         assert_eq!(kept, 1, "the pages around it still carry the chunk");
         assert!(
-            stats.removes.load(Ordering::Relaxed) >= 1,
+            settled(&stats.removes, |v| v >= 1) >= 1,
             "the REMOVE event reached the pump"
         );
         assert_eq!(stats.errors.load(Ordering::Relaxed), 0);
@@ -1628,10 +1639,10 @@ mod tests {
             &got[..16]
         );
         assert!(
-            stats.pages_reclaimed.load(Ordering::Relaxed) >= 1,
+            settled(&stats.pages_reclaimed, |v| v >= 1) >= 1,
             "the reclaimed page is counted"
         );
-        assert!(stats.removes.load(Ordering::Relaxed) >= 1);
+        assert!(settled(&stats.removes, |v| v >= 1) >= 1);
 
         // Control: a page that was never released still reads the layer,
         // so the fix did not simply zero the whole chunk.
