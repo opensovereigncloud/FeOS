@@ -23,13 +23,13 @@ each with a jailed process of its own per sandbox on the host:
 `feos-guest` already pipes both to the host, over vsock ports 10002 and
 10003 (ADR 0007). Nothing on the host answers yet.
 
-A third kind came from the workload identity prototype (seccont):
-**managed mTLS identities**. Every workload gets an X.509 certificate with
-a SPIFFE ID, and the private key stays on the host. The workload runs an
-ordinary TLS 1.3 handshake, and its TLS stack delegates the one private
-key operation, the CertificateVerify signature, to a daemon on the node
-over the protocol fetls/1. Libraries for Go, Rust, Python and TypeScript
-exist. A database that authenticates by certificate (PostgreSQL, MariaDB,
+A third kind comes from FeID, formerly FeTLS (ADR 0015): **managed mTLS
+identities**. Every workload gets an X.509 certificate with a SPIFFE ID,
+and the private key stays on the host. The workload runs an ordinary
+TLS 1.3 handshake, and its TLS stack delegates the one private key
+operation, the CertificateVerify signature, to the host over the
+protocol feid/1. FeID's libraries for Go, Rust, Python and TypeScript do
+that. A database that authenticates by certificate (PostgreSQL, MariaDB,
 Valkey, Kafka, NATS) then sees the workload itself, with no password
 anywhere and no proxy in the data path.
 
@@ -45,7 +45,8 @@ audit records and a way for secrets to reach the node.
 
 - `feos-authn` is a fifth program (ADR 0003): a small static binary of
   its own, shipped in the `feosd` package. It serves all three kinds:
-  Kubernetes, SSH and mTLS.
+  Kubernetes, SSH and mTLS, the last also through TLS bindings for
+  applications without FeID.
 - `feosd` starts one `feos-authn` per pod that runs with an identity or
   credentials. It starts it with the microVM on create, resume and
   restore, and stops it when the run ends. A suspended pod has no
@@ -61,17 +62,20 @@ audit records and a way for secrets to reach the node.
 ### One vsock port, the socket names the pod
 
 - The guest pipes every connection to vsock port 10002. A one-line
-  preamble selects what the connection is for: `kube <port>`, `ssh` or
-  `tls`. Port 10003 goes.
+  preamble selects what the connection is for: `kube <port>`,
+  `tls <port>`, `ssh` or `feid`. Port 10003 goes.
 - The preamble carries no authority. Identity comes from the host-side
   socket the stream arrives on, which belongs to the pod's microVM. A
   process in the pod that dials the vsock port itself gains nothing that
   the guest's sockets do not already give it.
-- In the guest, Kubernetes bindings are loopback ports, as before. SSH is
-  `/run/feos/ssh-agent.sock` with `SSH_AUTH_SOCK`, and the identity is
-  `/run/feos/identity.sock` with `SECCONT_SOCK`, which the fetls
-  libraries read. Each exists only while the pod has what it serves.
-- A Kubernetes port is not forwardable. That rule stays.
+- In the guest, Kubernetes and TLS bindings are loopback ports, as
+  Kubernetes bindings were. SSH is `/run/feos/ssh-agent.sock` with
+  `SSH_AUTH_SOCK`. The identity is `/run/feos/feid.sock` with
+  `FEID_SOCK`, where FeID's libraries look without being told
+  (ADR 0015), and the trust bundle is `/run/feos/ca.pem`. Each exists only
+  while the pod has what it serves.
+- A binding's port is not forwardable. That rule stays, and covers TLS
+  bindings too.
 
 ### What it answers
 
@@ -92,11 +96,20 @@ audit records and a way for secrets to reach the node.
   - the `query` extension.
 
   A client without `session-bind` gets nothing. RSA signs with SHA-2 only.
-- **mTLS (fetls/1, unchanged):** the guest's TLS stack fetches the pod's
+- **mTLS (feid/1):** the guest's TLS stack fetches the pod's
   certificate chain and the trust bundle, and asks for a signature. The
   signer signs only input of the exact shape of a TLS 1.3 CertificateVerify
   for client or server. Keys are Ed25519, so the input is unhashed and
-  can be checked. It is not a signing oracle.
+  can be checked. It is not a signing oracle. `feos-authn` speaks feid/1
+  through FeID's protocol crate, so that the check exists once.
+- **TLS bindings**, for applications without FeID: a binding names an
+  upstream, a host and a port, and its CA, or the WebPKI when it has none.
+  The application connects in plaintext to the binding's loopback port;
+  `feos-authn` checks and dials the upstream as for Kubernetes, runs
+  TLS 1.3 with the pod's certificate as its client certificate, and pipes
+  both directions. `psql` or an application that cannot be changed gets
+  the pod's identity this way. The plaintext passes through the host
+  process, which FeID's libraries avoid.
 - Every signature and every request is audited **before** it is answered.
   A signature whose record cannot be written is not given.
 
@@ -104,9 +117,10 @@ audit records and a way for secrets to reach the node.
 
 - A pod's spec names its identity: a SPIFFE ID that the control plane,
   the registration authority, chose. `feosd` does not choose identities.
-  The subject CN follows the ID by seccont's mapping: the trust domain
+  The subject CN follows the ID by FeID's mapping: the trust domain
   and path, cut at 55 characters plus a hash of the whole ID, so that
-  databases that map on the CN see it.
+  databases that map on the CN see it. The names under which the pod's
+  service is reachable are DNS names in the certificate (ADR 0015).
 - `feos-authn` makes the pod's key pair in its own memory, at every
   start. Its certificate signing request goes to the control plane,
   which issues a short-lived certificate. The private key never exists
@@ -116,12 +130,12 @@ audit records and a way for secrets to reach the node.
   that cannot be reached is retried; until the certificate expires, the
   old one serves. After that, the signer refuses, loudly.
 - Until a run's first certificate arrives, a request to sign waits a few
-  seconds, then gets a refusal that fetls clients retry.
+  seconds, then gets a refusal that FeID's libraries retry.
 - The trust bundle is public and comes to `feosd` with the pod.
 
 ### Secrets reach the process sealed to it
 
-- Kubernetes and SSH bindings are sets: the spec names all of a pod's
+- Kubernetes, TLS and SSH bindings are sets: the spec names all of a pod's
   bindings, and a change states the whole set again. What it does not
   name is gone.
 - At start, `feos-authn` makes a second key pair, for HPKE (RFC 9180),
@@ -152,13 +166,15 @@ audit records and a way for secrets to reach the node.
 ### Audit
 
 - `feos-authn` reports every Kubernetes request (binding, host, method,
-  path, status, bytes), every SSH signature (binding, host key, user) and
-  every TLS signature (identity, context) to `feosd` over its control
-  socket. Refusals are reported with their reason.
+  path, status, bytes), every TLS binding's connection (binding, host,
+  bytes), every SSH signature (binding, host key, user), every TLS
+  signature (identity, context) and the handshake reports of FeID's
+  libraries to `feosd` over its control socket. Refusals are reported
+  with their reason.
 - `feosd` publishes them as the pod's events (ADR 0006). The control
   plane can join TLS signatures to the flows and server names of
-  ADR 0013, which seccont's join of signatures, library reports and wire
-  observations did.
+  ADR 0013, as FeTLS's signer joined signatures, library reports and
+  wire observations.
 
 ## Alternatives considered
 
@@ -168,7 +184,7 @@ audit records and a way for secrets to reach the node.
   little: a process that has been taken over can always write back to the
   guest over its vsock stream, so the empty namespace keeps little in.
   The tenant boundary, one pod per process, stays.
-- **One daemon per node**, as seccont's signerd and its rule "no
+- **One daemon per node**, as FeTLS's signerd and its rule "no
   sidecars" have it. Fewer processes, but every tenant's keys in one
   address space and a lookup on every connection. A per-pod process on
   the host is no sidecar: nothing runs in the pod.
@@ -178,16 +194,18 @@ audit records and a way for secrets to reach the node.
 - **Inside `feosd`.** It would parse hostile HTTP and SSH in the
   privileged process that owns every microVM on the node.
 - **The control plane makes the keys and sends them with the pod**,
-  as seccont's issuer does. It needs one message fewer at start, but the
+  as FeTLS's issuer did. It needs one message fewer at start, but the
   key would exist outside the process that uses it.
 - **Bindings over Valkey in plaintext, or pushed directly from the
   control plane to the node**, as the sandbox system did. The first
   shows them to everything that reads the bus. The second needs a
   listener on the node (ADR 0006 has none), and the plaintext would
   still pass through `feosd`.
-- **A TLS-terminating proxy with a CA per pod** for mTLS. Applications
-  would need no library, but the platform would sit in the plaintext,
-  and the CA would have to be baked into the pod.
+- **A TLS-intercepting proxy with a CA per pod**, for any destination
+  the pod chooses. Applications would need neither a library nor a
+  binding, but the platform would sit in the plaintext of every
+  connection, and the CA would have to be baked into the pod. A TLS
+  binding sits in the plaintext only of the upstreams it names.
 
 ## Consequences
 
@@ -203,14 +221,15 @@ audit records and a way for secrets to reach the node.
   issuer of its own or SPIRE; the node does not care.
 - The kernel's network on the node gains one namespace for the
   processes. The guest replaces port 10003 with a preamble on 10002 and
-  gains the identity socket.
+  gains the FeID socket, the trust bundle and TLS bindings.
 - Offloading protects the bytes, not the authority. A Kubernetes
   credential that may read secrets gives the agent a real token in one
   command. A pod that has been taken over can have signatures made for
   new connections while it runs. Narrow roles, short lifetimes, rate
   limits and the audit are the boundary.
-- An application uses its identity through a fetls library; other TLS
-  stacks go without. Kubernetes and SSH need nothing in the pod.
+- An application uses its identity through FeID's libraries, end to
+  end, or through a TLS binding, without code. Kubernetes and SSH need
+  nothing in the pod.
 - Credentials supported first: bearer tokens and client certificates for
   Kubernetes, Ed25519, ECDSA and RSA keys of 2048 bits or more for SSH.
   Not supported: exec plugins, cloud auth providers, OIDC with refresh.
@@ -222,8 +241,8 @@ audit records and a way for secrets to reach the node.
   control plane by mTLS, too.
 - The trust domain and the layout of the IDs: tenant and workload, and
   what a sandbox is called.
-- Whether `SECCONT_SOCK` keeps its name, or the libraries learn a FeOS
-  name.
 - Whether the Kubernetes proxy dials from the node's address, or from
   the pod's, so that a cluster's firewall could tell pods apart.
 - How many signatures a pod may ask for per second.
+- Whether TLS bindings get an inbound side, which terminates mTLS for a
+  server in the pod that has no FeID.
