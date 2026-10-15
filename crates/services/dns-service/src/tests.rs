@@ -10,6 +10,7 @@ use hickory_proto::rr::rdata::svcb::{
 };
 use hickory_proto::rr::rdata::{CNAME, HTTPS, PTR, SOA};
 use hickory_proto::rr::Record;
+use std::net::Ipv6Addr;
 use tokio::net::TcpSocket;
 
 const POD: &str = "4f9a1c2e-0000-4000-8000-000000000001";
@@ -799,33 +800,4 @@ async fn serves_ipv6_clients() {
     assert_eq!(addresses(&answer), ips(&["2001:db8::6"]));
     let answer = ask_tcp_from(source, server, &query("v4.test.", RecordType::A)).await;
     assert_eq!(addresses(&answer), ips(&["1.2.3.4", "5.6.7.8"]));
-}
-
-#[tokio::test]
-async fn asks_ipv4_upstreams_under_the_nat64_prefix() {
-    // The fake upstream listens on ::1, which is 0.0.0.1 under ::/96.
-    let upstream = upstream().await;
-    let ipv4 = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 1).into(), upstream.address.port());
-    let config = Config {
-        default_upstreams: vec![ipv4],
-        nat64_prefix: Some(Ipv6Addr::UNSPECIFIED),
-        ..Config::default()
-    };
-    let (resolver, server) = resolver(config, vec![ipv4]).await;
-    let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
-    assert_eq!(addresses(&answer), ips(&["1.2.3.6"]));
-    let answer = ask_tcp(server, &query("v4.test.", RecordType::A)).await;
-    assert_eq!(addresses(&answer), ips(&["1.2.3.4", "5.6.7.8"]));
-    // The default upstreams too.
-    resolver.set_client(LOOPBACK.into(), POD, Vec::new());
-    let answer = ask_udp(server, &query("v6.test.", RecordType::AAAA)).await;
-    assert_eq!(addresses(&answer), ips(&["2001:db8::6"]));
-    assert_eq!(
-        upstream.asked(),
-        [
-            asked("v6.test.", RecordType::A, false),
-            asked("v4.test.", RecordType::A, true),
-            asked("v6.test.", RecordType::AAAA, false)
-        ]
-    );
 }

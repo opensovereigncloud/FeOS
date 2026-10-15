@@ -87,17 +87,10 @@ from node to node would need a route per pod, changed with every move.
 
 ### How IPv4 leaves the node
 
-- `--ipv4=nat`, the default: nftables masquerades the pods' IPv4 to the
-  node's address, with Linux's connection tracking.
-- `--ipv4=clat`, for a node without IPv4 in a network with a NAT64: the
-  node translates its pods' IPv4 to IPv6 (464XLAT, RFC 6877, the node
-  being the CLAT). An eBPF program on a device of its own translates
-  statelessly (SIIT, RFC 7915): the destination under the network's NAT64
-  prefix (`--nat64-prefix`, `64:ff9b::/96` by default), the pod's address
-  under the last /96 of the node's prefix, which no pod gets. eBPF is here
-  only because netfilter has no SIIT.
-- Either way, the node filters a pod's packets before NAT or translation,
-  in the family the pod sent them in (ADR 0012).
+- nftables masquerades the pods' IPv4 to the node's address, with
+  Linux's connection tracking.
+- The node filters a pod's packets before NAT, in the family the pod sent
+  them in (ADR 0012).
 
 ### DNS in feosd
 
@@ -165,9 +158,10 @@ from node to node would need a route per pod, changed with every move.
 - **A private range for the pods' IPv4**, such as `10.200.0.0/16`: it
   collides with the node's and tenants' networks; link-local addresses do
   not.
-- **A CLAT in `feos-guest`** (464XLAT in the guest, IPv6 alone on the
-  TAP): the node would see a pod's IPv4 traffic only as IPv6, and every
-  guest would translate where one program on the node does.
+- **A CLAT (464XLAT, RFC 6877)**, in the guest or on the node, so that
+  pods have IPv4 on nodes without IPv4 of their own, through a NAT64 in
+  the network: a translator in eBPF to build and keep, for networks we do
+  not run in.
 - **ULA addresses, an overlay between nodes and NAT66 to the internet**,
   as Fly.io does since 2026: no prefix routed to a node, but an overlay
   mesh between all nodes. It stays the way for networks that cannot route
@@ -181,9 +175,6 @@ from node to node would need a route per pod, changed with every move.
   it.
 - **A bridge with isolated ports**, as before: rules for MAC addresses,
   ARP and neighbor discovery that a route per TAP does not need.
-- **Jool for the CLAT**: mature, but a kernel module out of tree on every
-  node, built with DKMS on Debian and by ourselves for Garden Linux and
-  `feos-host-init`.
 - **Public resolvers for pods** (Google's, Cloudflare's): no code, but no
   upstream per pod and no record of queries (ADR 0013).
 - **A resolver next to `feosd`**, such as Unbound: one more program to
@@ -203,19 +194,15 @@ from node to node would need a route per pod, changed with every move.
   that speak only IPv4 work. A program that listens only on `0.0.0.0`
   cannot be reached from outside; listeners bind to `[::]`.
 - A pod's connections do not survive a resume on another node.
-- Every node needs a prefix routed to it, and IPv4 of its own or a NAT64
-  in its network.
+- Every node needs a prefix routed to it, and IPv4 of its own, through
+  which its pods leave.
 - `PodInfo` carries the pod's IPv6 and IPv4 addresses; the network in
   `PodSpec` names upstream resolvers and security groups. The guest's
   network configuration has both families (ADR 0007).
 - The control plane's front door reaches pods' ports over IPv6, without a
   port forward over vsock (ADR 0004).
-- `--ipv4=clat` brings an eBPF program to build, in a crate of its own on
-  nightly (ADR 0002), and to load. It stays attached while `feosd`
-  restarts. Its object is committed, built reproducibly on a dated
-  nightly and a pinned bpf-linker, and embedded in `feosd`: no other
-  build needs nightly, and a change of the program is a change of the
-  object in the same commit.
+- The pods' network is routing and netfilter: no eBPF, no translator,
+  nothing to build on nightly.
 - Other tables still apply: where Docker or a firewall drops forwarded
   packets by default, pods reach nothing until it lets them through.
 
@@ -232,4 +219,4 @@ from node to node would need a route per pod, changed with every move.
   why its port cannot be reached.
 - **Waking a suspended pod** on a packet to its address.
 - **Fixed IPv4 addresses for leaving**, per tenant: an address of the
-  node's per tenant to masquerade to, or a NAT64 in the network.
+  node's per tenant to masquerade to.

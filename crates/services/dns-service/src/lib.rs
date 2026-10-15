@@ -9,10 +9,8 @@
 //! a query to the pod's upstreams in order, to the next when one does not
 //! answer, and answers SERVFAIL when none does. Answers pass as the
 //! upstream gave them, but HTTPS and SVCB records lose `ech`, so that
-//! clients send the server name in the clear (ADR 0013). On a node without
-//! IPv4 of its own, a CLAT, an IPv4 upstream is asked at its address under
-//! the network's NAT64 prefix. Every query of a pod that is answered
-//! becomes a traffic record (ADR 0013).
+//! clients send the server name in the clear (ADR 0013). Every query of a
+//! pod that is answered becomes a traffic record (ADR 0013).
 //!
 //! feosd binds the sockets and hands them over, so that they can come from
 //! socket activation and outlive feosd.
@@ -29,7 +27,7 @@ use hickory_proto::rr::{Name, RData, RecordType};
 use log::{debug, warn};
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -71,11 +69,6 @@ pub struct Config {
     /// How long an upstream has to answer over UDP before the next is
     /// asked; over TCP, twice that.
     pub upstream_timeout: Duration,
-    /// The network's NAT64 prefix, a /96 whose last 32 bits are ignored,
-    /// when the node has no IPv4 of its own (`--ipv4 clat`): IPv4 upstreams
-    /// are asked at their addresses under it (RFC 6052). None: they are
-    /// asked over IPv4.
-    pub nat64_prefix: Option<Ipv6Addr>,
 }
 
 impl Default for Config {
@@ -83,7 +76,6 @@ impl Default for Config {
         Self {
             default_upstreams: Vec::new(),
             upstream_timeout: UPSTREAM_TIMEOUT,
-            nat64_prefix: None,
         }
     }
 }
@@ -117,8 +109,7 @@ enum Transport {
 type Permits = (OwnedSemaphorePermit, Option<OwnedSemaphorePermit>);
 
 impl Resolver {
-    pub fn new(mut config: Config) -> Arc<Self> {
-        config.default_upstreams = upstream::route(&config.default_upstreams, config.nat64_prefix);
+    pub fn new(config: Config) -> Arc<Self> {
         let (records, _) = broadcast::channel(RECORDS);
         Arc::new(Self {
             config,
@@ -134,7 +125,6 @@ impl Resolver {
     /// there are none. Replaces what the resolver knew of `address`.
     pub fn set_client(&self, address: IpAddr, pod_id: &str, upstreams: Vec<SocketAddr>) {
         let address = address.to_canonical();
-        let upstreams = upstream::route(&upstreams, self.config.nat64_prefix);
         let mut clients = self.clients.write().unwrap_or_else(PoisonError::into_inner);
         // A pod that is set again keeps its limits.
         let (queries, connections) = match clients.get(&address) {

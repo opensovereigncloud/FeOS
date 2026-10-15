@@ -20,22 +20,6 @@ use tokio::time;
 /// The largest UDP answer read; a larger one is asked for again over TCP.
 const RESPONSE_BUFFER: usize = 4096;
 
-/// Where `upstreams` are asked: with `nat64_prefix`, a /96, an IPv4 upstream
-/// at its address under the prefix (RFC 6052 2.2); any other as it is.
-pub fn route(upstreams: &[SocketAddr], nat64_prefix: Option<Ipv6Addr>) -> Vec<SocketAddr> {
-    upstreams
-        .iter()
-        .map(|&upstream| match (upstream, nat64_prefix) {
-            (SocketAddr::V4(v4), Some(prefix)) => {
-                let mut octets = prefix.octets();
-                octets[12..].copy_from_slice(&v4.ip().octets());
-                SocketAddr::new(Ipv6Addr::from(octets).into(), v4.port())
-            }
-            _ => upstream,
-        })
-        .collect()
-}
-
 /// The query for `query` that goes upstream on behalf of `request`: the
 /// request's flags, and EDNS of our own.
 pub fn query(request: &Message, query: Query) -> Message {
@@ -222,31 +206,6 @@ mod tests {
         let mut echo = asked.clone();
         echo.set_message_type(MessageType::Query);
         assert!(!answers(&asked, &echo));
-    }
-
-    #[test]
-    fn routes_ipv4_upstreams_through_nat64() {
-        let upstreams: Vec<SocketAddr> =
-            ["8.8.8.8:53", "[2001:4860:4860::8888]:53", "192.0.2.1:5353"]
-                .iter()
-                .map(|upstream| upstream.parse().unwrap())
-                .collect();
-        assert_eq!(route(&upstreams, None), upstreams);
-        let prefix = "64:ff9b::".parse().unwrap();
-        assert_eq!(
-            route(&upstreams, Some(prefix)),
-            [
-                "[64:ff9b::808:808]:53".parse::<SocketAddr>().unwrap(),
-                "[2001:4860:4860::8888]:53".parse().unwrap(),
-                "[64:ff9b::c000:201]:5353".parse().unwrap(),
-            ]
-        );
-        // Whatever the prefix has in its last 32 bits is replaced.
-        let prefix = "2001:db8:64::ffff:ffff".parse().unwrap();
-        assert_eq!(
-            route(&upstreams[..1], Some(prefix)),
-            ["[2001:db8:64::808:808]:53".parse::<SocketAddr>().unwrap()]
-        );
     }
 
     #[test]
