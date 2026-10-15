@@ -5,13 +5,17 @@
 //! They need no root.
 
 use super::*;
-use hickory_proto::rr::rdata::svcb::{Alpn, EchConfigList, IpHint, SvcParamValue, SVCB};
+use hickory_proto::rr::rdata::svcb::{
+    Alpn, EchConfigList, IpHint, SvcParamKey, SvcParamValue, SVCB,
+};
 use hickory_proto::rr::rdata::{CNAME, HTTPS, PTR, SOA};
 use hickory_proto::rr::Record;
-use std::net::Ipv4Addr;
+use tokio::net::TcpSocket;
 
 const POD: &str = "4f9a1c2e-0000-4000-8000-000000000001";
-const LOOPBACK: Ipv6Addr = Ipv6Addr::LOCALHOST;
+const OTHER_POD: &str = "4f9a1c2e-0000-4000-8000-000000000002";
+/// The resolver's address and its pod's: IPv4, as on a node.
+const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// Short, for the tests of upstreams that do not answer.
 const TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -143,9 +147,6 @@ fn zone(query: &Query, tcp: bool) -> Option<Message> {
                 nodata(&mut response);
             }
         }
-        ("private.test.", RecordType::A) => {
-            response.add_answer(a([10, 0, 0, 1]));
-        }
         ("mapped.test.", RecordType::AAAA) => {
             response.add_answer(aaaa("::ffff:1.2.3.4"));
         }
@@ -188,6 +189,16 @@ fn zone(query: &Query, tcp: bool) -> Option<Message> {
             response.add_answer(record(RData::HTTPS(HTTPS(svcb))));
             response.set_authentic_data(true);
         }
+        ("plain.test.", RecordType::HTTPS) => {
+            let alpn = SvcParamValue::Alpn(Alpn(vec!["h2".into()]));
+            let svcb = SVCB::new(1, Name::root(), vec![(SvcParamKey::Alpn, alpn)]);
+            response.add_answer(record(RData::HTTPS(HTTPS(svcb))));
+            response.set_authentic_data(true);
+        }
+        ("ipv4only.arpa.", RecordType::A) => {
+            response.add_answers([a([192, 0, 0, 170]), a([192, 0, 0, 171])]);
+        }
+        ("ipv4only.arpa.", _) => nodata(&mut response),
         ("4.3.2.1.in-addr.arpa.", RecordType::PTR) => {
             response.add_answer(record(RData::PTR(PTR(name("v4.test.")))));
         }
@@ -216,9 +227,18 @@ fn failure(_: &Query, _: bool) -> Option<Message> {
     Some(response)
 }
 
-/// A resolver on loopback, with `::1` as a client of `upstreams`.
+/// A resolver on loopback, with `127.0.0.1` as a client of `upstreams`.
 async fn resolver(config: Config, upstreams: Vec<SocketAddr>) -> (Arc<Resolver>, SocketAddr) {
-    let udp = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+    resolver_at(LOOPBACK.into(), config, upstreams).await
+}
+
+/// A resolver at `address`, which is its own client of `upstreams`.
+async fn resolver_at(
+    address: IpAddr,
+    config: Config,
+    upstreams: Vec<SocketAddr>,
+) -> (Arc<Resolver>, SocketAddr) {
+    let udp = UdpSocket::bind((address, 0)).await.unwrap();
     let address = udp.local_addr().unwrap();
     let tcp = TcpListener::bind(address).await.unwrap();
     let config = Config {
@@ -226,13 +246,14 @@ async fn resolver(config: Config, upstreams: Vec<SocketAddr>) -> (Arc<Resolver>,
         ..config
     };
     let resolver = Resolver::new(config);
-    resolver.set_client(LOOPBACK, POD, upstreams);
+    resolver.set_client(address.ip(), POD, upstreams);
     tokio::spawn(resolver.clone().serve(udp, tcp));
     (resolver, address)
 }
 
+/// A fake upstream on `::1`.
 async fn upstream() -> Upstream {
-    Upstream::start(IpAddr::V6(LOOPBACK), zone).await
+    Upstream::start(IpAddr::V6(Ipv6Addr::LOCALHOST), zone).await
 }
 
 fn query(owner: &str, record_type: RecordType) -> Message {
@@ -249,9 +270,14 @@ fn query(owner: &str, record_type: RecordType) -> Message {
     query
 }
 
-/// Sends `bytes` and waits for an answer as long as `wait`.
-async fn ask_udp_bytes(server: SocketAddr, bytes: &[u8], wait: Duration) -> Option<Vec<u8>> {
-    let socket = UdpSocket::bind((LOOPBACK, 0)).await.unwrap();
+/// Sends `bytes` from `source` and waits for an answer as long as `wait`.
+async fn ask_udp_bytes(
+    source: IpAddr,
+    server: SocketAddr,
+    bytes: &[u8],
+    wait: Duration,
+) -> Option<Vec<u8>> {
+    let socket = UdpSocket::bind((source, 0)).await.unwrap();
     socket.connect(server).await.unwrap();
     socket.send(bytes).await.unwrap();
     let mut buffer = vec![0; 65535];
@@ -263,7 +289,12 @@ async fn ask_udp_bytes(server: SocketAddr, bytes: &[u8], wait: Duration) -> Opti
 }
 
 async fn ask_udp(server: SocketAddr, query: &Message) -> Message {
-    let answer = ask_udp_bytes(server, &query.to_vec().unwrap(), Duration::from_secs(3))
+    ask_udp_from(LOOPBACK.into(), server, query).await
+}
+
+async fn ask_udp_from(source: IpAddr, server: SocketAddr, query: &Message) -> Message {
+    let bytes = query.to_vec().unwrap();
+    let answer = ask_udp_bytes(source, server, &bytes, Duration::from_secs(3))
         .await
         .expect("an answer");
     let answer = Message::from_vec(&answer).unwrap();
@@ -274,7 +305,17 @@ async fn ask_udp(server: SocketAddr, query: &Message) -> Message {
 }
 
 async fn ask_tcp(server: SocketAddr, query: &Message) -> Message {
-    let mut stream = TcpStream::connect(server).await.unwrap();
+    ask_tcp_from(LOOPBACK.into(), server, query).await
+}
+
+async fn ask_tcp_from(source: IpAddr, server: SocketAddr, query: &Message) -> Message {
+    let socket = match source {
+        IpAddr::V4(_) => TcpSocket::new_v4(),
+        IpAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .unwrap();
+    socket.bind((source, 0).into()).unwrap();
+    let mut stream = socket.connect(server).await.unwrap();
     write_message(&mut stream, &query.to_vec().unwrap())
         .await
         .unwrap();
@@ -324,23 +365,18 @@ async fn passes_aaaa_records() {
 }
 
 #[tokio::test]
-async fn synthesizes_aaaa_records() {
+async fn synthesizes_nothing() {
     let upstream = upstream().await;
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
+    // A name with A records alone has no AAAA records.
     let answer = ask_udp(server, &query("v4.test.", RecordType::AAAA)).await;
     assert_eq!(answer.response_code(), ResponseCode::NoError);
-    assert_eq!(
-        addresses(&answer),
-        ips(&["64:ff9b::102:304", "64:ff9b::506:708"])
-    );
-    // The A records' TTL, capped by the SOA's.
-    assert!(answer.answers().iter().all(|record| record.ttl() == 60));
+    assert!(answer.answers().is_empty());
+    // The negative answer, with its SOA record.
+    assert_eq!(answer.name_servers().len(), 1);
     assert_eq!(
         upstream.asked(),
-        [
-            asked("v4.test.", RecordType::AAAA, false),
-            asked("v4.test.", RecordType::A, false)
-        ]
+        [asked("v4.test.", RecordType::AAAA, false)]
     );
     // A records pass as they are.
     let answer = ask_udp(server, &query("v4.test.", RecordType::A)).await;
@@ -348,50 +384,18 @@ async fn synthesizes_aaaa_records() {
 }
 
 #[tokio::test]
-async fn synthesizes_under_a_prefix_of_its_own() {
-    let upstream = upstream().await;
-    let config = Config {
-        nat64_prefix: "2001:db8:64::".parse().unwrap(),
-        ..Config::default()
-    };
-    let (_, server) = resolver(config, vec![upstream.address]).await;
-    let answer = ask_udp(server, &query("private.test.", RecordType::AAAA)).await;
-    assert_eq!(addresses(&answer), ips(&["2001:db8:64::a00:1"]));
-}
-
-#[tokio::test]
-async fn excludes_all_aaaa_records() {
-    let upstream = upstream().await;
-    let config = Config {
-        exclude_all_aaaa: true,
-        ..Config::default()
-    };
-    let (_, server) = resolver(config, vec![upstream.address]).await;
-    let answer = ask_udp(server, &query("v6.test.", RecordType::AAAA)).await;
-    assert_eq!(addresses(&answer), ips(&["64:ff9b::102:306"]));
-    // Without an AAAA query.
-    assert_eq!(upstream.asked(), [asked("v6.test.", RecordType::A, false)]);
-    // A name without A records has no AAAA records either.
-    let answer = ask_udp(server, &query("nothing.test.", RecordType::AAAA)).await;
-    assert_eq!(answer.response_code(), ResponseCode::NoError);
-    assert!(answer.answers().is_empty());
-    let answer = ask_udp(server, &query("missing.test.", RecordType::AAAA)).await;
-    assert_eq!(answer.response_code(), ResponseCode::NXDomain);
-}
-
-#[tokio::test]
-async fn excludes_ipv4_mapped_aaaa_records() {
+async fn passes_ipv4_mapped_aaaa_records() {
     let upstream = upstream().await;
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
     let answer = ask_udp(server, &query("mapped.test.", RecordType::AAAA)).await;
-    assert_eq!(addresses(&answer), ips(&["64:ff9b::102:304"]));
+    assert_eq!(addresses(&answer), ips(&["::ffff:1.2.3.4"]));
 }
 
 #[tokio::test]
 async fn keeps_the_cname_chain() {
     let upstream = upstream().await;
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
-    let answer = ask_udp(server, &query("alias.test.", RecordType::AAAA)).await;
+    let answer = ask_udp(server, &query("alias.test.", RecordType::A)).await;
     let answers = answer.answers();
     assert_eq!(answers.len(), 3);
     assert_eq!(answers[0].name(), &name("alias.test."));
@@ -399,21 +403,15 @@ async fn keeps_the_cname_chain() {
     assert!(answers[1..]
         .iter()
         .all(|record| record.name() == &name("v4.test.")));
-    assert_eq!(
-        addresses(&answer),
-        ips(&["64:ff9b::102:304", "64:ff9b::506:708"])
-    );
-}
-
-#[tokio::test]
-async fn synthesizes_nothing_for_private_addresses() {
-    let upstream = upstream().await;
-    let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
-    let answer = ask_udp(server, &query("private.test.", RecordType::AAAA)).await;
+    assert_eq!(addresses(&answer), ips(&["1.2.3.4", "5.6.7.8"]));
+    // Without AAAA records at its end, the chain alone.
+    let answer = ask_udp(server, &query("alias.test.", RecordType::AAAA)).await;
     assert_eq!(answer.response_code(), ResponseCode::NoError);
-    assert!(answer.answers().is_empty());
-    // The negative answer of the AAAA query, with its SOA record.
-    assert_eq!(answer.name_servers().len(), 1);
+    assert_eq!(answer.answers().len(), 1);
+    assert_eq!(
+        answer.answers()[0].data(),
+        &RData::CNAME(CNAME(name("v4.test.")))
+    );
 }
 
 #[tokio::test]
@@ -423,7 +421,6 @@ async fn passes_nxdomain() {
     let answer = ask_udp(server, &query("missing.test.", RecordType::AAAA)).await;
     assert_eq!(answer.response_code(), ResponseCode::NXDomain);
     assert_eq!(answer.name_servers().len(), 1);
-    // No A query for a name that does not exist.
     assert_eq!(
         upstream.asked(),
         [asked("missing.test.", RecordType::AAAA, false)]
@@ -431,10 +428,10 @@ async fn passes_nxdomain() {
 }
 
 #[tokio::test]
-async fn synthesizes_nothing_for_a_validating_client() {
+async fn keeps_the_flags_of_a_validating_client() {
     let upstream = upstream().await;
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
-    let mut request = query("v4.test.", RecordType::AAAA);
+    let mut request = query("v6.test.", RecordType::AAAA);
     request.set_checking_disabled(true);
     request
         .extensions_mut()
@@ -443,76 +440,94 @@ async fn synthesizes_nothing_for_a_validating_client() {
         .set_dnssec_ok(true);
     let answer = ask_udp(server, &request).await;
     assert_eq!(answer.response_code(), ResponseCode::NoError);
-    assert!(answer.answers().is_empty());
+    assert_eq!(addresses(&answer), ips(&["2001:db8::6"]));
     assert!(answer.checking_disabled());
     assert!(answer.extensions().as_ref().unwrap().flags().dnssec_ok);
     assert_eq!(
         upstream.asked(),
-        [asked("v4.test.", RecordType::AAAA, false)]
+        [asked("v6.test.", RecordType::AAAA, false)]
     );
 }
 
 #[tokio::test]
-async fn answers_ipv4only_arpa_itself() {
+async fn asks_the_upstreams_for_ipv4only_arpa() {
     let upstream = upstream().await;
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
     let answer = ask_udp(server, &query("ipv4only.arpa.", RecordType::AAAA)).await;
+    assert_eq!(answer.response_code(), ResponseCode::NoError);
+    assert!(answer.answers().is_empty());
+    let answer = ask_udp(server, &query("ipv4only.arpa.", RecordType::A)).await;
+    assert_eq!(addresses(&answer), ips(&["192.0.0.170", "192.0.0.171"]));
     assert_eq!(
-        addresses(&answer),
-        ips(&["64:ff9b::c000:aa", "64:ff9b::c000:ab"])
+        upstream.asked(),
+        [
+            asked("ipv4only.arpa.", RecordType::AAAA, false),
+            asked("ipv4only.arpa.", RecordType::A, false)
+        ]
     );
-    assert!(upstream.asked().is_empty());
 }
 
 #[tokio::test]
-async fn maps_reverse_queries_under_the_prefix() {
+async fn passes_reverse_queries() {
     let upstream = upstream().await;
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
-    let address: Ipv6Addr = "64:ff9b::102:304".parse().unwrap();
-    let reverse = Name::from(address);
-    let answer = ask_udp(server, &query(&reverse.to_ascii(), RecordType::PTR)).await;
+    let answer = ask_udp(server, &query("4.3.2.1.in-addr.arpa.", RecordType::PTR)).await;
     assert_eq!(answer.response_code(), ResponseCode::NoError);
     assert_eq!(answer.answers().len(), 1);
-    assert_eq!(answer.answers()[0].name(), &reverse);
     assert_eq!(
         answer.answers()[0].data(),
         &RData::PTR(PTR(name("v4.test.")))
     );
+    // A name under the NAT64 prefix is asked as it is.
+    let address: Ipv6Addr = "64:ff9b::102:304".parse().unwrap();
+    let reverse = Name::from(address);
+    let answer = ask_udp(server, &query(&reverse.to_ascii(), RecordType::PTR)).await;
+    assert_eq!(answer.response_code(), ResponseCode::NXDomain);
     assert_eq!(
         upstream.asked(),
-        [asked("4.3.2.1.in-addr.arpa.", RecordType::PTR, false)]
+        [
+            asked("4.3.2.1.in-addr.arpa.", RecordType::PTR, false),
+            asked(&reverse.to_lowercase().to_ascii(), RecordType::PTR, false)
+        ]
     );
 }
 
 #[tokio::test]
-async fn strips_ech_and_ipv4hint() {
+async fn strips_ech() {
     let upstream = upstream().await;
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
-    let answer = ask_udp(server, &query("svc.test.", RecordType::HTTPS)).await;
-    let RData::HTTPS(HTTPS(svcb)) = answer.answers()[0].data() else {
-        panic!("not an HTTPS record");
-    };
-    let keys: Vec<_> = svcb.svc_params().iter().map(|(key, _)| *key).collect();
-    assert_eq!(keys, [SvcParamKey::Alpn, SvcParamKey::Ipv6Hint]);
-    assert!(!answer.authentic_data());
+    let request = query("svc.test.", RecordType::HTTPS);
+    for answer in [
+        ask_udp(server, &request).await,
+        ask_tcp(server, &request).await,
+    ] {
+        let RData::HTTPS(HTTPS(svcb)) = answer.answers()[0].data() else {
+            panic!("not an HTTPS record");
+        };
+        let keys: Vec<_> = svcb.svc_params().iter().map(|(key, _)| *key).collect();
+        assert_eq!(
+            keys,
+            [
+                SvcParamKey::Alpn,
+                SvcParamKey::Ipv4Hint,
+                SvcParamKey::Ipv6Hint
+            ]
+        );
+        assert!(!answer.authentic_data());
+    }
 
-    // Pods that reach no IPv6 address lose ipv6hint too.
-    let config = Config {
-        exclude_all_aaaa: true,
-        ..Config::default()
-    };
-    let (_, server) = resolver(config, vec![upstream.address]).await;
-    let answer = ask_udp(server, &query("svc.test.", RecordType::HTTPS)).await;
+    // A record without ech passes as it is.
+    let answer = ask_udp(server, &query("plain.test.", RecordType::HTTPS)).await;
     let RData::HTTPS(HTTPS(svcb)) = answer.answers()[0].data() else {
         panic!("not an HTTPS record");
     };
-    let keys: Vec<_> = svcb.svc_params().iter().map(|(key, _)| *key).collect();
-    assert_eq!(keys, [SvcParamKey::Alpn]);
+    assert_eq!(svcb.svc_params().len(), 1);
+    assert!(answer.authentic_data());
 }
 
 #[tokio::test]
 async fn fails_over_and_fails() {
-    let silent = Upstream::start(IpAddr::V6(LOOPBACK), silence).await;
+    let silent = Upstream::start(IpAddr::V6(Ipv6Addr::LOCALHOST), silence).await;
     let failing = Upstream::start(IpAddr::V4(Ipv4Addr::LOCALHOST), failure).await;
     let upstream = Upstream::start(IpAddr::V4(Ipv4Addr::LOCALHOST), zone).await;
     let (resolver, server) = resolver(
@@ -526,15 +541,15 @@ async fn fails_over_and_fails() {
     assert_eq!(failing.asked(), [asked("v6.test.", RecordType::A, false)]);
 
     // No upstream that answers: SERVFAIL.
-    resolver.set_client(LOOPBACK, POD, vec![silent.address]);
+    resolver.set_client(LOOPBACK.into(), POD, vec![silent.address]);
     let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert_eq!(answer.response_code(), ResponseCode::ServFail);
     // Only failures: the last stands.
-    resolver.set_client(LOOPBACK, POD, vec![silent.address, failing.address]);
+    resolver.set_client(LOOPBACK.into(), POD, vec![silent.address, failing.address]);
     let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert_eq!(answer.response_code(), ResponseCode::ServFail);
     // No upstream at all.
-    resolver.set_client(LOOPBACK, POD, Vec::new());
+    resolver.set_client(LOOPBACK.into(), POD, Vec::new());
     let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert_eq!(answer.response_code(), ResponseCode::ServFail);
 }
@@ -587,19 +602,10 @@ async fn truncates_what_does_not_fit() {
 async fn serves_tcp() {
     let upstream = upstream().await;
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
-    let answer = ask_tcp(server, &query("v4.test.", RecordType::AAAA)).await;
-    assert_eq!(
-        addresses(&answer),
-        ips(&["64:ff9b::102:304", "64:ff9b::506:708"])
-    );
+    let answer = ask_tcp(server, &query("v4.test.", RecordType::A)).await;
+    assert_eq!(addresses(&answer), ips(&["1.2.3.4", "5.6.7.8"]));
     // A query over TCP goes upstream over TCP.
-    assert_eq!(
-        upstream.asked(),
-        [
-            asked("v4.test.", RecordType::AAAA, true),
-            asked("v4.test.", RecordType::A, true)
-        ]
-    );
+    assert_eq!(upstream.asked(), [asked("v4.test.", RecordType::A, true)]);
 
     // Several queries on one connection, answered as they come.
     let mut stream = TcpStream::connect(server).await.unwrap();
@@ -628,7 +634,7 @@ async fn serves_tcp() {
 async fn refuses_unknown_clients() {
     let upstream = upstream().await;
     let (resolver, server) = resolver(Config::default(), vec![upstream.address]).await;
-    resolver.remove_client(LOOPBACK);
+    resolver.remove_client(LOOPBACK.into());
     let answer = ask_udp(server, &query("v6.test.", RecordType::AAAA)).await;
     assert_eq!(answer.response_code(), ResponseCode::Refused);
     let answer = ask_tcp(server, &query("v6.test.", RecordType::AAAA)).await;
@@ -641,8 +647,8 @@ async fn records_answered_queries() {
     let upstream = upstream().await;
     let (resolver, server) = resolver(Config::default(), vec![upstream.address]).await;
     let mut records = resolver.subscribe();
-    ask_udp(server, &query("V4.Test.", RecordType::AAAA)).await;
-    ask_udp(server, &query("missing.test.", RecordType::A)).await;
+    ask_udp(server, &query("V4.Test.", RecordType::A)).await;
+    ask_udp(server, &query("missing.test.", RecordType::AAAA)).await;
 
     let record = records.recv().await.unwrap();
     assert_eq!(record.pod_id, POD);
@@ -654,10 +660,9 @@ async fn records_answered_queries() {
         dns,
         DnsQuery {
             name: "v4.test".into(),
-            r#type: 28,
+            r#type: 1,
             rcode: 0,
-            addresses: vec!["64:ff9b::102:304".into(), "64:ff9b::506:708".into()],
-            synthesized: true,
+            addresses: vec!["1.2.3.4".into(), "5.6.7.8".into()],
         }
     );
     let record = records.recv().await.unwrap();
@@ -668,15 +673,14 @@ async fn records_answered_queries() {
         dns,
         DnsQuery {
             name: "missing.test".into(),
-            r#type: 1,
+            r#type: 28,
             rcode: 3,
             addresses: Vec::new(),
-            synthesized: false,
         }
     );
 
     // Unknown clients leave no record.
-    resolver.remove_client(LOOPBACK);
+    resolver.remove_client(LOOPBACK.into());
     ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert!(records.try_recv().is_err());
 }
@@ -687,15 +691,18 @@ async fn survives_garbage() {
     let (_, server) = resolver(Config::default(), vec![upstream.address]).await;
     // Runts and responses get no answer.
     let wait = Duration::from_millis(300);
-    assert!(ask_udp_bytes(server, &[1, 2, 3], wait).await.is_none());
+    let source = IpAddr::V4(LOOPBACK);
+    assert!(ask_udp_bytes(source, server, &[1, 2, 3], wait)
+        .await
+        .is_none());
     let mut response = query("v6.test.", RecordType::A);
     response.set_message_type(MessageType::Response);
     let bytes = response.to_vec().unwrap();
-    assert!(ask_udp_bytes(server, &bytes, wait).await.is_none());
+    assert!(ask_udp_bytes(source, server, &bytes, wait).await.is_none());
     // A header with a broken body: FORMERR.
     let mut broken = query("v6.test.", RecordType::A).to_vec().unwrap();
     broken.truncate(16);
-    let answer = ask_udp_bytes(server, &broken, Duration::from_secs(3))
+    let answer = ask_udp_bytes(source, server, &broken, Duration::from_secs(3))
         .await
         .unwrap();
     let answer = Message::from_vec(&answer).unwrap();
@@ -713,4 +720,112 @@ async fn survives_garbage() {
     // And the resolver still answers.
     let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert_eq!(addresses(&answer), ips(&["1.2.3.6"]));
+}
+
+#[tokio::test]
+async fn tells_pods_apart_by_their_ipv4_address() {
+    let upstream = upstream().await;
+    let failing = Upstream::start(IpAddr::V4(LOOPBACK), failure).await;
+    let (resolver, server) = resolver(Config::default(), vec![upstream.address]).await;
+    let other = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+    resolver.set_client(other, OTHER_POD, vec![failing.address]);
+    let mut records = resolver.subscribe();
+
+    // Each pod's queries go to its own upstreams, over UDP and TCP.
+    let request = query("v6.test.", RecordType::A);
+    let answer = ask_udp(server, &request).await;
+    assert_eq!(addresses(&answer), ips(&["1.2.3.6"]));
+    let answer = ask_udp_from(other, server, &request).await;
+    assert_eq!(answer.response_code(), ResponseCode::ServFail);
+    let answer = ask_tcp_from(other, server, &request).await;
+    assert_eq!(answer.response_code(), ResponseCode::ServFail);
+    assert_eq!(upstream.asked(), [asked("v6.test.", RecordType::A, false)]);
+    assert_eq!(
+        failing.asked(),
+        [
+            asked("v6.test.", RecordType::A, false),
+            asked("v6.test.", RecordType::A, true)
+        ]
+    );
+    // And their records name them.
+    let pods: Vec<_> = (0..3).map(|_| records.try_recv().unwrap().pod_id).collect();
+    assert_eq!(pods, [POD, OTHER_POD, OTHER_POD]);
+
+    // An address the resolver does not know is refused.
+    let unknown = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+    let answer = ask_udp_from(unknown, server, &request).await;
+    assert_eq!(answer.response_code(), ResponseCode::Refused);
+    let answer = ask_tcp_from(unknown, server, &request).await;
+    assert_eq!(answer.response_code(), ResponseCode::Refused);
+    assert!(records.try_recv().is_err());
+    // And so is a pod that is gone.
+    resolver.remove_client(other);
+    let answer = ask_udp_from(other, server, &request).await;
+    assert_eq!(answer.response_code(), ResponseCode::Refused);
+}
+
+#[tokio::test]
+async fn knows_ipv4_clients_by_their_ipv4_address() {
+    // An IPv6 socket sees an IPv4 peer at its IPv4-mapped address.
+    let peer: SocketAddr = "[::ffff:169.254.16.1]:40000".parse().unwrap();
+    assert_eq!(source_address(peer), IpAddr::from([169, 254, 16, 1]));
+    let peer: SocketAddr = "[fd00:fe05:1::2]:40000".parse().unwrap();
+    assert_eq!(source_address(peer), peer.ip());
+
+    // A client set at its IPv4-mapped address is its IPv4 address.
+    let upstream = upstream().await;
+    let (resolver, server) = resolver(Config::default(), vec![upstream.address]).await;
+    resolver.remove_client(LOOPBACK.into());
+    let mapped = IpAddr::V6(LOOPBACK.to_ipv6_mapped());
+    resolver.set_client(mapped, POD, vec![upstream.address]);
+    let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
+    assert_eq!(addresses(&answer), ips(&["1.2.3.6"]));
+    resolver.remove_client(mapped);
+    let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
+    assert_eq!(answer.response_code(), ResponseCode::Refused);
+}
+
+#[tokio::test]
+async fn serves_ipv6_clients() {
+    let upstream = upstream().await;
+    let (_, server) = resolver_at(
+        Ipv6Addr::LOCALHOST.into(),
+        Config::default(),
+        vec![upstream.address],
+    )
+    .await;
+    let source = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let answer = ask_udp_from(source, server, &query("v6.test.", RecordType::AAAA)).await;
+    assert_eq!(addresses(&answer), ips(&["2001:db8::6"]));
+    let answer = ask_tcp_from(source, server, &query("v4.test.", RecordType::A)).await;
+    assert_eq!(addresses(&answer), ips(&["1.2.3.4", "5.6.7.8"]));
+}
+
+#[tokio::test]
+async fn asks_ipv4_upstreams_under_the_nat64_prefix() {
+    // The fake upstream listens on ::1, which is 0.0.0.1 under ::/96.
+    let upstream = upstream().await;
+    let ipv4 = SocketAddr::new(Ipv4Addr::new(0, 0, 0, 1).into(), upstream.address.port());
+    let config = Config {
+        default_upstreams: vec![ipv4],
+        nat64_prefix: Some(Ipv6Addr::UNSPECIFIED),
+        ..Config::default()
+    };
+    let (resolver, server) = resolver(config, vec![ipv4]).await;
+    let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
+    assert_eq!(addresses(&answer), ips(&["1.2.3.6"]));
+    let answer = ask_tcp(server, &query("v4.test.", RecordType::A)).await;
+    assert_eq!(addresses(&answer), ips(&["1.2.3.4", "5.6.7.8"]));
+    // The default upstreams too.
+    resolver.set_client(LOOPBACK.into(), POD, Vec::new());
+    let answer = ask_udp(server, &query("v6.test.", RecordType::AAAA)).await;
+    assert_eq!(addresses(&answer), ips(&["2001:db8::6"]));
+    assert_eq!(
+        upstream.asked(),
+        [
+            asked("v6.test.", RecordType::A, false),
+            asked("v4.test.", RecordType::A, true),
+            asked("v6.test.", RecordType::AAAA, false)
+        ]
+    );
 }

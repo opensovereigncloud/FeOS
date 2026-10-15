@@ -1,38 +1,35 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! feosd's resolver for its pods (ADR 0010): DNS64 (RFC 6147) in front of
+//! feosd's resolver for its pods (ADR 0010): it forwards their queries to
 //! the upstream resolvers that a pod names, or the node's.
 //!
 //! It answers the pods it knows, told apart by the source address of a
 //! query, which the pod's TAP pins, and refuses everyone else. It forwards
 //! a query to the pod's upstreams in order, to the next when one does not
-//! answer, and answers SERVFAIL when none does. An AAAA query for a name
-//! without AAAA records gets the name's A records under the NAT64 prefix.
-//! HTTPS records lose `ech`, so that clients send the server name in the
-//! clear (ADR 0013), and `ipv4hint`, which pods cannot use. Every query of
-//! a pod that is answered becomes a traffic record (ADR 0013).
+//! answer, and answers SERVFAIL when none does. Answers pass as the
+//! upstream gave them, but HTTPS and SVCB records lose `ech`, so that
+//! clients send the server name in the clear (ADR 0013). On a node without
+//! IPv4 of its own, a CLAT, an IPv4 upstream is asked at its address under
+//! the network's NAT64 prefix. Every query of a pod that is answered
+//! becomes a traffic record (ADR 0013).
 //!
 //! feosd binds the sockets and hands them over, so that they can come from
 //! socket activation and outlive feosd.
 
-mod dns64;
 mod svcb;
 #[cfg(test)]
 mod tests;
 mod upstream;
 
-pub use dns64::WELL_KNOWN_PREFIX;
-
 use feos_proto::network_service::{traffic_record, DnsQuery, TrafficRecord};
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::svcb::SvcParamKey;
 use hickory_proto::rr::rdata::{A, AAAA};
-use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
+use hickory_proto::rr::{Name, RData, RecordType};
 use log::{debug, warn};
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -42,7 +39,7 @@ use tokio::task::JoinSet;
 use tokio::time;
 
 /// The resolver's address on every node (ADR 0010).
-pub const ADDRESS: Ipv6Addr = Ipv6Addr::new(0xfdfd, 0x07b5, 0x61d9, 0, 0, 0, 0, 0x53);
+pub const ADDRESS: Ipv4Addr = Ipv4Addr::new(169, 254, 0, 53);
 /// How long an upstream has to answer over UDP, by default.
 pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -69,26 +66,24 @@ const RECORDS: usize = 1024;
 /// What the resolver does for all pods.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// The NAT64 prefix, a /96 (ADR 0010); its last 32 bits are ignored.
-    pub nat64_prefix: Ipv6Addr,
-    /// AAAA records count as absent for every name (RFC 6147 5.1.4,
-    /// exclusion), and HTTPS records lose `ipv6hint`: for nodes whose pods
-    /// cannot reach the IPv6 internet, such as those of a ULA pod prefix.
-    pub exclude_all_aaaa: bool,
     /// The upstreams of pods that name none.
     pub default_upstreams: Vec<SocketAddr>,
     /// How long an upstream has to answer over UDP before the next is
     /// asked; over TCP, twice that.
     pub upstream_timeout: Duration,
+    /// The network's NAT64 prefix, a /96 whose last 32 bits are ignored,
+    /// when the node has no IPv4 of its own (`--ipv4 clat`): IPv4 upstreams
+    /// are asked at their addresses under it (RFC 6052). None: they are
+    /// asked over IPv4.
+    pub nat64_prefix: Option<Ipv6Addr>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            nat64_prefix: WELL_KNOWN_PREFIX,
-            exclude_all_aaaa: false,
             default_upstreams: Vec::new(),
             upstream_timeout: UPSTREAM_TIMEOUT,
+            nat64_prefix: None,
         }
     }
 }
@@ -97,7 +92,7 @@ impl Default for Config {
 /// `serve` is dropped.
 pub struct Resolver {
     config: Config,
-    clients: RwLock<HashMap<Ipv6Addr, Arc<Client>>>,
+    clients: RwLock<HashMap<IpAddr, Arc<Client>>>,
     records: broadcast::Sender<TrafficRecord>,
     queries: Arc<Semaphore>,
     connections: Arc<Semaphore>,
@@ -106,7 +101,7 @@ pub struct Resolver {
 /// A pod, as the resolver knows it.
 struct Client {
     pod_id: String,
-    /// Empty: the default upstreams.
+    /// Where its upstreams are asked; empty: the default upstreams.
     upstreams: Vec<SocketAddr>,
     queries: Arc<Semaphore>,
     connections: Arc<Semaphore>,
@@ -121,27 +116,9 @@ enum Transport {
 /// What a query of a pod holds while it is in flight.
 type Permits = (OwnedSemaphorePermit, Option<OwnedSemaphorePermit>);
 
-/// What the upstreams answered, changed as the resolver changes it.
-struct Resolution {
-    response: Message,
-    /// Whether DNS64 made the answer.
-    synthesized: bool,
-}
-
-impl Resolution {
-    fn new(response: Message) -> Self {
-        Self {
-            response,
-            synthesized: false,
-        }
-    }
-}
-
 impl Resolver {
     pub fn new(mut config: Config) -> Arc<Self> {
-        let mut prefix = config.nat64_prefix.octets();
-        prefix[12..].fill(0);
-        config.nat64_prefix = prefix.into();
+        config.default_upstreams = upstream::route(&config.default_upstreams, config.nat64_prefix);
         let (records, _) = broadcast::channel(RECORDS);
         Arc::new(Self {
             config,
@@ -152,10 +129,12 @@ impl Resolver {
         })
     }
 
-    /// Serves the pod `pod_id` at `address`, asking `upstreams`, or the
-    /// default upstreams when there are none. Replaces what the resolver
-    /// knew of `address`.
-    pub fn set_client(&self, address: Ipv6Addr, pod_id: &str, upstreams: Vec<SocketAddr>) {
+    /// Serves the pod `pod_id` at `address`, which its queries come from:
+    /// its IPv4 address. Asks `upstreams`, or the default upstreams when
+    /// there are none. Replaces what the resolver knew of `address`.
+    pub fn set_client(&self, address: IpAddr, pod_id: &str, upstreams: Vec<SocketAddr>) {
+        let address = address.to_canonical();
+        let upstreams = upstream::route(&upstreams, self.config.nat64_prefix);
         let mut clients = self.clients.write().unwrap_or_else(PoisonError::into_inner);
         // A pod that is set again keeps its limits.
         let (queries, connections) = match clients.get(&address) {
@@ -176,11 +155,11 @@ impl Resolver {
 
     /// Stops serving the pod at `address`: its queries are refused from
     /// now on.
-    pub fn remove_client(&self, address: Ipv6Addr) {
+    pub fn remove_client(&self, address: IpAddr) {
         self.clients
             .write()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&address);
+            .remove(&address.to_canonical());
     }
 
     /// The pods' queries from now on, one record for each that is
@@ -259,7 +238,7 @@ impl Resolver {
     async fn serve_connection(
         self: Arc<Self>,
         stream: TcpStream,
-        source: Ipv6Addr,
+        source: IpAddr,
         _permits: Permits,
     ) {
         let (mut reader, writer) = stream.into_split();
@@ -306,7 +285,7 @@ impl Resolver {
         while queries.join_next().await.is_some() {}
     }
 
-    fn client(&self, address: Ipv6Addr) -> Option<Arc<Client>> {
+    fn client(&self, address: IpAddr) -> Option<Arc<Client>> {
         self.clients
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -335,7 +314,7 @@ impl Resolver {
 
     /// Permits for a TCP connection, None when the client or all are at
     /// their limit.
-    fn try_connection(&self, source: Ipv6Addr) -> Option<Permits> {
+    fn try_connection(&self, source: IpAddr) -> Option<Permits> {
         let own = match self.client(source) {
             Some(client) => Some(client.connections.clone().try_acquire_owned().ok()?),
             None => None,
@@ -369,144 +348,36 @@ impl Resolver {
         let Some(client) = client else {
             return encode(&respond(&request, Err(ResponseCode::Refused)), limit);
         };
-        let (response, synthesized) = match check(&request) {
-            Some(code) => (respond(&request, Err(code)), false),
-            None => match self.resolve(&request, client, transport).await {
-                Some(Resolution {
-                    mut response,
-                    synthesized,
-                }) => {
-                    let keys = self.stripped_keys();
-                    let answers = svcb::strip(response.answers_mut(), keys);
-                    let additionals = svcb::strip(response.additionals_mut(), keys);
+        let response = match check(&request) {
+            Some(code) => respond(&request, Err(code)),
+            None => match self.ask(&request, client, transport).await {
+                Some(mut response) => {
+                    let answers = svcb::strip(response.answers_mut());
+                    let additionals = svcb::strip(response.additionals_mut());
                     // What was changed is no longer what was signed.
                     if answers || additionals {
                         response.set_authentic_data(false);
                     }
-                    (respond(&request, Ok(response)), synthesized)
+                    respond(&request, Ok(response))
                 }
-                None => (respond(&request, Err(ResponseCode::ServFail)), false),
+                None => respond(&request, Err(ResponseCode::ServFail)),
             },
         };
         if let [question] = request.queries() {
-            self.record(client, question, &response, synthesized);
+            self.record(client, question, &response);
         }
         encode(&response, limit)
     }
 
-    /// What the upstreams answer for the one question of `request`.
+    /// What the client's upstreams answer to the question of `request`.
     /// None when none answers.
-    async fn resolve(
-        &self,
-        request: &Message,
-        client: &Client,
-        transport: Transport,
-    ) -> Option<Resolution> {
-        let question = request.queries().first()?.clone();
-        let prefix = self.config.nat64_prefix;
-        if question.query_class() == DNSClass::IN {
-            if dns64::is_ipv4only_arpa(question.name()) {
-                return Some(Resolution {
-                    response: dns64::ipv4only(&question, prefix),
-                    synthesized: question.query_type() == RecordType::AAAA,
-                });
-            }
-            // A validating client asked for the records as they are
-            // (RFC 6147 5.5).
-            let raw = dnssec_ok(request) && request.checking_disabled();
-            if !raw && question.query_type() == RecordType::AAAA {
-                return self
-                    .resolve_aaaa(request, client, question, transport)
-                    .await;
-            }
-            if !raw
-                && question.query_type() == RecordType::PTR
-                && let Some(name) = dns64::reverse(question.name(), prefix)
-            {
-                return self
-                    .resolve_ptr(request, client, question, name, transport)
-                    .await;
-            }
-        }
-        let response = self.ask(request, client, question, transport).await?;
-        Some(Resolution::new(response))
-    }
-
-    /// AAAA through DNS64: the name's AAAA records, or, when it has none,
-    /// its A records under the NAT64 prefix (RFC 6147 5.1).
-    async fn resolve_aaaa(
-        &self,
-        request: &Message,
-        client: &Client,
-        question: Query,
-        transport: Transport,
-    ) -> Option<Resolution> {
-        let aaaa = if self.config.exclude_all_aaaa {
-            None
-        } else {
-            let mut response = self
-                .ask(request, client, question.clone(), transport)
-                .await?;
-            // Errors and names that do not exist pass as they are.
-            if response.response_code() != ResponseCode::NoError {
-                return Some(Resolution::new(response));
-            }
-            dns64::exclude(&mut response);
-            if dns64::has_aaaa(&response) {
-                return Some(Resolution::new(response));
-            }
-            Some(response)
-        };
-        let mut a_question = question;
-        a_question.set_query_type(RecordType::A);
-        let a = self.ask(request, client, a_question, transport).await;
-        if let Some(a) = &a
-            && a.response_code() == ResponseCode::NoError
-        {
-            let ttl = dns64::negative_ttl(aaaa.as_ref());
-            if let Some(response) = dns64::synthesize(a, self.config.nat64_prefix, ttl) {
-                return Some(Resolution {
-                    response,
-                    synthesized: true,
-                });
-            }
-        }
-        match (aaaa, a) {
-            (Some(aaaa), _) => Some(Resolution::new(aaaa)),
-            (None, Some(a)) => Some(Resolution::new(dns64::without_a(a))),
-            (None, None) => None,
-        }
-    }
-
-    /// PTR for an address under the NAT64 prefix: the PTR records of the
-    /// IPv4 address in it, `name` (RFC 6147 5.3.1).
-    async fn resolve_ptr(
-        &self,
-        request: &Message,
-        client: &Client,
-        question: Query,
-        name: Name,
-        transport: Transport,
-    ) -> Option<Resolution> {
-        let mut ipv4 = question.clone();
-        ipv4.set_name(name.clone());
-        let mut response = self.ask(request, client, ipv4, transport).await?;
-        dns64::rename(&mut response, &name, question.name());
-        let synthesized = !response.answers().is_empty();
-        Some(Resolution {
-            response,
-            synthesized,
-        })
-    }
-
-    /// Asks the client's upstreams `question` on behalf of `request`.
     async fn ask(
         &self,
         request: &Message,
         client: &Client,
-        question: Query,
         transport: Transport,
     ) -> Option<Message> {
+        let question = request.queries().first()?.clone();
         let upstreams = match client.upstreams.is_empty() {
             true => &self.config.default_upstreams,
             false => &client.upstreams,
@@ -516,20 +387,8 @@ impl Resolver {
         upstream::ask(upstreams, &query, tcp, self.config.upstream_timeout).await
     }
 
-    /// The parameters that SVCB and HTTPS records lose.
-    fn stripped_keys(&self) -> &'static [SvcParamKey] {
-        match self.config.exclude_all_aaaa {
-            true => &[
-                SvcParamKey::Ipv4Hint,
-                SvcParamKey::EchConfigList,
-                SvcParamKey::Ipv6Hint,
-            ],
-            false => &[SvcParamKey::Ipv4Hint, SvcParamKey::EchConfigList],
-        }
-    }
-
     /// Publishes the record of an answered query.
-    fn record(&self, client: &Client, question: &Query, response: &Message, synthesized: bool) {
+    fn record(&self, client: &Client, question: &Query, response: &Message) {
         let addresses = response
             .answers()
             .iter()
@@ -548,7 +407,6 @@ impl Resolver {
                 r#type: u16::from(question.query_type()).into(),
                 rcode: u16::from(response.response_code()).into(),
                 addresses,
-                synthesized,
             })),
         };
         // Nobody may be listening.
@@ -665,12 +523,10 @@ fn record_name(name: &Name) -> String {
     }
 }
 
-/// The address a peer is known by; an IPv4 peer by its mapped address.
-fn source_address(peer: SocketAddr) -> Ipv6Addr {
-    match peer.ip() {
-        IpAddr::V6(address) => address,
-        IpAddr::V4(address) => address.to_ipv6_mapped(),
-    }
+/// The address a peer is known by; an IPv4 peer of an IPv6 socket by its
+/// IPv4 address.
+fn source_address(peer: SocketAddr) -> IpAddr {
+    peer.ip().to_canonical()
 }
 
 /// Waits a moment after a socket error that may pass, such as running out

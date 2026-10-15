@@ -4,7 +4,7 @@
 //! The pods' network (ADR 0010, 0012, 0013). Pods are IPv6 only: each has
 //! an address of the node's prefix, routed to its TAP device, a link of
 //! its own between the node and the pod, on which the node is `fe80::1`.
-//! IPv4 goes through NAT64, names through feosd's DNS64 resolver; the
+//! IPv4 goes through NAT64, names through feosd's resolver; the
 //! pods' security groups become nftables rules; and their traffic becomes
 //! records.
 
@@ -38,6 +38,9 @@ use traffic_service::Collector;
 pub const GATEWAY: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
 /// The device that holds the resolver's address.
 pub const DNS_DEVICE: &str = "feos-dns";
+/// The resolver's address while pods are IPv6 only; with their IPv4, it
+/// becomes `dns_service::ADDRESS`.
+const DNS_ADDRESS: Ipv6Addr = Ipv6Addr::new(0xfdfd, 0x07b5, 0x61d9, 0, 0, 0, 0, 0x53);
 /// The node's default upstream resolvers: Google's and Cloudflare's.
 pub const DNS_UPSTREAMS: [&str; 4] = [
     "2001:4860:4860::8888",
@@ -103,7 +106,7 @@ impl Default for Config {
             nat64: Nat64Mode::Node,
             nat64_prefix: nat64::PREFIX,
             nat64_pool: (nat64::POOL, nat64::POOL_LEN),
-            dns_address: dns_service::ADDRESS,
+            dns_address: DNS_ADDRESS,
             dns_upstreams: DNS_UPSTREAMS
                 .iter()
                 .filter_map(|address| address.parse().ok())
@@ -490,7 +493,9 @@ impl Network {
                 wanted.insert(address, ipv4);
             }
             match self.upstreams(&pod_network(pod)) {
-                Ok(upstreams) => parts.resolver.set_client(address, &pod.pod_id, upstreams),
+                Ok(upstreams) => parts
+                    .resolver
+                    .set_client(address.into(), &pod.pod_id, upstreams),
                 Err(e) => warn!("Network: Pod {} gets no DNS: {}", pod.pod_id, e.message()),
             }
         }
@@ -557,7 +562,7 @@ impl Network {
                 .map(address, ipv4)
                 .map_err(|e| Status::internal(format!("NAT64 for {address}: {e}")))?;
         }
-        parts.resolver.set_client(address, pod_id, upstreams);
+        parts.resolver.set_client(address.into(), pod_id, upstreams);
         Ok(Some(Attachment {
             tap,
             mac: mac(pod_id),
@@ -573,7 +578,7 @@ impl Network {
             return Ok(());
         }
         if let (Ok(parts), Ok(address)) = (&self.parts, info.ipv6_address.parse::<Ipv6Addr>()) {
-            parts.resolver.remove_client(address);
+            parts.resolver.remove_client(address.into());
             if let Some(nat64) = &parts.nat64
                 && let Err(e) = nat64.unmap(address)
             {
@@ -730,12 +735,7 @@ async fn set_up(
         }
     };
 
-    // Where the pods cannot reach the IPv6 internet, as from a ULA prefix,
-    // every name goes through NAT64 (ADR 0010).
-    let ula = u128::from(prefix) >> 121 == 0xfc >> 1;
     let resolver = Resolver::new(dns_service::Config {
-        nat64_prefix: config.nat64_prefix,
-        exclude_all_aaaa: ula,
         default_upstreams: config
             .dns_upstreams
             .iter()
@@ -958,7 +958,7 @@ mod tests {
         assert!("both".parse::<Nat64Mode>().is_err());
         let config = Config::default();
         assert_eq!(config.dns_upstreams.len(), 4);
-        assert_eq!(config.dns_address, dns_service::ADDRESS);
+        assert_eq!(config.dns_address, DNS_ADDRESS);
     }
 
     #[test]
@@ -1081,7 +1081,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let resolver = dns_service::ADDRESS;
+        let resolver = DNS_ADDRESS;
         assert!(is_dns_flow(&flow("fdfd:7b5:61d9::53", 53, 0), resolver));
         assert!(!is_dns_flow(&flow("fdfd:7b5:61d9::53", 853, 0), resolver));
         assert!(!is_dns_flow(&flow("8.8.8.8", 53, 0), resolver));

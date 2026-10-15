@@ -194,10 +194,12 @@ message DnsQuery {
   uint32 type = 2;
   // The response code: 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, ...
   uint32 rcode = 3;
-  // The addresses of the answer, synthesized ones included.
+  // The addresses of the answer's A and AAAA records.
   repeated string addresses = 4;
-  // Whether DNS64 synthesized the answer.
-  bool synthesized = 5;
+  // Whether DNS64 synthesized the answer. Pods have IPv4, and the resolver
+  // passes answers as the upstream gave them.
+  reserved 5;
+  reserved "synthesized";
 }
 
 // The server a pod's connection asked for.

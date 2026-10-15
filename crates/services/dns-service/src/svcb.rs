@@ -2,25 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! What pods do not get of SVCB and HTTPS records (RFC 9460): `ech`, so
-//! that clients send the server name in the clear (ADR 0013), and address
-//! hints of a family they cannot reach.
+//! that clients send the server name in the clear (ADR 0013).
 
 use hickory_proto::rr::rdata::svcb::{Mandatory, SvcParamKey, SvcParamValue, SVCB};
 use hickory_proto::rr::rdata::HTTPS;
 use hickory_proto::rr::{RData, Record};
 
-/// Removes the parameters `keys` from the SVCB and HTTPS records among
-/// `records`, and from their `mandatory` lists. Returns whether a record
-/// changed.
-pub fn strip(records: &mut [Record], keys: &[SvcParamKey]) -> bool {
+/// The parameters that SVCB and HTTPS records lose.
+const STRIPPED: &[SvcParamKey] = &[SvcParamKey::EchConfigList];
+
+/// Removes `ech` from the SVCB and HTTPS records among `records`, and from
+/// their `mandatory` lists. Returns whether a record changed.
+pub fn strip(records: &mut [Record]) -> bool {
     let mut changed = false;
     for record in records {
         let svcb = match record.data_mut() {
             RData::HTTPS(HTTPS(svcb)) | RData::SVCB(svcb) => svcb,
             _ => continue,
         };
-        if svcb.svc_params().iter().any(|(key, _)| keys.contains(key)) {
-            *svcb = without(svcb, keys);
+        if svcb
+            .svc_params()
+            .iter()
+            .any(|(key, _)| STRIPPED.contains(key))
+        {
+            *svcb = without(svcb, STRIPPED);
             changed = true;
         }
     }
@@ -56,8 +61,6 @@ mod tests {
     use hickory_proto::rr::rdata::{A, AAAA};
     use hickory_proto::rr::Name;
 
-    const KEYS: [SvcParamKey; 2] = [SvcParamKey::Ipv4Hint, SvcParamKey::EchConfigList];
-
     fn https(params: Vec<(SvcParamKey, SvcParamValue)>) -> Record {
         let name = Name::from_ascii("example.com.").unwrap();
         let svcb = SVCB::new(1, Name::root(), params);
@@ -72,10 +75,14 @@ mod tests {
     }
 
     #[test]
-    fn removes_ech_and_ipv4hint() {
+    fn removes_ech() {
         let alpn = (
             SvcParamKey::Alpn,
             SvcParamValue::Alpn(Alpn(vec!["h2".into(), "h3".into()])),
+        );
+        let ipv4hint = (
+            SvcParamKey::Ipv4Hint,
+            SvcParamValue::Ipv4Hint(IpHint(vec![A([1, 2, 3, 4].into())])),
         );
         let ipv6hint = (
             SvcParamKey::Ipv6Hint,
@@ -90,17 +97,15 @@ mod tests {
                 ])),
             ),
             alpn.clone(),
-            (
-                SvcParamKey::Ipv4Hint,
-                SvcParamValue::Ipv4Hint(IpHint(vec![A([1, 2, 3, 4].into())])),
-            ),
+            ipv4hint.clone(),
             (
                 SvcParamKey::EchConfigList,
                 SvcParamValue::EchConfigList(EchConfigList(vec![0, 4, 0xfe, 0x0d, 0, 0])),
             ),
             ipv6hint.clone(),
         ])];
-        assert!(strip(&mut records, &KEYS));
+        assert!(strip(&mut records));
+        // Pods have both families: the address hints stay.
         assert_eq!(
             params(&records[0]),
             [
@@ -109,6 +114,7 @@ mod tests {
                     SvcParamValue::Mandatory(Mandatory(vec![SvcParamKey::Alpn]))
                 ),
                 alpn,
+                ipv4hint,
                 ipv6hint
             ]
         );
@@ -133,7 +139,7 @@ mod tests {
             ),
             (SvcParamKey::Port, SvcParamValue::Port(8443)),
         ])];
-        assert!(strip(&mut records, &KEYS));
+        assert!(strip(&mut records));
         assert_eq!(
             params(&records[0]),
             [(SvcParamKey::Port, SvcParamValue::Port(8443))]
@@ -145,7 +151,7 @@ mod tests {
         let port = vec![(SvcParamKey::Port, SvcParamValue::Port(8443))];
         let a = Record::from_rdata(Name::root(), 60, RData::A(A([1, 2, 3, 4].into())));
         let mut records = vec![https(port.clone()), a.clone()];
-        assert!(!strip(&mut records, &KEYS));
+        assert!(!strip(&mut records));
         assert_eq!(params(&records[0]), port);
         assert_eq!(records[1], a);
     }

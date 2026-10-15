@@ -32,7 +32,7 @@ crates/
                         bpf-linker
   services/
     container-service/  containers: overlay roots, exec, adoption, persistence
-    dns-service/        the pods' DNS64 resolver, which feosd serves
+    dns-service/        the pods' resolver, which feosd serves
     host-service/       host information, logs, power, upgrade, time, network
                         push, filesystem freezing, memory
     image-service/      OCI image pulls and the image store

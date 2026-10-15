@@ -148,9 +148,6 @@ fn dns_line(dns: &DnsQuery) -> String {
         line.push(' ');
         line.push_str(&dns.addresses.join(","));
     }
-    if dns.synthesized {
-        line.push_str(" dns64");
-    }
     line
 }
 
@@ -273,12 +270,11 @@ mod tests {
             name: "example.com".to_string(),
             r#type: 28,
             rcode: 0,
-            addresses: vec!["64:ff9b::c000:201".to_string()],
-            synthesized: true,
+            addresses: vec!["2001:db8::1".to_string()],
         };
         assert_eq!(
             line(&record(Record::Dns(dns), 0)),
-            "2025-10-09T08:53:20.123Z pod-a dns example.com AAAA NOERROR 64:ff9b::c000:201 dns64"
+            "2025-10-09T08:53:20.123Z pod-a dns example.com AAAA NOERROR 2001:db8::1"
         );
     }
 }
