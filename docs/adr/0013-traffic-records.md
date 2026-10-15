@@ -19,7 +19,7 @@ containers or processes.
 ### What is recorded
 
 - **Flows**: every connection of a pod, in either direction: the pod,
-  the protocol, addresses and ports (an IPv4 destination as IPv4), when
+  the protocol, addresses and ports (the pod's own, before NAT), when
   it began and ended, and bytes and packets each way.
 - **Drops**: packets that a security group or a denied prefix dropped
   (ADR 0012), limited in rate per pod: the pod, the protocol, addresses

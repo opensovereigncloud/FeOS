@@ -26,21 +26,22 @@ pods on every other node.
 ### Security groups
 
 - A security group has an ID, a version and rules. A rule has a
-  direction, in or out; a protocol, TCP, UDP, ICMPv6 or any; ports,
+  direction, in or out; a protocol, TCP, UDP, ICMP, ICMPv6 or any; ports,
   where the protocol has them; and a peer: an address block with
   exceptions, as Kubernetes's `ipBlock` has them, or a security group.
 - Rules only allow, and have no order. A pod has one or more groups,
   which the network in its spec names; what one of them allows, the pod
   may do. Everything else is dropped.
 - Security groups are stateful: the replies to a connection that a rule
-  allowed pass, and so do the ICMPv6 errors that belong to it.
-- An IPv4 block in a rule means its addresses under the NAT64 prefix
-  (ADR 0010).
+  allowed pass, and so do the ICMP and ICMPv6 errors that belong to it.
+- A block is of either family. A pod's IPv4 address is for leaving only
+  (ADR 0010), so an IPv4 block matters in rules out; a group as a peer
+  stands for its members' IPv6 addresses.
 - The prefixes of `--deny-prefix` (ADR 0010) come first: no rule opens
   them.
 - A pod whose spec names no group gets `feosd`'s default group: out to
-  the internet, which is global IPv6 addresses and global IPv4 addresses
-  under the NAT64 prefix; nothing in. That is what the first version of
+  the internet, which is the global addresses of both families; nothing
+  in. That is what the first version of
   ADR 0010 gave every pod.
 - Labels and selectors are the control plane's. It may offer Kubernetes's
   NetworkPolicy to CaaS and turn it into groups; `feosd` sees groups and
@@ -70,7 +71,7 @@ pods on every other node.
 - Each pod has a chain for what it sends and one for what it receives,
   reached through verdict maps by its TAP. Each group that a rule names
   as a peer is a named set of addresses; a block with exceptions is a set
-  of intervals, the difference computed by `feosd`.
+  of intervals, one per family, the difference computed by `feosd`.
 - In each chain, what belongs to an allowed connection passes, denied
   prefixes are dropped, the rules of the pod's groups accept, and the
   rest is dropped.

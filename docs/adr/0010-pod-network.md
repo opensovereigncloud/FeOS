@@ -12,8 +12,8 @@ each other, a service to its database, across nodes.
 The first version of this ADR gave pods what the sandbox system had: an
 IPv4 address of `10.200.0.0/16` on a bridge of isolated ports, NAT to the
 outside, and nftables rules that kept pods from each other, the node and
-private networks. `feosd` builds that today. Nobody can reach a pod behind
-NAT, and every node hands out the same addresses.
+private networks. Nobody can reach a pod behind NAT, and every node hands
+out the same addresses.
 
 Routing pods' addresses between nodes takes addresses that are unique
 across nodes, and a prefix per node that the network routes to it. IPv4
@@ -22,15 +22,31 @@ suspended ones included. An address that is handed out again inherits
 what other pods allowed its old owner, until every node has heard of the
 change (ADR 0012). IPv6 has room never to hand out an address twice.
 
+The second version made pods IPv6 only, with IPv4 destinations behind
+NAT64 and DNS64. In an agent's workspace runs whatever tool the agent
+picks, and much of it breaks there: IPv4 literals, programs that speak
+only IPv4, resolvers of their own or over HTTPS, and DNSSEC validation,
+which synthesized records fail.
+
 Pods resume on other nodes (ADR 0001). An address that followed a pod
 from node to node would need a route per pod, changed with every move.
 
 ## Decision
 
-### Addresses
+### Two families, two roles
 
-- Pods are IPv6 only. Their microVMs and containers have no IPv4
-  address.
+- A pod has an IPv6 address and an IPv4 address. IPv6 is its address on
+  the network: unique across nodes, routed, and reachable where a
+  security group allows it (ADR 0012). IPv4 is for leaving only.
+- Where a name has addresses of both families, programs take IPv6, since
+  the pod's IPv4 address is link-local (RFC 6724); IPv4 carries what has
+  no IPv6.
+- A pod that resumes on another node gets both addresses there. Nothing
+  stores a pod's addresses: the control plane's registry, the security
+  groups and the load balancers follow the pod's record.
+
+### IPv6: a prefix routed to the node
+
 - Every node has a prefix that its network routes to it, by a static
   route or BGP, and that `feosd` is given (`--pod-prefix`). A /64 is
   best; a smaller one, such as the /80 that AWS delegates to a network
@@ -40,92 +56,118 @@ from node to node would need a route per pod, changed with every move.
 - `feosd` gives a pod an address of the node's prefix when the pod comes
   to the node, keeps it in the pod's record while the pod is there, and
   never hands an address out twice.
-- A pod that resumes on another node gets an address there. Nothing
-  stores a pod's address: the control plane's registry, the security
-  groups (ADR 0012) and the load balancers follow the pod's record.
+- The node holds the rest of its prefix as unreachable, so that a packet
+  for a pod that is not running does not loop back into the network.
+
+### IPv4: a link-local address per pod
+
+- `feosd` gives every pod an address of `169.254.16.0/20`
+  (`--pod-ipv4-range`), as a /32, unique on the node and not across
+  nodes. No network routes link-local addresses (RFC 3927), and no
+  tenant's network collides with them.
+- No rule allows by a pod's IPv4 address: security groups name pods by
+  their IPv6 addresses (ADR 0012), and link-local destinations are denied
+  (below). So an IPv4 address may come round again: `feosd` hands out the
+  one that has been free longest, and drops the connection tracking
+  entries of a deleted pod's address.
+- The /20 bounds a node to 4096 pods, suspended ones included.
 
 ### Each pod's TAP is a link of its own
 
 - The pod's TAP device (`pod-<8 hex of its ID>`) is a point-to-point link
   between the node and the pod; there is no bridge. The node is
-  `fe80::1` on every TAP, and the pod's address has a /128 route on its
-  TAP.
-- The node holds the rest of its prefix as unreachable, so that a packet
-  for a pod that is not running does not loop back into the network.
+  `fe80::1` and `169.254.0.1` on every TAP, and the pod's addresses have
+  a /128 and a /32 route on its TAP.
 - A packet from a TAP whose source address is not routed back out that
   TAP is dropped: one reverse path rule (`fib`) pins every pod to its
-  address.
-- From a pod, the node takes neighbor discovery on the TAP and DNS
-  (below), nothing else. Router advertisements and redirects from a pod
-  are dropped.
+  addresses, in both families.
+- From a pod, the node takes neighbor discovery and ARP on the TAP and
+  DNS (below), nothing else. Router advertisements and redirects from a
+  pod are dropped.
 
-### IPv4 through NAT64
+### How IPv4 leaves the node
 
-- Pods reach IPv4 destinations through NAT64, under one /96 prefix that
-  DNS64 and NAT64 share (`--nat64-prefix`, `64:ff9b::/96` by default).
-- `--nat64=node`: the node routes the prefix into a device of its own.
-  An eBPF program there translates statelessly (SIIT, RFC 7915, with an
-  explicit mapping per pod, RFC 7757) between the pod's address and an
-  IPv4 address of a range of the node's own (`10.200.0.0/16` by
-  default), which nftables masquerades to the node's address. These IPv4
-  addresses never leave the node. eBPF is here only because netfilter has
-  no NAT64.
-- `--nat64=network`: the node routes the prefix like any other, and a
-  NAT64 in the network translates: a gateway, or a cloud's NAT gateway.
-- Either way, the node filters a pod's packets as IPv6, before any
-  translation (ADR 0012).
+- `--ipv4=nat`, the default: nftables masquerades the pods' IPv4 to the
+  node's address, with Linux's connection tracking.
+- `--ipv4=clat`, for a node without IPv4 in a network with a NAT64: the
+  node translates its pods' IPv4 to IPv6 (464XLAT, RFC 6877, the node
+  being the CLAT). An eBPF program on a device of its own translates
+  statelessly (SIIT, RFC 7915): the destination under the network's NAT64
+  prefix (`--nat64-prefix`, `64:ff9b::/96` by default), the pod's address
+  under the last /96 of the node's prefix, which no pod gets. eBPF is here
+  only because netfilter has no SIIT.
+- Either way, the node filters a pod's packets before NAT or translation,
+  in the family the pod sent them in (ADR 0012).
 
 ### DNS in feosd
 
-- `feosd` serves DNS to its pods at `fdfd:07b5:61d9::53`, the same
-  address on every node, so that a pod's resolver configuration holds
-  after a resume elsewhere. `fdfd:07b5:61d9::/48` is FeOS's prefix for
-  services on the node (RFC 4193); `--dns-address` changes the address.
+- `feosd` serves DNS to its pods at `169.254.0.53`, the same address on
+  every node, so that a pod's resolver configuration holds after a resume
+  elsewhere; `--dns-address` changes it.
 - The guest is pushed this resolver and no other, and so are its
   containers.
 - `feosd` asks the upstream resolvers that the pod's spec names, or the
   node's (`--dns-upstream`, Google's and Cloudflare's by default). An
   upstream in a denied prefix (below) is refused.
-- It is DNS64 (RFC 6147): a name that has only A records gets AAAA
-  records under the NAT64 prefix. Under the well-known prefix it
-  synthesizes none for non-global IPv4 addresses (RFC 6052). It answers
-  `ipv4only.arpa` (RFC 7050).
-- Where pods cannot reach the IPv6 internet, because the node's prefix is
-  a ULA (`fc00::/7`) as in labs and tests, AAAA records count as absent
-  (RFC 6147's exclusion), and every name is reached through NAT64.
+- It passes answers on as the upstream gave them. Pods have IPv4, so
+  there is no DNS64.
 - It tells pods apart by the source address of a query, which the TAP
   pins.
 - Its sockets outlive restarts of `feosd`: a query waits in them, it does
   not fail.
+
+### Metadata
+
+- `169.254.169.254` is the pod's metadata service. Firecracker answers it
+  inside the microVM's network device (MMDS), in the version that wants a
+  session token first, as AWS's IMDSv2 does, so that a request that a
+  pod's code is tricked into sending gets nothing.
+- Its packets never leave the VMM. Link-local destinations are denied on
+  the node, so no pod reaches the node's own cloud metadata service.
+- What it holds is decided apart; a pod's credentials are not in it
+  (ADR 0014).
 
 ### What a pod may reach
 
 - A pod's security groups decide what it sends and what reaches it
   (ADR 0012). There is no fixed list of private destinations: a group
   that allows the internet says which addresses that is.
-- `--deny-prefix` lists prefixes that no pod reaches, whatever a group
-  says: a cloud's metadata service, the control plane, Valkey, management
-  networks. An IPv4 prefix in it means its addresses under the NAT64
-  prefix. The node's own addresses and link-local, loopback and multicast
-  addresses of both families are denied always.
+- `--deny-prefix` lists prefixes of either family that no pod reaches,
+  whatever a group says: a cloud's metadata service, the control plane,
+  Valkey, management networks. The node's own addresses and link-local,
+  loopback and multicast addresses of both families are denied always.
+  Other pods' IPv4 addresses are among them: pods reach each other over
+  IPv6 alone.
 - `feosd` writes its nftables tables over netlink itself; it runs no
   `nft` or `iptables`.
 
 ## Alternatives considered
 
 - **IPv4 behind NAT on a bridge of isolated ports**, as the first version
-  of this ADR decided and `feosd` builds: no pod can be reached from
-  outside or from another pod.
-- **Routed IPv4, a prefix per node.** No NAT64, no DNS64, and every
-  program works as it is. But a /24 holds 253 pods, suspended ones
+  of this ADR decided: no pod can be reached from outside or from another
+  pod.
+- **IPv6 only, IPv4 destinations through NAT64 and DNS64**, as the second
+  version decided: one family in the guest, but IPv4 literals, programs
+  that speak only IPv4, resolvers of their own and DNSSEC validation
+  break.
+- **Routed IPv4, a prefix per node.** Every program works as it is, and
+  IPv4 clients reach pods. But a /24 holds 253 pods, suspended ones
   included; addresses come round again, so a change of a group's members
   would have to reach every node before its address is handed out again;
   and private IPv4 ranges collide with tenants' own networks once those
   are joined.
-- **Dual stack, with a private IPv4 address behind NAT for leaving
-  only**, as Fly.io's machines have: IPv4 literals and programs that only
-  speak IPv4 work, without NAT64 or DNS64. Every guest has two families;
-  a CLAT in the guest (464XLAT) gives the same where it is needed.
+- **The same IPv4 address in every pod**, such as `169.254.0.2`: the
+  guest's IPv4 would be the same on every node. But connection tracking
+  and routing cannot tell such pods apart; the node would have to rewrite
+  every pod's address to one of its own at the TAP, in eBPF, the inner
+  headers of ICMP errors included. And a resume elsewhere changes the
+  pod's IPv6 address anyway.
+- **A private range for the pods' IPv4**, such as `10.200.0.0/16`: it
+  collides with the node's and tenants' networks; link-local addresses do
+  not.
+- **A CLAT in `feos-guest`** (464XLAT in the guest, IPv6 alone on the
+  TAP): the node would see a pod's IPv4 traffic only as IPv6, and every
+  guest would translate where one program on the node does.
 - **ULA addresses, an overlay between nodes and NAT66 to the internet**,
   as Fly.io does since 2026: no prefix routed to a node, but an overlay
   mesh between all nodes. It stays the way for networks that cannot route
@@ -139,37 +181,41 @@ from node to node would need a route per pod, changed with every move.
   it.
 - **A bridge with isolated ports**, as before: rules for MAC addresses,
   ARP and neighbor discovery that a route per TAP does not need.
-- **Jool for NAT64**: mature, but a kernel module out of tree on every
+- **Jool for the CLAT**: mature, but a kernel module out of tree on every
   node, built with DKMS on Debian and by ourselves for Garden Linux and
   `feos-host-init`.
-- **Public DNS64 resolvers** (Google's, Cloudflare's): no code, but no
+- **Public resolvers for pods** (Google's, Cloudflare's): no code, but no
   upstream per pod and no record of queries (ADR 0013).
 - **A resolver next to `feosd`**, such as Unbound: one more program to
   package, and the upstreams per pod to configure in it.
-- **`fd00::1` for the resolver**: shorter, but `fd00::/64` is a common
-  default of routers, and the node would shadow it.
+- **A ULA address for the resolver**, `fdfd:07b5:61d9::53` as the second
+  version had: pods have IPv4, and a link-local address next to the
+  gateway needs no prefix of its own.
+- **A metadata service on the node**: it could answer from `feosd`'s
+  state, but it would be one more listener that every pod reaches, where
+  MMDS is in the VMM already.
 
 ## Consequences
 
-- Pods reach each other, and are reached from outside, where a security
-  group allows it (ADR 0001, isolation).
-- A program that listens only on `0.0.0.0` cannot be reached; listeners
-  bind to `[::]`. A program that connects to an IPv4 literal, or speaks
-  only IPv4, reaches no IPv4 destination.
+- Pods reach each other, and are reached from outside, over IPv6 where a
+  security group allows it (ADR 0001, isolation).
+- Pods reach IPv4 destinations as they are: IPv4 literals and programs
+  that speak only IPv4 work. A program that listens only on `0.0.0.0`
+  cannot be reached from outside; listeners bind to `[::]`.
 - A pod's connections do not survive a resume on another node.
-- Every node needs a prefix routed to it.
-- `PodInfo` carries the pod's IPv6 address, and with `--nat64=node` the
-  IPv4 address that stands for the pod on the node; the network in
+- Every node needs a prefix routed to it, and IPv4 of its own or a NAT64
+  in its network.
+- `PodInfo` carries the pod's IPv6 and IPv4 addresses; the network in
   `PodSpec` names upstream resolvers and security groups. The guest's
-  network configuration gains IPv6, by addition (ADR 0007).
+  network configuration has both families (ADR 0007).
 - The control plane's front door reaches pods' ports over IPv6, without a
   port forward over vsock (ADR 0004).
-- `--nat64=node` brings an eBPF program to build, in a crate of its own on
+- `--ipv4=clat` brings an eBPF program to build, in a crate of its own on
   nightly (ADR 0002), and to load. It stays attached while `feosd`
-  restarts. Its object is committed, built reproducibly with
-  `make nat64-bpf` on a dated nightly and a pinned bpf-linker, and
-  embedded in `feosd`: no other build needs nightly, and a change of the
-  program is a change of the object in the same commit.
+  restarts. Its object is committed, built reproducibly on a dated
+  nightly and a pinned bpf-linker, and embedded in `feosd`: no other
+  build needs nightly, and a change of the program is a change of the
+  object in the same commit.
 - Other tables still apply: where Docker or a firewall drops forwarded
   packets by default, pods reach nothing until it lets them through.
 
@@ -178,12 +224,12 @@ from node to node would need a route per pod, changed with every move.
 - **Load balancers**: HTTPS with ACME, L4, IPv4 clients, and holding
   requests while a pod resumes. They are the control plane's front doors
   (ADR 0001) and get an ADR of their own.
-- **A CLAT in `feos-guest`** (464XLAT), should IPv4 literals turn out to
-  matter.
 - **How the DNS sockets outlive `feosd`**: socket activation under
   systemd, and its like under `feos-host-init`.
+- **What the metadata service holds**, and how it is filled again after a
+  pod is restored from a snapshot.
 - **Telling an IPv4-only listener apart**, so that a pod's status says
   why its port cannot be reached.
 - **Waking a suspended pod** on a packet to its address.
-- **Fixed IPv4 addresses for leaving**, per tenant, through a NAT64 in the
-  network.
+- **Fixed IPv4 addresses for leaving**, per tenant: an address of the
+  node's per tenant to masquerade to, or a NAT64 in the network.
