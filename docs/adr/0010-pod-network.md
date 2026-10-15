@@ -75,9 +75,12 @@ from node to node would need a route per pod, changed with every move.
 ### Each pod's TAP is a link of its own
 
 - The pod's TAP device (`pod-<8 hex of its ID>`) is a point-to-point link
-  between the node and the pod; there is no bridge. The node is
-  `fe80::1` and `169.254.0.1` on every TAP, and the pod's addresses have
-  a /128 and a /32 route on its TAP.
+  between the node and the pod; there is no bridge. The pod's addresses
+  have a /128 and a /32 route on its TAP.
+- The pod's gateways are `fe80::1` and `169.254.0.1`. The node is
+  `fe80::1` on every TAP, and answers ARP for `169.254.0.1` on it by
+  proxy, without holding the address: some clouds' gateways are
+  `169.254.0.1`, and a node there would lose its own.
 - A packet from a TAP whose source address is not routed back out that
   TAP is dropped: one reverse path rule (`fib`) pins every pod to its
   addresses, in both families.
@@ -96,7 +99,9 @@ from node to node would need a route per pod, changed with every move.
 
 - `feosd` serves DNS to its pods at `169.254.0.53`, the same address on
   every node, so that a pod's resolver configuration holds after a resume
-  elsewhere; `--dns-address` changes it.
+  elsewhere. It is the one link-local address the node holds;
+  `--dns-address` and `--pod-ipv4-range` move the resolver and the pods'
+  addresses where a node's own network uses theirs.
 - The guest is pushed this resolver and no other, and so are its
   containers.
 - `feosd` asks the upstream resolvers that the pod's spec names, or the
@@ -175,6 +180,9 @@ from node to node would need a route per pod, changed with every move.
   it.
 - **A bridge with isolated ports**, as before: rules for MAC addresses,
   ARP and neighbor discovery that a route per TAP does not need.
+- **The node holding `169.254.0.1` on every TAP**: no proxy ARP, but a
+  node whose network's gateway is `169.254.0.1` would deliver its own
+  traffic for the gateway to itself.
 - **Public resolvers for pods** (Google's, Cloudflare's): no code, but no
   upstream per pod and no record of queries (ADR 0013).
 - **A resolver next to `feosd`**, such as Unbound: one more program to
