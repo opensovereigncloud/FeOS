@@ -30,6 +30,8 @@ pub mod image_tests;
 pub mod pod_tests;
 
 pub const PUBLIC_SERVER_ADDRESS: &str = "http://[::1]:1337";
+/// The pods' prefix: a ULA, as in labs.
+pub const POD_PREFIX: &str = "fd00:fe05:1::/64";
 pub const DEFAULT_TEST_CONTAINER_IMAGE_REF: &str = "docker.io/library/busybox:1.36";
 
 /// An image in a local registry, which the image test pulls: `make
@@ -83,6 +85,10 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
     runtime.spawn(async move {
         let options = main_server::ServerOptions {
             tcp: Some("[::]:1337".parse().expect("an address")),
+            network: pod_service::network::Config {
+                pod_prefix: pod_service::network::parse_pod_prefix(POD_PREFIX).ok(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         if let Err(e) = main_server::run_server(options).await {

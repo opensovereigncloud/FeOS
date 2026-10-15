@@ -92,7 +92,9 @@ fn valid_name(name: &str) -> bool {
 
 /// The pod's microVM: the newest guest installed on the node, with a
 /// balloon that reports free pages, so that a suspend writes what the
-/// guest uses, and the pod's TAP device and address if it has a network.
+/// guest uses, and the pod's TAP device and address if it has a network:
+/// IPv6 only, a /128 behind the node at `fe80::1`, and the node's resolver
+/// (ADR 0010).
 pub fn vm_config(pod_id: &str, spec: &PodSpec, attachment: Option<&Attachment>) -> VmConfig {
     let resources = spec.resources.unwrap_or_default();
     let mut config = VmConfig {
@@ -116,13 +118,14 @@ pub fn vm_config(pod_id: &str, spec: &PodSpec, attachment: Option<&Attachment>) 
             tap: Some(TapConfig {
                 tap_name: attachment.tap.clone(),
             }),
-            mac_address: network::mac_string(attachment.mac()),
+            mac_address: network::mac_string(attachment.mac),
         });
+        // No IPv4: the guest removes what it had.
         config.guest_network = Some(GuestNetworkConfig {
             interface: INTERFACE.to_string(),
-            ipv4_cidr: format!("{}/{}", attachment.address, network::PREFIX_LEN),
-            gateway: network::GATEWAY.to_string(),
-            dns: network::DNS.iter().map(|dns| dns.to_string()).collect(),
+            ipv6_cidr: format!("{}/128", attachment.address),
+            ipv6_gateway: network::GATEWAY.to_string(),
+            dns: vec![attachment.dns.to_string()],
             hostname: pod_id.to_string(),
             ..Default::default()
         });
@@ -211,14 +214,21 @@ mod tests {
     fn the_network_becomes_eth0() {
         let spec = normalize(spec(vec![container("main")])).unwrap();
         let id = "11111111-2222-3333-4444-555555555555";
-        let attachment = Attachment::new(id, std::net::Ipv4Addr::new(10, 200, 0, 9));
+        let attachment = Attachment {
+            tap: network::tap_name(id),
+            mac: network::mac(id),
+            address: "fd00:fe05:1::9".parse().unwrap(),
+            dns: "fdfd:7b5:61d9::53".parse().unwrap(),
+        };
         let config = vm_config(id, &spec, Some(&attachment));
         assert_eq!(config.net[0].tap.as_ref().unwrap().tap_name, "pod-11111111");
-        assert_eq!(config.net[0].mac_address, "06:00:ac:c8:00:09");
+        assert_eq!(config.net[0].mac_address, "06:00:11:11:11:11");
         let guest = config.guest_network.unwrap();
         assert_eq!(guest.interface, "eth0");
-        assert_eq!(guest.ipv4_cidr, "10.200.0.9/16");
-        assert_eq!(guest.gateway, "10.200.0.1");
+        assert_eq!(guest.ipv6_cidr, "fd00:fe05:1::9/128");
+        assert_eq!(guest.ipv6_gateway, "fe80::1");
+        assert_eq!((guest.ipv4_cidr.as_str(), guest.gateway.as_str()), ("", ""));
+        assert_eq!(guest.dns, ["fdfd:7b5:61d9::53"]);
         assert_eq!(guest.hostname, id);
         assert_eq!(config.memory.unwrap().size_mib, 512);
 

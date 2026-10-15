@@ -10,7 +10,7 @@
 //! again where it ended. What changes a pod runs under its lock; a stop or
 //! a delete ends a bring-up first.
 
-use crate::network::{self, Attachment};
+use crate::network::{Attachment, Network};
 use crate::spec;
 use crate::store::Store;
 use feos_proto::container_service::{
@@ -22,7 +22,8 @@ use feos_proto::microvm::{
     micro_vm_service_server::MicroVmService, stream_vm_console_request as console_request,
     AttachConsoleMessage, ConsoleData, CreateVmRequest, DeleteVmRequest, GetVmRequest,
     PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest,
-    StreamVmEventsRequest, SuspendVmRequest, VmEvent, VmInfo, VmState, VmStateChangedEvent,
+    StreamVmEventsRequest, SuspendVmRequest, VmConfig, VmEvent, VmInfo, VmState,
+    VmStateChangedEvent,
 };
 use feos_proto::pod_service::{
     ContainerSpec, ContainerState, ContainerStatus, MicroVm, PodConsoleInput, PodConsoleOutput,
@@ -53,6 +54,10 @@ const POLL: Duration = Duration::from_millis(250);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long GetPod waits for the guest's view of the containers.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often the rules are written anew without a change of the pods or
+/// their groups: the node's own addresses, which no pod reaches, may have
+/// changed.
+const REFRESH: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Pods {
@@ -62,7 +67,7 @@ pub struct Pods {
 struct Inner {
     vms: VmApiHandler,
     store: Store,
-    addresses: network::Addresses,
+    network: Network,
     pods: Mutex<HashMap<String, Pod>>,
     events: broadcast::Sender<PodEvent>,
 }
@@ -78,23 +83,34 @@ impl Pods {
     /// The pods kept in `dir`, on the pods' network. Those that were
     /// coming up come up now; the others follow their microVMs from here
     /// on.
-    pub async fn new(vms: VmApiHandler, dir: &Path) -> io::Result<Self> {
+    pub async fn new(vms: VmApiHandler, dir: &Path, network: Network) -> io::Result<Self> {
         let store = Store::open(dir)?;
-        let kept = store.load()?;
+        let mut kept = store.load()?;
+        for pod_id in network.adopt(&mut kept) {
+            if let Some(info) = kept.iter().find(|info| info.pod_id == pod_id)
+                && let Err(e) = store.save(info)
+            {
+                warn!("Pods: Failed to keep {pod_id}: {e}");
+            }
+        }
+        network.sync(&kept);
         let (events, _) = broadcast::channel(256);
         let pods = Self {
             inner: Arc::new(Inner {
                 vms,
                 store,
-                addresses: network::Addresses::new(dir),
+                network,
                 pods: Mutex::new(HashMap::new()),
                 events,
             }),
         };
         let mut pending = Vec::new();
+        let mut running = Vec::new();
         for info in kept {
-            if info.state() == PodState::Pending {
-                pending.push(info.pod_id.clone());
+            match info.state() {
+                PodState::Pending => pending.push(info.pod_id.clone()),
+                PodState::Running => running.push(info.pod_id.clone()),
+                _ => {}
             }
             pods.pods().insert(
                 info.pod_id.clone(),
@@ -106,18 +122,35 @@ impl Pods {
             );
         }
         info!("Pods: {} kept", pods.pods().len());
-        network::set_up_bridge().await?;
-        pods.apply_network()?;
+        match pods.apply_network().await {
+            Ok(()) => pods.inner.network.start_records(),
+            Err(e) => pods
+                .inner
+                .network
+                .fail(format!("the pods' rules are not written: {e}")),
+        }
+        let weak = Arc::downgrade(&pods.inner);
+        pods.inner.network.groups().set_in_use(move |id| {
+            weak.upgrade()
+                .is_some_and(|inner| Pods { inner }.names_group(id))
+        });
+        for pod_id in running {
+            if let Err(e) = pods.reattach(&pod_id).await {
+                warn!("Pods: {pod_id} runs without its network: {}", e.message());
+            }
+        }
         for pod_id in pending {
             pods.spawn_bring_up(&pod_id);
         }
         pods.follow_vms();
+        pods.follow_security_groups();
         Ok(pods)
     }
 
     pub async fn create(&self, pod_id: String, spec: PodSpec) -> Result<PodInfo, Status> {
         spec::check_id(&pod_id)?;
         let spec = spec::normalize(spec)?;
+        self.inner.network.check(&spec)?;
         let info = {
             let mut pods = self.pods();
             if let Some(pod) = pods.get(&pod_id) {
@@ -129,24 +162,16 @@ impl Pods {
                     )))
                 };
             }
-            let ipv4_address = if spec::has_network(&spec) {
-                let used = pods.values().filter_map(|pod| attachment(&pod.info));
-                let used = used.map(|attachment| attachment.address).collect();
-                self.inner
-                    .addresses
-                    .allocate(&used)
-                    .map_err(|e| Status::resource_exhausted(format!("no address: {e}")))?
-                    .to_string()
-            } else {
-                String::new()
-            };
-            let info = PodInfo {
+            let mut info = PodInfo {
                 pod_id: pod_id.clone(),
                 spec: Some(spec),
                 state: PodState::Pending as i32,
-                ipv4_address,
                 ..Default::default()
             };
+            if info.spec.as_ref().is_some_and(spec::has_network) {
+                let others = pods.values().map(|pod| &pod.info);
+                self.inner.network.allocate(others, &mut info)?;
+            }
             self.inner
                 .store
                 .save(&info)
@@ -163,7 +188,7 @@ impl Pods {
         };
         info!("Pods: {pod_id} created");
         // The pod's rules stand before its TAP device carries a frame.
-        if let Err(e) = self.apply_network() {
+        if let Err(e) = self.apply_network().await {
             warn!("Pods: Failed to set the pods' rules: {e}");
         }
         self.announce(&info, false);
@@ -220,10 +245,10 @@ impl Pods {
     pub async fn delete(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         self.delete_vm(pod_id).await?;
-        if let Some(attachment) = attachment(&self.info(pod_id)?) {
-            network::detach(&attachment)
-                .map_err(|e| Status::internal(format!("delete {}: {e}", attachment.tap)))?;
-        }
+        self.inner
+            .network
+            .detach(&self.info(pod_id)?)
+            .map_err(|e| Status::internal(e.to_string()))?;
         self.inner
             .store
             .remove(pod_id)
@@ -231,7 +256,7 @@ impl Pods {
         if let Some(pod) = self.pods().remove(pod_id) {
             self.announce(&pod.info, true);
         }
-        if let Err(e) = self.apply_network() {
+        if let Err(e) = self.apply_network().await {
             warn!("Pods: Failed to set the pods' rules: {e}");
         }
         info!("Pods: {pod_id} deleted");
@@ -255,14 +280,51 @@ impl Pods {
     pub async fn resume(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.lock(pod_id).await?;
         self.expect_state(pod_id, PodState::Suspended)?;
-        self.attach(pod_id).await?;
+        let attachment = self.attach(pod_id).await?;
         let request = Request::new(ResumeVmRequest {
             vm_id: pod_id.to_string(),
         });
         self.inner.vms.resume_vm(request).await?;
         self.settle(pod_id, VmState::Running).await?;
         self.set_state(pod_id, PodState::Running, "");
+        self.check_microvm_network(pod_id, attachment.as_ref())
+            .await;
         Ok(())
+    }
+
+    /// Whether a pod on the node names the security group.
+    fn names_group(&self, id: &str) -> bool {
+        self.pods().values().any(|pod| {
+            let network = pod
+                .info
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.network.as_ref());
+            network.is_some_and(|network| network.security_groups.iter().any(|g| g == id))
+        })
+    }
+
+    /// Puts a pod that runs from before feosd started on the network again.
+    async fn reattach(&self, pod_id: &str) -> Result<(), Status> {
+        let attachment = self.attach(pod_id).await?;
+        self.check_microvm_network(pod_id, attachment.as_ref())
+            .await;
+        Ok(())
+    }
+
+    /// Warns about a running microVM that was made for another network, such
+    /// as the first version's with IPv4: its guest keeps that network until
+    /// the pod boots anew.
+    async fn check_microvm_network(&self, pod_id: &str, attachment: Option<&Attachment>) {
+        let (Ok(info), Ok(Some(vm))) = (self.info(pod_id), self.vm(pod_id).await) else {
+            return;
+        };
+        let wanted = spec::vm_config(pod_id, &info.spec.unwrap_or_default(), attachment);
+        if stale(&vm, &wanted) {
+            warn!(
+                "Pods: {pod_id}'s microVM was made for another network; a stop and a start give it this one"
+            );
+        }
     }
 
     /// The pod, with its microVM and its containers as the guest reports
@@ -456,16 +518,26 @@ impl Pods {
     async fn boot(&self, pod_id: &str, spec: &PodSpec) -> Result<(), Status> {
         let vm_id = pod_id.to_string();
         let attachment = self.attach(pod_id).await?;
+        let config = spec::vm_config(pod_id, spec, attachment.as_ref());
         loop {
-            match self.vm(pod_id).await?.map(|vm| vm.state()) {
+            let vm = self.vm(pod_id).await?;
+            match vm.as_ref().map(|vm| vm.state()) {
                 None => {
                     let request = Request::new(CreateVmRequest {
-                        config: Some(spec::vm_config(pod_id, spec, attachment.as_ref())),
+                        config: Some(config.clone()),
                         vm_id: Some(vm_id.clone()),
                     });
                     self.inner.vms.create_vm(request).await?;
                 }
                 Some(VmState::Creating) => sleep(POLL).await,
+                // One made for another network is made anew, such as one
+                // of the first version's with IPv4.
+                Some(VmState::Created | VmState::Stopped)
+                    if vm.as_ref().is_some_and(|vm| stale(vm, &config)) =>
+                {
+                    info!("Pods: {pod_id}'s microVM was made for another network: making it anew");
+                    self.delete_vm(pod_id).await?;
+                }
                 Some(VmState::Created | VmState::Stopped) => {
                     let request = Request::new(StartVmRequest { vm_id });
                     self.inner.vms.start_vm(request).await?;
@@ -526,26 +598,39 @@ impl Pods {
         }
     }
 
-    /// Puts the pod's TAP device on the bridge, if the pod has a network:
-    /// before every boot and resume, which find it as they left it.
+    /// Puts the pod on the network, if it has one: its TAP device, its
+    /// route, NAT64 and the resolver, before every boot and resume. Fails
+    /// while the node does not have the pod's security groups.
     async fn attach(&self, pod_id: &str) -> Result<Option<Attachment>, Status> {
-        let Some(attachment) = attachment(&self.info(pod_id)?) else {
-            return Ok(None);
-        };
-        network::attach(&attachment)
-            .await
-            .map_err(|e| Status::internal(format!("attach {}: {e}", attachment.tap)))?;
-        Ok(Some(attachment))
+        self.inner.network.attach(&self.info(pod_id)?).await
     }
 
-    /// Replaces the pods' rules with the ones for the pods there are.
-    fn apply_network(&self) -> io::Result<()> {
-        let attachments: Vec<Attachment> = self
-            .pods()
-            .values()
-            .filter_map(|pod| attachment(&pod.info))
-            .collect();
-        network::apply(&attachments)
+    /// Writes the pods' rules for the pods there are.
+    async fn apply_network(&self) -> io::Result<()> {
+        let pods = self.list();
+        self.inner.network.apply(&pods).await
+    }
+
+    /// Writes the pods' rules again whenever the security groups change,
+    /// and every so often.
+    fn follow_security_groups(&self) {
+        let pods = self.clone();
+        let mut changes = self.inner.network.groups().subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    _ = sleep(REFRESH) => {}
+                }
+                if let Err(e) = pods.apply_network().await {
+                    warn!("Pods: Failed to set the pods' rules: {e}");
+                }
+            }
+        });
     }
 
     /// Waits until the VM service records the microVM in `state`: it
@@ -698,10 +783,11 @@ impl Pods {
     }
 }
 
-/// The pod's place on the bridge, if it has an address.
-fn attachment(info: &PodInfo) -> Option<Attachment> {
-    let address = info.ipv4_address.parse().ok()?;
-    Some(Attachment::new(&info.pod_id, address))
+/// Whether the microVM's network is not the one `wanted` has.
+fn stale(vm: &VmInfo, wanted: &VmConfig) -> bool {
+    let config = vm.config.as_ref();
+    config.map(|config| (&config.net, &config.guest_network))
+        != Some((&wanted.net, &wanted.guest_network))
 }
 
 /// A channel to the API of the pod's guest.

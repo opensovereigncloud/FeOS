@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::fixtures::{verify_microvm_cleanup, PodGuard};
-use super::{ensure_server, get_public_clients, installed_guest, PUBLIC_SERVER_ADDRESS};
+use super::{
+    ensure_server, get_public_clients, installed_guest, POD_PREFIX, PUBLIC_SERVER_ADDRESS,
+};
 use anyhow::{Context, Result};
 use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, ListContainersRequest,
@@ -16,6 +18,7 @@ use feos_proto::pod_service::{
     PodConsoleInput, PodInfo, PodNetwork, PodSpec, PodState, Resources, ResumePodRequest,
     StartPodRequest, StopPodRequest, SuspendPodRequest,
 };
+use feos_utils::nft;
 use feos_utils::vsock::API_PORT;
 use log::info;
 use microvm_service::vmm::jail;
@@ -23,6 +26,7 @@ use microvm_service::{vm_dir, vsock_path};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pod_service::network;
+use std::net::Ipv6Addr;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
@@ -60,6 +64,40 @@ fn check_cgroup(pod_id: &str, pid: i64, vcpus: u32) -> Result<u64> {
     assert_eq!(read("cpu.weight")?, jail::cpu_weight(vcpus).to_string());
     assert_eq!(read("memory.max")?, "max");
     Ok(read("memory.peak")?.parse::<u64>()? >> 20)
+}
+
+/// The IPv6 addresses of a device, from /proc/net/if_inet6.
+fn device_addresses(device: &str) -> Result<Vec<(Ipv6Addr, u8)>> {
+    let table = std::fs::read_to_string("/proc/net/if_inet6")?;
+    Ok(table
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.get(5) != Some(&device) {
+                return None;
+            }
+            let address = u128::from_str_radix(fields[0], 16).ok()?;
+            let len = u8::from_str_radix(fields[2], 16).ok()?;
+            Some((Ipv6Addr::from(address), len))
+        })
+        .collect())
+}
+
+/// The IPv6 routes through a device, from /proc/net/ipv6_route.
+fn device_routes(device: &str) -> Result<Vec<(Ipv6Addr, u8)>> {
+    let table = std::fs::read_to_string("/proc/net/ipv6_route")?;
+    Ok(table
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.get(9) != Some(&device) {
+                return None;
+            }
+            let destination = u128::from_str_radix(fields[0], 16).ok()?;
+            let len = u8::from_str_radix(fields[1], 16).ok()?;
+            Some((Ipv6Addr::from(destination), len))
+        })
+        .collect())
 }
 
 fn new_pod_id() -> String {
@@ -145,8 +183,8 @@ async fn test_pod_lifecycle() -> Result<()> {
     ensure_server().await;
     let (mut pods, _, _) = get_public_clients().await?;
 
-    // feosd gives the pod its network: a TAP device on the pods' bridge,
-    // and an address.
+    // feosd gives the pod its network: an address of the node's prefix,
+    // routed to a TAP device of the pod's own.
     let pod_id = new_pod_id();
     let tap_name = network::tap_name(&pod_id);
     let spec = PodSpec {
@@ -197,33 +235,48 @@ async fn test_pod_lifecycle() -> Result<()> {
         .get_network_config(GetNetworkConfigRequest {})
         .await?
         .into_inner();
-    let address: std::net::Ipv4Addr = pod.ipv4_address.parse()?;
+    let address: Ipv6Addr = pod.ipv6_address.parse()?;
+    let (prefix, len) = network::parse_pod_prefix(POD_PREFIX).map_err(anyhow::Error::msg)?;
     assert_eq!(
-        address.octets()[..2],
-        [10, 200],
-        "{address} is not the pods'"
+        u128::from(address) >> (128 - len),
+        u128::from(prefix) >> (128 - len),
+        "{address} is not of {POD_PREFIX}"
     );
+    // IPv6 only, behind the node at fe80::1, with feosd's resolver.
     assert!(network.configured);
     assert_eq!(network.interface, "eth0");
-    assert_eq!(network.ipv4_cidr, format!("{address}/16"));
-    assert_eq!(network.gateway, "10.200.0.1");
+    assert_eq!(network.ipv6_cidr, format!("{address}/128"));
+    assert_eq!(network.ipv6_gateway, "fe80::1");
     assert_eq!(
-        network.dns,
-        vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+        (network.ipv4_cidr.as_str(), network.gateway.as_str()),
+        ("", "")
     );
+    assert_eq!(network.dns, ["fdfd:7b5:61d9::53"]);
     assert_eq!(network.hostname, pod_id);
-    // An isolated port of the pods' bridge.
-    let port = Path::new("/sys/class/net").join(&tap_name);
-    let bridge = std::fs::read_link(port.join("master"))?;
+    // With NAT64 on the node, an IPv4 address of its pool stands for the
+    // pod; the guest never sees it.
+    let ipv4: std::net::Ipv4Addr = pod.ipv4_address.parse()?;
+    assert_eq!(ipv4.octets()[..2], [10, 200], "{ipv4} is not the pool's");
+    // The TAP device is a link of its own: the node is fe80::1 on it, and
+    // the pod's address is routed to it.
+    assert_eq!(device_addresses(&tap_name)?, [(network::GATEWAY, 64)]);
     assert!(
-        bridge.ends_with(network::BRIDGE),
-        "{tap_name} is on {}",
-        bridge.display()
+        device_routes(&tap_name)?.contains(&(address, 128)),
+        "no route to {address} on {tap_name}: {:?}",
+        device_routes(&tap_name)?
     );
-    assert_eq!(
-        std::fs::read_to_string(port.join("brport/isolated"))?.trim(),
-        "1"
-    );
+    // feosd's table, with the pod's chains.
+    let chains = nft::chains(nft::Family::Inet, network::TABLE)?;
+    for chain in [
+        "prerouting".to_string(),
+        "input".to_string(),
+        "forward".to_string(),
+        "postrouting".to_string(),
+        format!("in-{tap_name}"),
+        format!("out-{tap_name}"),
+    ] {
+        assert!(chains.contains(&chain), "no chain {chain} in {chains:?}");
+    }
     let skew = guest_clock_skew(&pod_id).await?;
     assert!(
         skew < Duration::from_secs(5),
@@ -346,6 +399,11 @@ async fn test_pod_lifecycle() -> Result<()> {
     assert!(
         !Path::new("/sys/class/net").join(&tap_name).exists(),
         "The pod's TAP device is gone with the pod"
+    );
+    let chains = nft::chains(nft::Family::Inet, network::TABLE)?;
+    assert!(
+        !chains.contains(&format!("out-{tap_name}")),
+        "The pod's chains are gone with the pod"
     );
     assert!(
         !jail::cgroup(&pod_id).exists(),

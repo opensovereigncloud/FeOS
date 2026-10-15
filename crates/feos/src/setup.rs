@@ -55,12 +55,27 @@ pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmApiHandler> 
     Ok(vm_api_handler)
 }
 
-/// The pods, on top of the VM service.
+/// The pods, on top of the VM service, and their network: its security
+/// groups and the records of its traffic.
 #[cfg(feature = "host")]
-pub(crate) async fn initialize_pod_service(vms: VmApiHandler) -> Result<pod_service::Pods> {
-    let pods = pod_service::Pods::new(vms, Path::new(pod_service::POD_DIR)).await?;
+pub(crate) async fn initialize_pod_service(
+    vms: VmApiHandler,
+    network: pod_service::network::Config,
+) -> Result<(
+    pod_service::Pods,
+    network_service::SecurityGroups,
+    traffic_service::TrafficApi,
+)> {
+    let groups = network_service::SecurityGroups::open(network_service::SECURITY_GROUP_DIR)?;
+    // Flows, drops and server names, and the resolver's queries, for
+    // TrafficService.
+    let (records, _) = tokio::sync::broadcast::channel(pod_service::network::RECORDS);
+    let dir = Path::new(pod_service::POD_DIR);
+    let network =
+        pod_service::network::Network::start(network, dir, groups.clone(), records.clone()).await;
+    let pods = pod_service::Pods::new(vms, dir, network).await?;
     info!("Main: Pod Service is configured.");
-    Ok(pods)
+    Ok((pods, groups, traffic_service::TrafficApi::new(records)))
 }
 
 pub(crate) async fn initialize_container_service(

@@ -11,6 +11,11 @@ mod task_supervisor;
 use anyhow::{Context, Result};
 use container_service::api::ContainerApiHandler;
 #[cfg(feature = "host")]
+use feos_proto::network_service::{
+    security_group_service_server::SecurityGroupServiceServer,
+    traffic_service_server::TrafficServiceServer,
+};
+#[cfg(feature = "host")]
 use feos_proto::pod_service::pod_service_server::PodServiceServer;
 use feos_proto::{
     container_service::container_service_server::ContainerServiceServer,
@@ -20,6 +25,8 @@ use feos_proto::{
 use host_service::{api::HostApiHandler, RestartSignal};
 use image_service::{api::ImageApiHandler, IMAGE_SERVICE_SOCKET};
 use log::{error, info, warn};
+#[cfg(feature = "host")]
+use network_service::SecurityGroups;
 use nix::unistd::{chown, Group, Uid};
 #[cfg(feature = "host")]
 use pod_service::{forward::ForwardLayer, Pods};
@@ -57,16 +64,21 @@ pub struct ServerOptions {
     /// Serves the API on TCP too, without authentication: for labs.
     #[cfg(feature = "host")]
     pub tcp: Option<std::net::SocketAddr>,
+    /// The pods' network (ADR 0010).
+    #[cfg(feature = "host")]
+    pub network: pod_service::network::Config,
 }
 
 impl ServerOptions {
-    /// Options without the TCP listener.
+    /// Options without the TCP listener, and pods without a network.
     pub fn new(restarted_after_upgrade: bool, self_upgrade: bool) -> Self {
         Self {
             restarted_after_upgrade,
             self_upgrade,
             #[cfg(feature = "host")]
             tcp: None,
+            #[cfg(feature = "host")]
+            network: Default::default(),
         }
     }
 }
@@ -110,9 +122,15 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
 
     #[cfg(feature = "host")]
     let vms = initialize_vm_service(&setup_database().await?).await?;
+    #[cfg(feature = "host")]
+    let (pods, groups, traffic) = initialize_pod_service(vms, options.network).await?;
     let services = Services {
         #[cfg(feature = "host")]
-        pods: initialize_pod_service(vms).await?,
+        pods,
+        #[cfg(feature = "host")]
+        groups,
+        #[cfg(feature = "host")]
+        traffic,
         container: initialize_container_service().await?,
         host: initialize_host_service(options.self_upgrade.then_some(restart_tx), log_handle),
         image: initialize_image_service().await?,
@@ -224,6 +242,10 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
 struct Services {
     #[cfg(feature = "host")]
     pods: Pods,
+    #[cfg(feature = "host")]
+    groups: SecurityGroups,
+    #[cfg(feature = "host")]
+    traffic: traffic_service::TrafficApi,
     container: ContainerServiceServer<ContainerApiHandler>,
     host: HostServiceServer<HostApiHandler>,
     image: ImageServiceServer<ImageApiHandler>,
@@ -248,7 +270,10 @@ impl Services {
             .add_service(self.host.clone())
             .add_service(self.image.clone());
         #[cfg(feature = "host")]
-        let router = router.add_service(PodServiceServer::new(self.pods.clone()));
+        let router = router
+            .add_service(PodServiceServer::new(self.pods.clone()))
+            .add_service(SecurityGroupServiceServer::new(self.groups.clone()))
+            .add_service(TrafficServiceServer::new(self.traffic.clone()));
         #[cfg(feature = "guest")]
         let router = self.guest.add_to(router);
         router
