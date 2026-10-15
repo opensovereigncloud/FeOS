@@ -8,6 +8,13 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
+/// An address family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Family {
+    V4,
+    V6,
+}
+
 /// An IPv4 or IPv6 prefix: an address, whose bits beyond the length are
 /// zero, and the length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -27,6 +34,13 @@ impl Prefix {
         matches!(self, Prefix::V4(..))
     }
 
+    pub fn family(&self) -> Family {
+        match self {
+            Prefix::V4(..) => Family::V4,
+            Prefix::V6(..) => Family::V6,
+        }
+    }
+
     /// Whether `other` lies inside this prefix. A prefix of the other
     /// family never does.
     pub fn contains(&self, other: &Prefix) -> bool {
@@ -41,15 +55,16 @@ impl Prefix {
         }
     }
 
-    /// The prefix's addresses as a range of IPv6 addresses: an IPv4
-    /// prefix's under the NAT64 prefix, given by its first 96 bits. A
-    /// length beyond the address's counts as the address's.
-    pub(crate) fn range(&self, nat64: u128) -> Range {
+    /// The prefix's addresses as a range of numbers of its family: of 32
+    /// bits for IPv4, of 128 for IPv6. A length beyond the address's
+    /// counts as the address's.
+    pub(crate) fn range(&self) -> Range {
         match *self {
-            Prefix::V4(address, len) => ranges::prefix(
-                ranges::nat64_base(nat64) | u128::from(u32::from(address)),
-                96u8.saturating_add(len),
-            ),
+            Prefix::V4(address, len) => {
+                // As the top 32 bits of 128.
+                let (start, end) = ranges::prefix(u128::from(u32::from(address)) << 96, len);
+                (start >> 96, end >> 96)
+            }
             Prefix::V6(address, len) => ranges::prefix(u128::from(address), len),
         }
     }
@@ -144,6 +159,8 @@ mod tests {
             Prefix::V4(Ipv4Addr::new(10, 0, 0, 0), 8)
         );
         assert!(prefix("1.2.3.4/32").is_ipv4());
+        assert_eq!(prefix("1.2.3.4/32").family(), Family::V4);
+        assert_eq!(prefix("::/0").family(), Family::V6);
         assert_eq!(prefix("2001:DB8::/32").to_string(), "2001:db8::/32");
     }
 
@@ -169,9 +186,9 @@ mod tests {
 
         // Built by hand, too long: they are their address, and nothing panics.
         let address = Ipv4Addr::new(10, 0, 0, 1);
-        let (start, end) = Prefix::V4(address, 255).range(0);
+        let (start, end) = Prefix::V4(address, 255).range();
         assert_eq!((start, end), (0x0a00_0001, 0x0a00_0001));
-        assert_eq!(Prefix::V6(Ipv6Addr::LOCALHOST, 200).range(0), (1, 1));
+        assert_eq!(Prefix::V6(Ipv6Addr::LOCALHOST, 200).range(), (1, 1));
         assert!(Prefix::V4(address, 200).contains(&Prefix::V4(address, 255)));
     }
 
@@ -188,32 +205,19 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_prefixes_lie_under_the_nat64_prefix() {
-        let nat64 = u128::from("64:ff9b::".parse::<Ipv6Addr>().unwrap());
-        let range = |s: &str| {
-            let (start, end) = prefix(s).range(nat64);
-            (Ipv6Addr::from(start), Ipv6Addr::from(end))
-        };
+    fn prefixes_are_ranges_of_their_family() {
+        let v4 = |s: &str| prefix(s).range();
+        assert_eq!(v4("0.0.0.0/0"), (0, u128::from(u32::MAX)));
+        assert_eq!(v4("10.0.0.0/8"), (0x0a00_0000, 0x0aff_ffff));
+        assert_eq!(v4("255.255.255.255/32"), (0xffff_ffff, 0xffff_ffff));
+        let (start, end) = prefix("2001:db8::/32").range();
         assert_eq!(
-            range("0.0.0.0/0"),
-            (
-                "64:ff9b::".parse().unwrap(),
-                "64:ff9b::ffff:ffff".parse().unwrap()
-            )
-        );
-        assert_eq!(
-            range("10.0.0.0/8"),
-            (
-                "64:ff9b::a00:0".parse().unwrap(),
-                "64:ff9b::aff:ffff".parse().unwrap()
-            )
-        );
-        assert_eq!(
-            range("2001:db8::/32"),
+            (Ipv6Addr::from(start), Ipv6Addr::from(end)),
             (
                 "2001:db8::".parse().unwrap(),
                 "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap()
             )
         );
+        assert_eq!(prefix("::/96").range(), v4("0.0.0.0/0"), "the numbers");
     }
 }

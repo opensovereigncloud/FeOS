@@ -1,12 +1,10 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ranges of IPv6 addresses, as numbers: the arithmetic behind the address
-//! sets. A list of ranges is normal when it is sorted, and its ranges
+//! Ranges of addresses of one family, as numbers: the arithmetic behind
+//! the address sets. IPv4 addresses are numbers of 32 bits, IPv6 ones of
+//! 128. A list of ranges is normal when it is sorted, and its ranges
 //! neither overlap nor touch: the form an nftables interval set takes.
-
-use std::net::Ipv6Addr;
-use std::ops::RangeInclusive;
 
 /// The first and the last address of a range.
 pub(crate) type Range = (u128, u128);
@@ -15,11 +13,6 @@ pub(crate) type Range = (u128, u128);
 pub(crate) fn prefix(address: u128, len: u8) -> Range {
     let host = if len >= 128 { 0 } else { u128::MAX >> len };
     (address & !host, address | host)
-}
-
-/// The first 96 bits of the NAT64 prefix.
-pub(crate) fn nat64_base(nat64: u128) -> u128 {
-    nat64 & !u128::from(u32::MAX)
 }
 
 /// The ranges, sorted and merged where they overlap or touch. Ranges that
@@ -72,16 +65,10 @@ pub(crate) fn intersect(a: Range, b: Range) -> Option<Range> {
     (start <= end).then_some((start, end))
 }
 
-pub(crate) fn to_addresses(ranges: &[Range]) -> Vec<RangeInclusive<Ipv6Addr>> {
-    ranges
-        .iter()
-        .map(|&(start, end)| Ipv6Addr::from(start)..=Ipv6Addr::from(end))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv6Addr;
 
     fn a(s: &str) -> u128 {
         u128::from(s.parse::<Ipv6Addr>().unwrap())
@@ -97,7 +84,6 @@ mod tests {
         assert_eq!(prefix(a("fd00::5"), 128), (a("fd00::5"), a("fd00::5")));
         assert_eq!(prefix(u128::MAX, 128), (u128::MAX, u128::MAX));
         assert_eq!(prefix(u128::MAX, 1), (1 << 127, u128::MAX));
-        assert_eq!(nat64_base(a("64:ff9b::1.2.3.4")), a("64:ff9b::"));
     }
 
     #[test]

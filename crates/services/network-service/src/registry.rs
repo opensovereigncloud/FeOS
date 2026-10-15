@@ -6,6 +6,7 @@
 
 use crate::prefix::Prefix;
 use crate::ranges::{self, Range};
+use std::net::Ipv4Addr;
 
 /// Global unicast IPv6 addresses, the IANA IPv6 Address Space registry's
 /// (https://www.iana.org/assignments/ipv6-address-space): all that IANA
@@ -81,45 +82,47 @@ const IPV4_SPECIAL: &[(&str, bool)] = &[
 ];
 
 /// What no pod reaches, whatever its groups say (ADR 0010): link-local,
-/// loopback and multicast addresses of both families.
+/// loopback, multicast and unspecified addresses of both families. Of
+/// IPv4, "this network", which holds the unspecified address and is no
+/// packet's destination.
 const ALWAYS_DENIED: &[&str] = &[
     "fe80::/10",
     "::1/128",
     "ff00::/8",
+    "::/128",
     "169.254.0.0/16",
     "127.0.0.0/8",
     "224.0.0.0/4",
+    "0.0.0.0/8",
 ];
 
-/// The internet of the default group: global IPv6 addresses, and global
-/// IPv4 addresses under the NAT64 prefix; normal. The NAT64 prefix's other
-/// addresses are not in it, even where the prefix is a global one.
-pub(crate) fn internet(nat64: u128) -> Vec<Range> {
-    let nat64 = ranges::prefix(ranges::nat64_base(nat64), 96);
-    let ipv6 = IPV6_GLOBAL_UNICAST
+/// The IPv6 internet of the default group: global unicast addresses;
+/// normal.
+pub(crate) fn internet6() -> Vec<Range> {
+    IPV6_GLOBAL_UNICAST
         .parse::<Prefix>()
-        .map(|prefix| prefix.range(0))
-        .map(|scope| global(scope, IPV6_SPECIAL, 0))
-        .unwrap_or_default();
-    let ipv6 = ranges::subtract(&ipv6, &[nat64]);
-    let ipv4 = global(nat64, IPV4_SPECIAL, nat64.0);
-    ranges::normalize([ipv6, ipv4].concat())
+        .map(|scope| global(scope.range(), IPV6_SPECIAL))
+        .unwrap_or_default()
 }
 
-/// The addresses that are denied always, IPv4 ones under the NAT64
-/// prefix; not normal.
-pub(crate) fn always_denied(nat64: u128) -> Vec<Range> {
+/// The IPv4 internet of the default group: globally reachable
+/// addresses; normal.
+pub(crate) fn internet4() -> Vec<Range> {
+    global(Prefix::V4(Ipv4Addr::UNSPECIFIED, 0).range(), IPV4_SPECIAL)
+}
+
+/// The prefixes that are denied always, of both families.
+pub(crate) fn always_denied() -> impl Iterator<Item = Prefix> {
     ALWAYS_DENIED
         .iter()
         .filter_map(|prefix| prefix.parse::<Prefix>().ok())
-        .map(|prefix| prefix.range(nat64))
-        .collect()
 }
 
 /// The globally reachable addresses of `scope`, as `registry` has them: from
 /// the shortest blocks to the longest, a block that is not globally
-/// reachable is taken out, one that is is put back in.
-fn global(scope: Range, registry: &[(&str, bool)], nat64: u128) -> Vec<Range> {
+/// reachable is taken out, one that is is put back in. The registry is of
+/// the scope's family.
+fn global(scope: Range, registry: &[(&str, bool)]) -> Vec<Range> {
     let mut entries: Vec<(Prefix, bool)> = registry
         .iter()
         .filter_map(|&(prefix, global)| Some((prefix.parse::<Prefix>().ok()?, global)))
@@ -127,7 +130,7 @@ fn global(scope: Range, registry: &[(&str, bool)], nat64: u128) -> Vec<Range> {
     entries.sort_by_key(|(prefix, _)| prefix.length());
     let mut reachable = vec![scope];
     for (prefix, global) in entries {
-        let range = prefix.range(nat64);
+        let range = prefix.range();
         reachable = if global {
             match ranges::intersect(range, scope) {
                 Some(range) => ranges::normalize([reachable, vec![range]].concat()),
@@ -143,24 +146,15 @@ fn global(scope: Range, registry: &[(&str, bool)], nat64: u128) -> Vec<Range> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv6Addr};
+    use std::net::IpAddr;
 
-    const NAT64: &str = "64:ff9b::";
-
-    fn nat64() -> u128 {
-        u128::from(NAT64.parse::<Ipv6Addr>().unwrap())
-    }
-
-    /// The address as the sets have it: an IPv4 one under the NAT64 prefix.
-    fn mapped(address: &str) -> u128 {
-        match address.parse::<IpAddr>().unwrap() {
-            IpAddr::V4(address) => nat64() | u128::from(u32::from(address)),
-            IpAddr::V6(address) => u128::from(address),
-        }
-    }
-
-    fn holds(ranges: &[Range], address: &str) -> bool {
-        let address = mapped(address);
+    /// Whether the IPv4 or the IPv6 ranges hold the address, as the number
+    /// of its family.
+    fn holds(ipv4: &[Range], ipv6: &[Range], address: &str) -> bool {
+        let (ranges, address) = match address.parse::<IpAddr>().unwrap() {
+            IpAddr::V4(address) => (ipv4, u128::from(u32::from(address))),
+            IpAddr::V6(address) => (ipv6, u128::from(address)),
+        };
         ranges
             .iter()
             .any(|&(start, end)| start <= address && address <= end)
@@ -177,12 +171,15 @@ mod tests {
         for prefix in ALWAYS_DENIED.iter().chain([&IPV6_GLOBAL_UNICAST]) {
             assert!(prefix.parse::<Prefix>().is_ok(), "{prefix}");
         }
+        assert_eq!(always_denied().count(), ALWAYS_DENIED.len());
     }
 
     #[test]
     fn the_internet_is_global_addresses() {
-        let internet = internet(nat64());
-        assert_eq!(ranges::normalize(internet.clone()), internet);
+        let (ipv4, ipv6) = (internet4(), internet6());
+        assert_eq!(ranges::normalize(ipv4.clone()), ipv4);
+        assert_eq!(ranges::normalize(ipv6.clone()), ipv6);
+        assert!(ipv4.iter().all(|&(_, end)| end <= u128::from(u32::MAX)));
         for address in [
             "8.8.8.8",
             "1.1.1.1",
@@ -201,7 +198,7 @@ mod tests {
             "3ffe::1",
         ] {
             assert!(
-                holds(&internet, address),
+                holds(&ipv4, &ipv6, address),
                 "{address} is not in the internet"
             );
         }
@@ -212,6 +209,7 @@ mod tests {
             "100.64.0.1",
             "127.0.0.1",
             "169.254.169.254",
+            "169.254.16.1",
             "0.0.0.0",
             "192.0.0.1",
             "192.0.0.8",
@@ -236,46 +234,46 @@ mod tests {
             "2001:10::1",
             "2002::1",
             "3fff::1",
+            "64:ff9b::808:808",
             "64:ff9b:1::1",
+            "::ffff:8.8.8.8",
             "1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
             "4000::",
         ] {
-            assert!(!holds(&internet, address), "{address} is in the internet");
+            assert!(
+                !holds(&ipv4, &ipv6, address),
+                "{address} is in the internet"
+            );
         }
     }
 
     #[test]
-    fn a_global_nat64_prefix_reaches_only_global_ipv4() {
-        let nat64 = u128::from("2a00:1:2:3::".parse::<Ipv6Addr>().unwrap());
-        let internet = internet(nat64);
-        let holds = |address: u128| {
-            internet
-                .iter()
-                .any(|&(start, end)| start <= address && address <= end)
-        };
-        assert!(holds(nat64 | 0x0808_0808), "8.8.8.8 under the prefix");
-        assert!(!holds(nat64 | 0x0a01_0203), "10.1.2.3 under the prefix");
-        assert!(
-            holds(nat64 - 1) && holds(nat64 + (1 << 32)),
-            "the prefix's neighbours"
-        );
-    }
-
-    #[test]
-    fn link_local_loopback_and_multicast_are_denied() {
-        let denied = always_denied(nat64());
+    fn link_local_loopback_multicast_and_unspecified_are_denied() {
+        let (ipv4, ipv6): (Vec<Prefix>, Vec<Prefix>) = always_denied().partition(Prefix::is_ipv4);
+        let ipv4: Vec<Range> = ipv4.iter().map(Prefix::range).collect();
+        let ipv6: Vec<Range> = ipv6.iter().map(Prefix::range).collect();
         for address in [
             "fe80::1",
             "::1",
             "ff02::1",
+            "::",
             "169.254.169.254",
+            "169.254.0.53",
+            "169.254.16.7",
             "127.0.0.1",
             "224.0.0.251",
+            "0.0.0.0",
         ] {
-            assert!(holds(&denied, address), "{address} is not denied");
+            assert!(holds(&ipv4, &ipv6, address), "{address} is not denied");
         }
-        for address in ["8.8.8.8", "2001:4860:4860::8888", "10.1.2.3", "fd00::1"] {
-            assert!(!holds(&denied, address), "{address} is denied");
+        for address in [
+            "8.8.8.8",
+            "2001:4860:4860::8888",
+            "10.1.2.3",
+            "fd00::1",
+            "::2",
+        ] {
+            assert!(!holds(&ipv4, &ipv6, address), "{address} is denied");
         }
     }
 }

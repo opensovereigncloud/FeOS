@@ -15,9 +15,10 @@ mod store;
 
 pub use group::{check_id, Protocol};
 pub use policy::{
-    compile, delta, AddressRange, Allow, Delta, Pod, PodPolicy, Policy, SetChange, DENY, INTERNET,
+    compile, delta, AddressRange, AddressSet, Allow, Delta, Pod, PodPolicy, Policy, SetChange,
+    DENY4, DENY6, INTERNET4, INTERNET6,
 };
-pub use prefix::Prefix;
+pub use prefix::{Family, Prefix};
 pub use service::SecurityGroups;
 pub use store::Store;
 

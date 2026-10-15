@@ -225,23 +225,25 @@ traffic is not theirs:
 
 | Chain | What it does |
 |---|---|
-| `prerouting` (filter, -150) | from a pod's TAP: drops IPv4, packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), both logged as `spoofed`, and router advertisements and redirects |
-| `input` | with `--nat64=node`, drops what comes from `feos-nat64`; from pods takes neighbor solicitations and advertisements and DNS to the resolver over UDP and TCP, and drops the rest |
-| `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), before anything else; accepts what belongs to a connection; drops invalid packets from and to pods, and new connections to the pool from anywhere but `feos-nat64`; then jumps to `from-pods` what comes from a TAP and to `to-pods` what goes to one |
+| `prerouting` (filter, -150) | from a pod's TAP: drops packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), of either family, logged as `spoofed`, and router advertisements and redirects of both families |
+| `input` | from pods takes neighbor solicitations and advertisements and DNS to the resolver's address over UDP and TCP, and drops the rest |
+| `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), of both families, before anything else; accepts what belongs to a connection; drops invalid packets from and to pods; then jumps to `from-pods` what comes from a TAP and to `to-pods` what goes to one |
 | `from-pods`, `to-pods` | go through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) to the pod's chains, and drop and log (`no-rule`) what a TAP the maps do not have sends or receives, such as one whose rules failed to be written |
-| `out-<TAP>`, `in-<TAP>` | a pod's chains: drop and log (`deny`) what goes to or comes from a denied address, `return` what a rule of the pod's groups allows, drop and log (`no-rule`) the rest |
-| `postrouting` (nat, 100) | with `--nat64=node`: masquerades the pool, except into `feos-nat64` |
+| `out-<TAP>`, `in-<TAP>` | a pod's chains: drop and log (`deny`) what goes to or comes from a denied address, `return` what a rule of the pod's groups allows, drop and log (`no-rule`) the rest; `out-` of both families, `in-` of IPv6 alone, since nothing new comes in over IPv4 |
+| `postrouting` (nat, 100) | masquerades the pods' IPv4 range, except into a pod's TAP |
 
 A pod's chains end allowed traffic with `return`, not `accept`, which
 would end the base chain: a packet between two pods passes the sender's
 `out-` chain and the receiver's `in-` chain. The maps go to them
 (`goto`), so their `return` leads back to `forward`. The sets are what
-`network-service` compiles: `deny` (the denied prefixes, the node's own
-addresses, the pool, and link-local, loopback and multicast addresses),
-`internet` (the default group's), `g-<group>` (a group's members) and
-`b-<hash>` (an address block without its exceptions), all of IPv6
-address intervals, IPv4 ones under the NAT64 prefix. Drops are logged to
-nflog group 2, at most 10 a second per pod and reason.
+`network-service` compiles, each of one family: `deny4` and `deny6` (the
+denied prefixes, the node's own addresses, link-local, loopback,
+multicast and unspecified addresses), `internet4` and `internet6` (the
+default group's), `g-<group>` (a group's members, of IPv6) and
+`b-<hash>` (an address block without its exceptions, of its family). An
+IPv4 block counts in rules out; rules in ignore it. ICMP rules are of
+IPv4, ICMPv6 rules of IPv6. Drops are logged to nflog group 2, at most
+10 a second per pod and reason.
 
 `feosd` replaces the table at its start and whenever pods come or go or
 rules change; when only members of groups or the node's addresses change,

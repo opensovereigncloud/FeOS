@@ -625,12 +625,7 @@ impl Network {
             })
             .collect();
         self.directory.set(&members);
-        let policy = compile(
-            &self.groups.snapshot(),
-            &members,
-            self.config.nat64_prefix,
-            &self.denied(&node),
-        );
+        let policy = compile(&self.groups.snapshot(), &members, &self.denied(&node));
         let table = rules::table(&policy, &self.rules());
         match applied
             .as_ref()
@@ -666,8 +661,9 @@ impl Network {
 
     fn rules(&self) -> rules::Options {
         rules::Options {
-            dns: self.config.dns_address,
-            pool: (self.config.nat64 == Nat64Mode::Node).then_some(self.config.nat64_pool),
+            dns: IpAddr::V6(self.config.dns_address),
+            // Until `--pod-ipv4-range` comes: its default.
+            ipv4_range: (Ipv4Addr::new(169, 254, 16, 0), 20),
         }
     }
 
@@ -1032,7 +1028,6 @@ mod tests {
             ..Config::default()
         });
         assert!(network_nat64.denied(&[]).is_empty());
-        assert_eq!(network_nat64.rules().pool, None);
     }
 
     #[test]
