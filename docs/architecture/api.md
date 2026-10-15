@@ -87,8 +87,9 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   group at `from_version`; `DeleteSecurityGroup` fails with
   `FAILED_PRECONDITION` while a pod names the group; `GetSecurityGroup`
   and `ListSecurityGroups`. A rule is a direction, a protocol (TCP, UDP,
-  ICMPv6 or any), ports of TCP and UDP, and a peer: an address block with
-  exceptions, of either family, or a group's members. A
+  ICMP, ICMPv6 or any), ports of TCP and UDP, and a peer: an address block
+  with exceptions, of either family, or a group's members, of IPv6. An
+  IPv4 block counts in rules out alone: nothing new comes in over IPv4. A
   change applies to the pods' rules within moments of the call.
 - `TrafficService.StreamTrafficRecords` streams flows, drops, DNS queries
   and server names as `feosd` makes them, of one pod or of all; what a

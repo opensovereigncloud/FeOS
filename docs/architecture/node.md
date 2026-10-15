@@ -152,9 +152,9 @@ At its start `feosd`:
    no other global address, and binds the resolver's UDP and TCP sockets
    to it, port 53.
 
-The resolver's is the one link-local address the node holds. It never
-holds `169.254.0.1`: where that is the gateway of the node's own network,
-as in some clouds, the node would lose its own.
+Of the pods' addresses on their links, the node holds the resolver's
+alone. It never holds `169.254.0.1`: where that is the gateway of the
+node's own network, as in some clouds, the node would lose its own.
 
 Before every boot and resume of a pod, `feosd` makes its TAP device,
 `pod-<8 hex digits of the ID>`, a link of its own between the node and
