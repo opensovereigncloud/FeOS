@@ -3,13 +3,15 @@
 # privileged container, and check feosd under systemd: its group and
 # socket, a pod from the installed guest and Firecracker, its cgroup, a
 # restart that keeps the pod, the refused self-upgrade, what autoremove
-# keeps, pods on feosd's network (an fd00: prefix, DNS64 and NAT64,
-# security groups, a denied prefix, traffic records) and their forwarded
-# services, removal, and a power-off through PID 1.
+# keeps, pods on feosd's network (an fd00: prefix and link-local IPv4
+# addresses behind proxy ARP and masquerade, DNS, security groups, a
+# denied prefix, traffic records, the deletion of a pod's connections)
+# and their forwarded services, removal, and a power-off through PID 1.
 #
 #   hack/packages/test-packages
 #
-# Needs docker, /dev/kvm, and internet access for the pods' images.
+# Needs docker, /dev/kvm, and IPv4 internet access for the pods' images
+# and checks; IPv6 internet is not needed.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -61,7 +63,7 @@ log "building ${IMAGE}: Debian 13 with systemd"
 docker build -q -t "${IMAGE}" - >/dev/null <<'EOF'
 FROM debian:13
 RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv \
-      iproute2 nftables && \
+      iproute2 nftables conntrack && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
@@ -143,21 +145,25 @@ in_node apt-mark manual feosd feosctl >/dev/null
   fail "autoremove would remove ${removed}"
 log "autoremove keeps the versions of Firecracker and the guest"
 
+pod_state() { in_node feosctl pod get "${1:-${pod}}" | sed -n 's/^  State: //p'; }
+pod_address() { in_node feosctl pod get "$1" | sed -n 's/^  IPv6 address: //p'; }
+pod_ipv4() { in_node feosctl pod get "$1" | sed -n 's/^  IPv4 address: //p'; }
+bare_ipv4="$(pod_ipv4 "${bare}")"
 in_node feosctl pod delete "${bare}" >/dev/null
 in_node test ! -e "/sys/fs/cgroup/system.slice/feosd.service/vms/${bare}" ||
   fail "the pod's cgroup outlived it"
+in_node grep -q "^freed ${bare_ipv4} " /var/lib/feos/pods/ipv4-addresses ||
+  fail "the deleted pod's ${bare_ipv4} is not free: $(in_node cat /var/lib/feos/pods/ipv4-addresses)"
 
 # Pods on feosd's network (ADR 0010, 0012, 0013). The pod pulls its image
-# through the network: DNS64 and NAT64.
+# through the network, over IPv4.
 pod=22222222-3333-4444-5555-666666666666
 client=33333333-3333-4444-5555-666666666666
 server=44444444-3333-4444-5555-666666666666
-pod_state() { in_node feosctl pod get "${1:-${pod}}" | sed -n 's/^  State: //p'; }
-pod_address() { in_node feosctl pod get "$1" | sed -n 's/^  Address: //p'; }
 in_pod() { in_node feosctl container --pod "${pod}" exec main -- "$@"; }
 in_client() { in_node feosctl container --pod "${client}" exec main -- "$@"; }
 # The records of everything below.
-in_node sh -c 'timeout 600 feosctl traffic watch >/tmp/traffic.log 2>&1 &'
+in_node sh -c 'timeout 900 feosctl traffic watch >/tmp/traffic.log 2>&1 &'
 in_node feosctl pod create --pod-id "${pod}" --image docker.io/library/busybox:1.36 --wait \
   -- sleep 3600 >/dev/null || fail "pod ${pod} did not come up: $(in_node feosctl pod get "${pod}")"
 in_node feosctl pod get "${pod}" | contains "main (docker.io/library/busybox:1.36): running" ||
@@ -169,14 +175,41 @@ if in_node feosctl container exec main -- true 2>/dev/null; then
 fi
 log "a pod pulled its image and runs; feosd forwards its services"
 
+# Both families: an address of the prefix and one of 169.254.16.0/20,
+# each routed to the pod's TAP device, which holds no IPv4 address; the
+# node answers ARP for the pod's gateway 169.254.0.1 by proxy.
 address="$(pod_address "${pod}")"
+pod_ipv4="$(pod_ipv4 "${pod}")"
 case "${address}" in fd00:fe05:1:*) ;; *) fail "pod ${pod} has the address ${address}" ;; esac
-in_pod ip -4 addr show dev eth0 | contains inet && fail "the pod has IPv4"
-in_pod cat /etc/resolv.conf | contains -x "nameserver fdfd:7b5:61d9::53" ||
+case "${pod_ipv4}" in 169.254.1[6-9].* | 169.254.2[0-9].* | 169.254.3[01].*) ;;
+  *) fail "pod ${pod} has the IPv4 address ${pod_ipv4}" ;; esac
+[ "${pod_ipv4}" != "${bare_ipv4}" ] || fail "${bare_ipv4} came round before one never used"
+in_pod ip -4 addr show dev eth0 | contains -F "inet ${pod_ipv4}/32" || fail "the pod has not ${pod_ipv4}/32"
+in_pod ip -6 addr show dev eth0 | contains -F "inet6 ${address}/128" || fail "the pod has not ${address}/128"
+in_pod ip -4 route show default | contains -F "default via 169.254.0.1 dev eth0" ||
+  fail "the pod's IPv4 gateway is not 169.254.0.1: $(in_pod ip -4 route)"
+tap=pod-22222222
+in_node ip -4 addr show dev "${tap}" | contains inet && fail "${tap} holds an IPv4 address"
+in_node ip neigh show proxy dev "${tap}" | contains -x "169.254.0.1 *proxy *" ||
+  fail "no proxy ARP for 169.254.0.1 on ${tap}: $(in_node ip neigh show proxy)"
+in_node ip route show "${pod_ipv4}" | contains "dev ${tap}" || fail "${pod_ipv4} is not routed to ${tap}"
+in_node ip -6 route show "${address}" | contains "dev ${tap}" || fail "${address} is not routed to ${tap}"
+in_node ip -4 addr show dev feos-dns | contains -F "inet 169.254.0.53/32" || fail "feos-dns does not hold 169.254.0.53"
+in_node ip -4 addr | contains -F "169.254.0.1/" && fail "the node holds 169.254.0.1"
+in_pod cat /etc/resolv.conf | contains -x "nameserver 169.254.0.53" ||
   fail "the pod does not ask feosd's resolver"
-in_pod nslookup -type=AAAA dns.google | contains "64:ff9b::808:808" || fail "no DNS64"
-in_pod ping -6 -c 1 -W 5 dns.google >/dev/null || fail "the pod does not reach the internet"
-log "pod ${pod} has ${address}, IPv6 only, and reaches the internet through DNS64 and NAT64"
+log "pod ${pod} has ${address} and ${pod_ipv4}, routed to ${tap}, behind 169.254.0.1 by proxy ARP"
+
+# Real answers of both families, nothing synthesized; IPv4 leaves the
+# node masqueraded: by name, by an IPv4 literal, and ICMP.
+dns="$(in_pod nslookup dns.google)"
+contains -F "8.8.8.8" <<<"${dns}" && contains -F "2001:4860:4860::8888" <<<"${dns}" ||
+  fail "no real answers for dns.google: ${dns}"
+contains -F "64:ff9b" <<<"${dns}" && fail "a synthesized answer: ${dns}"
+in_pod ping -c 1 -W 5 1.1.1.1 >/dev/null || fail "the pod does not reach 1.1.1.1 over ICMP"
+in_pod wget -q -O - http://example.com/ | contains "Example Domain" ||
+  fail "busybox wget does not reach http://example.com/ by name"
+log "the pod resolves through 169.254.0.53 and reaches the internet over IPv4"
 
 # A pod whose security groups the node does not have does not start.
 in_node feosctl pod create --pod-id "${server}" --memory 256 --security-group server \
@@ -186,9 +219,11 @@ in_node feosctl pod create --pod-id "${server}" --memory 256 --security-group se
 await "a pod without its group did not fail" bash -c "[ \"\$(in_node feosctl pod get ${server} | sed -n 's/^  State: //p')\" = FAILED ]"
 in_node feosctl pod get "${server}" | contains "Reason: .*security groups server" ||
   fail "the pod does not say which group it lacks: $(in_node feosctl pod get "${server}")"
+# IPv4 blocks count out: the pods pull their images over IPv4.
 in_node feosctl security-group put server --allow 'ingress tcp 8080 from group client' \
-  --allow 'egress any to ::/0' >/dev/null
-in_node feosctl security-group put client --allow 'egress any to ::/0' >/dev/null
+  --allow 'egress any to ::/0' --allow 'egress any to 0.0.0.0/0' >/dev/null
+in_node feosctl security-group put client --allow 'egress any to ::/0' \
+  --allow 'egress any to 0.0.0.0/0' >/dev/null
 in_node feosctl pod start --wait "${server}" >/dev/null || fail "pod ${server} did not start with its group"
 in_node feosctl pod create --pod-id "${client}" --memory 256 --security-group client \
   --image docker.io/curlimages/curl:8.11.1 --wait -- sleep 3600 >/dev/null ||
@@ -205,61 +240,110 @@ dropped() {
   in_pod nc -w 3 "$1" "${2:-9}" </dev/null >/dev/null 2>&1 || true
   [ $((SECONDS - start)) -ge 2 ]
 }
-# What the check sees when nothing drops: the pod's own address refuses.
+# What the check sees when nothing drops: the pod's own addresses refuse.
 dropped "${address}" && fail "a refused connection looks dropped"
+dropped "${pod_ipv4}" && fail "a refused connection over IPv4 looks dropped"
 server_address="$(pod_address "${server}")"
+server_ipv4="$(pod_ipv4 "${server}")"
+client_address="$(pod_address "${client}")"
+client_ipv4="$(pod_ipv4 "${client}")"
 node_ipv4="$(in_node ip -4 -o addr show dev eth0 | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p')"
-dropped "${server_address}" 8080 || fail "a pod reaches another pod"
-dropped fdfd:7b5:61d9::53 || fail "a pod reaches the node beside DNS"
-dropped "64:ff9b::${node_ipv4}" || fail "a pod reaches the node through NAT64"
-log "pods reach neither each other nor the node by default"
+dropped "${server_address}" 8080 || fail "a pod reaches another pod over IPv6"
+dropped "${server_ipv4}" 8080 || fail "a pod reaches another pod over IPv4"
+for target in "169.254.0.53 9" "169.254.0.53 80" "169.254.0.1 53" "169.254.0.1 80" \
+  "${node_ipv4} 22" "${node_ipv4} 9" "169.254.169.254 80"; do
+  # shellcheck disable=SC2086
+  dropped ${target} || fail "a pod reaches ${target}"
+done
+log "pods reach neither each other nor the node, its gateway or 169.254.169.254"
 
-# The client's group lets it reach the server on 8080, once it is a member.
+# The client's group lets it reach the server on 8080 over IPv6, once it
+# is a member; over IPv4 never.
 in_client curl -sS -m 3 "http://[${server_address}]:8080/" >/dev/null 2>&1 &&
   fail "the client reaches the server before it is a member of client"
-in_node feosctl security-group update client --from-version 1 \
-  --add "$(pod_address "${client}")" >/dev/null
+in_node feosctl security-group update client --from-version 1 --add "${client_address}" >/dev/null
 [ "$(in_client curl -sS -m 5 "http://[${server_address}]:8080/")" = hello ] ||
   fail "a member of client does not reach the server on 8080"
 in_client curl -sS -m 3 "http://[${server_address}]:9090/" >/dev/null 2>&1 &&
   fail "a member of client reaches the server on 9090"
+in_client curl -sS -m 3 "http://${server_ipv4}:8080/" >/dev/null 2>&1 &&
+  fail "a member of client reaches the server over IPv4"
 dropped "${server_address}" 8080 || fail "a pod outside client reaches the server"
-log "a security group lets one pod reach another on its port, and nothing else"
+log "a security group lets one pod reach another on its port over IPv6, and nothing else"
 
 [ "$(in_client curl -sS -m 10 -o /dev/null -w '%{http_code}' https://example.com/)" = 200 ] ||
   fail "the client does not reach https://example.com/"
+code="$(in_client curl -sS -m 10 -o /dev/null -w '%{http_code}' http://1.1.1.1/ || true)"
+case "${code}" in [1-5][0-9][0-9]) ;; *) fail "the client does not reach http://1.1.1.1/: ${code}" ;; esac
 start=${SECONDS}
-in_client curl -sS -m 3 -o /dev/null "http://[64:ff9b::9.9.9.9]/" 2>/dev/null &&
+in_client curl -sS -m 3 -o /dev/null "http://9.9.9.9/" 2>/dev/null &&
   fail "a pod reaches a denied prefix"
 [ $((SECONDS - start)) -ge 2 ] || fail "a denied prefix refuses rather than drops"
-log "the client reaches the internet, but not a denied prefix"
+log "the client reaches the internet over IPv4, by name and by literal, but not a denied prefix"
 
 table="$(in_node nft list table inet feos)"
-for expected in "map pod-in" "map pod-out" "set deny" "set internet" "set g-client" \
-  "chain out-pod-44444444" "chain in-pod-44444444" "chain from-pods" "chain to-pods" \
-  "iifname vmap @pod-out" \
-  "oifname vmap @pod-in" "fib saddr . iif oif missing" 'log prefix "copy" group 3' \
-  'log prefix "no-rule" group 2' "ct state established,related accept" "masquerade"; do
+for expected in "map pod-in" "map pod-out" "set deny4" "set deny6" "set internet4" \
+  "set internet6" "set g-client" "chain out-pod-44444444" "chain in-pod-44444444" \
+  "chain from-pods" "chain to-pods" "iifname vmap @pod-out" "oifname vmap @pod-in" \
+  "fib saddr . iif oif missing" 'log prefix "copy" group 3' 'log prefix "no-rule" group 2' \
+  "ct state established,related accept" "ip daddr @deny4" "ip daddr @internet4 return" \
+  'ip daddr 169.254.0.53 udp dport 53 accept' 'ip daddr 169.254.0.53 tcp dport 53 accept' \
+  'ip saddr 169.254.16.0/20 oifname != "pod-*" masquerade'; do
   contains -F "${expected}" <<<"${table}" || fail "the table has no ${expected}"
 done
 contains -F "tcp dport 8080 ip6 saddr @g-client return" <<<"${table}" ||
   fail "the server's chain does not return the client's port"
+deny4="$(sed -n '/set deny4/,/}/p' <<<"${table}" | tr -s ' \n\t' ' ')"
+for denied in 9.9.9.9 169.254.0.0/16 "${node_ipv4}"; do
+  contains -F "${denied}" <<<"${deny4}" || fail "deny4 has no ${denied}: ${deny4}"
+done
 sleep 2
 records="$(in_node cat /tmp/traffic.log)"
-for expected in " ${pod} dns dns.google AAAA NOERROR 64:ff9b::808:" \
-  " ${client} flow tcp " " ${server} flow tcp " " ${client} name tls tcp " \
-  " ${client} drop tcp " " denied-prefix" " no-rule"; do
+for expected in " ${pod} dns dns.google A NOERROR " " ${pod} dns dns.google AAAA NOERROR " \
+  " ${pod} flow icmp ${pod_ipv4} > 1.1.1.1 " " ${pod} flow tcp ${pod_ipv4}:" \
+  " ${client} flow tcp ${client_ipv4}:" " ${client} flow tcp [${client_address}]:" \
+  " ${server} flow tcp [${client_address}]:" " ${client} name tls tcp ${client_ipv4}:" \
+  " ${client} drop tcp ${client_ipv4}:" " ${client} drop tcp [${client_address}]:" \
+  " denied-prefix" " no-rule"; do
   contains -F -e "${expected}" <<<"${records}" || fail "no record with '${expected}': ${records}"
 done
-contains -F "example.com" <<<"$(grep " name tls " <<<"${records}")" ||
+contains -F "8.8.8.8" <<<"$(grep -F " ${pod} dns dns.google A NOERROR " <<<"${records}")" ||
+  fail "no A record of dns.google: ${records}"
+contains -F "2001:4860:4860::8888" <<<"$(grep -F " ${pod} dns dns.google AAAA NOERROR " <<<"${records}")" ||
+  fail "no AAAA record of dns.google: ${records}"
+contains -F "> 9.9.9.9:80 out denied-prefix" <<<"$(grep -F " ${client} drop tcp " <<<"${records}")" ||
+  fail "no drop of the denied prefix: ${records}"
+contains -F "example.com" <<<"$(grep -F " name tls " <<<"${records}")" ||
   fail "no TLS server name example.com: ${records}"
-log "nftables has the pods' chains and sets; feosctl traffic watch shows DNS, flows, drops and server names"
+grep -F " flow " <<<"${records}" | contains -F "169.254.0.53:53" &&
+  fail "a query to the resolver is recorded as a flow: ${records}"
+log "nftables has the pods' sets, chains and masquerade; feosctl traffic watch shows DNS, flows of both families with the pods' own addresses, drops and server names"
 
+# Deleting a pod deletes its TAP device and the connections of its IPv4
+# address, which comes round again only after the never used ones.
+in_client curl -sS -m 10 -o /dev/null http://1.1.1.1/ || true
+in_node conntrack -L -s "${client_ipv4}" 2>/dev/null | contains "src=${client_ipv4}" ||
+  fail "no connections of ${client_ipv4} to be deleted"
 for id in "${client}" "${server}"; do
   in_node feosctl pod delete "${id}" >/dev/null
 done
 in_node feosctl security-group delete server >/dev/null || fail "an unused group stays"
 in_node nft list table inet feos | contains "pod-44444444" && fail "a deleted pod's rules stay"
+for tap in pod-33333333 pod-44444444; do
+  in_node ip link show "${tap}" >/dev/null 2>&1 && fail "${tap} outlived its pod"
+done
+in_node ip neigh show proxy | contains -E "pod-(33333333|44444444)" && fail "a deleted pod's proxy entry stays"
+in_node conntrack -L -s "${client_ipv4}" 2>/dev/null | contains "src=${client_ipv4}" &&
+  fail "the deleted pod's connections stay: $(in_node conntrack -L -s "${client_ipv4}" 2>&1)"
+next=55555555-3333-4444-5555-666666666666
+in_node feosctl pod create --pod-id "${next}" --memory 256 --wait >/dev/null ||
+  fail "pod ${next} did not come up: $(in_node feosctl pod get "${next}")"
+next_ipv4="$(pod_ipv4 "${next}")"
+for used in "${bare_ipv4}" "${pod_ipv4}" "${server_ipv4}" "${client_ipv4}"; do
+  [ "${next_ipv4}" != "${used}" ] || fail "${used} came round before one never used"
+done
+in_node feosctl pod delete "${next}" >/dev/null
+log "a deleted pod takes its TAP device and its connections; the next pod got ${next_ipv4}, never used"
 
 in_node feosctl pod create --pod-id "${pod}" --image docker.io/library/busybox:1.36 \
   -- sleep 3600 >/dev/null ||
@@ -279,7 +363,13 @@ in_node systemctl restart feosd
 await "feosd did not come back" in_node systemctl is-active feosd
 [ "$(pod_state)" = RUNNING ] || fail "after a restart of feosd, the pod is $(pod_state)"
 [ "$(in_pod cat /tmp/mark)" = kept ] || fail "the pod did not outlive a restart of feosd"
-log "the pod outlived a restart of feosd"
+[ "$(pod_address "${pod}")" = "${address}" ] && [ "$(pod_ipv4 "${pod}")" = "${pod_ipv4}" ] ||
+  fail "the pod's addresses changed with a restart of feosd"
+in_node ip neigh show proxy dev pod-22222222 | contains -F "169.254.0.1" ||
+  fail "the pod's proxy ARP is gone with a restart of feosd"
+in_pod wget -q -O - http://example.com/ | contains "Example Domain" ||
+  fail "the pod lost its network with a restart of feosd"
+log "the pod outlived a restart of feosd, with its network"
 
 in_node feosctl pod stop "${pod}" >/dev/null || fail "no stop"
 [ "$(pod_state)" = STOPPED ] || fail "the pod is $(pod_state), not stopped"
