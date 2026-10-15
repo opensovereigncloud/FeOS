@@ -35,8 +35,9 @@ service MicroVmService {
   // a request to shut down; FeOS does.
   rpc ShutdownVm(ShutdownVmRequest) returns (ShutdownVmResponse);
   // Restores a suspended microVM from its snapshot in a new Firecracker
-  // process. A FeOS guest is pushed the time
-  // and its network configuration before this returns.
+  // process, or a created one that never booted from a snapshot written
+  // elsewhere. A FeOS guest is pushed the time and its network
+  // configuration before this returns.
   rpc ResumeVm(ResumeVmRequest) returns (ResumeVmResponse);
   // Writes the state and the memory of a running or paused Virtual Machine
   // to a snapshot in its directory and ends its Firecracker process. The
@@ -135,6 +136,18 @@ message VmConfig {
   // guest attaches to its lifecycle uplink and after every resume. Without
   // it, only the time is pushed.
   GuestNetworkConfig guest_network = 7;
+  // The guest's data volume, which it mounts at /var/lib/feos: a pod's
+  // disk from diskd. Unset, the guest keeps its data in memory.
+  DataDiskConfig data_disk = 8;
+}
+
+message DataDiskConfig {
+  // A block device or a file on the node, or a link to one, as diskd's
+  // <state>/live/<pod>/disk is: it is resolved again at every boot and
+  // restore, since a device's number changes when it is started anew.
+  // Firecracker opens it in its jail, as /data, with a writeback cache,
+  // so that the guest's flushes reach it.
+  string path = 1;
 }
 
 message GuestNetworkConfig {
@@ -277,6 +290,24 @@ message ShutdownVmRequest {
 
 message ResumeVmRequest {
   string vm_id = 1;
+  // A snapshot from elsewhere, for a microVM that was created and never
+  // booted: one that went to object storage, on this node or another.
+  RemoteSnapshot remote = 2;
+}
+
+// A snapshot written elsewhere. Its memory is not a file: a userfaultfd
+// handler serves it, listening on the socket memory.sock in the VM's
+// directory, such as diskd's (OpenMemory), and the guest runs while it
+// arrives.
+message RemoteSnapshot {
+  // Its vmstate, a file on the node, which the VM service takes into the
+  // VM's directory.
+  string vmstate_path = 1;
+  // What it was written with. It is restored only with the same: the
+  // Firecracker version installed, on the same CPU model and kernel.
+  string firecracker_version = 2;
+  string cpu_model = 3;
+  string kernel_release = 4;
 }
 
 message SuspendVmRequest {

@@ -87,10 +87,15 @@ pub trait Hypervisor: Send + Sync {
     /// be suspended is left running or paused, as it was.
     async fn suspend_vm(&self, vm_id: &str, settle_free_pages: bool) -> Result<u64, VmmError>;
 
-    /// Restores a suspended VM in a new VMM process and resumes it; returns
-    /// the process's pid. The snapshot is gone once the guest ran; an error
-    /// before that keeps it.
-    async fn restore_vm(&self, vm_id: &str) -> Result<i64, VmmError>;
+    /// Restores a suspended VM in a new VMM process and resumes it, or with
+    /// `remote` a created one from a snapshot written elsewhere, whose
+    /// memory a userfaultfd handler serves; returns the process's pid. The
+    /// snapshot is gone once the guest ran; an error before that keeps it.
+    async fn restore_vm(
+        &self,
+        vm_id: &str,
+        remote: Option<snapshot::Remote>,
+    ) -> Result<i64, VmmError>;
 
     /// Watches a running VM until its VMM process ends, and reports how it
     /// ended, unless the VM's ID arrives on the cancel bus first.

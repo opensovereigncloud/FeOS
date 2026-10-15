@@ -157,9 +157,10 @@ impl Guests {
 
     /// After the VM resumed: once a FeOS guest answers, pushes the time and
     /// its network configuration. Does nothing for a VM whose guest never
-    /// attached in this boot, which may be no FeOS.
-    pub async fn resumed(&self, vm_id: &str) {
-        if self.info(vm_id).is_none() {
+    /// attached in this boot, which may be no FeOS, unless it was restored
+    /// from a snapshot written elsewhere, whose guest attached there.
+    pub async fn resumed(&self, vm_id: &str, from_elsewhere: bool) {
+        if self.info(vm_id).is_none() && !from_elsewhere {
             return;
         }
         let answered = tokio::time::timeout(RESUME_TIMEOUT, async {

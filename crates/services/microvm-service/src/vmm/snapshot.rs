@@ -7,9 +7,14 @@
 //! - `memory`: the guest's memory, with holes where it was all zeroes
 //! - `host.json`: what the snapshot needs of the host that restores it
 //!
+//! A snapshot written elsewhere (`Remote`) has no memory file: a
+//! userfaultfd handler serves the memory on `memory.sock` in the VM's
+//! directory while the guest runs.
+//!
 //! A snapshot is restored once. Once the restored VM ran, its disks have
 //! moved on, and the snapshot would roll the guest back against them.
 
+use super::{installed, jail};
 use crate::vm_dir;
 use nix::fcntl::{fallocate, FallocateFlags};
 use nix::unistd::{lseek, Whence};
@@ -28,6 +33,17 @@ const CHUNK: usize = 1 << 20;
 /// Where Firecracker, in its jail, sees the snapshot.
 pub const JAILED_VMSTATE: &str = "/snapshot/vmstate";
 pub const JAILED_MEMORY: &str = "/snapshot/memory";
+/// The userfaultfd handler's socket of a remote snapshot, in the VM's
+/// directory.
+pub const MEMORY_SOCKET: &str = "memory.sock";
+
+/// A snapshot written elsewhere: its vmstate, a file on the node, and what
+/// it was written with. Its memory comes from a userfaultfd handler.
+#[derive(Debug, Clone)]
+pub struct Remote {
+    pub vmstate: PathBuf,
+    pub host: Host,
+}
 
 pub fn dir(vm_id: &str) -> PathBuf {
     vm_dir(vm_id).join("snapshot")
@@ -54,6 +70,29 @@ pub fn remove(vm_id: &str) -> io::Result<()> {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
+}
+
+/// Takes a remote snapshot into the VM's directory: its vmstate, moved
+/// there, and what it was written with, for the restore to check. Both
+/// are the VM's user's.
+pub fn receive(vm_id: &str, remote: &Remote) -> io::Result<()> {
+    remove(vm_id)?;
+    std::fs::create_dir_all(dir(vm_id))?;
+    let target = vmstate(vm_id);
+    match std::fs::rename(&remote.vmstate, &target) {
+        Ok(()) => {}
+        // From another filesystem.
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            std::fs::copy(&remote.vmstate, &target)?;
+            std::fs::remove_file(&remote.vmstate)?;
+        }
+        Err(e) => return Err(e),
+    }
+    remote.host.save(vm_id)?;
+    for path in [dir(vm_id), target] {
+        jail::give(vm_id, &path)?;
+    }
+    Ok(())
 }
 
 /// What a snapshot needs of the host that restores it: the Firecracker that
@@ -97,6 +136,20 @@ impl Host {
             cpu_model: field("cpu_model"),
             kernel_release: field("kernel_release"),
         })
+    }
+
+    /// Why a snapshot written on `self` cannot be restored on this host:
+    /// it needs the Firecracker that wrote it installed, and the same CPU
+    /// model and kernel. What a snapshot does not record counts as
+    /// different.
+    pub fn unrestorable_here(&self) -> Option<String> {
+        if installed::firecracker(&self.firecracker_version).is_none() {
+            return Some(format!(
+                "the snapshot is from Firecracker {:?}, which is not installed",
+                self.firecracker_version
+            ));
+        }
+        self.mismatch(&Host::this(&self.firecracker_version))
     }
 
     /// Why a snapshot written on `self` cannot be restored on `other`.

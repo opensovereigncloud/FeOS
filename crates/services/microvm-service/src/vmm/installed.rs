@@ -24,6 +24,23 @@ pub fn newest_guest() -> Option<PathBuf> {
     newest(Path::new(GUEST_DIR), &["vmlinuz", "initramfs"])
 }
 
+/// The directory of the installed Firecracker `version`, as Firecracker
+/// reports its version: what a snapshot of it needs.
+pub fn firecracker(version: &str) -> Option<PathBuf> {
+    version_dir(
+        Path::new(FIRECRACKER_DIR),
+        version,
+        &["firecracker", "jailer"],
+    )
+}
+
+/// The directory of `version` in `dir`, if it has all of `files`.
+fn version_dir(dir: &Path, version: &str, files: &[&str]) -> Option<PathBuf> {
+    let candidate = dir.join(version);
+    let plain = !version.is_empty() && !version.contains('/') && version != "..";
+    (plain && files.iter().all(|file| candidate.join(file).is_file())).then_some(candidate)
+}
+
 /// The directory of the newest version in `dir` that has all of `files`.
 fn newest(dir: &Path, files: &[&str]) -> Option<PathBuf> {
     std::fs::read_dir(dir)
@@ -92,5 +109,15 @@ mod tests {
             Some(dir.path().join("1.17.0"))
         );
         assert_eq!(newest(&dir.path().join("none"), &["x"]), None);
+
+        // A snapshot needs its own version, not the newest.
+        let files = ["firecracker", "jailer"];
+        assert_eq!(
+            version_dir(dir.path(), "1.9.0", &files),
+            Some(dir.path().join("1.9.0"))
+        );
+        for missing in ["1.18.0", "1.10.0", "", "..", "../1.9.0"] {
+            assert_eq!(version_dir(dir.path(), missing, &files), None, "{missing}");
+        }
     }
 }

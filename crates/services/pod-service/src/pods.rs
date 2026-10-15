@@ -288,6 +288,7 @@ impl Pods {
         let attachment = self.attach(pod_id).await?;
         let request = Request::new(ResumeVmRequest {
             vm_id: pod_id.to_string(),
+            remote: None,
         });
         self.inner.vms.resume_vm(request).await?;
         self.settle(pod_id, VmState::Running).await?;
@@ -550,7 +551,10 @@ impl Pods {
                 }
                 Some(VmState::Running) => return Ok(()),
                 Some(VmState::Paused) => {
-                    let request = Request::new(ResumeVmRequest { vm_id });
+                    let request = Request::new(ResumeVmRequest {
+                        vm_id,
+                        remote: None,
+                    });
                     self.inner.vms.resume_vm(request).await?;
                     return Ok(());
                 }

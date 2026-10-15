@@ -12,9 +12,12 @@
 //!   (Firecracker's stdout)
 //! - `vmm.log`: Firecracker's own log
 //! - `firecracker.pid`, `firecracker` and `dev/`: the jailer's
-//! - `vmlinuz`, `initramfs`, `rootfs.img`, `<drive>.img`: the image's files
-//!   and the data disks, linked in
+//! - `vmlinuz`, `initramfs`: the guest's files, linked in
+//! - `data`: the data disk, a device node of the VM's own or a file
+//!   linked in
 //! - `snapshot/`: the snapshot of a suspended VM (see `snapshot`)
+//! - `memory.sock`: where a userfaultfd handler serves the memory of a
+//!   snapshot written elsewhere
 //!
 //! Creating a VM writes its configuration. Starting it starts a Firecracker
 //! process that boots it at once. The process ends when the guest reboots or
@@ -71,6 +74,8 @@ const CONFIG: &str = "config.json";
 const API_SOCKET: &str = "fc.sock";
 const VSOCK: &str = "v.sock";
 const VMM_LOG: &str = "vmm.log";
+/// The data disk in the jail.
+const DATA_DISK: &str = "data";
 
 /// How a VMM process ended: its exit code, 128 + the signal when signalled,
 /// or `None` when it was not this process's child and the code is unknown.
@@ -241,12 +246,29 @@ fn firecracker_config(
         interfaces.push(interface);
     }
 
+    // A writeback cache, so that the guest's flushes reach the device: a
+    // pod's disk is written back to its top in diskd only then.
+    let mut drives = Vec::new();
+    if let Some(disk) = config
+        .data_disk
+        .as_ref()
+        .filter(|disk| !disk.path.is_empty())
+    {
+        drives.push(json!({
+            "drive_id": DATA_DISK,
+            "path_on_host": link(PathBuf::from(&disk.path), DATA_DISK.to_string(), true),
+            "is_root_device": false,
+            "is_read_only": false,
+            "cache_type": "Writeback",
+        }));
+    }
+
     let (vcpus, memory_mib) = machine_size(config);
     let machine = json!({"vcpu_count": vcpus, "mem_size_mib": memory_mib});
 
     let mut fc = json!({
         "boot-source": boot_source,
-        "drives": [],
+        "drives": drives,
         "network-interfaces": interfaces,
         "machine-config": machine,
         "vsock": {"guest_cid": GUEST_CID, "uds_path": format!("/{VSOCK}")},
@@ -632,20 +654,56 @@ impl Hypervisor for FirecrackerAdapter {
         snapshot::disk_usage(&memory).map_err(internal("measure the snapshot"))
     }
 
-    async fn restore_vm(&self, vm_id: &str) -> Result<i64, VmmError> {
-        if !snapshot::exists(vm_id) {
-            return Err(VmmError::SnapshotUnusable(
-                "the VM has no snapshot".to_string(),
-            ));
-        }
+    async fn restore_vm(
+        &self,
+        vm_id: &str,
+        remote: Option<snapshot::Remote>,
+    ) -> Result<i64, VmmError> {
+        // A local snapshot's memory is a file; a remote one's is served
+        // on a socket in the VM's directory.
+        let memory_backend = match &remote {
+            None if !snapshot::exists(vm_id) => {
+                return Err(VmmError::SnapshotUnusable(
+                    "the VM has no snapshot".to_string(),
+                ));
+            }
+            None => json!({"backend_type": "File", "backend_path": snapshot::JAILED_MEMORY}),
+            Some(remote) => {
+                snapshot::receive(vm_id, remote).map_err(internal("take the snapshot in"))?;
+                json!({"backend_type": "Uffd", "backend_path": format!("/{}", snapshot::MEMORY_SOCKET)})
+            }
+        };
         let saved = snapshot::Host::load(vm_id)
             .map_err(|e| VmmError::SnapshotUnusable(format!("host record: {e}")))?;
 
-        // The Firecracker that wrote the snapshot.
-        let recorded = jail::Manifest::load(vm_id)
-            .map_err(internal("read the jail's manifest"))?
-            .vmm
-            .unwrap_or_else(|| self.vmm_for_boot());
+        // The Firecracker that wrote the snapshot: the one this VM booted
+        // with, or for a remote one the installed one of its version,
+        // which the VM keeps from now on.
+        let recorded = match &remote {
+            None => jail::Manifest::load(vm_id)
+                .map_err(internal("read the jail's manifest"))?
+                .vmm
+                .unwrap_or_else(|| self.vmm_for_boot()),
+            Some(_) => {
+                let dir = installed::firecracker(&saved.firecracker_version).ok_or_else(|| {
+                    VmmError::SnapshotUnusable(format!(
+                        "the snapshot is from Firecracker {:?}, which is not installed",
+                        saved.firecracker_version
+                    ))
+                })?;
+                let vmm = jail::Vmm {
+                    firecracker: dir.join(crate::FIRECRACKER_BIN),
+                    jailer: dir.join(crate::JAILER_BIN),
+                };
+                let mut manifest =
+                    jail::Manifest::load(vm_id).map_err(internal("read the jail's manifest"))?;
+                manifest.vmm = Some(vmm.clone());
+                manifest
+                    .save(vm_id)
+                    .map_err(internal("write the jail's manifest"))?;
+                vmm
+            }
+        };
         for binary in [&recorded.firecracker, &recorded.jailer] {
             if !binary.is_file() {
                 return Err(VmmError::SnapshotUnusable(format!(
@@ -672,7 +730,7 @@ impl Hypervisor for FirecrackerAdapter {
             // up to here leaves the snapshot good.
             let body = json!({
                 "snapshot_path": snapshot::JAILED_VMSTATE,
-                "mem_backend": {"backend_type": "File", "backend_path": snapshot::JAILED_MEMORY},
+                "mem_backend": memory_backend,
                 "resume_vm": false,
             });
             fc_api::request_within(&api, "PUT", "/snapshot/load", Some(&body), SNAPSHOT_TIMEOUT)
@@ -934,7 +992,9 @@ impl Hypervisor for FirecrackerAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feos_proto::microvm::{BalloonConfig, CpuConfig, MemoryConfig, NetConfig, TapConfig};
+    use feos_proto::microvm::{
+        BalloonConfig, CpuConfig, DataDiskConfig, MemoryConfig, NetConfig, TapConfig,
+    };
 
     fn image(files: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -1023,6 +1083,29 @@ mod tests {
         );
         let (fc, _) = firecracker_config(&VmConfig::default(), image.path()).unwrap();
         assert!(fc.get("balloon").is_none());
+    }
+
+    #[test]
+    fn the_data_disk_is_linked_in_with_a_writeback_cache() {
+        let image = image(&["vmlinuz", "initramfs"]);
+        let config = VmConfig {
+            data_disk: Some(DataDiskConfig {
+                path: "/var/lib/feos/disk/live/pod/disk".to_string(),
+            }),
+            ..Default::default()
+        };
+        let (fc, links) = firecracker_config(&config, image.path()).unwrap();
+        assert_eq!(
+            fc["drives"],
+            json!([{"drive_id": "data", "path_on_host": "/data", "is_root_device": false,
+                    "is_read_only": false, "cache_type": "Writeback"}])
+        );
+        let disk = links.last().unwrap();
+        assert_eq!(
+            disk.source,
+            PathBuf::from("/var/lib/feos/disk/live/pod/disk")
+        );
+        assert!(disk.disk && disk.name == "data");
     }
 
     #[test]

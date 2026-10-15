@@ -329,7 +329,9 @@ the chroot its Firecracker runs in:
 | `vmm.log` | Firecracker's own log |
 | `firecracker.pid`, `firecracker`, `dev/` | the jailer's |
 | `vmlinuz`, `initramfs` | the installed guest's files, linked in |
+| `data` | the data disk: a device node of the microVM's own, of the device the `data_disk` link names, made at every start and restore |
 | `snapshot/` | the snapshot of a suspended microVM: `vmstate` and `memory` |
+| `memory.sock` | where diskd serves the memory of a microVM restored from object storage |
 
 `jail.json`, beside the chroot, records what a start links in and what a
 deletion undoes.
@@ -345,13 +347,18 @@ deletion undoes.
 - **Shutdown** sends Ctrl-Alt-Del and waits for the process to end.
 - **Suspend** writes a snapshot, ends the process and punches holes over
   the pages of zeroes. **Resume** loads the snapshot with the vCPUs
-  stopped, then resumes them and removes the snapshot.
+  stopped, then resumes them and removes the snapshot. A created microVM
+  that never booted resumes from a `RemoteSnapshot`: its vmstate is moved
+  into `snapshot/`, and its memory comes from a userfaultfd handler on
+  `memory.sock`; it runs the installed Firecracker of the snapshot's
+  version, which it keeps.
 - **Delete** stops the microVM, removes what `jail.json` records, its TAP
   devices and its directory.
 
 The layer records a change of state after the call that made it returns;
-the pod service waits for it. A microVM has no data disks (the disk daemon
-brings volumes) and no huge pages, which Firecracker backs neither an
+the pod service waits for it. A microVM has one data disk at most,
+which Firecracker opens with a writeback cache, so that the guest's
+flushes reach diskd, and no huge pages, which Firecracker backs neither an
 initramfs nor a balloon with.
 
 ### Jail, user and cgroup

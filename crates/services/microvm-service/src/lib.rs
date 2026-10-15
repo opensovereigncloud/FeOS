@@ -46,6 +46,13 @@ pub fn vsock_path(vm_id: &str) -> PathBuf {
     vm_dir(vm_id).join("v.sock")
 }
 
+/// Where a userfaultfd handler serves the memory of a VM restored from a
+/// snapshot written elsewhere (`RemoteSnapshot`): in the VM's directory,
+/// which Firecracker sees as its root.
+pub fn memory_socket_path(vm_id: &str) -> PathBuf {
+    vm_dir(vm_id).join(vmm::snapshot::MEMORY_SOCKET)
+}
+
 /// What a console's client sends: an attach message, then its input.
 pub type ConsoleInput = Pin<Box<dyn Stream<Item = Result<StreamVmConsoleRequest, Status>> + Send>>;
 

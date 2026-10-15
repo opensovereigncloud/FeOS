@@ -536,9 +536,10 @@ pub(crate) async fn handle_resume_vm_command(
         }
     };
 
-    match record.status.state {
-        // A new VMM process to watch.
-        VmState::Suspended => {
+    match (record.status.state, req.remote.is_some()) {
+        // A new VMM process to watch. A snapshot from elsewhere goes into
+        // a VM that never booted.
+        (VmState::Suspended, false) | (VmState::Created, true) => {
             tokio::spawn(worker::handle_restore_vm(
                 req,
                 responder,
@@ -548,9 +549,10 @@ pub(crate) async fn handle_resume_vm_command(
                 guests,
             ));
         }
-        current_state => {
+        (current_state, remote) => {
+            let wanted = if remote { "Created" } else { "Suspended" };
             let _ = responder.send(Err(VmServiceError::InvalidState(format!(
-                "Cannot resume VM in {current_state:?} state. Must be in Suspended."
+                "Cannot resume VM in {current_state:?} state. Must be in {wanted}."
             ))));
         }
     }

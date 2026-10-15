@@ -338,7 +338,16 @@ pub async fn handle_restore_vm(
     guests: Arc<Guests>,
 ) {
     let vm_id = req.vm_id.clone();
-    let result = hypervisor.restore_vm(&vm_id).await;
+    let remote = req.remote.map(|remote| crate::vmm::snapshot::Remote {
+        vmstate: PathBuf::from(remote.vmstate_path),
+        host: crate::vmm::snapshot::Host {
+            firecracker_version: remote.firecracker_version,
+            cpu_model: remote.cpu_model,
+            kernel_release: remote.kernel_release,
+        },
+    });
+    let from_elsewhere = remote.is_some();
+    let result = hypervisor.restore_vm(&vm_id, remote).await;
 
     if let Ok(pid) = result {
         crate::vmm::broadcast_state_change_event(
@@ -353,8 +362,9 @@ pub async fn handle_restore_vm(
         )
         .await;
         start_healthcheck_monitor(vm_id.clone(), hypervisor, broadcast_tx, cancel_bus);
-        // The guest's clock stood still in the snapshot.
-        guests.resumed(&vm_id).await;
+        // The guest's clock stood still in the snapshot, and one from
+        // elsewhere had the network of another node.
+        guests.resumed(&vm_id, from_elsewhere).await;
     }
 
     let result = result.map(|_pid| ResumeVmResponse {});
