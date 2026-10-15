@@ -9,7 +9,7 @@ use feos_proto::microvm::{
 };
 use prost::Message;
 use prost_types::Any;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use tokio::io::DuplexStream;
 use tokio::sync::{broadcast, mpsc};
@@ -140,17 +140,50 @@ fn validate_guest_network(network: &GuestNetworkConfig) -> Result<(), VmmError> 
     if network.interface.is_empty() {
         return invalid("no interface");
     }
-    let prefix_ok = network
-        .ipv4_cidr
-        .split_once('/')
-        .is_some_and(|(address, prefix)| {
-            address.parse::<Ipv4Addr>().is_ok() && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
-        });
-    if !prefix_ok {
-        return invalid(&format!("bad address/prefix {:?}", network.ipv4_cidr));
+    // A family is pushed when either of its fields is set; one at least.
+    let ipv4 = !network.ipv4_cidr.is_empty() || !network.gateway.is_empty();
+    let ipv6 = !network.ipv6_cidr.is_empty() || !network.ipv6_gateway.is_empty();
+    if !ipv4 && !ipv6 {
+        return invalid("neither an IPv6 nor an IPv4 address");
     }
-    if network.gateway.parse::<Ipv4Addr>().is_err() {
-        return invalid(&format!("bad gateway {:?}", network.gateway));
+    if ipv4 {
+        let prefix_ok = network
+            .ipv4_cidr
+            .split_once('/')
+            .is_some_and(|(address, prefix)| {
+                address.parse::<Ipv4Addr>().is_ok() && prefix.parse::<u8>().is_ok_and(|p| p <= 32)
+            });
+        if !prefix_ok {
+            return invalid(&format!("bad address/prefix {:?}", network.ipv4_cidr));
+        }
+        if network.gateway.parse::<Ipv4Addr>().is_err() {
+            return invalid(&format!("bad gateway {:?}", network.gateway));
+        }
+    }
+    // An address beyond the link: the guest's kernel makes the link-local
+    // one itself.
+    if ipv6 {
+        let prefix_ok = network
+            .ipv6_cidr
+            .split_once('/')
+            .is_some_and(|(address, prefix)| {
+                address.parse::<Ipv6Addr>().is_ok_and(|a| {
+                    !(a.is_unspecified()
+                        || a.is_loopback()
+                        || a.is_multicast()
+                        || a.is_unicast_link_local())
+                }) && prefix.parse::<u8>().is_ok_and(|p| (1..=128).contains(&p))
+            });
+        if !prefix_ok {
+            return invalid(&format!("bad IPv6 address/prefix {:?}", network.ipv6_cidr));
+        }
+        let gateway_ok = network
+            .ipv6_gateway
+            .parse::<Ipv6Addr>()
+            .is_ok_and(|g| !(g.is_unspecified() || g.is_loopback() || g.is_multicast()));
+        if !gateway_ok {
+            return invalid(&format!("bad IPv6 gateway {:?}", network.ipv6_gateway));
+        }
     }
     if let Some(dns) = network
         .dns
@@ -198,5 +231,57 @@ pub fn factory(vmm_type: VmmType) -> Box<dyn Hypervisor> {
             Path::new(super::FIRECRACKER_BIN).to_path_buf(),
             Path::new(super::JAILER_BIN).to_path_buf(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn network(ipv4: (&str, &str), ipv6: (&str, &str)) -> GuestNetworkConfig {
+        GuestNetworkConfig {
+            interface: "eth0".to_string(),
+            ipv4_cidr: ipv4.0.to_string(),
+            gateway: ipv4.1.to_string(),
+            dns: vec!["fdfd:7b5:61d9::53".to_string()],
+            ipv6_cidr: ipv6.0.to_string(),
+            ipv6_gateway: ipv6.1.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_guest_network_has_one_family_at_least() {
+        let ipv4 = ("10.200.0.2/16", "10.200.0.1");
+        let ipv6 = ("fd00:fe05:ffff::2/128", "fe80::1");
+        for ok in [
+            network(ipv4, ("", "")),
+            network(("", ""), ipv6),
+            network(ipv4, ipv6),
+        ] {
+            assert!(validate_guest_network(&ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            network(("", ""), ("", "")),
+            network(("10.200.0.2/33", "10.200.0.1"), ("", "")),
+            network(("10.200.0.2/16", ""), ipv6),
+            network(("", "10.200.0.1"), ipv6),
+            network(ipv4, ("fd00::2/129", "fe80::1")),
+            network(ipv4, ("fd00::2/0", "fe80::1")),
+            network(ipv4, ("fd00::2", "fe80::1")),
+            network(ipv4, ("10.200.0.2/16", "fe80::1")),
+            network(ipv4, ("fe80::2/64", "fe80::1")),
+            network(ipv4, ("::1/128", "fe80::1")),
+            network(ipv4, ("ff02::1/128", "fe80::1")),
+            network(("", ""), ("fd00::2/128", "")),
+            network(("", ""), ("fd00::2/128", "10.200.0.1")),
+            network(("", ""), ("fd00::2/128", "ff02::2")),
+            network(("", ""), ("", "fe80::1")),
+        ] {
+            assert!(validate_guest_network(&bad).is_err(), "{bad:?}");
+        }
+        let mut bad_resolver = network(("", ""), ipv6);
+        bad_resolver.dns.push("fdfd::53%eth0".to_string());
+        assert!(validate_guest_network(&bad_resolver).is_err());
     }
 }

@@ -1,14 +1,16 @@
 #!/bin/bash
-# Boot the FeOS guest with a network and a data volume, push the network
-# configuration, pull an image in the guest, and run a container: exec,
-# resolvers, toolbox, exit codes. Then reboot and adopt the container, and
-# check that its writable layer survived.
+# Boot the FeOS guest with a network and a data volume, push an IPv4
+# network configuration, pull an image in the guest, and run a container:
+# exec, resolvers, toolbox, exit codes. Then push IPv6 only, as feosd does,
+# and another IPv6 address, as after a resume on another node. Then reboot
+# with IPv6 only and adopt the container, and check that its writable layer
+# survived.
 #
 #   hack/guest/test-container [image]
 #
-# Needs sudo for the host network (a bridge, a TAP device and NAT, all
-# removed on exit), /dev/kvm, Firecracker (make firecracker), the guest
-# (make guest) and internet access for the pull.
+# Needs sudo for the host network (a TAP device with its addresses, routes
+# and NAT, all removed on exit), /dev/kvm, Firecracker (make firecracker),
+# the guest (make guest) and internet access for the pull.
 set -euo pipefail
 export PATH="$PATH:/sbin:/usr/sbin"
 
@@ -24,12 +26,18 @@ FEOSCTL="${REPO_ROOT}/target/debug/feosctl"
 IMAGE="${1:-docker.io/library/busybox:1.36}"
 TIMEOUT=60
 
-BRIDGE=feos-br0
 TAP=feos-tap0
 HOST_IP=192.168.102.1
 GUEST_IP=192.168.102.10
 SUBNET=192.168.102.0/24
 DNS=1.1.1.1
+# The TAP is a link of its own, as feosd sets a pod's up (ADR 0010): this
+# machine is fe80::1 on it, and the guest's addresses have /128 routes to
+# it. HOST_IP6 is the source the guest answers through its default route.
+HOST_IP6=fd00:fe05:ffff::1
+GUEST_IP6=fd00:fe05:ffff::2
+GUEST_IP6_MOVED=fd00:fe05:ffff::3
+DNS6=fdfd:07b5:61d9::53
 
 log() { printf '[test-container] %s\n' "$*"; }
 fail() { log "FAIL: $*"; tail -40 "${SERIAL_LOG:-/dev/null}" >&2 || true; exit 1; }
@@ -49,10 +57,9 @@ egress_if() { ip route show default | awk '/default/ {print $5; exit}'; }
 EGRESS="$(egress_if)"
 cleanup_net() {
   sudo iptables -t nat -D POSTROUTING -s "${SUBNET}" -o "${EGRESS}" -j MASQUERADE 2>/dev/null || true
-  sudo iptables -D FORWARD -i "${BRIDGE}" -o "${EGRESS}" -j ACCEPT 2>/dev/null || true
-  sudo iptables -D FORWARD -i "${EGRESS}" -o "${BRIDGE}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  sudo iptables -D FORWARD -i "${TAP}" -o "${EGRESS}" -j ACCEPT 2>/dev/null || true
+  sudo iptables -D FORWARD -i "${EGRESS}" -o "${TAP}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   sudo ip link del "${TAP}" 2>/dev/null || true
-  sudo ip link del "${BRIDGE}" 2>/dev/null || true
 }
 FC_PID=""
 stop_vm() {
@@ -66,19 +73,20 @@ SUDO=""
 trap 'stop_vm; cleanup_net' EXIT
 
 cleanup_net
-log "host network: ${BRIDGE} + ${TAP}, NAT via ${EGRESS}"
-sudo ip link add name "${BRIDGE}" type bridge
-sudo ip addr add "${HOST_IP}/24" dev "${BRIDGE}"
-sudo ip link set "${BRIDGE}" up
+log "host network: ${TAP}, NAT via ${EGRESS}"
 sudo ip tuntap add dev "${TAP}" mode tap
-sudo ip link set "${TAP}" master "${BRIDGE}"
+sudo ip addr add "${HOST_IP}/24" dev "${TAP}"
+sudo ip -6 addr add fe80::1/64 dev "${TAP}" nodad
+sudo ip -6 addr add "${HOST_IP6}/128" dev "${TAP}" nodad
 sudo ip link set "${TAP}" up
+sudo ip -6 route add "${GUEST_IP6}/128" dev "${TAP}"
+sudo ip -6 route add "${GUEST_IP6_MOVED}/128" dev "${TAP}"
 sudo sysctl -qw net.ipv4.ip_forward=1
 sudo iptables -t nat -A POSTROUTING -s "${SUBNET}" -o "${EGRESS}" -j MASQUERADE
 # Docker sets the FORWARD policy to DROP where it runs, as on GitHub's
 # runners.
-sudo iptables -I FORWARD -i "${BRIDGE}" -o "${EGRESS}" -j ACCEPT
-sudo iptables -I FORWARD -i "${EGRESS}" -o "${BRIDGE}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -I FORWARD -i "${TAP}" -o "${EGRESS}" -j ACCEPT
+sudo iptables -I FORWARD -i "${EGRESS}" -o "${TAP}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
 cat > "${RUN_DIR}/config.json" <<JSON
 {
@@ -106,15 +114,32 @@ boot() {
     sleep 0.2
   done
   [ -z "${SUDO}" ] || ${SUDO} chmod 0666 "${VSOCK}"
-  ctl host set-network --interface eth0 --ipv4 "${GUEST_IP}/24" --gateway "${HOST_IP}" \
-    --dns "${DNS}" --hostname feos-test >/dev/null
-  log "booted ($1), network pushed"
+  if [ "$2" = ipv4 ]; then
+    ctl host set-network --interface eth0 --ipv4 "${GUEST_IP}/24" --gateway "${HOST_IP}" \
+      --dns "${DNS}" --hostname feos-test >/dev/null
+  else
+    push_ipv6 "${GUEST_IP6}"
+  fi
+  log "booted ($1), $2 network pushed"
 }
 
 ctl() { "${FEOSCTL}" "$1" --address "vsock:${VSOCK}" "${@:2}"; }
 cexec() { ctl container exec main -- "$@"; }
+push_ipv6() {
+  ctl host set-network --interface eth0 --ipv6 "$1/128" --ipv6-gateway fe80::1 \
+    --dns "${DNS6}" --hostname feos-test >/dev/null
+}
+# Whether the guest answers on an address, from HOST_IP6 or HOST_IP.
+answers() {
+  local _
+  for _ in 1 2 3; do
+    ping -c1 -W1 "$1" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
 
-boot first
+# IPv4 first: the pull goes through this machine's NAT.
+boot first ipv4
 log "creating container main from ${IMAGE}"
 ctl container create --image-ref "${IMAGE}" --id main --cmd "sleep 3600"
 ctl container start main
@@ -202,15 +227,52 @@ ctl ssh set-agent >/dev/null
 cexec test -S /run/feos/ssh-agent.sock && fail "ssh agent socket not removed"
 log "the ssh agent socket comes and goes in the container"
 
+# IPv6 only, as feosd pushes it: the IPv4 address and routes go, and the
+# guest answers on its address through its default route via fe80::1, and
+# so does the web server in its container.
+answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP}"
+push_ipv6 "${GUEST_IP6}"
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6}"
+ping -c1 -W1 "${GUEST_IP}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP}"
+out="$(cexec ip addr show dev eth0)"
+grep -q "inet6 ${GUEST_IP6}/128 scope global" <<<"${out}" || fail "eth0: ${out}"
+grep -q "inet " <<<"${out}" && fail "an IPv4 address left on eth0: ${out}"
+grep -q "default via fe80::1 dev eth0" <<<"$(cexec ip -6 route show)" || fail "no IPv6 default route"
+out="$(cexec ip -4 route show)"
+[ -z "${out}" ] || fail "IPv4 routes left: ${out}"
+out="$(curl -s -g "http://[${GUEST_IP6}]:8080/index.html")"
+[ "${out}" = "forwarded" ] || fail "web server over IPv6: ${out}"
+out="$(cexec cat /etc/resolv.conf)"
+grep -qx "nameserver ${DNS6}" <<<"${out}" || fail "IPv6 resolver: ${out}"
+grep -q "${DNS}" <<<"${out}" && fail "IPv4 resolver left: ${out}"
+out="$(ctl host get-network)"
+grep -qx "IPv6: *${GUEST_IP6}/128" <<<"${out}" && grep -qx "IPv6 gateway: *fe80::1" <<<"${out}" \
+  && grep -qx "IPv4: *" <<<"${out}" || fail "get-network: ${out}"
+push_ipv6 "${GUEST_IP6}" || fail "the same push again"
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} after the same push again"
+log "IPv6 only: the guest answers on ${GUEST_IP6}, its IPv4 address is gone"
+
+# After a resume on another node, the guest is pushed another address: the
+# old one goes.
+push_ipv6 "${GUEST_IP6_MOVED}"
+answers "${GUEST_IP6_MOVED}" || fail "no answer on ${GUEST_IP6_MOVED}"
+ping -c1 -W1 "${GUEST_IP6}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP6}"
+grep -q "${GUEST_IP6}/" <<<"$(cexec ip addr show dev eth0)" && fail "${GUEST_IP6} left on eth0"
+log "another IPv6 address replaces the old one"
+
 # A host freezes the data volume before it stops a guest it wants to adopt
 # later; freezing writes back what is in the guest's page cache.
 ctl host freeze >/dev/null
 stop_vm
-boot second
+boot second ipv6
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} after the reboot"
 ctl container create --id main --adopt >/dev/null || fail "adopt"
 ctl container start main
 [ "$(cexec cat /persist)" = "kept" ] || fail "writable layer lost across the reboot"
 log "adopted the container after a reboot; its writable layer survived"
+out="$(cexec cat /proc/sys/net/ipv6/conf/eth0/accept_ra /proc/sys/net/ipv6/conf/eth0/autoconf)"
+[ "${out}" = "$(printf '0\n0')" ] || fail "router advertisements or autoconfiguration on: ${out}"
+log "a guest with IPv6 only from boot takes no router advertisements"
 
 ctl container delete main
 grep -q main <<<"$(ctl container list)" && fail "container still listed after delete"

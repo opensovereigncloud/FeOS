@@ -74,8 +74,7 @@ for util in ls cat head tail sort uniq wc du df mkdir touch rm cp mv chmod \
 done
 
 printf 'feos\n' > "${ROOTFS_DIR}/etc/hostname"
-# IPv4 only: the guest kernel has no IPv6.
-printf '127.0.0.1\tlocalhost\n127.0.1.1\tfeos\n' > "${ROOTFS_DIR}/etc/hosts"
+printf '127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tfeos\n' > "${ROOTFS_DIR}/etc/hosts"
 # The host pushes the resolvers.
 : > "${ROOTFS_DIR}/etc/resolv.conf"
 

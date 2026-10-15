@@ -3,7 +3,8 @@
 mod kernel_stats;
 
 use anyhow::Result;
-use clap::{Args, Subcommand};
+use clap::builder::ArgPredicate;
+use clap::{ArgGroup, Args, Subcommand};
 use feos_proto::host_service::{
     host_service_client::HostServiceClient, FreezeFilesystemRequest, GetCpuInfoRequest,
     GetMemoryBreakdownRequest, GetNetworkConfigRequest, GetNetworkInfoRequest, GetTimeRequest,
@@ -76,18 +77,31 @@ pub enum HostCommand {
     },
     /// Read the host's clock
     GetTime,
-    /// Push a static IPv4 network configuration
+    /// Push a static network configuration: an IPv6 address, an IPv4
+    /// address or both
+    #[command(group(
+        ArgGroup::new("addresses").required(true).multiple(true).args(["ipv4", "ipv6"])
+    ))]
     SetNetwork {
         #[arg(long, default_value = "eth0")]
         interface: String,
         #[arg(
             long,
-            required = true,
-            help = "Address with prefix, e.g. 192.168.100.10/24"
+            requires = "gateway",
+            help = "IPv4 address with prefix, e.g. 192.168.100.10/24"
         )]
-        ipv4: String,
-        #[arg(long, required = true)]
-        gateway: String,
+        ipv4: Option<String>,
+        #[arg(long, requires = "ipv4", help = "IPv4 default gateway")]
+        gateway: Option<String>,
+        #[arg(long, help = "IPv6 address with prefix, e.g. fd00:fe05::2/128")]
+        ipv6: Option<String>,
+        #[arg(
+            long,
+            requires = "ipv6",
+            default_value_if("ipv6", ArgPredicate::IsPresent, "fe80::1"),
+            help = "IPv6 default gateway on the interface's link; fe80::1 if not given"
+        )]
+        ipv6_gateway: Option<String>,
         #[arg(long = "dns", help = "Resolver; repeat for more than one")]
         dns: Vec<String>,
         #[arg(long, default_value = "")]
@@ -145,16 +159,19 @@ pub async fn handle_host_command(args: HostArgs) -> Result<()> {
             interface,
             ipv4,
             gateway,
+            ipv6,
+            ipv6_gateway,
             dns,
             hostname,
         } => {
             let request = SetNetworkConfigRequest {
                 interface,
-                ipv4_cidr: ipv4,
-                gateway,
+                ipv4_cidr: ipv4.unwrap_or_default(),
+                gateway: gateway.unwrap_or_default(),
                 dns,
                 hostname,
-                ..Default::default()
+                ipv6_cidr: ipv6.unwrap_or_default(),
+                ipv6_gateway: ipv6_gateway.unwrap_or_default(),
             };
             set_network(&mut client, request).await?
         }
@@ -509,11 +526,13 @@ async fn get_network(client: &mut HostServiceClient<Channel>) -> Result<()> {
         println!("No network configuration pushed since boot.");
         return Ok(());
     }
-    println!("Interface: {}", response.interface);
-    println!("Address:   {}", response.ipv4_cidr);
-    println!("Gateway:   {}", response.gateway);
-    println!("DNS:       {}", response.dns.join(", "));
-    println!("Hostname:  {}", response.hostname);
+    println!("Interface:    {}", response.interface);
+    println!("IPv6:         {}", response.ipv6_cidr);
+    println!("IPv6 gateway: {}", response.ipv6_gateway);
+    println!("IPv4:         {}", response.ipv4_cidr);
+    println!("IPv4 gateway: {}", response.gateway);
+    println!("DNS:          {}", response.dns.join(", "));
+    println!("Hostname:     {}", response.hostname);
     Ok(())
 }
 
@@ -541,5 +560,63 @@ fn print_memory_breakdown(m: &MemoryBreakdown) {
             process.name,
             mib(process.rss_kb)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// With the host's own arguments: clap checks that no name is taken twice.
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        host: HostArgs,
+    }
+
+    fn addresses(args: &[&str]) -> Option<[Option<String>; 4]> {
+        let cli = Cli::try_parse_from([["host", "set-network"].as_slice(), args].concat()).ok()?;
+        let HostCommand::SetNetwork {
+            ipv4,
+            gateway,
+            ipv6,
+            ipv6_gateway,
+            ..
+        } = cli.host.command
+        else {
+            panic!("not a set-network");
+        };
+        Some([ipv4, gateway, ipv6, ipv6_gateway])
+    }
+
+    #[test]
+    fn set_network_takes_either_family_or_both() {
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            addresses(&["--ipv6", "fd00::2/128"]),
+            Some([None, None, some("fd00::2/128"), some("fe80::1")])
+        );
+        assert_eq!(
+            addresses(&["--ipv6", "fd00::2/128", "--ipv6-gateway", "fd00::1"]),
+            Some([None, None, some("fd00::2/128"), some("fd00::1")])
+        );
+        assert_eq!(
+            addresses(&["--ipv4", "10.0.0.2/24", "--gateway", "10.0.0.1"]),
+            Some([some("10.0.0.2/24"), some("10.0.0.1"), None, None])
+        );
+        assert!(addresses(&[
+            "--ipv4",
+            "10.0.0.2/24",
+            "--gateway",
+            "10.0.0.1",
+            "--ipv6",
+            "fd00::2/128"
+        ])
+        .is_some());
+        assert_eq!(addresses(&[]), None);
+        assert_eq!(addresses(&["--ipv4", "10.0.0.2/24"]), None);
+        assert_eq!(addresses(&["--gateway", "10.0.0.1"]), None);
+        assert_eq!(addresses(&["--ipv6-gateway", "fe80::1"]), None);
     }
 }

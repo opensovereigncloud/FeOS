@@ -41,7 +41,7 @@ directly from a kernel and an initramfs, without a root disk:
 
 The guest kernel (`hack/guest/kernel`) starts from Firecracker's minimal
 microVM config with FeOS's changes on top: virtio-mmio devices, balloon and
-vsock, IPv4 only, no modules, no RTC sync. `make guest-kernel-config`
+vsock, IPv6 and IPv4, no modules, no RTC sync. `make guest-kernel-config`
 regenerates it. The initramfs (`hack/guest/rootfs/mk-rootfs`) holds
 feos-guest as `/init` and a static uutils coreutils that containers
 get as a toolbox. Kernel, Firecracker and coreutils downloads are pinned by

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Generate the guest kernel config: Firecracker's minimal microVM guest
-# config as the base, plus FeOS's changes (balloon, vsock, IPv4 only,
+# config as the base, plus FeOS's changes (balloon, vsock, IPv6,
 # containers, Ctrl-Alt-Del, no modules).
 #
 # Usage: hack/guest/kernel/mk-config <path-to-kernel-tree>
@@ -38,8 +38,16 @@ apply --enable  EXT4_FS
 apply --enable  BLK_DEV_INITRD
 apply --enable  RD_ZSTD                   # initramfs is zstd-compressed
 
-# IPv4 only
-apply --disable IPV6
+# IPv6 and IPv4. The pod's link is point to point and the host pushes its
+# address and route: no router advertisements' extras, no optimistic DAD, no
+# policy routing, multicast routing, segment routing or tunnels.
+apply --enable  IPV6
+apply --disable IPV6_ROUTER_PREF --disable IPV6_ROUTE_INFO \
+      --disable IPV6_OPTIMISTIC_DAD
+apply --disable IPV6_MULTIPLE_TABLES --disable IPV6_SUBTREES \
+      --disable IPV6_MROUTE --disable IPV6_SEG6_LWTUNNEL \
+      --disable IPV6_SEG6_HMAC
+apply --disable IPV6_SIT --disable IPV6_TUNNEL --disable IPV6_VTI
 apply --disable RTC_HCTOSYS               # the host pushes the time
 
 # containers
