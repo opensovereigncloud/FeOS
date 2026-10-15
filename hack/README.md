@@ -55,11 +55,12 @@ the lifecycle uplink with `feosctl --address vsock:target/guest/run/v.sock`.
 It needs /dev/kvm and runs Firecracker with sudo when /dev/kvm is not
 writable.
 
-`make test-guest-container` also gives the guest a network: a bridge, a TAP
-device and NAT on this machine (with sudo, removed when the test ends). It
-pulls a busybox image in the guest and runs a container: exec, the tools,
-watches, port forwarding, kube and SSH offloading, and the adoption of the
-container after a reboot.
+`make test-guest-container` also gives the guest a pod's network: a TAP
+device in a network namespace that stands for the node, and NAT on this
+machine (with sudo, removed when the test ends). It pulls a busybox image
+in the guest and runs a container: exec, the tools, watches, port
+forwarding, kube and SSH offloading, the network pushes of both families,
+and the adoption of the container after a reboot.
 
 ## Packages
 

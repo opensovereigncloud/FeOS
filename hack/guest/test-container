@@ -1,16 +1,22 @@
 #!/bin/bash
-# Boot the FeOS guest with a network and a data volume, push an IPv4
-# network configuration, pull an image in the guest, and run a container:
-# exec, resolvers, toolbox, exit codes. Then push IPv6 only, as feosd does,
-# and another IPv6 address, as after a resume on another node. Then reboot
-# with IPv6 only and adopt the container, and check that its writable layer
-# survived.
+# Boot the FeOS guest with a network and a data volume, push it a pod's
+# network as feosd does, pull an image in the guest, and run a container:
+# exec, resolvers, toolbox, exit codes. Then check the network: both
+# families, the same push again, other addresses as after a resume on
+# another node, and each family alone. Then reboot and adopt the container,
+# and check that its writable layer survived.
 #
 #   hack/guest/test-container [image]
 #
-# Needs sudo for the host network (a TAP device with its addresses, routes
-# and NAT, all removed on exit), /dev/kvm, Firecracker (make firecracker),
-# the guest (make guest) and internet access for the pull.
+# The guest's TAP is in a network namespace that stands for the node: the
+# node's addresses on the link, 169.254.0.1 and fe80::1, may be those of
+# this machine's own gateway, as in clouds. The namespace routes the
+# guest's addresses to the TAP, passes DNS for 169.254.0.53 on to a public
+# resolver, and NATs to this machine over a veth pair; this machine NATs
+# again. Needs sudo for the namespace and for this machine's NAT (the veth
+# pair and iptables rules, all removed on exit), /dev/kvm, Firecracker
+# (make firecracker), the guest (make guest) and internet access for the
+# pull.
 set -euo pipefail
 export PATH="$PATH:/sbin:/usr/sbin"
 
@@ -26,18 +32,26 @@ FEOSCTL="${REPO_ROOT}/target/debug/feosctl"
 IMAGE="${1:-docker.io/library/busybox:1.36}"
 TIMEOUT=60
 
+NS=feos-guest-test
+# This machine's end of the veth pair; the namespace's is "uplink".
+UPLINK=feos-gt0
+UPLINK_NET=192.168.102.0/30
+UPLINK_IP=192.168.102.1
+NS_UPLINK_IP=192.168.102.2
+UPSTREAM_DNS=1.1.1.1
+# The TAP is a link of its own, as feosd sets a pod's up (ADR 0010): the
+# node is 169.254.0.1 and fe80::1 on it, and the guest's addresses have a
+# /32 and a /128 route to it. NODE_IP6 is the source the guest answers
+# through its default route.
 TAP=feos-tap0
-HOST_IP=192.168.102.1
-GUEST_IP=192.168.102.10
-SUBNET=192.168.102.0/24
-DNS=1.1.1.1
-# The TAP is a link of its own, as feosd sets a pod's up (ADR 0010): this
-# machine is fe80::1 on it, and the guest's addresses have /128 routes to
-# it. HOST_IP6 is the source the guest answers through its default route.
-HOST_IP6=fd00:fe05:ffff::1
+NODE_IP=169.254.0.1
+NODE_IP6=fd00:fe05:ffff::1
+POD_RANGE=169.254.16.0/20
+GUEST_IP=169.254.16.2
+GUEST_IP_MOVED=169.254.16.3
 GUEST_IP6=fd00:fe05:ffff::2
 GUEST_IP6_MOVED=fd00:fe05:ffff::3
-DNS6=fdfd:07b5:61d9::53
+DNS=169.254.0.53
 
 log() { printf '[test-container] %s\n' "$*"; }
 fail() { log "FAIL: $*"; tail -40 "${SERIAL_LOG:-/dev/null}" >&2 || true; exit 1; }
@@ -55,38 +69,62 @@ mkfs.ext4 -q -F "${DATA_IMG}"
 
 egress_if() { ip route show default | awk '/default/ {print $5; exit}'; }
 EGRESS="$(egress_if)"
+# Runs a command in the node's namespace.
+node() { sudo ip netns exec "${NS}" "$@"; }
 cleanup_net() {
-  sudo iptables -t nat -D POSTROUTING -s "${SUBNET}" -o "${EGRESS}" -j MASQUERADE 2>/dev/null || true
-  sudo iptables -D FORWARD -i "${TAP}" -o "${EGRESS}" -j ACCEPT 2>/dev/null || true
-  sudo iptables -D FORWARD -i "${EGRESS}" -o "${TAP}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  sudo ip link del "${TAP}" 2>/dev/null || true
+  sudo iptables -t nat -D POSTROUTING -s "${UPLINK_NET}" -o "${EGRESS}" -j MASQUERADE 2>/dev/null || true
+  sudo iptables -D FORWARD -i "${UPLINK}" -o "${EGRESS}" -j ACCEPT 2>/dev/null || true
+  sudo iptables -D FORWARD -i "${EGRESS}" -o "${UPLINK}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  # The TAP and the veth pair go with the namespace.
+  sudo ip netns del "${NS}" 2>/dev/null || true
+  sudo ip link del "${UPLINK}" 2>/dev/null || true
 }
 FC_PID=""
 stop_vm() {
   [ -n "${FC_PID}" ] || return 0
-  ${SUDO} kill "${FC_PID}" 2>/dev/null || true
+  sudo kill "${FC_PID}" 2>/dev/null || true
   wait "${FC_PID}" 2>/dev/null || true
   FC_PID=""
 }
-SUDO=""
-[ -w /dev/kvm ] || SUDO="sudo"
 trap 'stop_vm; cleanup_net' EXIT
 
 cleanup_net
-log "host network: ${TAP}, NAT via ${EGRESS}"
-sudo ip tuntap add dev "${TAP}" mode tap
-sudo ip addr add "${HOST_IP}/24" dev "${TAP}"
-sudo ip -6 addr add fe80::1/64 dev "${TAP}" nodad
-sudo ip -6 addr add "${HOST_IP6}/128" dev "${TAP}" nodad
-sudo ip link set "${TAP}" up
-sudo ip -6 route add "${GUEST_IP6}/128" dev "${TAP}"
-sudo ip -6 route add "${GUEST_IP6_MOVED}/128" dev "${TAP}"
+log "node namespace ${NS}: ${TAP}, NAT via ${UPLINK} and ${EGRESS}"
+sudo ip netns add "${NS}"
+sudo ip link add "${UPLINK}" type veth peer name uplink netns "${NS}"
+sudo ip addr add "${UPLINK_IP}/30" dev "${UPLINK}"
+sudo ip link set "${UPLINK}" up
 sudo sysctl -qw net.ipv4.ip_forward=1
-sudo iptables -t nat -A POSTROUTING -s "${SUBNET}" -o "${EGRESS}" -j MASQUERADE
+sudo iptables -t nat -A POSTROUTING -s "${UPLINK_NET}" -o "${EGRESS}" -j MASQUERADE
 # Docker sets the FORWARD policy to DROP where it runs, as on GitHub's
 # runners.
-sudo iptables -I FORWARD -i "${TAP}" -o "${EGRESS}" -j ACCEPT
-sudo iptables -I FORWARD -i "${EGRESS}" -o "${TAP}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -I FORWARD -i "${UPLINK}" -o "${EGRESS}" -j ACCEPT
+sudo iptables -I FORWARD -i "${EGRESS}" -o "${UPLINK}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+node ip link set lo up
+node ip addr add "${NS_UPLINK_IP}/30" dev uplink
+node ip link set uplink up
+node ip route add default via "${UPLINK_IP}"
+node sysctl -qw net.ipv4.ip_forward=1
+# As feosd sets a pod's TAP up: the node answers ARP on it only for its
+# address there, and asks from that address.
+node ip tuntap add dev "${TAP}" mode tap
+node sysctl -qw "net.ipv4.conf.${TAP}.arp_ignore=1" "net.ipv4.conf.${TAP}.arp_announce=2"
+node ip addr add "${NODE_IP}/32" dev "${TAP}"
+node ip -6 addr add fe80::1/64 dev "${TAP}" nodad
+node ip -6 addr add "${NODE_IP6}/128" dev "${TAP}" nodad
+node ip link set "${TAP}" up
+for ip in "${GUEST_IP}" "${GUEST_IP_MOVED}"; do
+  node ip route add "${ip}/32" dev "${TAP}"
+done
+for ip in "${GUEST_IP6}" "${GUEST_IP6_MOVED}"; do
+  node ip -6 route add "${ip}/128" dev "${TAP}"
+done
+for proto in udp tcp; do
+  node iptables -t nat -A PREROUTING -i "${TAP}" -d "${DNS}" -p "${proto}" --dport 53 \
+    -j DNAT --to-destination "${UPSTREAM_DNS}"
+done
+node iptables -t nat -A POSTROUTING -s "${POD_RANGE}" -o uplink -j MASQUERADE
 
 cat > "${RUN_DIR}/config.json" <<JSON
 {
@@ -105,7 +143,9 @@ JSON
 boot() {
   SERIAL_LOG="${RUN_DIR}/serial-$1.log"
   rm -f "${VSOCK}" "${SERIAL_LOG}"
-  ${SUDO} "${FC}" --no-api --config-file "${RUN_DIR}/config.json" >"${SERIAL_LOG}" 2>&1 &
+  # Not through node(): FC_PID has to be sudo's, which passes the kill on.
+  sudo ip netns exec "${NS}" "${FC}" --no-api --config-file "${RUN_DIR}/config.json" \
+    >"${SERIAL_LOG}" 2>&1 &
   FC_PID=$!
   local end=$((SECONDS + TIMEOUT))
   until grep -q "listening on vsock port" "${SERIAL_LOG}" 2>/dev/null; do
@@ -113,33 +153,52 @@ boot() {
     kill -0 "${FC_PID}" 2>/dev/null || fail "Firecracker exited"
     sleep 0.2
   done
-  [ -z "${SUDO}" ] || ${SUDO} chmod 0666 "${VSOCK}"
-  if [ "$2" = ipv4 ]; then
-    ctl host set-network --interface eth0 --ipv4 "${GUEST_IP}/24" --gateway "${HOST_IP}" \
-      --dns "${DNS}" --hostname feos-test >/dev/null
-  else
-    push_ipv6 "${GUEST_IP6}"
-  fi
-  log "booted ($1), $2 network pushed"
+  sudo chmod 0666 "${VSOCK}"
+  push "${GUEST_IP}" "${GUEST_IP6}"
+  log "booted ($1), network pushed"
 }
 
 ctl() { "${FEOSCTL}" "$1" --address "vsock:${VSOCK}" "${@:2}"; }
 cexec() { ctl container exec main -- "$@"; }
-push_ipv6() {
-  ctl host set-network --interface eth0 --ipv6 "$1/128" --ipv6-gateway fe80::1 \
-    --dns "${DNS6}" --hostname feos-test >/dev/null
+# Pushes a pod's network as feosd does: an IPv4 /32 ($1) and an IPv6 /128
+# ($2), each via the node's address on the link, and the node's resolver.
+# An empty address leaves its family out.
+push() {
+  local args=()
+  [ -z "$1" ] || args+=(--ipv4 "$1/32" --gateway "${NODE_IP}")
+  [ -z "$2" ] || args+=(--ipv6 "$2/128" --ipv6-gateway fe80::1)
+  ctl host set-network --interface eth0 "${args[@]}" --dns "${DNS}" --hostname feos-test >/dev/null
 }
-# Whether the guest answers on an address, from HOST_IP6 or HOST_IP.
+# Whether the guest answers on an address, from the node's.
 answers() {
   local _
   for _ in 1 2 3; do
-    ping -c1 -W1 "$1" >/dev/null 2>&1 && return 0
+    node ping -c1 -W1 "$1" >/dev/null 2>&1 && return 0
   done
   return 1
 }
+# The guest's global addresses on eth0 and its routes of both families but
+# the kernel's for multicast, sorted, without metrics and protocols.
+guest_network() {
+  cexec sh -c 'ip addr show dev eth0; ip -4 route show; ip -6 route show' |
+    sed -E 's/ (metric|proto|pref) [^ ]+//g; s/ +/ /g; s/^ //; s/ $//' |
+    awk '/^inet6? .* scope global/ {print $1, $2; next} / dev eth0/ && !/^multicast /' | sort
+}
+# Checks the guest's addresses and routes after a push of $1 and $2: the
+# addresses, the default routes via the node, and a route to the node's IPv4
+# address on the link, outside the /32; the rest the kernel's.
+expect_network() {
+  local want=("fe80::/64 dev eth0") got
+  [ -z "$1" ] || want+=("inet $1/32" "${NODE_IP} dev eth0 scope link" "default via ${NODE_IP} dev eth0")
+  [ -z "$2" ] || want+=("inet6 $2/128" "$2 dev eth0" "default via fe80::1 dev eth0")
+  got="$(guest_network)"
+  [ "${got}" = "$(printf '%s\n' "${want[@]}" | sort)" ] \
+    || fail "the network after a push of '$1' and '$2': ${got}"
+}
 
-# IPv4 first: the pull goes through this machine's NAT.
-boot first ipv4
+# The pull goes out over IPv4, through the namespace's NAT and this
+# machine's, and resolves through the node's resolver.
+boot first
 log "creating container main from ${IMAGE}"
 ctl container create --image-ref "${IMAGE}" --id main --cmd "sleep 3600"
 ctl container start main
@@ -227,44 +286,61 @@ ctl ssh set-agent >/dev/null
 cexec test -S /run/feos/ssh-agent.sock && fail "ssh agent socket not removed"
 log "the ssh agent socket comes and goes in the container"
 
-# IPv6 only, as feosd pushes it: the IPv4 address and routes go, and the
-# guest answers on its address through its default route via fe80::1, and
-# so does the web server in its container.
+# A pod's network, as feosd pushes it: the guest answers the node on its
+# IPv4 /32 and its IPv6 /128, through routes via the node's addresses on
+# the link, and so does the web server in its container; its container
+# resolves through the node's resolver.
 answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP}"
-push_ipv6 "${GUEST_IP6}"
 answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6}"
-ping -c1 -W1 "${GUEST_IP}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP}"
-out="$(cexec ip addr show dev eth0)"
-grep -q "inet6 ${GUEST_IP6}/128 scope global" <<<"${out}" || fail "eth0: ${out}"
-grep -q "inet " <<<"${out}" && fail "an IPv4 address left on eth0: ${out}"
-grep -q "default via fe80::1 dev eth0" <<<"$(cexec ip -6 route show)" || fail "no IPv6 default route"
-out="$(cexec ip -4 route show)"
-[ -z "${out}" ] || fail "IPv4 routes left: ${out}"
-out="$(curl -s -g "http://[${GUEST_IP6}]:8080/index.html")"
+expect_network "${GUEST_IP}" "${GUEST_IP6}"
+out="$(node curl -s "http://${GUEST_IP}:8080/index.html")"
+[ "${out}" = "forwarded" ] || fail "web server over IPv4: ${out}"
+out="$(node curl -s -g "http://[${GUEST_IP6}]:8080/index.html")"
 [ "${out}" = "forwarded" ] || fail "web server over IPv6: ${out}"
-out="$(cexec cat /etc/resolv.conf)"
-grep -qx "nameserver ${DNS6}" <<<"${out}" || fail "IPv6 resolver: ${out}"
-grep -q "${DNS}" <<<"${out}" && fail "IPv4 resolver left: ${out}"
+out="$(cexec cat /etc/resolv.conf | grep -v '^#' || true)"
+[ "${out}" = "nameserver ${DNS}" ] || fail "resolvers: ${out}"
+grep -q "Server:.*${DNS}" <<<"$(cexec nslookup example.com)" || fail "no name through ${DNS}"
 out="$(ctl host get-network)"
-grep -qx "IPv6: *${GUEST_IP6}/128" <<<"${out}" && grep -qx "IPv6 gateway: *fe80::1" <<<"${out}" \
-  && grep -qx "IPv4: *" <<<"${out}" || fail "get-network: ${out}"
-push_ipv6 "${GUEST_IP6}" || fail "the same push again"
-answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} after the same push again"
-log "IPv6 only: the guest answers on ${GUEST_IP6}, its IPv4 address is gone"
+grep -qx "IPv4: *${GUEST_IP}/32" <<<"${out}" && grep -qx "IPv4 gateway: *${NODE_IP}" <<<"${out}" \
+  && grep -qx "IPv6: *${GUEST_IP6}/128" <<<"${out}" && grep -qx "IPv6 gateway: *fe80::1" <<<"${out}" \
+  && grep -qx "DNS: *${DNS}" <<<"${out}" || fail "get-network: ${out}"
+log "the guest answers on ${GUEST_IP} and ${GUEST_IP6} and resolves through ${DNS}"
 
-# After a resume on another node, the guest is pushed another address: the
-# old one goes.
-push_ipv6 "${GUEST_IP6_MOVED}"
+before="$(guest_network)"
+push "${GUEST_IP}" "${GUEST_IP6}" || fail "the same push again"
+[ "$(guest_network)" = "${before}" ] || fail "the same push again changed the network: $(guest_network)"
+answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP} after the same push again"
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} after the same push again"
+log "the same push again changes nothing"
+
+# After a resume on another node, the guest is pushed other addresses: the
+# old ones go.
+push "${GUEST_IP_MOVED}" "${GUEST_IP6_MOVED}"
+expect_network "${GUEST_IP_MOVED}" "${GUEST_IP6_MOVED}"
+answers "${GUEST_IP_MOVED}" || fail "no answer on ${GUEST_IP_MOVED}"
 answers "${GUEST_IP6_MOVED}" || fail "no answer on ${GUEST_IP6_MOVED}"
-ping -c1 -W1 "${GUEST_IP6}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP6}"
-grep -q "${GUEST_IP6}/" <<<"$(cexec ip addr show dev eth0)" && fail "${GUEST_IP6} left on eth0"
-log "another IPv6 address replaces the old one"
+for ip in "${GUEST_IP}" "${GUEST_IP6}"; do
+  node ping -c1 -W1 "${ip}" >/dev/null 2>&1 && fail "still an answer on ${ip}"
+done
+log "other addresses replace the old ones"
+
+# A family the push leaves out goes, with its routes.
+push "" "${GUEST_IP6_MOVED}"
+expect_network "" "${GUEST_IP6_MOVED}"
+answers "${GUEST_IP6_MOVED}" || fail "no answer on ${GUEST_IP6_MOVED} with IPv6 alone"
+node ping -c1 -W1 "${GUEST_IP_MOVED}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP_MOVED}"
+push "${GUEST_IP_MOVED}" ""
+expect_network "${GUEST_IP_MOVED}" ""
+answers "${GUEST_IP_MOVED}" || fail "no answer on ${GUEST_IP_MOVED} with IPv4 alone"
+node ping -c1 -W1 "${GUEST_IP6_MOVED}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP6_MOVED}"
+log "a push of one family leaves the other unconfigured"
 
 # A host freezes the data volume before it stops a guest it wants to adopt
 # later; freezing writes back what is in the guest's page cache.
 ctl host freeze >/dev/null
 stop_vm
-boot second ipv6
+boot second
+answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP} after the reboot"
 answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} after the reboot"
 ctl container create --id main --adopt >/dev/null || fail "adopt"
 ctl container start main
@@ -272,7 +348,7 @@ ctl container start main
 log "adopted the container after a reboot; its writable layer survived"
 out="$(cexec cat /proc/sys/net/ipv6/conf/eth0/accept_ra /proc/sys/net/ipv6/conf/eth0/autoconf)"
 [ "${out}" = "$(printf '0\n0')" ] || fail "router advertisements or autoconfiguration on: ${out}"
-log "a guest with IPv6 only from boot takes no router advertisements"
+log "a guest pushed its network at boot takes no router advertisements"
 
 ctl container delete main
 grep -q main <<<"$(ctl container list)" && fail "container still listed after delete"

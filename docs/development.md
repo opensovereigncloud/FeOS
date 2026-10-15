@@ -111,7 +111,7 @@ use) and `protoc`.
     make guest                 # guest kernel and initramfs: target/guest/
     make test-guest            # boot the guest under Firecracker and talk to it
     make test-guest-container  # run containers in the guest; needs sudo for a
-                               # bridge, a TAP device and NAT
+                               # network namespace and NAT
     make test-pods             # pods against Firecracker, with the guest
                                # installed; needs docker
 

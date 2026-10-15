@@ -18,7 +18,7 @@ guest-rootfs: ## Build the guest initramfs: target/guest/initramfs.cpio.zst.
 test-guest: firecracker ## Boot the guest under Firecracker and talk to it over vsock.
 	hack/guest/test-vsock
 
-test-guest-container: firecracker ## Run containers in the guest; needs sudo for a bridge, a TAP device and NAT.
+test-guest-container: firecracker ## Run containers in the guest; needs sudo for a network namespace and NAT.
 	hack/guest/test-container
 
 test-pods: firecracker ## Run pods against Firecracker, with the guest installed; needs docker.

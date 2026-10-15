@@ -79,6 +79,9 @@ pub enum HostCommand {
     GetTime,
     /// Push a static network configuration: an IPv6 address, an IPv4
     /// address or both
+    ///
+    /// A family left out is not configured. A pod gets both, each with the
+    /// node's address on its link as gateway: fe80::1 and 169.254.0.1.
     #[command(group(
         ArgGroup::new("addresses").required(true).multiple(true).args(["ipv4", "ipv6"])
     ))]
@@ -87,11 +90,16 @@ pub enum HostCommand {
         interface: String,
         #[arg(
             long,
-            requires = "gateway",
-            help = "IPv4 address with prefix, e.g. 192.168.100.10/24"
+            help = "IPv4 address with prefix, e.g. 169.254.16.2/32 or 192.168.100.10/24"
         )]
         ipv4: Option<String>,
-        #[arg(long, requires = "ipv4", help = "IPv4 default gateway")]
+        #[arg(
+            long,
+            requires = "ipv4",
+            default_value_if("ipv4", ArgPredicate::IsPresent, "169.254.0.1"),
+            help = "IPv4 default gateway on the interface's link, also outside the \
+                    address's prefix; 169.254.0.1 if not given"
+        )]
         gateway: Option<String>,
         #[arg(long, help = "IPv6 address with prefix, e.g. fd00:fe05::2/128")]
         ipv6: Option<String>,
@@ -614,8 +622,17 @@ mod tests {
             "fd00::2/128"
         ])
         .is_some());
+        // A pod's: the gateways are the node's on the link.
+        assert_eq!(
+            addresses(&["--ipv4", "169.254.16.2/32", "--ipv6", "fd00::2/128"]),
+            Some([
+                some("169.254.16.2/32"),
+                some("169.254.0.1"),
+                some("fd00::2/128"),
+                some("fe80::1")
+            ])
+        );
         assert_eq!(addresses(&[]), None);
-        assert_eq!(addresses(&["--ipv4", "10.0.0.2/24"]), None);
         assert_eq!(addresses(&["--gateway", "10.0.0.1"]), None);
         assert_eq!(addresses(&["--ipv6-gateway", "fe80::1"]), None);
     }
