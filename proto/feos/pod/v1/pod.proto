@@ -64,16 +64,23 @@ message ContainerSpec {
   map<string, string> env = 4;
 }
 
-// Every pod has a network (ADR 0010): an address on the node's pod
-// bridge, isolated from the other pods, the node and private networks,
-// with NAT to the outside. feosd makes the TAP device and picks the
-// address.
+// Every pod has a network (ADR 0010): an IPv6 address of the node's pod
+// prefix on a TAP device of its own, IPv4 through NAT64, DNS through
+// feosd's resolver, and what it may reach decided by its security groups
+// (ADR 0012).
 message PodNetwork {
   // A TAP device and an address the caller chose: feosd makes both now.
   reserved 1 to 5;
   reserved "tap_name", "mac_address", "ipv4_cidr", "gateway", "dns";
   // No network at all: the pod can pull no image then.
   bool none = 6;
+  // The pod's security groups (feos.network.v1.SecurityGroupService), which
+  // feosd must have before the pod starts. Without any, feosd's default
+  // group applies: out to the internet, nothing in.
+  repeated string security_groups = 7;
+  // The resolvers feosd's resolver asks for the pod, as IP addresses; the
+  // node's (feosd --dns-upstream) when empty.
+  repeated string dns_upstreams = 8;
 }
 
 enum PodState {
@@ -101,8 +108,12 @@ message PodInfo {
   repeated ContainerStatus containers = 5;
   // The pod's microVM; unset unless it runs.
   MicroVm microvm = 6;
-  // The pod's address, for its life; empty without a network.
+  // With feosd --nat64=node, the IPv4 address that stands for the pod on
+  // the node, behind NAT64; the guest never sees it. Empty otherwise.
   string ipv4_address = 7;
+  // The pod's IPv6 address, of the node's pod prefix, while it is on the
+  // node; empty without a network.
+  string ipv6_address = 8;
 }
 
 message MicroVm {

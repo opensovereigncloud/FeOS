@@ -305,6 +305,11 @@ message SetNetworkConfigRequest {
   repeated string dns = 4;
   // Kernel hostname. Left alone when empty.
   string hostname = 5;
+  // IPv6 address with prefix length, e.g. "fd00:fe05::2/128". Either this
+  // or ipv4_cidr, or both; the one left empty is not configured.
+  string ipv6_cidr = 6;
+  // IPv6 default gateway on the interface's link, e.g. "fe80::1".
+  string ipv6_gateway = 7;
 }
 
 message SetNetworkConfigResponse {
@@ -329,6 +334,8 @@ message GetNetworkConfigResponse {
   string gateway = 4;
   repeated string dns = 5;
   string hostname = 6;
+  string ipv6_cidr = 7;
+  string ipv6_gateway = 8;
 }
 
 message FreezeFilesystemRequest {

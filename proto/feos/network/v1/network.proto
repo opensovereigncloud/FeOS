@@ -1,0 +1,214 @@
+syntax = "proto3";
+
+package feos.network.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The security groups of the node's pods (ADR 0012). The control plane
+// owns the groups and sends each node the groups of its pods, and every
+// group their rules name as a peer: whole, or as a delta of members from
+// one version to the next. feosd keeps them on disk and enforces them with
+// nftables.
+service SecurityGroupService {
+  // Puts a group whole: its rules, members and version. It replaces the
+  // group feosd has, whatever its version.
+  rpc PutSecurityGroup(PutSecurityGroupRequest) returns (PutSecurityGroupResponse);
+  // Adds and removes members of a group, from one version to the next.
+  // Fails with FAILED_PRECONDITION unless feosd has the group at
+  // from_version: the control plane then puts the group whole.
+  rpc UpdateSecurityGroup(UpdateSecurityGroupRequest) returns (UpdateSecurityGroupResponse);
+  // Removes a group. Fails with FAILED_PRECONDITION while a pod on the
+  // node names it.
+  rpc DeleteSecurityGroup(DeleteSecurityGroupRequest) returns (DeleteSecurityGroupResponse);
+  rpc GetSecurityGroup(GetSecurityGroupRequest) returns (SecurityGroup);
+  // The groups feosd has, with their versions.
+  rpc ListSecurityGroups(ListSecurityGroupsRequest) returns (ListSecurityGroupsResponse);
+}
+
+// What the node's pods did on the network (ADR 0013): flows, drops, DNS
+// queries and server names, as feosd records them.
+service TrafficService {
+  // Streams records as feosd makes them, from the call on. Records a slow
+  // reader misses are counted in TrafficRecord.missed of the next one.
+  rpc StreamTrafficRecords(StreamTrafficRecordsRequest) returns (stream TrafficRecord);
+}
+
+message SecurityGroup {
+  // 1 to 64 characters of letters, digits, "-", "_" and ".".
+  string id = 1;
+  // Counts up with every change of the group's rules or members.
+  uint64 version = 2;
+  // Rules only allow, and have no order.
+  repeated Rule rules = 3;
+  // The IPv6 addresses of the group's pods, on every node.
+  repeated string members = 4;
+}
+
+message Rule {
+  Direction direction = 1;
+  Protocol protocol = 2;
+  // Ports of TCP and UDP; empty means every port.
+  repeated PortRange ports = 3;
+  // Whom the rule allows: the far end of a connection.
+  oneof peer {
+    AddressBlock block = 4;
+    // The ID of a security group: its members.
+    string group = 5;
+  }
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  // What reaches the pod.
+  DIRECTION_INGRESS = 1;
+  // What the pod sends.
+  DIRECTION_EGRESS = 2;
+}
+
+enum Protocol {
+  // Any protocol.
+  PROTOCOL_ANY = 0;
+  PROTOCOL_TCP = 1;
+  PROTOCOL_UDP = 2;
+  PROTOCOL_ICMPV6 = 3;
+}
+
+message PortRange {
+  uint32 first = 1;
+  // The last port of the range; 0 means first alone.
+  uint32 last = 2;
+}
+
+// A prefix, without the prefixes in except. An IPv4 prefix means its
+// addresses under the NAT64 prefix (ADR 0010).
+message AddressBlock {
+  // E.g. "::/0", "2001:db8::/32", "0.0.0.0/0".
+  string cidr = 1;
+  // Prefixes inside cidr, of the same family.
+  repeated string except = 2;
+}
+
+message PutSecurityGroupRequest {
+  SecurityGroup group = 1;
+}
+
+message PutSecurityGroupResponse {}
+
+message UpdateSecurityGroupRequest {
+  string id = 1;
+  // The version feosd must have.
+  uint64 from_version = 2;
+  // The version after this change.
+  uint64 version = 3;
+  repeated string add_members = 4;
+  repeated string remove_members = 5;
+}
+
+message UpdateSecurityGroupResponse {}
+
+message DeleteSecurityGroupRequest {
+  string id = 1;
+}
+
+message DeleteSecurityGroupResponse {}
+
+message GetSecurityGroupRequest {
+  string id = 1;
+}
+
+message ListSecurityGroupsRequest {}
+
+message ListSecurityGroupsResponse {
+  repeated SecurityGroup groups = 1;
+}
+
+message StreamTrafficRecordsRequest {
+  // Only this pod's records; all pods' when empty.
+  string pod_id = 1;
+}
+
+message TrafficRecord {
+  google.protobuf.Timestamp time = 1;
+  // The pod the record is about.
+  string pod_id = 2;
+  // Records missed before this one: lost by the kernel, or by a slow
+  // reader.
+  uint64 missed = 3;
+  oneof record {
+    Flow flow = 4;
+    Drop drop = 5;
+    DnsQuery dns = 6;
+    ServerName server_name = 7;
+  }
+}
+
+// Addresses and ports of a connection, as its first packet had them. An
+// IPv4 address behind NAT64 is written as IPv4.
+message Tuple {
+  // The IP protocol number: 6 TCP, 17 UDP, 58 ICMPv6.
+  uint32 protocol = 1;
+  string source_address = 2;
+  uint32 source_port = 3;
+  string destination_address = 4;
+  uint32 destination_port = 5;
+}
+
+// A connection of a pod, in either direction, when it ended; a flow that
+// is still open is recorded when it began, with ended false.
+message Flow {
+  Tuple tuple = 1;
+  // Whether the pod opened it.
+  bool outbound = 2;
+  google.protobuf.Timestamp start = 3;
+  google.protobuf.Timestamp end = 4;
+  bool ended = 5;
+  // Counted from the side that opened the connection.
+  uint64 bytes_sent = 6;
+  uint64 bytes_received = 7;
+  uint64 packets_sent = 8;
+  uint64 packets_received = 9;
+}
+
+// A packet a security group or a denied prefix dropped.
+message Drop {
+  Tuple tuple = 1;
+  bool outbound = 2;
+  DropReason reason = 3;
+}
+
+enum DropReason {
+  DROP_REASON_UNSPECIFIED = 0;
+  // No rule of the pod's groups allowed it.
+  DROP_REASON_NO_RULE = 1;
+  // Its destination is in a denied prefix (feosd --deny-prefix).
+  DROP_REASON_DENIED_PREFIX = 2;
+  // Its source address was not the pod's.
+  DROP_REASON_SPOOFED = 3;
+}
+
+message DnsQuery {
+  string name = 1;
+  // The query type: 1 A, 28 AAAA, 65 HTTPS, ...
+  uint32 type = 2;
+  // The response code: 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, ...
+  uint32 rcode = 3;
+  // The addresses of the answer, synthesized ones included.
+  repeated string addresses = 4;
+  // Whether DNS64 synthesized the answer.
+  bool synthesized = 5;
+}
+
+// The server a pod's connection asked for.
+message ServerName {
+  Tuple tuple = 1;
+  ServerNameSource source = 2;
+  string name = 3;
+}
+
+enum ServerNameSource {
+  SERVER_NAME_SOURCE_UNSPECIFIED = 0;
+  // The server name indication of a TLS ClientHello.
+  SERVER_NAME_SOURCE_TLS = 1;
+  // The Host of a plain HTTP request.
+  SERVER_NAME_SOURCE_HTTP = 2;
+}

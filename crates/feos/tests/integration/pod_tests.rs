@@ -376,7 +376,10 @@ async fn test_pod_crash() -> Result<()> {
                 memory_mib: 256,
             }),
             // A pod with no network at all.
-            network: Some(PodNetwork { none: true }),
+            network: Some(PodNetwork {
+                none: true,
+                ..Default::default()
+            }),
             ..Default::default()
         }),
     })

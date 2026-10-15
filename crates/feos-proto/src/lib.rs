@@ -42,3 +42,7 @@ pub mod ssh_service {
 pub mod disk_service {
     tonic::include_proto!("feos.disk.v1");
 }
+/// The pods' security groups and traffic records, on the node.
+pub mod network_service {
+    tonic::include_proto!("feos.network.v1");
+}

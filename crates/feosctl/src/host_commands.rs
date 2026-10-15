@@ -154,6 +154,7 @@ pub async fn handle_host_command(args: HostArgs) -> Result<()> {
                 gateway,
                 dns,
                 hostname,
+                ..Default::default()
             };
             set_network(&mut client, request).await?
         }

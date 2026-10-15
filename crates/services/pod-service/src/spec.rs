@@ -124,6 +124,7 @@ pub fn vm_config(pod_id: &str, spec: &PodSpec, attachment: Option<&Attachment>) 
             gateway: network::GATEWAY.to_string(),
             dns: network::DNS.iter().map(|dns| dns.to_string()).collect(),
             hostname: pod_id.to_string(),
+            ..Default::default()
         });
     }
     config
@@ -182,9 +183,15 @@ mod tests {
     fn a_pod_has_a_network_unless_it_says_none() {
         let mut spec = spec(vec![]);
         assert!(has_network(&spec));
-        spec.network = Some(PodNetwork { none: false });
+        spec.network = Some(PodNetwork {
+            none: false,
+            ..Default::default()
+        });
         assert!(has_network(&spec));
-        spec.network = Some(PodNetwork { none: true });
+        spec.network = Some(PodNetwork {
+            none: true,
+            ..Default::default()
+        });
         assert!(!has_network(&spec));
     }
 

@@ -240,6 +240,8 @@ impl Guests {
                         gateway: network.gateway,
                         dns: network.dns,
                         hostname: network.hostname,
+                        ipv6_cidr: network.ipv6_cidr,
+                        ipv6_gateway: network.ipv6_gateway,
                     })
                     .await
                     .map_err(|status| format!("SetNetworkConfig: {}", status.message()))?

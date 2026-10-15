@@ -140,14 +140,20 @@ message VmConfig {
 message GuestNetworkConfig {
   // Interface in the guest, e.g. "eth0".
   string interface = 1;
-  // Address with prefix length, e.g. "10.200.0.2/16".
+  // IPv4 address with prefix length, e.g. "10.200.0.2/16"; empty for a
+  // guest with IPv6 only.
   string ipv4_cidr = 2;
-  // Default gateway, e.g. "10.200.0.1".
+  // IPv4 default gateway, e.g. "10.200.0.1"; empty with ipv4_cidr.
   string gateway = 3;
   // Resolvers, in order.
   repeated string dns = 4;
   // Kernel hostname. Left alone when empty.
   string hostname = 5;
+  // IPv6 address with prefix length, e.g. "fd00:fe05::2/128"; empty for a
+  // guest with IPv4 only.
+  string ipv6_cidr = 6;
+  // IPv6 default gateway, on the interface's link, e.g. "fe80::1".
+  string ipv6_gateway = 7;
 }
 
 message CpuConfig {

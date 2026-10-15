@@ -55,6 +55,8 @@ pub async fn handle_get_network_config(
             gateway: c.gateway,
             dns: c.dns,
             hostname: c.hostname,
+            ipv6_cidr: c.ipv6_cidr,
+            ipv6_gateway: c.ipv6_gateway,
         },
         None => GetNetworkConfigResponse::default(),
     };

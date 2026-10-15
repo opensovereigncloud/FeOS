@@ -179,7 +179,10 @@ pub async fn handle_pod_command(args: PodArgs) -> Result<()> {
 }
 
 fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
-    let network = opts.no_network.then_some(PodNetwork { none: true });
+    let network = opts.no_network.then_some(PodNetwork {
+        none: true,
+        ..Default::default()
+    });
     CreatePodRequest {
         pod_id: opts
             .pod_id
@@ -505,6 +508,12 @@ mod tests {
             panic!("not a create");
         };
         let spec = create_pod_request(*opts).spec.unwrap();
-        assert_eq!(spec.network, Some(PodNetwork { none: true }));
+        assert_eq!(
+            spec.network,
+            Some(PodNetwork {
+                none: true,
+                ..Default::default()
+            })
+        );
     }
 }
