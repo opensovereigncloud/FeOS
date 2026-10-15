@@ -2572,6 +2572,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "network-service"
+version = "0.6.0"
+dependencies = [
+ "feos-proto",
+ "log",
+ "prost",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

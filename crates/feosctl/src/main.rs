@@ -9,6 +9,7 @@ mod forward_commands;
 mod host_commands;
 mod image_commands;
 mod pod_commands;
+mod security_group_commands;
 mod tool_commands;
 mod transport;
 mod watch_commands;
@@ -24,6 +25,9 @@ struct Cli {
 enum Service {
     /// Pods: a microVM and its containers
     Pod(pod_commands::PodArgs),
+    /// Security groups: what pods may send and receive
+    #[command(alias = "sg")]
+    SecurityGroup(security_group_commands::SecurityGroupArgs),
     Host(host_commands::HostArgs),
     Image(image_commands::ImageArgs),
     Container(container_commands::ContainerArgs),
@@ -46,6 +50,9 @@ async fn main() -> Result<()> {
 
     match cli.service {
         Service::Pod(args) => pod_commands::handle_pod_command(args).await?,
+        Service::SecurityGroup(args) => {
+            security_group_commands::handle_security_group_command(args).await?
+        }
         Service::Host(args) => host_commands::handle_host_command(args).await?,
         Service::Image(args) => image_commands::handle_image_command(args).await?,
         Service::Container(args) => container_commands::handle_container_command(args).await?,
