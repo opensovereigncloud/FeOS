@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Flows from connection tracking: its events over ctnetlink, a flow's
-//! begin (NEW) and its end (DESTROY, with counters and timestamps).
+//! begin (NEW) and its end (DESTROY, with counters and timestamps). And
+//! the deletion of an address's connections.
 
-use crate::netlink::{attribute, attributes, be16, be32, be64, Message, Socket};
+use crate::netlink::{self, attribute, attributes, be16, be32, be64, Message, Socket};
 use crate::packet::{Tuple, ICMPV6};
 use crate::{timestamp, tuple, Context, Pods};
 use feos_proto::network_service::{traffic_record, Flow, TrafficRecord};
@@ -14,6 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NFNL_SUBSYS_CTNETLINK: u16 = 1;
 const IPCTNL_MSG_CT_NEW: u16 = 0;
+const IPCTNL_MSG_CT_GET: u16 = 1;
 const IPCTNL_MSG_CT_DELETE: u16 = 2;
 const NFNLGRP_CONNTRACK_NEW: u32 = 1;
 const NFNLGRP_CONNTRACK_DESTROY: u32 = 3;
@@ -22,7 +24,13 @@ const CTA_TUPLE_ORIG: u16 = 1;
 const CTA_TUPLE_REPLY: u16 = 2;
 const CTA_COUNTERS_ORIG: u16 = 9;
 const CTA_COUNTERS_REPLY: u16 = 10;
+const CTA_ID: u16 = 12;
+const CTA_ZONE: u16 = 18;
 const CTA_TIMESTAMP: u16 = 20;
+const CTA_FILTER: u16 = 25;
+const CTA_FILTER_ORIG_FLAGS: u16 = 1;
+/// CTA_FILTER_FLAG(CTA_IP_SRC): the original tuple's source address.
+const CTA_FILTER_IP_SRC: u32 = 1 << 0;
 
 const CTA_TUPLE_IP: u16 = 1;
 const CTA_TUPLE_PROTO: u16 = 2;
@@ -84,12 +92,7 @@ pub fn run(socket: Socket, context: &Context) {
         let Some(event) = parse(&message) else {
             return;
         };
-        for record in records(
-            &event,
-            context.pods.as_ref(),
-            &context.nat64,
-            SystemTime::now(),
-        ) {
+        for record in records(&event, context.pods.as_ref(), SystemTime::now()) {
             context.send(record);
         }
     });
@@ -187,16 +190,8 @@ fn parse_counters(attrs: &[u8]) -> Counters {
 /// The records of an event: one for each end that is a pod. A pod opened
 /// the flow if it is the original source; it accepted it if it is the
 /// original destination, or the reply's source (behind DNAT).
-pub fn records(
-    event: &Event,
-    pods: &dyn Pods,
-    nat64: &Ipv6Addr,
-    now: SystemTime,
-) -> Vec<TrafficRecord> {
-    let pod = |address: IpAddr| match address {
-        IpAddr::V6(address) => pods.by_address(&address),
-        IpAddr::V4(_) => None,
-    };
+pub fn records(event: &Event, pods: &dyn Pods, now: SystemTime) -> Vec<TrafficRecord> {
+    let pod = |address: IpAddr| pods.by_address(address);
     let mut ends: Vec<(String, bool)> = Vec::new();
     let original = &event.original;
     let candidates = [
@@ -221,7 +216,7 @@ pub fn records(
             pod_id,
             missed: 0,
             record: Some(traffic_record::Record::Flow(Flow {
-                tuple: Some(tuple(original, nat64)),
+                tuple: Some(tuple(original)),
                 outbound,
                 start: start.map(timestamp),
                 end: end.map(timestamp),
@@ -235,11 +230,139 @@ pub fn records(
         .collect()
 }
 
+/// Deletes the tracked connections whose original source is `source`, in
+/// the calling thread's network namespace, and says how many it deleted.
+/// feosd calls it when a pod is deleted, before the pod's IPv4 address is
+/// handed out again: else the next pod with the address would find the
+/// old one's connections, and its records would be the old one's. Each
+/// connection ends with a DESTROY event; its record names the pod that
+/// has the address when the collector reads the event, if any.
+///
+/// The kernel is asked for an IPv4 source's connections alone
+/// (CTA_FILTER, Linux 5.8 on). One that ignores the filter sends all of
+/// the family's, and one that refuses it is asked for all; the source's
+/// are picked from them here. For an IPv6 source it is asked for all:
+/// its filter of IPv6 addresses passes the other addresses (Linux 6.12).
+/// It waits for the kernel to acknowledge each deletion.
+pub fn delete_connections(source: IpAddr) -> io::Result<usize> {
+    let mut socket = Socket::open(0)?;
+    socket.set_timeout(Duration::from_secs(5))?;
+    let entries = match entries(&mut socket, source, source.is_ipv4()) {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) => {
+            entries(&mut socket, source, false)?
+        }
+        entries => entries?,
+    };
+    let mut deleted = 0;
+    for entry in &entries {
+        match socket.request(|seq| delete_request(seq, family(source), entry)) {
+            Ok(()) => deleted += 1,
+            // It ended in between.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(deleted)
+}
+
+/// A tracked connection, as a deletion names it: its original tuple, its
+/// zone and its ID, as the kernel sent them.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Entry {
+    tuple: Vec<u8>,
+    zone: Option<Vec<u8>>,
+    id: Option<Vec<u8>>,
+}
+
+/// The connections whose original source is `source`, of its family;
+/// with `filter`, the kernel is asked for those alone.
+pub(crate) fn entries(socket: &mut Socket, source: IpAddr, filter: bool) -> io::Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    socket.dump(
+        |seq| dump_request(seq, source, filter),
+        |message| entries.extend(entry(message, source)),
+    )?;
+    Ok(entries)
+}
+
+/// A dump of the conntrack table of the source's family: of the
+/// connections from `source` with `filter`, else of all.
+fn dump_request(seq: u32, source: IpAddr, filter: bool) -> Vec<u8> {
+    let (kind, address) = match source {
+        IpAddr::V4(v4) => (CTA_IP_V4_SRC, v4.octets().to_vec()),
+        IpAddr::V6(v6) => (CTA_IP_V6_SRC, v6.octets().to_vec()),
+    };
+    let ip = netlink::nested(&[(kind, &address)]);
+    let tuple = netlink::nested(&[(CTA_TUPLE_IP | netlink::NLA_F_NESTED, &ip)]);
+    // In host order, as NLA_U32.
+    let flags = netlink::nested(&[(CTA_FILTER_ORIG_FLAGS, &CTA_FILTER_IP_SRC.to_ne_bytes())]);
+    let attrs: &[(u16, &[u8])] = match filter {
+        true => &[
+            (CTA_TUPLE_ORIG | netlink::NLA_F_NESTED, &tuple),
+            (CTA_FILTER | netlink::NLA_F_NESTED, &flags),
+        ],
+        false => &[],
+    };
+    netlink::request(
+        NFNL_SUBSYS_CTNETLINK << 8 | IPCTNL_MSG_CT_GET,
+        netlink::NLM_F_REQUEST | netlink::NLM_F_DUMP,
+        seq,
+        family(source),
+        0,
+        attrs,
+    )
+}
+
+/// The connection of a dumped message, if its original source is
+/// `source`.
+fn entry(message: &Message, source: IpAddr) -> Option<Entry> {
+    if message.kind != NFNL_SUBSYS_CTNETLINK << 8 | IPCTNL_MSG_CT_NEW {
+        return None;
+    }
+    let (_, _, attrs) = message.netfilter()?;
+    let tuple = attribute(attrs, CTA_TUPLE_ORIG)?;
+    if parse_tuple(tuple)?.source != source {
+        return None;
+    }
+    Some(Entry {
+        tuple: tuple.to_vec(),
+        zone: attribute(attrs, CTA_ZONE).map(<[u8]>::to_vec),
+        id: attribute(attrs, CTA_ID).map(<[u8]>::to_vec),
+    })
+}
+
+/// The deletion of a connection: by its original tuple, in its zone, if
+/// it still has its ID.
+fn delete_request(seq: u32, family: u8, entry: &Entry) -> Vec<u8> {
+    let mut attrs: Vec<(u16, &[u8])> = vec![(CTA_TUPLE_ORIG | netlink::NLA_F_NESTED, &entry.tuple)];
+    if let Some(zone) = &entry.zone {
+        attrs.push((CTA_ZONE, zone));
+    }
+    if let Some(id) = &entry.id {
+        attrs.push((CTA_ID, id));
+    }
+    netlink::request(
+        NFNL_SUBSYS_CTNETLINK << 8 | IPCTNL_MSG_CT_DELETE,
+        netlink::NLM_F_REQUEST | netlink::NLM_F_ACK,
+        seq,
+        family,
+        0,
+        &attrs,
+    )
+}
+
+/// The netfilter family of an address.
+fn family(address: IpAddr) -> u8 {
+    match address {
+        IpAddr::V4(_) => libc::AF_INET as u8,
+        IpAddr::V6(_) => libc::AF_INET6 as u8,
+    }
+}
+
 /// A request to flush the conntrack table of a family, for tests: every
 /// entry ends with a DESTROY event.
 #[cfg(test)]
 pub fn flush_request(seq: u32, family: u8) -> Vec<u8> {
-    use crate::netlink;
     netlink::request(
         NFNL_SUBSYS_CTNETLINK << 8 | IPCTNL_MSG_CT_DELETE,
         netlink::NLM_F_REQUEST | netlink::NLM_F_ACK,
@@ -253,31 +376,44 @@ pub fn flush_request(seq: u32, family: u8) -> Vec<u8> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::{netlink, testdata};
+    use crate::testdata;
     use feos_proto::network_service::Tuple as RecordTuple;
     use std::collections::HashMap;
 
-    pub struct Map(pub HashMap<Ipv6Addr, String>);
+    pub struct Map(pub HashMap<IpAddr, String>);
 
     impl Pods for Map {
-        fn by_address(&self, address: &Ipv6Addr) -> Option<String> {
-            self.0.get(address).cloned()
+        fn by_address(&self, address: IpAddr) -> Option<String> {
+            self.0.get(&address).cloned()
         }
     }
 
-    const NAT64: Ipv6Addr = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0);
+    /// The addresses of the pod of testdata.rs.
+    pub const POD: &str = "fd00:fe05:1::1";
+    pub const POD4: &str = "169.254.16.5";
+
+    pub fn address(address: &str) -> IpAddr {
+        address.parse().unwrap()
+    }
+
+    /// pod-a, by both its addresses.
+    pub fn pods() -> Map {
+        Map(HashMap::from([
+            (address(POD), "pod-a".to_string()),
+            (address(POD4), "pod-a".to_string()),
+        ]))
+    }
 
     fn event(bytes: &[u8]) -> Event {
         let message = netlink::messages(bytes).next().unwrap();
         parse(&message).unwrap()
     }
 
-    fn pod() -> Ipv6Addr {
-        "fd00:feed::1".parse().unwrap()
-    }
-
-    fn pods() -> Map {
-        Map(HashMap::from([(pod(), "pod-a".to_string())]))
+    fn flow(record: &TrafficRecord) -> &Flow {
+        let Some(traffic_record::Record::Flow(flow)) = &record.record else {
+            panic!("not a flow");
+        };
+        flow
     }
 
     #[test]
@@ -285,11 +421,8 @@ pub mod tests {
         let event = event(testdata::CT_NEW_TCP);
         assert!(!event.ended);
         assert_eq!(event.original.protocol, 6);
-        assert_eq!(event.original.source, IpAddr::from(pod()));
-        assert_eq!(
-            event.original.destination,
-            "64:ff9b::c000:202".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(event.original.source, address(POD));
+        assert_eq!(event.original.destination, address("fd00:fe05:2::2"));
         assert_eq!(event.original.destination_port, 8080);
         let reply = event.reply.unwrap();
         assert_eq!(
@@ -299,21 +432,19 @@ pub mod tests {
         assert_eq!(event.original_counters, Counters::default());
 
         let now = SystemTime::now();
-        let records = records(&event, &pods(), &NAT64, now);
+        let records = records(&event, &pods(), now);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].pod_id, "pod-a");
-        let Some(traffic_record::Record::Flow(flow)) = &records[0].record else {
-            panic!("not a flow");
-        };
+        let flow = flow(&records[0]);
         assert!(flow.outbound && !flow.ended);
         assert_eq!(flow.start, Some(timestamp(now)));
         assert_eq!(
             flow.tuple,
             Some(RecordTuple {
                 protocol: 6,
-                source_address: "fd00:feed::1".to_string(),
+                source_address: POD.to_string(),
                 source_port: u32::from(event.original.source_port),
-                destination_address: "192.0.2.2".to_string(),
+                destination_address: "fd00:fe05:2::2".to_string(),
                 destination_port: 8080,
             })
         );
@@ -328,10 +459,8 @@ pub mod tests {
         assert!(event.reply_counters.bytes >= 100);
         let (start, stop) = (event.start.unwrap(), event.stop.unwrap());
         assert!(start <= stop);
-        let records = records(&event, &pods(), &NAT64, SystemTime::now());
-        let Some(traffic_record::Record::Flow(flow)) = &records[0].record else {
-            panic!("not a flow");
-        };
+        let records = records(&event, &pods(), SystemTime::now());
+        let flow = flow(&records[0]);
         assert!(flow.ended);
         assert_eq!(flow.start, Some(timestamp(start)));
         assert_eq!(flow.end, Some(timestamp(stop)));
@@ -339,26 +468,57 @@ pub mod tests {
         assert_eq!(flow.packets_received, event.reply_counters.packets);
     }
 
+    /// The node masqueraded the pod's IPv4: the reply goes to the node's
+    /// address, the record has the pod's.
     #[test]
-    fn udp_and_icmpv6_flows() {
-        let udp = event(testdata::CT_NEW_UDP);
-        assert_eq!(udp.original.protocol, 17);
-        assert_eq!(udp.original.destination_port, 5353);
-        let icmp = event(testdata::CT_NEW_ICMPV6);
-        assert_eq!(icmp.original.protocol, 58);
-        assert_eq!(icmp.original.destination_port, 128);
-        assert_ne!(icmp.original.source_port, 0);
-        assert_eq!(icmp.reply.unwrap().destination_port, 129);
+    fn an_ipv4_flow_is_the_pod_s_before_masquerade() {
+        let event = event(testdata::CT_NEW_TCP4);
+        assert_eq!(event.original.source, address(POD4));
+        assert_eq!(event.original.destination, address("192.0.2.2"));
+        let reply = event.reply.unwrap();
+        assert_eq!(reply.source, address("192.0.2.2"));
+        assert_eq!(reply.destination, address("192.0.2.1"));
+
+        let records = records(&event, &pods(), SystemTime::now());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pod_id, "pod-a");
+        let flow = flow(&records[0]);
+        assert!(flow.outbound);
+        assert_eq!(
+            flow.tuple,
+            Some(RecordTuple {
+                protocol: 6,
+                source_address: POD4.to_string(),
+                source_port: u32::from(event.original.source_port),
+                destination_address: "192.0.2.2".to_string(),
+                destination_port: 8080,
+            })
+        );
     }
 
     #[test]
-    fn ipv4_flows_are_nobody_s() {
-        let event = event(testdata::CT_NEW_UDP4);
-        assert_eq!(
-            event.original.source,
-            "192.0.2.1".parse::<IpAddr>().unwrap()
-        );
-        assert!(records(&event, &pods(), &NAT64, SystemTime::now()).is_empty());
+    fn udp_icmpv6_and_icmp_flows() {
+        let udp = event(testdata::CT_NEW_UDP);
+        assert_eq!(udp.original.protocol, 17);
+        assert_eq!(udp.original.destination_port, 5353);
+        let icmpv6 = event(testdata::CT_NEW_ICMPV6);
+        assert_eq!(icmpv6.original.protocol, 58);
+        assert_eq!(icmpv6.original.destination_port, 128);
+        assert_ne!(icmpv6.original.source_port, 0);
+        assert_eq!(icmpv6.reply.unwrap().destination_port, 129);
+        let icmp = event(testdata::CT_NEW_ICMP);
+        assert_eq!(icmp.original.protocol, 1);
+        assert_eq!(icmp.original.source, address(POD4));
+        assert_eq!(icmp.original.destination_port, 8);
+        assert_ne!(icmp.original.source_port, 0);
+        let reply = icmp.reply.unwrap();
+        assert_eq!(reply.destination_port, 0);
+        assert_eq!(reply.destination, address("192.0.2.1"));
+        let records = records(&icmp, &pods(), SystemTime::now());
+        let tuple = flow(&records[0]).tuple.clone().unwrap();
+        assert_eq!((tuple.protocol, tuple.source_address.as_str()), (1, POD4));
+        assert_eq!(tuple.source_port, u32::from(icmp.original.source_port));
+        assert_eq!(tuple.destination_port, 8);
     }
 
     #[test]
@@ -366,17 +526,14 @@ pub mod tests {
         let mut event = event(testdata::CT_NEW_TCP);
         std::mem::swap(&mut event.original.source, &mut event.original.destination);
         event.reply = None;
-        let inbound = records(&event, &pods(), &NAT64, SystemTime::now());
-        let Some(traffic_record::Record::Flow(flow)) = &inbound[0].record else {
-            panic!("not a flow");
-        };
-        assert!(!flow.outbound);
+        let inbound = records(&event, &pods(), SystemTime::now());
+        assert!(!flow(&inbound[0]).outbound);
 
-        let other: Ipv6Addr = "fd00:feed::2".parse().unwrap();
-        event.original.source = other.into();
+        let other = address("fd00:fe05:1::2");
+        event.original.source = other;
         let mut pods = pods();
         pods.0.insert(other, "pod-b".to_string());
-        let both = records(&event, &pods, &NAT64, SystemTime::now());
+        let both = records(&event, &pods, SystemTime::now());
         let ends: Vec<_> = both.iter().map(|r| r.pod_id.as_str()).collect();
         assert_eq!(ends, ["pod-b", "pod-a"]);
     }
@@ -392,11 +549,81 @@ pub mod tests {
                 }
                 if let Some(message) = netlink::messages(&bytes).next() {
                     let _ = parse(&message);
+                    let _ = entry(&message, address(POD));
                 }
             }
         }
         let mut bytes = testdata::CT_NEW_TCP.to_vec();
         bytes[5] = 4; // another subsystem
         assert_eq!(parse(&netlink::messages(&bytes).next().unwrap()), None);
+    }
+
+    /// The attributes of a request, by type, without its flags.
+    fn request_attributes(request: &[u8]) -> (u16, u16, u8, HashMap<u16, Vec<u8>>) {
+        let message = netlink::messages(request).next().unwrap();
+        let flags = u16::from_ne_bytes([request[6], request[7]]);
+        let (family, _, attrs) = message.netfilter().unwrap();
+        let attrs = attributes(attrs).map(|(k, v)| (k, v.to_vec())).collect();
+        (message.kind, flags, family, attrs)
+    }
+
+    #[test]
+    fn dumps_ask_for_a_source() {
+        let (kind, flags, family, attrs) =
+            request_attributes(&dump_request(7, address(POD4), true));
+        assert_eq!(kind, 0x101);
+        assert_eq!(flags, netlink::NLM_F_REQUEST | netlink::NLM_F_DUMP);
+        assert_eq!(family, libc::AF_INET as u8);
+        let ip = attribute(&attrs[&CTA_TUPLE_ORIG], CTA_TUPLE_IP).unwrap();
+        assert_eq!(attribute(ip, CTA_IP_V4_SRC), Some(&[169, 254, 16, 5][..]));
+        assert_eq!(attribute(ip, CTA_IP_V4_DST), None);
+        let flags = attribute(&attrs[&CTA_FILTER], CTA_FILTER_ORIG_FLAGS).unwrap();
+        assert_eq!(flags, 1u32.to_ne_bytes());
+
+        let (_, _, family, attrs) = request_attributes(&dump_request(7, address(POD), true));
+        assert_eq!(family, libc::AF_INET6 as u8);
+        let ip = attribute(&attrs[&CTA_TUPLE_ORIG], CTA_TUPLE_IP).unwrap();
+        let pod: Ipv6Addr = POD.parse().unwrap();
+        assert_eq!(attribute(ip, CTA_IP_V6_SRC), Some(&pod.octets()[..]));
+
+        let (_, _, family, attrs) = request_attributes(&dump_request(7, address(POD4), false));
+        assert_eq!(family, libc::AF_INET as u8);
+        assert!(attrs.is_empty());
+    }
+
+    /// A NEW event has what a dump has of a connection.
+    #[test]
+    fn connections_of_a_source_are_deleted_by_their_tuple() {
+        let message = netlink::messages(testdata::CT_NEW_TCP4).next().unwrap();
+        assert_eq!(entry(&message, address("192.0.2.2")), None);
+        let entry = entry(&message, address(POD4)).unwrap();
+        let (_, _, attrs) = message.netfilter().unwrap();
+        assert_eq!(entry.tuple, attribute(attrs, CTA_TUPLE_ORIG).unwrap());
+        assert_eq!(entry.id.as_deref(), attribute(attrs, CTA_ID));
+        assert!(entry.id.is_some());
+        assert_eq!(entry.zone, None);
+
+        let request = delete_request(9, libc::AF_INET as u8, &entry);
+        let (kind, flags, family, attrs) = request_attributes(&request);
+        assert_eq!(kind, 0x102);
+        assert_eq!(flags, netlink::NLM_F_REQUEST | netlink::NLM_F_ACK);
+        assert_eq!(family, libc::AF_INET as u8);
+        assert_eq!(attrs[&CTA_TUPLE_ORIG], entry.tuple);
+        assert_eq!(
+            parse_tuple(&attrs[&CTA_TUPLE_ORIG]),
+            Some(event(testdata::CT_NEW_TCP4).original)
+        );
+        assert_eq!(Some(&attrs[&CTA_ID]), entry.id.as_ref());
+        assert!(!attrs.contains_key(&CTA_ZONE));
+        // The tuple is nested.
+        let at = 16 + 4;
+        assert_eq!(
+            u16::from_ne_bytes([request[at + 2], request[at + 3]]),
+            CTA_TUPLE_ORIG | netlink::NLA_F_NESTED
+        );
+
+        // A destroyed connection is not dumped.
+        let message = netlink::messages(testdata::CT_DESTROY_TCP).next().unwrap();
+        assert_eq!(super::entry(&message, address(POD)), None);
     }
 }

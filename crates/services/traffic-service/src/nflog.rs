@@ -14,7 +14,6 @@ use feos_proto::network_service::{
     traffic_record, Drop as DropRecord, DropReason, ServerName, ServerNameSource, TrafficRecord,
 };
 use std::io;
-use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const NFNL_SUBSYS_ULOG: u16 = 4;
@@ -143,26 +142,21 @@ pub fn reason(prefix: &str) -> DropReason {
 /// The record of a dropped packet, if it is a pod's. The pod sent it if
 /// it came in on the pod's TAP, or from the pod's address; else it was
 /// for the pod, if it was to go out on the pod's TAP, or to its address.
-/// A spoofed packet has the pod's TAP, not its address, and may be IPv4.
+/// A spoofed packet has the pod's TAP, not its address.
 pub fn drop_record(
     logged: &Logged,
     packet: &Packet,
     pods: &dyn Pods,
     interface: &dyn Fn(u32) -> Option<String>,
-    nat64: &Ipv6Addr,
     now: SystemTime,
 ) -> Option<TrafficRecord> {
     let tap = |index: Option<u32>| pods.by_interface(&interface(index?)?);
-    let address = |address: IpAddr| match address {
-        IpAddr::V6(address) => pods.by_address(&address),
-        IpAddr::V4(_) => None,
-    };
     let (pod_id, outbound) = tap(logged.indev)
-        .or_else(|| address(packet.tuple.source))
+        .or_else(|| pods.by_address(packet.tuple.source))
         .map(|pod| (pod, true))
         .or_else(|| {
             tap(logged.outdev)
-                .or_else(|| address(packet.tuple.destination))
+                .or_else(|| pods.by_address(packet.tuple.destination))
                 .map(|pod| (pod, false))
         })?;
     Some(TrafficRecord {
@@ -170,7 +164,7 @@ pub fn drop_record(
         pod_id,
         missed: 0,
         record: Some(traffic_record::Record::Drop(DropRecord {
-            tuple: Some(tuple(&packet.tuple, nat64)),
+            tuple: Some(tuple(&packet.tuple)),
             outbound,
             reason: reason(logged.prefix).into(),
         })),
@@ -196,7 +190,7 @@ pub fn run_drops(socket: Socket, context: &Context) {
         };
         let pods = context.pods.as_ref();
         let now = SystemTime::now();
-        if let Some(record) = drop_record(&logged, &packet, pods, &interface, &context.nat64, now) {
+        if let Some(record) = drop_record(&logged, &packet, pods, &interface, now) {
             context.send(record);
         }
     });
@@ -222,7 +216,8 @@ pub fn run_copies(socket: Socket, context: &Context) {
     });
 }
 
-/// Takes a copy of a packet that a pod sent on a connection it opened.
+/// Takes a copy of a packet that a pod sent on a connection it opened,
+/// over IPv6 or IPv4.
 pub fn copy(
     streams: &mut Streams,
     logged: &Logged,
@@ -232,18 +227,13 @@ pub fn copy(
 ) -> Option<TrafficRecord> {
     let packet = packet::parse(logged.payload)?;
     let segment = packet.segment?;
-    let (IpAddr::V6(source), IpAddr::V6(destination)) =
-        (packet.tuple.source, packet.tuple.destination)
-    else {
-        return None;
-    };
     // The pod's side of the connection; the server's answers do not name
     // the server.
-    let pod_id = context.pods.by_address(&source)?;
+    let pod_id = context.pods.by_address(packet.tuple.source)?;
     let key = (
-        source,
+        packet.tuple.source,
         packet.tuple.source_port,
-        destination,
+        packet.tuple.destination,
         packet.tuple.destination_port,
     );
     let (source, name) = streams.segment(now, key, segment.seq, segment.syn, segment.payload)?;
@@ -256,7 +246,7 @@ pub fn copy(
         pod_id,
         missed: 0,
         record: Some(traffic_record::Record::ServerName(ServerName {
-            tuple: Some(tuple(&packet.tuple, &context.nat64)),
+            tuple: Some(tuple(&packet.tuple)),
             source: source.into(),
             name,
         })),
@@ -266,67 +256,64 @@ pub fn copy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conntrack::tests::Map;
+    use crate::conntrack::tests::{address, pods, POD, POD4};
     use crate::packet::tests::tcp;
     use crate::server_name::tests::{browser_like, client_hello};
     use crate::testdata;
     use feos_proto::network_service::Tuple as RecordTuple;
-    use std::collections::HashMap;
+    use std::net::IpAddr;
     use std::sync::Arc;
     use tokio::sync::broadcast;
 
-    const NAT64: Ipv6Addr = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0);
-
-    fn pod() -> Ipv6Addr {
-        "fd00:feed::1".parse().unwrap()
-    }
-
-    fn pods() -> Map {
-        Map(HashMap::from([(pod(), "pod-a".to_string())]))
-    }
+    const SERVER: &str = "fd00:fe05:2::2";
+    const SERVER4: &str = "192.0.2.2";
 
     fn logged(bytes: &[u8]) -> Logged<'_> {
         parse(&netlink::messages(bytes).next().unwrap()).unwrap()
     }
 
-    #[test]
-    fn a_dropped_packet() {
-        let logged = logged(testdata::NFLOG_DROP_UDP);
-        assert_eq!((logged.group, logged.prefix), (2, "deny"));
-        assert!(logged.outdev.is_some());
-        let packet = packet::parse(logged.payload).unwrap();
-        let record = drop_record(
-            &logged,
-            &packet,
-            &pods(),
-            &|_| None,
-            &NAT64,
-            SystemTime::now(),
-        )
-        .unwrap();
-        assert_eq!(record.pod_id, "pod-a");
+    fn dropped(record: TrafficRecord) -> DropRecord {
         let Some(traffic_record::Record::Drop(drop)) = record.record else {
             panic!("not a drop");
         };
-        assert!(drop.outbound);
-        assert_eq!(drop.reason(), DropReason::DeniedPrefix);
-        assert_eq!(
-            drop.tuple,
-            Some(RecordTuple {
-                protocol: 17,
-                source_address: "fd00:feed::1".to_string(),
-                source_port: u32::from(packet.tuple.source_port),
-                destination_address: "192.0.2.2".to_string(),
-                destination_port: 9999,
-            })
-        );
+        drop
+    }
+
+    #[test]
+    fn dropped_packets_of_both_families() {
+        for (vector, pod, server) in [
+            (testdata::NFLOG_DROP_UDP, POD, SERVER),
+            (testdata::NFLOG_DROP_UDP4, POD4, SERVER4),
+        ] {
+            let logged = logged(vector);
+            assert_eq!((logged.group, logged.prefix), (2, "deny"));
+            // Dropped while forwarded.
+            assert!(logged.indev.is_some() && logged.outdev.is_some());
+            let packet = packet::parse(logged.payload).unwrap();
+            let record =
+                drop_record(&logged, &packet, &pods(), &|_| None, SystemTime::now()).unwrap();
+            assert_eq!(record.pod_id, "pod-a");
+            let drop = dropped(record);
+            assert!(drop.outbound);
+            assert_eq!(drop.reason(), DropReason::DeniedPrefix);
+            assert_eq!(
+                drop.tuple,
+                Some(RecordTuple {
+                    protocol: 17,
+                    source_address: pod.to_string(),
+                    source_port: u32::from(packet.tuple.source_port),
+                    destination_address: server.to_string(),
+                    destination_port: 9999,
+                })
+            );
+        }
     }
 
     /// A pod on its TAP, whatever the source address says.
     struct Tap;
 
     impl Pods for Tap {
-        fn by_address(&self, _: &Ipv6Addr) -> Option<String> {
+        fn by_address(&self, _: IpAddr) -> Option<String> {
             None
         }
 
@@ -337,21 +324,19 @@ mod tests {
 
     #[test]
     fn spoofed_packets_are_the_tap_s_pod_s() {
-        let mut logged = logged(testdata::NFLOG_DROP_UDP);
+        let mut logged = logged(testdata::NFLOG_DROP_UDP4);
         logged.prefix = "spoofed";
         logged.indev = Some(7);
         let packet = packet::parse(logged.payload).unwrap();
         let name = |index| (index == 7).then(|| "pod-0123abcd".to_string());
-        let record = drop_record(&logged, &packet, &Tap, &name, &NAT64, SystemTime::now()).unwrap();
+        let record = drop_record(&logged, &packet, &Tap, &name, SystemTime::now()).unwrap();
         assert_eq!(record.pod_id, "spoofer");
-        let Some(traffic_record::Record::Drop(drop)) = record.record else {
-            panic!("not a drop");
-        };
+        let drop = dropped(record);
         assert!(drop.outbound);
         assert_eq!(drop.reason(), DropReason::Spoofed);
         // Without the TAP, the address is nobody's.
         logged.indev = None;
-        assert!(drop_record(&logged, &packet, &Tap, &name, &NAT64, SystemTime::now()).is_none());
+        assert!(drop_record(&logged, &packet, &Tap, &name, SystemTime::now()).is_none());
 
         // An IPv4 packet: UDP from 10.1.2.3:68 to 255.255.255.255:67.
         let mut ipv4 = vec![0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0, 10, 1, 2, 3];
@@ -359,11 +344,8 @@ mod tests {
         logged.payload = &ipv4;
         logged.indev = Some(7);
         let packet = packet::parse(logged.payload).unwrap();
-        let record = drop_record(&logged, &packet, &Tap, &name, &NAT64, SystemTime::now()).unwrap();
-        let Some(traffic_record::Record::Drop(drop)) = record.record else {
-            panic!("not a drop");
-        };
-        let tuple = drop.tuple.unwrap();
+        let record = drop_record(&logged, &packet, &Tap, &name, SystemTime::now()).unwrap();
+        let tuple = dropped(record).tuple.unwrap();
         assert_eq!(tuple.source_address, "10.1.2.3");
         assert_eq!(
             (tuple.destination_address.as_str(), tuple.destination_port),
@@ -381,7 +363,7 @@ mod tests {
 
     fn context() -> Context {
         let (records, _) = broadcast::channel(16);
-        Context::new(Arc::new(pods()), NAT64, records)
+        Context::new(Arc::new(pods()), records)
     }
 
     #[test]
@@ -416,57 +398,70 @@ mod tests {
         assert_eq!(name.source(), ServerNameSource::Tls);
         let tuple = name.tuple.as_ref().unwrap();
         assert_eq!(
-            (tuple.destination_address.as_str(), tuple.destination_port),
-            ("192.0.2.2", 8443)
+            (
+                tuple.source_address.as_str(),
+                tuple.destination_address.as_str(),
+                tuple.destination_port
+            ),
+            (POD, SERVER, 8443)
         );
     }
 
     #[test]
-    fn copies_out_of_order() {
-        let context = context();
-        let mut streams = Streams::default();
-        let server: Ipv6Addr = "64:ff9b::102:304".parse().unwrap();
-        let flight = browser_like(&client_hello("copies.example", true));
-        let segment = |seq: u32, flags: u8, payload: &[u8]| {
-            tcp(pod(), 40000, server, 443, seq, flags, payload)
-        };
-        let packets = [
-            segment(9, 0x02, &[]),
-            segment(1010, 0x18, &flight[1000..]),
-            // The server's side is not read.
-            tcp(server, 443, pod(), 40000, 5, 0x12, &[]),
-            segment(10, 0x10, &flight[..1000]),
-            segment(10, 0x10, &flight[..1000]),
-        ];
-        let mut names = Vec::new();
-        for packet in &packets {
-            let logged = Logged {
-                group: 3,
-                prefix: "copy",
-                indev: None,
-                outdev: None,
-                time: None,
-                payload: packet,
+    fn copies_out_of_order_of_both_families() {
+        for (pod, server) in [(POD, SERVER), (POD4, SERVER4)] {
+            let context = context();
+            let mut streams = Streams::default();
+            let (pod, server) = (address(pod), address(server));
+            let flight = browser_like(&client_hello("copies.example", true));
+            let segment = |seq: u32, flags: u8, payload: &[u8]| {
+                tcp(pod, 40000, server, 443, seq, flags, payload)
             };
-            names.extend(copy(
-                &mut streams,
-                &logged,
-                &context,
-                Instant::now(),
-                SystemTime::now(),
-            ));
+            let packets = [
+                segment(9, 0x02, &[]),
+                segment(1010, 0x18, &flight[1000..]),
+                // The server's side is not read.
+                tcp(server, 443, pod, 40000, 5, 0x12, &[]),
+                segment(10, 0x10, &flight[..1000]),
+                segment(10, 0x10, &flight[..1000]),
+            ];
+            let mut names = Vec::new();
+            for packet in &packets {
+                let logged = Logged {
+                    group: 3,
+                    prefix: "copy",
+                    indev: None,
+                    outdev: None,
+                    time: None,
+                    payload: packet,
+                };
+                names.extend(copy(
+                    &mut streams,
+                    &logged,
+                    &context,
+                    Instant::now(),
+                    SystemTime::now(),
+                ));
+            }
+            assert_eq!(names.len(), 1);
+            assert_eq!(names[0].pod_id, "pod-a");
+            let Some(traffic_record::Record::ServerName(name)) = &names[0].record else {
+                panic!("not a server name");
+            };
+            assert_eq!(name.name, "copies.example");
+            let tuple = name.tuple.as_ref().unwrap();
+            assert_eq!(tuple.source_address, pod.to_string());
+            assert_eq!(tuple.destination_address, server.to_string());
         }
-        assert_eq!(names.len(), 1);
-        let Some(traffic_record::Record::ServerName(name)) = &names[0].record else {
-            panic!("not a server name");
-        };
-        assert_eq!(name.name, "copies.example");
-        assert_eq!(name.tuple.as_ref().unwrap().destination_address, "1.2.3.4");
     }
 
     #[test]
     fn garbage_is_no_packet() {
-        for vector in [testdata::NFLOG_DROP_UDP, testdata::NFLOG_COPIES] {
+        for vector in [
+            testdata::NFLOG_DROP_UDP,
+            testdata::NFLOG_DROP_UDP4,
+            testdata::NFLOG_COPIES,
+        ] {
             for len in 0..vector.len() {
                 let mut bytes = vector[..len].to_vec();
                 if len >= 4 {

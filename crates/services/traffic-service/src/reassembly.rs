@@ -14,7 +14,7 @@
 
 use crate::server_name::{self, Found, Source};
 use std::collections::HashMap;
-use std::net::Ipv6Addr;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 /// The bytes of a stream that are read for a name. A post-quantum
@@ -32,7 +32,7 @@ pub const MAX_STREAMS: usize = 16384;
 pub const MAX_BUFFERED: usize = 16 << 20;
 
 /// A stream: source address and port, destination address and port.
-pub type Key = (Ipv6Addr, u16, Ipv6Addr, u16);
+pub type Key = (IpAddr, u16, IpAddr, u16);
 
 struct Stream {
     started: Instant,
@@ -237,9 +237,10 @@ fn looks_like_a_start(payload: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::server_name::tests::{browser_like, client_hello};
+    use std::net::Ipv6Addr;
 
-    const CLIENT: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10);
-    const SERVER: Ipv6Addr = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0xc000, 0x0201);
+    const CLIENT: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10));
+    const SERVER: IpAddr = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x20));
     const KEY: Key = (CLIENT, 50000, SERVER, 443);
     const ISN: u32 = u32::MAX - 700;
 

@@ -681,10 +681,7 @@ impl Network {
             warn!("Network: Flows have no counters: {e}");
         }
         let (sender, receiver) = broadcast::channel(RECORDS);
-        let config = traffic_service::Config {
-            nat64_prefix: self.config.nat64_prefix,
-            ..Default::default()
-        };
+        let config = traffic_service::Config::default();
         match Collector::start(self.directory.clone(), config, sender) {
             Ok(collector) => {
                 *lock(&self.collector) = Some(collector);
@@ -876,11 +873,14 @@ impl Directory {
 }
 
 impl traffic_service::Pods for Directory {
-    fn by_address(&self, address: &Ipv6Addr) -> Option<String> {
+    fn by_address(&self, address: IpAddr) -> Option<String> {
+        let IpAddr::V6(address) = address else {
+            return None;
+        };
         self.addresses
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(address)
+            .get(&address)
             .cloned()
     }
 
@@ -1055,7 +1055,7 @@ mod tests {
             groups: vec![],
         }]);
         assert_eq!(
-            directory.by_address(&"fd00::2".parse().unwrap()),
+            directory.by_address("fd00::2".parse().unwrap()),
             Some("a".to_string())
         );
         assert_eq!(

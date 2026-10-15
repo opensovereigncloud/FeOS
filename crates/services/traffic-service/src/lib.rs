@@ -21,8 +21,12 @@
 //! Nothing here holds up traffic: what the kernel cannot hand over in time
 //! is dropped, and counted in the `missed` of the next record.
 //!
-//! An IPv4 address under the NAT64 prefix is written as IPv4. A flow or
-//! packet of IPv4 (the node's side of `--nat64=node`) is nobody's.
+//! Pods are found by either of their addresses, IPv6 and IPv4 (ADR 0010),
+//! and records have the pod's own addresses: those of conntrack's
+//! original tuple, before masquerade.
+//!
+//! [`delete_connections`] forgets the connections of an address, so that
+//! a deleted pod's IPv4 address can be handed out again.
 
 mod api;
 mod conntrack;
@@ -38,11 +42,12 @@ mod kernel_tests;
 mod testdata;
 
 pub use api::TrafficApi;
+pub use conntrack::delete_connections;
 
 use feos_proto::network_service::{TrafficRecord, Tuple};
 use netlink::{Message, Socket};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -70,8 +75,8 @@ pub mod prefix {
     pub const COPY: &str = "copy";
 }
 
-/// The bytes of a dropped packet that are read: the IPv6 header, some
-/// extension headers and the ports.
+/// The bytes of a dropped packet that are read: the IP header, some
+/// extension headers or options, and the ports.
 const DROP_COPY_RANGE: u16 = 256;
 /// How often the readers look up from the socket: to stop, and to count
 /// what the kernel dropped.
@@ -82,8 +87,8 @@ const RECEIVE_SIZE: usize = 128 << 10;
 
 /// Which pod an address or a TAP is, for the collector's threads.
 pub trait Pods: Send + Sync {
-    /// The ID of the pod with this address.
-    fn by_address(&self, address: &Ipv6Addr) -> Option<String>;
+    /// The ID of the pod with this address, its IPv6 or its IPv4.
+    fn by_address(&self, address: IpAddr) -> Option<String>;
 
     /// The ID of the pod whose TAP this is (`pod-<8 hex>`): a spoofed
     /// packet's source address is not the pod's.
@@ -94,8 +99,6 @@ pub trait Pods: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// The NAT64 prefix, a /96 (ADR 0010).
-    pub nat64_prefix: Ipv6Addr,
     pub drop_group: u16,
     pub copy_group: u16,
 }
@@ -103,7 +106,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            nat64_prefix: Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0),
             drop_group: DROP_GROUP,
             copy_group: COPY_GROUP,
         }
@@ -133,7 +135,7 @@ impl Collector {
             socket.set_timeout(TICK)?;
         }
         let mut collector = Self {
-            context: Arc::new(Context::new(pods, config.nat64_prefix, records)),
+            context: Arc::new(Context::new(pods, records)),
             threads: Vec::new(),
         };
         let readers: [(&str, Socket, Reader); 3] = [
@@ -185,7 +187,6 @@ type Reader = fn(Socket, &Context);
 /// What the readers share.
 pub(crate) struct Context {
     pods: Arc<dyn Pods>,
-    nat64: Ipv6Addr,
     records: broadcast::Sender<TrafficRecord>,
     /// Lost since the last record.
     missed: AtomicU64,
@@ -193,14 +194,9 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    fn new(
-        pods: Arc<dyn Pods>,
-        nat64: Ipv6Addr,
-        records: broadcast::Sender<TrafficRecord>,
-    ) -> Self {
+    fn new(pods: Arc<dyn Pods>, records: broadcast::Sender<TrafficRecord>) -> Self {
         Self {
             pods,
-            nat64,
             records,
             missed: AtomicU64::new(0),
             stop: AtomicBool::new(false),
@@ -271,24 +267,13 @@ fn timestamp(time: SystemTime) -> prost_types::Timestamp {
 }
 
 /// A tuple as records have it.
-fn tuple(tuple: &packet::Tuple, nat64: &Ipv6Addr) -> Tuple {
+fn tuple(tuple: &packet::Tuple) -> Tuple {
     Tuple {
         protocol: tuple.protocol.into(),
-        source_address: address(tuple.source, nat64),
+        source_address: tuple.source.to_string(),
         source_port: tuple.source_port.into(),
-        destination_address: address(tuple.destination, nat64),
+        destination_address: tuple.destination.to_string(),
         destination_port: tuple.destination_port.into(),
-    }
-}
-
-/// An address as records have it: IPv4 when it is under the NAT64 /96.
-fn address(address: IpAddr, nat64: &Ipv6Addr) -> String {
-    match address {
-        IpAddr::V6(v6) if v6.octets()[..12] == nat64.octets()[..12] => {
-            let o = v6.octets();
-            Ipv4Addr::new(o[12], o[13], o[14], o[15]).to_string()
-        }
-        address => address.to_string(),
     }
 }
 
@@ -297,30 +282,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nat64_addresses_are_ipv4() {
-        let nat64 = Config::default().nat64_prefix;
-        let a = |s: &str| address(s.parse().unwrap(), &nat64);
-        assert_eq!(a("64:ff9b::102:304"), "1.2.3.4");
-        assert_eq!(a("64:ff9b::1:102:304"), "64:ff9b::1:102:304");
-        assert_eq!(a("2001:db8::1"), "2001:db8::1");
-        assert_eq!(a("10.0.0.1"), "10.0.0.1");
-        let other: Ipv6Addr = "2001:db8:64::".parse().unwrap();
-        assert_eq!(
-            address("2001:db8:64::c000:201".parse().unwrap(), &other),
-            "192.0.2.1"
-        );
+    fn addresses_are_written_as_they_are() {
+        let written = |source: &str, destination: &str| {
+            tuple(&packet::Tuple {
+                protocol: 6,
+                source: source.parse().unwrap(),
+                source_port: 40000,
+                destination: destination.parse().unwrap(),
+                destination_port: 443,
+            })
+        };
+        let v6 = written("fd00:fe05:1::1", "2001:db8::2");
+        assert_eq!(v6.source_address, "fd00:fe05:1::1");
+        assert_eq!(v6.destination_address, "2001:db8::2");
+        let v4 = written("169.254.16.5", "192.0.2.2");
+        assert_eq!(v4.source_address, "169.254.16.5");
+        assert_eq!(v4.destination_address, "192.0.2.2");
+        assert_eq!((v4.source_port, v4.destination_port), (40000, 443));
     }
 
     #[test]
     fn missed_records_go_with_the_next() {
         struct Nobody;
         impl Pods for Nobody {
-            fn by_address(&self, _: &Ipv6Addr) -> Option<String> {
+            fn by_address(&self, _: IpAddr) -> Option<String> {
                 None
             }
         }
         let (records, mut rx) = broadcast::channel(4);
-        let context = Context::new(Arc::new(Nobody), Config::default().nat64_prefix, records);
+        let context = Context::new(Arc::new(Nobody), records);
         context.lost(3);
         context.lost(2);
         context.send(TrafficRecord::default());

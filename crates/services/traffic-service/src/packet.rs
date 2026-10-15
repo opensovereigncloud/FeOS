@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The headers of a packet as nflog copies it: addresses, the transport
-//! protocol and its ports, and of TCP the sequence number, flags and
-//! payload. A copy may be cut short anywhere. Pods speak IPv6; an IPv4
-//! packet from a pod is read only for the record of its drop.
+//! The headers of an IPv6 or IPv4 packet as nflog copies it: addresses,
+//! the transport protocol and its ports, and of TCP the sequence number,
+//! flags and payload. A copy may be cut short anywhere.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -184,9 +183,9 @@ pub mod tests {
 
     /// An IPv6 packet with a TCP header (and no options) before `payload`.
     pub fn tcp(
-        source: Ipv6Addr,
+        source: impl Into<IpAddr>,
         source_port: u16,
-        destination: Ipv6Addr,
+        destination: impl Into<IpAddr>,
         destination_port: u16,
         seq: u32,
         flags: u8,
@@ -201,7 +200,11 @@ pub mod tests {
         tcp.push(flags);
         tcp.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0]); // window, checksum, urgent
         tcp.extend_from_slice(payload);
-        ipv6(source, destination, TCP, &tcp)
+        match (source.into(), destination.into()) {
+            (IpAddr::V6(source), IpAddr::V6(destination)) => ipv6(source, destination, TCP, &tcp),
+            (IpAddr::V4(source), IpAddr::V4(destination)) => ipv4(source, destination, TCP, &tcp),
+            _ => panic!("addresses of two families"),
+        }
     }
 
     pub fn ipv6(source: Ipv6Addr, destination: Ipv6Addr, next: u8, payload: &[u8]) -> Vec<u8> {
@@ -215,31 +218,49 @@ pub mod tests {
         packet
     }
 
+    /// An IPv4 packet without options.
+    pub fn ipv4(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x45, 0];
+        packet.extend_from_slice(&(20 + payload.len() as u16).to_be_bytes());
+        // Identification, flags (don't fragment), TTL, protocol, checksum.
+        packet.extend_from_slice(&[0, 0, 0x40, 0, 64, protocol, 0, 0]);
+        packet.extend_from_slice(&source.octets());
+        packet.extend_from_slice(&destination.octets());
+        packet.extend_from_slice(payload);
+        packet
+    }
+
     const A: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
-    const B: Ipv6Addr = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x0102, 0x0304);
+    const B: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+    const A4: Ipv4Addr = Ipv4Addr::new(169, 254, 16, 5);
+    const B4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 2);
 
     #[test]
     fn tcp_segments_parse() {
-        let data = tcp(A, 40000, B, 443, 1000, 0x18, b"hello");
-        let packet = parse(&data).unwrap();
-        assert_eq!(packet.tuple.protocol, TCP);
-        assert_eq!(packet.tuple.source, IpAddr::from(A));
-        assert_eq!(
-            (packet.tuple.source_port, packet.tuple.destination_port),
-            (40000, 443)
-        );
-        let segment = packet.segment.unwrap();
-        assert_eq!(
-            (segment.seq, segment.syn, segment.payload),
-            (1000, false, &b"hello"[..])
-        );
-        // Cut short by the snap length: what is there counts.
-        let packet = parse(&data[..data.len() - 2]).unwrap();
-        assert_eq!(packet.segment.unwrap().payload, b"hel");
-        // The header alone.
-        let packet = parse(&data[..40 + 4]).unwrap();
-        assert_eq!(packet.tuple.destination_port, 443);
-        assert_eq!(packet.segment, None);
+        let pairs: [(IpAddr, IpAddr, usize); 2] =
+            [(A.into(), B.into(), 40), (A4.into(), B4.into(), 20)];
+        for (a, b, header) in pairs {
+            let data = tcp(a, 40000, b, 443, 1000, 0x18, b"hello");
+            let packet = parse(&data).unwrap();
+            assert_eq!(packet.tuple.protocol, TCP);
+            assert_eq!((packet.tuple.source, packet.tuple.destination), (a, b));
+            assert_eq!(
+                (packet.tuple.source_port, packet.tuple.destination_port),
+                (40000, 443)
+            );
+            let segment = packet.segment.unwrap();
+            assert_eq!(
+                (segment.seq, segment.syn, segment.payload),
+                (1000, false, &b"hello"[..])
+            );
+            // Cut short by the snap length: what is there counts.
+            let packet = parse(&data[..data.len() - 2]).unwrap();
+            assert_eq!(packet.segment.unwrap().payload, b"hel");
+            // The header alone.
+            let packet = parse(&data[..header + 4]).unwrap();
+            assert_eq!(packet.tuple.destination_port, 443);
+            assert_eq!(packet.segment, None);
+        }
     }
 
     #[test]
