@@ -65,6 +65,7 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 |---|---|
 | `/var/lib/feos/pods/<id>.pb` | a pod: its spec, its state and why, its addresses (a `feos.pod.v1.PodInfo`) |
 | `/var/lib/feos/pods/next-ipv6-address` | the counter of the pods' IPv6 addresses: the next one handed out |
+| `/var/lib/feos/pods/ipv4-addresses` | the pods' IPv4 addresses: the lowest never handed out, and those freed since, the longest free first, with when |
 | `/var/lib/feos/security-groups/<id>.pb` | a security group (a `feos.network.v1.SecurityGroup`) |
 | `/var/lib/feos/vms.db` | the microVM records (SQLite) |
 | `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
@@ -109,9 +110,10 @@ for the containers' states while the pod runs.
 
 ## The pods' network
 
-Every pod has a network unless its spec says `none`. Pods are IPv6 only
-([ADR 0010](../adr/0010-pod-network.md)), their security groups decide
-what they reach ([ADR 0012](../adr/0012-security-groups.md)), and their
+Every pod has a network unless its spec says `none`. A pod has an IPv6
+address, its address on the network, and an IPv4 address for leaving the
+node ([ADR 0010](../adr/0010-pod-network.md)); its security groups decide
+what it reaches ([ADR 0012](../adr/0012-security-groups.md)), and its
 traffic is recorded ([ADR 0013](../adr/0013-traffic-records.md)). The code
 is `crates/services/pod-service/src/network*`, on top of
 `network-service` (the groups and their compiler), `dns-service` (the
@@ -122,10 +124,13 @@ resolver) and `traffic-service` (the records).
 | Option | Default | What it is |
 |---|---|---|
 | `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120; a /64 is best |
-| `--dns-address ADDRESS` | `fdfd:7b5:61d9::53` | the pods' resolver, the same on every node |
+| `--pod-ipv4-range PREFIX` | `169.254.16.0/20` | the pods' IPv4 addresses, a /32 each; /1 to /30, with neither the resolver's address nor `169.254.0.1` in it |
+| `--dns-address ADDRESS` | `169.254.0.53` | the pods' resolver, an IPv4 address that the node holds, the same on every node; never `169.254.0.1` |
 | `--dns-upstream ADDRESS` | Google's and Cloudflare's, IPv6 first | the upstreams of pods that name none (repeatable) |
-| `--deny-prefix PREFIX` | none | what no pod reaches (repeatable) |
+| `--deny-prefix PREFIX` | none | what no pod reaches, of either family (repeatable) |
 
+`--pod-ipv4-range` and `--dns-address` move the pods' IPv4 addresses and
+the resolver where the node's own network uses link-local addresses.
 Without `--pod-prefix`, or when the network cannot be set up, `feosd`
 logs the error and runs on: creating a pod with a network fails with
 `FAILED_PRECONDITION` and the reason, and a kept pod with a network fails
@@ -143,48 +148,96 @@ At its start `feosd`:
    advertisements (`accept_ra` 1) go on taking them (2);
 3. routes the pod prefix as `unreachable`: a packet for a pod that is not
    here goes back as unreachable rather than out again;
-4. gives the dummy device `feos-dns` the resolver's address, a /128
-   without duplicate address detection, and binds the resolver's UDP and
-   TCP sockets to it, port 53.
+4. gives the dummy device `feos-dns` the resolver's address as a /32, and
+   no other global address, and binds the resolver's UDP and TCP sockets
+   to it, port 53.
+
+The resolver's is the one link-local address the node holds. It never
+holds `169.254.0.1`: where that is the gateway of the node's own network,
+as in some clouds, the node would lose its own.
 
 Before every boot and resume of a pod, `feosd` makes its TAP device,
 `pod-<8 hex digits of the ID>`, a link of its own between the node and
-the pod: no router advertisements, no address autoconfiguration and no
-link-local address of the kernel's (set before it goes up), no answers to
-ARP, up, `fe80::1/64` without duplicate address detection, and a route
-for the pod's address, a /128, to it. The guest is pushed its address as
-a /128, `fe80::1` as its gateway, the resolver and no IPv4
+the pod:
+
+- no router advertisements, no address autoconfiguration and no
+  link-local address of the kernel's, set before it goes up;
+- no IPv4 address; ARP answered only for addresses on the device
+  (`arp_ignore` 1), which has none, and asked from the best address for
+  the target (`arp_announce` 2); forwarding on;
+- `fe80::1/64` without duplicate address detection: the pod's IPv6
+  gateway;
+- a proxy neighbor entry (`NTF_PROXY`) for `169.254.0.1`, the pod's IPv4
+  gateway, and `proxy_delay` 0: the kernel answers ARP for it on the TAP
+  at once, with the TAP's MAC address, as long as its own route to
+  `169.254.0.1` leaves through another device, as any default route does,
+  and forwarding is on;
+- routes for the pod's addresses, a /128 and a /32, to it.
+
+The guest is pushed its IPv6 address as a /128 with `fe80::1` as its
+gateway, its IPv4 address as a /32 with `169.254.0.1` as its gateway, on
+the link although outside the /32, and the resolver
 ([guest.md](guest.md)); its MAC address is `06:00` and the 8 hex digits
-of its ID. Deleting the pod deletes the TAP device, which takes the route
-with it.
+of its ID. Deleting the pod deletes the TAP device, which takes the
+routes and the proxy entry with it.
 
 ### Addresses
 
-A pod gets an IPv6 address of the prefix when it is created, and keeps it
-in its record (`PodInfo.ipv6_address`) while it is on the node. The next
-address comes from a counter in `/var/lib/feos/pods/next-ipv6-address`,
-from `::2` on, written before an address is handed out: no address is
-handed out twice, not after a restart either. The counter goes past any
-address a kept pod holds.
+A pod gets an IPv6 address of the prefix and an IPv4 address of the
+range when it is created, and keeps them in its record
+(`PodInfo.ipv6_address`, `PodInfo.ipv4_address`) while it is on the node.
 
-A pod kept from the first, IPv4 network gets an IPv6 address at the start
-of `feosd`, and loses its IPv4 address. Its microVM was made for that
-network: one that is stopped is made anew at the next boot; one that runs
-or is suspended keeps the old network until the pod is stopped and
-started.
+- **IPv6**: the next address comes from a counter in
+  `/var/lib/feos/pods/next-ipv6-address`, from `::2` on, written before
+  an address is handed out: no address is handed out twice, not after a
+  restart either. The counter goes past any address a kept pod holds.
+- **IPv4**: a /32 of the range, unique on the node; the range's first and
+  last address are left out. An address never handed out comes first,
+  the lowest; once there is none, the one that has been free the longest.
+  `/var/lib/feos/pods/ipv4-addresses` keeps the lowest address never
+  handed out and the addresses freed since, in the order they were freed
+  and with when, and is written before an address is handed out. At its
+  start `feosd` counts an address that was handed out, that no kept pod
+  holds and that is not recorded as free, such as one whose pod was
+  deleted while `feosd` could not record it, as free from then on.
+
+Deleting a pod takes it off the network (the resolver, the TAP device),
+then deletes the connection tracking entries whose original source is
+its IPv4 address, so that the next pod with the address finds none of
+them, while the records still know the pod; then the pod leaves the table,
+and its IPv4 address is freed.
+
+A pod kept from an earlier network gets what it lacks at the start of
+`feosd`: an IPv6 address if it has none of the prefix, such as one of the
+first version, and an IPv4 address if it has none of the range, such as
+one of IPv6 alone or with an address of the first version's
+`10.200.0.0/16`. Its microVM was made for that network: one that is
+stopped is made anew at the next boot; one that runs or is suspended
+keeps the old network until the pod is stopped and started, and `feosd`
+warns about it.
 
 ### DNS
 
 `feosd`'s resolver (`dns-service`) answers the pods it knows, by the
-source address of a query, which the TAP pins, and refuses everyone
-else. It asks the upstreams of the pod's spec (`PodNetwork.dns_upstreams`),
-or `--dns-upstream`, in order. A create refuses an upstream that is not an
-IP address, is the resolver itself, a loopback, link-local or multicast
-address, in a denied prefix, the pod prefix or one of the node's
-addresses.
+source address of a query, the pod's IPv4 address, which the TAP pins,
+and refuses everyone else. It asks the upstreams of the pod's spec
+(`PodNetwork.dns_upstreams`), or `--dns-upstream`, in order. A create
+refuses an upstream that is not an IP address, is the resolver itself, a
+loopback, link-local or multicast address, in a denied prefix, a pod's
+(the pod prefix or the IPv4 range) or one of the node's addresses.
 
-Answers pass as the upstream gave them; it takes `ech` out of HTTPS
-records, and records every query it answers.
+Answers pass as the upstream gave them: pods have IPv4, so nothing is
+synthesized. The resolver takes `ech` out of HTTPS records, and records
+every query it answers. Its sockets are `feosd`'s and close while it
+restarts: a query then fails rather than waits (ADR 0010 wants them to
+outlive `feosd`).
+
+### Metadata
+
+`169.254.169.254` is left to a metadata service in Firecracker's network
+device (MMDS, ADR 0010), which is not built. Like every link-local
+destination it is denied on the node, so no pod reaches the node's own
+cloud metadata service.
 
 ### The table
 
@@ -199,20 +252,27 @@ traffic is not theirs:
 | `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), of both families, before anything else; accepts what belongs to a connection; drops invalid packets from and to pods; then jumps to `from-pods` what comes from a TAP and to `to-pods` what goes to one |
 | `from-pods`, `to-pods` | go through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) to the pod's chains, and drop and log (`no-rule`) what a TAP the maps do not have sends or receives, such as one whose rules failed to be written |
 | `out-<TAP>`, `in-<TAP>` | a pod's chains: drop and log (`deny`) what goes to or comes from a denied address, `return` what a rule of the pod's groups allows, drop and log (`no-rule`) the rest; `out-` of both families, `in-` of IPv6 alone, since nothing new comes in over IPv4 |
-| `postrouting` (nat, 100) | masquerades the pods' IPv4 range, except into a pod's TAP |
+| `postrouting` (nat, 100) | masquerades the pods' IPv4 range where it leaves the node (`ip saddr 169.254.16.0/20 oifname != "pod-*" masquerade`) |
+
+ARP is not IP: the table does not see it, and the kernel answers a pod
+only for `169.254.0.1`, by proxy. A pod's IPv4 leaves the node
+masqueraded to the node's address, through Linux's connection tracking;
+its IPv6 is routed as it is. Every node needs IPv4 of its own for its
+pods to reach IPv4 destinations.
 
 A pod's chains end allowed traffic with `return`, not `accept`, which
 would end the base chain: a packet between two pods passes the sender's
 `out-` chain and the receiver's `in-` chain. The maps go to them
 (`goto`), so their `return` leads back to `forward`. The sets are what
 `network-service` compiles, each of one family: `deny4` and `deny6` (the
-denied prefixes, the node's own addresses, link-local, loopback,
-multicast and unspecified addresses), `internet4` and `internet6` (the
-default group's), `g-<group>` (a group's members, of IPv6) and
-`b-<hash>` (an address block without its exceptions, of its family). An
-IPv4 block counts in rules out; rules in ignore it. ICMP rules are of
-IPv4, ICMPv6 rules of IPv6. Drops are logged to nflog group 2, at most
-10 a second per pod and reason.
+denied prefixes, the node's own addresses, the pods' IPv4 range,
+link-local, loopback, multicast and unspecified addresses: pods reach
+each other over IPv6 alone), `internet4` and `internet6` (the default
+group's), `g-<group>` (a group's members, of IPv6) and `b-<hash>` (an
+address block without its exceptions, of its family). An IPv4 block
+counts in rules out; rules in ignore it. ICMP rules are of IPv4, ICMPv6
+rules of IPv6. Drops are logged to nflog group 2, at most 10 a second per
+pod and reason.
 
 `feosd` replaces the table at its start and whenever pods come or go or
 rules change; when only members of groups or the node's addresses change,

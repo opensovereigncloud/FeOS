@@ -30,7 +30,7 @@ To test feosd locally, you can execute `make run` to compile and run feosd as ro
 
     make run
 
-Pods with a network need `--pod-prefix` (`sudo ./target/x86_64-unknown-linux-musl/debug/feosd --pod-prefix fd00:fe05:1::/64` in a lab), and feosd then sets the machine's network up for them: forwarding, routes, the device `feos-dns`, and the table `inet feos` ([docs/architecture/node.md](../docs/architecture/node.md#the-pods-network)). Run it in a VM or a privileged container rather than on a machine whose network matters.
+Pods with a network need `--pod-prefix` (`sudo ./target/x86_64-unknown-linux-musl/debug/feosd --pod-prefix fd00:fe05:1::/64` in a lab), and feosd then sets the machine's network up for them: forwarding, routes, the device `feos-dns` with the resolver's `169.254.0.53`, proxy ARP for `169.254.0.1` on the pods' TAP devices, and the table `inet feos` ([docs/architecture/node.md](../docs/architecture/node.md#the-pods-network)). Run it in a VM or a privileged container rather than on a machine whose network matters.
 
 
 ## Guest image (Firecracker)

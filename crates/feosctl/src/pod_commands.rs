@@ -335,13 +335,16 @@ fn print_pod(pod: &PodInfo) {
         );
     }
     let network = spec.network.clone().unwrap_or_default();
-    match pod.ipv6_address.as_str() {
+    match (pod.ipv6_address.as_str(), pod.ipv4_address.as_str()) {
         _ if network.none => println!("  Network: none"),
-        "" => println!("  Address: none yet"),
-        address => println!("  Address: {address}"),
-    }
-    if !pod.ipv4_address.is_empty() {
-        println!("  IPv4 address: {}", pod.ipv4_address);
+        ("", "") => println!("  Addresses: none yet"),
+        (ipv6, ipv4) => {
+            for (family, address) in [("IPv6", ipv6), ("IPv4", ipv4)] {
+                if !address.is_empty() {
+                    println!("  {family} address: {address}");
+                }
+            }
+        }
     }
     if !network.security_groups.is_empty() {
         println!("  Security groups: {}", network.security_groups.join(", "));

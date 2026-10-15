@@ -74,8 +74,10 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   use fails with `INVALID_ARGUMENT`; one with a network on a node without
   `--pod-prefix`, or whose network is not set up, fails with
   `FAILED_PRECONDITION`.
-- `PodInfo.ipv6_address`: the pod's address, of the node's prefix, while
-  it is on the node. `PodInfo.ipv4_address`: empty for now.
+- `PodInfo.ipv6_address`: the pod's address on the network, of the
+  node's prefix, while it is on the node. `PodInfo.ipv4_address`: its
+  IPv4 address on the node, of `--pod-ipv4-range`, for leaving through
+  masquerade; another pod may have it once the pod is deleted.
 
 `feos.network.v1` is the node's side of ADR 0012 and ADR 0013:
 
@@ -94,8 +96,9 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
 
 The guest's network configuration (`SetNetworkConfigRequest`,
 `GetNetworkConfigResponse`, `feos.microvm.v1.GuestNetworkConfig`) gained
-`ipv6_cidr` and `ipv6_gateway` by addition; `feosd` pushes IPv6 only
-([guest.md](guest.md)).
+`ipv6_cidr` and `ipv6_gateway` by addition; `feosd` pushes both
+families: the IPv6 /128 via `fe80::1`, the IPv4 /32 via `169.254.0.1`,
+and its resolver ([guest.md](guest.md)).
 
 ## Compatibility
 

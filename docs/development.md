@@ -119,8 +119,9 @@ Build release artifacts per package (`cargo build -p <crate>`), never with
 binary.
 
 Tests against the kernel need root and are ignored by default: those of
-`feos_utils::nft` and of the pods' table in `pod-service` (in a network
-namespace of their own, `unshare -n`, with `nft` in `$NFT`), of
+`feos_utils::nft` and of the pods' table and a pod's link in
+`pod-service` (in a network namespace of their own, `unshare -n`, with
+`nft` in `$NFT`), of
 `traffic-service`, which make their namespaces, and of the guest's network
 push. Their modules say how to run them, with `--ignored`.
 

@@ -37,7 +37,7 @@ A pod has both families ([ADR 0010](../adr/0010-pod-network.md)):
 with `fe80::1` as its gateway, an IPv4 address of `169.254.16.0/20` as a
 /32 with `169.254.0.1` as its gateway, and `feosd`'s resolver,
 `169.254.0.53`. The IPv6 address is the pod's on the network; the IPv4
-one is for leaving, and the node masquerades or translates it.
+one is for leaving, and the node masquerades it.
 
 The guest turns router advertisements and address autoconfiguration off
 before the interface goes up, and adds the IPv6 address without

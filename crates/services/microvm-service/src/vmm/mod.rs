@@ -243,7 +243,7 @@ mod tests {
             interface: "eth0".to_string(),
             ipv4_cidr: ipv4.0.to_string(),
             gateway: ipv4.1.to_string(),
-            dns: vec!["fdfd:7b5:61d9::53".to_string()],
+            dns: vec!["169.254.0.53".to_string()],
             ipv6_cidr: ipv6.0.to_string(),
             ipv6_gateway: ipv6.1.to_string(),
             ..Default::default()
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn a_guest_network_has_one_family_at_least() {
-        let ipv4 = ("10.200.0.2/16", "10.200.0.1");
+        let ipv4 = ("169.254.16.2/32", "169.254.0.1");
         let ipv6 = ("fd00:fe05:ffff::2/128", "fe80::1");
         for ok in [
             network(ipv4, ("", "")),

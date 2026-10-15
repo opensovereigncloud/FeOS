@@ -3,23 +3,33 @@
 #
 #   FEOSD_ARGS="--tcp [::]:1337"
 #
-# Pods are IPv6 only (ADR 0010). feosd needs the prefix that the network
-# routes to this node to give pods a network; without it, pods with a
-# network fail:
+# Pods have an IPv6 address on the network and an IPv4 address for
+# leaving this node through masquerade (ADR 0010). feosd needs the prefix
+# that the network routes to this node to give pods a network; without it,
+# pods with a network fail:
 #
-#   --pod-prefix PREFIX     e.g. 2001:db8:7:1::/64. A /64 is best, a smaller
-#                           one such as a /80 is enough. A lab whose network
-#                           routes nothing to the node takes a ULA, such as
-#                           fd00:fe05:1::/64: nothing outside the node
-#                           reaches its pods.
-#   --dns-address ADDRESS   the pods' resolver, fdfd:7b5:61d9::53 by default.
-#   --dns-upstream ADDRESS  a resolver it asks for pods that name none
-#                           (repeatable); Google's and Cloudflare's by default.
-#   --deny-prefix PREFIX    a prefix no pod reaches (repeatable): a cloud's
-#                           metadata service, the control plane, management
-#                           networks.
+#   --pod-prefix PREFIX       e.g. 2001:db8:7:1::/64. A /64 is best, a
+#                             smaller one such as a /80 is enough. A lab
+#                             whose network routes nothing to the node takes
+#                             a ULA, such as fd00:fe05:1::/64: its pods leave
+#                             over IPv4 alone, and nothing outside the node
+#                             reaches them.
+#   --pod-ipv4-range PREFIX   the pods' IPv4 addresses, a /32 each,
+#                             169.254.16.0/20 by default.
+#   --dns-address ADDRESS     the pods' resolver, an IPv4 address this node
+#                             holds, 169.254.0.53 by default. Pods' gateway
+#                             is 169.254.0.1, which the node answers ARP for
+#                             on their TAP devices and never holds.
+#   --dns-upstream ADDRESS    a resolver it asks for pods that name none
+#                             (repeatable); Google's and Cloudflare's by
+#                             default.
+#   --deny-prefix PREFIX      a prefix of either family that no pod reaches
+#                             (repeatable): the control plane, management
+#                             networks. Link-local addresses, such as a
+#                             cloud's metadata service, and this node's own
+#                             are denied always.
 #
 # A lab:
 #
-#   FEOSD_ARGS="--pod-prefix fd00:fe05:1::/64 --deny-prefix 169.254.169.254/32"
+#   FEOSD_ARGS="--pod-prefix fd00:fe05:1::/64 --deny-prefix 10.0.0.0/8"
 FEOSD_ARGS=""

@@ -172,10 +172,10 @@ impl Pods {
                 let others = pods.values().map(|pod| &pod.info);
                 self.inner.network.allocate(others, &mut info)?;
             }
-            self.inner
-                .store
-                .save(&info)
-                .map_err(|e| Status::internal(format!("keep pod {pod_id}: {e}")))?;
+            if let Err(e) = self.inner.store.save(&info) {
+                self.inner.network.release(&info);
+                return Err(Status::internal(format!("keep pod {pod_id}: {e}")));
+            }
             pods.insert(
                 pod_id.clone(),
                 Pod {
@@ -242,12 +242,16 @@ impl Pods {
         Ok(())
     }
 
+    /// Deletes the pod: its microVM, its place on the network, its record
+    /// and its rules, and then frees its IPv4 address.
     pub async fn delete(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         self.delete_vm(pod_id).await?;
+        let info = self.info(pod_id)?;
         self.inner
             .network
-            .detach(&self.info(pod_id)?)
+            .detach(&info)
+            .await
             .map_err(|e| Status::internal(e.to_string()))?;
         self.inner
             .store
@@ -259,6 +263,7 @@ impl Pods {
         if let Err(e) = self.apply_network().await {
             warn!("Pods: Failed to set the pods' rules: {e}");
         }
+        self.inner.network.release(&info);
         info!("Pods: {pod_id} deleted");
         Ok(())
     }
@@ -599,8 +604,9 @@ impl Pods {
     }
 
     /// Puts the pod on the network, if it has one: its TAP device, its
-    /// route and the resolver, before every boot and resume. Fails while
-    /// the node does not have the pod's security groups.
+    /// routes, proxy ARP for its gateway and the resolver, before every
+    /// boot and resume. Fails while the node does not have the pod's
+    /// security groups.
     async fn attach(&self, pod_id: &str) -> Result<Option<Attachment>, Status> {
         self.inner.network.attach(&self.info(pod_id)?).await
     }
