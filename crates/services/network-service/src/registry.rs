@@ -64,8 +64,8 @@ const IPV4_SPECIAL: &[(&str, bool)] = &[
     ("192.0.0.8/32", false),       // IPv4 dummy address
     ("192.0.0.9/32", true),        // Port Control Protocol Anycast
     ("192.0.0.10/32", true),       // Traversal Using Relays around NAT Anycast
-    ("192.0.0.170/32", false),     // NAT64/DNS64 Discovery
-    ("192.0.0.171/32", false),     // NAT64/DNS64 Discovery
+    ("192.0.0.170/32", false),     // ipv4only.arpa (RFC 7050)
+    ("192.0.0.171/32", false),     // ipv4only.arpa (RFC 7050)
     ("192.0.2.0/24", false),       // Documentation (TEST-NET-1)
     ("192.31.196.0/24", true),     // AS112-v4
     ("192.52.193.0/24", true),     // AMT

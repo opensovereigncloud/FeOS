@@ -341,7 +341,7 @@ fn print_pod(pod: &PodInfo) {
         address => println!("  Address: {address}"),
     }
     if !pod.ipv4_address.is_empty() {
-        println!("  NAT64 address: {}", pod.ipv4_address);
+        println!("  IPv4 address: {}", pod.ipv4_address);
     }
     if !network.security_groups.is_empty() {
         println!("  Security groups: {}", network.security_groups.join(", "));

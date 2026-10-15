@@ -10,7 +10,6 @@ use pod_service::network;
 use std::net::SocketAddr;
 
 const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix PREFIX]
-             [--nat64 node|network] [--nat64-prefix PREFIX] [--nat64-pool PREFIX]
              [--dns-address ADDRESS] [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
        feosd --version
 
@@ -19,16 +18,10 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
   --pod-prefix PREFIX    the IPv6 prefix the network routes to this node, such
                          as a /64; pods get their addresses from it. Without,
                          pods with a network fail
-  --nat64 node|network   where pods' IPv4 traffic is translated: on this node
-                         (the default), or by a NAT64 in the network
-  --nat64-prefix PREFIX  the NAT64 prefix, a /96; 64:ff9b::/96 by default
-  --nat64-pool PREFIX    the IPv4 addresses that stand for pods on this node
-                         with --nat64 node; 10.200.0.0/16 by default
   --dns-address ADDRESS  the pods' resolver; fdfd:7b5:61d9::53 by default
   --dns-upstream ADDRESS an upstream resolver of pods that name none
                          (repeatable); Google's and Cloudflare's by default
-  --deny-prefix PREFIX   a prefix no pod reaches, IPv4 ones under the NAT64
-                         prefix (repeatable)";
+  --deny-prefix PREFIX   a prefix no pod reaches (repeatable)";
 
 #[derive(Debug, Default, PartialEq)]
 struct Args {
@@ -66,15 +59,6 @@ impl Args {
                 "--pod-prefix" => {
                     network.pod_prefix =
                         Some(network::parse_pod_prefix(&value("a prefix")?).map_err(flag)?);
-                }
-                "--nat64" => network.nat64 = value("node or network")?.parse().map_err(flag)?,
-                "--nat64-prefix" => {
-                    network.nat64_prefix =
-                        network::parse_nat64_prefix(&value("a prefix")?).map_err(flag)?;
-                }
-                "--nat64-pool" => {
-                    network.nat64_pool =
-                        network::parse_nat64_pool(&value("a prefix")?).map_err(flag)?;
                 }
                 "--dns-address" => {
                     let address = value("an address")?;
@@ -164,9 +148,6 @@ mod tests {
             &["--pod-prefix", "10.0.0.0/8"][..],
             &["--pod-prefix", "fd00::1/64"],
             &["--pod-prefix"],
-            &["--nat64", "both"],
-            &["--nat64-prefix", "64:ff9b::/64"],
-            &["--nat64-pool", "fd00::/64"],
             &["--dns-address", "10.0.0.53"],
             &["--dns-upstream", "dns.google"],
             &["--deny-prefix", "169.254.169.254"],
@@ -183,12 +164,6 @@ mod tests {
         let args = parse(&[
             "--pod-prefix",
             "fd00:fe05:1::/64",
-            "--nat64",
-            "network",
-            "--nat64-prefix",
-            "2001:db8:64::/96",
-            "--nat64-pool",
-            "10.201.0.0/24",
             "--dns-address",
             "fd00:53::1",
             "--dns-upstream",
@@ -206,12 +181,6 @@ mod tests {
             network.pod_prefix,
             Some(("fd00:fe05:1::".parse().unwrap(), 64))
         );
-        assert_eq!(network.nat64, network::Nat64Mode::Network);
-        assert_eq!(
-            network.nat64_prefix,
-            "2001:db8:64::".parse::<std::net::Ipv6Addr>().unwrap()
-        );
-        assert_eq!(network.nat64_pool, ("10.201.0.0".parse().unwrap(), 24));
         assert_eq!(
             network.dns_address,
             "fd00:53::1".parse::<std::net::Ipv6Addr>().unwrap()

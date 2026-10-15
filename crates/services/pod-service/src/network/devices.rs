@@ -14,6 +14,8 @@ use rtnetlink::{Handle, LinkDummy, LinkUnspec, RouteMessageBuilder};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 
+const IPV6_CONF: &str = "/proc/sys/net/ipv6/conf";
+
 pub async fn connect() -> io::Result<Handle> {
     let (connection, handle, _) = rtnetlink::new_connection()?;
     tokio::spawn(connection);
@@ -49,6 +51,43 @@ async fn index(handle: &Handle, name: &str) -> io::Result<u32> {
 
 fn sysctl(path: &str, value: &str) -> io::Result<()> {
     std::fs::write(path, value).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))
+}
+
+/// Turns IPv4 and IPv6 forwarding on, after
+/// [`keep_router_advertisements`].
+pub fn enable_forwarding() -> io::Result<()> {
+    keep_router_advertisements()?;
+    sysctl("/proc/sys/net/ipv4/ip_forward", "1")?;
+    sysctl(&format!("{IPV6_CONF}/all/forwarding"), "1")
+}
+
+/// Lets interfaces that take router advertisements (`accept_ra` 1) go on
+/// taking them once IPv6 forwarding is on (`accept_ra` 2): a router
+/// ignores them otherwise, and a node that learns its default route from
+/// them loses it when it expires. Pods' TAP devices (`pod-*`) and FeOS's
+/// own (`feos-*`) are left alone: the node takes no routes from them.
+fn keep_router_advertisements() -> io::Result<()> {
+    for entry in std::fs::read_dir(IPV6_CONF)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if ["all", "default", "lo"].contains(&name.as_ref())
+            || name.starts_with("pod-")
+            || name.starts_with("feos-")
+        {
+            continue;
+        }
+        let path = format!("{IPV6_CONF}/{name}/accept_ra");
+        // An interface may be gone by now.
+        let Ok(value) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if value.trim() == "1" {
+            sysctl(&path, "2")?;
+            info!("Network: {name} keeps taking router advertisements while forwarding");
+        }
+    }
+    Ok(())
 }
 
 /// IPv6 on a device of feosd's own: no router advertisements, no

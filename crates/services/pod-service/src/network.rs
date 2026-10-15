@@ -4,9 +4,8 @@
 //! The pods' network (ADR 0010, 0012, 0013). Pods are IPv6 only: each has
 //! an address of the node's prefix, routed to its TAP device, a link of
 //! its own between the node and the pod, on which the node is `fe80::1`.
-//! IPv4 goes through NAT64, names through feosd's resolver; the
-//! pods' security groups become nftables rules; and their traffic becomes
-//! records.
+//! Names go through feosd's resolver; the pods' security groups become
+//! nftables rules; and their traffic becomes records.
 
 mod addresses;
 mod devices;
@@ -14,19 +13,17 @@ mod rules;
 
 pub use rules::TABLE;
 
-use addresses::{Ipv6Addresses, Pool};
+use addresses::Ipv6Addresses;
 use dns_service::Resolver;
 use feos_proto::network_service::{traffic_record, TrafficRecord};
 use feos_proto::pod_service::{PodInfo, PodNetwork, PodSpec};
 use feos_utils::nft::{self, Family, Table};
 use log::{error, info, warn};
-use nat64::Nat64;
 use network_service::{compile, delta, Delta, Policy, Prefix, SecurityGroups};
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
@@ -57,40 +54,12 @@ const SET_UP_ATTEMPTS: u32 = 3;
 const SET_UP_PAUSE: Duration = Duration::from_secs(1);
 const DNS_PORT: u16 = 53;
 
-/// Where the node translates pods' IPv4 traffic (`--nat64`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Nat64Mode {
-    /// On the node, with an IPv4 address of its pool per pod.
-    #[default]
-    Node,
-    /// In the network: the node routes the NAT64 prefix like any other.
-    Network,
-}
-
-impl FromStr for Nat64Mode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "node" => Ok(Self::Node),
-            "network" => Ok(Self::Network),
-            other => Err(format!("NAT64 {other:?}: node or network")),
-        }
-    }
-}
-
 /// How the node builds the pods' network: feosd's flags.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// The prefix the network routes to the node (`--pod-prefix`).
     /// Without, pods with a network fail.
     pub pod_prefix: Option<(Ipv6Addr, u8)>,
-    pub nat64: Nat64Mode,
-    /// The NAT64 prefix, a /96 (`--nat64-prefix`).
-    pub nat64_prefix: Ipv6Addr,
-    /// The IPv4 addresses that stand for pods with `--nat64=node`
-    /// (`--nat64-pool`).
-    pub nat64_pool: (Ipv4Addr, u8),
     /// The resolver's address on every node (`--dns-address`).
     pub dns_address: Ipv6Addr,
     /// The upstreams of pods that name none (`--dns-upstream`).
@@ -103,9 +72,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pod_prefix: None,
-            nat64: Nat64Mode::Node,
-            nat64_prefix: nat64::PREFIX,
-            nat64_pool: (nat64::POOL, nat64::POOL_LEN),
             dns_address: DNS_ADDRESS,
             dns_upstreams: DNS_UPSTREAMS
                 .iter()
@@ -122,22 +88,6 @@ pub fn parse_pod_prefix(s: &str) -> Result<(Ipv6Addr, u8), String> {
         Prefix::V6(address, len) if (1..=120).contains(&len) => Ok((address, len)),
         Prefix::V6(..) => Err(format!("pod prefix {s}: from /1 to /120")),
         Prefix::V4(..) => Err(format!("pod prefix {s}: pods are IPv6 only")),
-    }
-}
-
-/// `--nat64-prefix`: an IPv6 /96.
-pub fn parse_nat64_prefix(s: &str) -> Result<Ipv6Addr, String> {
-    match s.parse::<Prefix>()? {
-        Prefix::V6(address, 96) => Ok(address),
-        _ => Err(format!("NAT64 prefix {s}: an IPv6 /96")),
-    }
-}
-
-/// `--nat64-pool`: an IPv4 prefix of /30 or more addresses.
-pub fn parse_nat64_pool(s: &str) -> Result<(Ipv4Addr, u8), String> {
-    match s.parse::<Prefix>()? {
-        Prefix::V4(address, len) if (1..=30).contains(&len) => Ok((address, len)),
-        _ => Err(format!("NAT64 pool {s}: an IPv4 prefix from /1 to /30")),
     }
 }
 
@@ -211,18 +161,15 @@ pub struct Network {
 
 struct Parts {
     ipv6: Ipv6Addresses,
-    /// With `--nat64=node`.
-    pool: Option<Pool>,
-    nat64: Option<Nat64>,
     resolver: Arc<Resolver>,
 }
 
 impl Network {
     /// Sets the node up for pods: removes the first version's bridge and
     /// tables, turns forwarding on, routes the pod prefix as unreachable,
-    /// gives the resolver its address and sockets, and attaches NAT64 or
-    /// detaches it. A failure is logged, and fails the pods with a network
-    /// from then on: feosd goes on serving the others.
+    /// and gives the resolver its address and sockets. A failure is logged,
+    /// and fails the pods with a network from then on: feosd goes on
+    /// serving the others.
     pub async fn start(
         config: Config,
         dir: &Path,
@@ -233,8 +180,8 @@ impl Network {
             Some(prefix) => match set_up_again(&config, prefix, dir, &records).await {
                 Ok(parts) => {
                     info!(
-                        "Network: Pods get addresses of {}/{}, NAT64 {:?} under {}/96, DNS at {}",
-                        prefix.0, prefix.1, config.nat64, config.nat64_prefix, config.dns_address
+                        "Network: Pods get addresses of {}/{}, DNS at {}",
+                        prefix.0, prefix.1, config.dns_address
                     );
                     Ok(parts)
                 }
@@ -299,9 +246,7 @@ impl Network {
         Ok(())
     }
 
-    /// The pod's upstream resolvers, port 53. An address under the NAT64
-    /// prefix is asked as the IPv4 address it stands for: the node itself
-    /// has no address that NAT64 translates.
+    /// The pod's upstream resolvers, port 53.
     fn upstreams(&self, network: &PodNetwork) -> Result<Vec<SocketAddr>, Status> {
         network
             .dns_upstreams
@@ -312,12 +257,6 @@ impl Network {
                         "DNS upstream {upstream:?} is not an IP address"
                     ))
                 })?;
-                let address = match address {
-                    IpAddr::V6(v6) => {
-                        nat64::extract(self.config.nat64_prefix, v6).map_or(address, IpAddr::V4)
-                    }
-                    v4 => v4,
-                };
                 if let Some(why) = self.refused_upstream(address) {
                     return Err(Status::invalid_argument(format!(
                         "DNS upstream {upstream}: {why}"
@@ -369,19 +308,13 @@ impl Network {
         {
             return Some("it is a pod's");
         }
-        let (pool, len) = self.config.nat64_pool;
-        if self.config.nat64 == Nat64Mode::Node && Prefix::V4(pool, len).contains(&host) {
-            return Some("it is in the NAT64 pool");
-        }
         if lock(&self.node_addresses).contains(&address) {
             return Some("it is the node's");
         }
         None
     }
 
-    /// Gives a new pod its addresses: an IPv6 address of the prefix, and
-    /// with `--nat64=node` an IPv4 address of the pool. `pods` are the
-    /// others.
+    /// Gives a new pod its address, of the prefix. `pods` are the others.
     pub fn allocate<'a>(
         &self,
         pods: impl Iterator<Item = &'a PodInfo>,
@@ -390,7 +323,6 @@ impl Network {
         let parts = self.parts()?;
         let tap = tap_name(&info.pod_id);
         let mut ipv6 = HashSet::new();
-        let mut ipv4 = HashSet::new();
         for pod in pods.filter(|pod| has_network(pod)) {
             if tap_name(&pod.pod_id) == tap {
                 return Err(Status::already_exists(format!(
@@ -399,42 +331,31 @@ impl Network {
                 )));
             }
             ipv6.extend(pod.ipv6_address.parse::<Ipv6Addr>());
-            ipv4.extend(pod.ipv4_address.parse::<Ipv4Addr>());
         }
         let exhausted = |e: io::Error| Status::resource_exhausted(format!("no address: {e}"));
         info.ipv6_address = parts.ipv6.allocate(&ipv6).map_err(exhausted)?.to_string();
-        info.ipv4_address = match &parts.pool {
-            Some(pool) => pool.allocate(&ipv4).map_err(exhausted)?.to_string(),
-            None => String::new(),
-        };
+        info.ipv4_address = String::new();
         Ok(())
     }
 
     /// Gives pods kept from before what this network needs: an IPv6
     /// address of the prefix to those without one, such as those of the
-    /// first version's IPv4 network, and an IPv4 address of the pool with
-    /// `--nat64=node`, or none without. Returns the IDs of those changed.
+    /// first version's IPv4 network, and no IPv4 address. Returns the IDs
+    /// of those changed.
     pub fn adopt(&self, pods: &mut [PodInfo]) -> Vec<String> {
         let Ok(parts) = self.parts() else {
             return Vec::new();
         };
         // What pods keep comes first; the others get what is left.
         let mut ipv6 = HashSet::new();
-        let mut ipv4 = HashSet::new();
         let mut kept = Vec::with_capacity(pods.len());
         for pod in pods.iter() {
             let network = has_network(pod);
             let v6 = pod.ipv6_address.parse::<Ipv6Addr>().ok();
-            let v6 = v6.filter(|a| network && parts.ipv6.contains(*a) && ipv6.insert(*a));
-            let v4 = pod.ipv4_address.parse::<Ipv4Addr>().ok().filter(|a| {
-                network
-                    && parts.pool.as_ref().is_some_and(|pool| pool.contains(*a))
-                    && ipv4.insert(*a)
-            });
-            kept.push((v6, v4));
+            kept.push(v6.filter(|a| network && parts.ipv6.contains(*a) && ipv6.insert(*a)));
         }
         let mut changed = Vec::new();
-        for (pod, (v6, v4)) in pods.iter_mut().zip(kept) {
+        for (pod, v6) in pods.iter_mut().zip(kept) {
             if !has_network(pod) {
                 continue;
             }
@@ -448,29 +369,11 @@ impl Network {
                     Err(e) => warn!("Network: No address for pod {}: {e}", pod.pod_id),
                 }
             }
-            pod.ipv4_address = match (&parts.pool, v4) {
-                (None, _) => String::new(),
-                (Some(_), Some(kept)) => kept.to_string(),
-                (Some(pool), None) => match pool.allocate(&ipv4) {
-                    Ok(address) => {
-                        ipv4.insert(address);
-                        address.to_string()
-                    }
-                    Err(e) => {
-                        warn!("Network: No NAT64 address for pod {}: {e}", pod.pod_id);
-                        String::new()
-                    }
-                },
-            };
+            pod.ipv4_address = String::new();
             if (&pod.ipv6_address, &pod.ipv4_address) != (&before.0, &before.1) {
                 info!(
-                    "Network: Pod {} has the address {}{}",
-                    pod.pod_id,
-                    pod.ipv6_address,
-                    match pod.ipv4_address.as_str() {
-                        "" => String::new(),
-                        v4 => format!(", {v4} behind NAT64"),
-                    }
+                    "Network: Pod {} has the address {}",
+                    pod.pod_id, pod.ipv6_address
                 );
                 changed.push(pod.pod_id.clone());
             }
@@ -478,45 +381,21 @@ impl Network {
         changed
     }
 
-    /// Brings NAT64's mappings and the resolver's pods in line with the
-    /// pods kept: after a restart of feosd.
+    /// Brings the resolver's pods in line with the pods kept: after a
+    /// restart of feosd.
     pub fn sync(&self, pods: &[PodInfo]) {
         let Ok(parts) = self.parts() else {
             return;
         };
-        let mut wanted = HashMap::new();
         for pod in pods.iter().filter(|pod| has_network(pod)) {
             let Ok(address) = pod.ipv6_address.parse::<Ipv6Addr>() else {
                 continue;
             };
-            if let Ok(ipv4) = pod.ipv4_address.parse::<Ipv4Addr>() {
-                wanted.insert(address, ipv4);
-            }
             match self.upstreams(&pod_network(pod)) {
                 Ok(upstreams) => parts
                     .resolver
                     .set_client(address.into(), &pod.pod_id, upstreams),
                 Err(e) => warn!("Network: Pod {} gets no DNS: {}", pod.pod_id, e.message()),
-            }
-        }
-        let Some(nat64) = &parts.nat64 else {
-            return;
-        };
-        match nat64.mappings() {
-            Ok(mappings) => {
-                for (pod, ipv4) in mappings {
-                    if wanted.get(&pod) != Some(&ipv4)
-                        && let Err(e) = nat64.unmap(pod)
-                    {
-                        warn!("Network: Failed to unmap {pod} from NAT64: {e}");
-                    }
-                }
-            }
-            Err(e) => warn!("Network: NAT64's mappings do not read: {e}"),
-        }
-        for (pod, ipv4) in wanted {
-            if let Err(e) = nat64.map(pod, ipv4) {
-                warn!("Network: Failed to map {pod} to {ipv4} in NAT64: {e}");
             }
         }
     }
@@ -557,11 +436,6 @@ impl Network {
         devices::tap(&handle, &tap, GATEWAY, address)
             .await
             .map_err(|e| Status::internal(format!("attach {tap}: {e}")))?;
-        if let (Some(nat64), Ok(ipv4)) = (&parts.nat64, info.ipv4_address.parse()) {
-            nat64
-                .map(address, ipv4)
-                .map_err(|e| Status::internal(format!("NAT64 for {address}: {e}")))?;
-        }
         parts.resolver.set_client(address.into(), pod_id, upstreams);
         Ok(Some(Attachment {
             tap,
@@ -571,19 +445,14 @@ impl Network {
         }))
     }
 
-    /// Takes a deleted pod off the network: its TAP device, its NAT64
-    /// mapping and its resolver.
+    /// Takes a deleted pod off the network: its TAP device and its
+    /// resolver.
     pub fn detach(&self, info: &PodInfo) -> io::Result<()> {
         if !has_network(info) {
             return Ok(());
         }
         if let (Ok(parts), Ok(address)) = (&self.parts, info.ipv6_address.parse::<Ipv6Addr>()) {
             parts.resolver.remove_client(address.into());
-            if let Some(nat64) = &parts.nat64
-                && let Err(e) = nat64.unmap(address)
-            {
-                warn!("Network: Failed to unmap {address} from NAT64: {e}");
-            }
         }
         let tap = tap_name(&info.pod_id);
         microvm_service::vmm::jail::tap::delete(&tap)
@@ -644,18 +513,14 @@ impl Network {
         Ok(())
     }
 
-    /// What no pod reaches: the denied prefixes, the node's own
-    /// addresses, and with `--nat64=node` the pool.
+    /// What no pod reaches: the denied prefixes and the node's own
+    /// addresses.
     fn denied(&self, node: &[IpAddr]) -> Vec<Prefix> {
         let mut denied = self.config.deny_prefixes.clone();
         denied.extend(node.iter().map(|address| match *address {
             IpAddr::V4(v4) => Prefix::V4(v4, 32),
             IpAddr::V6(v6) => Prefix::V6(v6, 128),
         }));
-        if self.config.nat64 == Nat64Mode::Node {
-            let (pool, len) = self.config.nat64_pool;
-            denied.push(Prefix::V4(pool, len));
-        }
         denied
     }
 
@@ -703,30 +568,11 @@ async fn set_up(
     dir: &Path,
     records: &broadcast::Sender<TrafficRecord>,
 ) -> io::Result<Parts> {
-    // The bridge's route to 10.200.0.0/16 would take NAT64's pool.
     remove_old_network(false).await?;
     let handle = devices::connect().await?;
-    nat64::enable_forwarding()?;
+    devices::enable_forwarding()?;
     devices::route_unreachable(&handle, prefix, len).await?;
     devices::dummy_with_address(&handle, DNS_DEVICE, config.dns_address).await?;
-
-    let (pool, pool_len) = config.nat64_pool;
-    let nat64_config = nat64::Config {
-        prefix: config.nat64_prefix,
-        pool,
-        pool_len,
-        pin_dir: nat64::PIN_DIR.into(),
-    };
-    let (nat64, pool) = match config.nat64 {
-        Nat64Mode::Node => (
-            Some(Nat64::attach(&nat64_config).await?),
-            Some(Pool::new(dir, pool, pool_len)),
-        ),
-        Nat64Mode::Network => {
-            Nat64::detach(Path::new(nat64::PIN_DIR)).await?;
-            (None, None)
-        }
-    };
 
     let resolver = Resolver::new(dns_service::Config {
         default_upstreams: config
@@ -756,8 +602,6 @@ async fn set_up(
     });
     Ok(Parts {
         ipv6: Ipv6Addresses::new(dir, prefix, len),
-        pool,
-        nat64,
         resolver,
     })
 }
@@ -939,19 +783,6 @@ mod tests {
         assert!(parse_pod_prefix("fd00:fe05:1::1/64").is_err(), "host bits");
         assert!(parse_pod_prefix("fd00::/127").is_err(), "no room");
         assert!(parse_pod_prefix("10.0.0.0/8").is_err());
-        assert_eq!(
-            parse_nat64_prefix("64:ff9b::/96"),
-            Ok("64:ff9b::".parse().unwrap())
-        );
-        assert!(parse_nat64_prefix("64:ff9b::/64").is_err());
-        assert_eq!(
-            parse_nat64_pool("10.200.0.0/16"),
-            Ok((Ipv4Addr::new(10, 200, 0, 0), 16))
-        );
-        assert!(parse_nat64_pool("10.200.0.0/31").is_err());
-        assert!(parse_nat64_pool("fd00::/64").is_err());
-        assert_eq!("network".parse(), Ok(Nat64Mode::Network));
-        assert!("both".parse::<Nat64Mode>().is_err());
         let config = Config::default();
         assert_eq!(config.dns_upstreams.len(), 4);
         assert_eq!(config.dns_address, DNS_ADDRESS);
@@ -976,21 +807,14 @@ mod tests {
                 "9.9.9.9:53".parse().unwrap()
             ]
         );
-        // An address under the NAT64 prefix is asked over IPv4.
-        assert_eq!(
-            check(&["64:ff9b::909:909"]).unwrap(),
-            ["9.9.9.9:53".parse::<SocketAddr>().unwrap()]
-        );
         for refused in [
             "fdfd:7b5:61d9::53",
             "100.64.1.1",
-            "64:ff9b::6440:101",
             "2001:db8::53",
             "127.0.0.1",
             "::1",
             "fe80::1",
             "fd00:fe05:1::2",
-            "10.200.0.9",
             "192.0.2.7",
             "dns.google",
         ] {
@@ -1008,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn denied_has_the_node_and_the_pool() {
+    fn denied_has_the_node() {
         let network = network(Config {
             deny_prefixes: vec!["169.254.169.254/32".parse().unwrap()],
             ..Config::default()
@@ -1020,14 +844,11 @@ mod tests {
                 "169.254.169.254/32".parse().unwrap(),
                 "192.0.2.7/32".parse().unwrap(),
                 "2001:db8::7/128".parse().unwrap(),
-                "10.200.0.0/16".parse().unwrap(),
             ]
         );
-        let network_nat64 = self::tests::network(Config {
-            nat64: Nat64Mode::Network,
-            ..Config::default()
-        });
-        assert!(network_nat64.denied(&[]).is_empty());
+        assert!(self::tests::network(Config::default())
+            .denied(&[])
+            .is_empty());
     }
 
     #[test]

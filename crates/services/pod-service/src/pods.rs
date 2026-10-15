@@ -599,8 +599,8 @@ impl Pods {
     }
 
     /// Puts the pod on the network, if it has one: its TAP device, its
-    /// route, NAT64 and the resolver, before every boot and resume. Fails
-    /// while the node does not have the pod's security groups.
+    /// route and the resolver, before every boot and resume. Fails while
+    /// the node does not have the pod's security groups.
     async fn attach(&self, pod_id: &str) -> Result<Option<Attachment>, Status> {
         self.inner.network.attach(&self.info(pod_id)?).await
     }

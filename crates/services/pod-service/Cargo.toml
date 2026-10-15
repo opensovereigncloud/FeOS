@@ -12,7 +12,6 @@ feos-utils = { workspace = true }
 microvm-service = { workspace = true }
 network-service = { workspace = true }
 dns-service = { workspace = true }
-nat64 = { workspace = true }
 traffic-service = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

@@ -75,9 +75,7 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   `--pod-prefix`, or whose network is not set up, fails with
   `FAILED_PRECONDITION`.
 - `PodInfo.ipv6_address`: the pod's address, of the node's prefix, while
-  it is on the node. `PodInfo.ipv4_address`: with `--nat64=node`, the
-  address of the node's pool that stands for the pod behind NAT64; the
-  guest never sees it.
+  it is on the node. `PodInfo.ipv4_address`: empty for now.
 
 `feos.network.v1` is the node's side of ADR 0012 and ADR 0013:
 
@@ -88,7 +86,7 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   `FAILED_PRECONDITION` while a pod names the group; `GetSecurityGroup`
   and `ListSecurityGroups`. A rule is a direction, a protocol (TCP, UDP,
   ICMPv6 or any), ports of TCP and UDP, and a peer: an address block with
-  exceptions, IPv4 ones under the NAT64 prefix, or a group's members. A
+  exceptions, of either family, or a group's members. A
   change applies to the pods' rules within moments of the call.
 - `TrafficService.StreamTrafficRecords` streams flows, drops, DNS queries
   and server names as `feosd` makes them, of one pod or of all; what a

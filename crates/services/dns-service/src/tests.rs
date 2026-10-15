@@ -479,8 +479,8 @@ async fn passes_reverse_queries() {
         answer.answers()[0].data(),
         &RData::PTR(PTR(name("v4.test.")))
     );
-    // A name under the NAT64 prefix is asked as it is.
-    let address: Ipv6Addr = "64:ff9b::102:304".parse().unwrap();
+    // An IPv6 reverse name is asked as it is.
+    let address: Ipv6Addr = "2001:db8::102:304".parse().unwrap();
     let reverse = Name::from(address);
     let answer = ask_udp(server, &query(&reverse.to_ascii(), RecordType::PTR)).await;
     assert_eq!(answer.response_code(), ResponseCode::NXDomain);

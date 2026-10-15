@@ -65,7 +65,6 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 |---|---|
 | `/var/lib/feos/pods/<id>.pb` | a pod: its spec, its state and why, its addresses (a `feos.pod.v1.PodInfo`) |
 | `/var/lib/feos/pods/next-ipv6-address` | the counter of the pods' IPv6 addresses: the next one handed out |
-| `/var/lib/feos/pods/next-address` | where the next pod's NAT64 address is looked for in the pool |
 | `/var/lib/feos/security-groups/<id>.pb` | a security group (a `feos.network.v1.SecurityGroup`) |
 | `/var/lib/feos/vms.db` | the microVM records (SQLite) |
 | `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
@@ -73,7 +72,6 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 | `/var/lib/feos/containers/` | the host's containers, a `container.json` each |
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
 | `/run/feos/` | the API sockets, the task service's pid, the runtime state of containers |
-| `/sys/fs/bpf/feos/nat64/` | NAT64's pinned maps: the pods' IPv4 addresses and the counters |
 | `/usr/lib/feos/firecracker/<version>/` | Firecracker and its jailer, a version each, side by side |
 | `/usr/lib/feos/guest/<version>/` | the guest's `vmlinuz` and `initramfs`, a version each, side by side |
 
@@ -117,19 +115,16 @@ what they reach ([ADR 0012](../adr/0012-security-groups.md)), and their
 traffic is recorded ([ADR 0013](../adr/0013-traffic-records.md)). The code
 is `crates/services/pod-service/src/network*`, on top of
 `network-service` (the groups and their compiler), `dns-service` (the
-resolver), `nat64` and `traffic-service` (the records).
+resolver) and `traffic-service` (the records).
 
 `feosd` takes these options:
 
 | Option | Default | What it is |
 |---|---|---|
 | `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120; a /64 is best |
-| `--nat64 node\|network` | `node` | translate pods' IPv4 traffic on the node, or leave it to a NAT64 in the network |
-| `--nat64-prefix PREFIX` | `64:ff9b::/96` | the NAT64 prefix, a /96, which DNS64 synthesizes under |
-| `--nat64-pool PREFIX` | `10.200.0.0/16` | with `--nat64=node`, the IPv4 addresses that stand for pods; `.1` stands for the node |
 | `--dns-address ADDRESS` | `fdfd:7b5:61d9::53` | the pods' resolver, the same on every node |
 | `--dns-upstream ADDRESS` | Google's and Cloudflare's, IPv6 first | the upstreams of pods that name none (repeatable) |
-| `--deny-prefix PREFIX` | none | what no pod reaches, IPv4 prefixes under the NAT64 prefix (repeatable) |
+| `--deny-prefix PREFIX` | none | what no pod reaches (repeatable) |
 
 Without `--pod-prefix`, or when the network cannot be set up, `feosd`
 logs the error and runs on: creating a pod with a network fails with
@@ -150,9 +145,7 @@ At its start `feosd`:
    here goes back as unreachable rather than out again;
 4. gives the dummy device `feos-dns` the resolver's address, a /128
    without duplicate address detection, and binds the resolver's UDP and
-   TCP sockets to it, port 53;
-5. with `--nat64=node`, attaches NAT64 (below); with `--nat64=network`,
-   removes it.
+   TCP sockets to it, port 53.
 
 Before every boot and resume of a pod, `feosd` makes its TAP device,
 `pod-<8 hex digits of the ID>`, a link of its own between the node and
@@ -172,16 +165,13 @@ in its record (`PodInfo.ipv6_address`) while it is on the node. The next
 address comes from a counter in `/var/lib/feos/pods/next-ipv6-address`,
 from `::2` on, written before an address is handed out: no address is
 handed out twice, not after a restart either. The counter goes past any
-address a kept pod holds. With `--nat64=node` a pod also gets an IPv4
-address of the pool (`PodInfo.ipv4_address`), from a cursor in
-`/var/lib/feos/pods/next-address`, from `.2` on; a freed one comes round
-last.
+address a kept pod holds.
 
 A pod kept from the first, IPv4 network gets an IPv6 address at the start
-of `feosd`, and keeps its IPv4 address as its NAT64 address if it is in
-the pool. Its microVM was made for that network: one that is stopped is
-made anew at the next boot; one that runs or is suspended keeps the old
-network until the pod is stopped and started.
+of `feosd`, and loses its IPv4 address. Its microVM was made for that
+network: one that is stopped is made anew at the next boot; one that runs
+or is suspended keeps the old network until the pod is stopped and
+started.
 
 ### DNS
 
@@ -190,32 +180,11 @@ source address of a query, which the TAP pins, and refuses everyone
 else. It asks the upstreams of the pod's spec (`PodNetwork.dns_upstreams`),
 or `--dns-upstream`, in order. A create refuses an upstream that is not an
 IP address, is the resolver itself, a loopback, link-local or multicast
-address, in a denied prefix, the pod prefix, the NAT64 pool or one of the
-node's addresses; one under the NAT64 prefix is asked as the IPv4 address
-it stands for.
+address, in a denied prefix, the pod prefix or one of the node's
+addresses.
 
-It is DNS64: an AAAA query for a name without AAAA records gets the
-name's A records under the NAT64 prefix. When the pod prefix is a ULA
-(`fc00::/7`), as in labs, every AAAA record counts as absent and every
-name is reached through NAT64. It answers `ipv4only.arpa`, takes `ech`
-and `ipv4hint` out of HTTPS records, and records every query it answers.
-
-### NAT64
-
-With `--nat64=node`, `feosd` attaches the translator of the crate `nat64`:
-the dummy device `feos-nat64`, routes for the NAT64 prefix and the pool
-into it, and an eBPF program on its egress that translates between a
-pod's IPv6 address and its IPv4 address of the pool (SIIT, RFC 7915,
-with an explicit mapping per pod) and hands the packet back to the node.
-The program's maps are pinned in `/sys/fs/bpf/feos/nat64/` (`feosd`
-mounts the bpf filesystem if it is not), so translation goes on while
-`feosd` restarts; at its start `feosd` brings the mappings in line with
-the pods' records. A pod is mapped before every boot and resume and
-unmapped when it is deleted. No interface carries a pool address; the
-table below masquerades the pool to the node's address.
-
-The object `crates/nat64/bpf/nat64.bpf.o` is committed; `make nat64-bpf`
-builds it from `crates/nat64-ebpf` ([development.md](../development.md)).
+Answers pass as the upstream gave them; it takes `ech` out of HTTPS
+records, and records every query it answers.
 
 ### The table
 

@@ -25,11 +25,6 @@ crates/
   feos-utils/           shared building blocks: logger, mounts, reaper, vsock,
                         resolvers, confined container file access, dispatch
   feosctl/              command-line client
-  nat64/                NAT64 on the node: loads the eBPF program (aya), its
-                        device, routes and pinned maps; the program's object
-                        is bpf/nat64.bpf.o, committed
-  nat64-ebpf/           the NAT64 eBPF program, outside the workspace: nightly,
-                        bpf-linker
   services/
     container-service/  containers: overlay roots, exec, adoption, persistence
     dns-service/        the pods' resolver, which feosd serves
@@ -39,9 +34,9 @@ crates/
     network-service/    security groups: their store, SecurityGroupService,
                         and the compiler into sets of addresses and rules
     pod-service/        pods on top of the microVM layer, their network
-                        (addresses, TAP devices, the nftables table, NAT64,
-                        DNS, records), and the forwarding of a pod's services
-                        to its guest
+                        (addresses, TAP devices, the nftables table, DNS,
+                        records), and the forwarding of a pod's services to
+                        its guest
     task-service/       the container runtime (libcontainer), its own process
     traffic-service/    traffic records: flows from conntrack, drops and
                         server names from nflog; TrafficService
@@ -119,25 +114,9 @@ use) and `protoc`.
     make diskd-lab             # diskd's lab tests: ublk, recovery, writes,
                                # flatten, S3; needs sudo and fio, S3 from the env
 
-    make test-nat64            # NAT64 in network namespaces: echo, TCP, UDP,
-                               # ICMP errors, attach under traffic; needs sudo
-    make nat64-bpf             # rebuild crates/nat64/bpf/nat64.bpf.o; needs the
-                               # pinned nightly and bpf-linker
-
 Build release artifacts per package (`cargo build -p <crate>`), never with
 `--workspace`: a workspace build unifies the features of all crates into every
 binary.
-
-### The NAT64 eBPF program
-
-The program in `crates/nat64-ebpf` is not in the workspace: it builds for
-`bpfel-unknown-none` on the dated nightly that its `rust-toolchain.toml`
-pins, with `-Z build-std=core`, and links with bpf-linker 0.9.13
-(`cargo install bpf-linker`). `make nat64-bpf` builds it into
-`crates/nat64/bpf/nat64.bpf.o` and prints its sha256; the object is
-committed and `crates/nat64` embeds it, so no other build needs nightly.
-Rebuild it, test it with `make test-nat64`, and commit the object with the
-program's change.
 
 Tests against the kernel need root and are ignored by default: those of
 `feos_utils::nft` and of the pods' table in `pod-service` (in a network

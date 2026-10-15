@@ -4,9 +4,7 @@
 //! Asking the upstream resolvers: over UDP from a socket of its own, so from
 //! a port of the kernel's choosing, with an ID of ours; over TCP when the
 //! query came over TCP or the answer does not fit. A response counts only
-//! from the upstream asked, with the ID and the question of the query. A
-//! node without IPv4 of its own asks an IPv4 upstream through the network's
-//! NAT64.
+//! from the upstream asked, with the ID and the question of the query.
 
 use crate::{dnssec_ok, read_message, write_message, UDP_PAYLOAD};
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};

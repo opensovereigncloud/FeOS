@@ -30,23 +30,6 @@ SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
 path = [
-    "crates/nat64-ebpf/Cargo.lock",
-    "crates/nat64-ebpf/rust-toolchain.toml",
-    "crates/nat64-ebpf/.cargo/config.toml",
-]
-precedence = "aggregate"
-SPDX-FileCopyrightText = "SAP SE or an SAP affiliate company and IronCore contributors"
-SPDX-License-Identifier = "Apache-2.0"
-
-# Built from crates/nat64-ebpf by `make nat64-bpf`.
-[[annotations]]
-path = "crates/nat64/bpf/nat64.bpf.o"
-precedence = "override"
-SPDX-FileCopyrightText = "SAP SE or an SAP affiliate company and IronCore contributors"
-SPDX-License-Identifier = "Apache-2.0"
-
-[[annotations]]
-path = [
     "hack/**",
     "docs/**",
     "**/README.md",

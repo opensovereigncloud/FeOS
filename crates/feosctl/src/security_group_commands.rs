@@ -21,8 +21,8 @@ A rule allows one kind of traffic, in or out:
   protocol  tcp, udp, icmp, icmpv6 or any
   ports     TCP and UDP only, e.g. 443 or 80,443,8000-8100; every port without
   peer      group <id>: the members of a security group; or
-            <prefix> [except <prefix>,...]: an address block, IPv4 ones
-            under the NAT64 prefix
+            <prefix> [except <prefix>,...]: an address block of either
+            family
 
 Examples:
 

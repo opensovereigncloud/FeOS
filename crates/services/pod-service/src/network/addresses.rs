@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The pods' addresses: IPv6 ones of the node's prefix, never handed out
-//! twice (ADR 0010), and IPv4 ones of the NAT64 pool, which come round
-//! again.
+//! twice (ADR 0010).
 
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 
 /// The first address of the prefix a pod gets: `::0` is the subnet's
@@ -78,61 +77,6 @@ impl Ipv6Addresses {
     }
 }
 
-/// Hands out the NAT64 pool's addresses in turn, from a cursor kept in a
-/// file: an address a deleted pod freed comes round again only after all
-/// others. `.1` stands for the node (`nat64::Config::node_ipv4`).
-pub struct Pool {
-    cursor: PathBuf,
-    base: Ipv4Addr,
-    len: u8,
-}
-
-impl Pool {
-    pub fn new(dir: &Path, base: Ipv4Addr, len: u8) -> Self {
-        Self {
-            cursor: dir.join("next-address"),
-            base,
-            len,
-        }
-    }
-
-    pub fn contains(&self, address: Ipv4Addr) -> bool {
-        let mask = u32::MAX.checked_shl(32 - u32::from(self.len)).unwrap_or(0);
-        let offset = u32::from(address) & !mask;
-        u32::from(address) & mask == u32::from(self.base) && (2..=self.last()).contains(&offset)
-    }
-
-    /// The next address no pod in `used` holds.
-    pub fn allocate(&self, used: &HashSet<Ipv4Addr>) -> io::Result<Ipv4Addr> {
-        let base = u32::from(self.base);
-        // .0 is the network, .1 the node, the last the broadcast.
-        let (first, last) = (2u32, self.last());
-        if last < first {
-            return Err(io::Error::other("the NAT64 pool has no room for pods"));
-        }
-        let start = fs::read_to_string(&self.cursor)
-            .ok()
-            .and_then(|cursor| cursor.trim().parse::<u32>().ok())
-            .filter(|cursor| (first..=last).contains(cursor))
-            .unwrap_or(first);
-        let span = last - first + 1;
-        for step in 0..span {
-            let offset = first + (start - first + step) % span;
-            let address = Ipv4Addr::from(base + offset);
-            if !used.contains(&address) {
-                let next = if offset == last { first } else { offset + 1 };
-                write_atomically(&self.cursor, &next.to_string())?;
-                return Ok(address);
-            }
-        }
-        Err(io::Error::other("the NAT64 pool is full"))
-    }
-
-    fn last(&self) -> u32 {
-        (u32::MAX.checked_shr(u32::from(self.len)).unwrap_or(0)).saturating_sub(1)
-    }
-}
-
 /// Replaces `path` by a rename, after the new content is on disk.
 fn write_atomically(path: &Path, content: &str) -> io::Result<()> {
     let temporary = path.with_extension("new");
@@ -189,28 +133,5 @@ mod tests {
         assert_eq!(addresses.allocate(&used).unwrap(), a("fd00::102"));
         assert_eq!(addresses.allocate(&used).unwrap(), a("fd00::103"));
         assert!(addresses.allocate(&used).is_err());
-    }
-
-    #[test]
-    fn pool_addresses_come_round_in_turn() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = Pool::new(dir.path(), Ipv4Addr::new(10, 200, 0, 0), 16);
-        let mut used = HashSet::new();
-        let first = pool.allocate(&used).unwrap();
-        assert_eq!(first, Ipv4Addr::new(10, 200, 0, 2));
-        used.insert(first);
-        assert_eq!(pool.allocate(&used).unwrap(), Ipv4Addr::new(10, 200, 0, 3));
-        // .2 is free again, but its turn comes last.
-        used.remove(&first);
-        assert_eq!(pool.allocate(&used).unwrap(), Ipv4Addr::new(10, 200, 0, 4));
-        fs::write(dir.path().join("next-address"), "65534").unwrap();
-        assert_eq!(
-            pool.allocate(&used).unwrap(),
-            Ipv4Addr::new(10, 200, 255, 254)
-        );
-        assert_eq!(pool.allocate(&used).unwrap(), Ipv4Addr::new(10, 200, 0, 2));
-        assert!(pool.contains(Ipv4Addr::new(10, 200, 0, 2)));
-        assert!(!pool.contains(Ipv4Addr::new(10, 200, 0, 1)), "the node's");
-        assert!(!pool.contains(Ipv4Addr::new(10, 201, 0, 2)));
     }
 }
