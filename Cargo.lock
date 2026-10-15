@@ -959,6 +959,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-service"
+version = "0.6.0"
+dependencies = [
+ "feos-proto",
+ "hickory-proto",
+ "libc",
+ "log",
+ "prost-types",
+ "rand 0.9.2",
+ "tokio",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

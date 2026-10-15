@@ -9,6 +9,7 @@ members = [
     "crates/feos-utils",
     "crates/feosctl",
     "crates/services/container-service",
+    "crates/services/dns-service",
     "crates/services/forward-service",
     "crates/services/host-service",
     "crates/services/image-service",
@@ -61,6 +62,8 @@ libc = "0.2"
 rtnetlink = "0.18.1"
 pnet = "0.35.0"
 dhcproto = "0.13.0"
+# DNS messages for feosd's resolver: the wire format only, no I/O, no DNSSEC.
+hickory-proto = { version = "0.25.2", default-features = false }
 rand = "0.9"
 socket2 = "0.6.0"
 futures = "0.3.31"
@@ -88,6 +91,7 @@ disk-store = { path = "crates/disk-store" }
 feos-proto = { path = "crates/feos-proto" }
 feos-utils = { path = "crates/feos-utils" }
 container-service = { path = "crates/services/container-service" }
+dns-service = { path = "crates/services/dns-service" }
 forward-service = { path = "crates/services/forward-service" }
 host-service = { path = "crates/services/host-service" }
 image-service = { path = "crates/services/image-service" }
