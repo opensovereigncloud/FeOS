@@ -48,8 +48,9 @@ Firecracker and the guest are installed side by side, as kernel packages
 are: an upgrade adds the new version and leaves the old ones. `feosd`
 boots new pods with the newest versions it finds, records in each pod
 what it booted with, and reports which versions its pods and snapshots
-still use. A version nothing uses may be removed. The disk daemon and the
-per-pod proxies follow the same scheme when they arrive.
+still use. A version nothing uses may be removed. The disk daemon follows
+the same scheme when it arrives. `feos-authn` comes with `feosd`: each run
+of a pod starts it anew (ADR 0014).
 
 Garden Linux takes the packages when its image is built, in a feature that
 lists them. Its nodes are not changed with apt at runtime.

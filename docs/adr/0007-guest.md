@@ -27,8 +27,9 @@ what it does and which API carries what.
   no NTP.
 - The data volume, the virtio disk that is not the root, is mounted at
   `/var/lib/feos`.
-- Kubernetes and SSH credentials stay on the host. The guest pipes their
-  connections to vsock ports 10002 and 10003.
+- The pod's identity and its Kubernetes and SSH credentials stay on the
+  host. The guest pipes their connections to vsock port 10002, with a
+  preamble that says what each is for (ADR 0014).
 
 ### API
 

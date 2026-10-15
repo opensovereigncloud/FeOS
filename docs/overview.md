@@ -70,13 +70,14 @@ Both products run on one unit: the **pod**, a Firecracker microVM that runs
 
 | Program | Runs | Does |
 |---|---|---|
-| `feosd` | on every node, under systemd or `feos-host-init` | runs pods: Firecracker in its jailer, snapshots, the pods' network, per-pod proxies; serves the local API and takes the control plane's calls from Valkey |
+| `feosd` | on every node, under systemd or `feos-host-init` | runs pods: Firecracker in its jailer, snapshots, the pods' network, each pod's `feos-authn`; serves the local API and takes the control plane's calls from Valkey |
 | `feos-guest` | as PID 1 in every pod | runs the pod's containers with libcontainer, serves the guest's API to `feosd` over vsock; its time and network are pushed |
 | `feos-host-init` | as PID 1 when FeOS is the node's operating system | sets the machine up and keeps `feosd` running; otherwise the node runs Debian or Garden Linux |
 | `feosctl` | anywhere | the command-line client |
 
-A disk daemon (chunk store, object storage tiering) and the per-pod
-credential proxies join them as they are built.
+A disk daemon (chunk store, object storage tiering) and `feos-authn`, the
+process beside each pod that holds its identity and credentials
+(ADR 0014), join them as they are built.
 
 ### The control plane
 
@@ -97,8 +98,8 @@ guest's API is internal between `feosd` and `feos-guest`.
 ## Principles
 
 - **Nodes open no port for control.** They connect out to Valkey.
-- **No credential enters a pod.** What a workload may use, a proxy on the
-  host adds.
+- **No credential enters a pod.** What a workload may use, `feos-authn` on
+  the host adds or signs with: its keys and tokens, and its own identity.
 - **Pods outlive their node agent.** A restart or an upgrade of `feosd`
   leaves the pods running.
 - **A snapshot pins what it was written on**: the Firecracker version, the

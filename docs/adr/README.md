@@ -12,7 +12,7 @@ the ADRs say why it works that way.
 |---|---|---|---|---|
 | [0001](0001-what-we-build.md) | Foundation | Agent sandboxes and CaaS on isolated pods; FeOS is the node layer, the control plane one or two central services; CaaS has its own API, no Kubernetes | Accepted | – |
 | [0002](0002-one-repository.md) | Foundation | One repository for node, control plane and clients, laid out by language; workspace rules; static musl | Accepted | yes |
-| [0003](0003-programs.md) | Node | `feos-host-init`, `feosd`, `feos-guest`, `feosctl`; the sandbox manager's node half becomes `feosd`, its sandboxes go to the control plane | Accepted | partly: the binaries; the manager's port has not started |
+| [0003](0003-programs.md) | Node | `feos-host-init`, `feosd`, `feos-guest`, `feosctl`, and `feos-authn` beside each pod; the sandbox manager's node half becomes `feosd`, its sandboxes go to the control plane | Accepted | partly: the binaries; the manager's port has not started |
 | [0004](0004-pods.md) | Node | Pods instead of VMs in the API, and no VMs at all; one kind of pod for sandboxes, services and jobs, told apart by what an exit means: idle, init, sidecar and main containers, a restart policy, probes; a pod's services through `feosd`; the guest's API is internal | Accepted | partly: `feos.pod.v1`, the forwarding, no VMs; no credentials or proxies in the spec, the caller makes the pod's TAP; no roles, restarts, probes or reaper |
 | [0005](0005-firecracker.md) | Node | Firecracker is the only VMM, every VM in its jailer and a cgroup of its own | Accepted | yes |
 | [0006](0006-control-transport.md) | Node ↔ control plane | `feosd` connects out to Valkey, which carries the same gRPC calls; no inbound port | Proposed | no |
@@ -23,6 +23,7 @@ the ADRs say why it works that way.
 | [0011](0011-disk-daemon.md) | Node | `diskd`: a pod's disk as a ublk device over a chain of sealed, content-addressed layers and a sparse top, cached locally and tiered to S3 | Proposed | partly: the daemon, its store, `diskctl` and the labs; not wired to pods, not packaged |
 | [0012](0012-security-groups.md) | Node | Security groups: stateful rules that only allow, without order, peers as address blocks with exceptions or as other groups; the control plane sends each node its groups whole or as deltas, with a version per group; nftables enforces them | Proposed | no |
 | [0013](0013-traffic-records.md) | Node | `feosd` records the pods' traffic: flows from connection tracking, drops, DNS from its resolver, server names from copies of a connection's first packets; no eBPF, nothing in the data path | Proposed | no |
+| [0014](0014-authn.md) | Node | `feos-authn`, one process per running pod on the host, holds the pod's mTLS identity (a SPIFFE certificate whose key never leaves it, signing only TLS 1.3 CertificateVerify, as fetls/1) and its Kubernetes and SSH credentials (a proxy that adds them, an agent that signs only bound logins); one vsock port with a preamble; bindings sealed to the process; jailed, audited before it answers | Proposed | no: `feos-guest` pipes Kubernetes and SSH to ports 10002 and 10003; nothing answers on the host |
 
 ## Rules
 

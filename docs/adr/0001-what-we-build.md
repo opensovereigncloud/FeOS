@@ -52,7 +52,7 @@ container. A pod can be suspended to a snapshot and resumed.
 
 FeOS is everything that runs on a node: `feosd`, `feos-guest`,
 `feos-host-init` where FeOS is the node's operating system, `feosctl`, and
-what joins them on the node (a disk daemon, per-pod proxies). FeOS's APIs
+what joins them on the node (a disk daemon, `feos-authn`). FeOS's APIs
 speak of pods, containers and images, not of sandboxes or services.
 
 ### The control plane is one or two central services

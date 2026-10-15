@@ -32,6 +32,7 @@ the binary chooses at runtime.
 | `feosd` | `crates/feos`, feature `host` | as the node agent, under `feos-host-init` or systemd, never as PID 1 |
 | `feos-guest` | `crates/feos`, feature `guest` | as PID 1 in a pod's microVM (ADR 0007) |
 | `feosctl` | `crates/feosctl` | as the client, anywhere |
+| `feos-authn` | `crates/feos-authn` | one per running pod that has an identity or credentials, started by `feosd` (ADR 0014) |
 
 - `feos-host-init` sets the machine up: mounts, the network over DHCPv6
   and router advertisements, NTP, SR-IOV VFs. It takes
@@ -56,8 +57,8 @@ crates, in Rust, and what concerns sandboxes goes to the control plane
 (ADR 0004).
 
 - `feosd` runs pods (ADR 0004), takes the control plane's calls
-  (ADR 0006), isolates the pods' network, runs their proxies and port
-  forwards, and suspends and restores them (ADR 0008).
+  (ADR 0006), isolates the pods' network, runs their `feos-authn`
+  processes (ADR 0014) and port forwards, and suspends and restores them (ADR 0008).
 - The control plane gets the sandbox as an object, the agent's MCP tools
   mapped onto a pod's tool and exec calls, and the policies that pause and
   hibernate. `feosd` reports what they need and decides none of it.
@@ -94,12 +95,11 @@ and the pods keep running.
 
 ## Open questions
 
-- **The per-pod proxies**: binaries of their own, or `feosd` running
-  itself again, as for the task service.
 - **The order of the port.** Suggested, each step usable on its own, the
   Go manager doing what has not moved yet:
   1. pods on top of the microVM layer (ADR 0004), done;
   2. the Valkey transport, events and telemetry (ADR 0006);
   3. network isolation and the guest's DNS (ADR 0010);
-  4. the Kubernetes and SSH proxies and port forwarding;
+  4. `feos-authn`, with Kubernetes, SSH and mTLS (ADR 0014), and port
+     forwarding;
   5. hibernation, with the disk daemon (ADR 0008, ADR 0011).
