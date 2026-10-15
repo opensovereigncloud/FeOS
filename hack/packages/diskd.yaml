@@ -1,0 +1,49 @@
+# nfpm configuration of the diskd package (ADR 0009, ADR 0011). make
+# packages sets the variables.
+name: diskd
+arch: amd64
+platform: linux
+version: ${FEOS_VERSION}
+section: admin
+priority: optional
+maintainer: IronCore authors <ospo@sap.com>
+vendor: SAP SE
+homepage: https://github.com/ironcore-dev/FeOS
+license: Apache-2.0
+# The object store's TLS.
+depends:
+  - ca-certificates
+description: |-
+  FeOS disk daemon
+  diskd serves the pods' disks as ublk devices over a chunk store that it
+  tiers to an object store, and restores their memory from the same
+  chunks. feosd is its client; diskctl, for development and operators,
+  talks to it on /var/lib/feos/disk/diskd.sock.
+contents:
+  - src: ${MUSL_RELEASE}/diskd
+    dst: /usr/sbin/diskd
+    expand: true
+    file_info:
+      mode: 0755
+  - src: ${MUSL_RELEASE}/diskctl
+    dst: /usr/sbin/diskctl
+    expand: true
+    file_info:
+      mode: 0755
+  - src: hack/packages/diskd/diskd.service
+    dst: /usr/lib/systemd/system/diskd.service
+    file_info:
+      mode: 0644
+  - src: hack/packages/diskd/modules.conf
+    dst: /usr/lib/modules-load.d/diskd.conf
+    file_info:
+      mode: 0644
+  - src: hack/packages/diskd/default
+    dst: /etc/default/diskd
+    type: config|noreplace
+    file_info:
+      mode: 0600
+scripts:
+  postinstall: hack/packages/diskd/postinst
+  preremove: hack/packages/diskd/prerm
+  postremove: hack/packages/diskd/postrm

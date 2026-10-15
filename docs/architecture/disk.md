@@ -9,11 +9,13 @@ decisions behind it: [ADR 0011](../adr/0011-disk-daemon.md),
 
 ## Processes
 
-- **`diskd`** (`crates/diskd`): one per node, as root, beside `feosd`.
-  It needs the kernel's ublk driver (`/dev/ublk-control`,
+- **`diskd`** (`crates/diskd`): one per node, as root, beside `feosd`:
+  under systemd (`diskd.service`, of the package `diskd`) or
+  `feos-host-init`. It needs the kernel's ublk driver (`/dev/ublk-control`,
   `CONFIG_BLK_DEV_UBLK`) and, for memory, userfaultfd
   (`CONFIG_USERFAULTFD`). Each device has a thread of its own, and a
-  thread that fetches its missing chunks.
+  thread that fetches its missing chunks. Once it serves, its devices
+  recovered, it sends `READY=1` to `$NOTIFY_SOCKET` if systemd set one.
 - **`feosd`** is its client, on `--diskd-socket`
   (`/var/lib/feos/disk/diskd.sock`); see [below](#the-pods-disks).
 - **`diskctl`** (`crates/diskctl`): its client for development, the lab

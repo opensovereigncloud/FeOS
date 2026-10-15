@@ -16,7 +16,8 @@ Parts that are decided but not built are marked as such.
 ## Processes
 
 - **`feos-host-init`**: PID 1 when FeOS is the node's operating system. It
-  sets the machine up, starts `feosd` and starts it again when it ends.
+  sets the machine up, starts `diskd` and `feosd` and starts each again
+  when it ends.
 - **`feosd`**: the node agent: the API, the pod and microVM services, the container and
   image services. It runs under systemd or `feos-host-init`, never as
   PID 1.
@@ -35,9 +36,10 @@ filesystem, configures SR-IOV VFs, configures the network
 from router advertisements and DHCPv6, and keeps the clock with NTP from
 the servers DHCPv6 names. It takes Ctrl-Alt-Del over (a SIGINT makes it
 sync and reboot), reboots on `SIGRTMIN+5` and powers off on `SIGRTMIN+4`,
-reaps orphans, and runs `/usr/sbin/feosd --self-upgrade --tcp [::]:1337`,
+reaps orphans, runs `/usr/sbin/diskd --state-dir /var/lib/feos/disk`
+without an object store, and `/usr/sbin/feosd --self-upgrade --tcp [::]:1337`,
 with `--pod-prefix` and the prefix DHCPv6 delegated to the node if it got
-one, which it also routes as unreachable; it starts `feosd` again a second
+one, which it also routes as unreachable; it starts each again a second
 after it ends. It serves no API and logs to `/dev/kmsg`.
 
 On a distribution all of this is the operating system's
@@ -426,11 +428,12 @@ packages from https://apt.fecode.dev
 |---|---|
 | `feosd` | `/usr/sbin/feosd`, `feosd.service`, the group `feos` (sysusers), `/etc/default/feosd`, `/etc/apt/apt.conf.d/50feosd` |
 | `feosctl` | `/usr/bin/feosctl` |
+| `diskd` | `/usr/sbin/diskd`, `/usr/sbin/diskctl`, `diskd.service`, `/etc/default/diskd`, `/usr/lib/modules-load.d/diskd.conf` |
 | `feos-firecracker-<version>` | `/usr/lib/feos/firecracker/<version>/{firecracker,jailer}` |
 | `feos-guest-<version>` | `/usr/lib/feos/guest/<version>/{vmlinuz,initramfs,data.img.zst}` |
 | `feos-firecracker`, `feos-guest` | nothing; they depend on the newest versioned package |
 
-`feosd` depends on `feos-firecracker` and `feos-guest`, which depend on the
+`feosd` depends on `diskd`, `feos-firecracker` and `feos-guest`; the last two depend on the
 newest versioned packages, as `linux-image-amd64` does on the newest
 kernel: an upgrade installs a new Firecracker or guest beside the old
 ones, which the pods booted with them keep using. `50feosd` keeps every
@@ -447,6 +450,16 @@ no `--pod-prefix`, so pods with a network fail until one is set.
 Installing the package enables the unit the first time and starts it, or
 restarts it after an upgrade, whenever it is enabled; removing the package
 stops the unit; purging it disables the unit. `/var/lib/feos` stays.
+
+`diskd.service` is `Type=notify`: active once diskd serves, its devices
+recovered; `feosd.service` wants it and starts after it. `KillMode=process`
+and the devices' user recovery keep the pods' disks across a restart or
+an upgrade of diskd. `StateDirectory=feos/disk`, `LimitMEMLOCK=infinity`:
+every started device locks its buffers. `/etc/default/diskd`, mode 0600,
+holds `DISKD_ARGS` and the object store's `S3_BUCKET` and `AWS_*`; without
+them pods do not hibernate. The package loads `ublk_drv` when it is
+installed and at every boot, and behaves like `feosd`'s on install,
+removal and purge; `/var/lib/feos/disk` stays.
 
 The repository has one suite, `stable`, with the component `main`, and is
 signed by its own key:

@@ -40,6 +40,34 @@ fn init_tracing() {
     }
 }
 
+/// Tells systemd that diskd serves, its devices recovered (sd_notify
+/// READY=1): one datagram to $NOTIFY_SOCKET, without libsystemd. Nothing to
+/// do without it.
+fn notify_ready() {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let socket = socket.as_bytes();
+    // "@" names a socket in the abstract namespace.
+    let address = match socket.strip_prefix(b"@") {
+        Some(name) => SocketAddr::from_abstract_name(name),
+        None => {
+            SocketAddr::from_pathname(std::path::Path::new(std::ffi::OsStr::from_bytes(socket)))
+        }
+    };
+    let sent = address.and_then(|address| {
+        let datagram = UnixDatagram::unbound()?;
+        datagram.send_to_addr(b"READY=1", &address)
+    });
+    if let Err(e) = sent {
+        warn!(error = %e, "failed to notify systemd");
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), String> {
     init_tracing();
@@ -124,6 +152,7 @@ async fn main() -> Result<(), String> {
     let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
 
     info!("diskd serving");
+    notify_ready();
     tonic::transport::Server::builder()
         .add_service(feos_proto::disk_service::disk_service_server::DiskServiceServer::new(svc))
         .serve_with_incoming(incoming)

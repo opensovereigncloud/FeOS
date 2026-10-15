@@ -16,6 +16,7 @@ description: |-
   restores, and serves FeOS's API on /run/feos/api.sock. It boots the
   newest Firecracker and guest installed side by side in /usr/lib/feos.
 depends:
+  - diskd
   - feos-firecracker
   - feos-guest
 contents:

@@ -1,6 +1,6 @@
 # ADR 0009: The node's operating system and packages
 
-**Status:** Proposed · **Date:** 2026-10-14
+**Status:** Proposed · **Date:** 2026-10-15
 
 ## Context
 
@@ -41,6 +41,7 @@ are published in a signed apt repository of our own.
 |---|---|
 | `feosd` | `/usr/sbin/feosd`, `feosd.service`, tmpfiles and sysusers |
 | `feosctl` | `/usr/bin/feosctl` |
+| `diskd` | `/usr/sbin/diskd`, `diskctl`, `diskd.service` (ADR 0011) |
 | `feos-firecracker-<version>` | Firecracker and the jailer, in `/usr/lib/feos/firecracker/<version>/` |
 | `feos-guest-<version>` | the guest's kernel and initramfs, in `/usr/lib/feos/guest/<version>/` |
 
@@ -48,9 +49,10 @@ Firecracker and the guest are installed side by side, as kernel packages
 are: an upgrade adds the new version and leaves the old ones. `feosd`
 boots new pods with the newest versions it finds, records in each pod
 what it booted with, and reports which versions its pods and snapshots
-still use. A version nothing uses may be removed. The disk daemon follows
-the same scheme when it arrives. `feos-authn` comes with `feosd`: each run
-of a pod starts it anew (ADR 0014).
+still use. A version nothing uses may be removed. The disk daemon is one
+package, like `feosd`: the pods' disks outlive its restarts, so an upgrade
+replaces it in place, and `feosd` depends on it. `feos-authn` comes with
+`feosd`: each run of a pod starts it anew (ADR 0014).
 
 Garden Linux takes the packages when its image is built, in a feature that
 lists them. Its nodes are not changed with apt at runtime.

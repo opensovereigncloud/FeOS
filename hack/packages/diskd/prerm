@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stops diskd when the package goes, not when it is upgraded. The pods'
+# disks wait for a diskd that does not come; delete the pods first.
+set -e
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl stop diskd.service || true
+fi

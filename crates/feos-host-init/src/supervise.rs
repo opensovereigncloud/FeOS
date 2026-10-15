@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runs feosd and starts it again when it ends. feosd replaces its own
-//! binary in an upgrade and runs it with the same pid, so the wait goes on
-//! across an upgrade.
+//! Runs feosd and diskd, and starts each again when it ends. feosd
+//! replaces its own binary in an upgrade and runs it with the same pid, so
+//! the wait goes on across an upgrade. The pods' disks outlive diskd: the
+//! next one takes them over.
 
 use log::{error, info, warn};
 use std::net::Ipv6Addr;
@@ -16,6 +17,11 @@ const FEOSD: &str = "/usr/sbin/feosd";
 /// operating system is FeOS has no package manager, and no other way in.
 const FEOSD_ARGS: &[&str] = &["--self-upgrade", "--tcp", "[::]:1337"];
 const RESTART_DELAY: Duration = Duration::from_secs(1);
+/// Where the initramfs has diskd, where the package installs it.
+const DISKD: &str = "/usr/sbin/diskd";
+/// Its state in /var/lib/feos, a tmpfs here: the pods' disks are in
+/// memory, as their snapshots are. It tiers to no object store.
+const DISKD_ARGS: &[&str] = &["--state-dir", "/var/lib/feos/disk"];
 
 /// feosd's arguments: the prefix delegated to the node, if any, is its
 /// pods' (ADR 0010).
@@ -42,6 +48,28 @@ pub async fn run_feosd(pod_prefix: Option<(Ipv6Addr, u8)>) {
                 warn!("feosd (pid {pid}) exited with code {code}; starting it again");
             }
             Err(e) => error!("Failed to start {FEOSD}: {e}"),
+        }
+        tokio::time::sleep(RESTART_DELAY).await;
+    }
+}
+
+/// Runs diskd, the pods' disks (ADR 0011), and starts it again when it
+/// ends.
+pub async fn run_diskd() {
+    loop {
+        // A std child: the reaper owns waitpid in PID 1.
+        match Command::new(DISKD)
+            .args(DISKD_ARGS)
+            .stdin(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                let pid = child.id() as i32;
+                info!("Started diskd (pid {pid})");
+                let code = feos_utils::reaper::wait_for_exit(pid).await;
+                warn!("diskd (pid {pid}) exited with code {code}; starting it again");
+            }
+            Err(e) => error!("Failed to start {DISKD}: {e}"),
         }
         tokio::time::sleep(RESTART_DELAY).await;
     }

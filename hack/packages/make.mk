@@ -17,7 +17,7 @@ FIRECRACKER_EPOCH = $(shell git log -1 --format=%ct -- hack/firecracker \
 packages: firecracker guest package-binaries $(NFPM) ## Build the .deb packages into target/packages/ (ADR 0009).
 	mkdir -p $(PACKAGES_DIR)
 	rm -f $(PACKAGES_DIR)/*.deb
-	for package in feosd feosctl feos-firecracker feos-firecracker-meta feos-guest feos-guest-meta; do \
+	for package in feosd feosctl diskd feos-firecracker feos-firecracker-meta feos-guest feos-guest-meta; do \
 		case $$package in \
 			feos-firecracker*) epoch=$(FIRECRACKER_EPOCH) ;; \
 			*) epoch=$(SOURCE_EPOCH) ;; \
@@ -34,6 +34,8 @@ packages: firecracker guest package-binaries $(NFPM) ## Build the .deb packages 
 package-binaries:
 	cargo build --release --features git-version --target=$(MUSL_TARGET) -p feos --bin feosd
 	cargo build --release --target=$(MUSL_TARGET) -p feosctl
+	cargo build --release --target=$(MUSL_TARGET) -p diskd
+	cargo build --release --target=$(MUSL_TARGET) -p diskctl
 
 $(NFPM): hack/packages/nfpm.version hack/packages/nfpm.sha256
 	mkdir -p $(dir $(NFPM))

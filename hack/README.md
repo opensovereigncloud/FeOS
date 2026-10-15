@@ -68,7 +68,7 @@ and the adoption of the container after a reboot.
 The `.deb` packages of ADR 0009 build with nfpm, which `make packages`
 downloads, pinned by sha256 (`hack/packages/`):
 
-    make packages        # target/packages/*.deb: feosd, feosctl, Firecracker, the guest
+    make packages        # target/packages/*.deb: feosd, feosctl, diskd, Firecracker, the guest
     make test-packages   # installs them on Debian 13 with systemd, in docker, and checks feosd
     make publish-apt     # builds HEAD as a dev version and publishes it to apt.fecode.dev
 

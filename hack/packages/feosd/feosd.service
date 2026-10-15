@@ -1,8 +1,8 @@
 [Unit]
 Description=FeOS node agent
 Documentation=https://github.com/ironcore-dev/FeOS
-After=network-online.target
-Wants=network-online.target
+After=network-online.target diskd.service
+Wants=network-online.target diskd.service
 
 [Service]
 Type=notify

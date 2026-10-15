@@ -1,17 +1,20 @@
 #!/bin/bash
 # Install the packages (make packages) on Debian 13 with systemd, in a
-# privileged container, and check feosd under systemd: its group and
-# socket, a pod from the installed guest and Firecracker, its cgroup, a
+# privileged container, and check feosd and diskd under systemd: feosd's
+# group and socket, a pod from the installed guest and Firecracker on a
+# disk from diskd, its cgroup, a
 # restart that keeps the pod, the refused self-upgrade, what autoremove
-# keeps, pods on feosd's network (an fd00: prefix and link-local IPv4
+# keeps, a pod's disk across a restart of diskd and a stop, no
+# hibernation without an object store, pods on feosd's network (an fd00: prefix and link-local IPv4
 # addresses behind proxy ARP and masquerade, DNS, security groups, a
 # denied prefix, traffic records, the deletion of a pod's connections)
 # and their forwarded services, removal, and a power-off through PID 1.
 #
 #   hack/packages/test-packages
 #
-# Needs docker, /dev/kvm, and IPv4 internet access for the pods' images
-# and checks; IPv6 internet is not needed.
+# Needs docker, /dev/kvm, the ublk driver, and IPv4 internet access for
+# the pods' images and checks; IPv6 internet is not needed. The node's
+# /dev is the container's, where diskd's devices appear.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -23,7 +26,7 @@ TIMEOUT=60
 log() { printf '[test-packages] %s\n' "$*"; }
 fail() {
   log "FAIL: $*"
-  docker exec "${NAME}" journalctl -u feosd --no-pager -n 40 2>/dev/null || true
+  docker exec "${NAME}" journalctl -u diskd -u feosd --no-pager -n 40 2>/dev/null || true
   docker exec "${NAME}" sh -c 'for c in . system.slice system.slice/feosd.service; do
     echo "$c: controllers $(cat /sys/fs/cgroup/$c/cgroup.controllers), subtree $(cat /sys/fs/cgroup/$c/cgroup.subtree_control)"
   done; journalctl -b --no-pager | grep -i -E "controller|cgroup" | head -10' 2>/dev/null || true
@@ -57,13 +60,13 @@ await() {
 
 shopt -s nullglob
 debs=("${PACKAGES_DIR}"/*.deb)
-[ ${#debs[@]} -ge 6 ] || { log "missing packages; run make packages"; exit 1; }
+[ ${#debs[@]} -ge 7 ] || { log "missing packages; run make packages"; exit 1; }
 
 log "building ${IMAGE}: Debian 13 with systemd"
 docker build -q -t "${IMAGE}" - >/dev/null <<'EOF'
 FROM debian:13
 RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv \
-      iproute2 nftables conntrack && \
+      iproute2 nftables conntrack ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
@@ -74,7 +77,7 @@ trap cleanup EXIT
 cleanup
 # /var/lib/feos is a volume: on a distribution it is on disk.
 docker run -d --name "${NAME}" --privileged --cgroupns=private \
-  --tmpfs /run --tmpfs /run/lock -v /var/lib/feos "${IMAGE}" >/dev/null
+  --tmpfs /run --tmpfs /run/lock -v /var/lib/feos -v /dev:/dev "${IMAGE}" >/dev/null
 # Some units fail in a container: degraded is up, too.
 await "systemd did not come up" bash -c \
   "in_node systemctl is-system-running --wait | contains -E '^(running|degraded)'"
@@ -82,7 +85,9 @@ await "systemd did not come up" bash -c \
 log "installing ${debs[*]##*/}"
 docker cp "${PACKAGES_DIR}/." "${NAME}:/opt/packages/"
 in_node sh -c 'dpkg -i /opt/packages/*.deb' >/dev/null
-# Type=notify: active once feosd's listeners are bound.
+# Type=notify: active once diskd serves, and once feosd's listeners are
+# bound.
+await "diskd is not active" in_node systemctl is-active diskd
 await "feosd is not active" in_node systemctl is-active feosd
 in_node feosctl host version-info | contains "FeOS Version" || fail "no version"
 log "feosd is active and answers on its socket"
@@ -119,7 +124,8 @@ in_node grep -qx "${pid}" "/sys/fs/cgroup/system.slice/feosd.service/vms/${bare}
   fail "Firecracker (pid ${pid}) is not in the pod's cgroup"
 in_node grep -q '"firecracker":"/usr/lib/feos/firecracker/' \
   "/var/lib/feos/vms/firecracker/${bare}/jail.json" || fail "the pod does not run the installed Firecracker"
-log "a pod boots the installed guest, in system.slice/feosd.service/vms/${bare}"
+in_node test -b "/var/lib/feos/disk/live/${bare}/disk" || fail "the pod has no disk from diskd"
+log "a pod boots the installed guest on a disk from diskd, in system.slice/feosd.service/vms/${bare}"
 
 in_node systemctl restart feosd
 await "feosd did not come back" in_node systemctl is-active feosd
@@ -136,12 +142,12 @@ log "feosd refuses to replace its own binary"
 
 # With every package installed as a dependency, autoremove would take all
 # of them but the versions of Firecracker and the guest.
-in_node apt-mark auto feosd feosctl feos-firecracker feos-guest \
+in_node apt-mark auto feosd feosctl diskd feos-firecracker feos-guest \
   "$(in_node dpkg-query -W -f '${Package}\n' 'feos-firecracker-*')" \
   "$(in_node dpkg-query -W -f '${Package}\n' 'feos-guest-*')" >/dev/null
 removed="$(in_node apt-get -s autoremove | sed -n 's/^Remv \([^ ]*\).*/\1/p' | sort | tr '\n' ' ')"
 in_node apt-mark manual feosd feosctl >/dev/null
-[ "${removed}" = "feos-firecracker feos-guest feosctl feosd " ] ||
+[ "${removed}" = "diskd feos-firecracker feos-guest feosctl feosd " ] ||
   fail "autoremove would remove ${removed}"
 log "autoremove keeps the versions of Firecracker and the guest"
 
@@ -371,11 +377,27 @@ in_pod wget -q -O - http://example.com/ | contains "Example Domain" ||
   fail "the pod lost its network with a restart of feosd"
 log "the pod outlived a restart of feosd, with its network"
 
+# The pod's disk outlives diskd: the next diskd takes its device over.
+in_node systemctl restart diskd
+await "diskd did not come back" in_node systemctl is-active diskd
+in_pod sh -c 'echo kept >/on-disk && sync' || fail "the pod cannot write after a restart of diskd"
+log "the pod's disk outlived a restart of diskd"
+
+# Without an object store, which the package does not configure, a pod
+# does not hibernate, and runs on.
+out="$(in_node feosctl pod hibernate "${pod}" 2>&1)" &&
+  fail "a pod hibernated without an object store"
+contains "object store" <<<"${out}" || fail "no word of the object store: ${out}"
+[ "$(pod_state)" = RUNNING ] || fail "a refused hibernation left the pod $(pod_state)"
+[ "$(in_pod cat /tmp/mark)" = kept ] || fail "a refused hibernation reached the pod"
+log "without an object store, a pod does not hibernate"
+
 in_node feosctl pod stop "${pod}" >/dev/null || fail "no stop"
 [ "$(pod_state)" = STOPPED ] || fail "the pod is $(pod_state), not stopped"
 in_node feosctl pod start --wait "${pod}" >/dev/null || fail "the pod did not come up again"
 [ "$(in_pod echo again)" = again ] || fail "no exec after a start"
-log "a stopped pod comes up again"
+[ "$(in_pod cat /on-disk)" = kept ] || fail "the pod lost what it wrote on its disk in a stop"
+log "a stopped pod comes up again, on its disk"
 
 in_node feosctl pod delete "${pod}" >/dev/null
 in_node feosctl pod list | contains "${pod}" && fail "the pod outlived its delete"

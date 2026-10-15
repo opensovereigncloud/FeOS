@@ -4,8 +4,8 @@
 //! feos-host-init: PID 1 when FeOS is the node's operating system. It sets
 //! the machine up (mounts, the network, SR-IOV, the clock),
 //! takes Ctrl-Alt-Del and the power signals over, reaps orphans, and starts
-//! feosd and starts it again when it ends. It serves no API and logs to the
-//! kernel's log.
+//! diskd and feosd and starts them again when they end. It serves no API
+//! and logs to the kernel's log.
 
 mod kmsg;
 mod machine;
@@ -43,6 +43,7 @@ async fn main() {
     feos_utils::host::power::take_over_ctrl_alt_del();
     machine::take_over_power_signals();
     let pod_prefix = machine::set_up().await;
+    tokio::spawn(supervise::run_diskd());
     tokio::spawn(supervise::run_feosd(pod_prefix));
 
     // PID 1 must never exit: the kernel panics when it does.
