@@ -43,7 +43,8 @@ for line in sys.stdin:
         print(msg["executable"])')
 [ -x "${TEST_BIN}" ] || { log "no test binary"; exit 1; }
 
-cleanup() { docker rm -f "${REGISTRY_NAME}" >/dev/null 2>&1 || true; }
+# With the registry's anonymous volume.
+cleanup() { docker rm -f -v "${REGISTRY_NAME}" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
 log "starting a registry on 127.0.0.1:${REGISTRY_PORT}"
@@ -55,6 +56,15 @@ for _ in $(seq 50); do
 done
 "${REPO_ROOT}/hack/guest/push-image" "${TEST_IMAGE_REF}"
 
+# A worktree's target may be a link to another tree's: that is mounted
+# too, at its own path, so that the link resolves in the container.
+MOUNTS=(-v "${REPO_ROOT}:${REPO_ROOT}:ro")
+TARGET_DIR="$(realpath "${REPO_ROOT}/target")"
+case "${TARGET_DIR}" in
+  "${REPO_ROOT}"/*) ;;
+  *) MOUNTS+=(-v "${TARGET_DIR}:${TARGET_DIR}:ro") ;;
+esac
+
 log "running ${FILTERS[*]}"
 # --init: FeOS takes PID 1 for the init system and sets the machine up.
 # /var/lib/feos is a tmpfs, as when FeOS is the host's PID 1, where the
@@ -64,7 +74,7 @@ log "running ${FILTERS[*]}"
 docker run --rm --privileged --init \
   --network "container:${REGISTRY_NAME}" \
   --tmpfs /var/lib/feos:exec,dev \
-  -v "${REPO_ROOT}:${REPO_ROOT}:ro" \
+  "${MOUNTS[@]}" \
   -e TEST_IMAGE_REF="${TEST_IMAGE_REF}" \
   -e PATH="${REPO_ROOT}/target/firecracker:/usr/sbin:/usr/bin:/sbin:/bin" \
   -e RUST_LOG=info \

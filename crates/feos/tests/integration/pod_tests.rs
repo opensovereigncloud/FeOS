@@ -20,13 +20,17 @@ use feos_proto::pod_service::{
 };
 use feos_utils::nft;
 use feos_utils::vsock::API_PORT;
+use futures::TryStreamExt;
 use log::info;
 use microvm_service::vmm::jail;
 use microvm_service::{vm_dir, vsock_path};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pod_service::network;
-use std::net::Ipv6Addr;
+use rtnetlink::packet_route::address::AddressAttribute;
+use rtnetlink::packet_route::neighbour::{NeighbourAddress, NeighbourAttribute};
+use rtnetlink::packet_route::AddressFamily;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use tokio::time::timeout;
@@ -98,6 +102,85 @@ fn device_routes(device: &str) -> Result<Vec<(Ipv6Addr, u8)>> {
             Some((Ipv6Addr::from(destination), len))
         })
         .collect())
+}
+
+/// The IPv4 host routes through a device, from /proc/net/route.
+fn device_routes4(device: &str) -> Result<Vec<Ipv4Addr>> {
+    let table = std::fs::read_to_string("/proc/net/route")?;
+    let address = |hex: &str| {
+        u32::from_str_radix(hex, 16)
+            .ok()
+            .map(|raw| Ipv4Addr::from(raw.to_ne_bytes()))
+    };
+    Ok(table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.first() != Some(&device) || address(fields.get(7)?)? != Ipv4Addr::BROADCAST {
+                return None;
+            }
+            address(fields.get(1)?)
+        })
+        .collect())
+}
+
+/// What the node has of IPv4 on a device, over netlink: its addresses,
+/// and those it answers ARP for on it by proxy.
+async fn device_ipv4(index: u32) -> Result<(Vec<IpAddr>, Vec<Ipv4Addr>)> {
+    let (connection, handle, _) = rtnetlink::new_connection()?;
+    tokio::spawn(connection);
+    let addresses: Vec<_> = handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute()
+        .try_collect()
+        .await?;
+    let ipv4 = addresses
+        .iter()
+        .filter(|message| message.header.family == AddressFamily::Inet)
+        .filter_map(|message| {
+            message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    AddressAttribute::Address(address) => Some(*address),
+                    _ => None,
+                })
+        })
+        .collect();
+    let neighbours: Vec<_> = handle
+        .neighbours()
+        .get()
+        .proxies()
+        .execute()
+        .try_collect()
+        .await?;
+    let proxied = neighbours
+        .iter()
+        .filter(|neighbour| neighbour.header.ifindex == index)
+        .filter_map(|neighbour| {
+            neighbour
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    NeighbourAttribute::Destination(NeighbourAddress::Inet(address)) => {
+                        Some(*address)
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    Ok((ipv4, proxied))
+}
+
+fn sysctl(path: &str) -> Result<String> {
+    Ok(
+        std::fs::read_to_string(Path::new("/proc/sys/net").join(path))?
+            .trim()
+            .to_string(),
+    )
 }
 
 fn new_pod_id() -> String {
@@ -183,8 +266,8 @@ async fn test_pod_lifecycle() -> Result<()> {
     ensure_server().await;
     let (mut pods, _, _) = get_public_clients().await?;
 
-    // feosd gives the pod its network: an address of the node's prefix,
-    // routed to a TAP device of the pod's own.
+    // feosd gives the pod its network: an address of the node's prefix
+    // and one of its IPv4 range, routed to a TAP device of the pod's own.
     let pod_id = new_pod_id();
     let tap_name = network::tap_name(&pod_id);
     let spec = PodSpec {
@@ -242,28 +325,55 @@ async fn test_pod_lifecycle() -> Result<()> {
         u128::from(prefix) >> (128 - len),
         "{address} is not of {POD_PREFIX}"
     );
-    // IPv6 only, behind the node at fe80::1, with feosd's resolver.
+    // Both families, an IPv6 /128 behind the node at fe80::1 and an IPv4
+    // /32 behind 169.254.0.1, with feosd's resolver.
+    let ipv4: Ipv4Addr = pod.ipv4_address.parse()?;
+    assert_eq!(
+        u32::from(ipv4) >> 12,
+        u32::from(Ipv4Addr::new(169, 254, 16, 0)) >> 12,
+        "{ipv4} is not of 169.254.16.0/20"
+    );
     assert!(network.configured);
     assert_eq!(network.interface, "eth0");
     assert_eq!(network.ipv6_cidr, format!("{address}/128"));
     assert_eq!(network.ipv6_gateway, "fe80::1");
-    assert_eq!(
-        (network.ipv4_cidr.as_str(), network.gateway.as_str()),
-        ("", "")
-    );
-    assert_eq!(network.dns, ["fdfd:7b5:61d9::53"]);
+    assert_eq!(network.ipv4_cidr, format!("{ipv4}/32"));
+    assert_eq!(network.gateway, "169.254.0.1");
+    assert_eq!(network.dns, ["169.254.0.53"]);
     assert_eq!(network.hostname, pod_id);
-    // With NAT64 on the node, an IPv4 address of its pool stands for the
-    // pod; the guest never sees it.
-    let ipv4: std::net::Ipv4Addr = pod.ipv4_address.parse()?;
-    assert_eq!(ipv4.octets()[..2], [10, 200], "{ipv4} is not the pool's");
-    // The TAP device is a link of its own: the node is fe80::1 on it, and
-    // the pod's address is routed to it.
+    // The TAP device is a link of its own: the node is fe80::1 on it and
+    // holds no IPv4 address, but answers ARP for 169.254.0.1 by proxy, at
+    // once; the pod's addresses are routed to it.
     assert_eq!(device_addresses(&tap_name)?, [(network::GATEWAY, 64)]);
     assert!(
         device_routes(&tap_name)?.contains(&(address, 128)),
         "no route to {address} on {tap_name}: {:?}",
         device_routes(&tap_name)?
+    );
+    assert_eq!(device_routes4(&tap_name)?, [ipv4]);
+    let index: u32 =
+        std::fs::read_to_string(Path::new("/sys/class/net").join(&tap_name).join("ifindex"))?
+            .trim()
+            .parse()?;
+    let (tap_ipv4, proxied) = device_ipv4(index).await?;
+    assert!(tap_ipv4.is_empty(), "{tap_name} holds {tap_ipv4:?}");
+    assert_eq!(proxied, [network::GATEWAY4]);
+    for (path, value) in [
+        (format!("ipv4/neigh/{tap_name}/proxy_delay"), "0"),
+        (format!("ipv4/conf/{tap_name}/arp_ignore"), "1"),
+        (format!("ipv4/conf/{tap_name}/arp_announce"), "2"),
+        (format!("ipv4/conf/{tap_name}/forwarding"), "1"),
+    ] {
+        assert_eq!(sysctl(&path)?, value, "{path}");
+    }
+    // The node holds the resolver's address, and never the gateway.
+    let dns_device = Path::new("/sys/class/net")
+        .join(network::DNS_DEVICE)
+        .join("ifindex");
+    let dns_index: u32 = std::fs::read_to_string(dns_device)?.trim().parse()?;
+    assert_eq!(
+        device_ipv4(dns_index).await?.0,
+        ["169.254.0.53".parse::<IpAddr>()?]
     );
     // feosd's table, with the pod's chains.
     let chains = nft::chains(nft::Family::Inet, network::TABLE)?;
@@ -402,9 +512,17 @@ async fn test_pod_lifecycle() -> Result<()> {
         !Path::new("/sys/class/net").join(&tap_name).exists(),
         "The pod's TAP device is gone with the pod"
     );
+    assert!(
+        device_routes4(&tap_name)?.is_empty() && device_routes(&tap_name)?.is_empty(),
+        "The pod's routes are gone with the pod"
+    );
+    assert!(
+        device_ipv4(index).await?.1.is_empty(),
+        "The proxy entry is gone with the pod"
+    );
     let chains = nft::chains(nft::Family::Inet, network::TABLE)?;
     assert!(
-        !chains.contains(&format!("out-{tap_name}")),
+        !chains.contains(&format!("out-{tap_name}")) && !chains.contains(&format!("in-{tap_name}")),
         "The pod's chains are gone with the pod"
     );
     assert!(
