@@ -8,6 +8,7 @@ members = [
     "crates/feos-proto",
     "crates/feos-utils",
     "crates/feosctl",
+    "crates/nat64",
     "crates/services/container-service",
     "crates/services/dns-service",
     "crates/services/forward-service",
@@ -21,6 +22,8 @@ members = [
     "crates/services/watch-service",
     "crates/services/microvm-service",
 ]
+# eBPF programs build on nightly for another target (ADR 0002).
+exclude = ["crates/nat64-ebpf"]
 resolver = "3"
 
 [workspace.lints.clippy]
@@ -88,11 +91,14 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 proptest = "1"
 # Only for tests: real ClientHellos, with ring as reqwest has it.
 rustls = { version = "0.23.31", default-features = false }
+# Loads the NAT64 eBPF program; pure Rust, no libbpf.
+aya = { version = "0.14.0", default-features = false }
 
 # Workspace crates
 disk-store = { path = "crates/disk-store" }
 feos-proto = { path = "crates/feos-proto" }
 feos-utils = { path = "crates/feos-utils" }
+nat64 = { path = "crates/nat64" }
 container-service = { path = "crates/services/container-service" }
 dns-service = { path = "crates/services/dns-service" }
 forward-service = { path = "crates/services/forward-service" }

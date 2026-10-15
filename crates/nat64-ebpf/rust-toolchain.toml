@@ -1,0 +1,5 @@
+# The eBPF program builds on nightly (-Z build-std) with bpf-linker 0.9.13.
+# A dated nightly keeps crates/nat64/bpf/nat64.bpf.o reproducible.
+[toolchain]
+channel = "nightly-2026-10-11"
+components = ["rust-src"]
