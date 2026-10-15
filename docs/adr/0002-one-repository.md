@@ -23,9 +23,8 @@ history.
 
 1. **One repository** for the node, the control plane and the clients.
 2. **Laid out by language, not by component.** Rust crates live flat under
-   `crates/`, the service crates under `crates/services/`. Go, Python,
-   TypeScript and web code get a top-level directory each when they
-   arrive. All APIs live under
+   `crates/`, the service crates under `crates/services/`. Go and web code
+   get a top-level directory each when they arrive. All APIs live under
    `proto/feos/<api>/v1/` with the package `feos.<api>.v1`.
 3. **One Cargo workspace**, with four rules:
    - Release artifacts are built per package (`cargo build -p <crate>`),
