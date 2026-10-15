@@ -26,7 +26,9 @@ const NFT_MSG_DELTABLE: u16 = 2;
 const NFT_MSG_NEWCHAIN: u16 = 3;
 const NFT_MSG_GETCHAIN: u16 = 4;
 const NFT_MSG_NEWRULE: u16 = 6;
+const NFT_MSG_GETRULE: u16 = 7;
 const NFT_MSG_NEWSET: u16 = 9;
+const NFT_MSG_GETSET: u16 = 10;
 const NFT_MSG_NEWSETELEM: u16 = 12;
 const NFT_MSG_DELSETELEM: u16 = 14;
 
@@ -539,10 +541,13 @@ pub enum Expr {
 pub mod matches {
     use super::*;
 
+    pub const IPV4_SADDR: u32 = 12;
+    pub const IPV4_DADDR: u32 = 16;
     pub const IPV6_SADDR: u32 = 8;
     pub const IPV6_DADDR: u32 = 24;
     pub const TCP: u8 = libc::IPPROTO_TCP as u8;
     pub const UDP: u8 = libc::IPPROTO_UDP as u8;
+    pub const ICMP: u8 = libc::IPPROTO_ICMP as u8;
     pub const ICMPV6: u8 = libc::IPPROTO_ICMPV6 as u8;
 
     /// The interface name as nft compares it: IFNAMSIZ bytes, zero padded.
@@ -612,7 +617,8 @@ pub mod matches {
         ]
     }
 
-    /// An IPv4 packet, in the inet family.
+    /// An IPv4 packet, in the inet family. The IPv4 matches below start
+    /// with it, as nft's do.
     pub fn ipv4() -> Vec<Expr> {
         vec![
             Expr::Meta(MetaKey::NfProto),
@@ -623,33 +629,87 @@ pub mod matches {
         ]
     }
 
+    /// An address of the network header at `offset`, after `family`'s
+    /// match, in, or out of, a prefix `len` bits long. As nft does, it
+    /// compares the prefix's bytes if it ends on a byte, and the whole
+    /// address, masked, if not.
+    fn address_prefix(
+        family: Vec<Expr>,
+        offset: u32,
+        op: CmpOp,
+        address: &[u8],
+        len: u8,
+    ) -> Vec<Expr> {
+        let len = usize::from(len).min(8 * address.len());
+        let mask: Vec<u8> = (0..address.len())
+            .map(|byte| {
+                let bits = len.saturating_sub(8 * byte).min(8);
+                (0xff00u16 >> bits) as u8
+            })
+            .collect();
+        let whole_bytes = len > 0 && len.is_multiple_of(8);
+        let bytes = if whole_bytes { len / 8 } else { address.len() };
+        let mut exprs = family;
+        exprs.push(Expr::Payload {
+            base: Base::Network,
+            offset,
+            len: bytes as u32,
+        });
+        if !whole_bytes {
+            exprs.push(Expr::Bitwise { mask: mask.clone() });
+        }
+        exprs.push(Expr::Cmp {
+            op,
+            data: address
+                .iter()
+                .zip(&mask)
+                .take(bytes)
+                .map(|(byte, mask)| byte & mask)
+                .collect(),
+        });
+        exprs
+    }
+
     /// The IPv4 source (offset 12) or destination (16) in, or out of, a
     /// prefix.
     pub fn ipv4_prefix(offset: u32, op: CmpOp, address: Ipv4Addr, len: u8) -> Vec<Expr> {
-        let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
-        let net = u32::from(address) & mask;
-        vec![
-            Expr::Payload {
-                base: Base::Network,
-                offset,
-                len: 4,
-            },
-            Expr::Bitwise {
-                mask: mask.to_be_bytes().to_vec(),
-            },
-            Expr::Cmp {
-                op,
-                data: net.to_be_bytes().to_vec(),
-            },
-        ]
+        address_prefix(ipv4(), offset, op, &address.octets(), len)
     }
 
     pub fn ipv4_saddr(op: CmpOp, address: Ipv4Addr) -> Vec<Expr> {
-        ipv4_prefix(12, op, address, 32)
+        ipv4_prefix(IPV4_SADDR, op, address, 32)
     }
 
-    pub fn ipv4_daddr_in(address: Ipv4Addr, len: u8) -> Vec<Expr> {
-        ipv4_prefix(16, CmpOp::Eq, address, len)
+    pub fn ipv4_daddr(op: CmpOp, address: Ipv4Addr) -> Vec<Expr> {
+        ipv4_prefix(IPV4_DADDR, op, address, 32)
+    }
+
+    pub fn ipv4_daddr_prefix(address: Ipv4Addr, len: u8) -> Vec<Expr> {
+        ipv4_prefix(IPV4_DADDR, CmpOp::Eq, address, len)
+    }
+
+    /// The IPv4 source or destination in a set of addresses, or with
+    /// `invert` not.
+    pub fn ipv4_lookup(offset: u32, set: &str, invert: bool) -> Vec<Expr> {
+        let mut exprs = ipv4();
+        exprs.push(Expr::Payload {
+            base: Base::Network,
+            offset,
+            len: 4,
+        });
+        exprs.push(Expr::Lookup {
+            set: set.to_string(),
+            invert,
+        });
+        exprs
+    }
+
+    pub fn ipv4_saddr_in(set: &str) -> Vec<Expr> {
+        ipv4_lookup(IPV4_SADDR, set, false)
+    }
+
+    pub fn ipv4_daddr_in(set: &str) -> Vec<Expr> {
+        ipv4_lookup(IPV4_DADDR, set, false)
     }
 
     /// An IPv6 packet, in the inet family. The IPv6 matches below start
@@ -664,29 +724,9 @@ pub mod matches {
         ]
     }
 
-    /// The IPv6 source or destination in, or out of, a prefix. As nft
-    /// does, it compares the prefix's bytes, the last one masked.
+    /// The IPv6 source or destination in, or out of, a prefix.
     pub fn ipv6_prefix(offset: u32, op: CmpOp, address: Ipv6Addr, len: u8) -> Vec<Expr> {
-        let len = u32::from(len.min(128));
-        let bytes = len.div_ceil(8).max(1) as usize;
-        let mask = u128::MAX.checked_shl(128 - len).unwrap_or(0);
-        let net = (u128::from(address) & mask).to_be_bytes();
-        let mut exprs = ipv6();
-        exprs.push(Expr::Payload {
-            base: Base::Network,
-            offset,
-            len: bytes as u32,
-        });
-        if !len.is_multiple_of(8) || len == 0 {
-            exprs.push(Expr::Bitwise {
-                mask: mask.to_be_bytes()[..bytes].to_vec(),
-            });
-        }
-        exprs.push(Expr::Cmp {
-            op,
-            data: net[..bytes].to_vec(),
-        });
-        exprs
+        address_prefix(ipv6(), offset, op, &address.octets(), len)
     }
 
     pub fn ipv6_saddr(op: CmpOp, address: Ipv6Addr) -> Vec<Expr> {
@@ -766,6 +806,21 @@ pub mod matches {
 
     pub fn icmpv6_type(icmp_type: u8) -> Vec<Expr> {
         let mut exprs = [ipv6(), l4proto(ICMPV6)].concat();
+        exprs.push(Expr::Payload {
+            base: Base::Transport,
+            offset: 0,
+            len: 1,
+        });
+        exprs.push(Expr::Cmp {
+            op: CmpOp::Eq,
+            data: vec![icmp_type],
+        });
+        exprs
+    }
+
+    /// An ICMP message of IPv4, of this type.
+    pub fn icmp_type(icmp_type: u8) -> Vec<Expr> {
+        let mut exprs = [ipv4(), l4proto(ICMP)].concat();
         exprs.push(Expr::Payload {
             base: Base::Transport,
             offset: 0,
@@ -952,14 +1007,46 @@ pub fn delete(family: Family, name: &str) -> io::Result<()> {
 /// The names of the chains of a table in the kernel; none if there is no
 /// such table. For tests and diagnostics: it reads, and changes nothing.
 pub fn chains(family: Family, table: &str) -> io::Result<Vec<String>> {
+    dump(
+        family,
+        table,
+        NFT_MSG_GETCHAIN,
+        NFT_MSG_NEWCHAIN,
+        NFTA_CHAIN_NAME,
+    )
+}
+
+/// The names of the sets and maps of a table in the kernel, as
+/// [`chains`].
+pub fn sets(family: Family, table: &str) -> io::Result<Vec<String>> {
+    dump(family, table, NFT_MSG_GETSET, NFT_MSG_NEWSET, NFTA_SET_NAME)
+}
+
+/// The chain of every rule of a table in the kernel, in order: a chain's
+/// name as often as it has rules. As [`chains`].
+pub fn rules(family: Family, table: &str) -> io::Result<Vec<String>> {
+    dump(
+        family,
+        table,
+        NFT_MSG_GETRULE,
+        NFT_MSG_NEWRULE,
+        NFTA_RULE_CHAIN,
+    )
+}
+
+/// Dumps what of a table `get` asks for, and reads the attribute `name`
+/// of each answer `new` that is of the table: a chain, set or rule, whose
+/// first attribute is its table.
+fn dump(family: Family, table: &str, get: u16, new: u16, name: u16) -> io::Result<Vec<String>> {
+    const NFTA_TABLE: u16 = 1;
     let mut request = Batch::new(1);
     request.buf.clear();
     request.header(
-        (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETCHAIN,
+        (NFNL_SUBSYS_NFTABLES << 8) | get,
         NLM_F_REQUEST | NLM_F_DUMP,
         family as u8,
         0,
-        |m| m.str(NFTA_CHAIN_TABLE, table),
+        |m| m.str(NFTA_TABLE, table),
     );
     // SAFETY: plain socket(2); the fd is owned from here on.
     let fd = unsafe {
@@ -1019,21 +1106,29 @@ pub fn chains(family: Family, table: &str) -> io::Result<Vec<String>> {
                         code => Err(io::Error::from_raw_os_error(code)),
                     };
                 }
-                _ if ty == (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWCHAIN && len > 20 => {
-                    // After nlmsghdr and nfgenmsg: the attributes.
+                _ if ty == (NFNL_SUBSYS_NFTABLES << 8) | new && len > 20 => {
+                    // After nlmsghdr and nfgenmsg: the attributes. Only
+                    // what is of the table counts, whatever the kernel
+                    // filters.
                     let mut attrs = &rest[20..len];
+                    let (mut of_table, mut found) = (None, None);
                     while attrs.len() >= 4 {
                         let alen = u16::from_ne_bytes([attrs[0], attrs[1]]) as usize;
                         let aty = u16::from_ne_bytes([attrs[2], attrs[3]]) & 0x3fff;
                         if alen < 4 || alen > attrs.len() {
                             break;
                         }
-                        if aty == NFTA_CHAIN_NAME {
-                            let name = &attrs[4..alen];
-                            let name = name.split(|b| *b == 0).next().unwrap_or_default();
-                            names.push(String::from_utf8_lossy(name).into_owned());
+                        let value = &attrs[4..alen];
+                        let value = value.split(|b| *b == 0).next().unwrap_or_default();
+                        if aty == NFTA_TABLE {
+                            of_table = Some(value == table.as_bytes());
+                        } else if aty == name {
+                            found = Some(String::from_utf8_lossy(value).into_owned());
                         }
                         attrs = &attrs[((alen + 3) & !3).min(attrs.len())..];
+                    }
+                    if let (Some(true), Some(found)) = (of_table, found) {
+                        names.push(found);
                     }
                 }
                 _ => {}
@@ -1888,45 +1983,132 @@ mod tests {
         assert_eq!(&name[..5], b"eth0\0");
     }
 
+    /// As nft 1.1.3 sends a /20, a /16 and a /0 of IPv4, from `nft
+    /// --debug=netlink`.
     #[test]
-    fn prefixes_mask_the_address() {
-        let exprs = ipv4_daddr_in(Ipv4Addr::new(10, 1, 2, 3), 8);
+    fn ipv4_prefixes_compare_as_nft_compares_them() {
+        let address = Ipv4Addr::new(169, 254, 31, 3);
+        let exprs = ipv4_daddr_prefix(address, 20);
+        assert_eq!(exprs[..2], ipv4()[..]);
         assert_eq!(
-            exprs[1],
-            Expr::Bitwise {
-                mask: vec![255, 0, 0, 0]
-            }
+            exprs[2..],
+            [
+                Expr::Payload {
+                    base: Base::Network,
+                    offset: 16,
+                    len: 4
+                },
+                Expr::Bitwise {
+                    mask: vec![255, 255, 0xf0, 0]
+                },
+                Expr::Cmp {
+                    op: CmpOp::Eq,
+                    data: vec![169, 254, 16, 0]
+                },
+            ]
         );
+        // A prefix of whole bytes: those bytes, no mask.
+        let exprs = ipv4_prefix(IPV4_SADDR, CmpOp::Eq, Ipv4Addr::new(10, 77, 2, 3), 16);
         assert_eq!(
-            exprs[2],
+            exprs[2..],
+            [
+                Expr::Payload {
+                    base: Base::Network,
+                    offset: 12,
+                    len: 2
+                },
+                Expr::Cmp {
+                    op: CmpOp::Eq,
+                    data: vec![10, 77]
+                },
+            ]
+        );
+        let exprs = ipv4_saddr(CmpOp::Neq, address);
+        assert_eq!(
+            exprs[2..],
+            [
+                Expr::Payload {
+                    base: Base::Network,
+                    offset: 12,
+                    len: 4
+                },
+                Expr::Cmp {
+                    op: CmpOp::Neq,
+                    data: vec![169, 254, 31, 3]
+                },
+            ]
+        );
+        let any = ipv4_prefix(IPV4_DADDR, CmpOp::Eq, address, 0);
+        assert_eq!(any[3], Expr::Bitwise { mask: vec![0; 4] });
+        assert_eq!(
+            any[4],
             Expr::Cmp {
                 op: CmpOp::Eq,
-                data: vec![10, 0, 0, 0]
+                data: vec![0; 4]
             }
         );
-        let any = ipv4_prefix(16, CmpOp::Eq, Ipv4Addr::new(1, 2, 3, 4), 0);
-        assert_eq!(any[1], Expr::Bitwise { mask: vec![0; 4] });
+        // Longer than an address: the address.
+        assert_eq!(
+            ipv4_prefix(IPV4_DADDR, CmpOp::Eq, address, 200),
+            ipv4_daddr(CmpOp::Eq, address)
+        );
+        // Lookups and ICMP start with the family, too.
+        assert_eq!(ipv4_daddr_in("deny4")[..2], ipv4()[..]);
+        assert_eq!(
+            ipv4_saddr_in("deny4")[2],
+            Expr::Payload {
+                base: Base::Network,
+                offset: 12,
+                len: 4
+            }
+        );
+        let redirect = icmp_type(5);
+        assert_eq!(redirect[..4], [ipv4(), l4proto(1)].concat()[..]);
+        assert_eq!(
+            redirect[5],
+            Expr::Cmp {
+                op: CmpOp::Eq,
+                data: vec![5]
+            }
+        );
     }
 
+    /// As nft 1.1.3 sends `ip6 daddr fe80::/10` and `ip6 daddr
+    /// fd00:fe05::/48`, from `nft --debug=netlink`.
     #[test]
-    fn ipv6_prefixes_compare_their_bytes() {
+    fn ipv6_prefixes_compare_as_nft_compares_them() {
         let address = "fe80::1".parse().unwrap();
         let exprs = ipv6_daddr_prefix(address, 10);
         assert_eq!(exprs[..2], ipv6()[..]);
+        let mut mask = vec![0; 16];
+        mask[..2].copy_from_slice(&[0xff, 0xc0]);
         assert_eq!(
             exprs[2..],
             [
                 Expr::Payload {
                     base: Base::Network,
                     offset: 24,
-                    len: 2
+                    len: 16
                 },
-                Expr::Bitwise {
-                    mask: vec![0xff, 0xc0]
+                Expr::Bitwise { mask },
+                Expr::Cmp {
+                    op: CmpOp::Eq,
+                    data: v6("fe80::")
+                },
+            ]
+        );
+        let exprs = ipv6_daddr_prefix("fd00:fe05::1".parse().unwrap(), 48);
+        assert_eq!(
+            exprs[2..],
+            [
+                Expr::Payload {
+                    base: Base::Network,
+                    offset: 24,
+                    len: 6
                 },
                 Expr::Cmp {
                     op: CmpOp::Eq,
-                    data: vec![0xfe, 0x80]
+                    data: v6("fd00:fe05::")[..6].to_vec()
                 },
             ]
         );
@@ -1940,12 +2122,12 @@ mod tests {
             }
         );
         let any = ipv6_prefix(IPV6_DADDR, CmpOp::Eq, address, 0);
-        assert_eq!(any[3], Expr::Bitwise { mask: vec![0] });
+        assert_eq!(any[3], Expr::Bitwise { mask: vec![0; 16] });
         assert_eq!(
             any[4],
             Expr::Cmp {
                 op: CmpOp::Eq,
-                data: vec![0]
+                data: vec![0; 16]
             }
         );
     }
@@ -2272,6 +2454,8 @@ mod tests {
             ]
             .concat(),
             [ipv6_daddr_in("internet"), vec![Expr::Counter], accept()].concat(),
+            [ipv4_daddr_in("v4"), drop()].concat(),
+            [l4proto(ICMP), ipv4_lookup(IPV4_DADDR, "v4", true), accept()].concat(),
             [limit(10, Per::Minute, 20), log_group(2, "no-rule", 0)].concat(),
             vec![Expr::Verdict(Verdict::Return)],
             drop(),
@@ -2294,6 +2478,20 @@ mod tests {
             [
                 iifname_prefix(CmpOp::Eq, "pod-"),
                 ipv6_daddr_prefix("fdfd:7b5:61d9::".parse().unwrap(), 48),
+                drop(),
+            ]
+            .concat(),
+            [
+                iifname_prefix(CmpOp::Eq, "pod-"),
+                ipv4_daddr(CmpOp::Eq, Ipv4Addr::new(169, 254, 0, 53)),
+                l4proto(TCP),
+                th_dport(CmpOp::Eq, 53),
+                accept(),
+            ]
+            .concat(),
+            [
+                iifname_prefix(CmpOp::Eq, "pod-"),
+                ipv6_prefix(IPV6_SADDR, CmpOp::Neq, "fe80::".parse().unwrap(), 10),
                 drop(),
             ]
             .concat(),
@@ -2356,7 +2554,11 @@ mod tests {
             chains: vec![
                 Chain::regular(
                     &format!("in-{pod}"),
-                    vec![[ipv6_saddr_in("g-web"), accept()].concat(), drop()],
+                    vec![
+                        [ipv4_saddr_in("v4"), drop()].concat(),
+                        [ipv6_saddr_in("g-web"), accept()].concat(),
+                        drop(),
+                    ],
                 ),
                 Chain::regular(&format!("out-{pod}"), out),
                 Chain::base(
@@ -2365,13 +2567,16 @@ mod tests {
                     Hook::Prerouting,
                     -150,
                     Policy::Accept,
-                    vec![[
-                        iifname_prefix(CmpOp::Eq, "pod-"),
-                        fib_saddr_iif_oif_missing(),
-                        log_group(2, "spoofed", 0),
-                        drop(),
-                    ]
-                    .concat()],
+                    vec![
+                        [
+                            iifname_prefix(CmpOp::Eq, "pod-"),
+                            fib_saddr_iif_oif_missing(),
+                            log_group(2, "spoofed", 0),
+                            drop(),
+                        ]
+                        .concat(),
+                        [iifname_prefix(CmpOp::Eq, "pod-"), icmp_type(5), drop()].concat(),
+                    ],
                 ),
                 Chain::base("input", "filter", Hook::Input, 0, Policy::Accept, input),
                 Chain::base(
@@ -2392,13 +2597,20 @@ mod tests {
                     Hook::Postrouting,
                     100,
                     Policy::Accept,
-                    vec![[
-                        ipv4(),
-                        ipv4_prefix(12, CmpOp::Eq, Ipv4Addr::new(10, 200, 0, 0), 16),
-                        oifname(CmpOp::Neq, "feos-nat64"),
-                        vec![Expr::Masquerade],
-                    ]
-                    .concat()],
+                    vec![
+                        [
+                            ipv4_prefix(IPV4_SADDR, CmpOp::Eq, Ipv4Addr::new(10, 77, 0, 0), 16),
+                            oifname(CmpOp::Eq, "eth0"),
+                            vec![Expr::Masquerade],
+                        ]
+                        .concat(),
+                        [
+                            ipv4_prefix(IPV4_SADDR, CmpOp::Eq, Ipv4Addr::new(169, 254, 16, 0), 20),
+                            oifname_prefix(CmpOp::Neq, "pod-"),
+                            vec![Expr::Masquerade],
+                        ]
+                        .concat(),
+                    ],
                 ),
             ],
         }
@@ -2416,6 +2628,7 @@ table inet NAME {
   map pod-in { type ifname : verdict; elements = { "pod-1234abcd" : jump in-pod-1234abcd }; }
   map pod-out { type ifname : verdict; elements = { "pod-1234abcd" : goto out-pod-1234abcd }; }
   chain in-pod-1234abcd {
+    ip saddr @v4 drop
     ip6 saddr @g-web accept
     drop
   }
@@ -2426,6 +2639,8 @@ table inet NAME {
     meta l4proto tcp th dport 443 ip6 daddr @g-web accept
     meta l4proto tcp th dport >= 8000 th dport <= 8100 ip6 daddr != @b-top accept
     ip6 daddr @internet counter accept
+    ip daddr @v4 drop
+    meta l4proto icmp ip daddr != @v4 accept
     limit rate 10/minute burst 20 packets log prefix "no-rule" group 2
     return
     drop
@@ -2433,12 +2648,15 @@ table inet NAME {
   chain prerouting {
     type filter hook prerouting priority -150; policy accept;
     iifname "pod-*" fib saddr . iif oif missing log prefix "spoofed" group 2 drop
+    iifname "pod-*" icmp type redirect drop
   }
   chain input {
     type filter hook input priority 0; policy accept;
     iifname "pod-*" icmpv6 type nd-neighbor-solicit accept
     iifname "pod-*" ip6 daddr fdfd:7b5:61d9::53 udp dport 53 accept
     iifname "pod-*" ip6 daddr fdfd:7b5:61d9::/48 drop
+    iifname "pod-*" ip daddr 169.254.0.53 tcp dport 53 accept
+    iifname "pod-*" ip6 saddr != fe80::/10 drop
     iifname "pod-*" drop
   }
   chain forward {
@@ -2449,7 +2667,8 @@ table inet NAME {
   }
   chain postrouting {
     type nat hook postrouting priority 100; policy accept;
-    meta nfproto ipv4 ip saddr 10.200.0.0/16 oifname != "feos-nat64" masquerade
+    ip saddr 10.77.0.0/16 oifname "eth0" masquerade
+    ip saddr 169.254.16.0/20 oifname != "pod-*" masquerade
   }
 }
 "#;
@@ -2466,9 +2685,29 @@ table inet NAME {
         replace(&table()).unwrap();
         replace(&table()).unwrap();
         assert_eq!(chains(Family::Inet, "feos-test").unwrap(), ["input"]);
+        assert_eq!(rules(Family::Inet, "feos-test").unwrap(), ["input"]);
+        assert!(sets(Family::Inet, "feos-test").unwrap().is_empty());
+        // What is read is of the table alone.
+        let other = pod_network("feos-test-other");
+        replace(&other).unwrap();
+        assert_eq!(chains(Family::Inet, "feos-test").unwrap(), ["input"]);
+        let names: Vec<String> = other.sets.iter().map(|set| set.name.clone()).collect();
+        let mut listed = sets(Family::Inet, "feos-test-other").unwrap();
+        listed.sort();
+        let mut expected = names.clone();
+        expected.sort();
+        assert_eq!(listed, expected);
+        let counted = rules(Family::Inet, "feos-test-other").unwrap();
+        for chain in &other.chains {
+            let n = counted.iter().filter(|name| **name == chain.name).count();
+            assert_eq!(n, chain.rules.len(), "{}", chain.name);
+        }
+        delete(Family::Inet, "feos-test-other").unwrap();
         delete(Family::Inet, "feos-test").unwrap();
         delete(Family::Inet, "feos-test").unwrap();
         assert!(chains(Family::Inet, "feos-test").unwrap().is_empty());
+        assert!(sets(Family::Inet, "feos-test").unwrap().is_empty());
+        assert!(rules(Family::Inet, "feos-test").unwrap().is_empty());
     }
 
     /// Writes the pod network and changes its sets, as feosd and as nft
@@ -2521,6 +2760,17 @@ table inet NAME {
                 elements: vec![Element::ifname("pod-5678abcd")
                     .with_verdict(Verdict::Goto("out-pod-1234abcd".to_string()))],
             },
+            ElementOp::Delete {
+                set: "v4".to_string(),
+                elements: vec![Element::ipv4(Ipv4Addr::new(192, 168, 1, 1))],
+            },
+            ElementOp::Add {
+                set: "v4".to_string(),
+                elements: vec![Element::ipv4_range(
+                    Ipv4Addr::new(169, 254, 0, 0),
+                    Ipv4Addr::new(169, 255, 255, 255),
+                )],
+            },
         ];
         update(&table, &ops).unwrap();
         // Adding what is there changes nothing.
@@ -2535,6 +2785,8 @@ delete element inet feos-test-nft deny { 2001:db8::/32 }
 delete element inet feos-test-nft b-top { 8000::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff }
 delete element inet feos-test-nft pod-out { "pod-1234abcd" }
 add element inet feos-test-nft pod-out { "pod-5678abcd" : goto out-pod-1234abcd }
+delete element inet feos-test-nft v4 { 192.168.1.1 }
+add element inet feos-test-nft v4 { 169.254.0.0-169.255.255.255 }
 "#,
             ),
         );
@@ -2542,6 +2794,7 @@ add element inet feos-test-nft pod-out { "pod-5678abcd" : goto out-pod-1234abcd 
         assert_eq!(listed, listing("feos-test-nft"));
         let words = listed.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(words.contains("elements = { 2001:db8:1::/48, fd00:fe05::6, fd00:fe05::7 }"));
+        assert!(words.contains("elements = { 10.0.0.0/8, 169.254.0.0/15 }"));
 
         // The kernel finds addresses in the intervals.
         let get = |set: &str, key: &str| {
@@ -2560,6 +2813,7 @@ add element inet feos-test-nft pod-out { "pod-5678abcd" : goto out-pod-1234abcd 
         assert!(get("internet", "2a00::1").contains("::/0"));
         assert!(get("g-web", "fd00:fe05::6").contains("fd00:fe05::6"));
         assert!(get("deny", "fe80::1").contains("fe80::/10"));
+        assert!(get("v4", "169.254.169.254").contains("169.254.0.0/15"));
 
         // A delete of what is not there fails, and the batch with it.
         let delete_one = |address: &str| ElementOp::Delete {
@@ -2592,7 +2846,7 @@ add element inet feos-test-nft pod-out { "pod-5678abcd" : goto out-pod-1234abcd 
         assert!(
             error
                 .to_string()
-                .contains("rule 3 of chain in-pod-1234abcd"),
+                .contains("rule 4 of chain in-pod-1234abcd"),
             "{error}"
         );
 
