@@ -28,6 +28,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::broadcast;
 use tonic::Status;
@@ -48,6 +49,9 @@ pub const DNS_UPSTREAMS: [&str; 4] = [
 pub const RECORDS: usize = 4096;
 /// The bridge of the first version of the network, with IPv4 on it.
 const OLD_BRIDGE: &str = "feos-pods";
+/// How often the network's setup is tried, and how long apart.
+const SET_UP_ATTEMPTS: u32 = 3;
+const SET_UP_PAUSE: Duration = Duration::from_secs(1);
 const DNS_PORT: u16 = 53;
 
 /// Where the node translates pods' IPv4 traffic (`--nat64`).
@@ -223,7 +227,7 @@ impl Network {
         records: broadcast::Sender<TrafficRecord>,
     ) -> Self {
         let parts = match config.pod_prefix {
-            Some(prefix) => match set_up(&config, prefix, dir, &records).await {
+            Some(prefix) => match set_up_again(&config, prefix, dir, &records).await {
                 Ok(parts) => {
                     info!(
                         "Network: Pods get addresses of {}/{}, NAT64 {:?} under {}/96, DNS at {}",
@@ -693,7 +697,8 @@ impl Network {
     }
 }
 
-/// Sets the node up for pods, see [`Network::start`].
+/// Sets the node up for pods, see [`Network::start`]. Every step can be
+/// taken again; the resolver's sockets are bound last.
 async fn set_up(
     config: &Config,
     (prefix, len): (Ipv6Addr, u8),
@@ -706,6 +711,24 @@ async fn set_up(
     nat64::enable_forwarding()?;
     devices::route_unreachable(&handle, prefix, len).await?;
     devices::dummy_with_address(&handle, DNS_DEVICE, config.dns_address).await?;
+
+    let (pool, pool_len) = config.nat64_pool;
+    let nat64_config = nat64::Config {
+        prefix: config.nat64_prefix,
+        pool,
+        pool_len,
+        pin_dir: nat64::PIN_DIR.into(),
+    };
+    let (nat64, pool) = match config.nat64 {
+        Nat64Mode::Node => (
+            Some(Nat64::attach(&nat64_config).await?),
+            Some(Pool::new(dir, pool, pool_len)),
+        ),
+        Nat64Mode::Network => {
+            Nat64::detach(Path::new(nat64::PIN_DIR)).await?;
+            (None, None)
+        }
+    };
 
     // Where the pods cannot reach the IPv6 internet, as from a ULA prefix,
     // every name goes through NAT64 (ADR 0010).
@@ -738,30 +761,33 @@ async fn set_up(
             error!("Network: The resolver stopped: {e}");
         }
     });
-
-    let (pool, pool_len) = config.nat64_pool;
-    let nat64_config = nat64::Config {
-        prefix: config.nat64_prefix,
-        pool,
-        pool_len,
-        pin_dir: nat64::PIN_DIR.into(),
-    };
-    let (nat64, pool) = match config.nat64 {
-        Nat64Mode::Node => (
-            Some(Nat64::attach(&nat64_config).await?),
-            Some(Pool::new(dir, pool, pool_len)),
-        ),
-        Nat64Mode::Network => {
-            Nat64::detach(Path::new(nat64::PIN_DIR)).await?;
-            (None, None)
-        }
-    };
     Ok(Parts {
         ipv6: Ipv6Addresses::new(dir, prefix, len),
         pool,
         nat64,
         resolver,
     })
+}
+
+/// [`set_up`], taken again a few times after a failure: netlink may answer
+/// a moment later.
+async fn set_up_again(
+    config: &Config,
+    prefix: (Ipv6Addr, u8),
+    dir: &Path,
+    records: &broadcast::Sender<TrafficRecord>,
+) -> io::Result<Parts> {
+    let mut attempt = 1;
+    loop {
+        match set_up(config, prefix, dir, records).await {
+            Err(e) if attempt < SET_UP_ATTEMPTS => {
+                warn!("Network: Setting the pods' network up failed, trying again: {e}");
+                attempt += 1;
+                tokio::time::sleep(SET_UP_PAUSE).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Removes the first version of the network: its bridge and the table
