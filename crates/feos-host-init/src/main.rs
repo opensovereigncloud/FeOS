@@ -42,8 +42,8 @@ async fn main() {
     feos_utils::reaper::spawn();
     feos_utils::host::power::take_over_ctrl_alt_del();
     machine::take_over_power_signals();
-    machine::set_up().await;
-    tokio::spawn(supervise::run_feosd());
+    let pod_prefix = machine::set_up().await;
+    tokio::spawn(supervise::run_feosd(pod_prefix));
 
     // PID 1 must never exit: the kernel panics when it does.
     std::future::pending::<()>().await;

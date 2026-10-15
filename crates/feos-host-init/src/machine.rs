@@ -7,6 +7,7 @@
 use crate::network::{configure_network_devices, configure_sriov};
 use crate::ntp::TimeSyncWorker;
 use log::{error, info, warn};
+use std::net::Ipv6Addr;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -14,8 +15,9 @@ use tokio::signal::unix::{signal, SignalKind};
 const VFS_NUM: u32 = 125;
 
 /// Sets the machine up. A failed step is logged and the next one taken: the
-/// node may still be useful, and PID 1 must not die.
-pub async fn set_up() {
+/// node may still be useful, and PID 1 must not die. Returns the prefix that
+/// DHCPv6 delegated to the node, if any: its pods' (ADR 0010).
+pub async fn set_up() -> Option<(Ipv6Addr, u8)> {
     let is_on_vm = is_running_on_vm().await.unwrap_or_else(|e| {
         error!("Error checking VM status: {e}");
         false // Default to false in case of error
@@ -23,9 +25,11 @@ pub async fn set_up() {
 
     info!("Configuring network devices...");
     let mut ntp_servers = Vec::new();
+    let mut delegated = None;
     match configure_network_devices().await {
         Ok(Some((delegated_prefix, delegated_prefix_length, servers))) => {
             info!("Delegated prefix: {delegated_prefix}/{delegated_prefix_length}");
+            delegated = Some((delegated_prefix, delegated_prefix_length));
             ntp_servers = servers;
         }
         Ok(None) => {}
@@ -43,6 +47,7 @@ pub async fn set_up() {
     tokio::spawn(async move {
         time_worker.run().await;
     });
+    delegated
 }
 
 pub async fn is_running_on_vm() -> Result<bool, Box<dyn std::error::Error>> {
