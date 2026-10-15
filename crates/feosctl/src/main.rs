@@ -11,6 +11,7 @@ mod image_commands;
 mod pod_commands;
 mod security_group_commands;
 mod tool_commands;
+mod traffic_commands;
 mod transport;
 mod watch_commands;
 
@@ -37,6 +38,8 @@ enum Service {
     Forward(forward_commands::ForwardArgs),
     Kube(forward_commands::KubeArgs),
     Ssh(forward_commands::SshArgs),
+    /// The node's traffic records: flows, drops, DNS and server names
+    Traffic(traffic_commands::TrafficArgs),
 }
 
 #[tokio::main]
@@ -61,6 +64,7 @@ async fn main() -> Result<()> {
         Service::Forward(args) => forward_commands::handle_forward_command(args).await?,
         Service::Kube(args) => forward_commands::handle_kube_command(args).await?,
         Service::Ssh(args) => forward_commands::handle_ssh_command(args).await?,
+        Service::Traffic(args) => traffic_commands::handle_traffic_command(args).await?,
     }
 
     Ok(())

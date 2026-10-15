@@ -1,0 +1,21 @@
+[package]
+name = "traffic-service"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-proto = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true, features = ["socket", "net", "fs", "time"] }
+prost-types = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+
+[dev-dependencies]
+nix = { workspace = true, features = ["sched"] }
+rustls = { workspace = true, features = ["ring", "std"] }
