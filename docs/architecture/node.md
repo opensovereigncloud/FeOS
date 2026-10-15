@@ -227,13 +227,15 @@ traffic is not theirs:
 |---|---|
 | `prerouting` (filter, -150) | from a pod's TAP: drops IPv4, packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), both logged as `spoofed`, and router advertisements and redirects |
 | `input` | with `--nat64=node`, drops what comes from `feos-nat64`; from pods takes neighbor solicitations and advertisements and DNS to the resolver over UDP and TCP, and drops the rest |
-| `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), before anything else; accepts what belongs to a connection; drops invalid packets from and to pods, and new connections to the pool from anywhere but `feos-nat64`; then jumps through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) |
+| `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), before anything else; accepts what belongs to a connection; drops invalid packets from and to pods, and new connections to the pool from anywhere but `feos-nat64`; then jumps to `from-pods` what comes from a TAP and to `to-pods` what goes to one |
+| `from-pods`, `to-pods` | go through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) to the pod's chains, and drop and log (`no-rule`) what a TAP the maps do not have sends or receives, such as one whose rules failed to be written |
 | `out-<TAP>`, `in-<TAP>` | a pod's chains: drop and log (`deny`) what goes to or comes from a denied address, `return` what a rule of the pod's groups allows, drop and log (`no-rule`) the rest |
 | `postrouting` (nat, 100) | with `--nat64=node`: masquerades the pool, except into `feos-nat64` |
 
 A pod's chains end allowed traffic with `return`, not `accept`, which
 would end the base chain: a packet between two pods passes the sender's
-`out-` chain and the receiver's `in-` chain. The sets are what
+`out-` chain and the receiver's `in-` chain. The maps go to them
+(`goto`), so their `return` leads back to `forward`. The sets are what
 `network-service` compiles: `deny` (the denied prefixes, the node's own
 addresses, the pool, and link-local, loopback and multicast addresses),
 `internet` (the default group's), `g-<group>` (a group's members) and

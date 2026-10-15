@@ -236,7 +236,8 @@ log "the client reaches the internet, but not a denied prefix"
 
 table="$(in_node nft list table inet feos)"
 for expected in "map pod-in" "map pod-out" "set deny" "set internet" "set g-client" \
-  "chain out-pod-44444444" "chain in-pod-44444444" "iifname vmap @pod-out" \
+  "chain out-pod-44444444" "chain in-pod-44444444" "chain from-pods" "chain to-pods" \
+  "iifname vmap @pod-out" \
   "oifname vmap @pod-in" "fib saddr . iif oif missing" 'log prefix "copy" group 3' \
   'log prefix "no-rule" group 2' "ct state established,related accept" "masquerade"; do
   contains -F "${expected}" <<<"${table}" || fail "the table has no ${expected}"

@@ -272,6 +272,8 @@ async fn test_pod_lifecycle() -> Result<()> {
         "input".to_string(),
         "forward".to_string(),
         "postrouting".to_string(),
+        "from-pods".to_string(),
+        "to-pods".to_string(),
         format!("in-{tap_name}"),
         format!("out-{tap_name}"),
     ] {

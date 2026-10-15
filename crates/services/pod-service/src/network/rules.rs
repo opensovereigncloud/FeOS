@@ -11,11 +11,14 @@
 //!   nothing else of theirs, and nothing from NAT64's device.
 //! - `forward` copies the first packets of the TCP connections pods open
 //!   to nflog, passes what belongs to a connection, and sends what is new
-//!   through `pod-out` and `pod-in`, verdict maps from a TAP to the pod's
-//!   chains `out-<TAP>` and `in-<TAP>`. Those drop denied prefixes, return
-//!   what a rule of the pod's groups allows, and drop the rest. A pod's
-//!   chains end in `return` rather than `accept`, which would end the
-//!   base chain: a packet between two pods passes both.
+//!   from or to a pod's TAP through `from-pods` and `to-pods`. Their
+//!   verdict maps `pod-out` and `pod-in` go from a TAP to the pod's chains
+//!   `out-<TAP>` and `in-<TAP>`; a TAP the maps do not have is dropped.
+//!   A pod's chains drop denied prefixes, return what a rule of the pod's
+//!   groups allows, and drop the rest. They end in `return` rather than
+//!   `accept`, which would end the base chain: a packet between two pods
+//!   passes both. The maps go to them, so their `return` leads back to
+//!   `forward`.
 //! - `postrouting` masquerades the NAT64 pool.
 //!
 //! Base chains accept by default: the node's other traffic is not
@@ -36,6 +39,9 @@ pub const TABLE: &str = "feos";
 /// The verdict maps from a pod's TAP to its chains.
 pub const POD_IN: &str = "pod-in";
 pub const POD_OUT: &str = "pod-out";
+/// The chains that look a pod's TAP up in the maps.
+pub const FROM_PODS: &str = "from-pods";
+pub const TO_PODS: &str = "to-pods";
 /// What the names of pods' TAP devices start with.
 const PODS: &str = "pod-";
 /// Drops are logged at most this often, per pod and reason.
@@ -86,7 +92,7 @@ pub fn table(policy: &Policy, options: &Options) -> Table {
         let elements = policy
             .pods
             .iter()
-            .map(|pod| Element::ifname(&pod.tap).with_verdict(Verdict::Jump(chain(&pod.tap))))
+            .map(|pod| Element::ifname(&pod.tap).with_verdict(Verdict::Goto(chain(&pod.tap))))
             .collect();
         Set::verdict_map(name, KeyType::IfName, elements)
     };
@@ -98,6 +104,8 @@ pub fn table(policy: &Policy, options: &Options) -> Table {
         chains.push(pod_chain(&in_chain(&pod.tap), &pod.ingress, ipv6_saddr_in));
         chains.push(pod_chain(&out_chain(&pod.tap), &pod.egress, ipv6_daddr_in));
     }
+    chains.push(lookup_chain(FROM_PODS, iifname_vmap(POD_OUT)));
+    chains.push(lookup_chain(TO_PODS, oifname_vmap(POD_IN)));
     chains.push(Chain::base(
         "prerouting",
         "filter",
@@ -217,6 +225,16 @@ fn pod_chain(name: &str, allows: &[Allow], peer: fn(&str) -> Vec<Expr>) -> Chain
     Chain::regular(name, rules)
 }
 
+/// Goes to the chain of the pod whose TAP the map has, and drops what
+/// comes from or goes to a TAP of a pod it does not have, such as one
+/// whose rules failed to be written.
+fn lookup_chain(name: &str, vmap: Rule) -> Chain {
+    Chain::regular(
+        name,
+        vec![vmap, log(prefix::NO_RULE), verdict(Verdict::Drop)],
+    )
+}
+
 fn prerouting() -> Vec<Rule> {
     let spoofed = fib_saddr_iif_oif_missing;
     vec![
@@ -309,8 +327,8 @@ fn forward(options: &Options) -> Vec<Rule> {
             .concat(),
         );
     }
-    rules.push(iifname_vmap(POD_OUT));
-    rules.push(oifname_vmap(POD_IN));
+    rules.push([from_pods(), verdict(Verdict::Jump(FROM_PODS.to_string()))].concat());
+    rules.push([to_pods(), verdict(Verdict::Jump(TO_PODS.to_string()))].concat());
     rules
 }
 
@@ -419,9 +437,9 @@ mod tests {
             pod_in.elements,
             [
                 Element::ifname("pod-11111111")
-                    .with_verdict(Verdict::Jump("in-pod-11111111".to_string())),
+                    .with_verdict(Verdict::Goto("in-pod-11111111".to_string())),
                 Element::ifname("pod-22222222")
-                    .with_verdict(Verdict::Jump("in-pod-22222222".to_string())),
+                    .with_verdict(Verdict::Goto("in-pod-22222222".to_string())),
             ]
         );
         let names: Vec<&str> = table.chains.iter().map(|c| c.name.as_str()).collect();
@@ -432,13 +450,15 @@ mod tests {
                 "out-pod-11111111",
                 "in-pod-22222222",
                 "out-pod-22222222",
+                "from-pods",
+                "to-pods",
                 "prerouting",
                 "input",
                 "forward",
                 "postrouting"
             ]
         );
-        for chain in &table.chains[..4] {
+        for chain in &table.chains[..6] {
             assert!(chain.base.is_none(), "{} is a regular chain", chain.name);
         }
     }
@@ -491,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_copies_first_and_jumps_through_the_maps() {
+    fn forward_copies_first_and_goes_through_the_maps() {
         let table = table(&policy(), &options());
         let forward = chain(&table, "forward");
         let base = forward.base.as_ref().unwrap();
@@ -521,8 +541,25 @@ mod tests {
             .concat()
         );
         let n = rules.len();
-        assert_eq!(rules[n - 2], iifname_vmap(POD_OUT));
-        assert_eq!(rules[n - 1], oifname_vmap(POD_IN));
+        assert_eq!(
+            rules[n - 2],
+            [from_pods(), verdict(Verdict::Jump(FROM_PODS.to_string()))].concat()
+        );
+        assert_eq!(
+            rules[n - 1],
+            [to_pods(), verdict(Verdict::Jump(TO_PODS.to_string()))].concat()
+        );
+        // A TAP the maps do not have is dropped, not passed.
+        for (name, vmap) in [
+            (FROM_PODS, iifname_vmap(POD_OUT)),
+            (TO_PODS, oifname_vmap(POD_IN)),
+        ] {
+            let lookup = &chain(&table, name).rules;
+            assert_eq!(lookup.len(), 3);
+            assert_eq!(lookup[0], vmap);
+            assert!(logs(&lookup[1], DROP_GROUP, "no-rule"));
+            assert_eq!(lookup[2], verdict(Verdict::Drop));
+        }
         // New connections to the pool only come from NAT64.
         assert!(rules[4].contains(&Expr::Cmp {
             op: CmpOp::Neq,
