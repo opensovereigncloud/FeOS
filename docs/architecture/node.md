@@ -6,7 +6,9 @@ What runs on a node and how. The decisions behind it:
 [ADR 0005](../adr/0005-firecracker.md) (Firecracker),
 [ADR 0008](../adr/0008-suspend-and-restore.md) (suspend and restore),
 [ADR 0009](../adr/0009-node-os-and-packages.md) (operating system and
-packages).
+packages), [ADR 0010](../adr/0010-pod-network.md) (the pods' network),
+[ADR 0012](../adr/0012-security-groups.md) (security groups),
+[ADR 0013](../adr/0013-traffic-records.md) (traffic records).
 
 Parts that are decided but not built are marked as such.
 
@@ -31,15 +33,17 @@ from router advertisements and DHCPv6, and keeps the clock with NTP from
 the servers DHCPv6 names. It takes Ctrl-Alt-Del over (a SIGINT makes it
 sync and reboot), reboots on `SIGRTMIN+5` and powers off on `SIGRTMIN+4`,
 reaps orphans, and runs `/usr/sbin/feosd --self-upgrade --tcp [::]:1337`,
-which it starts again a second after it ends. It serves no API and logs
-to `/dev/kmsg`.
+with `--pod-prefix` and the prefix DHCPv6 delegated to the node if it got
+one, which it also routes as unreachable; it starts `feosd` again a second
+after it ends. It serves no API and logs to `/dev/kmsg`.
 
 On a distribution all of this is the operating system's
 ([ADR 0009](../adr/0009-node-os-and-packages.md)).
 
 ## feosd
 
-`feosd [--tcp ADDRESS] [--self-upgrade]` sets nothing of the machine up.
+`feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix PREFIX] ...` sets
+nothing of the machine up but the pods' network ([below](#the-pods-network)).
 
 - It serves the API on `/run/feos/api.sock` and, with `--tcp`, on TCP,
   without authentication ([api.md](api.md)). If a group `feos` exists, it
@@ -59,14 +63,17 @@ On a distribution all of this is the operating system's
 
 | Path | Holds |
 |---|---|
-| `/var/lib/feos/pods/<id>.pb` | a pod: its spec, its state and why, its address (a `feos.pod.v1.PodInfo`) |
-| `/var/lib/feos/pods/next-address` | where the next pod's address is looked for |
+| `/var/lib/feos/pods/<id>.pb` | a pod: its spec, its state and why, its addresses (a `feos.pod.v1.PodInfo`) |
+| `/var/lib/feos/pods/next-ipv6-address` | the counter of the pods' IPv6 addresses: the next one handed out |
+| `/var/lib/feos/pods/next-address` | where the next pod's NAT64 address is looked for in the pool |
+| `/var/lib/feos/security-groups/<id>.pb` | a security group (a `feos.network.v1.SecurityGroup`) |
 | `/var/lib/feos/vms.db` | the microVM records (SQLite) |
 | `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
 | `/var/lib/feos/images/` | pulled images, a `metadata.json` each |
 | `/var/lib/feos/containers/` | the host's containers, a `container.json` each |
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
 | `/run/feos/` | the API sockets, the task service's pid, the runtime state of containers |
+| `/sys/fs/bpf/feos/nat64/` | NAT64's pinned maps: the pods' IPv4 addresses and the counters |
 | `/usr/lib/feos/firecracker/<version>/` | Firecracker and its jailer, a version each, side by side |
 | `/usr/lib/feos/guest/<version>/` | the guest's `vmlinuz` and `initramfs`, a version each, side by side |
 
@@ -81,33 +88,6 @@ containers its spec names, which the guest runs with the names as their
 IDs. Its spec gives vCPUs and memory, the containers (image, command,
 environment) and whether it has a network. The microVM has a balloon with
 free page reporting.
-
-### The pods' network
-
-Every pod has a network unless its spec says `none`
-([ADR 0010](../adr/0010-pod-network.md)). The pods share the bridge
-`feos-pods`, which carries their gateway, `10.200.0.1/16`. `feosd` gives a
-pod an address of `10.200.0.0/16` when it is created, keeps it in the
-pod's record, and derives the MAC address from it (`06:00:ac` and the
-address's last three bytes); the next address comes from a cursor in
-`/var/lib/feos/pods/next-address`, so a freed one comes round last. Before
-every boot and resume it makes the pod's TAP device, `pod-<8 hex digits of
-the ID>`, an isolated port of the bridge and brings it up. The guest is
-pushed its address, the gateway and the resolvers `8.8.8.8` and
-`1.1.1.1`. Deleting the pod deletes the TAP device.
-
-`feosd` writes two nftables tables over netlink, `inet feos` and `bridge
-feos`, and replaces both whenever a pod comes or goes:
-
-| Chain | What it does |
-|---|---|
-| `inet feos input` | drops what comes in from the bridge: pods do not reach the node |
-| `inet feos forward` | drops what goes from the bridge to private, CGNAT, link-local, loopback, "this network", multicast and reserved addresses |
-| `inet feos postrouting` | masquerades what leaves the pods' subnet for elsewhere |
-| `bridge feos prerouting` | per pod's TAP: only its MAC, its IPv4 source address, ARP with both, nothing but IPv4 and ARP |
-
-Other tables still apply: where Docker or a firewall sets the `FORWARD`
-policy to drop, pods reach nothing until it lets the bridge out.
 
 - **Create** records the pod as `PENDING` and brings it up in the
   background: create and start the microVM, wait for the guest to attach
@@ -128,6 +108,176 @@ policy to drop, pods reach nothing until it lets the bridge out.
 
 What changes a pod runs under a lock of the pod's. `GetPod` asks the guest
 for the containers' states while the pod runs.
+
+## The pods' network
+
+Every pod has a network unless its spec says `none`. Pods are IPv6 only
+([ADR 0010](../adr/0010-pod-network.md)), their security groups decide
+what they reach ([ADR 0012](../adr/0012-security-groups.md)), and their
+traffic is recorded ([ADR 0013](../adr/0013-traffic-records.md)). The code
+is `crates/services/pod-service/src/network*`, on top of
+`network-service` (the groups and their compiler), `dns-service` (the
+resolver), `nat64` and `traffic-service` (the records).
+
+`feosd` takes these options:
+
+| Option | Default | What it is |
+|---|---|---|
+| `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120; a /64 at best |
+| `--nat64 node\|network` | `node` | translate pods' IPv4 traffic on the node, or leave it to a NAT64 in the network |
+| `--nat64-prefix PREFIX` | `64:ff9b::/96` | the NAT64 prefix, a /96, which DNS64 synthesizes under |
+| `--nat64-pool PREFIX` | `10.200.0.0/16` | with `--nat64=node`, the IPv4 addresses that stand for pods; `.1` stands for the node |
+| `--dns-address ADDRESS` | `fdfd:7b5:61d9::53` | the pods' resolver, the same on every node |
+| `--dns-upstream ADDRESS` | Google's and Cloudflare's, IPv6 first | the upstreams of pods that name none (repeatable) |
+| `--deny-prefix PREFIX` | none | what no pod reaches, IPv4 prefixes under the NAT64 prefix (repeatable) |
+
+Without `--pod-prefix`, or when the network cannot be set up, `feosd`
+logs the error and runs on: creating a pod with a network fails with
+`FAILED_PRECONDITION` and the reason, and a kept pod with a network fails
+when it boots or resumes. Pods without a network and the rest of the API
+work as before.
+
+### Devices and routes
+
+At its start `feosd`:
+
+1. removes the first version's network: the bridge `feos-pods` and the
+   table `bridge feos` (a kernel without the bridge family, as
+   `feos-host-init`'s, has none to remove);
+2. turns IPv4 and IPv6 forwarding on; interfaces that take router
+   advertisements (`accept_ra` 1) go on taking them (2);
+3. routes the pod prefix as `unreachable`: a packet for a pod that is not
+   here goes back as unreachable rather than out again;
+4. gives the dummy device `feos-dns` the resolver's address, a /128
+   without duplicate address detection, and binds the resolver's UDP and
+   TCP sockets to it, port 53;
+5. with `--nat64=node`, attaches NAT64 (below); with `--nat64=network`,
+   removes it.
+
+Before every boot and resume of a pod, `feosd` makes its TAP device,
+`pod-<8 hex digits of the ID>`, a link of its own between the node and
+the pod: no router advertisements, no address autoconfiguration and no
+link-local address of the kernel's (set before it goes up), no answers to
+ARP, up, `fe80::1/64` without duplicate address detection, and a route
+for the pod's address, a /128, to it. The guest is pushed its address as
+a /128, `fe80::1` as its gateway, the resolver and no IPv4
+([guest.md](guest.md)); its MAC address is `06:00` and the 8 hex digits
+of its ID. Deleting the pod deletes the TAP device, which takes the route
+with it.
+
+### Addresses
+
+A pod gets an IPv6 address of the prefix when it is created, and keeps it
+in its record (`PodInfo.ipv6_address`) while it is on the node. The next
+address comes from a counter in `/var/lib/feos/pods/next-ipv6-address`,
+from `::2` on, written before an address is handed out: no address is
+handed out twice, not after a restart either. The counter goes past any
+address a kept pod holds. With `--nat64=node` a pod also gets an IPv4
+address of the pool (`PodInfo.ipv4_address`), from a cursor in
+`/var/lib/feos/pods/next-address`, from `.2` on; a freed one comes round
+last.
+
+A pod kept from the first, IPv4 network gets an IPv6 address at the start
+of `feosd`, and keeps its IPv4 address as its NAT64 address if it is in
+the pool. Its microVM was made for that network: one that is stopped is
+made anew at the next boot; one that runs or is suspended keeps the old
+network until the pod is stopped and started.
+
+### DNS
+
+`feosd`'s resolver (`dns-service`) answers the pods it knows, by the
+source address of a query, which the TAP pins, and refuses everyone
+else. It asks the upstreams of the pod's spec (`PodNetwork.dns_upstreams`),
+or `--dns-upstream`, in order. A create refuses an upstream that is not an
+IP address, is the resolver itself, a loopback, link-local or multicast
+address, in a denied prefix, the pod prefix, the NAT64 pool or one of the
+node's addresses; one under the NAT64 prefix is asked as the IPv4 address
+it stands for.
+
+It is DNS64: an AAAA query for a name without AAAA records gets the
+name's A records under the NAT64 prefix. When the pod prefix is a ULA
+(`fc00::/7`), as in labs, every AAAA record counts as absent and every
+name is reached through NAT64. It answers `ipv4only.arpa`, takes `ech`
+and `ipv4hint` out of HTTPS records, and records every query it answers.
+
+### NAT64
+
+With `--nat64=node`, `feosd` attaches the translator of the crate `nat64`:
+the dummy device `feos-nat64`, routes for the NAT64 prefix and the pool
+into it, and an eBPF program on its egress that translates between a
+pod's IPv6 address and its IPv4 address of the pool (SIIT, RFC 7915,
+with an explicit mapping per pod) and hands the packet back to the node.
+The program's maps are pinned in `/sys/fs/bpf/feos/nat64/` (`feosd`
+mounts the bpf filesystem if it is not), so translation goes on while
+`feosd` restarts; at its start `feosd` brings the mappings in line with
+the pods' records. A pod is mapped before every boot and resume and
+unmapped when it is deleted. No interface carries a pool address; the
+table below masquerades the pool to the node's address.
+
+The object `crates/nat64/bpf/nat64.bpf.o` is committed; `make nat64-bpf`
+builds it from `crates/nat64-ebpf` ([development.md](../development.md)).
+
+### The table
+
+`feosd` writes one nftables table over netlink, `inet feos`. Its base
+chains accept what they do not decide on, so that the node's other
+traffic is not theirs:
+
+| Chain | What it does |
+|---|---|
+| `prerouting` (filter, -150) | from a pod's TAP: drops IPv4, packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), both logged as `spoofed`, and router advertisements and redirects |
+| `input` | with `--nat64=node`, drops what comes from `feos-nat64`; from pods takes neighbor solicitations and advertisements and DNS to the resolver over UDP and TCP, and drops the rest |
+| `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), before anything else; accepts what belongs to a connection; drops invalid packets from and to pods, and new connections to the pool from anywhere but `feos-nat64`; then jumps through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) |
+| `out-<TAP>`, `in-<TAP>` | a pod's chains: drop and log (`deny`) what goes to or comes from a denied address, `return` what a rule of the pod's groups allows, drop and log (`no-rule`) the rest |
+| `postrouting` (nat, 100) | with `--nat64=node`: masquerades the pool, except into `feos-nat64` |
+
+A pod's chains end allowed traffic with `return`, not `accept`, which
+would end the base chain: a packet between two pods passes the sender's
+`out-` chain and the receiver's `in-` chain. The sets are what
+`network-service` compiles: `deny` (the denied prefixes, the node's own
+addresses, the pool, and link-local, loopback and multicast addresses),
+`internet` (the default group's), `g-<group>` (a group's members) and
+`b-<hash>` (an address block without its exceptions), all of IPv6
+address intervals, IPv4 ones under the NAT64 prefix. Drops are logged to
+nflog group 2, at most 10 a second per pod and reason.
+
+`feosd` replaces the table at its start and whenever pods come or go or
+rules change; when only members of groups or the node's addresses change,
+it adds and removes set elements in one batch. It writes the rules again
+when a group changes and every minute, which picks up new addresses of
+the node.
+
+Other tables still apply: where Docker or a firewall sets the `FORWARD`
+policy to drop, pods reach nothing until it lets them through.
+
+### Security groups
+
+`feosd` keeps the groups it is sent (`feos.network.v1.SecurityGroupService`)
+in `/var/lib/feos/security-groups/<id>.pb`. A pod's spec names its groups
+(`PodNetwork.security_groups`); one that names none has the default
+group: out to the internet, nothing in. A pod whose groups the node does
+not have does not boot or resume: its bring-up fails, and the pod is
+`FAILED` with a reason that names them; `StartPod` brings it up once they
+are there, and `ResumePod` fails with `FAILED_PRECONDITION` until then. A
+group that a pod names cannot be deleted.
+
+### Traffic records
+
+`feosd` records what its pods do on the network
+(`feos.network.v1.TrafficService`, `feosctl traffic watch`):
+
+- **flows** from connection tracking's events over ctnetlink, with
+  `nf_conntrack_acct` and `nf_conntrack_timestamp` on, which `feosd` turns
+  on once the table has loaded connection tracking;
+- **drops** from nflog group 2, the reason from the rule's prefix;
+- **server names** from the copies on nflog group 3: a TLS ClientHello's
+  server name, or an HTTP request's Host;
+- **DNS** queries from the resolver.
+
+The collector's threads and the resolver feed one channel, from which
+every call streams; a pod's queries to the resolver are left out of the
+flows, which the DNS records cover. What is lost on the way is counted in
+the next record's `missed`.
 
 ## A pod's microVM
 
@@ -239,7 +389,9 @@ version from `apt autoremove`; a version nothing uses is removed with
 `DelegateSubgroup=feosd` and `KillMode=process`: a restart or an upgrade
 stops `feosd` alone, and the next one takes the pods over.
 `StateDirectory=feos` makes `/var/lib/feos` a directory on disk.
-`FEOSD_ARGS` in `/etc/default/feosd` passes options, such as `--tcp`.
+`FEOSD_ARGS` in `/etc/default/feosd` passes options, such as `--tcp`
+and the pods' network's, of which the file has a description; it gives
+no `--pod-prefix`, so pods with a network fail until one is set.
 Installing the package enables the unit the first time and starts it, or
 restarts it after an upgrade, whenever it is enabled; removing the package
 stops the unit; purging it disables the unit. `/var/lib/feos` stays.

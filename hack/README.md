@@ -30,6 +30,8 @@ To test feosd locally, you can execute `make run` to compile and run feosd as ro
 
     make run
 
+Pods with a network need `--pod-prefix` (`sudo ./target/x86_64-unknown-linux-musl/debug/feosd --pod-prefix fd00:fe05:1::/64` in a lab), and feosd then sets the machine's network up for them: forwarding, routes, the devices `feos-dns` and `feos-nat64`, and the table `inet feos` ([docs/architecture/node.md](../docs/architecture/node.md#the-pods-network)). Run it in a VM or a privileged container rather than on a machine whose network matters.
+
 
 ## Guest image (Firecracker)
 
@@ -69,13 +71,32 @@ downloads, pinned by sha256 (`hack/packages/`):
     make publish-apt     # builds HEAD as a dev version and publishes it to apt.fecode.dev
 
 `make test-packages` boots a pod from the installed guest, restarts feosd
-under it, runs pods on feosd's network (busybox from Docker Hub, so it
-needs internet access), checks that they reach neither each other nor the
-node, execs in one through feosd, suspends, resumes, stops and starts it, and powers the container
+under it, gives feosd an `fd00:` pod prefix and a denied prefix in
+`/etc/default/feosd`, and runs pods on its network (busybox and curl from
+Docker Hub, so it needs internet access): they have IPv6 addresses of the
+prefix and reach the internet through DNS64 and NAT64, but neither each
+other nor the node, a denied prefix not at all, and one pod the other on
+the port a security group opens; `feosctl traffic watch` records their DNS
+queries, flows, drops and a TLS server name. It execs in a pod through
+feosd, suspends, resumes, stops and starts it, and powers the container
 off through `feosctl host shutdown`.
 `make publish-apt` reads the bucket's credentials from
 `~/.config/feos/apt/r2.env` and signs with the key in
 `~/.config/feos/apt/gnupg`; both stay on the machine that publishes.
+
+## NAT64
+
+The pods' NAT64 on the node ([ADR 0010](../docs/adr/0010-pod-network.md))
+is an eBPF program, `crates/nat64-ebpf`, whose object
+`crates/nat64/bpf/nat64.bpf.o` is committed:
+
+    make nat64-bpf    # rebuild the object: the nightly of its rust-toolchain.toml, bpf-linker
+    make test-nat64   # the translator in network namespaces of its own; needs sudo
+
+`make test-nat64` puts a pod, the node and an IPv4-only internet into
+network namespaces and checks echo, 100 MB each way over TCP, UDP with and
+without checksums, ICMP errors both ways, unmapped pods, and an attach
+under traffic. It needs iptables, OpenBSD's nc, python3 and nsenter.
 
 ## diskd
 

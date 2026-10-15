@@ -166,7 +166,10 @@ from node to node would need a route per pod, changed with every move.
   port forward over vsock (ADR 0004).
 - `--nat64=node` brings an eBPF program to build, in a crate of its own on
   nightly (ADR 0002), and to load. It stays attached while `feosd`
-  restarts.
+  restarts. Its object is committed, built reproducibly with
+  `make nat64-bpf` on a dated nightly and a pinned bpf-linker, and
+  embedded in `feosd`: no other build needs nightly, and a change of the
+  program is a change of the object in the same commit.
 - Other tables still apply: where Docker or a firewall drops forwarded
   packets by default, pods reach nothing until it lets them through.
 

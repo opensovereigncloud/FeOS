@@ -10,6 +10,7 @@ plane, and between `feosd` and `feos-guest`. They live in
 | Package | What it is for | Served by today |
 |---|---|---|
 | `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, console, events | `feosd` |
+| `feos.network.v1` | the pods' security groups (`SecurityGroupService`) and the records of their traffic (`TrafficService`) | `feosd` |
 | `feos.microvm.v1` | the pods' microVMs, internal to `feosd`, served on no listener | – |
 | `feos.container.v1` | containers: create, start, stop, delete, exec, logs, events | `feosd`, `feos-guest` |
 | `feos.image.v1` | OCI image pulls and the image store | `feosd`, `feos-guest` |
@@ -34,7 +35,7 @@ On a node (`feosd`):
 
 | Listener | Services |
 |---|---|
-| `/run/feos/api.sock`, and TCP with `--tcp` | Pod, Container, Host, Image; and a pod's Container, Image, Tool and Watch |
+| `/run/feos/api.sock`, and TCP with `--tcp` | Pod, SecurityGroup, Traffic, Container, Host, Image; and a pod's Container, Image, Tool and Watch |
 | `/run/feos/image.sock` | Image, internal |
 | `/run/feos/task.sock` | Task, internal, in the task service process |
 | `<vm dir>/v.sock_10001`, per VM | Lifecycle, for the guest's uplink |
@@ -59,6 +60,44 @@ Every public listener serves the same services. TCP has no
 authentication; `feos-host-init` starts `feosd` with `--tcp [::]:1337`.
 Decided, not built
 ([ADR 0006](../adr/0006-control-transport.md)): a listener on Valkey.
+
+## The pods' network
+
+A pod's network ([ADR 0010](../adr/0010-pod-network.md),
+[node.md](node.md#the-pods-network)) is in its spec and its record:
+
+- `PodSpec.network` (`PodNetwork`): `none` for no network at all;
+  `security_groups`, the IDs of the pod's security groups, the node's
+  default group when empty; `dns_upstreams`, the IP addresses of the
+  resolvers that `feosd`'s resolver asks for the pod, the node's when
+  empty. A create with an invalid group ID or an upstream the pod may not
+  use fails with `INVALID_ARGUMENT`; one with a network on a node without
+  `--pod-prefix`, or whose network is not set up, fails with
+  `FAILED_PRECONDITION`.
+- `PodInfo.ipv6_address`: the pod's address, of the node's prefix, while
+  it is on the node. `PodInfo.ipv4_address`: with `--nat64=node`, the
+  address of the node's pool that stands for the pod behind NAT64; the
+  guest never sees it.
+
+`feos.network.v1` is the node's side of ADR 0012 and ADR 0013:
+
+- `SecurityGroupService`: `PutSecurityGroup` replaces a group whole;
+  `UpdateSecurityGroup` adds and removes members from `from_version` to
+  `version`, and fails with `FAILED_PRECONDITION` unless the node has the
+  group at `from_version`; `DeleteSecurityGroup` fails with
+  `FAILED_PRECONDITION` while a pod names the group; `GetSecurityGroup`
+  and `ListSecurityGroups`. A rule is a direction, a protocol (TCP, UDP,
+  ICMPv6 or any), ports of TCP and UDP, and a peer: an address block with
+  exceptions, IPv4 ones under the NAT64 prefix, or a group's members. A
+  change applies to the pods' rules within moments of the call.
+- `TrafficService.StreamTrafficRecords` streams flows, drops, DNS queries
+  and server names as `feosd` makes them, of one pod or of all; what a
+  slow call misses is counted in the next record's `missed`.
+
+The guest's network configuration (`SetNetworkConfigRequest`,
+`GetNetworkConfigResponse`, `feos.microvm.v1.GuestNetworkConfig`) gained
+`ipv6_cidr` and `ipv6_gateway` by addition; `feosd` pushes IPv6 only
+([guest.md](guest.md)).
 
 ## Compatibility
 

@@ -117,12 +117,12 @@ guest's API is internal between `feosd` and `feos-guest`.
 - Confidential computing (TDX, SEV-SNP).
 - Point-in-time recovery: a snapshot is the latest state, not a history.
 
-## Where it stands (2026-10-14)
+## Where it stands (2026-10-15)
 
 | Part | State |
 |---|---|
 | `feos-guest` | runs containers, tools, watches, port forwarding and credential offloading in a Firecracker guest |
-| `feosd` | runs pods (`feos.pod.v1`): a microVM in Firecracker's jailer and its containers, with snapshots, the balloon and the guest's uplink, under systemd or `feos-host-init`; forwards a pod's container, image, tool and watch calls to its guest; gives every pod its network (ADR 0010). Credentials and proxies are not built |
+| `feosd` | runs pods (`feos.pod.v1`): a microVM in Firecracker's jailer and its containers, with snapshots, the balloon and the guest's uplink, under systemd or `feos-host-init`; forwards a pod's container, image, tool and watch calls to its guest; gives every pod its IPv6 network (ADR 0010): an address of the node's prefix on a routed TAP device, NAT64 on the node or in the network, DNS64 from its own resolver; enforces security groups with nftables (ADR 0012) and records flows, drops, DNS queries and server names (ADR 0013), served as `feos.network.v1`. Credentials and proxies are not built; groups and records do not reach Valkey yet |
 | `feos-host-init` | sets the machine up as PID 1 and runs `feosd` |
 | `diskd` | the disk daemon (ADR 0011): ublk devices over sealed layers, a local cache and S3; ported with its labs, not yet wired to pods or packaged |
 | packages | `.deb` packages of `feosd`, `feosctl`, Firecracker and the guest, in a signed apt repository at apt.fecode.dev |

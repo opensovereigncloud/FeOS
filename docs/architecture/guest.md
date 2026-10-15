@@ -9,7 +9,7 @@ built with the `guest` feature.
 
 The guest is a kernel and an initramfs. The kernel starts from
 Firecracker's minimal microVM config: virtio-mmio devices, balloon and
-vsock, IPv4 only, no modules. The initramfs holds the guest as `/init` and
+vsock, IPv6 and IPv4, no modules. The initramfs holds the guest as `/init` and
 a static uutils coreutils, the toolbox for containers. Kernel, Firecracker
 and coreutils downloads are pinned by sha256 (`hack/guest/`).
 
@@ -29,6 +29,25 @@ As PID 1 the guest:
 
 It runs no DHCP and no NTP: the host pushes the time and the network when
 the guest attaches and after every resume.
+
+## Network
+
+A pod is IPv6 only ([ADR 0010](../adr/0010-pod-network.md)): `feosd`
+pushes `eth0` an address of the node's pod prefix as a /128, `fe80::1` as
+its gateway, `feosd`'s resolver (`fdfd:7b5:61d9::53`) and no IPv4
+address. The guest turns router advertisements and address
+autoconfiguration off before the interface goes up, adds the address
+without duplicate address detection, since the node is the link's only
+other end, and routes everything via `fe80::1` on `eth0`. A push leaves
+the interface with exactly its addresses: those of an earlier push go,
+and so does a family the push leaves out, such as the IPv4 of a pod from
+the first network; the same push again changes nothing. A resume on
+another node will push another address.
+
+Names resolve through DNS64: a name with only IPv4 addresses gets IPv6
+ones under the NAT64 prefix, which the node translates. A program that
+connects to an IPv4 literal, or prefers IPv4 from DNS as busybox's
+`wget` does, finds no route.
 
 ## Listeners and vsock ports
 
