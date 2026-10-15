@@ -4,9 +4,9 @@ The Node
 What runs on a node and how. The decisions behind it:
 [ADR 0003](../adr/0003-programs.md) (programs),
 [ADR 0005](../adr/0005-firecracker.md) (Firecracker),
-[ADR 0008](../adr/0008-suspend-and-restore.md) (suspend and restore),
-[ADR 0009](../adr/0009-node-os-and-packages.md) (operating system and
-packages), [ADR 0010](../adr/0010-pod-network.md) (the pods' network),
+[ADR 0008](../adr/0008-suspend-and-restore.md) (suspend, hibernation and
+restore), [ADR 0009](../adr/0009-node-os-and-packages.md) (operating system
+and packages), [ADR 0010](../adr/0010-pod-network.md) (the pods' network),
 [ADR 0011](../adr/0011-disk-daemon.md) (the disk daemon),
 [ADR 0012](../adr/0012-security-groups.md) (security groups),
 [ADR 0013](../adr/0013-traffic-records.md) (traffic records).
@@ -108,6 +108,10 @@ reporting.
 - **Suspend** and **Resume** suspend and resume the microVM, with
   `purge_guest`; the containers come back as they were. The disk stops
   with the microVM and starts again before the resume.
+- **Hibernate** and **Restore** take a pod into the object store and
+  bring it back, on this node or another, with its memory or on its disk
+  alone ([disk.md](disk.md#hibernation)). A hibernated pod is `HIBERNATED`,
+  a record with its checkpoint; **Resume** restores it.
 - **Delete** ends a bring-up and removes the microVM, the disk and the
   record.
 - A running pod whose microVM crashes is `FAILED`; one whose microVM stops

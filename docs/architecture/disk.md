@@ -3,8 +3,9 @@ The Disk Daemon
 
 `diskd` serves pods' disks as block devices over a chunk store that it
 tiers to an object store, and restores pods' memory from the same chunks.
-Every pod has a disk from it. The decision behind it:
-[ADR 0011](../adr/0011-disk-daemon.md).
+Every pod has a disk from it, and hibernates into its object store. The
+decisions behind it: [ADR 0011](../adr/0011-disk-daemon.md),
+[ADR 0008](../adr/0008-suspend-and-restore.md).
 
 ## Processes
 
@@ -91,7 +92,8 @@ Every pod has one disk (`crates/services/pod-service/src/disk.rs`):
   file, and its inode tables and journal zeroed. `feosd` has diskd import
   it the first time a pod needs it after `feosd` started.
 - **A boot** of a pod (create, start) opens its disk: `OpenDisk(pod)` if
-  diskd has it, else `CreateDisk(pod, [L0])`. The microVM's `data_disk` is the link
+  diskd has it, else `OpenDisk(pod, head)` from the pod's checkpoint, else
+  `CreateDisk(pod, [L0])`. The microVM's `data_disk` is the link
   `<state>/live/<pod>/disk`; the microVM layer makes a device node of it,
   `data` in the jail, at every start and restore, and Firecracker attaches
   it as `/data` with `cache_type` `Writeback`. The guest mounts it at
@@ -107,6 +109,42 @@ Every pod has one disk (`crates/services/pod-service/src/disk.rs`):
 
 A pod from before pods had disks gets one at its next boot, in a new
 microVM.
+
+## Hibernation
+
+`HibernatePod` (`feos.pod.v1`) takes a pod off the node, under its lock:
+
+1. a running pod is suspended (`purge_guest`), its snapshot in its jail;
+2. `StopDisk`, `Seal(upload)`: the disk's chain is in the bucket;
+3. `SealFile(memory, upload)`, and `PutObject` of the vmstate to
+   `snapshots/<pod>/<epoch>/vmstate` and of the pod's spec, a
+   `feos.pod.v1.PodSpec`, to `snapshots/<pod>/<epoch>/pod.pb`;
+4. `PutHead(pod, epoch, memory)`: the head, with what the snapshot pins
+   (from its `host.json`);
+5. the pod is `HIBERNATED`, with `PodInfo.checkpoint`; its microVM and
+   snapshot, its disk (`RemoveDevice`), its addresses and its TAP device
+   go. A `feosd` that starts with a hibernated pod removes what is left.
+
+The epoch is the seconds since 1970, or one more than the last
+checkpoint's. A stopped or failed pod skips step 1 and the memory.
+
+`RestorePod(pod, head, cold)` brings it back; `ResumePod` of a hibernated
+pod is `RestorePod` with its own checkpoint:
+
+1. a node that does not have the pod reads the head (`GetHead`) and the
+   spec (`GetObject`) and records the pod, hibernated;
+2. the disk the node has of the pod goes (`RemoveDevice`); the pod gets
+   addresses and is `PENDING`, `restoring from <head>`;
+3. with memory in the head, an installed Firecracker of its version and
+   the same CPU model and kernel, and unless `cold`: `OpenDisk(pod, head)`,
+   `CreateVm`, `GetObject` of the vmstate, `OpenMemory` on
+   `memory.sock` in the microVM's directory, and `ResumeVm` with
+   `RemoteSnapshot`: Firecracker loads the vmstate with the `Uffd`
+   backend, `/memory.sock` in its jail, and the guest runs; it is pushed
+   the time and its network. The pod is `RUNNING` when the call returns;
+4. otherwise, or if step 3 fails before the guest ran, the pod boots anew
+   on the checkpoint's disk, in the background, and adopts its
+   containers.
 
 ## Directories
 
@@ -138,7 +176,10 @@ key and what the snapshot pins: the Firecracker version, the CPU model and
 the host's kernel.
 
 `Sweep` deletes what the bucket holds that the live heads and layers it is
-given do not reach, and nothing younger than a day.
+given do not reach, and nothing younger than a day. The live heads are
+every pod's `checkpoint.head_key`, on every node: a pod reads from the
+checkpoint it came from until its next one. `feosd` sweeps nothing; the
+control plane, which knows all pods, will.
 
 ## Development
 
@@ -156,4 +197,8 @@ of their own.
 
 `make test-pods` runs a diskd beside `feosd` in its container, with the
 node's `/dev`, and the pods' integration tests against it: disks across a
-stop, a start and a crash.
+stop, a start and a crash, and hibernation with and without memory, from
+an evicted cache. With S3 in the environment, or in
+`~/.config/feos/diskd/s3.env` (`FEOS_S3_ENV`), it hibernates under a key
+prefix of its own and sweeps it at the end; without, the hibernation test
+skips.

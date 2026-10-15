@@ -16,7 +16,7 @@ use feos_proto::disk_service::{
     disk_service_client::DiskServiceClient, CloseMemoryRequest, CreateDiskRequest, GetHeadRequest,
     GetObjectRequest, Head, ImportBaseRequest, Layer, MemoryRef, OpenDiskRequest,
     OpenMemoryRequest, PutHeadRequest, PutObjectRequest, RemoveDeviceRequest, SealFileRequest,
-    SealRequest, StopDiskRequest,
+    SealRequest, StatsRequest, StopDiskRequest,
 };
 use hyper_util::rt::TokioIo;
 use log::{info, warn};
@@ -208,6 +208,21 @@ impl Disks {
         };
         self.client().remove_device(request).await.map_err(diskd)?;
         Ok(())
+    }
+
+    /// Fails unless diskd has an object store, which a pod hibernates
+    /// into.
+    pub async fn require_object_store(&self, pod_id: &str) -> Result<(), Status> {
+        let request = StatsRequest {
+            pod_id: pod_id.to_string(),
+        };
+        let stats = self.client().stats(request).await.map_err(diskd)?;
+        if stats.into_inner().object_store {
+            return Ok(());
+        }
+        Err(Status::failed_precondition(
+            "diskd has no object store: pods do not hibernate on this node",
+        ))
     }
 
     /// Seals the stopped disk's writes into the pod's own layer and

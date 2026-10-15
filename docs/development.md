@@ -110,7 +110,9 @@ use) and `protoc`.
     make test-guest-container  # run containers in the guest; needs sudo for a
                                # network namespace and NAT
     make test-pods             # pods against Firecracker, with the guest
-                               # installed and a diskd; needs docker, ublk
+                               # installed and a diskd; needs docker, ublk,
+                               # S3 from the env or ~/.config/feos/diskd/s3.env
+                               # for hibernation
 
     make diskd                 # static diskd and diskctl
     make diskd-lab             # diskd's lab tests: ublk, recovery, writes,

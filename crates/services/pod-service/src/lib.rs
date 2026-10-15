@@ -14,9 +14,10 @@ mod store;
 use feos_proto::pod_service::pod_service_server::PodService;
 use feos_proto::pod_service::{
     CreatePodRequest, CreatePodResponse, DeletePodRequest, DeletePodResponse, GetPodRequest,
-    ListPodsRequest, ListPodsResponse, PodConsoleInput, PodConsoleOutput, PodEvent, PodInfo,
-    ResumePodRequest, ResumePodResponse, StartPodRequest, StartPodResponse, StopPodRequest,
-    StopPodResponse, StreamPodEventsRequest, SuspendPodRequest, SuspendPodResponse,
+    HibernatePodRequest, HibernatePodResponse, ListPodsRequest, ListPodsResponse, PodConsoleInput,
+    PodConsoleOutput, PodEvent, PodInfo, RestorePodRequest, RestorePodResponse, ResumePodRequest,
+    ResumePodResponse, StartPodRequest, StartPodResponse, StopPodRequest, StopPodResponse,
+    StreamPodEventsRequest, SuspendPodRequest, SuspendPodResponse,
 };
 pub use pods::Pods;
 use std::pin::Pin;
@@ -134,5 +135,25 @@ impl PodService for Pods {
     ) -> Result<Response<ResumePodResponse>, Status> {
         self.resume(&request.into_inner().pod_id).await?;
         Ok(Response::new(ResumePodResponse {}))
+    }
+
+    async fn hibernate_pod(
+        &self,
+        request: Request<HibernatePodRequest>,
+    ) -> Result<Response<HibernatePodResponse>, Status> {
+        Ok(Response::new(
+            self.hibernate(&request.into_inner().pod_id).await?,
+        ))
+    }
+
+    async fn restore_pod(
+        &self,
+        request: Request<RestorePodRequest>,
+    ) -> Result<Response<RestorePodResponse>, Status> {
+        let request = request.into_inner();
+        Ok(Response::new(
+            self.restore(&request.pod_id, &request.head_key, request.cold)
+                .await?,
+        ))
     }
 }

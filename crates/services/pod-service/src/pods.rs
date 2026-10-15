@@ -10,6 +10,14 @@
 //! or a stop, is taken up again where it ended. A boot on a disk that has
 //! the pod's containers adopts them. What changes a pod runs under its
 //! lock; a stop or a delete ends a bring-up first.
+//!
+//! A pod hibernates (ADR 0008) under its lock, in this order: it is
+//! suspended, its disk is stopped, sealed and uploaded, its memory sealed
+//! and uploaded, its vmstate and its spec put beside them, and its head
+//! last; then it is a record with its checkpoint, and what it held on the
+//! node goes. Until the head is up the pod stays suspended on the node. A
+//! restore opens the checkpoint's disk and restores the memory where the
+//! node can load the snapshot; elsewhere, it boots anew on the disk.
 
 use crate::disk::Disks;
 use crate::network::{Attachment, Network};
@@ -20,27 +28,29 @@ use feos_proto::container_service::{
     ContainerState as GuestContainerState, CreateContainerRequest, GetContainerRequest,
     ListContainersRequest, StartContainerRequest,
 };
+use feos_proto::disk_service::{Head, MemoryRef};
 use feos_proto::microvm::{
     micro_vm_service_server::MicroVmService, stream_vm_console_request as console_request,
     AttachConsoleMessage, ConsoleData, CreateVmRequest, DeleteVmRequest, GetVmRequest,
-    PingVmRequest, ResumeVmRequest, ShutdownVmRequest, StartVmRequest, StreamVmConsoleRequest,
-    StreamVmEventsRequest, SuspendVmRequest, VmConfig, VmEvent, VmInfo, VmState,
-    VmStateChangedEvent,
+    PingVmRequest, RemoteSnapshot, ResumeVmRequest, ShutdownVmRequest, StartVmRequest,
+    StreamVmConsoleRequest, StreamVmEventsRequest, SuspendVmRequest, VmConfig, VmEvent, VmInfo,
+    VmState, VmStateChangedEvent,
 };
 use feos_proto::pod_service::{
-    ContainerSpec, ContainerState, ContainerStatus, MicroVm, PodConsoleInput, PodConsoleOutput,
-    PodEvent, PodInfo, PodSpec, PodState,
+    Checkpoint, ContainerSpec, ContainerState, ContainerStatus, HibernatePodResponse, MicroVm,
+    PodConsoleInput, PodConsoleOutput, PodEvent, PodInfo, PodSpec, PodState, RestorePodResponse,
 };
 use feos_utils::vsock::{self, API_PORT};
 use log::{info, warn};
 use microvm_service::api::VmApiHandler;
-use microvm_service::vsock_path;
+use microvm_service::vmm::snapshot;
+use microvm_service::{memory_socket_path, vsock_path};
 use prost::Message;
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, OwnedMutexGuard};
 use tokio::task::AbortHandle;
 use tokio::time::{sleep, timeout, Instant};
@@ -69,6 +79,9 @@ pub struct Pods {
 struct Inner {
     vms: VmApiHandler,
     store: Store,
+    /// Where the pods are kept; a hibernation's and a restore's files pass
+    /// through it.
+    dir: PathBuf,
     network: Network,
     disks: Disks,
     pods: Mutex<HashMap<String, Pod>>,
@@ -84,8 +97,9 @@ struct Pod {
 
 impl Pods {
     /// The pods kept in `dir`, on the pods' network, with their disks from
-    /// `disks`. Those that were coming up come up now; the others follow
-    /// their microVMs from here on.
+    /// `disks`. Those that were coming up come up now, and what hibernated
+    /// pods left on the node goes; the others follow their microVMs from
+    /// here on.
     pub async fn new(
         vms: VmApiHandler,
         dir: &Path,
@@ -93,7 +107,11 @@ impl Pods {
         disks: Disks,
     ) -> io::Result<Self> {
         let store = Store::open(dir)?;
-        let mut kept = store.load()?;
+        // A hibernated pod has no addresses on the node.
+        let (mut kept, hibernated): (Vec<_>, Vec<_>) = store
+            .load()?
+            .into_iter()
+            .partition(|info| info.state() != PodState::Hibernated);
         for pod_id in network.adopt(&mut kept) {
             if let Some(info) = kept.iter().find(|info| info.pod_id == pod_id)
                 && let Err(e) = store.save(info)
@@ -101,12 +119,14 @@ impl Pods {
                 warn!("Pods: Failed to keep {pod_id}: {e}");
             }
         }
+        kept.extend(hibernated);
         network.sync(&kept);
         let (events, _) = broadcast::channel(256);
         let pods = Self {
             inner: Arc::new(Inner {
                 vms,
                 store,
+                dir: dir.to_path_buf(),
                 network,
                 disks,
                 pods: Mutex::new(HashMap::new()),
@@ -115,10 +135,12 @@ impl Pods {
         };
         let mut pending = Vec::new();
         let mut running = Vec::new();
+        let mut purge = Vec::new();
         for info in kept {
             match info.state() {
                 PodState::Pending => pending.push(info.pod_id.clone()),
                 PodState::Running => running.push(info.pod_id.clone()),
+                PodState::Hibernated => purge.push(info.pod_id.clone()),
                 _ => {}
             }
             pods.pods().insert(
@@ -150,6 +172,19 @@ impl Pods {
         }
         for pod_id in pending {
             pods.spawn_bring_up(&pod_id);
+        }
+        // A hibernation that was cut off after its head was up.
+        for pod_id in purge {
+            let pods = pods.clone();
+            tokio::spawn(async move {
+                if let Ok(_lock) = pods.lock(&pod_id).await
+                    && pods
+                        .info(&pod_id)
+                        .is_ok_and(|i| i.state() == PodState::Hibernated)
+                {
+                    pods.purge(&pod_id).await;
+                }
+            });
         }
         pods.follow_vms();
         pods.follow_security_groups();
@@ -215,6 +250,11 @@ impl Pods {
                     "pod {pod_id} is suspended: resume it"
                 )));
             }
+            PodState::Hibernated => {
+                return Err(Status::failed_precondition(format!(
+                    "pod {pod_id} is hibernated: resume or restore it, or stop it to boot it anew"
+                )));
+            }
             _ => {}
         }
         self.set_state(pod_id, PodState::Pending, "");
@@ -224,11 +264,21 @@ impl Pods {
     }
 
     /// Ends the pod's microVM and stops its disk. Whatever state it is in,
-    /// the next start boots it anew on its disk.
+    /// the next start boots it anew on its disk; a hibernated pod's is the
+    /// one of its checkpoint.
     pub async fn stop(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
-        if self.info(pod_id)?.state() == PodState::Stopped {
-            return Ok(());
+        match self.info(pod_id)?.state() {
+            PodState::Stopped => return Ok(()),
+            PodState::Hibernated => {
+                self.set_state(
+                    pod_id,
+                    PodState::Stopped,
+                    "stopped: its memory is dropped, its disk is its checkpoint's",
+                );
+                return Ok(());
+            }
+            _ => {}
         }
         match self.vm(pod_id).await?.map(|vm| vm.state()) {
             None | Some(VmState::Stopped) => {}
@@ -311,9 +361,16 @@ impl Pods {
         Ok(response.memory_bytes)
     }
 
-    /// Restores a suspended pod from its snapshot, on its disk.
+    /// Restores a suspended pod from its snapshot, or a hibernated one from
+    /// its checkpoint. A resume that comes while the pod hibernates waits
+    /// for its lock, and finds it hibernated.
     pub async fn resume(&self, pod_id: &str) -> Result<(), Status> {
-        let _lock = self.lock(pod_id).await?;
+        let lock = self.lock(pod_id).await?;
+        if self.info(pod_id)?.state() == PodState::Hibernated {
+            drop(lock);
+            self.restore(pod_id, "", false).await?;
+            return Ok(());
+        }
         self.expect_state(pod_id, PodState::Suspended)?;
         let attachment = self.attach(pod_id).await?;
         self.open_disk(pod_id).await?;
@@ -329,6 +386,392 @@ impl Pods {
         Ok(())
     }
 
+    /// Takes the pod off the node into object storage (ADR 0008): under
+    /// its lock, so that a resume waits for it. Until its head is up, the
+    /// pod stays on the node, suspended if it ran.
+    pub async fn hibernate(&self, pod_id: &str) -> Result<HibernatePodResponse, Status> {
+        let _lock = self.lock(pod_id).await?;
+        let info = self.info(pod_id)?;
+        if info.state() != PodState::Hibernated {
+            // Before anything changes: without one, the pod stays as it is.
+            self.inner.disks.require_object_store(pod_id).await?;
+        }
+        let memory = match info.state() {
+            PodState::Hibernated => {
+                return Ok(HibernatePodResponse {
+                    checkpoint: info.checkpoint,
+                    ..Default::default()
+                });
+            }
+            PodState::Running => {
+                self.set_state(pod_id, PodState::Running, "hibernating");
+                if let Err(e) = self.suspend_locked(pod_id).await {
+                    if self.info(pod_id)?.state() == PodState::Running {
+                        self.set_state(pod_id, PodState::Running, "");
+                    }
+                    return Err(e);
+                }
+                true
+            }
+            // One whose snapshot is gone has its disk.
+            PodState::Suspended => snapshot::exists(pod_id),
+            PodState::Stopped | PodState::Failed => false,
+            state => {
+                return Err(Status::failed_precondition(format!(
+                    "pod {pod_id} is {}",
+                    state.as_str_name()
+                )));
+            }
+        };
+        if !memory {
+            // A failed pod's microVM may have left its disk started.
+            self.delete_vm(pod_id).await?;
+        }
+        self.inner.disks.stop(pod_id).await?;
+        let epoch = next_epoch(info.checkpoint.as_ref());
+        info!("Pods: {pod_id} hibernates, epoch {epoch}");
+        let disk = self.inner.disks.seal(pod_id).await?;
+        let mut memory_bytes = 0;
+        let memory = if memory {
+            let host = snapshot::Host::load(pod_id)
+                .map_err(|e| Status::internal(format!("the snapshot's host record: {e}")))?;
+            let layer = self
+                .inner
+                .disks
+                .seal_memory(&snapshot::memory(pod_id))
+                .await?;
+            memory_bytes = layer.logical_bytes;
+            let vmstate_key = checkpoint_key(pod_id, epoch, "vmstate");
+            self.inner
+                .disks
+                .put_object(&vmstate_key, &snapshot::vmstate(pod_id))
+                .await?;
+            Some(MemoryRef {
+                layer: layer.layer_id,
+                vmstate_key,
+                firecracker_version: host.firecracker_version,
+                cpu_model: host.cpu_model,
+                kernel_release: host.kernel_release,
+            })
+        } else {
+            None
+        };
+        // The spec, for a node that does not have the pod.
+        let spec = self.inner.dir.join(format!("{pod_id}.spec"));
+        std::fs::write(&spec, info.spec.unwrap_or_default().encode_to_vec())
+            .map_err(|e| Status::internal(format!("write {}: {e}", spec.display())))?;
+        let put = self
+            .inner
+            .disks
+            .put_object(&checkpoint_key(pod_id, epoch, SPEC_OBJECT), &spec)
+            .await;
+        let _ = std::fs::remove_file(&spec);
+        put?;
+        let head = self.inner.disks.put_head(pod_id, epoch, memory).await?;
+        let checkpoint = Checkpoint {
+            head_key: head.key,
+            epoch,
+            memory: head.memory.is_some(),
+        };
+        info!("Pods: {pod_id} is in {}", checkpoint.head_key);
+
+        // From here on, the checkpoint is the pod. It leaves the network
+        // as a deleted pod does, its addresses last.
+        let placed = self.info(pod_id)?;
+        if let Err(e) = self.inner.network.detach(&placed).await {
+            warn!("Pods: Failed to take {pod_id} off the network: {e}");
+        }
+        self.update(pod_id, |info| {
+            info.checkpoint = Some(checkpoint.clone());
+            info.ipv6_address.clear();
+            info.ipv4_address.clear();
+        });
+        self.set_state(pod_id, PodState::Hibernated, "hibernated");
+        self.purge(pod_id).await;
+        if let Err(e) = self.apply_network().await {
+            warn!("Pods: Failed to set the pods' rules: {e}");
+        }
+        self.inner.network.release(&placed);
+        Ok(HibernatePodResponse {
+            checkpoint: Some(checkpoint),
+            memory_bytes,
+            disk_bytes: disk.logical_bytes,
+        })
+    }
+
+    /// Removes what a hibernated pod held on the node: its microVM with
+    /// its snapshot, its disk and its TAP device. What fails is logged and
+    /// left; the next start of feosd tries again.
+    async fn purge(&self, pod_id: &str) {
+        if let Err(e) = self.delete_vm(pod_id).await {
+            warn!("Pods: Failed to remove {pod_id}'s microVM: {}", e.message());
+        }
+        self.inner.disks.close_memory(pod_id).await;
+        if let Err(e) = self.inner.disks.remove(pod_id).await {
+            warn!("Pods: Failed to remove {pod_id}'s disk: {}", e.message());
+        }
+        if let Ok(info) = self.info(pod_id)
+            && let Err(e) = self.inner.network.detach(&info).await
+        {
+            warn!("Pods: Failed to take {pod_id} off the network: {e}");
+        }
+    }
+
+    /// Brings a hibernated pod back from the checkpoint `head_key`, or its
+    /// own: on this node, or on one that does not have the pod, which
+    /// takes its spec from the checkpoint. The memory is restored where
+    /// the node can load the snapshot, unless `cold`; otherwise, and if the
+    /// restore of the memory fails before the guest ran, the pod boots
+    /// anew on the checkpoint's disk.
+    pub async fn restore(
+        &self,
+        pod_id: &str,
+        head_key: &str,
+        cold: bool,
+    ) -> Result<RestorePodResponse, Status> {
+        spec::check_id(pod_id)?;
+        if self.info(pod_id).is_err() {
+            self.adopt_checkpoint(pod_id, head_key).await?;
+        }
+        let lock = self.end_bring_up_and_lock(pod_id).await?;
+        let info = self.info(pod_id)?;
+        let own = info.checkpoint.as_ref().map(|c| c.head_key.clone());
+        let key = match head_key {
+            "" => own.clone().unwrap_or_default(),
+            key => key.to_string(),
+        };
+        match info.state() {
+            PodState::Hibernated => {}
+            // Restored already, by a call whose caller lost the answer.
+            PodState::Pending | PodState::Running if own.as_deref() == Some(key.as_str()) => {
+                return Ok(RestorePodResponse {
+                    pod: Some(info),
+                    ..Default::default()
+                });
+            }
+            state => {
+                return Err(Status::failed_precondition(format!(
+                    "pod {pod_id} is {}, not hibernated",
+                    state.as_str_name()
+                )));
+            }
+        }
+        if key.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "pod {pod_id} has no checkpoint"
+            )));
+        }
+        let head = self.inner.disks.get_head(&key).await?;
+        if head.pod_id != pod_id {
+            return Err(Status::invalid_argument(format!(
+                "{key} is pod {}'s, not {pod_id}'s",
+                head.pod_id
+            )));
+        }
+
+        // A disk the node has of the pod is the checkpoint's at best.
+        self.inner.disks.remove(pod_id).await?;
+        self.place(pod_id)?;
+        self.update(pod_id, |info| {
+            info.checkpoint = Some(Checkpoint {
+                head_key: key.clone(),
+                epoch: head.epoch,
+                memory: head.memory.is_some(),
+            });
+        });
+        self.set_state(pod_id, PodState::Pending, &format!("restoring from {key}"));
+        if let Err(e) = self.apply_network().await {
+            warn!("Pods: Failed to set the pods' rules: {e}");
+        }
+
+        let reason = match why_cold(cold, head.memory.as_ref()) {
+            Some(reason) => reason,
+            None => match self.restore_memory(pod_id, &head).await {
+                Ok(()) => {
+                    self.set_state(pod_id, PodState::Running, "");
+                    info!("Pods: {pod_id} is restored from {key}, with its memory");
+                    return Ok(RestorePodResponse {
+                        pod: Some(self.info(pod_id)?),
+                        memory_restored: true,
+                        reason: String::new(),
+                    });
+                }
+                Err(Restore::Booted(e)) => {
+                    // The guest runs: what is left to do is a bring-up's.
+                    warn!("Pods: {pod_id} runs from {key}, but: {}", e.message());
+                    drop(lock);
+                    self.spawn_bring_up(pod_id);
+                    return Err(e);
+                }
+                Err(Restore::NotBooted(e)) => {
+                    warn!("Pods: {pod_id}'s memory is not restored: {}", e.message());
+                    format!("its memory did not restore: {}", e.message())
+                }
+            },
+        };
+        info!("Pods: {pod_id} boots anew on the disk of {key}: {reason}");
+        self.set_state(
+            pod_id,
+            PodState::Pending,
+            &format!("booting anew on its disk: {reason}"),
+        );
+        drop(lock);
+        self.spawn_bring_up(pod_id);
+        Ok(RestorePodResponse {
+            pod: Some(self.info(pod_id)?),
+            memory_restored: false,
+            reason,
+        })
+    }
+
+    /// Records a pod the node does not have, hibernated, from its
+    /// checkpoint: its spec is beside the head.
+    async fn adopt_checkpoint(&self, pod_id: &str, head_key: &str) -> Result<(), Status> {
+        if head_key.is_empty() {
+            return Err(Status::not_found(format!(
+                "no pod {pod_id}: name its checkpoint's head to restore it here"
+            )));
+        }
+        let head = self.inner.disks.get_head(head_key).await?;
+        if head.pod_id != pod_id {
+            return Err(Status::invalid_argument(format!(
+                "{head_key} is pod {}'s, not {pod_id}'s",
+                head.pod_id
+            )));
+        }
+        let path = self.inner.dir.join(format!("{pod_id}.spec"));
+        let key = checkpoint_key(pod_id, head.epoch, SPEC_OBJECT);
+        let fetched = self.inner.disks.get_object(&key, &path).await;
+        let read = fetched.and_then(|()| {
+            std::fs::read(&path).map_err(|e| Status::internal(format!("read {key}: {e}")))
+        });
+        let _ = std::fs::remove_file(&path);
+        let spec = PodSpec::decode(read?.as_slice())
+            .map_err(|e| Status::invalid_argument(format!("{key}: {e}")))?;
+        let spec = spec::normalize(spec)?;
+        self.inner.network.check(&spec)?;
+        let info = {
+            let mut pods = self.pods();
+            if pods.contains_key(pod_id) {
+                // Another restore was faster.
+                return Ok(());
+            }
+            let info = PodInfo {
+                pod_id: pod_id.to_string(),
+                spec: Some(spec),
+                state: PodState::Hibernated as i32,
+                reason: "hibernated".to_string(),
+                checkpoint: Some(Checkpoint {
+                    head_key: head_key.to_string(),
+                    epoch: head.epoch,
+                    memory: head.memory.is_some(),
+                }),
+                ..Default::default()
+            };
+            self.inner
+                .store
+                .save(&info)
+                .map_err(|e| Status::internal(format!("keep pod {pod_id}: {e}")))?;
+            pods.insert(
+                pod_id.to_string(),
+                Pod {
+                    info: info.clone(),
+                    lock: Arc::default(),
+                    bring_up: None,
+                },
+            );
+            info
+        };
+        info!("Pods: {pod_id} comes from {head_key}");
+        self.announce(&info, false);
+        Ok(())
+    }
+
+    /// Restores the pod's memory from its checkpoint into a microVM that
+    /// never booted, on the checkpoint's disk: diskd serves the memory as
+    /// the guest asks for it.
+    async fn restore_memory(&self, pod_id: &str, head: &Head) -> Result<(), Restore> {
+        let memory = head.memory.clone().unwrap_or_default();
+        let vmstate = self.inner.dir.join(format!("{pod_id}.vmstate"));
+        let prepared = async {
+            let info = self.info(pod_id)?;
+            let attachment = self.attach(pod_id).await?;
+            let disk = self.inner.disks.open_checkpoint(pod_id, &head.key).await?;
+            let config = spec::vm_config(
+                pod_id,
+                &info.spec.unwrap_or_default(),
+                attachment.as_ref(),
+                Some(&disk),
+            );
+            self.delete_vm(pod_id).await?;
+            let request = Request::new(CreateVmRequest {
+                config: Some(config),
+                vm_id: Some(pod_id.to_string()),
+            });
+            self.inner.vms.create_vm(request).await?;
+            self.settle(pod_id, VmState::Created).await?;
+            self.inner
+                .disks
+                .get_object(&memory.vmstate_key, &vmstate)
+                .await?;
+            self.inner
+                .disks
+                .open_memory(pod_id, &memory.layer, &memory_socket_path(pod_id))
+                .await?;
+            let request = Request::new(ResumeVmRequest {
+                vm_id: pod_id.to_string(),
+                remote: Some(RemoteSnapshot {
+                    vmstate_path: vmstate.to_string_lossy().into_owned(),
+                    firecracker_version: memory.firecracker_version.clone(),
+                    cpu_model: memory.cpu_model.clone(),
+                    kernel_release: memory.kernel_release.clone(),
+                }),
+            });
+            self.inner.vms.resume_vm(request).await.map(drop)
+        }
+        .await;
+        let _ = std::fs::remove_file(&vmstate);
+        if let Err(e) = prepared {
+            // The guest did not run: the disk is as the checkpoint has it,
+            // for a boot.
+            self.inner.disks.close_memory(pod_id).await;
+            if let Err(e) = self.delete_vm(pod_id).await {
+                warn!("Pods: Failed to remove {pod_id}'s microVM: {}", e.message());
+            }
+            return Err(Restore::NotBooted(e));
+        }
+        self.settle(pod_id, VmState::Running)
+            .await
+            .map_err(Restore::Booted)
+    }
+
+    /// Gives a pod that is to come back onto the node what it gave up when
+    /// it hibernated: its addresses.
+    fn place(&self, pod_id: &str) -> Result<(), Status> {
+        let mut pods = self.pods();
+        let Some(pod) = pods.get(pod_id) else {
+            return Err(Status::not_found(format!("no pod {pod_id}")));
+        };
+        let info = &pod.info;
+        if !info.spec.as_ref().is_some_and(spec::has_network) || !info.ipv6_address.is_empty() {
+            return Ok(());
+        }
+        let mut info = info.clone();
+        let others = pods
+            .values()
+            .filter(|pod| pod.info.pod_id != pod_id)
+            .map(|pod| &pod.info);
+        self.inner.network.allocate(others, &mut info)?;
+        self.inner
+            .store
+            .save(&info)
+            .map_err(|e| Status::internal(format!("keep pod {pod_id}: {e}")))?;
+        if let Some(pod) = pods.get_mut(pod_id) {
+            pod.info = info;
+        }
+        Ok(())
+    }
+
     /// Stops the pod's disk when its microVM has ended, and lets go of the
     /// memory diskd served it. What fails is logged: the disk's next start
     /// takes what is there.
@@ -339,10 +782,16 @@ impl Pods {
         }
     }
 
-    /// Starts the pod's disk: the one the node has, or a new one. Returns
-    /// the path Firecracker takes.
+    /// Starts the pod's disk: the one the node has, or its checkpoint's,
+    /// or a new one. Returns the path Firecracker takes.
     async fn open_disk(&self, pod_id: &str) -> Result<String, Status> {
-        self.inner.disks.open(pod_id, None).await
+        let info = self.info(pod_id)?;
+        let head_key = info
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.head_key.as_str())
+            .filter(|key| !key.is_empty());
+        self.inner.disks.open(pod_id, head_key).await
     }
 
     /// Whether a pod on the node names the security group.
@@ -499,6 +948,18 @@ impl Pods {
         self.lock(pod_id).await
     }
 
+    /// Changes the pod's record and keeps it, without an event.
+    fn update(&self, pod_id: &str, change: impl FnOnce(&mut PodInfo)) {
+        let mut pods = self.pods();
+        let Some(pod) = pods.get_mut(pod_id) else {
+            return;
+        };
+        change(&mut pod.info);
+        if let Err(e) = self.inner.store.save(&pod.info) {
+            warn!("Pods: Failed to keep {pod_id}: {e}");
+        }
+    }
+
     fn set_state(&self, pod_id: &str, state: PodState, reason: &str) {
         let info = {
             let mut pods = self.pods();
@@ -578,6 +1039,7 @@ impl Pods {
     /// is in. Returns whether it booted it anew.
     async fn boot(&self, pod_id: &str, spec: &PodSpec) -> Result<bool, Status> {
         let vm_id = pod_id.to_string();
+        self.place(pod_id)?;
         let attachment = self.attach(pod_id).await?;
         let disk = self.open_disk(pod_id).await?;
         let config = spec::vm_config(pod_id, spec, attachment.as_ref(), Some(&disk));
@@ -863,6 +1325,58 @@ impl Pods {
     }
 }
 
+/// What a restore of a pod's memory left.
+enum Restore {
+    /// The guest did not run: the disk is as the checkpoint has it.
+    NotBooted(Status),
+    /// The guest ran, and something after it failed.
+    Booted(Status),
+}
+
+impl From<Status> for Restore {
+    fn from(e: Status) -> Self {
+        Restore::NotBooted(e)
+    }
+}
+
+/// Why a restore boots the pod anew on its checkpoint's disk instead of
+/// restoring its memory, if it does: it was asked to, the checkpoint
+/// holds no memory, or this node cannot load the snapshot. That is
+/// decided before anything starts, from what the snapshot pins; a load
+/// that fails all the same falls back, too, as long as the guest did not
+/// run.
+fn why_cold(cold: bool, memory: Option<&MemoryRef>) -> Option<String> {
+    match memory {
+        _ if cold => Some("asked to boot anew".to_string()),
+        None => Some("its checkpoint holds no memory".to_string()),
+        Some(memory) => snapshot::Host {
+            firecracker_version: memory.firecracker_version.clone(),
+            cpu_model: memory.cpu_model.clone(),
+            kernel_release: memory.kernel_release.clone(),
+        }
+        .unrestorable_here(),
+    }
+}
+
+/// The object of a checkpoint that holds the pod's spec, for a node that
+/// does not have the pod.
+const SPEC_OBJECT: &str = "pod.pb";
+
+/// The key of an object of the pod's checkpoint `epoch`, beside its head.
+fn checkpoint_key(pod_id: &str, epoch: u64, name: &str) -> String {
+    format!("snapshots/{pod_id}/{epoch}/{name}")
+}
+
+/// The epoch of the pod's next checkpoint: the seconds since 1970, or one
+/// more than the last one's, so that it grows and no head is written
+/// twice.
+fn next_epoch(last: Option<&Checkpoint>) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    now.max(last.map_or(0, |checkpoint| checkpoint.epoch + 1))
+}
+
 /// Whether the microVM's network or disk is not the one `wanted` has.
 fn stale(vm: &VmInfo, wanted: &VmConfig) -> bool {
     let config = vm.config.as_ref();
@@ -926,5 +1440,49 @@ async fn run_container(
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn memory(firecracker_version: &str) -> MemoryRef {
+        let here = snapshot::Host::this(firecracker_version);
+        MemoryRef {
+            layer: "aa".to_string(),
+            vmstate_key: "snapshots/p/1/vmstate".to_string(),
+            firecracker_version: here.firecracker_version,
+            cpu_model: here.cpu_model,
+            kernel_release: here.kernel_release,
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_boots_anew_where_its_memory_cannot_be_restored() {
+        assert_eq!(
+            why_cold(true, Some(&memory("1.17.0"))).unwrap(),
+            "asked to boot anew"
+        );
+        assert!(why_cold(false, None).unwrap().contains("no memory"));
+        // A Firecracker no node has.
+        let reason = why_cold(false, Some(&memory("0.0.0-none"))).unwrap();
+        assert!(reason.contains("not installed"), "{reason}");
+        // What the snapshot does not record counts as different.
+        let mut unknown = memory("0.0.0-none");
+        unknown.cpu_model.clear();
+        assert!(why_cold(false, Some(&unknown)).is_some());
+    }
+
+    #[test]
+    fn epochs_grow_and_are_never_written_twice() {
+        let now = next_epoch(None);
+        assert!(now > 1_700_000_000);
+        let ahead = Checkpoint {
+            epoch: now + 100,
+            ..Default::default()
+        };
+        assert_eq!(next_epoch(Some(&ahead)), now + 101);
+        assert_eq!(checkpoint_key("p", 7, SPEC_OBJECT), "snapshots/p/7/pod.pb");
     }
 }

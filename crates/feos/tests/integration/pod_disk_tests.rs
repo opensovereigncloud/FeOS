@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pods' disks from diskd (ADR 0011): what is on a pod's disk survives a
-//! stop and a crash.
+//! Pods' disks from diskd (ADR 0011) and their hibernation (ADR 0008): what
+//! is on a pod's disk survives a stop, a crash and a trip through object
+//! storage, and its memory comes back where the node can restore it.
 //!
 //! The pods have no network, so that the tests need no registry: what is
 //! on a disk is told by container records, which the guest keeps on its
 //! data volume and lists. A test puts a record on a stopped pod's disk
 //! from the node; the guest's own changes are a record it deletes.
+//! Hibernation needs diskd with an object store, as `make test-pods` gives
+//! it when it has one; without, that test skips.
 
 use super::fixtures::{verify_microvm_cleanup, PodGuard};
 use super::pod_tests::{for_pod, get_pod, guest_ping, new_pod_id};
@@ -17,18 +20,22 @@ use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, DeleteContainerRequest, ListContainersRequest,
 };
 use feos_proto::disk_service::{
-    disk_service_client::DiskServiceClient, OpenDiskRequest, StatsRequest, StopDiskRequest,
+    disk_service_client::DiskServiceClient, evict_request, EvictRequest, GetHeadRequest,
+    OpenDiskRequest, StatsRequest, StopDiskRequest,
 };
 use feos_proto::pod_service::{
-    pod_service_client::PodServiceClient, CreatePodRequest, DeletePodRequest, PodInfo, PodNetwork,
-    PodSpec, PodState, Resources, StartPodRequest, StopPodRequest,
+    pod_service_client::PodServiceClient, CreatePodRequest, DeletePodRequest, HibernatePodRequest,
+    PodInfo, PodNetwork, PodSpec, PodState, Resources, RestorePodRequest, ResumePodRequest,
+    StartPodRequest, StopPodRequest,
 };
 use hyper_util::rt::TokioIo;
 use log::info;
+use microvm_service::vm_dir;
 use nix::mount::{mount, umount, MsFlags};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pod_service::disk::DISKD_SOCKET;
+use pod_service::network;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -283,6 +290,211 @@ async fn test_pod_disk_survives_stop_and_crash() -> Result<()> {
         !disk_dir(&pod_id).exists(),
         "the pod's disk is gone with it"
     );
+    guard.disable_cleanup();
+    Ok(())
+}
+
+/// Hibernates the pod; returns its checkpoint's head.
+async fn hibernate(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<String> {
+    let response = pods
+        .hibernate_pod(HibernatePodRequest {
+            pod_id: pod_id.to_string(),
+        })
+        .await?
+        .into_inner();
+    let checkpoint = response
+        .checkpoint
+        .context("a hibernation has a checkpoint")?;
+    info!(
+        "Pod {pod_id} is in {}: {} MiB of memory, {} KiB on its disk",
+        checkpoint.head_key,
+        response.memory_bytes >> 20,
+        response.disk_bytes >> 10
+    );
+    assert!(
+        checkpoint.memory,
+        "a running pod hibernates with its memory"
+    );
+    assert!(response.memory_bytes > 0 && response.disk_bytes > 0);
+    let pod = get_pod(pods, pod_id).await?;
+    assert_eq!(pod.state(), PodState::Hibernated);
+    assert_eq!(pod.checkpoint.as_ref(), Some(&checkpoint));
+    // Nothing of it is left on the node.
+    assert!(!vm_dir(pod_id).exists(), "a hibernated pod has no microVM");
+    assert!(!disk_dir(pod_id).exists(), "a hibernated pod has no disk");
+    assert!(
+        !Path::new("/sys/class/net")
+            .join(network::tap_name(pod_id))
+            .exists(),
+        "a hibernated pod has no TAP device"
+    );
+    Ok(checkpoint.head_key)
+}
+
+#[tokio::test]
+async fn test_pod_hibernate_and_restore() -> Result<()> {
+    if installed_guest()?.is_none() {
+        return Ok(());
+    }
+    if std::env::var("S3_BUCKET").map_or(true, |bucket| bucket.is_empty()) {
+        log::warn!("Skipping test: no object store (S3_BUCKET) to hibernate to.");
+        return Ok(());
+    }
+    ensure_server().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let mut disks = diskd().await?;
+
+    let pod_id = new_pod_id();
+    pods.create_pod(CreatePodRequest {
+        pod_id: pod_id.clone(),
+        spec: Some(spec()),
+    })
+    .await?;
+    let mut guard = PodGuard::new(pod_id.clone());
+    wait_until_up(&mut pods, &pod_id).await?;
+    stop(&mut pods, &pod_id).await?;
+    let marker = format!("marker/{}", uuid::Uuid::new_v4());
+    plant(&pod_id, &["keep"], &marker).await?;
+    let pod = start(&mut pods, &pod_id).await?;
+    guard.set_pid(pid(&pod)?);
+    assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
+    let before = guest_ping(&pod_id).await?;
+
+    let head_key = hibernate(&mut pods, &pod_id).await?;
+
+    // Another node: one that has neither the pod nor anything of it in
+    // its cache.
+    info!("Forgetting pod {pod_id} and what diskd has of it");
+    let head = disks
+        .get_head(GetHeadRequest {
+            key: head_key.clone(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(head.chain.len(), 2, "the blank volume and the pod's layer");
+    let memory = head.memory.clone().context("the head has the memory")?;
+    pods.delete_pod(DeletePodRequest {
+        pod_id: pod_id.clone(),
+    })
+    .await?;
+    disks
+        .evict(EvictRequest {
+            target: evict_request::Target::All as i32,
+            force: false,
+        })
+        .await?;
+    // The pod's own layers come from the object store again; the blank
+    // volume is every pod's.
+    let layers = diskd_state().join("layers");
+    for layer in [&head.chain[1], &memory.layer] {
+        std::fs::remove_file(layers.join(format!("{layer}.manifest")))?;
+    }
+
+    info!("Restoring pod {pod_id} from {head_key}");
+    let restored = pods
+        .restore_pod(RestorePodRequest {
+            pod_id: pod_id.clone(),
+            head_key: head_key.clone(),
+            cold: false,
+        })
+        .await?
+        .into_inner();
+    assert!(
+        restored.memory_restored,
+        "the memory was not restored: {}",
+        restored.reason
+    );
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    assert_eq!(pod.spec, Some(spec()), "the spec comes with the checkpoint");
+    guard.set_pid(pid(&pod)?);
+    // The same boot, with its memory: the ping count goes on.
+    let after = guest_ping(&pod_id).await?;
+    assert_eq!(after.boot_id, before.boot_id, "the same boot");
+    assert!(after.tick > before.tick, "the guest forgot its pings");
+    assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
+    for layer in [&head.chain[1], &memory.layer] {
+        assert!(layers.join(format!("{layer}.manifest")).is_file());
+    }
+    let stats = disks
+        .stats(StatsRequest {
+            pod_id: pod_id.clone(),
+        })
+        .await?
+        .into_inner();
+    let served = stats.memories.first().context("diskd serves the memory")?;
+    info!(
+        "diskd served {} faults, {} chunks from the object store",
+        served.faults, served.s3_fetches
+    );
+    assert!(
+        served.s3_fetches > 0,
+        "the memory came from the object store"
+    );
+
+    // A resume that comes while the pod hibernates waits, and restores it.
+    info!("Hibernating pod {pod_id} again, and resuming it meanwhile");
+    let hibernation = {
+        let mut pods = pods.clone();
+        let pod_id = pod_id.clone();
+        tokio::spawn(async move { hibernate(&mut pods, &pod_id).await })
+    };
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let pod = get_pod(&mut pods, &pod_id).await?;
+            if pod.reason == "hibernating" || pod.state() != PodState::Running {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("the hibernation did not start")??;
+    pods.resume_pod(ResumePodRequest {
+        pod_id: pod_id.clone(),
+    })
+    .await?;
+    let second = hibernation.await??;
+    assert_ne!(second, head_key, "every hibernation has a head of its own");
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    guard.set_pid(pid(&pod)?);
+    assert_eq!(guest_ping(&pod_id).await?.boot_id, before.boot_id);
+    assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
+
+    // Without its memory: a new boot on the checkpoint's disk.
+    info!("Hibernating pod {pod_id}, and restoring it without its memory");
+    let third = hibernate(&mut pods, &pod_id).await?;
+    let restored = pods
+        .restore_pod(RestorePodRequest {
+            pod_id: pod_id.clone(),
+            head_key: String::new(),
+            cold: true,
+        })
+        .await?
+        .into_inner();
+    assert!(!restored.memory_restored);
+    let pod = wait_until_up(&mut pods, &pod_id).await?;
+    guard.set_pid(pid(&pod)?);
+    assert_ne!(
+        guest_ping(&pod_id).await?.boot_id,
+        before.boot_id,
+        "a new boot"
+    );
+    assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
+    // Hibernation after hibernation, the chain keeps its shape.
+    let head = disks
+        .get_head(GetHeadRequest { key: third })
+        .await?
+        .into_inner();
+    assert_eq!(head.chain.len(), 2, "the chain grew: {:?}", head.chain);
+
+    pods.delete_pod(DeletePodRequest {
+        pod_id: pod_id.clone(),
+    })
+    .await?;
+    verify_microvm_cleanup(&pod_id);
+    assert!(!disk_dir(&pod_id).exists());
     guard.disable_cleanup();
     Ok(())
 }

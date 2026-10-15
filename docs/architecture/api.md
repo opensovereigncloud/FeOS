@@ -9,7 +9,7 @@ plane, and between `feosd` and `feos-guest`. They live in
 
 | Package | What it is for | Served by today |
 |---|---|---|
-| `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, console, events | `feosd` |
+| `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, hibernate, restore, console, events | `feosd` |
 | `feos.disk.v1` | the pods' disks and memory over a chunk store and the object store, internal to the node ([disk.md](disk.md)) | `diskd` |
 | `feos.network.v1` | the pods' security groups (`SecurityGroupService`) and the records of their traffic (`TrafficService`) | `feosd` |
 | `feos.microvm.v1` | the pods' microVMs, internal to `feosd`, served on no listener | – |

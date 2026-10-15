@@ -10,9 +10,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::tty::IsTty;
 use feos_proto::pod_service::{
     pod_service_client::PodServiceClient, ContainerSpec, ContainerState, CreatePodRequest,
-    DeletePodRequest, GetPodRequest, ListPodsRequest, PodConsoleInput, PodInfo, PodNetwork,
-    PodSpec, PodState, Resources, ResumePodRequest, StartPodRequest, StopPodRequest,
-    StreamPodEventsRequest, SuspendPodRequest,
+    DeletePodRequest, GetPodRequest, HibernatePodRequest, ListPodsRequest, PodConsoleInput,
+    PodInfo, PodNetwork, PodSpec, PodState, Resources, RestorePodRequest, ResumePodRequest,
+    StartPodRequest, StopPodRequest, StreamPodEventsRequest, SuspendPodRequest,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -53,14 +53,29 @@ pub enum PodCommand {
         #[arg(long, help = "Wait until the pod runs")]
         wait: bool,
     },
-    /// Shut a pod's microVM down
+    /// Shut a pod's microVM down; its disk stays
     Stop { pod_id: String },
-    /// Remove a pod and its microVM
+    /// Remove a pod, its microVM and its disk
     Delete { pod_id: String },
-    /// Write a running pod to a snapshot on disk
+    /// Write a running pod to a snapshot on the node
     Suspend { pod_id: String },
-    /// Restore a suspended pod
+    /// Restore a suspended or hibernated pod
     Resume { pod_id: String },
+    /// Take a pod off the node into object storage: its disk and memory
+    Hibernate { pod_id: String },
+    /// Bring a hibernated pod back, here or on a node that does not have it
+    Restore {
+        pod_id: String,
+        #[arg(
+            long,
+            help = "The S3 key of the checkpoint's head; the pod's own when not given"
+        )]
+        head: Option<String>,
+        #[arg(long, help = "Boot the pod anew on its disk, without its memory")]
+        cold: bool,
+        #[arg(long, help = "Wait until the pod runs")]
+        wait: bool,
+    },
     /// Attach to the serial console of a pod's microVM; Ctrl+] leaves
     Console { pod_id: String },
     /// Watch the pods' state changes
@@ -187,6 +202,45 @@ pub async fn handle_pod_command(args: PodArgs) -> Result<()> {
                 })
                 .await?;
             println!("Pod {pod_id} runs again");
+        }
+        PodCommand::Hibernate { pod_id } => {
+            let response = client
+                .hibernate_pod(HibernatePodRequest {
+                    pod_id: pod_id.clone(),
+                })
+                .await?
+                .into_inner();
+            let checkpoint = response.checkpoint.unwrap_or_default();
+            println!(
+                "Pod {pod_id} is hibernated in {}: {} MiB of memory, {} MiB on its disk",
+                checkpoint.head_key,
+                response.memory_bytes >> 20,
+                response.disk_bytes >> 20
+            );
+        }
+        PodCommand::Restore {
+            pod_id,
+            head,
+            cold,
+            wait,
+        } => {
+            let response = client
+                .restore_pod(RestorePodRequest {
+                    pod_id: pod_id.clone(),
+                    head_key: head.unwrap_or_default(),
+                    cold,
+                })
+                .await?
+                .into_inner();
+            if response.memory_restored {
+                println!("Pod {pod_id} runs again, with its memory");
+            } else {
+                println!("Pod {pod_id} boots anew on its disk: {}", response.reason);
+                if wait {
+                    wait_until_running(&mut client, &pod_id).await?;
+                    println!("Pod {pod_id} runs");
+                }
+            }
         }
         PodCommand::Console { pod_id } => console(&mut client, pod_id).await?,
         PodCommand::Events { pod_id } => watch_events(&mut client, pod_id).await?,
@@ -346,6 +400,17 @@ fn print_pod(pod: &PodInfo) {
             }
         }
     }
+    if let Some(checkpoint) = &pod.checkpoint {
+        println!(
+            "  Checkpoint: {}{}",
+            checkpoint.head_key,
+            if checkpoint.memory {
+                ""
+            } else {
+                " (disk only)"
+            }
+        );
+    }
     if !network.security_groups.is_empty() {
         println!("  Security groups: {}", network.security_groups.join(", "));
     }
@@ -486,6 +551,7 @@ fn state_name(state: PodState) -> &'static str {
         PodState::Stopped => "STOPPED",
         PodState::Suspended => "SUSPENDED",
         PodState::Failed => "FAILED",
+        PodState::Hibernated => "HIBERNATED",
     }
 }
 
@@ -525,6 +591,32 @@ mod tests {
         assert_eq!(spec.containers[0].env["A"], "b");
         assert_eq!(spec.network, None, "a pod has a network by default");
         assert!(uuid::Uuid::parse_str(&request.pod_id).is_ok());
+    }
+
+    #[test]
+    fn a_restore_names_a_head_or_takes_the_pods_own() {
+        let head = "snapshots/11111111-2222-3333-4444-555555555555/7/head.json";
+        let cli = Cli::try_parse_from(["pod", "restore", "p", "--head", head, "--cold"]).unwrap();
+        let PodCommand::Restore {
+            pod_id,
+            head: Some(given),
+            cold: true,
+            wait: false,
+        } = cli.command
+        else {
+            panic!("not a cold restore from a head");
+        };
+        assert_eq!((pod_id.as_str(), given.as_str()), ("p", head));
+        let cli = Cli::try_parse_from(["pod", "restore", "p"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            PodCommand::Restore {
+                head: None,
+                cold: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["pod", "hibernate", "p"]).is_ok());
     }
 
     #[test]
