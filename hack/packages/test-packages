@@ -3,12 +3,13 @@
 # privileged container, and check feosd under systemd: its group and
 # socket, a pod from the installed guest and Firecracker, its cgroup, a
 # restart that keeps the pod, the refused self-upgrade, what autoremove
-# keeps, a pod with a network and its forwarded services, removal, and a
-# power-off through PID 1.
+# keeps, pods on feosd's network (an fd00: prefix, DNS64 and NAT64,
+# security groups, a denied prefix, traffic records) and their forwarded
+# services, removal, and a power-off through PID 1.
 #
 #   hack/packages/test-packages
 #
-# Needs docker, /dev/kvm, and internet access for the pod's image.
+# Needs docker, /dev/kvm, and internet access for the pods' images.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -66,7 +67,7 @@ STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
 EOF
 
-cleanup() { docker rm -f "${NAME}" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f -v "${NAME}" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
 # /var/lib/feos is a volume: on a distribution it is on disk.
@@ -89,6 +90,17 @@ log "feosd is active and answers on its socket"
 in_node useradd -m -G feos tester
 in_node su tester -c 'feosctl host hostname' >/dev/null || fail "a member of feos cannot use the API"
 log "the group feos may use the API socket"
+
+# Without --pod-prefix, a pod with a network fails, and says why.
+out="$(in_node feosctl pod create --memory 256 2>&1)" &&
+  fail "a pod with a network was created without --pod-prefix"
+contains -e "--pod-prefix" <<<"${out}" || fail "no word of --pod-prefix: ${out}"
+# The pods' network (ADR 0010) as in a lab: a ULA prefix, and a denied
+# prefix.
+in_node sh -c 'printf "%s\n" "FEOSD_ARGS=\"--pod-prefix fd00:fe05:1::/64 --deny-prefix 9.9.9.9/32\"" >/etc/default/feosd'
+in_node systemctl restart feosd
+await "feosd is not active with its network" in_node systemctl is-active feosd
+log "pods with a network need --pod-prefix, which /etc/default/feosd gives"
 
 leaf="$(in_node sh -c 'cat /proc/$(systemctl show -P MainPID feosd)/cgroup')"
 [ "${leaf}" = "0::/system.slice/feosd.service/feosd" ] || fail "feosd runs in ${leaf}"
@@ -135,16 +147,19 @@ in_node feosctl pod delete "${bare}" >/dev/null
 in_node test ! -e "/sys/fs/cgroup/system.slice/feosd.service/vms/${bare}" ||
   fail "the pod's cgroup outlived it"
 
-# Pods with feosd's network (ADR 0010): the image comes through its NAT.
+# Pods on feosd's network (ADR 0010, 0012, 0013). The pod pulls its image
+# through the network: DNS64 and NAT64.
 pod=22222222-3333-4444-5555-666666666666
-other=33333333-3333-4444-5555-666666666666
-pod_state() { in_node feosctl pod get "${pod}" | sed -n 's/^  State: //p'; }
+client=33333333-3333-4444-5555-666666666666
+server=44444444-3333-4444-5555-666666666666
+pod_state() { in_node feosctl pod get "${1:-${pod}}" | sed -n 's/^  State: //p'; }
 pod_address() { in_node feosctl pod get "$1" | sed -n 's/^  Address: //p'; }
 in_pod() { in_node feosctl container --pod "${pod}" exec main -- "$@"; }
-for id in "${pod}" "${other}"; do
-  in_node feosctl pod create --pod-id "${id}" --image docker.io/library/busybox:1.36 --wait \
-    -- sleep 3600 >/dev/null || fail "pod ${id} did not come up: $(in_node feosctl pod get "${id}")"
-done
+in_client() { in_node feosctl container --pod "${client}" exec main -- "$@"; }
+# The records of everything below.
+in_node sh -c 'timeout 600 feosctl traffic watch >/tmp/traffic.log 2>&1 &'
+in_node feosctl pod create --pod-id "${pod}" --image docker.io/library/busybox:1.36 --wait \
+  -- sleep 3600 >/dev/null || fail "pod ${pod} did not come up: $(in_node feosctl pod get "${pod}")"
 in_node feosctl pod get "${pod}" | contains "main (docker.io/library/busybox:1.36): running" ||
   fail "the pod's container does not run"
 [ "$(in_pod echo forwarded)" = forwarded ] || fail "no exec in the pod through feosd"
@@ -154,25 +169,96 @@ if in_node feosctl container exec main -- true 2>/dev/null; then
 fi
 log "a pod pulled its image and runs; feosd forwards its services"
 
+address="$(pod_address "${pod}")"
+case "${address}" in fd00:fe05:1:*) ;; *) fail "pod ${pod} has the address ${address}" ;; esac
+in_pod ip -4 addr show dev eth0 | contains inet && fail "the pod has IPv4"
+in_pod cat /etc/resolv.conf | contains -x "nameserver fdfd:7b5:61d9::53" ||
+  fail "the pod does not ask feosd's resolver"
+in_pod nslookup -type=AAAA dns.google | contains "64:ff9b::808:808" || fail "no DNS64"
+in_pod ping -6 -c 1 -W 5 dns.google >/dev/null || fail "the pod does not reach the internet"
+log "pod ${pod} has ${address}, IPv6 only, and reaches the internet through DNS64 and NAT64"
+
+# A pod whose security groups the node does not have does not start.
+in_node feosctl pod create --pod-id "${server}" --memory 256 --security-group server \
+  --image docker.io/library/busybox:1.36 -- sh -c \
+  'mkdir -p /www && echo hello >/www/index.html && httpd -p 8080 -h /www && httpd -p 9090 -h /www && exec sleep 3600' \
+  >/dev/null
+await "a pod without its group did not fail" bash -c "[ \"\$(in_node feosctl pod get ${server} | sed -n 's/^  State: //p')\" = FAILED ]"
+in_node feosctl pod get "${server}" | contains "Reason: .*security groups server" ||
+  fail "the pod does not say which group it lacks: $(in_node feosctl pod get "${server}")"
+in_node feosctl security-group put server --allow 'ingress tcp 8080 from group client' \
+  --allow 'egress any to ::/0' >/dev/null
+in_node feosctl security-group put client --allow 'egress any to ::/0' >/dev/null
+in_node feosctl pod start --wait "${server}" >/dev/null || fail "pod ${server} did not start with its group"
+in_node feosctl pod create --pod-id "${client}" --memory 256 --security-group client \
+  --image docker.io/curlimages/curl:8.11.1 --wait -- sleep 3600 >/dev/null ||
+  fail "pod ${client} did not come up: $(in_node feosctl pod get "${client}")"
+if in_node feosctl security-group delete server 2>/dev/null; then
+  fail "a group a pod names was deleted"
+fi
+log "a pod starts once the node has its security groups, which stay while it names them"
+
 # A connection that is dropped runs into nc's timeout of 3 s; one that
 # gets through is refused at once, nothing listens on port 9.
 dropped() {
   local start=${SECONDS}
-  in_pod nc -w 3 "$1" 9 </dev/null >/dev/null 2>&1 || true
+  in_pod nc -w 3 "$1" "${2:-9}" </dev/null >/dev/null 2>&1 || true
   [ $((SECONDS - start)) -ge 2 ]
 }
 # What the check sees when nothing drops: the pod's own address refuses.
-dropped "$(pod_address "${pod}")" && fail "a refused connection looks dropped"
-other_address="$(pod_address "${other}")"
-case "${other_address}" in 10.200.*) ;; *) fail "pod ${other} has the address ${other_address}" ;; esac
-dropped "${other_address}" || fail "a pod reaches another pod"
-dropped 10.200.0.1 || fail "a pod reaches the node"
-in_node nft list table bridge feos | contains "ether saddr != 06:00:ac" ||
-  fail "no rules pin the pods' addresses"
-in_node nft list table inet feos | contains masquerade || fail "no NAT for the pods"
-in_pod wget -q -T 10 -O /dev/null http://example.com/ || fail "a pod does not reach the internet"
-in_node feosctl pod delete "${other}" >/dev/null
-log "pods reach the internet, but neither each other nor the node; their addresses are pinned"
+dropped "${address}" && fail "a refused connection looks dropped"
+server_address="$(pod_address "${server}")"
+node_ipv4="$(in_node ip -4 -o addr show dev eth0 | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p')"
+dropped "${server_address}" 8080 || fail "a pod reaches another pod"
+dropped fdfd:7b5:61d9::53 || fail "a pod reaches the node beside DNS"
+dropped "64:ff9b::${node_ipv4}" || fail "a pod reaches the node through NAT64"
+log "pods reach neither each other nor the node by default"
+
+# The client's group lets it reach the server on 8080, once it is a member.
+in_client curl -sS -m 3 "http://[${server_address}]:8080/" >/dev/null 2>&1 &&
+  fail "the client reaches the server before it is a member of client"
+in_node feosctl security-group update client --from-version 1 \
+  --add "$(pod_address "${client}")" >/dev/null
+[ "$(in_client curl -sS -m 5 "http://[${server_address}]:8080/")" = hello ] ||
+  fail "a member of client does not reach the server on 8080"
+in_client curl -sS -m 3 "http://[${server_address}]:9090/" >/dev/null 2>&1 &&
+  fail "a member of client reaches the server on 9090"
+dropped "${server_address}" 8080 || fail "a pod outside client reaches the server"
+log "a security group lets one pod reach another on its port, and nothing else"
+
+[ "$(in_client curl -sS -m 10 -o /dev/null -w '%{http_code}' https://example.com/)" = 200 ] ||
+  fail "the client does not reach https://example.com/"
+start=${SECONDS}
+in_client curl -sS -m 3 -o /dev/null "http://[64:ff9b::9.9.9.9]/" 2>/dev/null &&
+  fail "a pod reaches a denied prefix"
+[ $((SECONDS - start)) -ge 2 ] || fail "a denied prefix refuses rather than drops"
+log "the client reaches the internet, but not a denied prefix"
+
+table="$(in_node nft list table inet feos)"
+for expected in "map pod-in" "map pod-out" "set deny" "set internet" "set g-client" \
+  "chain out-pod-44444444" "chain in-pod-44444444" "iifname vmap @pod-out" \
+  "oifname vmap @pod-in" "fib saddr . iif oif missing" 'log prefix "copy" group 3' \
+  'log prefix "no-rule" group 2' "ct state established,related accept" "masquerade"; do
+  contains -F "${expected}" <<<"${table}" || fail "the table has no ${expected}"
+done
+contains -F "tcp dport 8080 ip6 saddr @g-client return" <<<"${table}" ||
+  fail "the server's chain does not return the client's port"
+sleep 2
+records="$(in_node cat /tmp/traffic.log)"
+for expected in " ${pod} dns dns.google AAAA NOERROR 64:ff9b::808:" \
+  " ${client} flow tcp " " ${server} flow tcp " " ${client} name tls tcp " \
+  " ${client} drop tcp " " denied-prefix" " no-rule"; do
+  contains -F -e "${expected}" <<<"${records}" || fail "no record with '${expected}': ${records}"
+done
+contains -F "example.com" <<<"$(grep " name tls " <<<"${records}")" ||
+  fail "no TLS server name example.com: ${records}"
+log "nftables has the pods' chains and sets; feosctl traffic watch shows DNS, flows, drops and server names"
+
+for id in "${client}" "${server}"; do
+  in_node feosctl pod delete "${id}" >/dev/null
+done
+in_node feosctl security-group delete server >/dev/null || fail "an unused group stays"
+in_node nft list table inet feos | contains "pod-44444444" && fail "a deleted pod's rules stay"
 
 in_node feosctl pod create --pod-id "${pod}" --image docker.io/library/busybox:1.36 \
   -- sleep 3600 >/dev/null ||

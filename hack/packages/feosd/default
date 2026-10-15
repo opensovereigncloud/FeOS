@@ -2,4 +2,31 @@
 # too, without authentication, for a lab:
 #
 #   FEOSD_ARGS="--tcp [::]:1337"
+#
+# Pods are IPv6 only (ADR 0010). feosd needs the prefix that the network
+# routes to this node to give pods a network; without it, pods with a
+# network fail:
+#
+#   --pod-prefix PREFIX     e.g. 2001:db8:7:1::/64, a /64 at best, a /80 at
+#                           least. A lab whose network routes nothing to the
+#                           node takes a ULA, such as fd00:fe05:1::/64: its
+#                           pods reach the internet through NAT64 alone, and
+#                           nothing outside the node reaches them.
+#   --nat64 node|network    where pods' IPv4 traffic is translated: on this
+#                           node (the default), or by a NAT64 in the network.
+#   --nat64-prefix PREFIX   the NAT64 prefix, 64:ff9b::/96 by default.
+#   --nat64-pool PREFIX     the IPv4 addresses that stand for pods on this
+#                           node, 10.200.0.0/16 by default; they never leave
+#                           the node, but must not be the network's.
+#   --dns-address ADDRESS   the pods' resolver, fdfd:7b5:61d9::53 by default.
+#   --dns-upstream ADDRESS  a resolver it asks for pods that name none
+#                           (repeatable); Google's and Cloudflare's by default.
+#   --deny-prefix PREFIX    a prefix no pod reaches (repeatable): a cloud's
+#                           metadata service, the control plane, management
+#                           networks. IPv4 ones mean their addresses under the
+#                           NAT64 prefix.
+#
+# A lab:
+#
+#   FEOSD_ARGS="--pod-prefix fd00:fe05:1::/64 --deny-prefix 169.254.169.254/32"
 FEOSD_ARGS=""
