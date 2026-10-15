@@ -9,11 +9,12 @@
 #   hack/guest/test-container [image]
 #
 # The guest's TAP is in a network namespace that stands for the node: the
-# node's addresses on the link, 169.254.0.1 and fe80::1, may be those of
-# this machine's own gateway, as in clouds. The namespace routes the
-# guest's addresses to the TAP, passes DNS for 169.254.0.53 on to a public
-# resolver, and NATs to this machine over a veth pair; this machine NATs
-# again. Needs sudo for the namespace and for this machine's NAT (the veth
+# guest's gateways on the link, 169.254.0.1 and fe80::1, may be those of
+# this machine's own network, as in clouds. As feosd does, the namespace
+# holds fe80::1 on the TAP and answers ARP for 169.254.0.1 by proxy,
+# without holding it, routes the guest's addresses to the TAP, passes DNS
+# for 169.254.0.53 on to a public resolver, and NATs to this machine over
+# a veth pair; this machine NATs again. Needs sudo for the namespace and for this machine's NAT (the veth
 # pair and iptables rules, all removed on exit), /dev/kvm, Firecracker
 # (make firecracker), the guest (make guest) and internet access for the
 # pull.
@@ -40,9 +41,9 @@ UPLINK_IP=192.168.102.1
 NS_UPLINK_IP=192.168.102.2
 UPSTREAM_DNS=1.1.1.1
 # The TAP is a link of its own, as feosd sets a pod's up (ADR 0010): the
-# node is 169.254.0.1 and fe80::1 on it, and the guest's addresses have a
-# /32 and a /128 route to it. NODE_IP6 is the source the guest answers
-# through its default route.
+# node is fe80::1 on it and answers ARP for 169.254.0.1, and the guest's
+# addresses have a /32 and a /128 route to it. NODE_IP6 is the source the
+# guest answers through its default route.
 TAP=feos-tap0
 NODE_IP=169.254.0.1
 NODE_IP6=fd00:fe05:ffff::1
@@ -106,11 +107,13 @@ node ip addr add "${NS_UPLINK_IP}/30" dev uplink
 node ip link set uplink up
 node ip route add default via "${UPLINK_IP}"
 node sysctl -qw net.ipv4.ip_forward=1
-# As feosd sets a pod's TAP up: the node answers ARP on it only for its
-# address there, and asks from that address.
+# As feosd sets a pod's TAP up: no IPv4 address on it, ARP answered for
+# 169.254.0.1 alone, by proxy and at once, while the namespace's route
+# there leaves through the uplink.
 node ip tuntap add dev "${TAP}" mode tap
-node sysctl -qw "net.ipv4.conf.${TAP}.arp_ignore=1" "net.ipv4.conf.${TAP}.arp_announce=2"
-node ip addr add "${NODE_IP}/32" dev "${TAP}"
+node sysctl -qw "net.ipv4.conf.${TAP}.arp_ignore=1" "net.ipv4.conf.${TAP}.arp_announce=2" \
+  "net.ipv4.neigh.${TAP}.proxy_delay=0"
+node ip neigh add proxy "${NODE_IP}" dev "${TAP}"
 node ip -6 addr add fe80::1/64 dev "${TAP}" nodad
 node ip -6 addr add "${NODE_IP6}/128" dev "${TAP}" nodad
 node ip link set "${TAP}" up
