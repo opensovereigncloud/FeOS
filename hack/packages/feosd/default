@@ -7,11 +7,12 @@
 # routes to this node to give pods a network; without it, pods with a
 # network fail:
 #
-#   --pod-prefix PREFIX     e.g. 2001:db8:7:1::/64, a /64 at best, a /80 at
-#                           least. A lab whose network routes nothing to the
-#                           node takes a ULA, such as fd00:fe05:1::/64: its
-#                           pods reach the internet through NAT64 alone, and
-#                           nothing outside the node reaches them.
+#   --pod-prefix PREFIX     e.g. 2001:db8:7:1::/64. A /64 is best, a smaller
+#                           one such as a /80 is enough. A lab whose network
+#                           routes nothing to the node takes a ULA, such as
+#                           fd00:fe05:1::/64: its pods reach the internet
+#                           through NAT64 alone, and nothing outside the node
+#                           reaches them.
 #   --nat64 node|network    where pods' IPv4 traffic is translated: on this
 #                           node (the default), or by a NAT64 in the network.
 #   --nat64-prefix PREFIX   the NAT64 prefix, 64:ff9b::/96 by default.

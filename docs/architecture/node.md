@@ -123,7 +123,7 @@ resolver), `nat64` and `traffic-service` (the records).
 
 | Option | Default | What it is |
 |---|---|---|
-| `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120; a /64 at best |
+| `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120; a /64 is best |
 | `--nat64 node\|network` | `node` | translate pods' IPv4 traffic on the node, or leave it to a NAT64 in the network |
 | `--nat64-prefix PREFIX` | `64:ff9b::/96` | the NAT64 prefix, a /96, which DNS64 synthesizes under |
 | `--nat64-pool PREFIX` | `10.200.0.0/16` | with `--nat64=node`, the IPv4 addresses that stand for pods; `.1` stands for the node |

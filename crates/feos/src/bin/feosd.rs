@@ -16,8 +16,8 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
 
   --tcp ADDRESS          also serve the API on TCP, without authentication
   --self-upgrade         let UpgradeFeosBinary replace this binary
-  --pod-prefix PREFIX    the IPv6 prefix the network routes to this node, a /64
-                         at best; pods get their addresses from it. Without,
+  --pod-prefix PREFIX    the IPv6 prefix the network routes to this node, such
+                         as a /64; pods get their addresses from it. Without,
                          pods with a network fail
   --nat64 node|network   where pods' IPv4 traffic is translated: on this node
                          (the default), or by a NAT64 in the network
