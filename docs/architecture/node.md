@@ -74,7 +74,7 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
 | `/run/feos/` | the API sockets, the task service's pid, the runtime state of containers |
 | `/usr/lib/feos/firecracker/<version>/` | Firecracker and its jailer, a version each, side by side |
-| `/usr/lib/feos/guest/<version>/` | the guest's `vmlinuz` and `initramfs`, a version each, side by side |
+| `/usr/lib/feos/guest/<version>/` | the guest's `vmlinuz`, `initramfs` and blank data volume `data.img.zst`, a version each, side by side |
 
 `/var/lib/feos` is a tmpfs when FeOS is the node's operating system and a
 directory on disk on a distribution.
@@ -415,7 +415,7 @@ packages from https://apt.fecode.dev
 | `feosd` | `/usr/sbin/feosd`, `feosd.service`, the group `feos` (sysusers), `/etc/default/feosd`, `/etc/apt/apt.conf.d/50feosd` |
 | `feosctl` | `/usr/bin/feosctl` |
 | `feos-firecracker-<version>` | `/usr/lib/feos/firecracker/<version>/{firecracker,jailer}` |
-| `feos-guest-<version>` | `/usr/lib/feos/guest/<version>/{vmlinuz,initramfs}` |
+| `feos-guest-<version>` | `/usr/lib/feos/guest/<version>/{vmlinuz,initramfs,data.img.zst}` |
 | `feos-firecracker`, `feos-guest` | nothing; they depend on the newest versioned package |
 
 `feosd` depends on `feos-firecracker` and `feos-guest`, which depend on the

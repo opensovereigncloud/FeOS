@@ -8,6 +8,7 @@ initramfs: target/firecracker/firecracker guest container-release
 	cp target/firecracker/firecracker target/firecracker/jailer target/rootfs/usr/lib/feos/firecracker/$(FIRECRACKER_VERSION)/
 	cp target/guest/vmlinuz target/rootfs/usr/lib/feos/guest/$(GUEST_VERSION)/vmlinuz
 	cp target/guest/initramfs.cpio.zst target/rootfs/usr/lib/feos/guest/$(GUEST_VERSION)/initramfs
+	cp target/guest/data.img.zst target/rootfs/usr/lib/feos/guest/$(GUEST_VERSION)/data.img.zst
 	rm -f target/rootfs/bin/feos target/rootfs/bin/firecracker target/rootfs/bin/jailer
 	rm -f target/rootfs/usr/share/feos/vmlinuz target/rootfs/usr/share/feos/initramfs
 	cp target/container/x86_64-unknown-linux-musl/release/feos-host-init target/rootfs/usr/sbin/feos-host-init

@@ -103,7 +103,8 @@ use) and `protoc`.
     make release-guest   # target/x86_64-unknown-linux-musl/release/feos-guest
     make cli             # feosctl
 
-    make guest                 # guest kernel and initramfs: target/guest/
+    make guest                 # guest kernel, initramfs and blank data volume:
+                               # target/guest/
     make test-guest            # boot the guest under Firecracker and talk to it
     make test-guest-container  # run containers in the guest; needs sudo for a
                                # network namespace and NAT

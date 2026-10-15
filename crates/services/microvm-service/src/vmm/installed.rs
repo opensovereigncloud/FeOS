@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 /// `<version>/firecracker` and `<version>/jailer`.
 pub const FIRECRACKER_DIR: &str = "/usr/lib/feos/firecracker";
-/// `<version>/vmlinuz` and `<version>/initramfs`.
+/// `<version>/vmlinuz` and `<version>/initramfs`, and the blank data
+/// volume `<version>/data.img.zst`.
 pub const GUEST_DIR: &str = "/usr/lib/feos/guest";
 
 /// The newest installed Firecracker's directory.
@@ -33,6 +34,10 @@ pub fn firecracker(version: &str) -> Option<PathBuf> {
         &["firecracker", "jailer"],
     )
 }
+
+/// The guest's blank data volume, which a pod's disk starts from: a
+/// zstd-compressed ext4 image, in the guest's directory.
+pub const BLANK_DATA_VOLUME: &str = "data.img.zst";
 
 /// The directory of `version` in `dir`, if it has all of `files`.
 fn version_dir(dir: &Path, version: &str, files: &[&str]) -> Option<PathBuf> {

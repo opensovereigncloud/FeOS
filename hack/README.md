@@ -38,7 +38,7 @@ Pods with a network need `--pod-prefix` (`sudo ./target/x86_64-unknown-linux-mus
 feos-guest runs as PID 1 in a Firecracker microVM, booted
 directly from a kernel and an initramfs, without a root disk:
 
-    make guest          # target/guest/vmlinuz and target/guest/initramfs.cpio.zst
+    make guest          # target/guest/vmlinuz, initramfs.cpio.zst and data.img.zst
     make test-guest     # downloads Firecracker, boots the guest, talks to it over vsock
 
 The guest kernel (`hack/guest/kernel`) starts from Firecracker's minimal
