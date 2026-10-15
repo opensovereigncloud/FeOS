@@ -32,22 +32,35 @@ the guest attaches and after every resume.
 
 ## Network
 
-A pod is IPv6 only ([ADR 0010](../adr/0010-pod-network.md)): `feosd`
-pushes `eth0` an address of the node's pod prefix as a /128, `fe80::1` as
-its gateway, `feosd`'s resolver (`fdfd:7b5:61d9::53`) and no IPv4
-address. The guest turns router advertisements and address
-autoconfiguration off before the interface goes up, adds the address
-without duplicate address detection, since the node is the link's only
-other end, and routes everything via `fe80::1` on `eth0`. A push leaves
-the interface with exactly its addresses: those of an earlier push go,
-and so does a family the push leaves out, such as the IPv4 of a pod from
-the first network; the same push again changes nothing. A resume on
-another node will push another address.
+A pod has both families ([ADR 0010](../adr/0010-pod-network.md)):
+`feosd` pushes `eth0` an IPv6 address of the node's pod prefix as a /128
+with `fe80::1` as its gateway, an IPv4 address of `169.254.16.0/20` as a
+/32 with `169.254.0.1` as its gateway, and `feosd`'s resolver,
+`169.254.0.53`. The IPv6 address is the pod's on the network; the IPv4
+one is for leaving, and the node masquerades or translates it.
 
-Names resolve through DNS64: a name with only IPv4 addresses gets IPv6
-ones under the NAT64 prefix, which the node translates. A program that
-connects to an IPv4 literal, or prefers IPv4 from DNS as busybox's
-`wget` does, finds no route.
+The guest turns router advertisements and address autoconfiguration off
+before the interface goes up, and adds the IPv6 address without
+duplicate address detection, since the node is the link's only other
+end. The IPv4 gateway lies outside the /32, and the kernel takes no
+route via a gateway it has no route to: the guest routes `169.254.0.1`
+on the link first (`169.254.0.1 dev eth0 scope link`), then everything
+via it. IPv6 routes everything via `fe80::1`, which the link-local
+prefix holds. Any gateway outside its address's prefix, and for IPv6
+outside the link-local one, gets such a route of its own.
+
+A push leaves `eth0` with exactly its addresses and routes: the routes
+the kernel makes for the addresses, the default routes and the routes to
+the gateways. Addresses and routes of an earlier push go, as after a
+resume on another node, and so do other routes through `eth0`; a family
+whose address the push leaves empty goes with its routes. What is there
+already stays, so the same push again changes nothing. Pushes take effect
+one after the other.
+
+Names resolve as the upstream resolvers answer them. Where a name has
+addresses of both families, programs take IPv6, since the pod's IPv4
+address is link-local; IPv4 literals and programs that speak only IPv4
+leave over IPv4.
 
 ## Listeners and vsock ports
 
