@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix PREFIX]
              [--pod-ipv4-range PREFIX] [--dns-address ADDRESS]
              [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
+             [--diskd-socket PATH]
        feosd --version
 
   --tcp ADDRESS            also serve the API on TCP, without authentication
@@ -27,13 +28,16 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
   --dns-upstream ADDRESS   an upstream resolver of pods that name none
                            (repeatable); Google's and Cloudflare's by default
   --deny-prefix PREFIX     a prefix of either family no pod reaches
-                           (repeatable)";
+                           (repeatable)
+  --diskd-socket PATH      diskd's socket, which the pods' disks come from;
+                           /var/lib/feos/disk/diskd.sock by default";
 
 #[derive(Debug, Default, PartialEq)]
 struct Args {
     tcp: Option<SocketAddr>,
     self_upgrade: bool,
     network: network::Config,
+    diskd_socket: Option<std::path::PathBuf>,
     /// Passed by feosd itself: the task service, and the process an upgrade
     /// exec'd.
     task_service: bool,
@@ -88,6 +92,7 @@ impl Args {
                     let prefix = value("a prefix")?.parse().map_err(flag)?;
                     network.deny_prefixes.push(prefix);
                 }
+                "--diskd-socket" => parsed.diskd_socket = Some(value("a path")?.into()),
                 "--self-upgrade" => parsed.self_upgrade = true,
                 "--task-service" => parsed.task_service = true,
                 "--restarted-after-upgrade" => parsed.restarted_after_upgrade = true,
@@ -132,6 +137,7 @@ async fn main() -> Result<()> {
     run_server(ServerOptions {
         tcp: args.tcp,
         network: args.network,
+        diskd_socket: args.diskd_socket,
         ..ServerOptions::new(args.restarted_after_upgrade, args.self_upgrade)
     })
     .await
@@ -150,6 +156,8 @@ mod tests {
         let args = parse(&["--tcp", "[::]:1337", "--self-upgrade"]).unwrap();
         assert_eq!(args.tcp, Some("[::]:1337".parse().unwrap()));
         assert!(args.self_upgrade && !args.task_service);
+        let args = parse(&["--diskd-socket", "/run/diskd.sock"]).unwrap();
+        assert_eq!(args.diskd_socket, Some("/run/diskd.sock".into()));
         assert_eq!(parse(&[]).unwrap(), Args::default());
     }
 

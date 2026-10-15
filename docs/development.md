@@ -75,7 +75,8 @@ Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
   content-addressed chunk store tiered to S3, and their memory through
   userfaultfd, on `<state-dir>/diskd.sock`
   ([ADR 0011](adr/0011-disk-daemon.md), [architecture/disk.md](architecture/disk.md)).
-  `feosd` does not use it yet.
+  Every pod's disk is diskd's: `feosd` is its client, and pods do not come
+  up without it.
 - **`diskctl`** (`crates/diskctl`): diskd's client, for development and
   the lab tests. diskd's API is internal to the node, so it is not part
   of `feosctl`.
@@ -109,7 +110,7 @@ use) and `protoc`.
     make test-guest-container  # run containers in the guest; needs sudo for a
                                # network namespace and NAT
     make test-pods             # pods against Firecracker, with the guest
-                               # installed; needs docker
+                               # installed and a diskd; needs docker, ublk
 
     make diskd                 # static diskd and diskctl
     make diskd-lab             # diskd's lab tests: ublk, recovery, writes,

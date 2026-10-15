@@ -3,13 +3,15 @@
 
 //! The pods, on top of the VM service (ADR 0004).
 //!
-//! A pod comes up in steps: its microVM is created and booted, its guest
-//! attaches, and its containers are created and started in the guest, one
-//! after the other. Each step looks at what is there first, so that a
-//! bring-up that was cut off, by a restart of feosd or a stop, is taken up
-//! again where it ended. What changes a pod runs under its lock; a stop or
-//! a delete ends a bring-up first.
+//! A pod comes up in steps: its disk is started, its microVM is created
+//! and booted, its guest attaches, and its containers are created and
+//! started in the guest, one after the other. Each step looks at what is
+//! there first, so that a bring-up that was cut off, by a restart of feosd
+//! or a stop, is taken up again where it ended. A boot on a disk that has
+//! the pod's containers adopts them. What changes a pod runs under its
+//! lock; a stop or a delete ends a bring-up first.
 
+use crate::disk::Disks;
 use crate::network::{Attachment, Network};
 use crate::spec;
 use crate::store::Store;
@@ -68,6 +70,7 @@ struct Inner {
     vms: VmApiHandler,
     store: Store,
     network: Network,
+    disks: Disks,
     pods: Mutex<HashMap<String, Pod>>,
     events: broadcast::Sender<PodEvent>,
 }
@@ -80,10 +83,15 @@ struct Pod {
 }
 
 impl Pods {
-    /// The pods kept in `dir`, on the pods' network. Those that were
-    /// coming up come up now; the others follow their microVMs from here
-    /// on.
-    pub async fn new(vms: VmApiHandler, dir: &Path, network: Network) -> io::Result<Self> {
+    /// The pods kept in `dir`, on the pods' network, with their disks from
+    /// `disks`. Those that were coming up come up now; the others follow
+    /// their microVMs from here on.
+    pub async fn new(
+        vms: VmApiHandler,
+        dir: &Path,
+        network: Network,
+        disks: Disks,
+    ) -> io::Result<Self> {
         let store = Store::open(dir)?;
         let mut kept = store.load()?;
         for pod_id in network.adopt(&mut kept) {
@@ -100,6 +108,7 @@ impl Pods {
                 vms,
                 store,
                 network,
+                disks,
                 pods: Mutex::new(HashMap::new()),
                 events,
             }),
@@ -196,7 +205,7 @@ impl Pods {
         Ok(info)
     }
 
-    /// Brings a stopped or failed pod up again.
+    /// Brings a stopped or failed pod up again, on its disk.
     pub async fn start(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.lock(pod_id).await?;
         match self.info(pod_id)?.state() {
@@ -214,8 +223,8 @@ impl Pods {
         Ok(())
     }
 
-    /// Ends the pod's microVM. Whatever state it is in, the next start
-    /// boots it anew.
+    /// Ends the pod's microVM and stops its disk. Whatever state it is in,
+    /// the next start boots it anew on its disk.
     pub async fn stop(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         if self.info(pod_id)?.state() == PodState::Stopped {
@@ -238,15 +247,27 @@ impl Pods {
             }
             Some(_) => self.delete_vm(pod_id).await?,
         }
+        self.release_disk(pod_id).await;
         self.set_state(pod_id, PodState::Stopped, "stopped");
         Ok(())
     }
 
-    /// Deletes the pod: its microVM, its place on the network, its record
-    /// and its rules, and then frees its IPv4 address.
+    /// Deletes the pod: its microVM, its disk, its place on the network,
+    /// its record and its rules, and then frees its IPv4 address.
     pub async fn delete(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         self.delete_vm(pod_id).await?;
+        // A pod whose disk cannot go stays, to be deleted again: diskd
+        // would keep what it wrote for ever.
+        self.inner.disks.close_memory(pod_id).await;
+        if let Err(e) = self.inner.disks.remove(pod_id).await {
+            self.set_state(
+                pod_id,
+                PodState::Failed,
+                &format!("its disk is not deleted: {}", e.message()),
+            );
+            return Err(e);
+        }
         let info = self.info(pod_id)?;
         self.inner
             .network
@@ -272,20 +293,30 @@ impl Pods {
     pub async fn suspend(&self, pod_id: &str) -> Result<u64, Status> {
         let _lock = self.lock(pod_id).await?;
         self.expect_state(pod_id, PodState::Running)?;
+        self.suspend_locked(pod_id).await
+    }
+
+    /// `suspend`, under the pod's lock. The snapshot holds what the guest
+    /// wrote to its disk: Firecracker flushes it first. The disk stops
+    /// with the microVM.
+    async fn suspend_locked(&self, pod_id: &str) -> Result<u64, Status> {
         let request = Request::new(SuspendVmRequest {
             vm_id: pod_id.to_string(),
             purge_guest: true,
         });
         let response = self.inner.vms.suspend_vm(request).await?.into_inner();
         self.settle(pod_id, VmState::Suspended).await?;
+        self.release_disk(pod_id).await;
         self.set_state(pod_id, PodState::Suspended, "suspended");
         Ok(response.memory_bytes)
     }
 
+    /// Restores a suspended pod from its snapshot, on its disk.
     pub async fn resume(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.lock(pod_id).await?;
         self.expect_state(pod_id, PodState::Suspended)?;
         let attachment = self.attach(pod_id).await?;
+        self.open_disk(pod_id).await?;
         let request = Request::new(ResumeVmRequest {
             vm_id: pod_id.to_string(),
             remote: None,
@@ -296,6 +327,22 @@ impl Pods {
         self.check_microvm_network(pod_id, attachment.as_ref())
             .await;
         Ok(())
+    }
+
+    /// Stops the pod's disk when its microVM has ended, and lets go of the
+    /// memory diskd served it. What fails is logged: the disk's next start
+    /// takes what is there.
+    async fn release_disk(&self, pod_id: &str) {
+        self.inner.disks.close_memory(pod_id).await;
+        if let Err(e) = self.inner.disks.stop(pod_id).await {
+            warn!("Pods: Failed to stop {pod_id}'s disk: {}", e.message());
+        }
+    }
+
+    /// Starts the pod's disk: the one the node has, or a new one. Returns
+    /// the path Firecracker takes.
+    async fn open_disk(&self, pod_id: &str) -> Result<String, Status> {
+        self.inner.disks.open(pod_id, None).await
     }
 
     /// Whether a pod on the node names the security group.
@@ -325,7 +372,12 @@ impl Pods {
         let (Ok(info), Ok(Some(vm))) = (self.info(pod_id), self.vm(pod_id).await) else {
             return;
         };
-        let wanted = spec::vm_config(pod_id, &info.spec.unwrap_or_default(), attachment);
+        let disk = vm
+            .config
+            .as_ref()
+            .and_then(|config| config.data_disk.as_ref())
+            .map(|disk| disk.path.as_str());
+        let wanted = spec::vm_config(pod_id, &info.spec.unwrap_or_default(), attachment, disk);
         if stale(&vm, &wanted) {
             warn!(
                 "Pods: {pod_id}'s microVM was made for another network; a stop and a start give it this one"
@@ -506,25 +558,29 @@ impl Pods {
     }
 
     async fn bring_up(&self, pod_id: &str, spec: &PodSpec) -> Result<(), Status> {
-        self.boot(pod_id, spec).await?;
+        let booted = self.boot(pod_id, spec).await?;
         self.wait_for_guest(pod_id).await?;
         let mut guest = ContainerServiceClient::new(guest_channel(pod_id).await?);
         for container in &spec.containers {
-            run_container(&mut guest, container).await.map_err(|e| {
-                Status::new(
-                    e.code(),
-                    format!("container {}: {}", container.name, e.message()),
-                )
-            })?;
+            run_container(&mut guest, container, booted)
+                .await
+                .map_err(|e| {
+                    Status::new(
+                        e.code(),
+                        format!("container {}: {}", container.name, e.message()),
+                    )
+                })?;
         }
         Ok(())
     }
 
-    /// Gets the pod's microVM running, from whatever state it is in.
-    async fn boot(&self, pod_id: &str, spec: &PodSpec) -> Result<(), Status> {
+    /// Gets the pod's microVM running on its disk, from whatever state it
+    /// is in. Returns whether it booted it anew.
+    async fn boot(&self, pod_id: &str, spec: &PodSpec) -> Result<bool, Status> {
         let vm_id = pod_id.to_string();
         let attachment = self.attach(pod_id).await?;
-        let config = spec::vm_config(pod_id, spec, attachment.as_ref());
+        let disk = self.open_disk(pod_id).await?;
+        let config = spec::vm_config(pod_id, spec, attachment.as_ref(), Some(&disk));
         loop {
             let vm = self.vm(pod_id).await?;
             match vm.as_ref().map(|vm| vm.state()) {
@@ -536,27 +592,28 @@ impl Pods {
                     self.inner.vms.create_vm(request).await?;
                 }
                 Some(VmState::Creating) => sleep(POLL).await,
-                // One made for another network is made anew, such as one
-                // of the first version's with IPv4.
+                // One made for another network or disk is made anew, such
+                // as one of the first version's with IPv4, or one from
+                // before pods had disks.
                 Some(VmState::Created | VmState::Stopped)
                     if vm.as_ref().is_some_and(|vm| stale(vm, &config)) =>
                 {
-                    info!("Pods: {pod_id}'s microVM was made for another network: making it anew");
+                    info!("Pods: {pod_id}'s microVM was made for another network or disk: making it anew");
                     self.delete_vm(pod_id).await?;
                 }
                 Some(VmState::Created | VmState::Stopped) => {
                     let request = Request::new(StartVmRequest { vm_id });
                     self.inner.vms.start_vm(request).await?;
-                    return Ok(());
+                    return Ok(true);
                 }
-                Some(VmState::Running) => return Ok(()),
+                Some(VmState::Running) => return Ok(false),
                 Some(VmState::Paused) => {
                     let request = Request::new(ResumeVmRequest {
                         vm_id,
                         remote: None,
                     });
                     self.inner.vms.resume_vm(request).await?;
-                    return Ok(());
+                    return Ok(false);
                 }
                 // A crashed microVM does not start again: it is made anew.
                 Some(VmState::Crashed) => self.delete_vm(pod_id).await?,
@@ -789,15 +846,28 @@ impl Pods {
         };
         if let Some((state, reason)) = next {
             self.set_state(&event.vm_id, state, &reason);
+            // The microVM is gone; its disk keeps what the pod wrote, for
+            // the next start.
+            let pods = self.clone();
+            let pod_id = event.vm_id;
+            tokio::spawn(async move {
+                if let Ok(_lock) = pods.lock(&pod_id).await
+                    && pods.info(&pod_id).is_ok_and(|info| {
+                        matches!(info.state(), PodState::Failed | PodState::Stopped)
+                    })
+                {
+                    pods.release_disk(&pod_id).await;
+                }
+            });
         }
     }
 }
 
-/// Whether the microVM's network is not the one `wanted` has.
+/// Whether the microVM's network or disk is not the one `wanted` has.
 fn stale(vm: &VmInfo, wanted: &VmConfig) -> bool {
     let config = vm.config.as_ref();
-    config.map(|config| (&config.net, &config.guest_network))
-        != Some((&wanted.net, &wanted.guest_network))
+    config.map(|config| (&config.net, &config.guest_network, &config.data_disk))
+        != Some((&wanted.net, &wanted.guest_network, &wanted.data_disk))
 }
 
 /// A channel to the API of the pod's guest.
@@ -807,28 +877,35 @@ pub(crate) async fn guest_channel(pod_id: &str) -> Result<Channel, Status> {
         .map_err(|e| Status::unavailable(format!("the guest of pod {pod_id}: {e}")))
 }
 
-/// Gets a container running in the guest, from whatever is there.
+/// Gets a container running in the guest, from whatever is there. After a
+/// new boot, a container that the pod's disk has from the boot before is
+/// stopped, and is adopted with what it wrote; one that is not there is
+/// created.
 async fn run_container(
     guest: &mut ContainerServiceClient<Channel>,
     container: &ContainerSpec,
+    booted: bool,
 ) -> Result<(), Status> {
     let container_id = container.name.clone();
+    let create = CreateContainerRequest {
+        config: Some(ContainerConfig {
+            image_ref: container.image_ref.clone(),
+            command: container.command.clone(),
+            env: container.env.clone(),
+        }),
+        container_id: Some(container_id.clone()),
+        // Without a container to adopt, a plain create.
+        adopt: true,
+    };
+    // Adopted once at most: one that stops again exited in this boot.
+    let mut adopt = booted;
     loop {
         let request = GetContainerRequest {
             container_id: container_id.clone(),
         };
         match guest.get_container(request).await {
             Err(e) if e.code() == Code::NotFound => {
-                let request = CreateContainerRequest {
-                    config: Some(ContainerConfig {
-                        image_ref: container.image_ref.clone(),
-                        command: container.command.clone(),
-                        env: container.env.clone(),
-                    }),
-                    container_id: Some(container_id.clone()),
-                    adopt: false,
-                };
-                guest.create_container(request).await?;
+                guest.create_container(create.clone()).await?;
             }
             Err(e) => return Err(e),
             Ok(info) => match info.into_inner().state() {
@@ -838,6 +915,10 @@ async fn run_container(
                     let request = StartContainerRequest { container_id };
                     guest.start_container(request).await?;
                     return Ok(());
+                }
+                GuestContainerState::Stopped if adopt => {
+                    adopt = false;
+                    guest.create_container(create.clone()).await?;
                 }
                 GuestContainerState::Running | GuestContainerState::Stopped => return Ok(()),
                 GuestContainerState::Unspecified => {

@@ -67,6 +67,10 @@ pub struct ServerOptions {
     /// The pods' network (ADR 0010).
     #[cfg(feature = "host")]
     pub network: pod_service::network::Config,
+    /// diskd's socket, which the pods' disks come from (ADR 0011); its
+    /// default when unset.
+    #[cfg(feature = "host")]
+    pub diskd_socket: Option<std::path::PathBuf>,
 }
 
 impl ServerOptions {
@@ -79,6 +83,8 @@ impl ServerOptions {
             tcp: None,
             #[cfg(feature = "host")]
             network: Default::default(),
+            #[cfg(feature = "host")]
+            diskd_socket: None,
         }
     }
 }
@@ -123,7 +129,8 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     #[cfg(feature = "host")]
     let vms = initialize_vm_service(&setup_database().await?).await?;
     #[cfg(feature = "host")]
-    let (pods, groups, traffic) = initialize_pod_service(vms, options.network).await?;
+    let (pods, groups, traffic) =
+        initialize_pod_service(vms, options.network, options.diskd_socket).await?;
     let services = Services {
         #[cfg(feature = "host")]
         pods,

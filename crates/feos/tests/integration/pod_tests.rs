@@ -183,11 +183,11 @@ fn sysctl(path: &str) -> Result<String> {
     )
 }
 
-fn new_pod_id() -> String {
+pub(super) fn new_pod_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-async fn get_pod(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<PodInfo> {
+pub(super) async fn get_pod(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<PodInfo> {
     Ok(pods
         .get_pod(GetPodRequest {
             pod_id: pod_id.to_string(),
@@ -226,7 +226,7 @@ async fn guest_host(pod_id: &str) -> Result<HostServiceClient<Channel>> {
     ))
 }
 
-async fn guest_ping(pod_id: &str) -> Result<PingResponse> {
+pub(super) async fn guest_ping(pod_id: &str) -> Result<PingResponse> {
     Ok(guest_host(pod_id)
         .await?
         .ping(PingRequest {})
@@ -250,7 +250,7 @@ async fn guest_clock_skew(pod_id: &str) -> Result<Duration> {
 }
 
 /// A request for the pod's guest, through feosd.
-fn for_pod<T>(pod_id: &str, message: T) -> tonic::Request<T> {
+pub(super) fn for_pod<T>(pod_id: &str, message: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
     request
         .metadata_mut()

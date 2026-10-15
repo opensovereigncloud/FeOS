@@ -4,6 +4,7 @@
 //! Pods (ADR 0004): `feos.pod.v1.PodService`, and the forwarding of a
 //! pod's services to its guest.
 
+pub mod disk;
 pub mod forward;
 pub mod network;
 mod pods;

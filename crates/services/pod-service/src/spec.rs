@@ -5,7 +5,8 @@
 
 use crate::network::{self, Attachment};
 use feos_proto::microvm::{
-    BalloonConfig, CpuConfig, GuestNetworkConfig, MemoryConfig, NetConfig, TapConfig, VmConfig,
+    BalloonConfig, CpuConfig, DataDiskConfig, GuestNetworkConfig, MemoryConfig, NetConfig,
+    TapConfig, VmConfig,
 };
 use feos_proto::pod_service::{PodSpec, Resources};
 use std::collections::HashSet;
@@ -92,11 +93,16 @@ fn valid_name(name: &str) -> bool {
 
 /// The pod's microVM: the newest guest installed on the node, with a
 /// balloon that reports free pages, so that a suspend writes what the
-/// guest uses, and the pod's TAP device and addresses if it has a network
-/// (ADR 0010): an IPv6 /128 behind the node at `fe80::1`, an IPv4 /32
-/// behind `169.254.0.1`, which is on the link although outside the /32,
-/// and the node's resolver.
-pub fn vm_config(pod_id: &str, spec: &PodSpec, attachment: Option<&Attachment>) -> VmConfig {
+/// guest uses, the pod's disk if it has one started, and the pod's TAP
+/// device and addresses if it has a network (ADR 0010): an IPv6 /128
+/// behind the node at `fe80::1`, an IPv4 /32 behind `169.254.0.1`, which
+/// is on the link although outside the /32, and the node's resolver.
+pub fn vm_config(
+    pod_id: &str,
+    spec: &PodSpec,
+    attachment: Option<&Attachment>,
+    disk: Option<&str>,
+) -> VmConfig {
     let resources = spec.resources.unwrap_or_default();
     let mut config = VmConfig {
         cpus: Some(CpuConfig {
@@ -110,6 +116,9 @@ pub fn vm_config(pod_id: &str, spec: &PodSpec, attachment: Option<&Attachment>) 
                 free_page_reporting: true,
                 stats_interval_s: 0,
             }),
+        }),
+        data_disk: disk.map(|path| DataDiskConfig {
+            path: path.to_string(),
         }),
         ..Default::default()
     };
@@ -222,7 +231,7 @@ mod tests {
             ipv4: "169.254.16.9".parse().unwrap(),
             dns: "169.254.0.53".parse().unwrap(),
         };
-        let config = vm_config(id, &spec, Some(&attachment));
+        let config = vm_config(id, &spec, Some(&attachment), None);
         assert_eq!(config.net[0].tap.as_ref().unwrap().tap_name, "pod-11111111");
         assert_eq!(config.net[0].mac_address, "06:00:11:11:11:11");
         let guest = config.guest_network.unwrap();
@@ -237,7 +246,17 @@ mod tests {
         assert_eq!(guest.hostname, id);
         assert_eq!(config.memory.unwrap().size_mib, 512);
 
-        let config = vm_config(id, &spec, None);
+        let config = vm_config(id, &spec, None, None);
         assert!(config.net.is_empty() && config.guest_network.is_none());
+    }
+
+    #[test]
+    fn the_disk_is_the_data_disk() {
+        let spec = normalize(spec(vec![])).unwrap();
+        let id = "11111111-2222-3333-4444-555555555555";
+        let link = format!("/var/lib/feos/disk/live/{id}/disk");
+        let config = vm_config(id, &spec, None, Some(&link));
+        assert_eq!(config.data_disk.unwrap().path, link);
+        assert!(vm_config(id, &spec, None, None).data_disk.is_none());
     }
 }

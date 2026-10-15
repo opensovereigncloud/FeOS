@@ -27,6 +27,7 @@ pub mod container_tests;
 pub mod fixtures;
 pub mod host_tests;
 pub mod image_tests;
+pub mod pod_disk_tests;
 pub mod pod_tests;
 
 pub const PUBLIC_SERVER_ADDRESS: &str = "http://[::1]:1337";
@@ -142,23 +143,37 @@ pub struct Installed {
 }
 
 /// Installs the guest (make guest) and the Firecracker in PATH (make
-/// firecracker) as their packages would, or None if either is missing:
-/// the pod tests are skipped then.
+/// firecracker) as their packages would, or None if either is missing, or
+/// no diskd serves the pods' disks (make test-pods runs one): the pod
+/// tests are skipped then.
 pub fn installed_guest() -> Result<Option<Installed>> {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let kernel = repo.join("target/guest/vmlinuz");
     let initramfs = repo.join("target/guest/initramfs.cpio.zst");
+    let data = repo.join("target/guest/data.img.zst");
     let firecracker = env::split_paths(&env::var_os("PATH").unwrap_or_default())
         .map(|dir| dir.join("firecracker"))
         .find(|path| path.is_file());
-    let (Some(firecracker), true, true) = (firecracker, kernel.exists(), initramfs.exists()) else {
+    let guest_built = kernel.exists() && initramfs.exists() && data.exists();
+    let (Some(firecracker), true) = (firecracker, guest_built) else {
         log::warn!("Skipping test: no Firecracker in PATH, or no guest in target/guest.");
         return Ok(None);
     };
+    if !Path::new(pod_service::disk::DISKD_SOCKET).exists() {
+        log::warn!(
+            "Skipping test: no diskd on {}.",
+            pod_service::disk::DISKD_SOCKET
+        );
+        return Ok(None);
+    }
     let guest = install(
         Path::new(GUEST_DIR),
         "0.0.1-test",
-        &[(&kernel, "vmlinuz"), (&initramfs, "initramfs")],
+        &[
+            (&kernel, "vmlinuz"),
+            (&initramfs, "initramfs"),
+            (&data, "data.img.zst"),
+        ],
     )?;
     let firecracker = install(
         Path::new(FIRECRACKER_DIR),

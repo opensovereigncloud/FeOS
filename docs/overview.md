@@ -75,9 +75,10 @@ Both products run on one unit: the **pod**, a Firecracker microVM that runs
 | `feos-host-init` | as PID 1 when FeOS is the node's operating system | sets the machine up and keeps `feosd` running; otherwise the node runs Debian or Garden Linux |
 | `feosctl` | anywhere | the command-line client |
 
-A disk daemon (chunk store, object storage tiering) and `feos-authn`, the
+`diskd`, the disk daemon, runs beside `feosd` on every node: the pods'
+disks, and their way into object storage (ADR 0011). `feos-authn`, the
 process beside each pod that holds its identity and credentials
-(ADR 0014), join them as they are built.
+(ADR 0014), joins them when it is built.
 
 ### The control plane
 
@@ -124,7 +125,7 @@ guest's API is internal between `feosd` and `feos-guest`.
 | `feos-guest` | runs containers, tools, watches, port forwarding and credential offloading in a Firecracker guest |
 | `feosd` | runs pods (`feos.pod.v1`): a microVM in Firecracker's jailer and its containers, with snapshots, the balloon and the guest's uplink, under systemd or `feos-host-init`; forwards a pod's container, image, tool and watch calls to its guest; gives every pod its network (ADR 0010): an IPv6 address of the node's prefix and a link-local IPv4 address on a routed TAP device, with proxy ARP for the IPv4 gateway and masquerade for leaving over IPv4, DNS from its own resolver; enforces security groups with nftables (ADR 0012) and records flows, drops, DNS queries and server names (ADR 0013), served as `feos.network.v1`. Credentials and proxies are not built; groups and records do not reach Valkey yet |
 | `feos-host-init` | sets the machine up as PID 1 and runs `feosd` |
-| `diskd` | the disk daemon (ADR 0011): ublk devices over sealed layers, a local cache and S3; ported with its labs, not yet wired to pods or packaged |
+| `diskd` | the disk daemon (ADR 0011): ublk devices over sealed layers, a local cache and S3. Every pod has a disk from it, which outlives its stops and crashes. Not packaged yet; no hibernation, no baked images |
 | packages | `.deb` packages of `feosd`, `feosctl`, Firecracker and the guest, in a signed apt repository at apt.fecode.dev |
 | Valkey bridge | proposed, not built |
 | control plane, node-side manager | in Go, still in the sandbox system's repository; the manager is being ported into `feosd` |

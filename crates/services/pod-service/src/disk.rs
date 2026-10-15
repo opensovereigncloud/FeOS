@@ -1,0 +1,325 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! The pods' disks (ADR 0011): every pod has one, a ublk device of diskd,
+//! the node's disk daemon, which feosd reaches on its socket.
+//!
+//! A pod's disk starts from the blank data volume of the newest guest
+//! installed, which diskd imports once as an L0, and holds what the pod
+//! writes in its top. It lives as long as the pod: it is started for a
+//! boot or a restore, stopped when the microVM ends, sealed and uploaded
+//! when the pod hibernates, and removed when the pod is deleted or has
+//! hibernated. All the node's traffic with the object store runs through
+//! diskd.
+
+use feos_proto::disk_service::{
+    disk_service_client::DiskServiceClient, CloseMemoryRequest, CreateDiskRequest, GetHeadRequest,
+    GetObjectRequest, Head, ImportBaseRequest, Layer, MemoryRef, OpenDiskRequest,
+    OpenMemoryRequest, PutHeadRequest, PutObjectRequest, RemoveDeviceRequest, SealFileRequest,
+    SealRequest, StopDiskRequest,
+};
+use hyper_util::rt::TokioIo;
+use log::{info, warn};
+use microvm_service::vmm::installed::{self, BLANK_DATA_VOLUME};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::time::{sleep, Instant};
+use tonic::transport::{Channel, Endpoint, Uri};
+use tonic::{Code, Status};
+use tower::service_fn;
+
+/// diskd's socket, in its state directory (`diskd --state-dir`).
+pub const DISKD_SOCKET: &str = "/var/lib/feos/disk/diskd.sock";
+/// How long a boot waits for a diskd that does not answer: one that
+/// restarts recovers its devices before it serves.
+const DISKD_WAIT: Duration = Duration::from_secs(20);
+
+/// diskd, as the pods use it.
+pub struct Disks {
+    socket: PathBuf,
+    channel: Channel,
+    /// The blank data volume's layer, by its image: imported once.
+    blanks: tokio::sync::Mutex<HashMap<PathBuf, String>>,
+}
+
+/// A call's error, saying that diskd answered it.
+fn diskd(e: Status) -> Status {
+    Status::new(e.code(), format!("diskd: {}", e.message()))
+}
+
+impl Disks {
+    /// diskd on `socket`. It is connected to on the first call, and again
+    /// after it restarted.
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
+        let socket = socket.into();
+        let path = socket.clone();
+        let channel = Endpoint::from_static("http://diskd").connect_with_connector_lazy(
+            service_fn(move |_: Uri| {
+                let path = path.clone();
+                async move {
+                    tokio::net::UnixStream::connect(path)
+                        .await
+                        .map(TokioIo::new)
+                }
+            }),
+        );
+        Self {
+            socket,
+            channel,
+            blanks: Default::default(),
+        }
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    fn client(&self) -> DiskServiceClient<Channel> {
+        DiskServiceClient::new(self.channel.clone())
+    }
+
+    /// Starts the pod's disk for a boot, and returns the path Firecracker
+    /// takes: the disk the node has of the pod, or the one of its
+    /// checkpoint `head_key`, or a new one on the blank data volume.
+    pub async fn open(&self, pod_id: &str, head_key: Option<&str>) -> Result<String, Status> {
+        let request = OpenDiskRequest {
+            pod_id: pod_id.to_string(),
+            head_key: String::new(),
+        };
+        // diskd may be starting, and recovering its devices first.
+        let deadline = Instant::now() + DISKD_WAIT;
+        loop {
+            match self.client().open_disk(request.clone()).await {
+                Ok(device) => return Ok(device.into_inner().link_path),
+                Err(e) if e.code() == Code::NotFound => break,
+                Err(e) if e.code() == Code::Unavailable && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(diskd(e)),
+            }
+        }
+        let device = match head_key {
+            Some(head_key) => self.open_checkpoint(pod_id, head_key).await?,
+            None => self.create(pod_id).await?,
+        };
+        Ok(device)
+    }
+
+    /// Starts the pod's disk from its checkpoint, the head `head_key`. The
+    /// node must have no disk of the pod.
+    pub async fn open_checkpoint(&self, pod_id: &str, head_key: &str) -> Result<String, Status> {
+        let request = OpenDiskRequest {
+            pod_id: pod_id.to_string(),
+            head_key: head_key.to_string(),
+        };
+        let device = self.client().open_disk(request).await.map_err(diskd)?;
+        info!("Disks: {pod_id}'s disk comes from {head_key}");
+        Ok(device.into_inner().link_path)
+    }
+
+    /// A new disk on the blank data volume.
+    async fn create(&self, pod_id: &str) -> Result<String, Status> {
+        let create = |chain: String| {
+            let mut client = self.client();
+            let request = CreateDiskRequest {
+                pod_id: pod_id.to_string(),
+                chain: vec![chain],
+                logical_size: 0,
+            };
+            async move { client.create_disk(request).await }
+        };
+        let device = match create(self.blank().await?).await {
+            Ok(device) => device,
+            // diskd may have lost the layer since it was imported: once
+            // more, imported anew.
+            Err(e) if e.code() == Code::Internal => {
+                warn!(
+                    "Disks: The blank data volume did not serve {pod_id}: {}; importing it again",
+                    e.message()
+                );
+                self.blanks.lock().await.clear();
+                create(self.blank().await?).await.map_err(diskd)?
+            }
+            Err(e) => return Err(diskd(e)),
+        };
+        info!("Disks: {pod_id} has a new disk");
+        Ok(device.into_inner().link_path)
+    }
+
+    /// The layer of the blank data volume of the newest guest installed,
+    /// imported into diskd the first time a pod needs it.
+    async fn blank(&self) -> Result<String, Status> {
+        let guest = installed::newest_guest().ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "no guest is installed in {}",
+                installed::GUEST_DIR
+            ))
+        })?;
+        let image = guest.join(BLANK_DATA_VOLUME);
+        let mut blanks = self.blanks.lock().await;
+        if let Some(layer) = blanks.get(&image) {
+            return Ok(layer.clone());
+        }
+        if !image.is_file() {
+            return Err(Status::failed_precondition(format!(
+                "the guest in {} has no blank data volume {BLANK_DATA_VOLUME}",
+                guest.display()
+            )));
+        }
+        let request = ImportBaseRequest {
+            path: image.to_string_lossy().into_owned(),
+            chunk_size: 0,
+        };
+        let layer = self
+            .client()
+            .import_base(request)
+            .await
+            .map_err(diskd)?
+            .into_inner();
+        info!(
+            "Disks: The blank data volume {} is layer {}",
+            image.display(),
+            layer.layer_id
+        );
+        blanks.insert(image, layer.layer_id.clone());
+        Ok(layer.layer_id)
+    }
+
+    /// Stops the pod's disk, which keeps what the pod wrote: its microVM
+    /// has ended. Nothing to do for a disk that is not started.
+    pub async fn stop(&self, pod_id: &str) -> Result<(), Status> {
+        let request = StopDiskRequest {
+            pod_id: pod_id.to_string(),
+        };
+        match self.client().stop_disk(request).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.code() == Code::NotFound => Ok(()),
+            Err(e) => Err(diskd(e)),
+        }
+    }
+
+    /// Removes the pod's disk from the node, with what it holds that is
+    /// not sealed.
+    pub async fn remove(&self, pod_id: &str) -> Result<(), Status> {
+        self.stop(pod_id).await?;
+        let request = RemoveDeviceRequest {
+            pod_id: pod_id.to_string(),
+        };
+        self.client().remove_device(request).await.map_err(diskd)?;
+        Ok(())
+    }
+
+    /// Seals the stopped disk's writes into the pod's own layer and
+    /// uploads its chain.
+    pub async fn seal(&self, pod_id: &str) -> Result<Layer, Status> {
+        let request = SealRequest {
+            pod_id: pod_id.to_string(),
+            upload: true,
+        };
+        Ok(self
+            .client()
+            .seal(request)
+            .await
+            .map_err(diskd)?
+            .into_inner())
+    }
+
+    /// Seals a memory dump into a flat layer and uploads it.
+    pub async fn seal_memory(&self, path: &Path) -> Result<Layer, Status> {
+        let request = SealFileRequest {
+            path: path.to_string_lossy().into_owned(),
+            upload: true,
+            chunk_size: 0,
+        };
+        Ok(self
+            .client()
+            .seal_file(request)
+            .await
+            .map_err(diskd)?
+            .into_inner())
+    }
+
+    /// Uploads a file to the object store at `key`.
+    pub async fn put_object(&self, key: &str, path: &Path) -> Result<(), Status> {
+        let request = PutObjectRequest {
+            key: key.to_string(),
+            path: path.to_string_lossy().into_owned(),
+        };
+        self.client().put_object(request).await.map_err(diskd)?;
+        Ok(())
+    }
+
+    /// Downloads the object at `key` into a file.
+    pub async fn get_object(&self, key: &str, path: &Path) -> Result<(), Status> {
+        let request = GetObjectRequest {
+            key: key.to_string(),
+            path: path.to_string_lossy().into_owned(),
+        };
+        self.client().get_object(request).await.map_err(diskd)?;
+        Ok(())
+    }
+
+    /// Uploads the head of the pod's checkpoint `epoch`, last.
+    pub async fn put_head(
+        &self,
+        pod_id: &str,
+        epoch: u64,
+        memory: Option<MemoryRef>,
+    ) -> Result<Head, Status> {
+        let request = PutHeadRequest {
+            pod_id: pod_id.to_string(),
+            epoch,
+            memory,
+        };
+        Ok(self
+            .client()
+            .put_head(request)
+            .await
+            .map_err(diskd)?
+            .into_inner())
+    }
+
+    pub async fn get_head(&self, key: &str) -> Result<Head, Status> {
+        let request = GetHeadRequest {
+            key: key.to_string(),
+        };
+        Ok(self
+            .client()
+            .get_head(request)
+            .await
+            .map_err(diskd)?
+            .into_inner())
+    }
+
+    /// Serves the pod's memory from a memory layer on `socket`, for
+    /// Firecracker to restore it from.
+    pub async fn open_memory(
+        &self,
+        pod_id: &str,
+        layer: &str,
+        socket: &Path,
+    ) -> Result<(), Status> {
+        let request = OpenMemoryRequest {
+            pod_id: pod_id.to_string(),
+            layer: layer.to_string(),
+            socket_path: socket.to_string_lossy().into_owned(),
+        };
+        self.client().open_memory(request).await.map_err(diskd)?;
+        Ok(())
+    }
+
+    /// Lets go of the pod's memory, if diskd serves it. Its handler also
+    /// ends when Firecracker does.
+    pub async fn close_memory(&self, pod_id: &str) {
+        let request = CloseMemoryRequest {
+            pod_id: pod_id.to_string(),
+        };
+        if let Err(e) = self.client().close_memory(request).await {
+            warn!(
+                "Disks: Failed to let go of {pod_id}'s memory: {}",
+                e.message()
+            );
+        }
+    }
+}

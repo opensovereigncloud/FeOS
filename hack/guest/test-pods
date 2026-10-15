@@ -1,8 +1,9 @@
 #!/bin/bash
 # Run pods against Firecracker: the pod integration tests install the
 # guest and Firecracker as their packages would, and create, stop, start,
-# crash, suspend, resume and delete pods. The image test pulls the guest
-# from a local registry.
+# crash, suspend, resume and delete pods, on disks from a diskd of their
+# own. The image test pulls the guest from a local
+# registry.
 #
 #   hack/guest/test-pods [test name filter...]
 #
@@ -11,8 +12,9 @@
 # The tests run as root in a privileged container, so that FeOS's
 # directories (/var/lib/feos, /run/feos) stay in there, in the network
 # namespace of the registry's container, so that FeOS's API port stays in
-# there too. Needs docker, /dev/kvm, Firecracker (make firecracker) and
-# the guest (make guest).
+# there too. The node's /dev is the container's: diskd's ublk devices
+# appear there. Needs docker, /dev/kvm, the ublk driver, Firecracker (make
+# firecracker) and the guest (make guest).
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -23,13 +25,19 @@ REGISTRY_PORT=5000
 TEST_IMAGE_REF="127.0.0.1:${REGISTRY_PORT}/feos/guest:test"
 RUNNER_IMAGE="debian:13"
 FILTERS=("$@")
-[ ${#FILTERS[@]} -gt 0 ] || FILTERS=(pod_tests image_tests::test_image_lifecycle)
+[ ${#FILTERS[@]} -gt 0 ] || FILTERS=(pod_tests pod_disk_tests image_tests::test_image_lifecycle)
 
 log() { printf '[test-pods] %s\n' "$*"; }
 
-for f in target/firecracker/firecracker target/guest/vmlinuz target/guest/initramfs.cpio.zst; do
+for f in target/firecracker/firecracker target/guest/vmlinuz target/guest/initramfs.cpio.zst \
+  target/guest/data.img.zst; do
   [ -e "${REPO_ROOT}/${f}" ] || { log "missing ${f}"; exit 1; }
 done
+
+log "building diskd for ${TARGET}"
+cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" --release --target "${TARGET}" \
+  -p diskd -p diskctl
+DISKD_BIN="${REPO_ROOT}/target/${TARGET}/release"
 
 # Static binaries run in any container.
 log "building the integration tests for ${TARGET}"
@@ -70,11 +78,14 @@ log "running ${FILTERS[*]}"
 # /var/lib/feos is a tmpfs, as when FeOS is the host's PID 1, where the
 # VMs' disks and snapshots live in memory; with device nodes, which the
 # jailer creates in there. The containers' overlay roots could not have their upper layer on
-# the container's own overlayfs either.
+# the container's own overlayfs either. diskd runs beside the tests, with
+# its state in /var/lib/feos/disk.
 docker run --rm --privileged --init \
   --network "container:${REGISTRY_NAME}" \
   --tmpfs /var/lib/feos:exec,dev \
+  -v /dev:/dev \
   "${MOUNTS[@]}" \
+  -e DISKD_BIN="${DISKD_BIN}" \
   -e TEST_IMAGE_REF="${TEST_IMAGE_REF}" \
   -e PATH="${REPO_ROOT}/target/firecracker:/usr/sbin:/usr/bin:/sbin:/bin" \
   -e RUST_LOG=info \
@@ -86,5 +97,18 @@ docker run --rm --privileged --init \
     xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || :
     sed -e "s/ / +/g" -e "s/^/+/" /sys/fs/cgroup/cgroup.controllers \
       > /sys/fs/cgroup/cgroup.subtree_control
-    exec "$@"' sh "${TEST_BIN}" --nocapture "${FILTERS[@]}"
+    state=/var/lib/feos/disk
+    "${DISKD_BIN}/diskd" --state-dir "${state}" >/var/lib/feos/diskd.log 2>&1 &
+    diskd=$!
+    for _ in $(seq 100); do [ -S "${state}/diskd.sock" ] && break; sleep 0.1; done
+    [ -S "${state}/diskd.sock" ] || { echo "diskd did not start:"; cat /var/lib/feos/diskd.log; exit 1; }
+    "$@"
+    status=$?
+    # The devices a failed test left are stopped: a device outlives its
+    # diskd, waiting for the next, which does not come here.
+    ctl="${DISKD_BIN}/diskctl --socket ${state}/diskd.sock"
+    for pod in $(ls "${state}/live" 2>/dev/null); do $ctl stop "${pod}" >/dev/null 2>&1; done
+    kill "${diskd}"
+    [ "${status}" = 0 ] || tail -40 /var/lib/feos/diskd.log
+    exit "${status}"' sh "${TEST_BIN}" --nocapture "${FILTERS[@]}"
 log "PASS"

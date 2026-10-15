@@ -6,6 +6,10 @@ package feos.pod.v1;
 // containers in it. A pod's containers, images, tools and watches are
 // reached through feosd with the APIs they have in the guest: a call that
 // carries the metadata "feos-pod-id" goes unchanged to that pod's guest.
+//
+// Every pod has a disk of its own from the node's disk daemon (ADR 0011),
+// which the guest mounts at /var/lib/feos: its images and containers
+// live there, and what the containers write survives a stop and a crash.
 service PodService {
   // Creates a pod and brings it up: its microVM boots the newest guest
   // installed on the node, and its containers are pulled, created and
@@ -14,19 +18,20 @@ service PodService {
   // with the ID of a pod that exists returns that pod if the spec is the
   // same, and fails with ALREADY_EXISTS if it is not.
   rpc CreatePod(CreatePodRequest) returns (CreatePodResponse);
-  // Brings a stopped or failed pod up again: a new boot, with its
-  // containers created anew from the spec.
+  // Brings a stopped or failed pod up again: a new boot on its disk, where
+  // its containers are adopted with what they wrote, or created from the
+  // spec where they are not there.
   rpc StartPod(StartPodRequest) returns (StartPodResponse);
-  // Shuts the pod's microVM down. What the containers wrote is gone: a pod
-  // has no disk yet.
+  // Shuts the pod's microVM down; its disk stays.
   rpc StopPod(StopPodRequest) returns (StopPodResponse);
-  // Removes the pod and its microVM, in whatever state.
+  // Removes the pod, its microVM and its disk, in whatever state.
   rpc DeletePod(DeletePodRequest) returns (DeletePodResponse);
   rpc GetPod(GetPodRequest) returns (PodInfo);
   rpc ListPods(ListPodsRequest) returns (ListPodsResponse);
   // Streams the pods' state changes as they happen.
   rpc StreamPodEvents(StreamPodEventsRequest) returns (stream PodEvent);
-  // Writes the running pod to a snapshot on disk and ends its microVM.
+  // Writes the running pod to a snapshot on the node and ends its
+  // microVM.
   rpc SuspendPod(SuspendPodRequest) returns (SuspendPodResponse);
   // Restores a suspended pod, with its containers as they were.
   rpc ResumePod(ResumePodRequest) returns (ResumePodResponse);
@@ -92,9 +97,10 @@ enum PodState {
   POD_STATE_RUNNING = 2;
   // Its microVM is shut down.
   POD_STATE_STOPPED = 3;
-  // In a snapshot on disk.
+  // In a snapshot on the node.
   POD_STATE_SUSPENDED = 4;
   // Bringing it up failed, or its microVM crashed: PodInfo.reason says why.
+  // Its disk stays, and a start boots on it.
   POD_STATE_FAILED = 5;
 }
 

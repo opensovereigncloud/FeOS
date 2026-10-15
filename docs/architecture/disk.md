@@ -3,21 +3,20 @@ The Disk Daemon
 
 `diskd` serves pods' disks as block devices over a chunk store that it
 tiers to an object store, and restores pods' memory from the same chunks.
-The decision behind it: [ADR 0011](../adr/0011-disk-daemon.md).
-
-**Not wired yet.** diskd builds, runs and has its API, but `feosd` does not
-call it: pods still have no disk, and suspend and resume use Firecracker's
-snapshot files as before ([ADR 0008](../adr/0008-suspend-and-restore.md)).
-Nor is diskd packaged.
+Every pod has a disk from it. The decision behind it:
+[ADR 0011](../adr/0011-disk-daemon.md).
 
 ## Processes
 
-- **`diskd`** (`crates/diskd`): one per node, as root. It needs the
-  kernel's ublk driver (`/dev/ublk-control`, `CONFIG_BLK_DEV_UBLK`) and,
-  for memory, userfaultfd (`CONFIG_USERFAULTFD`). Each device has a thread
-  of its own, and a thread that fetches its missing chunks.
+- **`diskd`** (`crates/diskd`): one per node, as root, beside `feosd`.
+  It needs the kernel's ublk driver (`/dev/ublk-control`,
+  `CONFIG_BLK_DEV_UBLK`) and, for memory, userfaultfd
+  (`CONFIG_USERFAULTFD`). Each device has a thread of its own, and a
+  thread that fetches its missing chunks.
+- **`feosd`** is its client, on `--diskd-socket`
+  (`/var/lib/feos/disk/diskd.sock`); see [below](#the-pods-disks).
 - **`diskctl`** (`crates/diskctl`): its client for development, the lab
-  scripts and tests. It prints JSON.
+  scripts, tests and operators. It prints JSON.
 
 `diskd [--state-dir DIR] [--socket PATH] [--budget-bytes N]
 [--s3-concurrency N] [--mem-readahead N] [--s3-prefix P]`. The state
@@ -81,6 +80,34 @@ memory backend (`PUT /snapshot/load` with `backend_type` `Uffd`) and serves
 the guest's page faults from the layer; pages the guest reported free come
 back as zero pages. `CloseMemory` detaches it.
 
+## The pods' disks
+
+Every pod has one disk (`crates/services/pod-service/src/disk.rs`):
+
+- **L0** is the blank data volume of the newest guest installed,
+  `/usr/lib/feos/guest/<version>/data.img.zst`: an 8 GiB ext4 filesystem,
+  label `feos-data`, made by `make guest-data` (`hack/guest/data/mk-data`)
+  with a fixed UUID, hash seed and time, so that every build is the same
+  file, and its inode tables and journal zeroed. `feosd` has diskd import
+  it the first time a pod needs it after `feosd` started.
+- **A boot** of a pod (create, start) opens its disk: `OpenDisk(pod)` if
+  diskd has it, else `CreateDisk(pod, [L0])`. The microVM's `data_disk` is the link
+  `<state>/live/<pod>/disk`; the microVM layer makes a device node of it,
+  `data` in the jail, at every start and restore, and Firecracker attaches
+  it as `/data` with `cache_type` `Writeback`. The guest mounts it at
+  `/var/lib/feos`. On a boot after which the disk holds the pod's
+  containers, `feosd` creates them with `adopt`: their writable layers and
+  logs stay.
+- **When the microVM ends**, by a stop, a suspend, a crash or the guest,
+  `feosd` stops the disk (`StopDisk`) and lets go of memory diskd served
+  it (`CloseMemory`). A resume opens the disk before it restores the
+  microVM.
+- **A delete** stops and removes the disk (`RemoveDevice`), its top with
+  it, and fails while diskd cannot.
+
+A pod from before pods had disks gets one at its next boot, in a new
+microVM.
+
 ## Directories
 
 | Path (in the state directory) | Holds |
@@ -88,10 +115,10 @@ back as zero pages. `CloseMemory` detaches it.
 | `diskd.sock` | the API |
 | `diskd.state` | the device table: pod, ublk device id, chain, size |
 | `cache/<hh>/<hash>` | raw chunks, within the budget |
-| `staging/` | chunks and manifests before their rename |
+| `staging/` | chunks and manifests before their rename, a compressed image while it is imported |
 | `layers/<layer>.manifest` | layer manifests |
 | `live/<pod>/top.img`, `live/<pod>/disk` | a pod's top, and the link to its device |
-| `snapshots/<pod>/head.json` | a pod's head: chain, size, memory |
+| `snapshots/<pod>/head.json` | a pod's head after its last seal: chain, size |
 | `uploaded/` | which chunks and layers are in the object store |
 | `zero.bin` | zeroes to serve reads from |
 
@@ -126,3 +153,7 @@ given do not reach, and nothing younger than a day.
 The lab tests are `#[ignore]`d in `cargo test`. Those that need S3 skip
 without `S3_BUCKET` and `AWS_*` in the environment, and use a key prefix
 of their own.
+
+`make test-pods` runs a diskd beside `feosd` in its container, with the
+node's `/dev`, and the pods' integration tests against it: disks across a
+stop, a start and a crash.
