@@ -18,7 +18,7 @@ A rule allows one kind of traffic, in or out:
   ingress <protocol> [<ports>] from <peer>
   egress <protocol> [<ports>] to <peer>
 
-  protocol  tcp, udp, icmpv6 or any
+  protocol  tcp, udp, icmp, icmpv6 or any
   ports     TCP and UDP only, e.g. 443 or 80,443,8000-8100; every port without
   peer      group <id>: the members of a security group; or
             <prefix> [except <prefix>,...]: an address block, IPv4 ones
@@ -195,10 +195,11 @@ fn parse_rule(s: &str) -> Result<Rule, String> {
         Some("tcp") => Protocol::Tcp,
         Some("udp") => Protocol::Udp,
         Some("icmpv6") => Protocol::Icmpv6,
+        Some("icmp") => Protocol::Icmp,
         Some("any") => Protocol::Any,
         other => {
             return Err(format!(
-                "{} is not a protocol: tcp, udp, icmpv6 or any",
+                "{} is not a protocol: tcp, udp, icmp, icmpv6 or any",
                 other.unwrap_or("nothing")
             ))
         }
@@ -294,6 +295,7 @@ fn format_rule(rule: &Rule) -> String {
         Protocol::Tcp => "tcp",
         Protocol::Udp => "udp",
         Protocol::Icmpv6 => "icmpv6",
+        Protocol::Icmp => "icmp",
     };
     let mut words = vec![direction.to_string(), protocol.to_string()];
     if !rule.ports.is_empty() {

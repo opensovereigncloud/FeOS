@@ -140,10 +140,11 @@ message VmConfig {
 message GuestNetworkConfig {
   // Interface in the guest, e.g. "eth0".
   string interface = 1;
-  // IPv4 address with prefix length, e.g. "10.200.0.2/16"; empty for a
+  // IPv4 address with prefix length, e.g. "169.254.16.2/32"; empty for a
   // guest with IPv6 only.
   string ipv4_cidr = 2;
-  // IPv4 default gateway, e.g. "10.200.0.1"; empty with ipv4_cidr.
+  // IPv4 default gateway, on the interface's link, e.g. "169.254.0.1";
+  // empty with ipv4_cidr.
   string gateway = 3;
   // Resolvers, in order.
   repeated string dns = 4;

@@ -170,12 +170,13 @@ fn tuple(tuple: Option<&Tuple>) -> String {
         return "-".to_string();
     };
     let protocol = match t.protocol {
+        1 => "icmp".to_string(),
         6 => "tcp".to_string(),
         17 => "udp".to_string(),
         58 => "icmpv6".to_string(),
         other => format!("proto{other}"),
     };
-    if t.protocol == 58 {
+    if t.protocol == 1 || t.protocol == 58 {
         return format!(
             "{protocol} {} > {} type {} id {}",
             t.source_address, t.destination_address, t.destination_port, t.source_port

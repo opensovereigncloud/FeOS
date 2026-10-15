@@ -71,6 +71,8 @@ enum Protocol {
   PROTOCOL_TCP = 1;
   PROTOCOL_UDP = 2;
   PROTOCOL_ICMPV6 = 3;
+  // ICMP of IPv4.
+  PROTOCOL_ICMP = 4;
 }
 
 message PortRange {
@@ -79,8 +81,8 @@ message PortRange {
   uint32 last = 2;
 }
 
-// A prefix, without the prefixes in except. An IPv4 prefix means its
-// addresses under the NAT64 prefix (ADR 0010).
+// A prefix of either family, without the prefixes in except. Pods' IPv4
+// is for leaving only (ADR 0010): an IPv4 block matters in egress rules.
 message AddressBlock {
   // E.g. "::/0", "2001:db8::/32", "0.0.0.0/0".
   string cidr = 1;
@@ -142,10 +144,10 @@ message TrafficRecord {
   }
 }
 
-// Addresses and ports of a connection, as its first packet had them. An
-// IPv4 address behind NAT64 is written as IPv4.
+// Addresses and ports of a connection, as its first packet had them: the
+// pod's own addresses, before NAT.
 message Tuple {
-  // The IP protocol number: 6 TCP, 17 UDP, 58 ICMPv6.
+  // The IP protocol number: 1 ICMP, 6 TCP, 17 UDP, 58 ICMPv6.
   uint32 protocol = 1;
   string source_address = 2;
   uint32 source_port = 3;

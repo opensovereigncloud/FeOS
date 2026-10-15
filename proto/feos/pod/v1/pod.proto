@@ -65,9 +65,9 @@ message ContainerSpec {
 }
 
 // Every pod has a network (ADR 0010): an IPv6 address of the node's pod
-// prefix on a TAP device of its own, IPv4 through NAT64, DNS through
-// feosd's resolver, and what it may reach decided by its security groups
-// (ADR 0012).
+// prefix and a link-local IPv4 address for leaving, on a TAP device of
+// its own, DNS through feosd's resolver, and what it may reach decided by
+// its security groups (ADR 0012).
 message PodNetwork {
   // A TAP device and an address the caller chose: feosd makes both now.
   reserved 1 to 5;
@@ -108,8 +108,8 @@ message PodInfo {
   repeated ContainerStatus containers = 5;
   // The pod's microVM; unset unless it runs.
   MicroVm microvm = 6;
-  // With feosd --nat64=node, the IPv4 address that stands for the pod on
-  // the node, behind NAT64; the guest never sees it. Empty otherwise.
+  // The pod's IPv4 address on the node, of feosd --pod-ipv4-range
+  // (169.254.16.0/20), for leaving only; empty without a network.
   string ipv4_address = 7;
   // The pod's IPv6 address, of the node's pod prefix, while it is on the
   // node; empty without a network.

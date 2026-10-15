@@ -39,8 +39,8 @@ service HostService {
   // Reads CLOCK_REALTIME.
   rpc GetTime(GetTimeRequest) returns (GetTimeResponse);
 
-  // Configures an interface with a static IPv4 address, the default route,
-  // the DNS resolvers and the hostname. A guest has no DHCP: its host pushes
+  // Configures an interface with static IPv4 and IPv6 addresses, the
+  // default routes, the DNS resolvers and the hostname. A guest has no DHCP: its host pushes
   // this after every boot and every resume. Pushing the same configuration
   // twice is fine.
   rpc SetNetworkConfig(SetNetworkConfigRequest) returns (SetNetworkConfigResponse);
@@ -296,9 +296,11 @@ message GetTimeResponse {
 message SetNetworkConfigRequest {
   // Interface name, e.g. "eth0".
   string interface = 1;
-  // Address with prefix length, e.g. "192.168.100.10/24".
+  // Address with prefix length, e.g. "169.254.16.2/32" or
+  // "192.168.100.10/24".
   string ipv4_cidr = 2;
-  // Default gateway, e.g. "192.168.100.1".
+  // IPv4 default gateway, on the interface's link even outside ipv4_cidr,
+  // e.g. "169.254.0.1".
   string gateway = 3;
   // Resolvers, in order. FeOS writes them to /etc/resolv.conf and to
   // /run/feos/resolv.conf, which containers link to.

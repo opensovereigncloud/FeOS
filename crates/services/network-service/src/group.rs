@@ -17,6 +17,7 @@ pub enum Protocol {
     Tcp,
     Udp,
     Icmpv6,
+    Icmp,
 }
 
 impl Protocol {
@@ -27,6 +28,7 @@ impl Protocol {
             Protocol::Tcp => Some(6),
             Protocol::Udp => Some(17),
             Protocol::Icmpv6 => Some(58),
+            Protocol::Icmp => Some(1),
         }
     }
 }
@@ -113,6 +115,7 @@ pub(crate) fn parse_rule(rule: &proto::Rule) -> Result<Rule, String> {
         Ok(proto::Protocol::Tcp) => Protocol::Tcp,
         Ok(proto::Protocol::Udp) => Protocol::Udp,
         Ok(proto::Protocol::Icmpv6) => Protocol::Icmpv6,
+        Ok(proto::Protocol::Icmp) => Protocol::Icmp,
         Err(_) => return Err(format!("it has an unknown protocol {}", rule.protocol)),
     };
     if !rule.ports.is_empty() && !matches!(protocol, Protocol::Tcp | Protocol::Udp) {
