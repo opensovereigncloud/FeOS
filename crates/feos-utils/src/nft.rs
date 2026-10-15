@@ -24,6 +24,7 @@ const NFNL_MSG_BATCH_END: u16 = 0x11;
 const NFT_MSG_NEWTABLE: u16 = 0;
 const NFT_MSG_DELTABLE: u16 = 2;
 const NFT_MSG_NEWCHAIN: u16 = 3;
+const NFT_MSG_GETCHAIN: u16 = 4;
 const NFT_MSG_NEWRULE: u16 = 6;
 const NFT_MSG_NEWSET: u16 = 9;
 const NFT_MSG_NEWSETELEM: u16 = 12;
@@ -31,9 +32,11 @@ const NFT_MSG_DELSETELEM: u16 = 14;
 
 const NLM_F_REQUEST: u16 = 0x1;
 const NLM_F_ACK: u16 = 0x4;
+const NLM_F_DUMP: u16 = 0x300;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_APPEND: u16 = 0x800;
 const NLMSG_ERROR: u16 = 0x2;
+const NLMSG_DONE: u16 = 0x3;
 const NLA_F_NESTED: u16 = 0x8000;
 
 const NFTA_TABLE_NAME: u16 = 1;
@@ -403,6 +406,8 @@ pub enum MetaKey {
 pub enum CtKey {
     /// The bits of [`ct`], host byte order.
     State = 0,
+    /// The packet's [`Direction`], a byte.
+    Direction = 1,
     Status = 2,
     Mark = 3,
     /// Packets, a u64 in host byte order; with accounting, which the
@@ -790,6 +795,20 @@ pub mod matches {
         ]
     }
 
+    /// The packet goes in this direction of its connection.
+    pub fn ct_direction(direction: Direction) -> Vec<Expr> {
+        vec![
+            Expr::Ct {
+                key: CtKey::Direction,
+                direction: None,
+            },
+            Expr::Cmp {
+                op: CmpOp::Eq,
+                data: vec![direction as u8],
+            },
+        ]
+    }
+
     /// Compares the packets that the connection's initiator sent, this one
     /// included.
     pub fn ct_original_packets(op: CmpOp, packets: u64) -> Vec<Expr> {
@@ -928,6 +947,100 @@ pub fn delete(family: Family, name: &str) -> io::Result<()> {
     );
     batch.finish();
     send(&batch)
+}
+
+/// The names of the chains of a table in the kernel; none if there is no
+/// such table. For tests and diagnostics: it reads, and changes nothing.
+pub fn chains(family: Family, table: &str) -> io::Result<Vec<String>> {
+    let mut request = Batch::new(1);
+    request.buf.clear();
+    request.header(
+        (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_GETCHAIN,
+        NLM_F_REQUEST | NLM_F_DUMP,
+        family as u8,
+        0,
+        |m| m.str(NFTA_CHAIN_TABLE, table),
+    );
+    // SAFETY: plain socket(2); the fd is owned from here on.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+            NETLINK_NETFILTER,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a socket this function just opened.
+    let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: sockaddr_nl is plain data; all zeroes addresses the kernel.
+    let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: the buffer and the address outlive the call.
+    let sent = unsafe {
+        libc::sendto(
+            socket.as_raw_fd(),
+            request.buf.as_ptr().cast(),
+            request.buf.len(),
+            0,
+            (&kernel as *const libc::sockaddr_nl).cast(),
+            size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut names = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        // SAFETY: the buffer outlives the call.
+        let n = unsafe { libc::recv(socket.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Ok(names);
+        }
+        let mut rest = &buf[..n as usize];
+        while rest.len() >= 16 {
+            let len = u32::from_ne_bytes(rest[0..4].try_into().unwrap_or_default()) as usize;
+            let ty = u16::from_ne_bytes(rest[4..6].try_into().unwrap_or_default());
+            if len < 16 || len > rest.len() {
+                break;
+            }
+            match ty {
+                NLMSG_DONE => return Ok(names),
+                NLMSG_ERROR if len >= 20 => {
+                    let code = i32::from_ne_bytes(rest[16..20].try_into().unwrap_or_default());
+                    return match -code {
+                        0 => Ok(names),
+                        libc::ENOENT => Ok(Vec::new()),
+                        code => Err(io::Error::from_raw_os_error(code)),
+                    };
+                }
+                _ if ty == (NFNL_SUBSYS_NFTABLES << 8) | NFT_MSG_NEWCHAIN && len > 20 => {
+                    // After nlmsghdr and nfgenmsg: the attributes.
+                    let mut attrs = &rest[20..len];
+                    while attrs.len() >= 4 {
+                        let alen = u16::from_ne_bytes([attrs[0], attrs[1]]) as usize;
+                        let aty = u16::from_ne_bytes([attrs[2], attrs[3]]) & 0x3fff;
+                        if alen < 4 || alen > attrs.len() {
+                            break;
+                        }
+                        if aty == NFTA_CHAIN_NAME {
+                            let name = &attrs[4..alen];
+                            let name = name.split(|b| *b == 0).next().unwrap_or_default();
+                            names.push(String::from_utf8_lossy(name).into_owned());
+                        }
+                        attrs = &attrs[((alen + 3) & !3).min(attrs.len())..];
+                    }
+                }
+                _ => {}
+            }
+            rest = &rest[((len + 3) & !3).min(rest.len())..];
+        }
+    }
 }
 
 fn replace_batch(table: &Table, seq: u32) -> io::Result<Batch> {
@@ -2062,6 +2175,16 @@ mod tests {
             attr(&data(&encode(&packets[2])), 2),
             Some(&2u32.to_be_bytes()[..])
         );
+        // ct direction original: a byte.
+        let direction = ct_direction(Direction::Original);
+        assert_eq!(
+            attr(&data(&encode(&direction[0])), 2),
+            Some(&1u32.to_be_bytes()[..])
+        );
+        assert_eq!(
+            attr(attr(&data(&encode(&direction[1])), 3).unwrap(), 1),
+            Some(&[0][..])
+        );
         // fib saddr . iif oif missing.
         let fib = fib_saddr_iif_oif_missing();
         assert_eq!(attr(&data(&encode(&fib[0])), 3), Some(&[0, 0, 0, 0x29][..]));
@@ -2342,8 +2465,10 @@ table inet NAME {
     fn the_kernel_takes_a_table() {
         replace(&table()).unwrap();
         replace(&table()).unwrap();
+        assert_eq!(chains(Family::Inet, "feos-test").unwrap(), ["input"]);
         delete(Family::Inet, "feos-test").unwrap();
         delete(Family::Inet, "feos-test").unwrap();
+        assert!(chains(Family::Inet, "feos-test").unwrap().is_empty());
     }
 
     /// Writes the pod network and changes its sets, as feosd and as nft
