@@ -6,7 +6,7 @@
 //! nftables rules that keep the pods away from each other, from the node
 //! and from private networks, and pin each pod's addresses to its TAP.
 
-use feos_utils::nft::{self, matches::*, Chain, CmpOp, Expr, Family, Hook, Table};
+use feos_utils::nft::{self, matches::*, Chain, CmpOp, Expr, Family, Hook, Policy, Table, Verdict};
 use futures::TryStreamExt;
 use log::info;
 use microvm_service::vmm::jail::tap;
@@ -251,7 +251,7 @@ fn inet_table() -> Table {
                 from_pods(),
                 ipv4(),
                 ipv4_daddr_in(address, len),
-                vec![Expr::Drop],
+                vec![Expr::Verdict(Verdict::Drop)],
             ]
             .concat(),
         );
@@ -259,34 +259,38 @@ fn inet_table() -> Table {
     Table {
         family: Family::Inet,
         name: TABLE.to_string(),
+        sets: Vec::new(),
         chains: vec![
-            Chain {
-                name: "input".to_string(),
-                kind: "filter",
-                hook: Hook::Input,
-                priority: 0,
-                rules: vec![[from_pods(), vec![Expr::Drop]].concat()],
-            },
-            Chain {
-                name: "forward".to_string(),
-                kind: "filter",
-                hook: Hook::Forward,
-                priority: 0,
-                rules: forward,
-            },
-            Chain {
-                name: "postrouting".to_string(),
-                kind: "nat",
-                hook: Hook::Postrouting,
-                priority: 100,
-                rules: vec![[
+            Chain::base(
+                "input",
+                "filter",
+                Hook::Input,
+                0,
+                Policy::Accept,
+                vec![[from_pods(), vec![Expr::Verdict(Verdict::Drop)]].concat()],
+            ),
+            Chain::base(
+                "forward",
+                "filter",
+                Hook::Forward,
+                0,
+                Policy::Accept,
+                forward,
+            ),
+            Chain::base(
+                "postrouting",
+                "nat",
+                Hook::Postrouting,
+                100,
+                Policy::Accept,
+                vec![[
                     ipv4(),
                     ipv4_prefix(12, CmpOp::Eq, GATEWAY, PREFIX_LEN),
                     oifname(CmpOp::Neq, BRIDGE),
                     vec![Expr::Masquerade],
                 ]
                 .concat()],
-            },
+            ),
         ],
     }
 }
@@ -298,13 +302,20 @@ fn bridge_table(pods: &[Attachment]) -> Table {
     for pod in pods {
         let port = || iifname(CmpOp::Eq, &pod.tap);
         let mac = pod.mac();
-        rules.push([port(), ether_saddr(CmpOp::Neq, mac), vec![Expr::Drop]].concat());
+        rules.push(
+            [
+                port(),
+                ether_saddr(CmpOp::Neq, mac),
+                vec![Expr::Verdict(Verdict::Drop)],
+            ]
+            .concat(),
+        );
         rules.push(
             [
                 port(),
                 ether_type(CmpOp::Eq, ETHERTYPE_IPV4),
                 ipv4_saddr(CmpOp::Neq, pod.address),
-                vec![Expr::Drop],
+                vec![Expr::Verdict(Verdict::Drop)],
             ]
             .concat(),
         );
@@ -313,7 +324,7 @@ fn bridge_table(pods: &[Attachment]) -> Table {
                 port(),
                 ether_type(CmpOp::Eq, ETHERTYPE_ARP),
                 arp_sha(CmpOp::Neq, mac),
-                vec![Expr::Drop],
+                vec![Expr::Verdict(Verdict::Drop)],
             ]
             .concat(),
         );
@@ -322,7 +333,7 @@ fn bridge_table(pods: &[Attachment]) -> Table {
                 port(),
                 ether_type(CmpOp::Eq, ETHERTYPE_ARP),
                 arp_spa(CmpOp::Neq, pod.address),
-                vec![Expr::Drop],
+                vec![Expr::Verdict(Verdict::Drop)],
             ]
             .concat(),
         );
@@ -331,7 +342,7 @@ fn bridge_table(pods: &[Attachment]) -> Table {
                 port(),
                 ether_type(CmpOp::Neq, ETHERTYPE_IPV4),
                 ether_type(CmpOp::Neq, ETHERTYPE_ARP),
-                vec![Expr::Drop],
+                vec![Expr::Verdict(Verdict::Drop)],
             ]
             .concat(),
         );
@@ -339,13 +350,15 @@ fn bridge_table(pods: &[Attachment]) -> Table {
     Table {
         family: Family::Bridge,
         name: TABLE.to_string(),
-        chains: vec![Chain {
-            name: "prerouting".to_string(),
-            kind: "filter",
-            hook: Hook::Prerouting,
-            priority: -200,
+        sets: Vec::new(),
+        chains: vec![Chain::base(
+            "prerouting",
+            "filter",
+            Hook::Prerouting,
+            -200,
+            Policy::Accept,
             rules,
-        }],
+        )],
     }
 }
 
