@@ -17,9 +17,9 @@
 #   --pod-ipv4-range PREFIX   the pods' IPv4 addresses, a /32 each,
 #                             169.254.16.0/20 by default.
 #   --dns-address ADDRESS     the pods' resolver, an IPv4 address this node
-#                             holds, 169.254.0.53 by default. Pods' gateway
-#                             is 169.254.0.1, which the node answers ARP for
-#                             on their TAP devices and never holds.
+#                             holds, 169.254.0.53 by default. The pods'
+#                             gateway is 169.254.0.1, which the node answers
+#                             ARP for on their TAP devices and never holds.
 #   --dns-upstream ADDRESS    a resolver it asks for pods that name none
 #                             (repeatable); Google's and Cloudflare's by
 #                             default.

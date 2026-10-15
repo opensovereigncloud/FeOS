@@ -196,7 +196,7 @@ message DnsQuery {
   uint32 rcode = 3;
   // The addresses of the answer's A and AAAA records.
   repeated string addresses = 4;
-  // Whether DNS64 synthesized the answer. Pods have IPv4, and the resolver
+  // Field 5 said whether the resolver had synthesized the answer; it
   // passes answers as the upstream gave them.
   reserved 5;
   reserved "synthesized";

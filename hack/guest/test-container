@@ -14,10 +14,10 @@
 # holds fe80::1 on the TAP and answers ARP for 169.254.0.1 by proxy,
 # without holding it, routes the guest's addresses to the TAP, passes DNS
 # for 169.254.0.53 on to a public resolver, and NATs to this machine over
-# a veth pair; this machine NATs again. Needs sudo for the namespace and for this machine's NAT (the veth
-# pair and iptables rules, all removed on exit), /dev/kvm, Firecracker
-# (make firecracker), the guest (make guest) and internet access for the
-# pull.
+# a veth pair; this machine NATs again. Needs sudo for the namespace and
+# for this machine's NAT (the veth pair and iptables rules, all removed on
+# exit), /dev/kvm, Firecracker (make firecracker), the guest (make guest)
+# and internet access for the pull.
 set -euo pipefail
 export PATH="$PATH:/sbin:/usr/sbin"
 

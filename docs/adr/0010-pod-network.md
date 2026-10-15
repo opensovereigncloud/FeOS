@@ -70,7 +70,7 @@ from node to node would need a route per pod, changed with every move.
   (below). So an IPv4 address may come round again: `feosd` hands out the
   one that has been free longest, and drops the connection tracking
   entries of a deleted pod's address.
-- The /20 bounds a node to 4096 pods, suspended ones included.
+- The /20 bounds a node to 4094 pods, suspended ones included.
 
 ### Each pod's TAP is a link of its own
 
