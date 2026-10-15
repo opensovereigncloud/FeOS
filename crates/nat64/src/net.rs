@@ -130,18 +130,19 @@ pub(crate) async fn set_routes(handle: &Handle, index: u32, config: &Config) -> 
         (IpAddr::V6(config.prefix), 96),
         (IpAddr::V4(config.pool), config.pool_len),
     ];
-    let v4 = handle
+    // One dump after the other: a netlink socket takes no dump while
+    // another runs on it (EBUSY).
+    let mut routes: Vec<RouteMessage> = handle
         .route()
         .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
-        .execute();
+        .execute()
+        .try_collect()
+        .await
+        .map_err(netlink_error("list the routes"))?;
     let v6 = handle
         .route()
         .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
         .execute();
-    let mut routes: Vec<RouteMessage> = v4
-        .try_collect()
-        .await
-        .map_err(netlink_error("list the routes"))?;
     routes.extend(
         v6.try_collect::<Vec<_>>()
             .await
