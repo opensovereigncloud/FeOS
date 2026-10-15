@@ -136,6 +136,7 @@ fn lab_sweep_collects_exactly_the_dead_pod() {
             epoch: 1,
             fc_version: "lab".into(),
             cpu_model: "lab".into(),
+            kernel_release: "lab".into(),
         });
         let head_key = disk_store::head::head_key(POD, 1);
         rt.block_on(async {

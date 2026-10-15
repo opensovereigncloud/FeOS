@@ -51,13 +51,23 @@ top      a sparse file: what the pod wrote since
   cache, fetched from the object store into it when missing, or zero.
   Writes go to the top. Discards and write-zeroes write zeroes into the
   top.
+- `ImportBase(path)` seals a raw image into an L0; an image whose name
+  ends in `.zst` is unpacked first, sparse, into `staging/`.
 - `StopDisk` stops the device and keeps the top. `OpenDisk(pod)` starts it
-  again over the same chain and top; `OpenDisk(pod, head_key)` starts it on
-  a node that has never seen the pod, from a head in the object store.
+  again over the same chain and top, or returns it if it runs;
+  `OpenDisk(pod, head_key)` starts it on a node that has no disk of the
+  pod, from a head in the object store, with a fresh top.
 - `Seal(pod, upload)`, on a stopped device, merges the top into the pod's
-  layer S and removes the top; with `upload`, it pushes the layer and the
-  pod's head. `Bake(pod)` seals the frozen top of a running device into a
-  layer on L0 and changes nothing about the pod.
+  layer S, points the device's row at it and then removes the top; with
+  `upload`, it pushes the chain. A disk without a top is sealed already,
+  and the seal returns its newest layer. `Bake(pod)` seals the frozen top
+  of a running device into a layer on L0 and changes nothing about the
+  pod.
+- `PutHead(pod, epoch, memory)` uploads the head of a checkpoint of a
+  sealed, stopped disk: its chain, how much of it is shared, its size,
+  and the memory the caller sealed and put beside it. It refuses a head
+  whose layers or vmstate are not in the bucket, and one that exists:
+  heads are never overwritten. `GetHead(key)` reads one.
 - `RemoveDevice` forgets a stopped pod.
 
 When diskd ends, its devices stay. The next diskd recovers every device in
@@ -91,7 +101,14 @@ The state directory belongs on a filesystem of its own, preferably XFS.
 |---|---|
 | `chunks/<hh>/<hash>.zst` | chunks, zstd |
 | `layers/<layer>.manifest` | layer manifests, uploaded after their chunks |
-| `snapshots/<pod>/<epoch>/head.json`, `…/vmstate` | a checkpoint: its head, last; the caller's own objects (`PutObject`) |
+| `snapshots/<pod>/<epoch>/head.json`, `…/vmstate`, `…/pod.pb` | a checkpoint: its head (`PutHead`), last; the caller's own objects (`PutObject`) |
+
+A head (`head.json`) names the disk's chain, L0 first, how many of its
+layers are shared (`shared_depth`; the rest, at most one, is the pod's
+own and the next seal replaces it), the disk's size and chunk size, the
+epoch, and, for a checkpoint with memory, the memory layer, the vmstate's
+key and what the snapshot pins: the Firecracker version, the CPU model and
+the host's kernel.
 
 `Sweep` deletes what the bucket holds that the live heads and layers it is
 given do not reach, and nothing younger than a day.

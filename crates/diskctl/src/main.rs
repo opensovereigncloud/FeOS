@@ -146,10 +146,43 @@ enum Cmd {
         #[arg(long = "layer")]
         layers: Vec<String>,
     },
+    /// Upload a checkpoint's head for a sealed, stopped disk, last.
+    PutHead {
+        pod_id: String,
+        #[arg(long)]
+        epoch: u64,
+        /// The memory layer (seal-file --upload); without, the disk alone.
+        #[arg(long)]
+        memory_layer: Option<String>,
+        /// The vmstate's key (put-object), with --memory-layer.
+        #[arg(long, requires = "memory_layer")]
+        vmstate_key: Option<String>,
+        #[arg(long, default_value = "")]
+        firecracker_version: String,
+        #[arg(long, default_value = "")]
+        cpu_model: String,
+        #[arg(long, default_value = "")]
+        kernel_release: String,
+    },
+    /// Read a head from the object store.
+    GetHead { key: String },
     /// Debug: dump a ublk device's kernel state.
     DevDump { dev_id: i32 },
     /// Debug: delete an orphaned (quiesced) ublk device.
     DevDel { dev_id: i32 },
+}
+
+fn head_json(h: &pb::Head) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "key": h.key, "pod_id": h.pod_id, "epoch": h.epoch,
+        "chain": h.chain, "logical_size": h.logical_size,
+        "memory": h.memory.as_ref().map(|m| serde_json::json!({
+            "layer": m.layer, "vmstate_key": m.vmstate_key,
+            "firecracker_version": m.firecracker_version,
+            "cpu_model": m.cpu_model, "kernel_release": m.kernel_release,
+        })),
+    }))
+    .unwrap_or_default()
 }
 
 async fn connect(sock: &str) -> Result<DiskServiceClient<tonic::transport::Channel>, String> {
@@ -332,6 +365,7 @@ async fn main() -> Result<(), String> {
                 .map_err(|e| e.message().to_string())?
                 .into_inner();
             serde_json::to_string_pretty(&serde_json::json!({
+                "object_store": s.object_store,
                 "cache_bytes": s.cache_bytes, "cache_entries": s.cache_entries,
                 "s3_puts": s.s3_puts, "s3_put_bytes": s.s3_put_bytes,
                 "s3_gets": s.s3_gets, "s3_get_bytes": s.s3_get_bytes,
@@ -405,6 +439,41 @@ async fn main() -> Result<(), String> {
                 "deleted_keys": r.deleted_keys,
             }))
             .map_err(|e| e.to_string())?
+        }
+        Cmd::PutHead {
+            pod_id,
+            epoch,
+            memory_layer,
+            vmstate_key,
+            firecracker_version,
+            cpu_model,
+            kernel_release,
+        } => {
+            let memory = memory_layer.map(|layer| pb::MemoryRef {
+                layer,
+                vmstate_key: vmstate_key.unwrap_or_default(),
+                firecracker_version,
+                cpu_model,
+                kernel_release,
+            });
+            let h = c!()
+                .put_head(pb::PutHeadRequest {
+                    pod_id,
+                    epoch,
+                    memory,
+                })
+                .await
+                .map_err(|e| format!("{}: {}", e.code(), e.message()))?
+                .into_inner();
+            head_json(&h)
+        }
+        Cmd::GetHead { key } => {
+            let h = c!()
+                .get_head(pb::GetHeadRequest { key })
+                .await
+                .map_err(|e| format!("{}: {}", e.code(), e.message()))?
+                .into_inner();
+            head_json(&h)
         }
         Cmd::DevDump { dev_id } => {
             let ctrl = libublk::ctrl::UblkCtrl::new_simple(dev_id).map_err(|e| e.to_string())?;

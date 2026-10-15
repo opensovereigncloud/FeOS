@@ -5,23 +5,26 @@ package feos.disk.v1;
 // diskd's API (ADR 0011), on a unix socket of the node. A pod's disk is a
 // chain of sealed, content-addressed layers and a mutable top, served as
 // /dev/ublkb<N>. Layers live in the node's chunk cache and, when S3 is
-// configured, in an object store. Internal: feosd will be its client,
-// diskctl is the one for development.
+// configured, in an object store. Internal: feosd is its client, diskctl
+// the one for development.
 service DiskService {
-  // Chunks a raw image file into a base layer, L0.
+  // Chunks a raw image file into a base layer, L0. A file whose name ends
+  // in .zst is a zstd-compressed image.
   rpc ImportBase(ImportBaseRequest) returns (Layer);
   // Starts a device for a pod over a chain and a fresh top, and links it
   // at <state>/live/<pod>/disk.
   rpc CreateDisk(CreateDiskRequest) returns (Device);
   // Starts the device of a pod whose disk this node has, or with head_key
-  // one whose head another node uploaded.
+  // one whose head another node uploaded. A device that is already
+  // started is returned as it is.
   rpc OpenDisk(OpenDiskRequest) returns (Device);
   // Stops the device and keeps its top.
   rpc StopDisk(StopDiskRequest) returns (Empty);
   // Seals a stopped pod's top into a new layer, merged with the pod's own
   // layer below it (flatten on seal): a pod's chain is its shared layers
-  // and at most one layer of its own. With upload, the chunks, the layer
-  // and then the pod's head go to S3.
+  // and at most one layer of its own. With upload, the chain's chunks and
+  // then its layers go to S3; PutHead names them. A disk without a top,
+  // sealed already, returns the newest layer of its chain.
   rpc Seal(SealRequest) returns (Layer);
   // Seals the frozen top of a running device into a layer on L0, for
   // other pods to start from. Nothing about the pod changes. Fails with
@@ -59,6 +62,14 @@ service DiskService {
   // chooses the key, e.g. snapshots/<pod>/<epoch>/vmstate.
   rpc PutObject(PutObjectRequest) returns (Empty);
   rpc GetObject(GetObjectRequest) returns (Empty);
+  // Uploads the head of a checkpoint of a pod whose disk is sealed and
+  // stopped: its chain and geometry, and the memory the caller sealed
+  // and put beside it, at snapshots/<pod>/<epoch>/head.json. A head is
+  // the last object of a checkpoint and names only what is uploaded
+  // already; it is never overwritten.
+  rpc PutHead(PutHeadRequest) returns (Head);
+  // Reads a head from the object store.
+  rpc GetHead(GetHeadRequest) returns (Head);
   // Serves a pod's guest memory from a memory layer, read through: diskd
   // binds a Firecracker UFFD backend socket and fills the guest's page
   // faults chunk by chunk from the cache and S3, so the microVM resumes
@@ -83,7 +94,7 @@ message GetObjectRequest {
 }
 
 message ImportBaseRequest {
-  // A raw image file on the node.
+  // A raw image file on the node, or a zstd-compressed one (*.zst).
   string path = 1;
   // 0 is the default, 64 KiB.
   uint32 chunk_size = 2;
@@ -221,6 +232,9 @@ message StatsResponse {
   uint64 s3_get_bytes = 7;
   // One per pod whose memory diskd serves.
   repeated MemoryStats memories = 8;
+  // Whether diskd has an object store: without one, it pushes and pulls
+  // nothing, and no pod hibernates on this node.
+  bool object_store = 9;
 }
 
 message FsckRequest {
@@ -319,3 +333,43 @@ message RemoveDeviceRequest {
   string pod_id = 1;
 }
 message RemoveDeviceResponse {}
+
+message PutHeadRequest {
+  string pod_id = 1;
+  // The checkpoint's epoch: the head goes to
+  // snapshots/<pod_id>/<epoch>/head.json, which must not exist yet.
+  uint64 epoch = 2;
+  // The pod's memory, if the checkpoint has it.
+  MemoryRef memory = 3;
+}
+
+message GetHeadRequest {
+  // The S3 key of a head.
+  string key = 1;
+}
+
+// The memory of a checkpoint, and what a restore of it needs of a node.
+message MemoryRef {
+  // The flat memory layer (SealFile), uploaded.
+  string layer = 1;
+  // The S3 key of the Firecracker vmstate (PutObject).
+  string vmstate_key = 2;
+  // What the snapshot was written with: the Firecracker version, the CPU
+  // model and the host's kernel. Firecracker loads it with the same only.
+  string firecracker_version = 3;
+  string cpu_model = 4;
+  string kernel_release = 5;
+}
+
+// A pod's checkpoint in the object store.
+message Head {
+  // Its S3 key.
+  string key = 1;
+  string pod_id = 2;
+  uint64 epoch = 3;
+  // The disk's layers, L0 first, all uploaded.
+  repeated string chain = 4;
+  uint64 logical_size = 5;
+  // Unset for a checkpoint of the disk alone.
+  MemoryRef memory = 6;
+}

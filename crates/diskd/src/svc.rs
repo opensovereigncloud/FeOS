@@ -11,8 +11,9 @@
 //! Beyond devices: `Bake` (live seal of a frozen top), flatten-on-seal as
 //! `Seal`'s default behaviour, `SealFile` (flat memory
 //! layers), `OpenDisk{head_key}` (restore from a foreign node's head),
-//! per-chunk upload markers + bounded-parallel S3 PUT/GET (`Push`,
-//! `Pull --warm`, miss hydration, materialize).
+//! `PutHead`/`GetHead` (a checkpoint's head, last), per-chunk upload
+//! markers + bounded-parallel S3 PUT/GET (`Push`, `Pull --warm`, miss
+//! hydration, materialize).
 
 #![allow(clippy::disallowed_types)] // control plane only — see module docs
 
@@ -492,24 +493,50 @@ impl DiskService for DiskSvc {
         let this = self.clone();
         let path = req.path.clone();
         let res = tokio::task::spawn_blocking(move || {
-            let md = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-            let logical = md.len();
-            let chunk_size = if req.chunk_size == 0 {
-                disk_store::chunk::DEFAULT_DISK_CHUNK_SIZE
-            } else {
-                req.chunk_size
+            // A compressed image is unpacked first, sparse, next to the
+            // cache: the seal walks the image's data extents only.
+            let unpacked = path.ends_with(".zst").then(|| {
+                static IMPORTS: AtomicU64 = AtomicU64::new(0);
+                this.state_dir.join("staging").join(format!(
+                    "import-{}-{}.img",
+                    std::process::id(),
+                    IMPORTS.fetch_add(1, Ordering::Relaxed)
+                ))
+            });
+            let image = match &unpacked {
+                Some(raw) => {
+                    std::fs::create_dir_all(this.state_dir.join("staging"))
+                        .map_err(|e| e.to_string())?;
+                    disk_store::materialize::unpack_zstd(std::path::Path::new(&path), raw)
+                        .map_err(|e| format!("unpack {path}: {e}"))?;
+                    raw.clone()
+                }
+                None => PathBuf::from(&path),
             };
-            disk_store::seal::seal_top(
-                std::path::Path::new(&path),
-                &[],
-                None,
-                &this.cache,
-                &this.state_dir,
-                logical,
-                chunk_size,
-                None,
-            )
-            .map_err(|e| e.to_string())
+            let sealed = (|| {
+                let md = std::fs::metadata(&image).map_err(|e| e.to_string())?;
+                let logical = md.len();
+                let chunk_size = if req.chunk_size == 0 {
+                    disk_store::chunk::DEFAULT_DISK_CHUNK_SIZE
+                } else {
+                    req.chunk_size
+                };
+                disk_store::seal::seal_top(
+                    &image,
+                    &[],
+                    None,
+                    &this.cache,
+                    &this.state_dir,
+                    logical,
+                    chunk_size,
+                    None,
+                )
+                .map_err(|e| e.to_string())
+            })();
+            if let Some(raw) = &unpacked {
+                let _ = std::fs::remove_file(raw);
+            }
+            sealed
         })
         .await
         .map_err(internal)?
@@ -576,13 +603,24 @@ impl DiskService for DiskSvc {
     ) -> Result<Response<pb::Device>, Status> {
         let req = request.into_inner();
         let (pod_id, row) = if req.head_key.is_empty() {
-            if self
+            // Started already: its caller lost the answer, or never knew.
+            let live = self
                 .devices
                 .lock()
                 .map_err(|_| internal("poisoned"))?
-                .contains_key(&req.pod_id)
-            {
-                return Err(Status::already_exists(req.pod_id));
+                .get(&req.pod_id)
+                .map(|d| d.bdev.clone());
+            if let Some(bdev) = live {
+                let st = State::load(&self.state_dir).map_err(internal)?;
+                return Ok(Response::new(pb::Device {
+                    dev_path: bdev.display().to_string(),
+                    link_path: self.link_path(&req.pod_id).display().to_string(),
+                    size_bytes: st
+                        .devices
+                        .get(&req.pod_id)
+                        .map_or(0, |row| row.logical_size),
+                    pod_id: req.pod_id,
+                }));
             }
             let st = State::load(&self.state_dir).map_err(internal)?;
             let row = st
@@ -622,16 +660,29 @@ impl DiskService for DiskSvc {
             {
                 return Err(Status::already_exists(head.pod_id));
             }
+            // A disk the node has of the pod may hold writes the head does
+            // not: its top would end up over another chain.
+            if State::load(&self.state_dir)
+                .map_err(internal)?
+                .devices
+                .contains_key(&head.pod_id)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "this node has a disk of pod {} already: remove it first",
+                    head.pod_id
+                )));
+            }
             self.ensure_manifests(chain_head).await.map_err(internal)?;
-            // The whole restored chain is shared/immutable; restores
-            // never flatten below this depth.
+            // The pod's own layer stays its own, so that the next seal
+            // replaces it and the chain keeps its shape; a head that does
+            // not say which it is holds the whole chain as shared.
             let row = DeviceRow {
                 dev_id: None,
                 chain: head.chain.clone(),
                 logical_size: head.logical_size,
                 chunk_size: head.chunk_size,
                 has_top: true,
-                shared_depth: head.chain.len(),
+                shared_depth: head.shared_depth(),
             };
             (head.pod_id.clone(), row)
         };
@@ -721,6 +772,9 @@ impl DiskService for DiskSvc {
                 "device still live; stop_disk first",
             ));
         }
+        if req.upload && self.s3.is_none() {
+            return Err(Status::failed_precondition("S3 not configured"));
+        }
         let this = self.clone();
         let pod = req.pod_id.clone();
         let pod_log = pod.clone();
@@ -753,7 +807,17 @@ impl DiskService for DiskSvc {
                 let parents: Vec<&disk_store::Manifest> = chain.iter().collect();
                 let top = this.top_path(&pod);
                 if !top.is_file() {
-                    return Err("no mutable top; nothing to seal".into());
+                    // Sealed already, by a seal whose caller lost the
+                    // answer: the row names the newest layer, and the top
+                    // goes only after it does (below).
+                    let newest = row.chain.last().ok_or("empty chain")?;
+                    let manifest = this.load_layer(newest)?;
+                    return Ok(disk_store::seal::SealOutcome {
+                        layer_id: manifest.layer_id(),
+                        manifest_path: this.layer_path(newest),
+                        manifest,
+                        stats: Default::default(),
+                    });
                 }
                 let outcome = disk_store::seal::seal_top(
                     &top,
@@ -767,9 +831,9 @@ impl DiskService for DiskSvc {
                 )
                 .map_err(|e| e.to_string())?;
                 // Commit order: seal_top already committed chunks+manifest;
-                // now the top is redundant — delete it and point the row
-                // at shared… + S'.
-                std::fs::remove_file(&top).map_err(|e| e.to_string())?;
+                // now point the row at shared… + S', and then delete the
+                // top, which S' holds. A crash in between leaves a top
+                // over S' that reads as S' does.
                 let new_id = outcome.layer_id.hex();
                 let old_private: Option<String> = if row.chain.len() > depth {
                     row.chain.last().cloned()
@@ -789,6 +853,7 @@ impl DiskService for DiskSvc {
                     row2.chain.clone()
                 };
                 State::store(&this.state_dir, &st2).map_err(|e| e.to_string())?;
+                std::fs::remove_file(&top).map_err(|e| e.to_string())?;
                 // head.json is committed after the row (proto contract);
                 // existing memory refs survive a disk-only seal.
                 let mut head = disk_store::head::PodHead::load(&this.state_dir, &pod)
@@ -801,6 +866,7 @@ impl DiskService for DiskSvc {
                         )
                     });
                 head.chain = new_chain;
+                head.shared_depth = Some(depth.max(1));
                 head.has_top = false;
                 head.store(&this.state_dir).map_err(|e| e.to_string())?;
                 // The replaced private layer is local garbage the moment
@@ -923,6 +989,9 @@ impl DiskService for DiskSvc {
         let req = request.into_inner();
         if req.path.is_empty() {
             return Err(Status::invalid_argument("path required"));
+        }
+        if req.upload && self.s3.is_none() {
+            return Err(Status::failed_precondition("S3 not configured"));
         }
         let chunk_size = if req.chunk_size == 0 {
             disk_store::chunk::DEFAULT_MEM_CHUNK_SIZE
@@ -1098,6 +1167,7 @@ impl DiskService for DiskSvc {
             s3_gets: 0,
             s3_get_bytes: 0,
             memories: Vec::new(),
+            object_store: self.s3.is_some(),
         };
         if let Ok(st) = self.cache.stats() {
             out.cache_bytes = st.bytes;
@@ -1544,6 +1614,135 @@ impl DiskService for DiskSvc {
             .and_then(|_| std::fs::rename(&tmp, &req.path))
             .map_err(|e| Status::internal(format!("write {}: {e}", req.path)))?;
         Ok(Response::new(pb::Empty {}))
+    }
+
+    // The head is a checkpoint's last object (ADR 0011's commit order):
+    // it names the disk's chain as this node's row has it after a seal,
+    // and the memory the caller sealed and put beside it. Every layer it
+    // names must be in the bucket before it is, so that a head in the
+    // bucket is always whole.
+    async fn put_head(
+        &self,
+        request: Request<pb::PutHeadRequest>,
+    ) -> Result<Response<pb::Head>, Status> {
+        let req = request.into_inner();
+        let s3 = self
+            .s3
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("S3 not configured"))?;
+        if req.pod_id.is_empty() || req.epoch == 0 {
+            return Err(Status::invalid_argument("pod_id and an epoch are required"));
+        }
+        if self
+            .devices
+            .lock()
+            .map_err(|_| internal("poisoned"))?
+            .contains_key(&req.pod_id)
+        {
+            return Err(Status::failed_precondition(
+                "device still live; stop and seal it first",
+            ));
+        }
+        let row = State::load(&self.state_dir)
+            .map_err(internal)?
+            .devices
+            .get(&req.pod_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found(format!("no disk of pod {}", req.pod_id)))?;
+        if self.top_path(&req.pod_id).is_file() {
+            return Err(Status::failed_precondition(
+                "the disk has writes that are not sealed; seal it first",
+            ));
+        }
+        let mut head = disk_store::head::PodHead::new(
+            &req.pod_id,
+            row.logical_size,
+            row.chunk_size,
+            row.chain.clone(),
+        );
+        head.shared_depth = Some(row.shared_depth.clamp(1, row.chain.len().max(1)));
+        head.epoch = req.epoch;
+        head.memory = req.memory.map(|m| disk_store::head::MemoryRef {
+            layer: m.layer,
+            vmstate_key: m.vmstate_key,
+            epoch: req.epoch,
+            fc_version: m.firecracker_version,
+            cpu_model: m.cpu_model,
+            kernel_release: m.kernel_release,
+        });
+        head.validate()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        let mut layers = head.chain.clone();
+        layers.extend(head.memory.as_ref().map(|m| m.layer.clone()));
+        for id in &layers {
+            let lid = disk_store::manifest::LayerId::from_hex(id)
+                .map_err(|e| Status::invalid_argument(format!("layer {id}: {e}")))?;
+            if !s3.has_manifest(&lid).await {
+                return Err(Status::failed_precondition(format!(
+                    "layer {id} is not in the object store; push it first"
+                )));
+            }
+        }
+        if let Some(m) = &head.memory
+            && !s3.has_object(&m.vmstate_key).await
+        {
+            return Err(Status::failed_precondition(format!(
+                "{} is not in the object store",
+                m.vmstate_key
+            )));
+        }
+        let key = disk_store::head::head_key(&req.pod_id, req.epoch);
+        if s3.has_object(&key).await {
+            return Err(Status::already_exists(format!(
+                "{key} exists: a head is never overwritten"
+            )));
+        }
+        head.stamp();
+        let buf = head.encode().map_err(internal)?;
+        s3.put_object(&key, buf).await.map_err(internal)?;
+        info!(pod = %req.pod_id, key = %key, memory = head.memory.is_some(), "put_head");
+        Ok(Response::new(head_message(key, head)))
+    }
+
+    async fn get_head(
+        &self,
+        request: Request<pb::GetHeadRequest>,
+    ) -> Result<Response<pb::Head>, Status> {
+        let key = request.into_inner().key;
+        let s3 = self
+            .s3
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("S3 not configured"))?;
+        let buf = s3
+            .find_object(&key)
+            .await
+            .map_err(|e| internal(format!("head {key}: {e}")))?
+            .ok_or_else(|| Status::not_found(format!("no head {key}")))?;
+        let head = disk_store::head::PodHead::decode(&buf)
+            .map_err(|e| Status::invalid_argument(format!("head {key}: {e}")))?;
+        Ok(Response::new(head_message(key, head)))
+    }
+}
+
+/// A head as the API shows it.
+fn head_message(key: String, head: disk_store::head::PodHead) -> pb::Head {
+    pb::Head {
+        key,
+        epoch: head
+            .memory
+            .as_ref()
+            .map_or(head.epoch, |m| head.epoch.max(m.epoch)),
+        pod_id: head.pod_id,
+        chain: head.chain,
+        logical_size: head.logical_size,
+        memory: head.memory.map(|m| pb::MemoryRef {
+            layer: m.layer,
+            vmstate_key: m.vmstate_key,
+            firecracker_version: m.fc_version,
+            cpu_model: m.cpu_model,
+            kernel_release: m.kernel_release,
+        }),
     }
 }
 

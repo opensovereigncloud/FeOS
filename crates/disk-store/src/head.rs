@@ -28,6 +28,10 @@ pub struct MemoryRef {
     /// (`snapshot/load` refuses otherwise).
     pub fc_version: String,
     pub cpu_model: String,
+    /// The host kernel whose KVM saved the vCPUs; empty in heads from
+    /// before it was recorded.
+    #[serde(default)]
+    pub kernel_release: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,8 +43,18 @@ pub struct PodHead {
     /// Ordered layer chain, L0 first. The newest entry is the layer the
     /// mutable top (if any) builds on.
     pub chain: Vec<String>,
+    /// How many leading layers of the chain are shared; the rest, at most
+    /// one, is the pod's own, which the next seal replaces. A restore
+    /// keeps it, so that the chain does not grow by a layer per node it
+    /// passes. Heads from before it was recorded hold the whole chain as
+    /// shared.
+    #[serde(default)]
+    pub shared_depth: Option<usize>,
     /// Whether `live/<id>/top.img` currently exists (dirty mutable layer).
     pub has_top: bool,
+    /// The checkpoint's epoch, as in its key; 0 in a node's local head.
+    #[serde(default)]
+    pub epoch: u64,
     /// Memory checkpoint refs (ADR 0011).
     #[serde(default)]
     pub memory: Option<MemoryRef>,
@@ -73,10 +87,20 @@ impl PodHead {
             logical_size,
             chunk_size,
             chain,
+            shared_depth: None,
             has_top: false,
+            epoch: 0,
             memory: None,
             updated_at: String::new(),
         }
+    }
+
+    /// How many leading layers of the chain are shared: what the head
+    /// says, and the whole chain for a head that does not say.
+    pub fn shared_depth(&self) -> usize {
+        self.shared_depth
+            .unwrap_or(self.chain.len())
+            .min(self.chain.len())
     }
 
     pub fn path(state_dir: &Path, pod_id: &str) -> PathBuf {
@@ -121,6 +145,16 @@ impl PodHead {
                 self.pod_id, self.logical_size, self.chunk_size
             )));
         }
+        // L0 is always shared: a seal must never merge it away.
+        if let Some(depth) = self.shared_depth
+            && (depth == 0 || depth > self.chain.len())
+        {
+            return Err(Error::Head(format!(
+                "head.json for {}: {depth} shared layers of a chain of {}",
+                self.pod_id,
+                self.chain.len()
+            )));
+        }
         Ok(())
     }
 
@@ -128,10 +162,15 @@ impl PodHead {
         serde_json::to_vec_pretty(self).map_err(|e| Error::Head(e.to_string()))
     }
 
+    /// Records that the head changes now.
+    pub fn stamp(&mut self) {
+        self.updated_at = now_rfc3339();
+    }
+
     /// Atomic commit: tmp file, fsync, rename, dir fsync. This is the
     /// last write of every seal/pause sequence.
     pub fn store(&mut self, state_dir: &Path) -> Result<()> {
-        self.updated_at = now_rfc3339();
+        self.stamp();
         let p = Self::path(state_dir, &self.pod_id);
         if let Some(dir) = p.parent() {
             fs::create_dir_all(dir)?;
@@ -186,5 +225,28 @@ mod tests {
         let back = PodHead::decode(&buf).expect("round-trip");
         assert_eq!(back.logical_size, 1 << 30);
         assert_eq!(back.chunk_size, 1 << 16);
+    }
+
+    #[test]
+    fn a_head_keeps_which_layer_is_the_pods_own() {
+        let mut h = PodHead::new("sb", 1 << 30, 1 << 16, vec!["aa".into(), "bb".into()]);
+        // A head from before shared_depth: the whole chain is shared.
+        assert_eq!(h.shared_depth(), 2);
+        h.shared_depth = Some(1);
+        h.epoch = 7;
+        let back = PodHead::decode(&h.encode().unwrap()).unwrap();
+        assert_eq!((back.shared_depth(), back.epoch), (1, 7));
+        h.shared_depth = Some(0);
+        PodHead::decode(&h.encode().unwrap()).expect_err("L0 is never the pod's own");
+        h.shared_depth = Some(3);
+        PodHead::decode(&h.encode().unwrap()).expect_err("deeper than the chain");
+        // Old heads decode, without the new fields.
+        let old = br#"{"version":1,"pod_id":"sb","logical_size":1024,"chunk_size":65536,
+            "chain":["aa"],"has_top":false,"updated_at":"",
+            "memory":{"layer":"cc","vmstate_key":"k","epoch":1,"fc_version":"1.17.0",
+            "cpu_model":"x"}}"#;
+        let old = PodHead::decode(old).unwrap();
+        assert_eq!(old.shared_depth(), 1);
+        assert_eq!(old.memory.unwrap().kernel_release, "");
     }
 }

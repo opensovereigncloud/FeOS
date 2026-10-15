@@ -142,6 +142,23 @@ impl S3 {
         Ok(())
     }
 
+    /// Whether an object exists at `key` (relative to the client prefix).
+    pub async fn has_object(&self, key: &str) -> bool {
+        self.store
+            .head(&ObjPath::from(format!("{}{}", self.prefix, key)))
+            .await
+            .is_ok()
+    }
+
+    /// `get_object`, with None where there is no object.
+    pub async fn find_object(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        match self.get_object(key).await {
+            Ok(buf) => Ok(Some(buf)),
+            Err(_) if !self.has_object(key).await => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Raw object read at `key` (relative to the client prefix).
     pub async fn get_object(&self, key: &str) -> Result<Vec<u8>> {
         let r = self
