@@ -99,6 +99,22 @@ pub struct CreatePodOptions {
     #[arg(long, help = "No network: the pod can pull no image then")]
     no_network: bool,
 
+    #[arg(
+        long = "security-group",
+        value_name = "ID",
+        conflicts_with = "no_network",
+        help = "A security group of the pod (repeatable); without, the node's default group: out to the internet, nothing in"
+    )]
+    security_groups: Vec<String>,
+
+    #[arg(
+        long = "dns-upstream",
+        value_name = "ADDRESS",
+        conflicts_with = "no_network",
+        help = "A resolver the node's resolver asks for the pod (repeatable); the node's when not given"
+    )]
+    dns_upstreams: Vec<String>,
+
     #[arg(long, help = "Wait until the pod runs")]
     wait: bool,
 
@@ -179,10 +195,20 @@ pub async fn handle_pod_command(args: PodArgs) -> Result<()> {
 }
 
 fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
-    let network = opts.no_network.then_some(PodNetwork {
-        none: true,
-        ..Default::default()
-    });
+    let network = if opts.no_network {
+        Some(PodNetwork {
+            none: true,
+            ..Default::default()
+        })
+    } else if !opts.security_groups.is_empty() || !opts.dns_upstreams.is_empty() {
+        Some(PodNetwork {
+            security_groups: opts.security_groups,
+            dns_upstreams: opts.dns_upstreams,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
     CreatePodRequest {
         pod_id: opts
             .pod_id
@@ -308,9 +334,20 @@ fn print_pod(pod: &PodInfo) {
             }
         );
     }
-    match pod.ipv4_address.as_str() {
-        "" => println!("  Network: none"),
+    let network = spec.network.clone().unwrap_or_default();
+    match pod.ipv6_address.as_str() {
+        _ if network.none => println!("  Network: none"),
+        "" => println!("  Address: none yet"),
         address => println!("  Address: {address}"),
+    }
+    if !pod.ipv4_address.is_empty() {
+        println!("  NAT64 address: {}", pod.ipv4_address);
+    }
+    if !network.security_groups.is_empty() {
+        println!("  Security groups: {}", network.security_groups.join(", "));
+    }
+    if !network.dns_upstreams.is_empty() {
+        println!("  DNS upstreams: {}", network.dns_upstreams.join(", "));
     }
     for (key, value) in &spec.labels {
         println!("  Label: {key}={value}");
@@ -499,6 +536,32 @@ mod tests {
             .containers
             .is_empty());
         assert!(Cli::try_parse_from(["pod", "create", "--", "sleep"]).is_err());
+    }
+
+    #[test]
+    fn a_pod_names_its_groups_and_resolvers() {
+        let cli = Cli::try_parse_from([
+            "pod",
+            "create",
+            "--security-group",
+            "web",
+            "--security-group",
+            "db",
+            "--dns-upstream",
+            "2620:fe::fe",
+        ])
+        .unwrap();
+        let PodCommand::Create(opts) = cli.command else {
+            panic!("not a create");
+        };
+        let network = create_pod_request(*opts).spec.unwrap().network.unwrap();
+        assert_eq!(network.security_groups, ["web", "db"]);
+        assert_eq!(network.dns_upstreams, ["2620:fe::fe"]);
+        assert!(!network.none);
+        assert!(
+            Cli::try_parse_from(["pod", "create", "--no-network", "--security-group", "web"])
+                .is_err()
+        );
     }
 
     #[test]
