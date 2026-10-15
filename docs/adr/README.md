@@ -19,8 +19,10 @@ the ADRs say why it works that way.
 | [0007](0007-guest.md) | Guest | `feos-guest`: vsock, configuration pushed by the host, the API mapping, libcontainer in its own process | Accepted | partly: guest RPCs still in `HostService` |
 | [0008](0008-suspend-and-restore.md) | Node | Balloon with free page reporting, full snapshots, two-step restore, version pinning | Accepted | yes |
 | [0009](0009-node-os-and-packages.md) | Operations | Debian and Garden Linux first, `.deb` packages, Firecracker side by side, `feosd` under systemd | Proposed | partly: the packages, the unit and the apt repository; no Garden Linux feature, no release workflow |
-| [0010](0010-pod-network.md) | Node | `feosd` gives every pod its network: a bridge of isolated ports, an address of `10.200.0.0/16`, NAT, nftables rules that keep pods from each other, the node and private networks and pin their addresses | Proposed | yes; no egress exceptions, ingress or traffic observation |
+| [0010](0010-pod-network.md) | Node | `feosd` gives every pod its network: IPv6 only, an address of a prefix routed to the node, a routed TAP per pod pinned to its address, NAT64 on the node (eBPF) or in the network, DNS64 in `feosd`, prefixes no pod reaches | Proposed | no: `feosd` builds the first version's IPv4 bridge with NAT and a fixed deny list |
 | [0011](0011-disk-daemon.md) | Node | `diskd`: a pod's disk as a ublk device over a chain of sealed, content-addressed layers and a sparse top, cached locally and tiered to S3 | Proposed | partly: the daemon, its store, `diskctl` and the labs; not wired to pods, not packaged |
+| [0012](0012-security-groups.md) | Node | Security groups: stateful rules that only allow, without order, peers as address blocks with exceptions or as other groups; the control plane sends each node its groups whole or as deltas, with a version per group; nftables enforces them | Proposed | no |
+| [0013](0013-traffic-records.md) | Node | `feosd` records the pods' traffic: flows from connection tracking, drops, DNS from its resolver, server names from copies of a connection's first packets; no eBPF, nothing in the data path | Proposed | no |
 
 ## Rules
 

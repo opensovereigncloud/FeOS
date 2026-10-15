@@ -70,8 +70,9 @@ usually changes both sides at once. They live in one repository (ADR 0002).
 ### Requirements
 
 1. **Isolation.** The VM is the boundary between tenants. No control
-   surface is reachable without authentication; pods do not see each
-   other; no credential enters a pod.
+   surface is reachable without authentication; pods reach each other
+   only where a security group allows it (ADR 0012); no credential
+   enters a pod.
 2. **Cheap suspend.** Suspending is frequent: it writes what changed, not
    the whole memory.
 3. **Fast resume.** Under a second to the first instruction. Memory and
@@ -94,10 +95,10 @@ usually changes both sides at once. They live in one repository (ADR 0002).
 
 CaaS needs what the sandboxes ruled out for themselves:
 
-- **Inbound traffic.** Sandboxes take none, except through the control
-  plane's front door to their ports. Services must be reachable: is HTTP
-  through a central front door enough, or do services need L4 and
-  addresses of their own?
+- **Inbound traffic.** Every pod has an IPv6 address of its own, which
+  its security groups open or keep closed (ADR 0010, ADR 0012). What
+  stands in front of services is open: load balancers for HTTPS with
+  ACME and for L4, and the way in for IPv4 clients.
 - **What a service's pod needs** beyond ADR 0004 (restarts, health
   checks, jobs, credentials): persistent volumes and images from private
   registries (the sandboxes pull public images only).
