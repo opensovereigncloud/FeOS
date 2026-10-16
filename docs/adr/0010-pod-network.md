@@ -229,7 +229,10 @@ from node to node would need a route per pod, changed with every move.
   cannot be reached from outside; listeners bind to `[::]`.
 - A pod's connections do not survive a resume on another node.
 - Every node needs a prefix routed to it, and IPv4 of its own, through
-  which its pods leave.
+  which its pods leave. A node whose operating system is FeOS takes its
+  IPv4 by DHCPv4, as a distribution does, and its prefix by DHCPv6
+  delegation or, where it is routed statically, from the kernel's
+  command line.
 - `PodInfo` carries the pod's IPv6 and IPv4 addresses; the network in
   `PodSpec` names upstream resolvers and security groups, and `PodSpec`
   carries the pod's metadata. The guest's network configuration has

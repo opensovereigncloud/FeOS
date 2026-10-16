@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::dhcpv6::*;
+use super::{dhcpv4, resolv};
 use futures::stream::TryStreamExt;
 use log::{error, info, warn};
 use rtnetlink::new_connection;
+use rtnetlink::packet_route::address::{AddressAttribute, AddressScope};
 use rtnetlink::packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use rtnetlink::packet_route::route::RouteType;
 use std::fs::File;
@@ -16,6 +18,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, Duration};
 
 pub const INTERFACE_NAME: &str = "eth0";
+/// How long DHCPv6 may take: without a server, the node goes on without
+/// its address and prefix.
+const DHCPV6_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn configure_sriov(num_vfs: u32) -> Result<(), String> {
     let base_path = format!("/sys/class/net/{INTERFACE_NAME}/device");
@@ -151,6 +156,12 @@ pub async fn configure_network_devices() -> Result<Option<(Ipv6Addr, u8, Vec<Ipv
     tokio::spawn(connection);
 
     enable_ipv6_forwarding().map_err(|e| format!("Failed to enable ipv6 forwarding: {e}"))?;
+    // The node forwards, and takes router advertisements on its uplink
+    // still: the router's default route, and an address by SLAAC where the
+    // router offers one.
+    if let Err(e) = accept_router_advertisements(&interface_name) {
+        warn!("{interface_name} takes no router advertisements: {e}");
+    }
 
     let mut link_ts = handle
         .link()
@@ -177,10 +188,12 @@ pub async fn configure_network_devices() -> Result<Option<(Ipv6Addr, u8, Vec<Ipv
         .map_err(|e| format!("{interface_name} can not be set up: {e}"))?;
 
     info!("{interface_name}:");
+    let mut mac = None;
     for attr in link.attributes {
         match attr {
             LinkAttribute::Address(mac_bytes) => {
                 info!("  mac: {}", format_mac(mac_bytes.clone()));
+                mac = Some(mac_bytes);
             }
             LinkAttribute::Carrier(carrier) => {
                 info!("  carrier: {carrier}");
@@ -192,6 +205,19 @@ pub async fn configure_network_devices() -> Result<Option<(Ipv6Addr, u8, Vec<Ipv
         }
     }
 
+    // IPv4 beside IPv6, for as long as the node runs.
+    match mac.filter(|mac| mac.len() == 6) {
+        Some(mac) => {
+            tokio::spawn(dhcpv4::run(
+                handle.clone(),
+                interface_name.clone(),
+                link.header.index,
+                mac,
+            ));
+        }
+        None => warn!("{interface_name} has no MAC address: no DHCPv4"),
+    }
+
     // Router discovery blocks on a raw socket; keep it off the async workers.
     let ra_interface = interface_name.clone();
     let ra_gateway =
@@ -200,8 +226,15 @@ pub async fn configure_network_devices() -> Result<Option<(Ipv6Addr, u8, Vec<Ipv
             .map_err(|e| format!("Router discovery failed: {e}"))?;
     if let Some(ipv6_gateway) = ra_gateway {
         sleep(Duration::from_secs(4)).await;
-        match run_dhcpv6_client(interface_name.clone()).await {
+        let dhcpv6 =
+            tokio::time::timeout(DHCPV6_TIMEOUT, run_dhcpv6_client(interface_name.clone()))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!("no answer within {}s", DHCPV6_TIMEOUT.as_secs()).into())
+                });
+        match dhcpv6 {
             Ok(result) => {
+                resolv::set_ipv6(&result.dns_servers);
                 send_neigh_solicitation(interface_name.clone(), &ipv6_gateway, &result.address);
                 if let Some(prefix_info) = result.prefix {
                     let delegated_prefix = prefix_info.prefix;
@@ -227,20 +260,72 @@ pub async fn configure_network_devices() -> Result<Option<(Ipv6Addr, u8, Vec<Ipv
                     info!("No prefix delegation received.");
                 }
                 info!("Setting IPv6 gateway to {ipv6_gateway} on interface {interface_name}");
-                if let Err(e) = set_ipv6_gateway(&handle, &interface_name, ipv6_gateway).await {
-                    warn!("Failed to set IPv6 gateway: {e}");
+                match set_ipv6_gateway(&handle, &interface_name, ipv6_gateway).await {
+                    Ok(()) => {}
+                    // The router's advertisement routed by it already.
+                    Err(rtnetlink::Error::NetlinkError(e)) if -e.raw_code() == libc::EEXIST => {}
+                    Err(e) => warn!("Failed to set IPv6 gateway: {e}"),
                 }
             }
             Err(e) => warn!("Error running DHCPv6 client: {e}"),
         }
     }
 
+    log_addresses(&handle, &interface_name, link.header.index).await;
     Ok(result_option)
 }
 
 pub fn enable_ipv6_forwarding() -> Result<(), std::io::Error> {
     File::create("/proc/sys/net/ipv6/conf/all/forwarding")?.write_all(b"1")?;
     Ok(())
+}
+
+/// Logs the interface's addresses, of both families, but link-local ones.
+async fn log_addresses(handle: &rtnetlink::Handle, interface_name: &str, index: u32) {
+    let messages: Vec<_> = match handle
+        .address()
+        .get()
+        .set_link_index_filter(index)
+        .execute()
+        .try_collect()
+        .await
+    {
+        Ok(messages) => messages,
+        Err(e) => {
+            warn!("Failed to list {interface_name}'s addresses: {e}");
+            return;
+        }
+    };
+    let addresses: Vec<String> = messages
+        .iter()
+        .filter(|message| {
+            !matches!(
+                message.header.scope,
+                AddressScope::Link | AddressScope::Host
+            )
+        })
+        .filter_map(|message| {
+            message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    AddressAttribute::Address(address) => {
+                        Some(format!("{address}/{}", message.header.prefix_len))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    info!("{interface_name}'s addresses: {}", addresses.join(", "));
+}
+
+/// Lets the interface take router advertisements although the node
+/// forwards (accept_ra 2).
+fn accept_router_advertisements(interface_name: &str) -> Result<(), std::io::Error> {
+    File::create(format!(
+        "/proc/sys/net/ipv6/conf/{interface_name}/accept_ra"
+    ))?
+    .write_all(b"2")
 }
 
 fn format_mac(bytes: Vec<u8>) -> String {

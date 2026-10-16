@@ -5,7 +5,7 @@ This guide explains how to set up a development environment on a Linux host to r
 The setup involves four key services running on the host and serving the main FeOS VM running on the `vm-br0` bridge:
 1.  **radvd**: Provides IPv6 router advertisements for stateful address configuration.
 2.  **DHCPv6 Server**: Assigns a stateful IPv6 address to the FeOS VM.
-3.  **dnsmasq**: A DNS server that redirects OCI registry requests to a local mirror.
+3.  **dnsmasq**: Assigns the FeOS VM an IPv4 address by DHCPv4, which its pods leave through, and is a DNS server that redirects OCI registry requests to a local mirror.
 4.  **OCI Mirror**: A local pull-through registry cache to serve container images.
 
 ## 1. Prerequisites
@@ -154,7 +154,7 @@ The `radvd` service, with the `AdvManagedFlag` set, instructs clients to contact
         prefix6 2001:db8:0:100:: 2001:db8:0:1ff:: /64;
     
         # Provide DNS servers to clients in this subnet
-        option dhcp6.name-servers 2001:4860:4860::6464;
+        option dhcp6.name-servers 2001:4860:4860::8888;
     }
     ```
 
@@ -163,9 +163,9 @@ The `radvd` service, with the `AdvManagedFlag` set, instructs clients to contact
     sudo /usr/sbin/dhcpd -6 -q -cf ./dhcpd6.conf vm-br0
     ```
 
-### DNS Setup (dnsmasq)
+### DHCPv4 and DNS Setup (dnsmasq)
 
-This `dnsmasq` instance will act as a DNS server on the `vm-br0` bridge. Its primary role is to intercept DNS queries for `ghcr.io` and return the IP address of our local OCI mirror. All other queries are forwarded to public DNS servers.
+This `dnsmasq` instance gives the FeOS VM its IPv4 address on the `vm-br0` bridge, which `make network` gives `169.254.42.1/24`: a node needs IPv4 of its own, through which its pods' IPv4 leaves (ADR 0010). It also acts as a DNS server on the bridge. Its other role is to intercept DNS queries for `ghcr.io` and return the IP address of our local OCI mirror. All other queries are forwarded to public DNS servers.
 
 1.  Create a configuration file named `dnsmasq.conf`:
     ```
@@ -187,11 +187,22 @@ This `dnsmasq` instance will act as a DNS server on the `vm-br0` bridge. Its pri
     # Forward all other DNS requests to public DNS servers
     server=2001:4860:4860::8888
     server=2606:4700:4700::1111
+
+    # IPv4 for the FeOS VM, with this host as its router and resolver
+    dhcp-range=169.254.42.10,169.254.42.100,255.255.255.0,12h
+    dhcp-option=option:router,169.254.42.1
+    dhcp-option=option:dns-server,169.254.42.1
     ```
 
 2.  Run `dnsmasq`:
     ```bash
     sudo dnsmasq --no-daemon --log-queries --conf-file=./dnsmasq.conf
+    ```
+
+3.  Let the FeOS VM's IPv4 leave through this host:
+    ```bash
+    sudo sysctl -w net.ipv4.ip_forward=1
+    sudo iptables -t nat -A POSTROUTING -s 169.254.42.0/24 ! -o vm-br0 -j MASQUERADE
     ```
 
 ### OCI Mirror Setup

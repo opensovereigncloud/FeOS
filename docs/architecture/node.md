@@ -33,16 +33,32 @@ Parts that are decided but not built are marked as such.
 
 `feos-host-init` moves its root off the initramfs, mounts `/proc`, `/sys`,
 `/dev`, `/dev/pts`, `/run`, a tmpfs at `/var/lib/feos` and the cgroup
-filesystem, configures SR-IOV VFs, configures the network
-from router advertisements and DHCPv6, and keeps the clock with NTP from
-the servers DHCPv6 names. It takes Ctrl-Alt-Del over (a SIGINT makes it
+filesystem, configures SR-IOV VFs, and configures the uplink `eth0`:
+
+- **IPv6** from router advertisements, which the uplink takes although
+  the node forwards (`accept_ra` 2): the router's default route, and an
+  address by SLAAC where the router offers one; and from DHCPv6, which
+  gets 30 seconds: an address, a delegated prefix, resolvers and NTP
+  servers.
+- **IPv4** from DHCPv4: the lease's address and prefix, a default route by
+  its router (on the link if outside the prefix), and resolvers. The
+  client renews the lease at T1 and rebinds at T2 for as long as the node
+  runs, and asks again, without end, where no server answers or a lease
+  ends.
+
+The resolvers DHCPv4 and DHCPv6 name, of both families in turn, replace
+`/etc/resolv.conf`; until one names any, the initramfs's stay (Google's
+and Cloudflare's). It keeps the clock with NTP from the servers DHCPv6
+names. It takes Ctrl-Alt-Del over (a SIGINT makes it
 sync and reboot), reboots on `SIGRTMIN+5` and powers off on `SIGRTMIN+4`,
 reaps orphans, runs `/usr/sbin/diskd --state-dir /var/lib/feos/disk`
 without an object store, and `/usr/sbin/feosd --self-upgrade --tcp [::]:1337`,
-with `--pod-prefix` and the prefix DHCPv6 delegated to the node if it got
-one, which it also routes as unreachable; it starts each again a second
-after it ends. It binds the pods' resolver's UDP and TCP sockets to
-`169.254.0.53:53` before the node holds the address (`IP_FREEBIND`),
+with `--pod-prefix` and the pods' prefix if it has one: the one the
+kernel's command line names (`feos.pod-prefix=PREFIX/LEN`, for a prefix
+the network routes to the node statically), else the one DHCPv6
+delegated, which it also routes as unreachable. It starts each again a
+second after it ends. It binds the pods' resolver's UDP and TCP sockets
+to `169.254.0.53:53` before the node holds the address (`IP_FREEBIND`),
 keeps them, and hands them to every `feosd` it starts, as systemd would
 ([DNS](#dns)). It serves no API and logs to `/dev/kmsg`.
 
@@ -373,7 +389,7 @@ ARP is not IP: the table does not see it, and the kernel answers a pod
 only for `169.254.0.1`, by proxy. A pod's IPv4 leaves the node
 masqueraded to the node's address, through Linux's connection tracking;
 its IPv6 is routed as it is. Every node needs IPv4 of its own for its
-pods to reach IPv4 destinations.
+pods to reach IPv4 destinations; under `feos-host-init`, DHCPv4 gives it.
 
 A pod's chains end allowed traffic with `return`, not `accept`, which
 would end the base chain: a packet between two pods passes the sender's

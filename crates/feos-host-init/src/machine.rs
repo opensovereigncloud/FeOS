@@ -13,10 +13,14 @@ use tokio::signal::unix::{signal, SignalKind};
 
 /// SR-IOV virtual functions per physical function.
 const VFS_NUM: u32 = 125;
+/// The kernel's command line names the pods' prefix where the network
+/// routes one to the node statically, not by DHCPv6.
+const POD_PREFIX_PARAMETER: &str = "feos.pod-prefix=";
 
 /// Sets the machine up. A failed step is logged and the next one taken: the
-/// node may still be useful, and PID 1 must not die. Returns the prefix that
-/// DHCPv6 delegated to the node, if any: its pods' (ADR 0010).
+/// node may still be useful, and PID 1 must not die. Returns the pods'
+/// prefix (ADR 0010), if any: the one the kernel's command line names, else
+/// the one DHCPv6 delegated to the node.
 pub async fn set_up() -> Option<(Ipv6Addr, u8)> {
     let is_on_vm = is_running_on_vm().await.unwrap_or_else(|e| {
         error!("Error checking VM status: {e}");
@@ -47,7 +51,31 @@ pub async fn set_up() -> Option<(Ipv6Addr, u8)> {
     tokio::spawn(async move {
         time_worker.run().await;
     });
-    delegated
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    match pod_prefix(&cmdline) {
+        Some(Ok((prefix, len))) => {
+            info!("The pods' prefix, from the kernel's command line: {prefix}/{len}");
+            Some((prefix, len))
+        }
+        Some(Err(given)) => {
+            error!("{POD_PREFIX_PARAMETER}{given} is no IPv6 prefix; ignoring it");
+            delegated
+        }
+        None => delegated,
+    }
+}
+
+/// The pods' prefix the kernel's command line names, or what it gave
+/// instead of one.
+fn pod_prefix(cmdline: &str) -> Option<Result<(Ipv6Addr, u8), &str>> {
+    let given = cmdline
+        .split_whitespace()
+        .find_map(|parameter| parameter.strip_prefix(POD_PREFIX_PARAMETER))?;
+    let parsed = given.split_once('/').and_then(|(prefix, len)| {
+        let len = len.parse::<u8>().ok().filter(|len| *len <= 128)?;
+        Some((prefix.parse::<Ipv6Addr>().ok()?, len))
+    });
+    Some(parsed.ok_or(given))
 }
 
 pub async fn is_running_on_vm() -> Result<bool, Box<dyn std::error::Error>> {
@@ -97,5 +125,29 @@ pub fn take_over_power_signals() {
             };
             error!("Failed to power the machine down: {e}");
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_command_line_names_the_pods_prefix() {
+        let prefix: Ipv6Addr = "fd00:fe05:ffff::".parse().unwrap();
+        assert_eq!(
+            pod_prefix("console=ttyS0 feos.pod-prefix=fd00:fe05:ffff::/64 quiet"),
+            Some(Ok((prefix, 64)))
+        );
+        assert_eq!(pod_prefix("console=ttyS0"), None);
+        assert_eq!(pod_prefix("feos.pod-prefix=fd00::"), Some(Err("fd00::")));
+        assert_eq!(
+            pod_prefix("feos.pod-prefix=10.0.0.0/8"),
+            Some(Err("10.0.0.0/8"))
+        );
+        assert_eq!(
+            pod_prefix("feos.pod-prefix=fd00::/129"),
+            Some(Err("fd00::/129"))
+        );
     }
 }
