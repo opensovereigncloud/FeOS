@@ -138,7 +138,11 @@ async fn mount(volume: &Volume, disks: &[Disk]) -> Result<(String, bool), String
     if volume::mounted_from(&target, &device) {
         // Mounted by an earlier call: the same volume?
         volume::plan(&found, &volume.volume_id, false)?;
-        return Ok((device, false));
+        if !volume.format {
+            return Ok((device, false));
+        }
+        // Whose confirmation the host did not get: made again.
+        volume::unmount_volume(&target)?;
     }
     if volume::is_mount_point(&target) {
         return Err(format!(
@@ -155,15 +159,7 @@ async fn mount(volume: &Volume, disks: &[Disk]) -> Result<(String, bool), String
             volume::make_filesystem(&device, &volume.volume_id).await?;
             true
         }
-        Plan::Mount => {
-            if volume.format {
-                info!(
-                    "Volumes: Volume {} on {device} has its filesystem already, and was mounted before",
-                    volume.name
-                );
-            }
-            false
-        }
+        Plan::Mount => false,
     };
     volume::mount_volume(&device, &target)?;
     info!(

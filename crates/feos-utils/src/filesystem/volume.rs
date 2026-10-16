@@ -14,7 +14,7 @@
 //! formatted over.
 
 use log::info;
-use nix::mount::{mount, MsFlags};
+use nix::mount::{mount, umount, MsFlags};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -84,9 +84,11 @@ pub enum Plan {
 }
 
 /// What to do with a volume's disk that holds `found`: format it if the
-/// host says it is new (`format`) and nothing on it was ever mounted; else
-/// mount it if it holds the volume's own filesystem. Never formats a
-/// filesystem that was mounted, and never mounts another volume's.
+/// host says it is new (`format`), unless another volume's filesystem
+/// that was mounted is on it; else mount it if it holds the volume's own
+/// filesystem. A filesystem of the volume's own that the host believes new
+/// was made by a format whose confirmation the host did not get; no
+/// container ran on it, so it is made again.
 pub fn plan(found: &Found, volume_id: &str, format: bool) -> Result<Plan, String> {
     let own = |uuid: &str| uuid.eq_ignore_ascii_case(volume_id);
     match found {
@@ -96,10 +98,8 @@ pub fn plan(found: &Found, volume_id: &str, format: bool) -> Result<Plan, String
         Found::Ext4 { uuid, mounted } if !own(uuid) && *mounted => Err(format!(
             "the disk holds the filesystem {uuid}, which was mounted: it is not formatted over"
         )),
-        // An interrupted mkfs, of this volume's or not.
-        Found::Ext4 { mounted: false, .. } if format => Ok(Plan::Format),
-        // The volume's own: formatted before, by a format whose
-        // confirmation the host did not get.
+        // An interrupted mkfs, or the volume's own unconfirmed one.
+        Found::Ext4 { .. } if format => Ok(Plan::Format),
         Found::Ext4 { .. } => Ok(Plan::Mount),
         Found::Other(what) => Err(format!("the disk holds {what}: it is not formatted over")),
         Found::Blank | Found::Unknown if format => Ok(Plan::Format),
@@ -305,6 +305,11 @@ pub fn mount_volume(device: &str, target: &Path) -> Result<(), String> {
     .map_err(|e| format!("mount {device} at {}: {e}", target.display()))
 }
 
+/// Unmounts the volume at `target`.
+pub fn unmount_volume(target: &Path) -> Result<(), String> {
+    umount(target).map_err(|e| format!("unmount {}: {e}", target.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,7 +402,7 @@ mod tests {
 
     /// The format safety rule (ADR 0016).
     #[test]
-    fn a_new_volume_is_formatted_unless_a_mounted_filesystem_is_on_it() {
+    fn a_new_volume_is_formatted_unless_another_mounted_filesystem_is_on_it() {
         let blank = Found::Blank;
         let interrupted = probe(&ext4_disk(OTHER, 0, 0));
         let own_unmounted = probe(&ext4_disk(VOLUME, 0, 0));
@@ -410,8 +415,8 @@ mod tests {
         assert_eq!(plan(&Found::Unknown, VOLUME, true), Ok(Plan::Format));
         assert_eq!(plan(&interrupted, VOLUME, true), Ok(Plan::Format));
         assert_eq!(plan(&own_unmounted, VOLUME, true), Ok(Plan::Format));
-        // Formatted and used before the host learnt of it: kept.
-        assert_eq!(plan(&own_mounted, VOLUME, true), Ok(Plan::Mount));
+        // Formatted and mounted before the host learnt of it: made again.
+        assert_eq!(plan(&own_mounted, VOLUME, true), Ok(Plan::Format));
         assert!(plan(&other_mounted, VOLUME, true).is_err());
         assert!(plan(&xfs, VOLUME, true).is_err());
 

@@ -10,9 +10,10 @@ service GuestService {
   // name in the guest, from which containers bind-mount it. The guest
   // finds a volume's disk by its drive, checks its size and the UUID of
   // its filesystem, which is the volume's ID, and formats it only when
-  // asked to and when the disk holds no filesystem that was ever
-  // mounted. A volume mounted already is left as it is. Every volume
-  // gets an answer of its own; one that fails leaves the others.
+  // asked to, and then not over another volume's filesystem that was
+  // mounted or another filesystem. A volume mounted already is left as
+  // it is, unless it is to be formatted. Every volume gets an answer of
+  // its own; one that fails leaves the others.
   rpc MountVolumes(MountVolumesRequest) returns (MountVolumesResponse);
 }
 

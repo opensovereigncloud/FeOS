@@ -303,7 +303,9 @@ impl Volumes {
         }
     }
 
-    /// Keeps the record, replaced by a rename, and puts it in the map.
+    /// Keeps the record, replaced by a rename, and puts it in the map. The
+    /// rename is synced too: no container may start on a volume before
+    /// its `formatted` is on disk (ADR 0016).
     fn save(&self, volume: &Volume) -> Result<(), Status> {
         let path = self.path(&volume.volume_id);
         let temporary = path.with_extension("pb.new");
@@ -313,6 +315,7 @@ impl Volumes {
         });
         written
             .and_then(|()| std::fs::rename(&temporary, &path))
+            .and_then(|()| std::fs::File::open(&self.inner.dir)?.sync_all())
             .map_err(|e| Status::internal(format!("keep volume {}: {e}", volume.volume_id)))?;
         self.volumes()
             .insert(volume.volume_id.clone(), volume.clone());

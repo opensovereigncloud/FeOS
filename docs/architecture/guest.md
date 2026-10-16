@@ -85,9 +85,10 @@ name, ID, drive, size and whether it is new. For each, the guest:
    data;
 4. formats it with `mke2fs -t ext4 -b 4096 -m 0 -U <volume ID> -E
    lazy_itable_init=1,lazy_journal_init=1,nodiscard` only if the host
-   says it is new and it holds no filesystem that was mounted; a
-   filesystem that was mounted and is the volume's own, by its UUID, is
-   mounted as it is; anything else fails the volume;
+   says it is new; a filesystem of the volume's own, by its UUID, is
+   formatted over then, since its confirmation was lost, and one
+   mounted earlier in the same boot is unmounted first; another UUID's
+   filesystem that was mounted, or another filesystem, fails the volume;
 5. without the host saying it is new, mounts only the volume's own
    filesystem: a blank disk or another UUID fails it;
 6. mounts it at `/run/feos/volumes/<name>`, ext4 with `noinit_itable`,

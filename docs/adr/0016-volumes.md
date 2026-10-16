@@ -81,15 +81,18 @@ its own, and a blank filesystem per size is not a thing to ship.
   volume has its filesystem; until the guest confirms that it made it,
   it has not, and every boot until then asks the guest to format. A
   mount that fails never leads to a format.
-- **The guest refuses to destroy a filesystem.** Asked to format, it
-  formats a disk that holds no filesystem, or one that was never
-  mounted: what an interrupted `mke2fs` leaves. A filesystem that was
-  mounted (ext4 whose superblock is valid and has a mount time or a
-  mount count), or another filesystem's signature, is not formatted. If
-  that filesystem is the volume's own, by its UUID, the guest's
-  confirmation was lost after the volume had been used: the guest mounts
-  it as it is, and reports it as formatted. Anything else fails the
-  mount.
+- **A volume is provisioned when the host has the confirmation.**
+  `feosd` writes the volume's record, synced, before it starts any of
+  the pod's containers. A volume whose confirmation never arrived was
+  not provisioned, and nothing of a container's can be on it, so the
+  next boot throws its filesystem away and formats again: one the guest
+  made and mounted in a boot whose answer was lost, by its UUID the
+  volume's own, as well as what an interrupted `mke2fs` leaves.
+- **The guest refuses to destroy another volume's filesystem.** Asked to
+  format, it refuses a filesystem that was mounted (ext4 whose
+  superblock is valid and has a mount time or a mount count) with
+  another UUID than the volume's, and any other filesystem's
+  signature: a drive taken for another is not formatted over.
 
 ### The guest tells its drives by their order
 
@@ -146,9 +149,13 @@ its own, and a blank filesystem per size is not a thing to ship.
   disks' is: one per size, and every size another L0.
 - **Formatting whenever no filesystem mounts**: a disk that is broken,
   or a drive taken for another, would be formatted over.
-- **Refusing to mount a volume's own filesystem that the host believes
-  new**: the pod would fail for good after a lost confirmation, with no
-  way for the host to learn better.
+- **Mounting a volume's own filesystem that the host believes new**,
+  as it is, after a lost confirmation: its provisioning never finished,
+  and a filesystem the host has not taken over would be one whose state
+  nobody vouches for.
+- **Refusing a volume's own filesystem that the host believes new**:
+  the pod would fail for good after a lost confirmation, with no way for
+  the host to learn better.
 - **Volumes that pods share** (ReadWriteMany), over virtio-fs or NFS:
   a server per volume, and locking across microVMs, for which nothing
   asks yet.
