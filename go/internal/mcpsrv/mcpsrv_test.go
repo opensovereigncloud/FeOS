@@ -270,6 +270,11 @@ func TestRendering(t *testing.T) {
 	if !isError || text != "error: ensure sandbox: no capacity (retryable): no feasible node" {
 		t.Errorf("no capacity: %q", text)
 	}
+	h.env.Engine.FailAcquire(h.sb.ID, hibernating{h.sb.ID})
+	text, isError, err = call(cs, "bash", map[string]any{"command": "true"})
+	if err != nil || !isError || text != "error: ensure sandbox: sandbox "+h.sb.ID.String()+" is hibernating; retry in a minute" {
+		t.Errorf("hibernating: %q %v %v", text, isError, err)
+	}
 
 	// render on its own: the old texts.
 	for _, tc := range []struct {
@@ -709,3 +714,13 @@ func TestTokenTouch(t *testing.T) {
 		t.Errorf("touched twice within a minute: %v %v", first.LastUsedAt, again.LastUsedAt)
 	}
 }
+
+// hibernating is the engine's answer for a sandbox whose hibernation did
+// not end within Ensure's wait: a text of its own that is model.ErrBusy.
+type hibernating struct{ id uuid.UUID }
+
+func (e hibernating) Error() string {
+	return "sandbox " + e.id.String() + " is hibernating; retry in a minute"
+}
+
+func (e hibernating) Unwrap() error { return model.ErrBusy }

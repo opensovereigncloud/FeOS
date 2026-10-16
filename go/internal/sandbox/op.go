@@ -124,7 +124,13 @@ type OpHandle struct {
 }
 
 // Wait waits for the op's end, or ctx; ctx ends the wait, never the op.
+// An op that has ended gives its result, also when ctx has ended.
 func (h *OpHandle) Wait(ctx context.Context) (OpResult, error) {
+	select {
+	case <-h.done:
+		return h.res, nil
+	default:
+	}
 	select {
 	case <-h.done:
 		return h.res, nil

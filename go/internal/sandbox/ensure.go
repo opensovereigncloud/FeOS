@@ -25,6 +25,13 @@ import (
 // error of an op it started or joined that failed, instead of trying
 // again: "<op> on node <n> failed: <description>". Its ops carry the
 // trigger ensure; they run on when Ensure stops waiting.
+//
+// A hibernate in flight (this instance's, another live instance's, or
+// one Ensure began itself) is waited for at most hibernateWait: a
+// hibernation uploads the pod's disk and memory to the object store and
+// takes minutes, longer than a caller should wait. One that has not ended
+// by then is ErrBusy, "sandbox <id> is hibernating; retry in a minute",
+// and goes on; a later Ensure restores the sandbox.
 func (e *Engine) Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error) {
 	ctx, cancel := context.WithTimeout(ctx, e.t.prepBudget)
 	defer cancel()
@@ -53,6 +60,9 @@ type ensurer struct {
 	lostSynced bool
 	tombTried  map[store.TombstoneKey]bool
 	lastDesc   string
+	// hibernateSince is when this call first met a hibernate in flight;
+	// it waits for hibernates until hibernateWait after it.
+	hibernateSince time.Time
 }
 
 // errContinue makes the loop read the row again.
@@ -164,9 +174,10 @@ func (en *ensurer) step(ctx context.Context, row store.Sandbox) (model.Lease, er
 }
 
 // opInFlight joins this instance's op when it is the row's, takes over
-// one whose owner is not live, or waits for the row to change. An op of
-// this instance's that is not the row's (taken over by another instance,
-// or of an earlier incarnation) is not waited for.
+// one whose owner is not live, or waits for the row to change; a hibernate
+// of a live owner only within the hibernate wait. An op of this
+// instance's that is not the row's (taken over by another instance, or of
+// an earlier incarnation) is not waited for.
 func (en *ensurer) opInFlight(ctx context.Context, row store.Sandbox) error {
 	e := en.e
 	if h := e.runner.Running(en.id); h != nil && h.opID == row.OpID {
@@ -175,6 +186,9 @@ func (en *ensurer) opInFlight(ctx context.Context, row store.Sandbox) error {
 	live, err := e.st.InstanceLive(ctx, row.OpOwner)
 	if err != nil {
 		return err
+	}
+	if live && OpKind(row.Op) == OpHibernate {
+		return en.waitHibernateRow(ctx)
 	}
 	if live {
 		en.waitNext = true
@@ -540,8 +554,81 @@ func (en *ensurer) preconditionFailed(ctx context.Context, read store.Sandbox, e
 	return err
 }
 
-// await waits for an op this call started or joined and judges its end.
+// hibernateDeadline is when this call stops waiting for hibernates:
+// hibernateWait after the first one it met.
+func (en *ensurer) hibernateDeadline() time.Time {
+	if en.hibernateSince.IsZero() {
+		en.hibernateSince = time.Now()
+	}
+	return en.hibernateSince.Add(en.e.t.hibernateWait)
+}
+
+// hibernating is the answer of a call whose hibernate did not end within
+// the wait: retryable, the op goes on.
+func (en *ensurer) hibernating() error {
+	return errorf(model.ErrBusy, "sandbox %s is hibernating; retry in a minute", en.id)
+}
+
+// waitHibernateOp waits for a hibernate this instance runs (joined, or
+// begun by this call, a takeover among them) until it ends, within the
+// hibernate wait. The end of ctx's deadline counts as the wait's: Ensure
+// never waits longer than its budget, and its caller learns that the
+// sandbox is hibernating. A hibernate that has ended when the wait ends
+// has ended, as the row path's read after the wait finds.
+func (en *ensurer) waitHibernateOp(ctx context.Context, h *OpHandle) error {
+	select {
+	case <-h.Done():
+		return nil
+	default:
+	}
+	t := time.NewTimer(time.Until(en.hibernateDeadline()))
+	defer t.Stop()
+	select {
+	case <-h.Done():
+		return nil
+	case <-t.C:
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return ctx.Err()
+		}
+	}
+	select {
+	case <-h.Done():
+		return nil
+	default:
+		return en.hibernating()
+	}
+}
+
+// waitHibernateRow waits for a hibernate of a live owner that this
+// instance does not run (another instance's): for a change of the row (or
+// the poll), within the hibernate wait, after which the loop reads the row
+// again.
+func (en *ensurer) waitHibernateRow(ctx context.Context) error {
+	deadline := en.hibernateDeadline()
+	if !time.Now().Before(deadline) {
+		return en.hibernating()
+	}
+	wctx, cancel := context.WithDeadline(ctx, deadline)
+	en.waitChange(wctx)
+	cancel()
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return en.hibernating()
+		}
+		return err
+	}
+	return errContinue
+}
+
+// await waits for an op this call started or joined and judges its end;
+// a hibernate only within the hibernate wait.
 func (en *ensurer) await(ctx context.Context, h *OpHandle) error {
+	if h.kind == OpHibernate {
+		if err := en.waitHibernateOp(ctx, h); err != nil {
+			return err
+		}
+	}
 	res, err := h.Wait(ctx)
 	if err != nil {
 		return err

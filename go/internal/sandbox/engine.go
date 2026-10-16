@@ -38,7 +38,11 @@ type Config struct {
 	// IdlePause and HibernateAfter switch their policies off at 0.
 	IdlePause, HibernateAfter, LostGrace, NodeWait, DrainTimeout time.Duration
 	PendingRepairAfter, UnreachableRepairAfter                   time.Duration
-	Log                                                          *slog.Logger
+	// HibernateTimeout is how long a hibernate's node call may run
+	// (--hibernate-timeout): the hibernate op's deadline is this plus 16
+	// seconds per GiB of memory.
+	HibernateTimeout time.Duration
+	Log              *slog.Logger
 }
 
 // Defaults of Config when zero (§3).
@@ -49,6 +53,8 @@ const (
 	defaultDrainTimeout           = time.Hour
 	defaultPendingRepairAfter     = 10 * time.Minute
 	defaultUnreachableRepairAfter = 2 * time.Minute
+	// DefaultHibernateTimeout is --hibernate-timeout's default.
+	DefaultHibernateTimeout = time.Hour
 )
 
 // The placement policies.
@@ -117,12 +123,20 @@ type timings struct {
 	touchEvery time.Duration
 	// waitPoll is the timer of the waits on another instance's write.
 	waitPoll time.Duration
+	// hibernateWait is how long Ensure waits for a hibernate in flight
+	// before it tells its caller to come back (ErrBusy): a hibernation
+	// uploads the pod's disk and memory and takes minutes.
+	hibernateWait time.Duration
 }
 
-func defaultTimings() timings {
+// defaultTimings are the timings of an instance whose hibernates may run
+// for hibernateTimeout.
+func defaultTimings(hibernateTimeout time.Duration) timings {
 	return timings{
-		prepBudget:    PreparationBudget,
-		opDeadline:    OpDeadline,
+		prepBudget: PreparationBudget,
+		opDeadline: func(kind OpKind, memoryMiB int) time.Duration {
+			return deadlineFor(kind, memoryMiB, hibernateTimeout)
+		},
 		pollEvery:     5 * time.Second,
 		retryMin:      100 * time.Millisecond,
 		retryMax:      2 * time.Second,
@@ -141,6 +155,7 @@ func defaultTimings() timings {
 		pauseWait:     time.Minute,
 		touchEvery:    time.Second,
 		waitPoll:      db.DefaultPoll,
+		hibernateWait: 30 * time.Second,
 	}
 }
 
@@ -150,8 +165,15 @@ func defaultTimings() timings {
 const PreparationBudget = 7*time.Minute + 5*time.Second
 
 // OpDeadline is the deadline of an op of kind for a sandbox of memoryMiB
-// (§9 ops table); GiB = ceil(memory_mib / 1024).
+// (§9 ops table), a hibernate's with DefaultHibernateTimeout; GiB =
+// ceil(memory_mib / 1024).
 func OpDeadline(kind OpKind, memoryMiB int) time.Duration {
+	return deadlineFor(kind, memoryMiB, DefaultHibernateTimeout)
+}
+
+// deadlineFor is OpDeadline with the instance's hibernate timeout: a
+// hibernate's deadline is hibernateTimeout plus 16 seconds per GiB.
+func deadlineFor(kind OpKind, memoryMiB int, hibernateTimeout time.Duration) time.Duration {
 	g := gib(memoryMiB)
 	switch kind {
 	case OpCreate, OpStart:
@@ -163,7 +185,7 @@ func OpDeadline(kind OpKind, memoryMiB int) time.Duration {
 	case OpPause:
 		return 2*time.Minute + 4*time.Second*g
 	case OpHibernate:
-		return 15*time.Minute + 16*time.Second*g
+		return hibernateTimeout + 16*time.Second*g
 	}
 	return PreparationBudget
 }
@@ -256,6 +278,7 @@ func New(cfg Config, deps Deps) (*Engine, error) {
 	}{
 		{&cfg.LostGrace, defaultLostGrace}, {&cfg.NodeWait, defaultNodeWait}, {&cfg.DrainTimeout, defaultDrainTimeout},
 		{&cfg.PendingRepairAfter, defaultPendingRepairAfter}, {&cfg.UnreachableRepairAfter, defaultUnreachableRepairAfter},
+		{&cfg.HibernateTimeout, DefaultHibernateTimeout},
 	}
 	for _, x := range defaults {
 		if *x.v <= 0 {
@@ -272,7 +295,7 @@ func New(cfg Config, deps Deps) (*Engine, error) {
 	}
 	e := &Engine{
 		cfg: cfg, id: cfg.InstanceID, d: deps.DB, st: st, conns: deps.Conns, el: deps.Elector,
-		act: deps.Activity, log: log, t: defaultTimings(), procs: deps.Processes,
+		act: deps.Activity, log: log, t: defaultTimings(cfg.HibernateTimeout), procs: deps.Processes,
 		deferred: map[uuid.UUID]struct{}{}, notified: map[string]time.Time{}, touched: map[uuid.UUID]time.Time{},
 		unreachable: map[uuid.UUID]*reach{}, evacuations: map[uuid.UUID]string{}, evacuatingOn: map[string]int{},
 		holds: map[holdKey]*holdState{}, tombs: map[store.TombstoneKey]*tombRun{}, rl: newRateLog(log),

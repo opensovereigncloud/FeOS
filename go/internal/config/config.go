@@ -164,6 +164,9 @@ type Config struct {
 	// connection; the stream budgets derive from it.
 	NodeMaxStreams   int
 	ConnDrainTimeout time.Duration
+	// HibernateTimeout is how long a hibernate's node call may run; the
+	// hibernate op's deadline is this plus 16 seconds per GiB of memory.
+	HibernateTimeout time.Duration
 	// ShutdownGrace is how long a stopping instance waits for its requests
 	// and ops (§7). A container deployment sets its termination grace
 	// period to at least this plus 30 s.
@@ -214,6 +217,7 @@ func Default() Config {
 		PodCertTTL:             time.Hour,
 		NodeMaxStreams:         1024,
 		ConnDrainTimeout:       20 * time.Minute,
+		HibernateTimeout:       time.Hour,
 		ShutdownGrace:          10 * time.Minute,
 		ActivityRetention:      720 * time.Hour,
 		TrafficRetention:       168 * time.Hour,
@@ -306,6 +310,8 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.DurationVar(&c.PodCertTTL, "pod-cert-ttl", c.PodCertTTL, "lifetime of pod certificates (renewed at three quarters)")
 	fs.IntVar(&c.NodeMaxStreams, "node-max-streams", c.NodeMaxStreams, "HTTP/2 stream limit of a node connection; the stream budgets derive from it")
 	fs.DurationVar(&c.ConnDrainTimeout, "conn-drain-timeout", c.ConnDrainTimeout, "a draining node connection is closed after this at the latest")
+	fs.DurationVar(&c.HibernateTimeout, "hibernate-timeout", c.HibernateTimeout,
+		"how long a hibernate may run (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB")
 	fs.DurationVar(&c.ShutdownGrace, "shutdown-grace", c.ShutdownGrace,
 		"how long a stopping instance waits for its requests and ops; set a container's termination grace to at least this plus 30s")
 	fs.DurationVar(&c.ActivityRetention, "activity-retention", c.ActivityRetention, "how long activity is kept")
@@ -430,6 +436,7 @@ func (c *Config) Validate() error {
 		{"rollout-grace", c.RolloutGrace}, {"drain-timeout", c.DrainTimeout},
 		{"pending-repair-after", c.PendingRepairAfter}, {"unreachable-repair-after", c.UnreachableRepairAfter},
 		{"node-cert-ttl", c.NodeCertTTL}, {"pod-cert-ttl", c.PodCertTTL}, {"conn-drain-timeout", c.ConnDrainTimeout},
+		{"hibernate-timeout", c.HibernateTimeout},
 		{"activity-retention", c.ActivityRetention}, {"traffic-retention", c.TrafficRetention},
 	}
 	for _, d := range positive {

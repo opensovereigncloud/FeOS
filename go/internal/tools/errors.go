@@ -55,12 +55,14 @@ func (e *TimeoutError) Error() string { return fmt.Sprintf("timeout after %ds", 
 
 // Retryable reports whether a failed call is worth repeating shortly, as
 // the REST tool routes tell with Retry-After: no capacity, a node or
-// instance that is unavailable or stopping, a stream or tool budget or the
-// exec cap exhausted, a call cut by a forced drain.
+// instance that is unavailable or stopping, an op in flight that the
+// sandbox's preparation does not wait for (a hibernation), a stream or
+// tool budget or the exec cap exhausted, a call cut by a forced drain.
 func Retryable(err error) bool {
 	switch {
 	case errors.Is(err, model.ErrNoCapacity), errors.Is(err, model.ErrNodeUnavailable),
-		errors.Is(err, model.ErrStopping), errors.Is(err, ErrExecCap), errors.Is(err, ErrCancelled):
+		errors.Is(err, model.ErrStopping), errors.Is(err, model.ErrBusy), errors.Is(err, ErrExecCap),
+		errors.Is(err, ErrCancelled):
 		return true
 	}
 	var ne *NodeError

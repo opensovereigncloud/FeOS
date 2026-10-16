@@ -316,7 +316,7 @@ func TestStatusRendering(t *testing.T) {
 
 // Pause and resume answer the status as read before; a recheck that found
 // the row changed is a 200; every other error a 500 "<op>: <err>", also a
-// stopping instance's.
+// stopping instance's and a hibernating sandbox's.
 func TestPauseResume(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
@@ -352,6 +352,8 @@ func TestPauseResume(t *testing.T) {
 		{&stoppingErr{"instance i1 is stopping"}, 500, errBody("resume: instance i1 is stopping")},
 		{fmt.Errorf("no capacity on node n1 for sandbox %s (retryable): slots: 50 of 50 used: %w", id, model.ErrNoCapacity),
 			500, errBody("resume: no capacity on node n1 for sandbox " + id + " (retryable): slots: 50 of 50 used: no capacity")},
+		{&busyErr{"sandbox " + id + " is hibernating; retry in a minute"}, 500,
+			errBody("resume: sandbox " + id + " is hibernating; retry in a minute")},
 		{model.ErrNotFound, 404, errBody("unknown sandbox " + id)},
 	} {
 		e.fake.mu.Lock()
@@ -369,9 +371,16 @@ type stoppingErr struct{ msg string }
 func (e *stoppingErr) Error() string { return e.msg }
 func (e *stoppingErr) Unwrap() error { return model.ErrStopping }
 
+// busyErr is the engine's ErrBusy with its own text: a hibernation that
+// Ensure does not wait for.
+type busyErr struct{ msg string }
+
+func (e *busyErr) Error() string { return e.msg }
+func (e *busyErr) Unwrap() error { return model.ErrBusy }
+
 // The tool routes never map an error to another status: a failed call is
-// a 502 "<tool>: <err>", with Retry-After for a stopping instance and an
-// exhausted budget.
+// a 502 "<tool>: <err>", with Retry-After for a stopping instance, a
+// hibernating sandbox and an exhausted budget.
 func TestToolRouteErrors(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
@@ -384,6 +393,8 @@ func TestToolRouteErrors(t *testing.T) {
 		{"stopping", &stoppingErr{"instance i1 is stopping"}, nil,
 			errBody("bash: ensure sandbox: instance i1 is stopping"), "5"},
 		{"lost", model.ErrLost, nil, errBody("bash: ensure sandbox: sandbox lost"), ""},
+		{"hibernating", &busyErr{"sandbox 5f0c6a3e-0000-4000-8000-000000000001 is hibernating; retry in a minute"}, nil,
+			errBody("bash: ensure sandbox: sandbox 5f0c6a3e-0000-4000-8000-000000000001 is hibernating; retry in a minute"), "5"},
 		{"budget", nil, status.Error(codes.ResourceExhausted, "node n1: stream budget exhausted"),
 			errBody("bash: node n1: stream budget exhausted"), "5"},
 	} {

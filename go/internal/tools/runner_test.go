@@ -49,6 +49,7 @@ func TestEnsureSandboxWrapping(t *testing.T) {
 		{errors.New("resolve image alpine: 401 Unauthorized"), "ensure sandbox: resolve image alpine: 401 Unauthorized", false},
 		{errors.New("create on node n1 failed: no space left"), "ensure sandbox: create on node n1 failed: no space left", false},
 		{context.DeadlineExceeded, "ensure sandbox: context deadline exceeded", false},
+		{hibernating{sb.ID}, "ensure sandbox: sandbox " + sb.ID.String() + " is hibernating; retry in a minute", true},
 	} {
 		env.Engine.FailAcquire(sb.ID, tc.err)
 		res, err := r.Call(bg, sb, ToolBash, json.RawMessage(`{"command":"true"}`), nil)
@@ -74,8 +75,29 @@ func TestEnsureSandboxWrapping(t *testing.T) {
 	if err == nil || err.Error() != `unknown tool "nope"` {
 		t.Errorf("unknown tool: %v", err)
 	}
-	if n := env.Engine.Calls("Acquire", sb.ID); n != 8 {
+	if n := env.Engine.Calls("Acquire", sb.ID); n != 9 {
 		t.Errorf("%d Acquires", n)
+	}
+}
+
+// hibernating is the engine's answer for a sandbox whose hibernation did
+// not end within Ensure's wait: a text of its own that is model.ErrBusy.
+type hibernating struct{ id uuid.UUID }
+
+func (e hibernating) Error() string {
+	return "sandbox " + e.id.String() + " is hibernating; retry in a minute"
+}
+
+func (e hibernating) Unwrap() error { return model.ErrBusy }
+
+// An op in flight that Ensure does not wait for (a hibernation) is worth
+// a retry, however it is wrapped.
+func TestRetryableBusy(t *testing.T) {
+	for _, err := range []error{model.ErrBusy, hibernating{uuid.New()},
+		fmt.Errorf("ensure sandbox: %w", hibernating{uuid.New()})} {
+		if !Retryable(err) {
+			t.Errorf("%v is not retryable", err)
+		}
 	}
 }
 

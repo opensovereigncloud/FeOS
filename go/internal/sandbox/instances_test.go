@@ -251,3 +251,73 @@ func TestStopWaitsForBegins(t *testing.T) {
 		t.Fatalf("row after Stop %+v", row)
 	}
 }
+
+// TestEnsureMeetsAnotherInstancesHibernate: Ensure meeting a hibernate of
+// another live instance waits for it within the hibernate wait only: one
+// that does not end by then is ErrBusy at once and goes on on its owner,
+// and a later Ensure restores the sandbox; one that ends within the wait
+// is waited for, and the sandbox restored.
+func TestEnsureMeetsAnotherInstancesHibernate(t *testing.T) {
+	h := newHarness(t)
+	i2 := h.addInstance("i2")
+	h.addNode("n1")
+	e := h.eng()
+	e.t.hibernateWait = 300 * time.Millisecond
+	sb := h.running(512)
+	hibernateOnI2 := func() *OpHandle {
+		t.Helper()
+		h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+		ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+		defer cancel()
+		hd, err := i2.eng.runner.start(ctx, sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerExplicit, Target: "n1",
+			Incarnation: sb.Incarnation}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hd
+	}
+
+	arrived, release := h.gate("n1", podv1.PodService_HibernatePod_FullMethodName)
+	defer release()
+	hd := hibernateOnI2()
+	waitClosed(t, arrived, "i2's hibernate call")
+	_, took, err := ensureFor(e, sb.ID, time.Minute)
+	wantHibernating(t, sb.ID, took, err)
+	if row := h.row(sb.ID); row.ClientState != model.StateHibernating || row.OpOwner != "i2" {
+		t.Fatalf("i2's hibernate did not go on: %+v", row)
+	}
+	release()
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	if res, err := hd.Wait(ctx); err != nil || res.State != model.StateHibernated {
+		t.Fatalf("i2's hibernate's end %+v %v", res, err)
+	}
+	if lease := h.ensure(sb.ID); lease.Node != "n1" {
+		t.Fatalf("restored on %s", lease.Node)
+	}
+	wantState(t, h.row(sb.ID), model.StateRunning)
+
+	// Within the wait: i1 waits for i2's hibernate, then restores.
+	e.t.hibernateWait = 20 * time.Second
+	arrived, release2 := h.gate("n1", podv1.PodService_HibernatePod_FullMethodName)
+	defer release2()
+	hibernateOnI2()
+	waitClosed(t, arrived, "i2's hibernate call")
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ensureFor(e, sb.ID, time.Minute)
+		done <- err
+	}()
+	never(t, 500*time.Millisecond, "Ensure returned during i2's hibernate", func() bool { return len(done) > 0 })
+	release2()
+	if err := <-done; err != nil {
+		t.Fatalf("Ensure after i2's hibernate within the wait: %v", err)
+	}
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateRunning)
+	var restores int
+	h.scalar(&restores, "SELECT count(*) FROM placements WHERE pod_id = $1 AND instance_id = 'i1'", sb.ID)
+	if restores != 3 { // the create and two restores
+		t.Fatalf("%d placements of i1", restores)
+	}
+}

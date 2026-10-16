@@ -6,6 +6,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -260,5 +261,158 @@ func TestRecreateWhileOldOpRuns(t *testing.T) {
 	h.noPod(oldNode, id)
 	if info := h.podState(lease.Node, id, podv1.PodState_POD_STATE_RUNNING); podIncarnation(info) != sb.Incarnation {
 		t.Fatal("the new pod is not the new incarnation's")
+	}
+}
+
+// ensureFor runs Ensure on e within d and reports how long it took.
+func ensureFor(e *Engine, id uuid.UUID, d time.Duration) (model.Lease, time.Duration, error) {
+	ctx, cancel := context.WithTimeout(bg, d)
+	defer cancel()
+	start := time.Now()
+	lease, err := e.Ensure(ctx, id)
+	return lease, time.Since(start), err
+}
+
+// wantHibernating checks the answer of an Ensure that met a hibernate it
+// did not wait for: ErrBusy with the exact text, after the hibernate wait
+// and well before the budget.
+func wantHibernating(t *testing.T, id uuid.UUID, took time.Duration, err error) {
+	t.Helper()
+	want := "sandbox " + id.String() + " is hibernating; retry in a minute"
+	if err == nil || err.Error() != want || !errors.Is(err, model.ErrBusy) {
+		t.Fatalf("got error %v, want ErrBusy %q", err, want)
+	}
+	if took < 300*time.Millisecond || took > 10*time.Second {
+		t.Fatalf("the answer took %v", took)
+	}
+}
+
+// TestEnsureMeetsHibernate: Ensure meeting a hibernate of this instance in
+// flight (one it joins, one it begins itself) waits for it within the
+// hibernate wait only: a hibernate that does not end by then is ErrBusy at
+// once and goes on, and a later Ensure restores the sandbox. A hibernate
+// that ends within the wait is waited for, and the sandbox restored.
+func TestEnsureMeetsHibernate(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	e.t.hibernateWait = 300 * time.Millisecond
+	sb := h.running(512)
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+
+	// Joined: the hibernate is held at the node.
+	arrived, release := h.gate("n1", podv1.PodService_HibernatePod_FullMethodName)
+	defer release()
+	hd, err := h.begin(sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerExplicit, Target: "n1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitClosed(t, arrived, "the hibernate's call")
+	_, took, err := ensureFor(e, sb.ID, time.Minute)
+	wantHibernating(t, sb.ID, took, err)
+	if row := h.row(sb.ID); row.ClientState != model.StateHibernating || row.Op != string(OpHibernate) {
+		t.Fatalf("the hibernate did not go on: %+v", row)
+	}
+	release()
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	if res, err := hd.Wait(ctx); err != nil || res.State != model.StateHibernated {
+		t.Fatalf("the hibernate's end %+v %v", res, err)
+	}
+	if lease := h.ensure(sb.ID); lease.Node != "n1" {
+		t.Fatalf("restored on %s", lease.Node)
+	}
+	wantState(t, h.row(sb.ID), model.StateRunning)
+
+	// Begun by Ensure itself: the resume is refused for capacity and the
+	// sandbox is hibernated, to be restored elsewhere.
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+	h.exec("UPDATE nodes SET slots = 0 WHERE name = 'n1'")
+	arrived, release2 := h.gate("n1", podv1.PodService_HibernatePod_FullMethodName)
+	defer release2()
+	_, took, err = ensureFor(e, sb.ID, time.Minute)
+	wantHibernating(t, sb.ID, took, err)
+	waitClosed(t, arrived, "the hibernate's call")
+	h.exec("UPDATE nodes SET slots = 50 WHERE name = 'n1'")
+	release2()
+	h.waitState(sb.ID, model.StateHibernated, 15*time.Second)
+	if lease := h.ensure(sb.ID); lease.Node != "n1" {
+		t.Fatalf("restored on %s", lease.Node)
+	}
+
+	// A hibernate that ends within the wait: Ensure waits for it and
+	// restores the sandbox.
+	e.t.hibernateWait = 20 * time.Second
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+	before := h.row(sb.ID)
+	arrived, release3 := h.gate("n1", podv1.PodService_HibernatePod_FullMethodName)
+	defer release3()
+	if _, err := h.begin(sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerExplicit, Target: "n1"}); err != nil {
+		t.Fatal(err)
+	}
+	waitClosed(t, arrived, "the hibernate's call")
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ensureFor(e, sb.ID, time.Minute)
+		done <- err
+	}()
+	never(t, 500*time.Millisecond, "Ensure returned during the hibernate", func() bool { return len(done) > 0 })
+	release3()
+	if err := <-done; err != nil {
+		t.Fatalf("Ensure after a hibernate within the wait: %v", err)
+	}
+	after := h.row(sb.ID)
+	wantState(t, after, model.StateRunning)
+	if after.CheckpointHead == "" || !after.CheckpointAt.After(before.CheckpointAt) {
+		t.Fatalf("not restored from a new checkpoint: %+v (before %+v)", after, before)
+	}
+}
+
+// endingCtx is a ctx whose Done ends the op h as the caller takes the
+// channel, so that the op's end and the wait's are ready at once in the
+// caller's select. Its done is nil (it never ends), or closed: it has
+// ended by its deadline.
+type endingCtx struct {
+	context.Context
+	h    *OpHandle
+	once sync.Once
+	done chan struct{}
+}
+
+func (c *endingCtx) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.h.done) })
+	return c.done
+}
+
+func (c *endingCtx) Err() error {
+	if c.done != nil {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// TestEnsureHibernateEndsAtTheBound: a hibernate this instance runs that
+// ends as the hibernate wait does (at its bound, or at the end of
+// Ensure's budget) has ended: Ensure takes its end and goes on, and does
+// not answer that the sandbox is hibernating.
+func TestEnsureHibernateEndsAtTheBound(t *testing.T) {
+	e := &Engine{t: timings{hibernateWait: time.Minute}}
+	for i := range 100 {
+		for _, budget := range []bool{false, true} {
+			h := &OpHandle{done: make(chan struct{}), kind: OpHibernate, target: "n1",
+				res: OpResult{State: model.StateHibernated}}
+			en := &ensurer{e: e, id: uuid.New(), ops: map[string]OpResult{}}
+			ctx := &endingCtx{Context: bg, h: h}
+			if budget {
+				ctx.done = make(chan struct{})
+				close(ctx.done)
+			} else {
+				// The bound has passed: its timer is ready at once.
+				en.hibernateSince = time.Now().Add(-2 * e.t.hibernateWait)
+			}
+			if err := en.await(ctx, h); !errors.Is(err, errContinue) {
+				t.Fatalf("round %d (the budget ended: %v): a hibernate that ended gave %v", i, budget, err)
+			}
+		}
 	}
 }

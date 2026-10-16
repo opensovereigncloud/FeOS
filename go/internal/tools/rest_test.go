@@ -257,6 +257,8 @@ func TestRESTErrors(t *testing.T) {
 			`{"error":"ls: ensure sandbox: node unavailable: node n1 is down"}` + "\n", "5"},
 		{fmt.Errorf("instance i1 is stopping: %w", model.ErrStopping), "/processes", ``,
 			`{"error":"process_list: ensure sandbox: instance i1 is stopping: instance is stopping"}` + "\n", "5"},
+		{hibernating{sb.ID}, "/exec", `{"command":"x"}`,
+			`{"error":"bash: ensure sandbox: sandbox ` + sb.ID.String() + ` is hibernating; retry in a minute"}` + "\n", "5"},
 	} {
 		env.Engine.FailAcquire(sb.ID, tc.err)
 		method := "GET"

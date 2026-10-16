@@ -43,7 +43,7 @@ func TestDefaults(t *testing.T) {
 		"unreachable-repair-after": c.UnreachableRepairAfter, "node-cert-ttl": c.NodeCertTTL, "pod-cert-ttl": c.PodCertTTL,
 		"node-max-streams": c.NodeMaxStreams, "conn-drain-timeout": c.ConnDrainTimeout, "shutdown-grace": c.ShutdownGrace,
 		"activity-retention": c.ActivityRetention, "traffic-retention": c.TrafficRetention, "log-level": c.LogLevel,
-		"oidc-scopes": strings.Join(c.OIDCScopes, " "),
+		"oidc-scopes": strings.Join(c.OIDCScopes, " "), "hibernate-timeout": c.HibernateTimeout,
 	} {
 		wantV := map[string]any{
 			"listen": ":8100", "node-listen": ":7443", "trust-domain": "feos.local", "ca-dir": "/etc/ferun/ca",
@@ -56,7 +56,7 @@ func TestDefaults(t *testing.T) {
 			"node-cert-ttl": 168 * time.Hour, "pod-cert-ttl": time.Hour, "node-max-streams": 1024,
 			"conn-drain-timeout": 20 * time.Minute, "shutdown-grace": 10 * time.Minute,
 			"activity-retention": 720 * time.Hour, "traffic-retention": 168 * time.Hour, "log-level": slog.LevelInfo,
-			"oidc-scopes": "openid profile email",
+			"oidc-scopes": "openid profile email", "hibernate-timeout": time.Hour,
 		}[name]
 		if !reflect.DeepEqual(got, wantV) {
 			t.Errorf("--%s default %v, want %v", name, got, wantV)
@@ -163,6 +163,9 @@ func TestValidation(t *testing.T) {
 		{[]string{"--node-advertise-address", "10.0.0.1"}, nil, `--node-advertise-address "10.0.0.1" is not host:port`},
 		{[]string{"--node-server-names", "10.0.0.1"}, nil, "is an IP address"},
 		{[]string{"--node-ttl", "0s"}, nil, "--node-ttl must be positive"},
+		{[]string{"--hibernate-timeout", "0s"}, nil, "--hibernate-timeout must be positive"},
+		{nil, map[string]string{"FERUN_HIBERNATE_TIMEOUT": "-5m"}, "--hibernate-timeout must be positive"},
+		{nil, map[string]string{"FERUN_HIBERNATE_TIMEOUT": "an hour"}, "FERUN_HIBERNATE_TIMEOUT"},
 		{[]string{"--disk-budget", "4GB"}, nil, "is not a byte size"},
 		{nil, map[string]string{"FERUN_NODE_TTL": "soon"}, "FERUN_NODE_TTL"},
 		{[]string{"extra"}, nil, `unexpected arguments ["extra"]`},
@@ -256,7 +259,9 @@ func TestUsage(t *testing.T) {
 	var b strings.Builder
 	Usage(&b, CmdServe)
 	for _, s := range []string{"--database-url (FERUN_DATABASE_URL)", "--oidc-client-secret-file (FERUN_OIDC_CLIENT_SECRET_FILE)",
-		`--shutdown-grace (FERUN_SHUTDOWN_GRACE, default "10m0s")`, "--node-advertise-address (FERUN_NODE_ADVERTISE_ADDRESS)"} {
+		`--shutdown-grace (FERUN_SHUTDOWN_GRACE, default "10m0s")`, "--node-advertise-address (FERUN_NODE_ADVERTISE_ADDRESS)",
+		`--hibernate-timeout (FERUN_HIBERNATE_TIMEOUT, default "1h0m0s")`,
+		"how long a hibernate may run (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB"} {
 		if !strings.Contains(b.String(), s) {
 			t.Errorf("serve help lacks %q", s)
 		}
@@ -270,5 +275,34 @@ func TestUsage(t *testing.T) {
 	}
 	if EnvName("oidc-client-secret-file") != "FERUN_OIDC_CLIENT_SECRET_FILE" {
 		t.Fatal(EnvName("oidc-client-secret-file"))
+	}
+}
+
+// --hibernate-timeout bounds a hibernate's node call: its variable is
+// FERUN_HIBERNATE_TIMEOUT, its default an hour, and the flag wins over the
+// variable.
+func TestHibernateTimeout(t *testing.T) {
+	t.Parallel()
+	if EnvName("hibernate-timeout") != "FERUN_HIBERNATE_TIMEOUT" {
+		t.Fatal(EnvName("hibernate-timeout"))
+	}
+	c, err := Parse([]string{"--database-url", testURL}, env(nil))
+	if err != nil || c.HibernateTimeout != time.Hour || Default().HibernateTimeout != time.Hour {
+		t.Fatalf("default %v %v", c.HibernateTimeout, err)
+	}
+	c, err = Parse([]string{"--database-url", testURL}, env(map[string]string{"FERUN_HIBERNATE_TIMEOUT": "90m"}))
+	if err != nil || c.HibernateTimeout != 90*time.Minute {
+		t.Fatalf("from the variable %v %v", c.HibernateTimeout, err)
+	}
+	c, err = Parse([]string{"--database-url", testURL, "--hibernate-timeout", "2h"},
+		env(map[string]string{"FERUN_HIBERNATE_TIMEOUT": "90m"}))
+	if err != nil || c.HibernateTimeout != 2*time.Hour {
+		t.Fatalf("from the flag %v %v", c.HibernateTimeout, err)
+	}
+	c = Default()
+	c.DatabaseURL = testURL
+	c.HibernateTimeout = 0
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "--hibernate-timeout must be positive") {
+		t.Fatalf("an instance built in process with no hibernate timeout: %v", err)
 	}
 }

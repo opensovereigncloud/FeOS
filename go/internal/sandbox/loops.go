@@ -234,9 +234,10 @@ func (e *Engine) hibernateAfter(ctx context.Context) error {
 // holds. A node without an object store cannot drain; one that holds
 // nothing but hibernated, lost and pending sandboxes is drained. A pass
 // only starts evacuations, at most drainPerNode per node at a time across
-// passes, and never waits for them (a hibernation takes up to 15 minutes
-// and more): every pass looks at every draining node, its overdue status
-// and its held sandboxes again, and describes its progress.
+// passes, and never waits for them (a hibernation takes minutes per GiB,
+// up to --hibernate-timeout): every pass looks at every draining node,
+// its overdue status and its held sandboxes again, and describes its
+// progress.
 func (e *Engine) drain(ctx context.Context) error {
 	nodes, err := e.st.DrainingNodes(ctx, e.cfg.DrainTimeout)
 	if err != nil {

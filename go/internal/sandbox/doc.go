@@ -22,7 +22,9 @@
 //   - Ensure brings a sandbox to running before a tool call, a forward or a
 //     resume: it places it (the old placement algorithm with the gates of
 //     §9), resolves and pins its image, and starts or joins the ops that
-//     its state needs. Acquire holds it awake while a call runs.
+//     its state needs. A hibernate in flight, which takes minutes, it waits
+//     for only briefly and then tells its caller to come back (ErrBusy).
+//     Acquire holds it awake while a call runs.
 //   - Sync and ReconcileNode apply what a node reports to the rows: Sync
 //     one sandbox after a pod event, ReconcileNode a node's whole inventory
 //     against a snapshot of the rows taken before it was listed.

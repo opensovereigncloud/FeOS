@@ -446,13 +446,91 @@ func TestOpDeadlines(t *testing.T) {
 		{OpResume, 1025, 2*time.Minute + 4*time.Second},
 		{OpRestore, 2048, 7*time.Minute + 5*time.Second + 16*time.Second},
 		{OpPause, 512, 2*time.Minute + 4*time.Second},
-		{OpHibernate, 65536, 15*time.Minute + 64*16*time.Second},
+		{OpHibernate, 65536, time.Hour + 64*16*time.Second},
 		{OpRepair, 1024, 7*time.Minute + 5*time.Second + 8*time.Second},
 	}
 	for _, c := range cases {
 		if got := OpDeadline(c.kind, c.mem); got != c.want {
 			t.Errorf("%s of %d MiB: %v, want %v", c.kind, c.mem, got, c.want)
 		}
+	}
+}
+
+// TestHibernateDeadline: a hibernate op's deadline is the instance's
+// hibernate timeout plus 16 s per GiB, in a fresh begin and in a takeover;
+// the other kinds keep theirs, and an engine without one has the default.
+func TestHibernateDeadline(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.HibernateTimeout = 2 * time.Hour })
+	h.addNode("n1")
+	e := h.eng()
+	want := 2*time.Hour + 16*time.Second
+	if got := e.t.opDeadline(OpHibernate, 1024); got != want {
+		t.Fatalf("hibernate of 1 GiB: %v, want %v", got, want)
+	}
+	for _, k := range []OpKind{OpCreate, OpStart, OpResume, OpRestore, OpPause, OpRepair} {
+		if got := e.t.opDeadline(k, 1024); got != OpDeadline(k, 1024) {
+			t.Errorf("%s: %v, want %v", k, got, OpDeadline(k, 1024))
+		}
+	}
+	def, err := New(Config{InstanceID: "i9"}, Deps{DB: h.d, Conns: h.ins[0].srv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := def.t.opDeadline(OpHibernate, 1024); got != DefaultHibernateTimeout+16*time.Second || got != OpDeadline(OpHibernate, 1024) {
+		t.Fatalf("default hibernate deadline %v", got)
+	}
+
+	// The row's op_deadline, as begin and takeover write it.
+	opLeft := func(id uuid.UUID) time.Duration {
+		t.Helper()
+		var secs float64
+		h.scalar(&secs, "SELECT extract(epoch FROM op_deadline - now()) FROM sandboxes WHERE id = $1", id)
+		return time.Duration(secs * float64(time.Second))
+	}
+	near := func(what string, got time.Duration) {
+		t.Helper()
+		if got > want || got < want-30*time.Second {
+			t.Fatalf("%s: op deadline %v ahead, want %v", what, got, want)
+		}
+	}
+	sb := h.running(1024)
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+	arrived, release := h.gate("n1", podv1.PodService_HibernatePod_FullMethodName)
+	defer release()
+	hd, err := h.begin(sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerExplicit, Target: "n1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitClosed(t, arrived, "the hibernate's call")
+	near("begin", opLeft(sb.ID))
+	if d := time.Until(hd.deadline); d > want || d < want-30*time.Second {
+		t.Fatalf("the node call's deadline is %v ahead, want %v", d, want)
+	}
+	release()
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	if res, err := hd.Wait(ctx); err != nil || res.State != model.StateHibernated {
+		t.Fatalf("hibernate %+v %v", res, err)
+	}
+
+	// A takeover of a dead owner's hibernate gets a deadline of the same
+	// length.
+	h.settle(sb.ID)
+	h.deadInstance("gone")
+	row := h.opOfDeadOwner(h.row(sb.ID), OpHibernate, "gone")
+	if left := opLeft(sb.ID); left > time.Minute {
+		t.Fatalf("the dead owner's deadline is %v ahead", left)
+	}
+	hd, err = h.begin(sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerRepair, Target: "n1", takeover: row.OpID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hd.takeover {
+		t.Fatal("not a takeover")
+	}
+	near("takeover", opLeft(sb.ID))
+	if res, err := hd.Wait(ctx); err != nil || res.State != model.StateHibernated {
+		t.Fatalf("taken over hibernate %+v %v", res, err)
 	}
 }
 
