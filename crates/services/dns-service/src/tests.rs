@@ -34,11 +34,24 @@ struct Upstream {
 /// Answers of a zone: None for silence.
 type Zone = fn(&Query, bool) -> Option<Message>;
 
+/// A UDP and a TCP socket on one port of `ip`. Another program may hold
+/// the UDP port's number in TCP, as tests running beside these do: then
+/// another port.
+async fn sockets(ip: IpAddr) -> (UdpSocket, TcpListener) {
+    loop {
+        let udp = UdpSocket::bind((ip, 0)).await.unwrap();
+        match TcpListener::bind(udp.local_addr().unwrap()).await {
+            Ok(tcp) => return (udp, tcp),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => continue,
+            Err(e) => panic!("TCP on the UDP socket's port: {e}"),
+        }
+    }
+}
+
 impl Upstream {
     async fn start(ip: IpAddr, zone: Zone) -> Self {
-        let udp = UdpSocket::bind((ip, 0)).await.unwrap();
+        let (udp, tcp) = sockets(ip).await;
         let address = udp.local_addr().unwrap();
-        let tcp = TcpListener::bind(address).await.unwrap();
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
         let log = asked.clone();
@@ -239,9 +252,8 @@ async fn resolver_at(
     config: Config,
     upstreams: Vec<SocketAddr>,
 ) -> (Arc<Resolver>, SocketAddr) {
-    let udp = UdpSocket::bind((address, 0)).await.unwrap();
+    let (udp, tcp) = sockets(address).await;
     let address = udp.local_addr().unwrap();
-    let tcp = TcpListener::bind(address).await.unwrap();
     let config = Config {
         upstream_timeout: TIMEOUT,
         ..config
