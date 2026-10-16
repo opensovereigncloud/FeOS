@@ -833,7 +833,8 @@ async fn remove_old_network(inet: bool, dir: &Path) -> io::Result<()> {
         Ok(()) => {}
         // No bridge family, as in feos-host-init's kernel.
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) if e.to_string().contains("not supported") => {}
+        // EOPNOTSUPP, whose text musl gives as "Not supported".
+        Err(e) if e.to_string().to_lowercase().contains("not supported") => {}
         Err(e) => warn!("Network: Failed to remove the table bridge {TABLE}: {e}"),
     }
     if inet && let Err(e) = nft::delete(Family::Inet, TABLE) {
