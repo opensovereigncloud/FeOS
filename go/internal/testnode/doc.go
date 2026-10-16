@@ -1,0 +1,28 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package testnode is a Go implementation of what feosd does on the wire
+// to the control plane (ADR 0015), for tests and local development: a
+// node that ferund cannot tell from feosd by what it sends and answers.
+//
+// The node joins with a token "feos-join-<secret>.<pin>" over a connection
+// that authenticates the control plane by the token's pin, or takes the
+// identity it kept in its state directory. Afterwards it keeps a node
+// connection (ALPN "feos-node/1") to every instance the control plane
+// lists, on which it is the HTTP/2 server of its feos.* APIs, and an
+// uplink (ALPN "h2") to every one, of which it uses one at a time: there
+// it reports telemetry, publishes its events with dense sequence numbers
+// per start and acknowledgements, renews its certificate and asks for
+// pods' credentials.
+//
+// Its pods live in memory and follow feosd's rules: creates are idempotent
+// by their normalised spec, the lifecycle calls have feosd's preconditions
+// and answers, hibernations go to a fake object store that nodes share
+// (in memory, or in a directory that several processes share),
+// and calls that carry "feos-pod-id" reach a fake guest: commands run with
+// a temporary directory per pod as their working directory, the tools work
+// on that directory, watches answer with scripted events, and port
+// forwards dial local addresses. A Script injects faults and scripted
+// answers while the node runs; Restart, Crash and Partition play what
+// happens to a real node.
+package testnode
