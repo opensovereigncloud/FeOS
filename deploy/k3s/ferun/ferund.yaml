@@ -56,6 +56,23 @@ spec:
               value: 2m
             - name: FERUN_SHUTDOWN_GRACE
               value: 2m
+            # People sign in to the UI and the admin API with their FeCode ID
+            # (id.fecode.dev); its group admins gets the admin surface.
+            - name: FERUN_PUBLIC_URL
+              value: https://run.fecode.dev
+            - name: FERUN_OIDC_ISSUER
+              value: https://id.fecode.dev/
+            - name: FERUN_OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oidc-client-ferun
+                  key: client_id
+            - name: FERUN_OIDC_CLIENT_SECRET_FILE
+              value: /etc/ferun/oidc/secret
+            - name: FERUN_OIDC_ADMIN_GROUP
+              value: admins
+            - name: FERUN_SESSION_TTL
+              value: 12h
           ports:
             - name: http
               containerPort: 8100
@@ -81,11 +98,22 @@ spec:
             - name: ca
               mountPath: /etc/ferun/ca
               readOnly: true
+            - name: oidc
+              mountPath: /etc/ferun/oidc
+              readOnly: true
       volumes:
         - name: ca
           secret:
             secretName: ferun-ca
             defaultMode: 0400
+        # ~/idp/create-client.sh ferun ferun
+        - name: oidc
+          secret:
+            secretName: oidc-client-ferun
+            defaultMode: 0400
+            items:
+              - key: client_secret
+                path: secret
 ---
 apiVersion: v1
 kind: Service

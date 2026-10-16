@@ -7,8 +7,8 @@ traefik, cert-manager, the registry oci.fecore.dev) runs the whole platform:
 | Part | Where | What |
 |---|---|---|
 | [`feos/`](feos/) | namespace `feos`, a DaemonSet on every node labelled `feos.fecode.dev/node=true` | installs FeOS's packages (feosd, diskd, feosctl, Firecracker, the guest) on the node and has systemd run them |
-| [`ferun/`](ferun/) | namespace `ferun` | ferund, FeRun's control plane (ADR 0015), and its PostgreSQL; https://run.fecode.dev |
-| [`fechat/`](fechat/) | namespace `fechat` | FeChat, the chat client whose tools run in FeRun's sandboxes; https://chat.fecode.dev |
+| [`ferun/`](ferun/) | namespace `ferun` | ferund, FeRun's control plane (ADR 0015), and its PostgreSQL; https://run.fecode.dev, sign-in with a FeCode ID |
+| [`fechat/`](fechat/) | namespace `fechat` | FeChat, the chat client whose tools run in FeRun's sandboxes; https://chat.fecode.dev, sign-in with a FeCode ID |
 
 FeOS runs on the nodes as it would on any Debian machine: the DaemonSet is
 only how the packages get there. feosd and diskd are the host's services, so
@@ -76,7 +76,12 @@ instances' certificates on the nodes' port carry and the nodes check
       --from-literal=FERUN_BOOTSTRAP_TOKEN=$(openssl rand -hex 32)
 
 The bootstrap token becomes a token of the tenant `operator` while there is
-no tenant: FeChat's `FERUN_TOKEN`.
+no tenant: FeChat's `FERUN_TOKEN`. The admin users are a fallback: people
+sign in to ferund's UI and admin API with their FeCode ID
+(https://id.fecode.dev, the users FeCode, FeRun and FeChat share), and the
+group `admins` there gets the admin surface. ferund's client at the IdP:
+
+    ~/idp/create-client.sh ferun ferun      # secret oidc-client-ferun
 
 ### Deploy
 

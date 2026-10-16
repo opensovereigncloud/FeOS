@@ -13,6 +13,7 @@
 #   ferund-postgres   password: PostgreSQL's
 #   ferund            FERUN_DATABASE_URL, FERUN_ADMIN_USERS,
 #                     FERUN_BOOTSTRAP_TOKEN
+#   oidc-client-ferun ferund's client at id.fecode.dev: ~/idp/create-client.sh ferun ferun
 apiVersion: v1
 kind: Namespace
 metadata:
