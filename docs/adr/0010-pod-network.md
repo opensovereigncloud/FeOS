@@ -112,7 +112,12 @@ from node to node would need a route per pod, changed with every move.
 - It tells pods apart by the source address of a query, which the TAP
   pins.
 - Its sockets outlive restarts of `feosd`: a query waits in them, it does
-  not fail.
+  not fail. They are handed over as systemd hands sockets to a service
+  (`sd_listen_fds`): under systemd, a socket unit holds them, and a query
+  while `feosd` is stopped starts it; under `feos-host-init`, PID 1 binds
+  them and hands them to every `feosd` it starts; a self-upgrade hands
+  them to the new binary. `feosd` answers on them once it knows its pods
+  again, so that a query that waited is not refused.
 
 ### Metadata
 
@@ -196,6 +201,12 @@ from node to node would need a route per pod, changed with every move.
   upstream per pod and no record of queries (ADR 0013).
 - **A resolver next to `feosd`**, such as Unbound: one more program to
   package, and the upstreams per pod to configure in it.
+- **Sockets that `feosd` binds at every start**: a query while it restarts
+  fails, and a pod's resolver waits seconds before it asks again.
+- **systemd's file descriptor store** (`FDSTORE=1`), into which `feosd`
+  puts sockets it bound itself: the address would stay `feosd`'s flag
+  alone, but the store keeps them across a stop only from systemd 254 on,
+  and `feos-host-init` would have to keep a store of its own.
 - **A ULA address for the resolver**, `fdfd:07b5:61d9::53` as the second
   version had: pods have IPv4, and a link-local address next to the
   gateway needs no prefix of its own.
@@ -237,8 +248,6 @@ from node to node would need a route per pod, changed with every move.
 - **Load balancers**: HTTPS with ACME, L4, IPv4 clients, and holding
   requests while a pod resumes. They are the control plane's front doors
   (ADR 0001) and get an ADR of their own.
-- **How the DNS sockets outlive `feosd`**: socket activation under
-  systemd, and its like under `feos-host-init`.
 - **Changing a pod's metadata** while it runs: the spec is fixed at the
   pod's creation, and Firecracker's store takes changes at any time.
 - **Telling an IPv4-only listener apart**, so that a pod's status says

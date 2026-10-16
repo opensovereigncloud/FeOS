@@ -138,6 +138,7 @@ impl Pods {
         }
         kept.extend(hibernated);
         network.sync(&kept);
+        network.serve_dns();
         volumes.reconcile(&kept);
         let (events, _) = broadcast::channel(256);
         let pods = Self {

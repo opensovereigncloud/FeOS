@@ -71,6 +71,10 @@ pub struct ServerOptions {
     /// The pods' network (ADR 0010).
     #[cfg(feature = "host")]
     pub network: pod_service::network::Config,
+    /// The sockets handed to `feosd` (`feos_utils::listen_fds`): the
+    /// resolver's, which outlive it.
+    #[cfg(feature = "host")]
+    pub dns_sockets: Vec<(std::os::fd::OwnedFd, String)>,
     /// diskd's socket, which the pods' disks come from (ADR 0011); its
     /// default when unset.
     #[cfg(feature = "host")]
@@ -87,6 +91,8 @@ impl ServerOptions {
             tcp: None,
             #[cfg(feature = "host")]
             network: Default::default(),
+            #[cfg(feature = "host")]
+            dns_sockets: Vec::new(),
             #[cfg(feature = "host")]
             diskd_socket: None,
         }
@@ -133,8 +139,13 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     #[cfg(feature = "host")]
     let vms = initialize_vm_service(&setup_database().await?).await?;
     #[cfg(feature = "host")]
-    let (pods, volumes, groups, traffic) =
-        initialize_pod_service(vms, options.network, options.diskd_socket).await?;
+    let (pods, volumes, groups, traffic) = initialize_pod_service(
+        vms,
+        options.network,
+        options.dns_sockets,
+        options.diskd_socket,
+    )
+    .await?;
     let services = Services {
         #[cfg(feature = "host")]
         pods,

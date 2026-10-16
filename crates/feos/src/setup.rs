@@ -57,11 +57,12 @@ pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmApiHandler> 
 
 /// The pods, on top of the VM service, their disks from diskd, their
 /// volumes, and their network: its security groups and the records of its
-/// traffic.
+/// traffic, and the resolver on the sockets handed to `feosd`, if any.
 #[cfg(feature = "host")]
 pub(crate) async fn initialize_pod_service(
     vms: VmApiHandler,
     network: pod_service::network::Config,
+    dns_sockets: Vec<(std::os::fd::OwnedFd, String)>,
     diskd_socket: Option<std::path::PathBuf>,
 ) -> Result<(
     pod_service::Pods,
@@ -74,8 +75,14 @@ pub(crate) async fn initialize_pod_service(
     // TrafficService.
     let (records, _) = tokio::sync::broadcast::channel(pod_service::network::RECORDS);
     let dir = Path::new(pod_service::POD_DIR);
-    let network =
-        pod_service::network::Network::start(network, dir, groups.clone(), records.clone()).await;
+    let network = pod_service::network::Network::start(
+        network,
+        dns_sockets,
+        dir,
+        groups.clone(),
+        records.clone(),
+    )
+    .await;
     let disks = pod_service::disk::Disks::new(
         diskd_socket.unwrap_or_else(|| pod_service::disk::DISKD_SOCKET.into()),
     );
@@ -266,8 +273,10 @@ pub(crate) fn handle_upgrade(new_binary_path: &Path) -> Result<()> {
     let cstr_path = CString::new(current_exe.into_os_string().into_vec()).unwrap();
 
     info!("Main: Executing new binary with arguments: {cstr_args:?}");
-    let Err(e) = nix::unistd::execv(&cstr_path, &cstr_args);
-    // execv replaces the current process, so it should not return.
+    // The new binary gets the resolver's sockets, which pods' queries wait
+    // in meanwhile (ADR 0010).
+    let e = feos_utils::listen_fds::exec(&cstr_path, &cstr_args);
+    // The exec replaces the current process, so it should not return.
     // If it returns, it's a fatal error.
     panic!("FATAL: execv failed after replacing binary: {e}");
 }

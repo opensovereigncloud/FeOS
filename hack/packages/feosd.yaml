@@ -29,6 +29,10 @@ contents:
     dst: /usr/lib/systemd/system/feosd.service
     file_info:
       mode: 0644
+  - src: hack/packages/feosd/feosd.socket
+    dst: /usr/lib/systemd/system/feosd.socket
+    file_info:
+      mode: 0644
   - src: hack/packages/feosd/feosd.sysusers
     dst: /usr/lib/sysusers.d/feosd.conf
     file_info:

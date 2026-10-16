@@ -20,6 +20,7 @@ use devices::PodLink;
 use dns_service::Resolver;
 use feos_proto::network_service::{traffic_record, TrafficRecord};
 use feos_proto::pod_service::{PodInfo, PodNetwork, PodSpec};
+use feos_utils::listen_fds;
 use feos_utils::nft::{self, Family, Table};
 use log::{error, info, warn};
 use network_service::{compile, delta, Delta, Policy, Prefix, SecurityGroups};
@@ -27,6 +28,7 @@ use rtnetlink::Handle;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -221,22 +223,36 @@ struct Parts {
     ipv6: Ipv6Addresses,
     ipv4: Ipv4Addresses,
     resolver: Arc<Resolver>,
+    /// The resolver's sockets until it serves on them.
+    sockets: Mutex<Option<(UdpSocket, TcpListener)>>,
 }
+
+/// The resolver's sockets that were handed to `feosd`, if any.
+type Handed = (Option<std::net::UdpSocket>, Option<std::net::TcpListener>);
 
 impl Network {
     /// Sets the node up for pods: removes the first version's bridge and
     /// tables and the NAT64 version's translator, turns forwarding on,
     /// routes the pod prefix as unreachable, and gives the resolver its
-    /// address and sockets. A failure is logged, and fails the pods with a
-    /// network from then on: feosd goes on serving the others.
+    /// address and sockets: those of `sockets` that are bound to its
+    /// address, which systemd or `feos-host-init` hold across restarts of
+    /// `feosd` (ADR 0010), or new ones. A failure is logged, and fails the
+    /// pods with a network from then on: feosd goes on serving the others.
     pub async fn start(
         config: Config,
+        sockets: Vec<(OwnedFd, String)>,
         dir: &Path,
         groups: SecurityGroups,
         records: broadcast::Sender<TrafficRecord>,
     ) -> Self {
+        let resolver = SocketAddr::new(config.dns_address.into(), DNS_PORT);
+        let (udp, tcp, refused) = listen_fds::bound_to(sockets, resolver);
+        for reason in refused {
+            warn!("Network: The resolver does not take the {reason}");
+        }
+        let mut handed = (udp, tcp);
         let parts = match config.pod_prefix {
-            Some(prefix) => match set_up_again(&config, prefix, dir, &records).await {
+            Some(prefix) => match set_up_again(&config, prefix, dir, &records, &mut handed).await {
                 Ok(parts) => {
                     let (range, range_len) = config.pod_ipv4_range;
                     info!(
@@ -468,6 +484,24 @@ impl Network {
             }
         }
         changed
+    }
+
+    /// Lets the resolver answer on its sockets, once it knows the pods
+    /// ([`Network::sync`]): a query that waited in them while `feosd`
+    /// restarted is answered then, not refused.
+    pub fn serve_dns(&self) {
+        let Ok(parts) = self.parts() else {
+            return;
+        };
+        let Some((udp, tcp)) = lock(&parts.sockets).take() else {
+            return;
+        };
+        let serving = parts.resolver.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serving.serve(udp, tcp).await {
+                error!("Network: The resolver stopped: {e}");
+            }
+        });
     }
 
     /// Brings the resolver's pods in line with the pods kept: after a
@@ -703,12 +737,14 @@ impl Network {
 }
 
 /// Sets the node up for pods, see [`Network::start`]. Every step can be
-/// taken again; the resolver's sockets are bound last.
+/// taken again; the resolver's sockets are taken from `handed` or bound
+/// last.
 async fn set_up(
     config: &Config,
     (prefix, len): (Ipv6Addr, u8),
     dir: &Path,
     records: &broadcast::Sender<TrafficRecord>,
+    handed: &mut Handed,
 ) -> io::Result<Parts> {
     config.check().map_err(io::Error::other)?;
     remove_old_network(false, dir).await?;
@@ -726,28 +762,43 @@ async fn set_up(
         ..Default::default()
     });
     let address = SocketAddr::new(config.dns_address.into(), DNS_PORT);
-    let udp = UdpSocket::bind(address)
-        .await
-        .map_err(|e| io::Error::new(e.kind(), format!("DNS: bind udp {address}: {e}")))?;
-    let tcp = TcpListener::bind(address)
-        .await
-        .map_err(|e| io::Error::new(e.kind(), format!("DNS: bind tcp {address}: {e}")))?;
+    let udp = match handed.0.take() {
+        Some(socket) => {
+            info!("Network: The resolver takes the UDP socket handed to feosd");
+            socket.set_nonblocking(true)?;
+            UdpSocket::from_std(socket)?
+        }
+        None => UdpSocket::bind(address)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("DNS: bind udp {address}: {e}")))?,
+    };
+    let tcp = match handed.1.take() {
+        Some(listener) => {
+            info!("Network: The resolver takes the TCP socket handed to feosd");
+            listener.set_nonblocking(true)?;
+            TcpListener::from_std(listener)?
+        }
+        None => TcpListener::bind(address)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("DNS: bind tcp {address}: {e}")))?,
+    };
+    // A self-upgrade hands them to the next feosd.
+    for fd in [udp.as_fd(), tcp.as_fd()] {
+        if let Err(e) = listen_fds::hand_on(fd, listen_fds::DNS) {
+            warn!("Network: A self-upgrade will not hand on the resolver's sockets: {e}");
+        }
+    }
     tokio::spawn(forward_records(
         resolver.subscribe(),
         records.clone(),
         |_| true,
     ));
-    let serving = resolver.clone();
-    tokio::spawn(async move {
-        if let Err(e) = serving.serve(udp, tcp).await {
-            error!("Network: The resolver stopped: {e}");
-        }
-    });
     let (range, range_len) = config.pod_ipv4_range;
     Ok(Parts {
         ipv6: Ipv6Addresses::new(dir, prefix, len),
         ipv4: Ipv4Addresses::new(dir, range, range_len),
         resolver,
+        sockets: Mutex::new(Some((udp, tcp))),
     })
 }
 
@@ -758,10 +809,11 @@ async fn set_up_again(
     prefix: (Ipv6Addr, u8),
     dir: &Path,
     records: &broadcast::Sender<TrafficRecord>,
+    handed: &mut Handed,
 ) -> io::Result<Parts> {
     let mut attempt = 1;
     loop {
-        match set_up(config, prefix, dir, records).await {
+        match set_up(config, prefix, dir, records, handed).await {
             Err(e) if attempt < SET_UP_ATTEMPTS => {
                 warn!("Network: Setting the pods' network up failed, trying again: {e}");
                 attempt += 1;
@@ -1000,6 +1052,7 @@ mod tests {
             ipv6: Ipv6Addresses::new(dir, prefix, len),
             ipv4: Ipv4Addresses::new(dir, range, range_len),
             resolver: Resolver::new(dns_service::Config::default()),
+            sockets: Mutex::new(None),
         });
         network
     }

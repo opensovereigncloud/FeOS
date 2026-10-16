@@ -111,8 +111,16 @@ impl Args {
     }
 }
 
+fn main() -> Result<()> {
+    // The resolver's sockets, if systemd, feos-host-init or the feosd
+    // before a self-upgrade handed them over (ADR 0010).
+    // SAFETY: the process has no other threads yet.
+    let dns_sockets = unsafe { feos_utils::listen_fds::take() };
+    serve(dns_sockets)
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn serve(dns_sockets: Vec<(std::os::fd::OwnedFd, String)>) -> Result<()> {
     let args = Args::parse(std::env::args().skip(1))?;
     if args.version {
         println!("feosd {}", feos_utils::version::full_version_string());
@@ -137,6 +145,7 @@ async fn main() -> Result<()> {
     run_server(ServerOptions {
         tcp: args.tcp,
         network: args.network,
+        dns_sockets,
         diskd_socket: args.diskd_socket,
         ..ServerOptions::new(args.restarted_after_upgrade, args.self_upgrade)
     })

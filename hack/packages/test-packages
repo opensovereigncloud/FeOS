@@ -3,7 +3,8 @@
 # privileged container, and check feosd and diskd under systemd: feosd's
 # group and socket, a pod from the installed guest and Firecracker on a
 # disk from diskd, its cgroup, a
-# restart that keeps the pod, the refused self-upgrade, what autoremove
+# restart that keeps the pod, the resolver's sockets in feosd.socket
+# across a stop of feosd, the refused self-upgrade, what autoremove
 # keeps, a pod's disk across a restart of diskd and a stop, no
 # hibernation without an object store, pods on feosd's network (an fd00: prefix and link-local IPv4
 # addresses behind proxy ARP and masquerade, DNS, security groups, a
@@ -416,6 +417,28 @@ in_pod wget -q -O - http://example.com/ | contains "Example Domain" ||
 [ "$(pod_metadata feos/pod-id)" = "${pod}" ] || fail "the pod lost its metadata with a restart of feosd"
 log "the pod outlived a restart of feosd, with its network and its metadata"
 
+# The resolver's sockets are feosd.socket's, which feosd takes and which
+# outlive it (ADR 0010): a query while feosd is stopped waits in them,
+# starts feosd, and is answered, not refused. feosctl reaches the pod
+# through feosd: the pod puts its query off until feosd has stopped, and
+# nothing but the query starts feosd again.
+for proto in -u -t; do
+  in_node ss -Hlnp "${proto}" src 169.254.0.53:53 | contains -F '"systemd"' ||
+    fail "systemd does not hold the resolver's socket (ss ${proto})"
+  in_node ss -Hlnp "${proto}" src 169.254.0.53:53 | contains -F '"feosd"' ||
+    fail "feosd does not serve on systemd's socket (ss ${proto}): $(in_node ss -Hlnp "${proto}" src 169.254.0.53)"
+done
+in_pod sh -c 'setsid sh -c "sleep 8; nslookup dns.google >/tmp/stopped 2>&1" </dev/null >/dev/null 2>&1 &'
+in_node systemctl stop feosd 2>/dev/null
+in_node systemctl is-active feosd >/dev/null && fail "feosd did not stop"
+in_node systemctl is-active feosd.socket >/dev/null || fail "feosd.socket stopped with feosd"
+await "the pod's query did not start feosd" in_node systemctl is-active feosd
+answered_while_stopped() { in_pod cat /tmp/stopped | contains -F "8.8.8.8"; }
+await "no answer to the query while feosd was stopped" answered_while_stopped
+in_node journalctl -u feosd --no-pager -n 300 |
+  contains "The resolver takes the UDP socket handed to feosd" || fail "feosd bound a socket of its own"
+log "the pods' resolver's sockets are feosd.socket's: a query while feosd is stopped starts it and is answered"
+
 # The pod's disk outlives diskd: the next diskd takes its device over.
 in_node systemctl restart diskd
 await "diskd did not come back" in_node systemctl is-active diskd
@@ -445,6 +468,9 @@ log "a pod is deleted with its microVM"
 
 in_node dpkg -r feosd >/dev/null
 if in_node systemctl is-active feosd >/dev/null 2>&1; then fail "feosd runs after its removal"; fi
+if in_node systemctl is-active feosd.socket >/dev/null 2>&1; then
+  fail "feosd.socket is active after the removal"
+fi
 in_node sh -c 'dpkg -i /opt/packages/feosd_*.deb' >/dev/null
 await "feosd is not active again" in_node systemctl is-active feosd
 log "removing the package stops feosd, installing it starts it"

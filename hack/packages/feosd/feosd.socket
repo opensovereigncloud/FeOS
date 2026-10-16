@@ -1,0 +1,22 @@
+[Unit]
+Description=FeOS pods' resolver
+Documentation=https://github.com/ironcore-dev/FeOS
+
+# feosd answers the pods' DNS on these sockets. They outlive restarts and
+# upgrades of feosd, so that a pod's query waits in them meanwhile, and a
+# query while feosd is stopped starts it (ADR 0010). feosd.service wants
+# this unit. The address is feosd's --dns-address: a node that moves the
+# resolver moves these sockets with a drop-in, such as
+# /etc/systemd/system/feosd.socket.d/address.conf:
+#
+#   [Socket]
+#   ListenDatagram=
+#   ListenStream=
+#   ListenDatagram=169.254.1.53:53
+#   ListenStream=169.254.1.53:53
+[Socket]
+ListenDatagram=169.254.0.53:53
+ListenStream=169.254.0.53:53
+# feosd gives the node the address after it starts.
+FreeBind=yes
+FileDescriptorName=dns

@@ -7,6 +7,7 @@ pub mod feos_logger;
 pub mod filesystem;
 pub mod fs;
 pub mod host;
+pub mod listen_fds;
 pub mod nft;
 pub mod reaper;
 pub mod resolver;

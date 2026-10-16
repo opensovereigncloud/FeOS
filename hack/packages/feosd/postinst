@@ -1,7 +1,9 @@
 #!/bin/sh
 # feosd's group, and its unit: enabled on the first install, and started,
 # or restarted after an upgrade, whenever it is enabled. A restart keeps
-# the VMs running.
+# the VMs running, and the pods' queries wait in feosd.socket, which the
+# unit wants. A feosd from before feosd.socket holds the resolver's
+# address itself: it stops before the socket binds the address.
 set -e
 if [ "$1" = configure ]; then
     systemd-sysusers feosd.conf >/dev/null 2>&1 || true
@@ -11,6 +13,9 @@ if [ "$1" = configure ]; then
     if [ -d /run/systemd/system ]; then
         systemctl daemon-reload
         if systemctl is-enabled --quiet feosd.service; then
+            if ! systemctl is-active --quiet feosd.socket; then
+                systemctl stop feosd.service
+            fi
             systemctl restart feosd.service
         fi
     fi

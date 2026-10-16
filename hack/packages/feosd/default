@@ -20,6 +20,9 @@
 #                             holds, 169.254.0.53 by default. The pods'
 #                             gateway is 169.254.0.1, which the node answers
 #                             ARP for on their TAP devices and never holds.
+#                             feosd.socket holds the resolver's sockets
+#                             across restarts of feosd: another address
+#                             needs a drop-in for it too, as the unit says.
 #   --dns-upstream ADDRESS    a resolver it asks for pods that name none
 #                             (repeatable); Google's and Cloudflare's by
 #                             default.

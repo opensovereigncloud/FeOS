@@ -41,7 +41,10 @@ reaps orphans, runs `/usr/sbin/diskd --state-dir /var/lib/feos/disk`
 without an object store, and `/usr/sbin/feosd --self-upgrade --tcp [::]:1337`,
 with `--pod-prefix` and the prefix DHCPv6 delegated to the node if it got
 one, which it also routes as unreachable; it starts each again a second
-after it ends. It serves no API and logs to `/dev/kmsg`.
+after it ends. It binds the pods' resolver's UDP and TCP sockets to
+`169.254.0.53:53` before the node holds the address (`IP_FREEBIND`),
+keeps them, and hands them to every `feosd` it starts, as systemd would
+([DNS](#dns)). It serves no API and logs to `/dev/kmsg`.
 
 On a distribution all of this is the operating system's
 ([ADR 0009](../adr/0009-node-os-and-packages.md)).
@@ -59,8 +62,8 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
   systemd set one.
 - `HostService.Reboot` and `Shutdown` send PID 1 `SIGRTMIN+5` and
   `SIGRTMIN+4`. `UpgradeFeosBinary` replaces the binary and runs it with
-  the same pid only with `--self-upgrade`; without, the call fails with
-  `FAILED_PRECONDITION`.
+  the same pid, and the resolver's sockets, only with `--self-upgrade`;
+  without, the call fails with `FAILED_PRECONDITION`.
 - It is the subreaper of its children. Pods and the task service outlive
   it: a `feosd` that starts again takes the running pods over and keeps the
   running task service.
@@ -207,8 +210,8 @@ At its start `feosd`:
 3. routes the pod prefix as `unreachable`: a packet for a pod that is not
    here goes back as unreachable rather than out again;
 4. gives the dummy device `feos-dns` the resolver's address as a /32, and
-   no other global address, and binds the resolver's UDP and TCP sockets
-   to it, port 53.
+   no other global address, and takes the resolver's UDP and TCP sockets
+   at it, port 53, that were handed to it ([DNS](#dns)), or binds them.
 
 Of the pods' addresses on their links, the node holds the resolver's
 alone. It never holds `169.254.0.1`: where that is the gateway of the
@@ -292,9 +295,19 @@ loopback, link-local or multicast address, in a denied prefix, a pod's
 
 Answers pass as the upstream gave them: pods have IPv4, so nothing is
 synthesized. The resolver takes `ech` out of HTTPS records, and records
-every query it answers. Its sockets are `feosd`'s and close while it
-restarts: a query then fails rather than waits (ADR 0010 wants them to
-outlive `feosd`).
+every query it answers.
+
+Its sockets outlive `feosd`, so that a query waits in them while `feosd`
+restarts rather than fails. They are handed to `feosd` by systemd's
+protocol (`sd_listen_fds`: from fd 3 on, `LISTEN_FDS`, `LISTEN_PID`,
+`LISTEN_FDNAMES`, here `dns`), by `feosd.socket` under systemd
+([Packages](#packages)), by `feos-host-init` under FeOS, and by `feosd`
+itself to the binary of a self-upgrade. `feosd` takes, before it starts
+threads, the UDP socket and the listening TCP socket bound to
+`--dns-address`, port 53, closes the others, and removes the variables
+from its environment; without, it binds its own. It answers on them once
+it has gone through its pods, so that a query that waited is not
+refused.
 
 ### Metadata
 
@@ -522,7 +535,7 @@ packages from https://apt.fecode.dev
 
 | Package | Contents |
 |---|---|
-| `feosd` | `/usr/sbin/feosd`, `feosd.service`, the group `feos` (sysusers), `/etc/default/feosd`, `/etc/apt/apt.conf.d/50feosd` |
+| `feosd` | `/usr/sbin/feosd`, `feosd.service`, `feosd.socket`, the group `feos` (sysusers), `/etc/default/feosd`, `/etc/apt/apt.conf.d/50feosd` |
 | `feosctl` | `/usr/bin/feosctl` |
 | `diskd` | `/usr/sbin/diskd`, `/usr/sbin/diskctl`, `diskd.service`, `/etc/default/diskd`, `/usr/lib/modules-load.d/diskd.conf` |
 | `feos-firecracker-<version>` | `/usr/lib/feos/firecracker/<version>/{firecracker,jailer}` |
@@ -546,6 +559,16 @@ no `--pod-prefix`, so pods with a network fail until one is set.
 Installing the package enables the unit the first time and starts it, or
 restarts it after an upgrade, whenever it is enabled; removing the package
 stops the unit; purging it disables the unit. `/var/lib/feos` stays.
+
+`feosd.socket` holds the pods' resolver's sockets, UDP and TCP at
+`169.254.0.53:53`, `FreeBind=yes` since `feosd` gives the node the
+address later, named `dns`; `feosd.service` wants it, and it starts
+before. A restart or an upgrade of `feosd` leaves it, and a query while
+`feosd` is stopped starts `feosd`. A node whose `--dns-address` is
+another moves the socket with a drop-in, as the unit says. Installing the
+package stops a running `feosd` first when the socket is not active yet:
+a `feosd` from before the socket holds the address itself. Removing the
+package stops the socket too.
 
 `diskd.service` is `Type=notify`: active once diskd serves, its devices
 recovered; `feosd.service` wants it and starts after it. `KillMode=process`

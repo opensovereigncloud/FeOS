@@ -4,15 +4,22 @@
 //! Runs feosd and diskd, and starts each again when it ends. feosd
 //! replaces its own binary in an upgrade and runs it with the same pid, so
 //! the wait goes on across an upgrade. The pods' disks outlive diskd: the
-//! next one takes them over.
+//! next one takes them over. The pods' resolver's sockets outlive feosd:
+//! feos-host-init holds them and hands them to every feosd it starts.
 
+use feos_utils::listen_fds;
 use log::{error, info, warn};
-use std::net::Ipv6Addr;
+use std::ffi::{CStr, CString};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4};
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Where the initramfs has feosd, where the package installs it.
-const FEOSD: &str = "/usr/sbin/feosd";
+const FEOSD: &CStr = c"/usr/sbin/feosd";
+/// The pods' resolver at feosd's default `--dns-address`
+/// (`dns_service::ADDRESS`), which feos-host-init does not change.
+const RESOLVER: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(169, 254, 0, 53), 53);
 /// feosd replaces its own binary here, and serves on TCP: a node whose
 /// operating system is FeOS has no package manager, and no other way in.
 const FEOSD_ARGS: &[&str] = &["--self-upgrade", "--tcp", "[::]:1337"];
@@ -36,18 +43,47 @@ fn feosd_args(pod_prefix: Option<(Ipv6Addr, u8)>) -> Vec<String> {
     args
 }
 
-pub async fn run_feosd(pod_prefix: Option<(Ipv6Addr, u8)>) {
-    let args = feosd_args(pod_prefix);
+/// The pods' resolver's sockets, bound to `feosd`'s default `--dns-address`
+/// before the node holds it, which `feosd` takes from every start to the
+/// next (ADR 0010): a pod's query waits in them while `feosd` restarts.
+/// Without them, `feosd` binds its own.
+pub fn resolver_sockets() -> Option<(OwnedFd, OwnedFd)> {
+    match listen_fds::bind_freely(RESOLVER) {
+        Ok(sockets) => Some(sockets),
+        Err(e) => {
+            error!("Failed to bind the pods' resolver's sockets to {RESOLVER}: {e}");
+            None
+        }
+    }
+}
+
+pub async fn run_feosd(pod_prefix: Option<(Ipv6Addr, u8)>, resolver: Option<(OwnedFd, OwnedFd)>) {
+    let mut argv = vec![CString::from(FEOSD)];
+    argv.extend(
+        feosd_args(pod_prefix)
+            .into_iter()
+            .filter_map(|arg| CString::new(arg).ok()),
+    );
+    let sockets: Vec<_> = resolver
+        .iter()
+        .flat_map(|(udp, tcp)| {
+            [
+                (udp.as_fd(), listen_fds::DNS),
+                (tcp.as_fd(), listen_fds::DNS),
+            ]
+        })
+        .collect();
     loop {
-        // A std child: the reaper owns waitpid in PID 1.
-        match Command::new(FEOSD).args(&args).stdin(Stdio::null()).spawn() {
-            Ok(child) => {
-                let pid = child.id() as i32;
+        // Not a std child: the reaper owns waitpid in PID 1, and the child
+        // needs the sockets and the pid it has.
+        match listen_fds::spawn(FEOSD, &argv, &sockets) {
+            Ok(pid) => {
+                let pid = pid.as_raw();
                 info!("Started feosd (pid {pid})");
                 let code = feos_utils::reaper::wait_for_exit(pid).await;
                 warn!("feosd (pid {pid}) exited with code {code}; starting it again");
             }
-            Err(e) => error!("Failed to start {FEOSD}: {e}"),
+            Err(e) => error!("Failed to start {FEOSD:?}: {e}"),
         }
         tokio::time::sleep(RESTART_DELAY).await;
     }
