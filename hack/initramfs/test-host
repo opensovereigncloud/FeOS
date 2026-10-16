@@ -109,6 +109,8 @@ for test in /feos-tests/*; do
   done
 done
 echo "feos-kernel-tests: ${status}"
+# The console drains first: the kernel's "Power Off" would cut the line.
+sleep 1
 echo o >/proc/sysrq-trigger
 sleep 10
 EOF
