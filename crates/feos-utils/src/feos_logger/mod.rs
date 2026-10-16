@@ -6,6 +6,8 @@ use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::Write;
+use std::sync::mpsc::sync_channel;
+use std::time::Duration;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -159,10 +161,18 @@ impl LogReader {
 
 type HistoryRequest = oneshot::Sender<VecDeque<LogEntry>>;
 
-struct LogMessage {
-    level: Level,
-    target: String,
-    message: String,
+/// How long a flush waits for the actor, which may run on the thread that
+/// waits: then it writes the records later, or never.
+const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+enum LogMessage {
+    Record {
+        level: Level,
+        target: String,
+        message: String,
+    },
+    /// Answered once the records before it are written.
+    Flush(std::sync::mpsc::SyncSender<()>),
 }
 
 struct FeosLogger {
@@ -180,7 +190,7 @@ impl Log for FeosLogger {
             return;
         }
 
-        let msg = LogMessage {
+        let msg = LogMessage::Record {
             level: record.level(),
             target: record.target().to_string(),
             message: format!("{}", record.args()),
@@ -191,7 +201,14 @@ impl Log for FeosLogger {
         }
     }
 
-    fn flush(&self) {}
+    /// Waits until the actor has written what was logged before, as an
+    /// exec, which would drop it, needs.
+    fn flush(&self) {
+        let (done, written) = sync_channel(1);
+        if self.sender.try_send(LogMessage::Flush(done)).is_ok() {
+            let _ = written.recv_timeout(FLUSH_TIMEOUT);
+        }
+    }
 }
 
 struct LoggerActor {
@@ -210,14 +227,22 @@ impl LoggerActor {
         loop {
             tokio::select! {
                 Some(msg) = self.log_receiver.recv() => {
+                    let (level, target, message) = match msg {
+                        LogMessage::Record { level, target, message } => (level, target, message),
+                        LogMessage::Flush(done) => {
+                            let _ = self.stdout_writer.flush();
+                            let _ = done.send(());
+                            continue;
+                        }
+                    };
                     self.seq_counter += 1;
 
                     let entry = LogEntry {
                         seq: self.seq_counter,
                         timestamp: Utc::now(),
-                        level: msg.level,
-                        target: msg.target,
-                        message: msg.message,
+                        level,
+                        target,
+                        message,
                     };
 
                     if self.log_to_stdout {

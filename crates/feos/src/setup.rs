@@ -273,6 +273,8 @@ pub(crate) fn handle_upgrade(new_binary_path: &Path) -> Result<()> {
     let cstr_path = CString::new(current_exe.into_os_string().into_vec()).unwrap();
 
     info!("Main: Executing new binary with arguments: {cstr_args:?}");
+    // The logger writes from a task of its own, which the exec ends.
+    log::logger().flush();
     // The new binary gets the resolver's sockets, which pods' queries wait
     // in meanwhile (ADR 0010).
     let e = feos_utils::listen_fds::exec(&cstr_path, &cstr_args);
