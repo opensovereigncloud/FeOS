@@ -1,0 +1,422 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package sandbox
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/store"
+)
+
+// hibernatedOn makes a sandbox that is hibernated with its record on node.
+func (h *harness) hibernatedOn(node string) store.Sandbox {
+	h.t.Helper()
+	sb := h.running(512)
+	if sb.Node != node {
+		h.t.Fatalf("placed on %s, not %s", sb.Node, node)
+	}
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: node})
+	h.startOp(sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerExplicit, Target: node})
+	return h.waitState(sb.ID, model.StateHibernated, 10*time.Second)
+}
+
+func TestRollbackFreshBegin(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	h.addNode("n2")
+	sb := h.hibernatedOn("n1")
+	h.settle(sb.ID)
+	// Lost grace left it with lost_from; n1 drains, so the restore goes
+	// to n2, which this instance turns out not to reach.
+	h.exec("UPDATE sandboxes SET lost_from = node WHERE id = $1", sb.ID)
+	h.exec("UPDATE nodes SET draining = true WHERE name = 'n1'")
+	before := h.row(sb.ID)
+	var during store.Sandbox
+	h.failNextOp(func() { during = h.row(sb.ID) })
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	_, err := h.eng().Ensure(ctx, sb.ID)
+	wantErr(t, err, model.ErrNodeUnavailable, "node n2 is not connected to instance i1")
+	// The begin had moved the row to n2 and tombstoned the record on n1.
+	if during.Node != "n2" || during.LostFrom != "" || during.Materialised || during.Op != string(OpRestore) {
+		t.Fatalf("row during the op %+v", during)
+	}
+	after := h.row(sb.ID)
+	wantState(t, after, model.StateHibernated)
+	if after.Node != "n1" || after.LostFrom != "n1" || after.Materialised != before.Materialised || after.Op != "" {
+		t.Fatalf("row after the rollback %+v (before %+v)", after, before)
+	}
+	if after.StatusDescription != "node n2 is not connected to instance i1; nothing was sent" {
+		t.Fatalf("description %q", after.StatusDescription)
+	}
+	if ts := h.tombstones(sb.ID); len(ts) != 0 {
+		t.Fatalf("tombstones after the rollback %+v", ts)
+	}
+	if _, ok := h.booking(sb.ID); ok {
+		t.Fatal("the admission's booking stayed")
+	}
+	// The record on n1 stayed, and the sandbox comes back once n1 takes
+	// work again.
+	h.podState("n1", sb.ID, podv1.PodState_POD_STATE_HIBERNATED)
+	h.exec("UPDATE nodes SET draining = false WHERE name = 'n1'")
+	if lease := h.ensure(sb.ID); lease.Node != "n1" {
+		t.Fatalf("restored on %s", lease.Node)
+	}
+}
+
+// opOfDeadOwner writes an op of instance owner into the row, as its begin
+// would have.
+func (h *harness) opOfDeadOwner(sb store.Sandbox, kind OpKind, owner string) store.Sandbox {
+	h.t.Helper()
+	h.exec(`UPDATE sandboxes SET op = $2, op_id = gen_random_uuid(), op_owner = $3, op_deadline = now() + interval '1 minute',
+		op_target = node, op_from_state = client_state, client_state = $4, gen = gen + 1 WHERE id = $1`,
+		sb.ID, string(kind), owner, transitional(kind))
+	return h.row(sb.ID)
+}
+
+func TestRollbackTakeover(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	sb := h.running(512)
+	h.settle(sb.ID)
+	h.deadInstance("gone")
+	h.opOfDeadOwner(sb, OpPause, "gone")
+	h.failNextOp(nil)
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	_, err := h.eng().Ensure(ctx, sb.ID)
+	wantErr(t, err, model.ErrNodeUnavailable, "node n1 is not connected to instance i1")
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateUnknown)
+	if row.Node != "n1" || row.StatusDescription != "node n1 is not connected to instance i1; the outcome of pause is unknown" {
+		t.Fatalf("row after the takeover's rollback %+v", row)
+	}
+	if b, ok := h.booking(sb.ID); !ok || b.Node != "n1" {
+		t.Fatal("the booking went")
+	}
+	// Sync resolves it: the pod still runs.
+	h.ensure(sb.ID)
+	wantState(t, h.row(sb.ID), model.StateRunning)
+}
+
+func TestRollbackRowChangedMeanwhile(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	sb := h.running(512)
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+	h.settle(sb.ID)
+	// Between the begin and the call, the op is released (as by a stopping
+	// instance's step 4): the rollback finds the op not its own.
+	h.failNextOp(func() {
+		if err := h.st.InTx(bg, func(tx *store.Store) error {
+			_, err := tx.ReleaseOpsOf(bg, "i1")
+			return err
+		}); err != nil {
+			t.Error(err)
+		}
+	})
+	res := h.startOp(sb.ID, OpIntent{Kind: OpResume, Trigger: TriggerEnsure, Target: "n1"})
+	if !res.fenced {
+		t.Fatalf("rollback result %+v", res)
+	}
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateUnknown)
+	if row.StatusDescription != "op resume of stopping instance i1 was released" {
+		t.Fatalf("the rollback wrote over a changed row: %+v", row)
+	}
+}
+
+func TestFencedOutCreateTombstone(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	arrived, release := h.gate("n1", podv1.PodService_CreatePod_FullMethodName)
+	defer release()
+	sb := h.sandbox(512)
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.eng().Ensure(bg, sb.ID)
+		done <- err
+	}()
+	waitClosed(t, arrived, "the create's call")
+	row, tombstoned, err := h.eng().Delete(bg, testTenant, sb.ID)
+	if err != nil || !tombstoned || row.ID != sb.ID {
+		t.Fatalf("delete: %v %v", tombstoned, err)
+	}
+	// A live op may still make the pod: not before its deadline.
+	ts := h.tombstones(sb.ID)
+	if len(ts) != 1 || ts[0].Node != "n1" || ts[0].Incarnation != sb.Incarnation {
+		t.Fatalf("tombstones %+v", ts)
+	}
+	if ts[0].NotBefore.Before(time.Now().Add(time.Minute)) {
+		t.Fatalf("tombstone due at %v, before the op's deadline", ts[0].NotBefore)
+	}
+	release()
+	wantErr(t, <-done, model.ErrNotFound, "")
+	// The finish was fenced out (the row is gone): its tombstone is due
+	// now and processed, the pod deleted.
+	h.noPod("n1", sb.ID)
+	eventually(t, 10*time.Second, "the tombstone processed", func() bool { return len(h.tombstones(sb.ID)) == 0 })
+}
+
+func TestFencedOutCheckpointMerge(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	sb := h.running(512)
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+	arrived, release := h.gate("n1", podv1.PodService_HibernatePod_FullMethodName)
+	defer release()
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	hd, err := h.eng().runner.Start(ctx, sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerExplicit, Target: "n1",
+		Incarnation: sb.Incarnation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another (live) instance took the op over meanwhile.
+	waitClosed(t, arrived, "the hibernation's call")
+	h.liveInstance("other")
+	h.exec("UPDATE sandboxes SET op_id = gen_random_uuid(), op_owner = 'other', gen = gen + 1 WHERE id = $1", sb.ID)
+	release()
+	res, err := hd.Wait(ctx)
+	if err != nil || !res.fenced {
+		t.Fatalf("fenced finish %+v %v", res, err)
+	}
+	row := h.row(sb.ID)
+	if row.Op != string(OpHibernate) || row.OpOwner != "other" || row.ClientState != model.StateHibernating {
+		t.Fatalf("the fenced finish wrote over the op: %+v", row)
+	}
+	if row.CheckpointHead == "" || row.CheckpointEpoch == 0 || row.CheckpointStore != h.objs.ID() {
+		t.Fatalf("checkpoint not merged: %+v", row)
+	}
+	if ts := h.tombstones(sb.ID); len(ts) != 0 {
+		t.Fatalf("a hibernate wrote tombstones %+v", ts)
+	}
+}
+
+func TestTakeoverByLiveness(t *testing.T) {
+	for _, owner := range []string{"dead", "stopping"} {
+		t.Run(owner, func(t *testing.T) {
+			h := newHarness(t)
+			h.addNode("n1")
+			sb := h.running(512)
+			h.settle(sb.ID)
+			if owner == "dead" {
+				h.deadInstance(owner)
+			} else {
+				h.liveInstance(owner)
+				h.exec("UPDATE instances SET stopping = now() WHERE id = $1", owner)
+			}
+			before := h.opOfDeadOwner(sb, OpPause, owner)
+			arrived, release := h.gate("n1", podv1.PodService_SuspendPod_FullMethodName)
+			defer release()
+			done := make(chan error, 1)
+			go func() {
+				_, err := h.eng().Ensure(bg, sb.ID)
+				done <- err
+			}()
+			waitClosed(t, arrived, "the taken-over pause's call")
+			during := h.row(sb.ID)
+			if during.OpOwner != "i1" {
+				t.Fatalf("not taken over: %+v", during)
+			}
+			// Only the op's ownership was written.
+			if during.Op != before.Op || during.OpTarget != before.OpTarget || during.OpFromState != before.OpFromState ||
+				during.ClientState != before.ClientState || during.Node != before.Node || during.OpID == before.OpID ||
+				during.Gen != before.Gen+1 || during.ImageRef != before.ImageRef || during.Materialised != before.Materialised {
+				t.Fatalf("takeover wrote more than the op's ownership:\n%+v\n%+v", before, during)
+			}
+			release()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			// The pause it took over ran; Ensure then resumed the sandbox.
+			wantState(t, h.row(sb.ID), model.StateRunning)
+		})
+	}
+}
+
+func TestNoTakeoverOfLiveOwner(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	sb := h.running(512)
+	h.liveInstance("other")
+	row := h.opOfDeadOwner(sb, OpPause, "other")
+	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
+	defer cancel()
+	_, err := h.eng().runner.Start(ctx, sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerEnsure, Target: "n1",
+		Incarnation: sb.Incarnation})
+	wantErr(t, err, model.ErrBusy, "")
+	// Ensure waits for the owner; when the op ends, it goes on.
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.eng().Ensure(bg, sb.ID)
+		done <- err
+	}()
+	never(t, 500*time.Millisecond, "Ensure took over a live owner's op", func() bool { return h.row(sb.ID).OpOwner != "other" })
+	h.exec(`UPDATE sandboxes SET op = '', op_id = NULL, op_owner = '', op_deadline = NULL, op_target = '',
+		op_from_state = '', client_state = 'running', gen = gen + 1 WHERE id = $1 AND op_id = $2`, sb.ID, row.OpID)
+	h.exec("SELECT pg_notify('ferun_sandbox', $1)", sb.ID.String())
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaleOpLoop(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	h.deadInstance("dead")
+	h.liveInstance("other")
+
+	// A dead owner's op towards a node the leader reaches: taken over.
+	a := h.running(512)
+	h.opOfDeadOwner(a, OpPause, "dead")
+
+	// A dead owner's op towards a node the leader does not reach:
+	// released.
+	b := h.running(512)
+	h.exec("INSERT INTO nodes (name, status) VALUES ('far', 'ready')")
+	h.exec("UPDATE sandboxes SET node = 'far' WHERE id = $1", b.ID)
+	h.exec("UPDATE bookings SET node = 'far' WHERE pod_id = $1", b.ID)
+	h.opOfDeadOwner(h.row(b.ID), OpPause, "dead")
+
+	// A live owner's op 5 minutes past its deadline: released too.
+	c := h.running(512)
+	h.opOfDeadOwner(c, OpPause, "other")
+	h.exec("UPDATE sandboxes SET op_deadline = now() - interval '6 minutes' WHERE id = $1", c.ID)
+
+	// A live owner's op past its deadline by less: left alone.
+	d := h.running(512)
+	h.opOfDeadOwner(d, OpPause, "other")
+	h.exec("UPDATE sandboxes SET op_deadline = now() - interval '1 minute' WHERE id = $1", d.ID)
+
+	if err := e.staleOps(bg); err != nil {
+		t.Fatal(err)
+	}
+	h.waitState(a.ID, model.StatePaused, 10*time.Second)
+	rb := h.row(b.ID)
+	wantState(t, rb, model.StateUnknown)
+	if rb.StatusDescription != "op pause of instance dead was abandoned" || rb.Node != "far" {
+		t.Fatalf("released row %+v", rb)
+	}
+	if bk, ok := h.booking(b.ID); !ok || bk.Node != "far" {
+		t.Fatal("a released op's booking went")
+	}
+	// Released (a Sync may have resolved it since: its pod runs).
+	if rc := h.row(c.ID); rc.Op != "" {
+		t.Fatalf("overdue op kept %+v", rc)
+	}
+	eventually(t, 10*time.Second, "the release recorded", func() bool {
+		var n int
+		h.scalar(&n, `SELECT count(*) FROM activity WHERE sandbox_id = $1 AND kind = 'sandbox_state'
+			AND detail->>'description' = 'op pause of instance other was abandoned'`, c.ID)
+		return n == 1
+	})
+	if rd := h.row(d.ID); rd.Op != string(OpPause) || rd.OpOwner != "other" {
+		t.Fatalf("a live owner's op was touched: %+v", rd)
+	}
+}
+
+func TestBeforeBeginWaitsForRollout(t *testing.T) {
+	h := newHarness(t)
+	n := h.addNode("n1")
+	sb := h.running(512)
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+
+	// Without a rollout deadline, a resume towards a node that is gone
+	// fails after the node wait, with nothing begun.
+	n.Crash()
+	eventually(t, 10*time.Second, "n1 disconnected", func() bool { return !h.ins[0].srv.Connected("n1") })
+	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
+	_, err := h.eng().Ensure(ctx, sb.ID)
+	cancel()
+	wantErr(t, err, model.ErrNodeUnavailable, "node n1 is not connected to instance i1")
+	if row := h.row(sb.ID); row.ClientState != model.StatePaused || row.Op != "" {
+		t.Fatalf("row after a refused begin %+v", row)
+	}
+
+	// The node announced a restart: the wait goes up to the rollout
+	// deadline, and the resume runs once the node is back.
+	h.exec("UPDATE nodes SET stopping_until = now() + interval '30 seconds' WHERE name = 'n1'")
+	h.ins[0].srv.SetStoppingUntil("n1", time.Now().Add(30*time.Second))
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.eng().Ensure(bg, sb.ID)
+		done <- err
+	}()
+	time.Sleep(1500 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("Ensure returned while the node was away: %v", err)
+	default:
+	}
+	n.Restart(false)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	wantState(t, h.row(sb.ID), model.StateRunning)
+}
+
+func TestTakeoverCreateKeepsImageAndSpec(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	sb := h.sandbox(512)
+	// A create of a dead instance: begun (node, image_ref, booking), its
+	// pod made on the node with the same spec.
+	h.deadInstance("dead")
+	h.exec(`UPDATE sandboxes SET image_ref = $2, node = 'n1', op = 'create', op_id = gen_random_uuid(), op_owner = 'dead',
+		op_deadline = now() + interval '1 minute', op_target = 'n1', op_from_state = 'pending', client_state = 'creating',
+		gen = gen + 1 WHERE id = $1`, sb.ID, testImage)
+	h.exec("INSERT INTO bookings (pod_id, node, vcpus, memory_mib, gated) VALUES ($1, 'n1', 1, 512, true)", sb.ID)
+	row := h.row(sb.ID)
+	if _, err := h.pods("n1").CreatePod(bg, &podv1.CreatePodRequest{PodId: sb.ID.String(), Spec: podSpec(row)}); err != nil {
+		t.Fatal(err)
+	}
+	lease := h.ensure(sb.ID)
+	if lease.Node != "n1" {
+		t.Fatalf("lease %+v", lease)
+	}
+	row = h.row(sb.ID)
+	wantState(t, row, model.StateRunning)
+	var placements int
+	h.scalar(&placements, "SELECT count(*) FROM placements WHERE pod_id = $1", sb.ID)
+	if placements != 0 {
+		t.Fatalf("a takeover wrote %d placement rows", placements)
+	}
+	// The pod is the one the dead instance made (the same spec: the
+	// create was idempotent).
+	info := h.podState("n1", sb.ID, podv1.PodState_POD_STATE_RUNNING)
+	if podIncarnation(info) != sb.Incarnation || info.GetSpec().GetContainers()[0].GetImageRef() != testImage {
+		t.Fatalf("pod %+v", info.GetSpec())
+	}
+}
+
+func TestTakeoverIntentNeverBeginsAnOp(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	sb := h.running(512)
+	// The op a caller meant to take over ended before the begin: nothing
+	// is begun in its place.
+	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
+	defer cancel()
+	_, err := h.eng().runner.start(ctx, sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerRepair, Target: "n1",
+		Incarnation: sb.Incarnation, takeover: sb.Incarnation}, false)
+	wantErr(t, err, model.ErrPrecondition, "the op to take over ended")
+	if row := h.row(sb.ID); row.Op != "" || row.ClientState != model.StateRunning {
+		t.Fatalf("row %+v", row)
+	}
+	// Another op is in flight than the one meant: not taken over either.
+	h.deadInstance("dead")
+	h.opOfDeadOwner(sb, OpPause, "dead")
+	_, err = h.eng().runner.start(ctx, sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerRepair, Target: "n1",
+		Incarnation: sb.Incarnation, takeover: sb.Incarnation}, false)
+	wantErr(t, err, model.ErrPrecondition, "the op to take over ended")
+	if row := h.row(sb.ID); row.OpOwner != "dead" {
+		t.Fatalf("taken over: %+v", row)
+	}
+}
