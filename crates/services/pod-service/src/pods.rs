@@ -1207,7 +1207,8 @@ impl Pods {
     /// alone with the resolver of that version, the guest is pushed this
     /// one and takes it at once. A microVM whose devices differ, such as
     /// the first version's with IPv4 on a bridge, keeps its network until
-    /// the pod boots anew, and feosd warns.
+    /// the pod boots anew, and so does one from before pods had a metadata
+    /// service; feosd warns.
     async fn check_microvm_network(&self, pod_id: &str, attachment: Option<&Attachment>) {
         let (Ok(info), Ok(Some(vm))) = (self.info(pod_id), self.vm(pod_id).await) else {
             return;
@@ -1225,10 +1226,15 @@ impl Pods {
         if !stale(&vm, &wanted) {
             return;
         }
-        let devices_differ = config.net != wanted.net;
-        match wanted.guest_network {
-            Some(network) if !devices_differ => {
-                match self.inner.vms.set_guest_network(pod_id, network).await {
+        if config.net != wanted.net {
+            warn!(
+                "Pods: {pod_id}'s microVM was made for another network; a stop and a start give it this one"
+            );
+            return;
+        }
+        if config.guest_network != wanted.guest_network {
+            match wanted.guest_network {
+                Some(network) => match self.inner.vms.set_guest_network(pod_id, network).await {
                     Ok(true) => info!("Pods: {pod_id}'s guest took this network"),
                     Ok(false) => {
                         info!("Pods: {pod_id}'s guest takes this network when it attaches")
@@ -1237,11 +1243,16 @@ impl Pods {
                         "Pods: {pod_id}'s guest keeps another network for now: {}",
                         e.message()
                     ),
-                }
+                },
+                None => warn!(
+                    "Pods: {pod_id}'s microVM was made for another network; a stop and a start give it this one"
+                ),
             }
-            _ => warn!(
-                "Pods: {pod_id}'s microVM was made for another network; a stop and a start give it this one"
-            ),
+        }
+        if config.metadata_json != wanted.metadata_json {
+            warn!(
+                "Pods: {pod_id}'s microVM was made for other metadata; a stop and a start give it this one"
+            );
         }
     }
 
@@ -1469,11 +1480,11 @@ impl Pods {
                 Some(VmState::Creating) => sleep(POLL).await,
                 // One made for another network or disk is made anew, such
                 // as one of the first version's with IPv4, or one from
-                // before pods had disks.
+                // before pods had disks or a metadata service.
                 Some(VmState::Created | VmState::Stopped)
                     if vm.as_ref().is_some_and(|vm| stale(vm, &config)) =>
                 {
-                    info!("Pods: {pod_id}'s microVM was made for another network or disk: making it anew");
+                    info!("Pods: {pod_id}'s microVM was made for another network, metadata or disk: making it anew");
                     self.delete_vm(pod_id).await?;
                 }
                 Some(VmState::Created | VmState::Stopped) => {
@@ -1794,19 +1805,22 @@ fn next_epoch(last: impl IntoIterator<Item = u64>) -> u64 {
     now.max(last.into_iter().map(|epoch| epoch + 1).max().unwrap_or(0))
 }
 
-/// Whether the microVM's network or disks are not the ones `wanted` has.
+/// Whether the microVM's network, its metadata or its disks are not the
+/// ones `wanted` has.
 fn stale(vm: &VmInfo, wanted: &VmConfig) -> bool {
     let config = vm.config.as_ref();
     config.map(|config| {
         (
             &config.net,
             &config.guest_network,
+            &config.metadata_json,
             &config.data_disk,
             &config.volumes,
         )
     }) != Some((
         &wanted.net,
         &wanted.guest_network,
+        &wanted.metadata_json,
         &wanted.data_disk,
         &wanted.volumes,
     ))
@@ -1955,6 +1969,22 @@ mod tests {
         assert!(!stale(&vm, &wanted));
         // One made before the pod had volumes, or with others.
         vm.config.as_mut().unwrap().volumes.clear();
+        assert!(stale(&vm, &wanted));
+    }
+
+    #[test]
+    fn a_microvm_without_its_metadata_is_stale() {
+        let wanted = VmConfig {
+            metadata_json: r#"{"feos":{}}"#.to_string(),
+            ..Default::default()
+        };
+        let mut vm = VmInfo {
+            config: Some(wanted.clone()),
+            ..Default::default()
+        };
+        assert!(!stale(&vm, &wanted));
+        // One made before pods had a metadata service.
+        vm.config.as_mut().unwrap().metadata_json.clear();
         assert!(stale(&vm, &wanted));
     }
 }

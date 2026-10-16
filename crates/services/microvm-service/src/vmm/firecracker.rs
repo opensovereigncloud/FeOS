@@ -5,6 +5,8 @@
 //! chroot of its jail (see `jail`):
 //!
 //! - `config.json`: its Firecracker configuration, written at creation
+//! - `metadata.json`: what its metadata service serves the guest, written
+//!   at creation, if it has one
 //! - `fc.sock`: Firecracker's API socket
 //! - `v.sock`: the host end of the guest's vsock device
 //! - `console.in`: a FIFO, the serial console's input (Firecracker's stdin)
@@ -24,7 +26,8 @@
 //! process that boots it at once. The process ends when the guest reboots or
 //! shuts down, so every boot is a new process. Suspending a VM writes a
 //! snapshot and ends the process; restoring it starts a process that loads
-//! the snapshot.
+//! the snapshot, and puts the metadata in again, which a snapshot does not
+//! hold.
 
 use super::{fc_api, installed, jail, snapshot, Hypervisor, VmmError};
 use crate::{jail_dir, vm_dir, vsock_path, VmEventWrapper, VM_DIR};
@@ -72,6 +75,7 @@ const CONSOLE_POLL: Duration = Duration::from_millis(50);
 const LOG_TAIL_LINES: usize = 5;
 /// Files in the VM's directory, the jail's root.
 const CONFIG: &str = "config.json";
+const METADATA: &str = "metadata.json";
 const API_SOCKET: &str = "fc.sock";
 const VSOCK: &str = "v.sock";
 const VMM_LOG: &str = "vmm.log";
@@ -297,6 +301,18 @@ fn firecracker_config(
             "stats_polling_interval_s": balloon.stats_interval_s,
         });
     }
+    // Version 2 answers a request only with a session token, which takes a
+    // PUT: a GET that the guest's code is tricked into sending gets
+    // nothing (ADR 0010).
+    if !config.metadata_json.is_empty()
+        && let Some(interface) = fc["network-interfaces"][0]["iface_id"].as_str()
+    {
+        fc["mmds-config"] = json!({
+            "version": "V2",
+            "network_interfaces": [interface],
+            "ipv4_address": super::METADATA_ADDRESS.to_string(),
+        });
+    }
     Ok((fc, links))
 }
 
@@ -340,6 +356,21 @@ fn find_executable(name: &Path) -> PathBuf {
 
 fn internal(what: &str) -> impl FnOnce(io::Error) -> VmmError + '_ {
     move |e| VmmError::Internal(format!("{what}: {e}"))
+}
+
+/// Puts the VM's metadata into the store of its Firecracker, if it has
+/// any.
+async fn put_metadata(vm_id: &str, api: &Path) -> Result<(), VmmError> {
+    let metadata = match std::fs::read(vm_dir(vm_id).join(METADATA)) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(internal("read the metadata")(e)),
+    };
+    let metadata: Value = serde_json::from_slice(&metadata)
+        .map_err(|e| VmmError::Internal(format!("read the metadata: {e}")))?;
+    fc_api::request(api, "PUT", "/mmds", Some(&metadata))
+        .await
+        .map(drop)
 }
 
 async fn firecracker_version(api: &Path) -> Result<String, VmmError> {
@@ -473,6 +504,10 @@ impl FirecrackerAdapter {
             .args(["--api-sock", &format!("/{API_SOCKET}")]);
         if let Some(config) = config {
             command.arg("--config-file").arg(config);
+            // The metadata is in the store before the guest boots.
+            if dir.join(METADATA).exists() {
+                command.arg("--metadata").arg(format!("/{METADATA}"));
+            }
         }
         command
             .args(["--log-path", &format!("/{VMM_LOG}")])
@@ -543,6 +578,17 @@ impl Hypervisor for FirecrackerAdapter {
         let fc_config = serde_json::to_vec_pretty(&fc_config)
             .map_err(|e| VmmError::Internal(format!("serialize the configuration: {e}")))?;
         std::fs::write(dir.join(CONFIG), fc_config).map_err(internal("write the configuration"))?;
+        let metadata = dir.join(METADATA);
+        if config.metadata_json.is_empty() {
+            match std::fs::remove_file(&metadata) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(internal("remove the old metadata")(e)),
+            }
+        } else {
+            std::fs::write(&metadata, &config.metadata_json)
+                .map_err(internal("write the metadata"))?;
+        }
         match unistd::mkfifo(&dir.join("console.in"), Mode::S_IRUSR | Mode::S_IWUSR) {
             Ok(()) | Err(nix::Error::EEXIST) => {}
             Err(e) => return Err(VmmError::Internal(format!("create the console FIFO: {e}"))),
@@ -757,6 +803,12 @@ impl Hypervisor for FirecrackerAdapter {
         if let Err(e) = loaded {
             self.discard(vm_id, &mut vmm).await;
             return Err(e);
+        }
+        // The snapshot keeps where the metadata is served, not what: it goes
+        // in again before the guest runs, as the VM was made, with the
+        // addresses it has on this node. Without it the guest runs on.
+        if let Err(e) = put_metadata(vm_id, &api).await {
+            warn!("FirecrackerAdapter ({vm_id}): The guest runs without its metadata: {e}");
         }
 
         let body = json!({"state": "Resumed"});
@@ -1074,6 +1126,29 @@ mod tests {
         assert_eq!(
             fc["machine-config"],
             json!({"vcpu_count": 2, "mem_size_mib": 1024})
+        );
+        assert_eq!(fc.get("mmds-config"), None);
+    }
+
+    #[test]
+    fn metadata_is_served_on_the_first_interface_in_version_2() {
+        let image = image(&["vmlinuz"]);
+        let nic = |tap: &str, id: &str| NetConfig {
+            device_id: id.to_string(),
+            tap: Some(TapConfig {
+                tap_name: tap.to_string(),
+            }),
+            ..Default::default()
+        };
+        let config = VmConfig {
+            net: vec![nic("tap0", "pod"), nic("tap1", "")],
+            metadata_json: r#"{"feos": {"pod-id": "x"}}"#.to_string(),
+            ..Default::default()
+        };
+        let (fc, _) = firecracker_config(&config, image.path()).unwrap();
+        assert_eq!(
+            fc["mmds-config"],
+            json!({"version": "V2", "network_interfaces": ["pod"], "ipv4_address": "169.254.169.254"})
         );
     }
 

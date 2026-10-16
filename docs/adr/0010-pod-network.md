@@ -122,8 +122,17 @@ from node to node would need a route per pod, changed with every move.
   pod's code is tricked into sending gets nothing.
 - Its packets never leave the VMM. Link-local destinations are denied on
   the node, so no pod reaches the node's own cloud metadata service.
-- What it holds is decided apart; a pod's credentials are not in it
-  (ADR 0014).
+- It holds the pod's identity, which `feosd` writes, its ID and its
+  addresses on the node, and what the pod's creator puts into the pod's
+  spec, which FeOS does not read. A pod learns where it runs without
+  asking `feosd` or the control plane, and a sandbox or a service gets
+  its configuration without credentials.
+- A pod's credentials are not in it (ADR 0014): whatever runs in the pod
+  can read it; the session token keeps out requests that the pod's code
+  is tricked into, not the code.
+- A snapshot keeps where the metadata is served, not what: `feosd` puts
+  it in again after every load, with the addresses the pod has where it
+  is restored.
 
 ### What a pod may reach
 
@@ -193,6 +202,12 @@ from node to node would need a route per pod, changed with every move.
 - **A metadata service on the node**: it could answer from `feosd`'s
   state, but it would be one more listener that every pod reaches, where
   MMDS is in the VMM already.
+- **AWS's layout of the metadata** (`latest/meta-data/...`), so that
+  tools for EC2 find it: a pod is no EC2 instance, and those tools would
+  find names they expect with values that mean something else.
+- **Metadata in the guest's configuration**, pushed over vsock: the
+  guest would have to serve it to its containers, where MMDS serves every
+  process in the pod already.
 
 ## Consequences
 
@@ -205,8 +220,11 @@ from node to node would need a route per pod, changed with every move.
 - Every node needs a prefix routed to it, and IPv4 of its own, through
   which its pods leave.
 - `PodInfo` carries the pod's IPv6 and IPv4 addresses; the network in
-  `PodSpec` names upstream resolvers and security groups. The guest's
-  network configuration has both families (ADR 0007).
+  `PodSpec` names upstream resolvers and security groups, and `PodSpec`
+  carries the pod's metadata. The guest's network configuration has
+  both families (ADR 0007).
+- A pod without a network has no metadata service: MMDS is part of the
+  network device.
 - The control plane's front door reaches pods' ports over IPv6, without a
   port forward over vsock (ADR 0004).
 - The pods' network is routing and netfilter: no eBPF, no translator,
@@ -221,8 +239,8 @@ from node to node would need a route per pod, changed with every move.
   (ADR 0001) and get an ADR of their own.
 - **How the DNS sockets outlive `feosd`**: socket activation under
   systemd, and its like under `feos-host-init`.
-- **What the metadata service holds**, and how it is filled again after a
-  pod is restored from a snapshot.
+- **Changing a pod's metadata** while it runs: the spec is fixed at the
+  pod's creation, and Firecracker's store takes changes at any time.
 - **Telling an IPv4-only listener apart**, so that a pod's status says
   why its port cannot be reached.
 - **Waking a suspended pod** on a packet to its address.

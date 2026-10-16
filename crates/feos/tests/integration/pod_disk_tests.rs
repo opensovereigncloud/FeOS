@@ -13,7 +13,7 @@
 //! it when it has one; without, that test skips.
 
 use super::fixtures::{verify_microvm_cleanup, PodGuard};
-use super::pod_tests::{for_pod, get_pod, guest_ping, new_pod_id};
+use super::pod_tests::{for_pod, get_pod, guest_ping, microvm_metadata, new_pod_id};
 use super::{ensure_server, get_public_clients, installed_guest, PUBLIC_SERVER_ADDRESS};
 use anyhow::{bail, Context, Result};
 use feos_proto::container_service::{
@@ -347,10 +347,17 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
     let (mut pods, _, _) = get_public_clients().await?;
     let mut disks = diskd().await?;
 
+    // On the network, with metadata: a restore gives the pod addresses
+    // anew, and its metadata has them.
+    let networked = PodSpec {
+        network: None,
+        metadata: [("role".to_string(), "hibernated".to_string())].into(),
+        ..spec()
+    };
     let pod_id = new_pod_id();
     pods.create_pod(CreatePodRequest {
         pod_id: pod_id.clone(),
-        spec: Some(spec()),
+        spec: Some(networked.clone()),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());
@@ -362,6 +369,7 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
     guard.set_pid(pid(&pod)?);
     assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
     let before = guest_ping(&pod_id).await?;
+    let placed = pod.ipv6_address.clone();
 
     let head_key = hibernate(&mut pods, &pod_id).await?;
 
@@ -409,8 +417,19 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
     );
     let pod = get_pod(&mut pods, &pod_id).await?;
     assert_eq!(pod.state(), PodState::Running);
-    assert_eq!(pod.spec, Some(spec()), "the spec comes with the checkpoint");
+    assert_eq!(
+        pod.spec,
+        Some(networked),
+        "the spec comes with the checkpoint"
+    );
     guard.set_pid(pid(&pod)?);
+    // No address is handed out twice: the restored pod has a new one, and
+    // the metadata that went in after the snapshot's load says so.
+    assert_ne!(pod.ipv6_address, placed);
+    let metadata = microvm_metadata(&pod_id).await?;
+    assert_eq!(metadata["feos"]["ipv6"], pod.ipv6_address.as_str());
+    assert_eq!(metadata["feos"]["ipv4"], pod.ipv4_address.as_str());
+    assert_eq!(metadata["metadata"]["role"], "hibernated");
     // The same boot, with its memory: the ping count goes on.
     let after = guest_ping(&pod_id).await?;
     assert_eq!(after.boot_id, before.boot_id, "the same boot");

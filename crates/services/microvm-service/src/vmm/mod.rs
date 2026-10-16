@@ -16,11 +16,17 @@ use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
 use uuid::Uuid;
 
-mod fc_api;
+pub mod fc_api;
 pub mod firecracker;
 pub mod installed;
 pub mod jail;
 pub mod snapshot;
+
+/// Where Firecracker serves a microVM's metadata to its guest (ADR 0010).
+pub const METADATA_ADDRESS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+/// Firecracker's limit of its metadata store, in bytes, by default: its
+/// API's largest request.
+pub const METADATA_LIMIT: usize = 51200;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VmmError {
@@ -137,7 +143,30 @@ pub fn validate_config(config: &VmConfig) -> Result<(), VmmError> {
     if let Some(network) = &config.guest_network {
         validate_guest_network(network)?;
     }
-    Ok(())
+    validate_metadata(config)
+}
+
+/// The metadata of a microVM: a JSON object that fits Firecracker's store,
+/// served on a network interface of the VM's.
+fn validate_metadata(config: &VmConfig) -> Result<(), VmmError> {
+    if config.metadata_json.is_empty() {
+        return Ok(());
+    }
+    let invalid = |what: &str| Err(VmmError::InvalidConfig(format!("metadata: {what}")));
+    if config.net.is_empty() {
+        return invalid("a microVM without a network interface has no metadata service");
+    }
+    match serde_json::from_str::<serde_json::Value>(&config.metadata_json) {
+        // Firecracker measures what it keeps as it serializes it.
+        Ok(object @ serde_json::Value::Object(_)) => match object.to_string().len() {
+            size if size > METADATA_LIMIT => invalid(&format!(
+                "{size} bytes, more than the {METADATA_LIMIT} Firecracker keeps"
+            )),
+            _ => Ok(()),
+        },
+        Ok(_) => invalid("not a JSON object"),
+        Err(e) => invalid(&e.to_string()),
+    }
 }
 
 fn validate_guest_network(network: &GuestNetworkConfig) -> Result<(), VmmError> {
@@ -242,6 +271,7 @@ pub fn factory(vmm_type: VmmType) -> Box<dyn Hypervisor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use feos_proto::microvm::{NetConfig, TapConfig};
 
     fn network(ipv4: (&str, &str), ipv6: (&str, &str)) -> GuestNetworkConfig {
         GuestNetworkConfig {
@@ -288,5 +318,38 @@ mod tests {
         let mut bad_resolver = network(("", ""), ipv6);
         bad_resolver.dns.push("fdfd::53%eth0".to_string());
         assert!(validate_guest_network(&bad_resolver).is_err());
+    }
+
+    #[test]
+    fn metadata_is_a_json_object_on_a_network_interface() {
+        let nic = NetConfig {
+            device_id: "eth0".to_string(),
+            tap: Some(TapConfig {
+                tap_name: "pod-00000000".to_string(),
+            }),
+            mac_address: String::new(),
+        };
+        let config = |net: Vec<NetConfig>, metadata: &str| VmConfig {
+            net,
+            metadata_json: metadata.to_string(),
+            ..Default::default()
+        };
+        for ok in [
+            config(vec![], ""),
+            config(vec![nic.clone()], ""),
+            config(vec![nic.clone()], r#"{"feos": {"pod-id": "x"}}"#),
+        ] {
+            assert!(validate_config(&ok).is_ok(), "{ok:?}");
+        }
+        let large = format!(r#"{{"a": "{}"}}"#, "x".repeat(METADATA_LIMIT));
+        for bad in [
+            config(vec![], "{}"),
+            config(vec![nic.clone()], "[]"),
+            config(vec![nic.clone()], r#""text""#),
+            config(vec![nic.clone()], "{"),
+            config(vec![nic], &large),
+        ] {
+            assert!(validate_config(&bad).is_err(), "{bad:?}");
+        }
     }
 }

@@ -11,7 +11,7 @@ use feos_proto::microvm::{
 };
 use feos_proto::pod_service::{PodSpec, Resources};
 use feos_utils::filesystem::volume as feos_volume;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -27,6 +27,10 @@ const INTERFACE: &str = "eth0";
 /// some 19 devices, of which the balloon, the disk, the network and vsock
 /// take four.
 const MAX_VOLUMES: usize = 8;
+/// What a pod's metadata may take, as JSON: Firecracker keeps 50 KiB,
+/// feosd's part beside it a few hundred bytes.
+const MAX_METADATA_BYTES: usize = 32 * 1024;
+const MAX_METADATA_KEY: usize = 128;
 
 /// Checks a pod's ID: a UUID, which also names its microVM and its paths.
 pub fn check_id(pod_id: &str) -> Result<(), Status> {
@@ -78,8 +82,45 @@ pub fn normalize(mut spec: PodSpec) -> Result<PodSpec, Status> {
         }
     }
     check_volumes(&spec)?;
+    check_metadata(&spec)?;
 
     Ok(spec)
+}
+
+/// Checks what the pod's metadata service is to serve: keys that are
+/// names in its paths, and no more than [`MAX_METADATA_BYTES`]; a pod
+/// without a network has no metadata service.
+fn check_metadata(spec: &PodSpec) -> Result<(), Status> {
+    if spec.metadata.is_empty() {
+        return Ok(());
+    }
+    if !has_network(spec) {
+        return Err(Status::invalid_argument(
+            "a pod without a network has no metadata service, and no metadata",
+        ));
+    }
+    if let Some(key) = spec.metadata.keys().find(|key| !valid_metadata_key(key)) {
+        return Err(Status::invalid_argument(format!(
+            "invalid metadata key {key:?}: 1 to {MAX_METADATA_KEY} letters, digits, \"-\", \"_\" and \".\""
+        )));
+    }
+    let size = serde_json::to_string(&spec.metadata).map_or(usize::MAX, |json| json.len());
+    if size > MAX_METADATA_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "the metadata takes {size} bytes as JSON, more than {MAX_METADATA_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+/// A key of the metadata, which is a name in the metadata service's paths.
+fn valid_metadata_key(key: &str) -> bool {
+    (1..=MAX_METADATA_KEY).contains(&key.len())
+        && key != "."
+        && key != ".."
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Checks the pod's volumes and its containers' mounts of them: at most
@@ -164,7 +205,8 @@ fn valid_name(name: &str) -> bool {
 /// disks after it, in the order of its spec, and the pod's TAP device and
 /// addresses if it has a network (ADR 0010): an IPv6 /128 behind the node
 /// at `fe80::1`, an IPv4 /32 behind `169.254.0.1`, which is on the link
-/// although outside the /32, and the node's resolver.
+/// although outside the /32, the node's resolver, and the metadata
+/// service at `169.254.169.254`.
 pub fn vm_config(
     pod_id: &str,
     spec: &PodSpec,
@@ -212,8 +254,26 @@ pub fn vm_config(
             dns: vec![attachment.dns.to_string()],
             hostname: pod_id.to_string(),
         });
+        config.metadata_json = metadata_json(pod_id, spec, attachment);
     }
     config
+}
+
+/// What the pod's metadata service serves: feosd's part under "feos", the
+/// pod's ID and its addresses on this node, and the spec's under
+/// "metadata". The keys are in order, so that the microVM's configuration
+/// compares the same as long as the pod and its addresses are.
+fn metadata_json(pod_id: &str, spec: &PodSpec, attachment: &Attachment) -> String {
+    let metadata: BTreeMap<&String, &String> = spec.metadata.iter().collect();
+    serde_json::json!({
+        "feos": {
+            "pod-id": pod_id,
+            "ipv6": attachment.ipv6.to_string(),
+            "ipv4": attachment.ipv4.to_string(),
+        },
+        "metadata": metadata,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -321,6 +381,58 @@ mod tests {
 
         let config = vm_config(id, &spec, None, None, &[]);
         assert!(config.net.is_empty() && config.guest_network.is_none());
+        assert!(config.metadata_json.is_empty());
+    }
+
+    #[test]
+    fn the_metadata_has_the_pods_identity_and_the_specs() {
+        let mut spec = normalize(spec(vec![])).unwrap();
+        spec.metadata = [
+            ("zone".to_string(), "b".to_string()),
+            ("role".to_string(), "web".to_string()),
+        ]
+        .into();
+        let id = "11111111-2222-3333-4444-555555555555";
+        let attachment = Attachment {
+            tap: network::tap_name(id),
+            mac: network::mac(id),
+            ipv6: "fd00:fe05:1::9".parse().unwrap(),
+            ipv4: "169.254.16.9".parse().unwrap(),
+            dns: "169.254.0.53".parse().unwrap(),
+        };
+        let config = vm_config(id, &spec, Some(&attachment), None, &[]);
+        assert_eq!(
+            config.metadata_json,
+            r#"{"feos":{"ipv4":"169.254.16.9","ipv6":"fd00:fe05:1::9","pod-id":"11111111-2222-3333-4444-555555555555"},"metadata":{"role":"web","zone":"b"}}"#
+        );
+        // The same pod with the same addresses, the same configuration.
+        for _ in 0..8 {
+            let again = vm_config(id, &spec.clone(), Some(&attachment), None, &[]);
+            assert_eq!(again.metadata_json, config.metadata_json);
+        }
+    }
+
+    #[test]
+    fn metadata_takes_names_a_network_and_little_room() {
+        let with = |key: &str, value: &str| {
+            let mut spec = spec(vec![]);
+            spec.metadata = [(key.to_string(), value.to_string())].into();
+            spec
+        };
+        assert!(normalize(with("role", "web")).is_ok());
+        assert!(normalize(with("a-b_c.1", &"x".repeat(16 * 1024))).is_ok());
+        for bad in ["", ".", "..", "a/b", "a b", "ä", &"k".repeat(129)] {
+            assert!(normalize(with(bad, "v")).is_err(), "{bad:?}");
+        }
+        assert!(normalize(with("role", &"x".repeat(MAX_METADATA_BYTES))).is_err());
+        // Escaped, a value takes more room.
+        assert!(normalize(with("role", &"\u{1}".repeat(MAX_METADATA_BYTES / 4))).is_err());
+        let mut none = with("role", "web");
+        none.network = Some(PodNetwork {
+            none: true,
+            ..Default::default()
+        });
+        assert!(normalize(none).is_err());
     }
 
     #[test]

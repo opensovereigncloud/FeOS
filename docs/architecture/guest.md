@@ -68,6 +68,12 @@ addresses of both families, programs take IPv6, since the pod's IPv4
 address is link-local; IPv4 literals and programs that speak only IPv4
 leave over IPv4.
 
+The pod's metadata is at `169.254.169.254`, port 80, a session token
+first ([node.md](node.md#metadata)). Firecracker answers it in the
+network device and takes its packets by their destination, so the
+guest's default route through `169.254.0.1` reaches it: the guest needs
+no route of its own for it, and runs nothing for it.
+
 ## Volumes
 
 The pod's volumes are virtio disks after the data volume, in the order

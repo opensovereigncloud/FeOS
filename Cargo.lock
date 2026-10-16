@@ -3146,6 +3146,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rtnetlink",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",

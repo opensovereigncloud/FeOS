@@ -7,8 +7,9 @@
 # keeps, a pod's disk across a restart of diskd and a stop, no
 # hibernation without an object store, pods on feosd's network (an fd00: prefix and link-local IPv4
 # addresses behind proxy ARP and masquerade, DNS, security groups, a
-# denied prefix, traffic records, the deletion of a pod's connections)
-# and their forwarded services, removal, and a power-off through PID 1.
+# denied prefix, traffic records, the deletion of a pod's connections,
+# the metadata service) and their forwarded services, removal, and a
+# power-off through PID 1.
 #
 #   hack/packages/test-packages
 #
@@ -234,7 +235,7 @@ in_node feosctl security-group put client --allow 'egress any to ::/0' \
   --allow 'egress any to 0.0.0.0/0' >/dev/null
 in_node feosctl pod start --wait "${server}" >/dev/null || fail "pod ${server} did not start with its group"
 in_node feosctl pod create --pod-id "${client}" --memory 256 --security-group client \
-  --image docker.io/curlimages/curl:8.11.1 --wait -- sleep 3600 >/dev/null ||
+  --metadata role=client --image docker.io/curlimages/curl:8.11.1 --wait -- sleep 3600 >/dev/null ||
   fail "pod ${client} did not come up: $(in_node feosctl pod get "${client}")"
 if in_node feosctl security-group delete server 2>/dev/null; then
   fail "a group a pod names was deleted"
@@ -259,11 +260,43 @@ node_ipv4="$(in_node ip -4 -o addr show dev eth0 | sed -n 's/.* inet \([0-9.]*\)
 dropped "${server_address}" 8080 || fail "a pod reaches another pod over IPv6"
 dropped "${server_ipv4}" 8080 || fail "a pod reaches another pod over IPv4"
 for target in "169.254.0.53 9" "169.254.0.53 80" "169.254.0.1 53" "169.254.0.1 80" \
-  "${node_ipv4} 22" "${node_ipv4} 9" "169.254.169.254 80"; do
+  "${node_ipv4} 22" "${node_ipv4} 9" "169.254.169.253 80" "169.254.170.2 80"; do
   # shellcheck disable=SC2086
   dropped ${target} || fail "a pod reaches ${target}"
 done
-log "pods reach neither each other nor the node, its gateway or 169.254.169.254"
+log "pods reach neither each other nor the node, its gateway or other link-local addresses"
+
+# The pod's metadata (ADR 0010): Firecracker answers 169.254.169.254 in
+# the microVM's network device, with a session token first. busybox has
+# no PUT: nc asks for the token.
+pod_metadata() {
+  in_pod sh -c 'printf "PUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\nX-metadata-token-ttl-seconds: 60\r\nContent-Length: 0\r\n\r\n" |
+    nc -w 2 169.254.169.254 80 | tail -n 1 >/tmp/token &&
+    wget -q -O - --header "X-metadata-token: $(cat /tmp/token)" "http://169.254.169.254/$1"' sh "$1"
+}
+client_metadata() {
+  local token
+  token="$(in_client curl -sS -m 5 -X PUT -H 'X-metadata-token-ttl-seconds: 60' \
+    http://169.254.169.254/latest/api/token)" || return 1
+  in_client curl -sS -m 5 -H "X-metadata-token: ${token}" "$@"
+}
+code="$(in_client curl -sS -m 5 -o /dev/null -w '%{http_code}' http://169.254.169.254/feos/pod-id || true)"
+[ "${code}" = 401 ] || fail "the metadata service answered ${code} without a session token"
+in_pod wget -q -O - http://169.254.169.254/feos/pod-id >/dev/null 2>&1 &&
+  fail "busybox wget got the metadata without a session token"
+[ "$(client_metadata http://169.254.169.254/feos/pod-id)" = "${client}" ] ||
+  fail "the client's metadata has not its ID: $(client_metadata http://169.254.169.254/feos/pod-id)"
+[ "$(client_metadata http://169.254.169.254/feos/ipv6)" = "${client_address}" ] ||
+  fail "the client's metadata has not its IPv6 address"
+[ "$(client_metadata http://169.254.169.254/feos/ipv4)" = "${client_ipv4}" ] ||
+  fail "the client's metadata has not its IPv4 address"
+[ "$(client_metadata http://169.254.169.254/metadata/role)" = client ] ||
+  fail "the client's metadata has not the spec's"
+json="$(client_metadata -H 'Accept: application/json' http://169.254.169.254/)"
+contains -F '"metadata":{"role":"client"}' <<<"${json}" || fail "no metadata as JSON: ${json}"
+[ "$(pod_metadata feos/pod-id)" = "${pod}" ] || fail "the pod's metadata has not its ID: $(pod_metadata feos/pod-id)"
+[ -z "$(pod_metadata metadata)" ] || fail "the pod has metadata it was not given: $(pod_metadata metadata)"
+log "the pods read their metadata at 169.254.169.254, with a session token alone"
 
 # The client's group lets it reach the server on 8080 over IPv6, once it
 # is a member; over IPv4 never.
@@ -325,6 +358,8 @@ contains -F "example.com" <<<"$(grep -F " name tls " <<<"${records}")" ||
   fail "no TLS server name example.com: ${records}"
 grep -F " flow " <<<"${records}" | contains -F "169.254.0.53:53" &&
   fail "a query to the resolver is recorded as a flow: ${records}"
+contains -F "169.254.169.254" <<<"${records}" &&
+  fail "a packet to the metadata service reached the node: ${records}"
 log "nftables has the pods' sets, chains and masquerade; feosctl traffic watch shows DNS, flows of both families with the pods' own addresses, drops and server names"
 
 # Deleting a pod deletes its TAP device and the connections of its IPv4
@@ -365,7 +400,8 @@ in_node feosctl pod suspend "${pod}" >/dev/null || fail "no suspend"
 [ "$(pod_state)" = SUSPENDED ] || fail "the pod is $(pod_state), not suspended"
 in_node feosctl pod resume "${pod}" >/dev/null || fail "no resume"
 [ "$(in_pod cat /tmp/mark)" = kept ] || fail "the pod lost its memory in a suspend"
-log "a pod suspends and resumes with its containers"
+[ "$(pod_metadata feos/ipv6)" = "${address}" ] || fail "the pod lost its metadata in a suspend"
+log "a pod suspends and resumes with its containers and its metadata"
 
 in_node systemctl restart feosd
 await "feosd did not come back" in_node systemctl is-active feosd
@@ -377,7 +413,8 @@ in_node ip neigh show proxy dev pod-22222222 | contains -F "169.254.0.1" ||
   fail "the pod's proxy ARP is gone with a restart of feosd"
 in_pod wget -q -O - http://example.com/ | contains "Example Domain" ||
   fail "the pod lost its network with a restart of feosd"
-log "the pod outlived a restart of feosd, with its network"
+[ "$(pod_metadata feos/pod-id)" = "${pod}" ] || fail "the pod lost its metadata with a restart of feosd"
+log "the pod outlived a restart of feosd, with its network and its metadata"
 
 # The pod's disk outlives diskd: the next diskd takes its device over.
 in_node systemctl restart diskd

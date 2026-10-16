@@ -143,6 +143,12 @@ message VmConfig {
   // the data disk in this order: Firecracker's drives volume0, volume1,
   // ..., which the guest tells apart by their order.
   repeated DataDiskConfig volumes = 9;
+  // A JSON object, the microVM's metadata: Firecracker serves it to the
+  // guest at 169.254.169.254 on the first network interface (MMDS,
+  // version 2, which wants a session token first). A snapshot does not
+  // hold it: the VM service puts it in again after every load. Empty: no
+  // metadata service.
+  string metadata_json = 10;
 }
 
 message DataDiskConfig {

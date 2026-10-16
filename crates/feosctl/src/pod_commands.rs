@@ -112,6 +112,15 @@ pub struct CreatePodOptions {
     #[arg(long, value_parser = parse_key_val, help = "KEY=value for the pod (repeatable)")]
     label: Vec<(String, String)>,
 
+    #[arg(
+        long,
+        value_name = "KEY=value",
+        value_parser = parse_key_val,
+        conflicts_with = "no_network",
+        help = "KEY=value the pod reads from its metadata service at 169.254.169.254 (repeatable); no credentials"
+    )]
+    metadata: Vec<(String, String)>,
+
     #[arg(long, help = "No network: the pod can pull no image then")]
     no_network: bool,
 
@@ -324,6 +333,7 @@ fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
             network,
             labels: opts.label.into_iter().collect::<HashMap<_, _>>(),
             volumes: opts.volumes,
+            metadata: opts.metadata.into_iter().collect(),
         }),
     }
 }
@@ -459,6 +469,11 @@ fn print_pod(pod: &PodInfo) {
     }
     for (key, value) in &spec.labels {
         println!("  Label: {key}={value}");
+    }
+    let mut metadata: Vec<_> = spec.metadata.iter().collect();
+    metadata.sort();
+    for (key, value) in metadata {
+        println!("  Metadata: {key}={value}");
     }
     for volume in &spec.volumes {
         println!("  Volume: {} ({})", volume.name, volume.volume_id);
@@ -634,6 +649,28 @@ mod tests {
         assert_eq!(spec.containers[0].env["A"], "b");
         assert_eq!(spec.network, None, "a pod has a network by default");
         assert!(uuid::Uuid::parse_str(&request.pod_id).is_ok());
+    }
+
+    #[test]
+    fn a_create_gives_the_pod_metadata_with_a_network() {
+        let cli = Cli::try_parse_from([
+            "pod",
+            "create",
+            "--metadata",
+            "role=web",
+            "--metadata",
+            "url=http://a/?b=c",
+        ])
+        .unwrap();
+        let PodCommand::Create(opts) = cli.command else {
+            panic!("not a create");
+        };
+        let spec = create_pod_request(*opts).spec.unwrap();
+        assert_eq!(spec.metadata["role"], "web");
+        assert_eq!(spec.metadata["url"], "http://a/?b=c");
+        assert!(
+            Cli::try_parse_from(["pod", "create", "--no-network", "--metadata", "a=b"]).is_err()
+        );
     }
 
     #[test]

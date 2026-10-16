@@ -22,7 +22,7 @@ use feos_utils::nft;
 use feos_utils::vsock::API_PORT;
 use futures::TryStreamExt;
 use log::info;
-use microvm_service::vmm::jail;
+use microvm_service::vmm::{fc_api, jail};
 use microvm_service::{vm_dir, vsock_path};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
@@ -250,6 +250,18 @@ async fn guest_clock_skew(pod_id: &str) -> Result<Duration> {
 }
 
 /// A request for the pod's guest, through feosd.
+/// The API socket of the pod's Firecracker.
+fn fc_socket(pod_id: &str) -> std::path::PathBuf {
+    vm_dir(pod_id).join("fc.sock")
+}
+
+/// What the pod's Firecracker serves the guest at 169.254.169.254.
+pub(super) async fn microvm_metadata(pod_id: &str) -> Result<serde_json::Value> {
+    fc_api::request(&fc_socket(pod_id), "GET", "/mmds", None)
+        .await?
+        .context("Firecracker has no metadata")
+}
+
 pub(super) fn for_pod<T>(pod_id: &str, message: T) -> tonic::Request<T> {
     let mut request = tonic::Request::new(message);
     request
@@ -279,6 +291,7 @@ async fn test_pod_lifecycle() -> Result<()> {
         network: None,
         labels: [("test".to_string(), "lifecycle".to_string())].into(),
         volumes: vec![],
+        metadata: [("role".to_string(), "test".to_string())].into(),
     };
     let create = CreatePodRequest {
         pod_id: pod_id.clone(),
@@ -342,6 +355,22 @@ async fn test_pod_lifecycle() -> Result<()> {
     assert_eq!(network.gateway, "169.254.0.1");
     assert_eq!(network.dns, ["169.254.0.53"]);
     assert_eq!(network.hostname, pod_id);
+    // Firecracker serves the pod its metadata at 169.254.169.254, version
+    // 2: the pod's identity and the spec's.
+    assert_eq!(
+        microvm_metadata(&pod_id).await?,
+        serde_json::json!({
+            "feos": {"pod-id": pod_id, "ipv6": address.to_string(), "ipv4": ipv4.to_string()},
+            "metadata": {"role": "test"},
+        })
+    );
+    let fc_config = fc_api::request(&fc_socket(&pod_id), "GET", "/vm/config", None)
+        .await?
+        .context("no configuration")?;
+    let mmds = &fc_config["mmds-config"];
+    assert_eq!(mmds["version"], "V2", "{fc_config}");
+    assert_eq!(mmds["network_interfaces"], serde_json::json!(["eth0"]));
+    assert_eq!(mmds["ipv4_address"], "169.254.169.254");
     // The TAP device is a link of its own: the node is fe80::1 on it and
     // holds no IPv4 address, but answers ARP for 169.254.0.1 by proxy, at
     // once; the pod's addresses are routed to it.
@@ -638,6 +667,8 @@ async fn test_pod_suspend_and_resume() -> Result<()> {
     let pod = wait_for_pod(&mut pods, &pod_id, PodState::Running).await?;
     guard.set_pid(pod.microvm.context("a running pod has a microVM")?.pid as i32);
     let first = guest_ping(&pod_id).await?;
+    let metadata = microvm_metadata(&pod_id).await?;
+    assert_eq!(metadata["feos"]["pod-id"], pod_id.as_str());
 
     for round in 0..2 {
         info!("Suspending pod {pod_id}, round {round}");
@@ -684,6 +715,8 @@ async fn test_pod_suspend_and_resume() -> Result<()> {
         let pong = guest_ping(&pod_id).await?;
         assert_eq!(pong.boot_id, first.boot_id);
         assert!(pong.tick > first.tick, "The guest forgot its pings");
+        // A snapshot does not hold the metadata: it went in again.
+        assert_eq!(microvm_metadata(&pod_id).await?, metadata);
         let skew = guest_clock_skew(&pod_id).await?;
         assert!(
             skew < Duration::from_secs(2),

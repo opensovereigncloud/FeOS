@@ -298,10 +298,48 @@ outlive `feosd`).
 
 ### Metadata
 
-`169.254.169.254` is left to a metadata service in Firecracker's network
-device (MMDS, ADR 0010), which is not built. Like every link-local
-destination it is denied on the node, so no pod reaches the node's own
-cloud metadata service.
+A pod with a network has a metadata service at `169.254.169.254`, which
+Firecracker answers in the microVM's network device, `eth0` (MMDS,
+ADR 0010); its packets never reach the TAP. It is version 2: a `GET`
+needs a session token, which a `PUT /latest/api/token` with the header
+`X-metadata-token-ttl-seconds` (1 to 21600) hands out, and which the
+`GET` carries in `X-metadata-token`; without one it gets `401`. With
+`Accept: application/json` an answer is JSON, without it a string, or
+the keys of an object one per line.
+
+It holds a JSON object:
+
+```json
+{
+  "feos": {
+    "pod-id": "22222222-3333-4444-5555-666666666666",
+    "ipv6": "2001:db8:0:1::5",
+    "ipv4": "169.254.16.5"
+  },
+  "metadata": {"role": "web"}
+}
+```
+
+`feos` is the pod's ID and its addresses on this node; `metadata` is the
+spec's (`PodSpec.metadata`), keys of 1 to 128 letters, digits, `-`, `_`
+and `.`, at most 32 KiB as JSON. `GET /feos/ipv6` gives the address,
+`GET /metadata/role` the value.
+
+The VM service writes the object into the microVM's directory,
+`metadata.json`, when the microVM is made, and Firecracker loads it
+before the guest boots (`--metadata`). A snapshot keeps where the
+metadata is served, not what: after every load, a resume on the node as
+a restore from a checkpoint, the VM service puts it in again
+(`PUT /mmds`) before the guest runs, with the addresses the pod has on
+this node; a restored pod has new ones. A restart of `feosd` leaves
+Firecracker's store alone. A microVM made before pods had a metadata
+service has none: one that is stopped is made anew at the next boot,
+one that runs or is suspended goes on without it until the pod is
+stopped and started, and `feosd` warns about it: MMDS cannot be turned
+on in a running Firecracker.
+
+Every other link-local destination is denied on the node, so no pod
+reaches the node's own cloud metadata service.
 
 ### The table
 

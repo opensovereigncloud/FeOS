@@ -86,6 +86,14 @@ message PodSpec {
   // microVM's drives. They are fixed at its creation, and attached to it
   // until it is deleted.
   repeated PodVolume volumes = 5;
+  // What the pod reads from its metadata service at 169.254.169.254
+  // (Firecracker's MMDS, version 2: a session token first), under
+  // "metadata", beside feosd's "feos" with the pod's ID and addresses. No
+  // credentials belong here: anything in the pod can read it (ADR 0014).
+  // Keys are 1 to 128 letters, digits, "-", "_" and "."; keys and values
+  // take 32 KiB at most. A pod without a network has no metadata service,
+  // and no metadata.
+  map<string, string> metadata = 6;
 }
 
 // A volume of a pod, by the name its containers mount it by.

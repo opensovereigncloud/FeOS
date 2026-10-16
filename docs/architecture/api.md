@@ -79,6 +79,13 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   use fails with `INVALID_ARGUMENT`; one with a network on a node without
   `--pod-prefix`, or whose network is not set up, fails with
   `FAILED_PRECONDITION`.
+- `PodSpec.metadata`: keys and values that the pod reads from its
+  metadata service at `169.254.169.254`, beside `feosd`'s own, the pod's
+  ID and addresses ([node.md](node.md#metadata)); no credentials, which
+  anything in the pod could read. A create with a key other than 1 to
+  128 letters, digits, `-`, `_` and `.`, with more than 32 KiB as JSON,
+  or with metadata and no network fails with `INVALID_ARGUMENT`.
+  `feosctl pod create --metadata KEY=value`.
 - `PodInfo.ipv6_address`: the pod's address on the network, of the
   node's prefix, while it is on the node. `PodInfo.ipv4_address`: its
   IPv4 address on the node, of `--pod-ipv4-range`, for leaving through

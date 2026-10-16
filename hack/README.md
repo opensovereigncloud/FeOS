@@ -82,14 +82,17 @@ Docker Hub, so it needs IPv4 internet access, IPv6 not): they have an
 IPv6 address of the prefix and an IPv4 address of `169.254.16.0/20`
 behind proxy ARP for `169.254.0.1`, resolve through `169.254.0.53` and
 reach the internet over IPv4, by name, by literal and with ICMP; they
-reach neither each other nor the node, `169.254.169.254` or a denied
-prefix, and one pod the other only over IPv6 on the port a security
-group opens; `feosctl traffic watch` records their DNS queries, flows of
-both families, drops and a TLS server name. A deleted pod takes its TAP
-device and its connections in connection tracking, and the next pod gets
-an IPv4 address never used. It execs in a pod through feosd, suspends,
-resumes, stops and starts it, restarts feosd under it with its network,
-and powers the container off through `feosctl host shutdown`.
+reach neither each other nor the node, other link-local addresses or a
+denied prefix, and one pod the other only over IPv6 on the port a
+security group opens; they read their ID, addresses and metadata at
+`169.254.169.254` with a session token, and get `401` without one;
+`feosctl traffic watch` records their DNS queries, flows of both
+families, drops and a TLS server name, and no packet to the metadata
+service. A deleted pod takes its TAP device and its connections in
+connection tracking, and the next pod gets an IPv4 address never used.
+It execs in a pod through feosd, suspends, resumes, stops and starts it,
+restarts feosd under it with its network and its metadata, and powers
+the container off through `feosctl host shutdown`.
 `make publish-apt` reads the bucket's credentials from
 `~/.config/feos/apt/r2.env` and signs with the key in
 `~/.config/feos/apt/gnupg`; both stay on the machine that publishes.
