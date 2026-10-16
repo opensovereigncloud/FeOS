@@ -84,7 +84,8 @@ trap cleanup EXIT
 end=$((SECONDS + TIMEOUT))
 until grep -q "listening on vsock port" "${SERIAL_LOG}" 2>/dev/null; do
   [ ${SECONDS} -lt ${end} ] || fail "API not up within ${TIMEOUT}s"
-  kill -0 "${FC_PID}" 2>/dev/null || fail "Firecracker exited"
+  # Not kill -0: sudo is root's for a moment while it opens its session.
+  [ -d "/proc/${FC_PID}" ] || fail "Firecracker exited"
   sleep 0.2
 done
 [ -z "${SUDO}" ] || ${SUDO} chmod 0666 "${VSOCK}"
