@@ -4,10 +4,10 @@
 use crate::{Command, ConsoleInput};
 use feos_proto::microvm::{
     micro_vm_service_server::MicroVmService, CreateVmRequest, CreateVmResponse, DeleteVmRequest,
-    DeleteVmResponse, GetVmRequest, PingVmRequest, PingVmResponse, ResumeVmRequest,
-    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
-    StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest,
-    SuspendVmResponse, VmEvent, VmInfo,
+    DeleteVmResponse, GetVmRequest, GuestNetworkConfig, PingVmRequest, PingVmResponse,
+    ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
+    StartVmResponse, StreamVmConsoleRequest, StreamVmConsoleResponse, StreamVmEventsRequest,
+    SuspendVmRequest, SuspendVmResponse, VmEvent, VmInfo,
 };
 use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
@@ -37,6 +37,23 @@ impl VmApiHandler {
             .await
             .map_err(|e| Status::internal(format!("Failed to send command to dispatcher: {e}")))?;
         Ok(ReceiverStream::new(output_rx))
+    }
+
+    /// Gives the VM's guest another network configuration, for a caller in
+    /// this process: the VM's record keeps it, and a guest that is attached
+    /// takes it at once. Returns whether one was; a guest that is not gets
+    /// it when it attaches or resumes.
+    pub async fn set_guest_network(
+        &self,
+        vm_id: &str,
+        network: GuestNetworkConfig,
+    ) -> Result<bool, Status> {
+        info!("VmApi: Received SetGuestNetwork for {vm_id}.");
+        dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::SetGuestNetwork(vm_id.to_string(), network, resp_tx)
+        })
+        .await
+        .map(Response::into_inner)
     }
 }
 

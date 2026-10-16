@@ -270,9 +270,14 @@ A pod kept from an earlier network gets what it lacks at the start of
 first version, and an IPv4 address if it has none of the range, such as
 one of IPv6 alone or with an address of the first version's
 `10.200.0.0/16`. Its microVM was made for that network: one that is
-stopped is made anew at the next boot; one that runs or is suspended
-keeps the old network until the pod is stopped and started, and `feosd`
-warns about it.
+stopped is made anew at the next boot. One that runs, or is suspended,
+when it resumes, keeps its devices; where only its guest's configuration
+differs, as for a pod of IPv6 alone, its record takes this one and the
+guest is pushed it, and applies it at once, its containers' resolvers
+too (a guest that is not attached yet gets it when it attaches). One
+whose devices differ, such as the first version's on a bridge, keeps the
+old network until the pod is stopped and started, and `feosd` warns
+about it.
 
 ### DNS
 

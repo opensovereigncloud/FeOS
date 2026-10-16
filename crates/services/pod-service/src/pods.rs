@@ -1202,9 +1202,12 @@ impl Pods {
         Ok(())
     }
 
-    /// Warns about a running microVM that was made for another network, such
-    /// as the first version's with IPv4: its guest keeps that network until
-    /// the pod boots anew.
+    /// Brings a running microVM that was made for another network in line.
+    /// Where only its guest's configuration differs, such as one of IPv6
+    /// alone with the resolver of that version, the guest is pushed this
+    /// one and takes it at once. A microVM whose devices differ, such as
+    /// the first version's with IPv4 on a bridge, keeps its network until
+    /// the pod boots anew, and feosd warns.
     async fn check_microvm_network(&self, pod_id: &str, attachment: Option<&Attachment>) {
         let (Ok(info), Ok(Some(vm))) = (self.info(pod_id), self.vm(pod_id).await) else {
             return;
@@ -1219,10 +1222,26 @@ impl Pods {
             disk,
             &volumes,
         );
-        if stale(&vm, &wanted) {
-            warn!(
+        if !stale(&vm, &wanted) {
+            return;
+        }
+        let devices_differ = config.net != wanted.net;
+        match wanted.guest_network {
+            Some(network) if !devices_differ => {
+                match self.inner.vms.set_guest_network(pod_id, network).await {
+                    Ok(true) => info!("Pods: {pod_id}'s guest took this network"),
+                    Ok(false) => {
+                        info!("Pods: {pod_id}'s guest takes this network when it attaches")
+                    }
+                    Err(e) => warn!(
+                        "Pods: {pod_id}'s guest keeps another network for now: {}",
+                        e.message()
+                    ),
+                }
+            }
+            _ => warn!(
                 "Pods: {pod_id}'s microVM was made for another network; a stop and a start give it this one"
-            );
+            ),
         }
     }
 

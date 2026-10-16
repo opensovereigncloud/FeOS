@@ -3,8 +3,9 @@
 # network as feosd does, pull an image in the guest, and run a container:
 # exec, resolvers, toolbox, exit codes. Then check the network: both
 # families, the same push again, other addresses as after a resume on
-# another node, and each family alone. Then reboot and adopt the container,
-# and check that its writable layer survived.
+# another node, each family alone, and the network of this version over
+# one of an earlier one. Then reboot and adopt the container, and check
+# that its writable layer survived.
 #
 #   hack/guest/test-container [image]
 #
@@ -53,6 +54,8 @@ GUEST_IP_MOVED=169.254.16.3
 GUEST_IP6=fd00:fe05:ffff::2
 GUEST_IP6_MOVED=fd00:fe05:ffff::3
 DNS=169.254.0.53
+# A resolver of an earlier network.
+OLD_DNS=2001:db8::53
 
 log() { printf '[test-container] %s\n' "$*"; }
 fail() { log "FAIL: $*"; tail -40 "${SERIAL_LOG:-/dev/null}" >&2 || true; exit 1; }
@@ -164,13 +167,13 @@ boot() {
 ctl() { "${FEOSCTL}" "$1" --address "vsock:${VSOCK}" "${@:2}"; }
 cexec() { ctl container exec main -- "$@"; }
 # Pushes a pod's network as feosd does: an IPv4 /32 ($1) and an IPv6 /128
-# ($2), each via the node's address on the link, and the node's resolver.
-# An empty address leaves its family out.
+# ($2), each via the node's address on the link, and the node's resolver,
+# or another one ($3). An empty address leaves its family out.
 push() {
   local args=()
   [ -z "$1" ] || args+=(--ipv4 "$1/32" --gateway "${NODE_IP}")
   [ -z "$2" ] || args+=(--ipv6 "$2/128" --ipv6-gateway fe80::1)
-  ctl host set-network --interface eth0 "${args[@]}" --dns "${DNS}" --hostname feos-test >/dev/null
+  ctl host set-network --interface eth0 "${args[@]}" --dns "${3:-${DNS}}" --hostname feos-test >/dev/null
 }
 # Whether the guest answers on an address, from the node's.
 answers() {
@@ -337,6 +340,20 @@ expect_network "${GUEST_IP_MOVED}" ""
 answers "${GUEST_IP_MOVED}" || fail "no answer on ${GUEST_IP_MOVED} with IPv4 alone"
 node ping -c1 -W1 "${GUEST_IP6_MOVED}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP6_MOVED}"
 log "a push of one family leaves the other unconfigured"
+
+# A pod that runs from an earlier network, IPv6 alone with a resolver of
+# its own, is pushed this one by feosd: its running container resolves
+# through the node's resolver at once.
+push "" "${GUEST_IP6}" "${OLD_DNS}"
+out="$(cexec cat /etc/resolv.conf | grep -v '^#' || true)"
+[ "${out}" = "nameserver ${OLD_DNS}" ] || fail "resolvers of the earlier network: ${out}"
+push "${GUEST_IP}" "${GUEST_IP6}"
+expect_network "${GUEST_IP}" "${GUEST_IP6}"
+answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP} after the push of this network"
+out="$(cexec cat /etc/resolv.conf | grep -v '^#' || true)"
+[ "${out}" = "nameserver ${DNS}" ] || fail "resolvers after the push of this network: ${out}"
+grep -q "Server:.*${DNS}" <<<"$(cexec nslookup example.com)" || fail "no name through ${DNS} after the push"
+log "a running container takes the resolver of a new push"
 
 # A host freezes the data volume before it stops a guest it wants to adopt
 # later; freezing writes back what is in the guest's page cache.

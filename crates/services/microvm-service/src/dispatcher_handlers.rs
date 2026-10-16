@@ -10,10 +10,10 @@ use crate::{
 };
 use feos_proto::microvm::{
     stream_vm_console_request as console_input, AttachConsoleMessage, CreateVmRequest,
-    CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest, ResumeVmRequest,
-    ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse,
-    StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse, VmEvent,
-    VmInfo, VmState, VmStateChangedEvent,
+    CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest, GuestNetworkConfig,
+    ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest,
+    StartVmResponse, StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest,
+    SuspendVmResponse, VmEvent, VmInfo, VmState, VmStateChangedEvent,
 };
 use log::{error, info, warn};
 use prost::Message;
@@ -594,6 +594,39 @@ pub(crate) async fn handle_suspend_vm_command(
         guests,
         free_page_reporting,
     ));
+}
+
+/// Gives the VM's guest another network configuration: the VM's record
+/// keeps it, and a guest that is attached takes it at once; the push runs
+/// beside the dispatcher. A guest that is not attached gets it when it
+/// attaches or resumes.
+pub(crate) async fn handle_set_guest_network_command(
+    repository: &VmRepository,
+    vm_id: String,
+    network: GuestNetworkConfig,
+    responder: oneshot::Sender<Result<bool, VmServiceError>>,
+    guests: Arc<Guests>,
+) {
+    let kept = async {
+        let (_, mut record) = parse_vm_id_and_get_record(&vm_id, repository).await?;
+        record.config.guest_network = Some(network.clone());
+        crate::vmm::validate_config(&record.config)?;
+        repository.save_vm(&record).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = kept {
+        let _ = responder.send(Err(e));
+        return;
+    }
+    tokio::spawn(async move {
+        let pushed = guests.reconfigure(&vm_id, network).await.map_err(|e| {
+            VmServiceError::InvalidState(format!(
+                "the guest did not take its network: {e}; it gets it when it attaches again"
+            ))
+        });
+        let _ = responder.send(pushed);
+    });
 }
 
 pub(crate) async fn check_and_cleanup_vms(

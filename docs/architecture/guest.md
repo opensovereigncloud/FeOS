@@ -32,7 +32,9 @@ As PID 1 the guest:
    `LifecycleService.Attach` open.
 
 It runs no DHCP and no NTP: the host pushes the time and the network when
-the guest attaches and after every resume.
+the guest attaches and after every resume, and the network again when
+`feosd` finds a running pod's guest configured for an earlier network
+([node.md](node.md)).
 
 ## Network
 

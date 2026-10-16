@@ -4,8 +4,8 @@
 use crate::{
     dispatcher_handlers::{
         handle_create_vm_command, handle_delete_vm_command, handle_get_vm_command,
-        handle_resume_vm_command, handle_shutdown_vm_command, handle_start_vm_command,
-        handle_stream_vm_console_command, handle_stream_vm_events_command,
+        handle_resume_vm_command, handle_set_guest_network_command, handle_shutdown_vm_command,
+        handle_start_vm_command, handle_stream_vm_console_command, handle_stream_vm_events_command,
         handle_suspend_vm_command, perform_startup_sanity_check,
     },
     error::VmServiceError,
@@ -104,6 +104,9 @@ impl VmServiceDispatcher {
                         }
                         Command::ResumeVm(req, responder) => {
                             handle_resume_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, &self.healthcheck_cancel_bus, guests).await;
+                        }
+                        Command::SetGuestNetwork(vm_id, network, responder) => {
+                            handle_set_guest_network_command(&self.repository, vm_id, network, responder, guests).await;
                         }
                     }
                 },

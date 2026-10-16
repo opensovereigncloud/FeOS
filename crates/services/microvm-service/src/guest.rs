@@ -181,6 +181,31 @@ impl Guests {
         self.pushed(vm_id, result);
     }
 
+    /// Remembers another network configuration for the VM's guest, and
+    /// pushes it with the time if the guest is attached: it takes it at
+    /// once. Returns whether it pushed; a guest that is not attached gets
+    /// it when it attaches or resumes.
+    pub async fn reconfigure(
+        &self,
+        vm_id: &str,
+        network: GuestNetworkConfig,
+    ) -> Result<bool, String> {
+        let attached = match self.lock().get_mut(vm_id) {
+            Some(guest) => {
+                guest.network = Some(network);
+                guest.info.as_ref().is_some_and(|info| info.attached)
+            }
+            // Its listener takes the network from the VM's record.
+            None => false,
+        };
+        if !attached {
+            return Ok(false);
+        }
+        let result = self.push(vm_id).await;
+        self.pushed(vm_id, result.clone());
+        result.map(|()| true)
+    }
+
     /// Before a snapshot: has a FeOS guest empty its memory as far as it
     /// can, so that the snapshot gets smaller. Best effort.
     pub async fn prepare_pause(&self, vm_id: &str, free_page_reporting: bool) {
@@ -399,5 +424,47 @@ mod tests {
             uplink_path("vm"),
             PathBuf::from("/var/lib/feos/vms/firecracker/vm/root/v.sock_10001")
         );
+    }
+
+    #[tokio::test]
+    async fn another_network_goes_to_the_attached_guest() {
+        let (events, _) = mpsc::channel(1);
+        let guests = Guests::new(events);
+        let network = |address: &str| GuestNetworkConfig {
+            interface: "eth0".to_string(),
+            ipv6_cidr: format!("{address}/128"),
+            ipv6_gateway: "fe80::1".to_string(),
+            ..Default::default()
+        };
+        // A VM nobody listens for: its listener takes the record's.
+        assert_eq!(
+            guests.reconfigure("vm", network("2001:db8::2")).await,
+            Ok(false)
+        );
+        assert!(guests.lock().get("vm").is_none());
+
+        // A guest that is not attached gets it when it attaches.
+        guests.lock().insert(
+            "vm".to_string(),
+            Guest {
+                network: Some(network("2001:db8::2")),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            guests.reconfigure("vm", network("2001:db8::3")).await,
+            Ok(false)
+        );
+        assert_eq!(guests.lock()["vm"].network, Some(network("2001:db8::3")));
+
+        // An attached one is pushed it at once; here none answers.
+        guests.lock().get_mut("vm").unwrap().info = Some(GuestInfo {
+            attached: true,
+            ..Default::default()
+        });
+        let pushed = guests.reconfigure("vm", network("2001:db8::4")).await;
+        let error = pushed.expect_err("no guest answers");
+        assert_eq!(guests.lock()["vm"].network, Some(network("2001:db8::4")));
+        assert_eq!(guests.info("vm").unwrap().push_error, error);
     }
 }

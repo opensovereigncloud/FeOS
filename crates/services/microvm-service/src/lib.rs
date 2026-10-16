@@ -4,8 +4,8 @@
 use crate::error::VmServiceError;
 use feos_proto::microvm::{
     CreateVmRequest, CreateVmResponse, DeleteVmRequest, DeleteVmResponse, GetVmRequest,
-    PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse, ShutdownVmRequest,
-    ShutdownVmResponse, StartVmRequest, StartVmResponse, StreamVmConsoleRequest,
+    GuestNetworkConfig, PingVmRequest, PingVmResponse, ResumeVmRequest, ResumeVmResponse,
+    ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, StartVmResponse, StreamVmConsoleRequest,
     StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse, VmEvent,
     VmInfo,
 };
@@ -100,6 +100,13 @@ pub enum Command {
         SuspendVmRequest,
         oneshot::Sender<Result<SuspendVmResponse, VmServiceError>>,
     ),
+    /// Another network configuration for a VM's guest, from a caller in
+    /// this process; answers whether it was pushed into the guest.
+    SetGuestNetwork(
+        String,
+        GuestNetworkConfig,
+        oneshot::Sender<Result<bool, VmServiceError>>,
+    ),
 }
 
 impl std::fmt::Debug for Command {
@@ -117,6 +124,11 @@ impl std::fmt::Debug for Command {
             Command::ShutdownVm(req, _) => f.debug_tuple("ShutdownVm").field(req).finish(),
             Command::ResumeVm(req, _) => f.debug_tuple("ResumeVm").field(req).finish(),
             Command::SuspendVm(req, _) => f.debug_tuple("SuspendVm").field(req).finish(),
+            Command::SetGuestNetwork(vm_id, network, _) => f
+                .debug_tuple("SetGuestNetwork")
+                .field(vm_id)
+                .field(network)
+                .finish(),
         }
     }
 }
