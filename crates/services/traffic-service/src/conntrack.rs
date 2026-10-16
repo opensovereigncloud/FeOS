@@ -236,7 +236,8 @@ pub fn records(event: &Event, pods: &dyn Pods, now: SystemTime) -> Vec<TrafficRe
 /// handed out again: else the next pod with the address would find the
 /// old one's connections, and its records would be the old one's. Each
 /// connection ends with a DESTROY event; its record names the pod that
-/// has the address when the collector reads the event, if any.
+/// the caller's [`Pods`] gives for the address when the collector reads
+/// the event, which in feosd is the deleted one still.
 ///
 /// The kernel is asked for an IPv4 source's connections alone
 /// (CTA_FILTER, Linux 5.8 on). One that ignores the filter sends all of

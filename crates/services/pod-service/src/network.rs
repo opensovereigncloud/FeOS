@@ -29,7 +29,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::broadcast;
 use tonic::Status;
@@ -883,12 +883,24 @@ async fn forward_records(
 struct Directory {
     addresses: RwLock<HashMap<IpAddr, String>>,
     taps: RwLock<HashMap<String, String>>,
+    /// The addresses of pods that left, with when, for [`DEPARTED`]: the
+    /// ends of their connections come after they left, those that a
+    /// delete ends among them. An address that a pod holds is its.
+    departed: RwLock<HashMap<IpAddr, (String, Instant)>>,
 }
 
+/// How long the records know a pod by its addresses after it left.
+const DEPARTED: Duration = Duration::from_secs(300);
+
 impl Directory {
-    /// Knows these pods, those with a network, and no others.
+    /// Knows these pods, those with a network, and those that left in the
+    /// last [`DEPARTED`].
     fn set(&self, pods: &[&PodInfo]) {
-        let addresses = pods
+        self.set_at(pods, Instant::now());
+    }
+
+    fn set_at(&self, pods: &[&PodInfo], now: Instant) {
+        let addresses: HashMap<IpAddr, String> = pods
             .iter()
             .flat_map(|pod| {
                 [&pod.ipv6_address, &pod.ipv4_address]
@@ -901,21 +913,46 @@ impl Directory {
             .iter()
             .map(|pod| (tap_name(&pod.pod_id), pod.pod_id.clone()))
             .collect();
-        *self
-            .addresses
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = addresses;
+        let left = std::mem::replace(
+            &mut *self
+                .addresses
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+            addresses.clone(),
+        );
         *self.taps.write().unwrap_or_else(PoisonError::into_inner) = taps;
+        let mut departed = self
+            .departed
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        departed.retain(|address, (_, since)| {
+            !addresses.contains_key(address) && now.saturating_duration_since(*since) < DEPARTED
+        });
+        for (address, pod_id) in left {
+            if !addresses.contains_key(&address) {
+                departed.insert(address, (pod_id, now));
+            }
+        }
     }
 }
 
 impl traffic_service::Pods for Directory {
     fn by_address(&self, address: IpAddr) -> Option<String> {
-        self.addresses
+        let address = address.to_canonical();
+        let holder = self
+            .addresses
             .read()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&address.to_canonical())
-            .cloned()
+            .get(&address)
+            .cloned();
+        holder.or_else(|| {
+            self.departed
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&address)
+                .filter(|(_, since)| since.elapsed() < DEPARTED)
+                .map(|(pod_id, _)| pod_id.clone())
+        })
     }
 
     fn by_interface(&self, name: &str) -> Option<String> {
@@ -1297,8 +1334,33 @@ mod tests {
         assert_eq!(id("169.254.16.2"), None);
         assert_eq!(directory.by_interface("pod-aaaaaaaa"), a);
         assert_eq!(directory.by_interface("eth0"), None);
-        directory.set(&[]);
+
+        // A pod that left is known by its addresses for a while: the ends
+        // of its connections come after it left.
+        let now = Instant::now();
+        directory.set_at(&[&pods[1]], now);
+        assert_eq!(id("fd00::2"), a);
+        assert_eq!(id("::ffff:169.254.16.1"), a);
+        assert_eq!(directory.by_interface("pod-aaaaaaaa"), None);
+        // A pod that holds the address is its.
+        let c = pod(
+            "cccccccc-0000-0000-0000-000000000000",
+            "fd00::4",
+            "169.254.16.1",
+        );
+        directory.set_at(&[&pods[1], &c], now);
+        assert_eq!(id("169.254.16.1"), Some(c.pod_id.clone()));
+        directory.set_at(&[&pods[1]], now);
+        assert_eq!(id("169.254.16.1"), Some(c.pod_id.clone()));
+        assert_eq!(id("fd00::2"), a);
+        // Until it has been gone too long.
+        directory.set_at(&[&pods[1]], now + DEPARTED);
+        assert_eq!(id("fd00::2"), None);
         assert_eq!(id("169.254.16.1"), None);
+        assert_eq!(id("fd00::4"), None);
+        let long_ago = Instant::now().checked_sub(DEPARTED).unwrap();
+        directory.set_at(&[], long_ago);
+        assert_eq!(id("fd00::3"), None);
     }
 
     #[tokio::test]

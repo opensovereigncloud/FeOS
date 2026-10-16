@@ -262,8 +262,9 @@ range when it is created, and keeps them in its record
 Deleting a pod takes it off the network (the resolver, the TAP device),
 then deletes the connection tracking entries whose original source is
 its IPv4 address, so that the next pod with the address finds none of
-them, while the records still know the pod; then the pod leaves the table,
-and its IPv4 address is freed.
+them, and whose ends the records name the pod for ([traffic
+records](#traffic-records)); then the pod leaves the table, and its IPv4
+address is freed.
 
 A pod kept from an earlier network gets what it lacks at the start of
 `feosd`: an IPv6 address if it has none of the prefix, such as one of the
@@ -374,6 +375,13 @@ The collector's threads and the resolver feed one channel, from which
 every call streams; a pod's queries to the resolver are left out of the
 flows, which the DNS records cover. What is lost on the way is counted in
 the next record's `missed`.
+
+A record names the pod by the addresses of the event, or by its TAP
+device. A pod that left, deleted or hibernated, is known by its
+addresses for five minutes more, unless another pod holds one of them by
+then: the ends of its connections come after it left, among them those
+that its delete ends. A connection that ends later is recorded without a
+pod.
 
 ## A pod's microVM
 
