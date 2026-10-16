@@ -13,6 +13,8 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
              [--pod-ipv4-range PREFIX] [--dns-address ADDRESS]
              [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
              [--diskd-socket PATH]
+             [--control-plane HOST:PORT [--control-plane-name NAME]
+              [--trust-domain NAME] [--join-token-file PATH] [--node-dir PATH]]
        feosd --version
 
   --tcp ADDRESS            also serve the API on TCP, without authentication
@@ -30,7 +32,20 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
   --deny-prefix PREFIX     a prefix of either family no pod reaches
                            (repeatable)
   --diskd-socket PATH      diskd's socket, which the pods' disks come from;
-                           /var/lib/feos/disk/diskd.sock by default";
+                           /var/lib/feos/disk/diskd.sock by default
+  --control-plane HOST:PORT
+                           the control plane's port for nodes, which the node
+                           joins and connects to (ADR 0015); without, the node
+                           is on its own
+  --control-plane-name NAME
+                           the DNS name the control plane's certificate is
+                           checked for, wherever feosd dials; HOST by default
+  --trust-domain NAME      the control plane's SPIFFE trust domain; feos.local
+                           by default
+  --join-token-file PATH   the join token, read while the node has not joined;
+                           /etc/feos/join-token by default
+  --node-dir PATH          the node's key, certificate and trust bundle;
+                           /var/lib/feos/node by default";
 
 #[derive(Debug, Default, PartialEq)]
 struct Args {
@@ -38,6 +53,8 @@ struct Args {
     self_upgrade: bool,
     network: network::Config,
     diskd_socket: Option<std::path::PathBuf>,
+    /// The control plane, and how the node joins it.
+    fleet: Option<fleet_client::Config>,
     /// Passed by feosd itself: the task service, and the process an upgrade
     /// exec'd.
     task_service: bool,
@@ -51,6 +68,11 @@ impl Args {
         let mut args = args.into_iter();
         // The first --dns-upstream replaces the defaults.
         let mut upstreams = Vec::new();
+        let mut control_plane = None;
+        let mut control_plane_name = None;
+        let mut trust_domain = None;
+        let mut join_token_file = None;
+        let mut node_dir = None;
         while let Some(arg) = args.next() {
             let mut value = |what: &str| {
                 args.next()
@@ -93,6 +115,11 @@ impl Args {
                     network.deny_prefixes.push(prefix);
                 }
                 "--diskd-socket" => parsed.diskd_socket = Some(value("a path")?.into()),
+                "--control-plane" => control_plane = Some(value("HOST:PORT")?),
+                "--control-plane-name" => control_plane_name = Some(value("a name")?),
+                "--trust-domain" => trust_domain = Some(value("a name")?),
+                "--join-token-file" => join_token_file = Some(value("a path")?.into()),
+                "--node-dir" => node_dir = Some(value("a path")?.into()),
                 "--self-upgrade" => parsed.self_upgrade = true,
                 "--task-service" => parsed.task_service = true,
                 "--restarted-after-upgrade" => parsed.restarted_after_upgrade = true,
@@ -102,6 +129,24 @@ impl Args {
         }
         if !upstreams.is_empty() {
             parsed.network.dns_upstreams = upstreams;
+        }
+        if let Some(address) = control_plane {
+            let trust_domain = trust_domain
+                .as_deref()
+                .unwrap_or(fleet_client::TRUST_DOMAIN);
+            let mut config =
+                fleet_client::Config::new(&address, control_plane_name.as_deref(), trust_domain)
+                    .map_err(|e| anyhow!("--control-plane: {e}\n{USAGE}"))?;
+            if let Some(file) = join_token_file {
+                config.join_token_file = file;
+            }
+            if let Some(dir) = node_dir {
+                config.node_dir = dir;
+            }
+            parsed.fleet = Some(config);
+        } else if let Some(trust_domain) = trust_domain {
+            fleet_client::check_trust_domain(&trust_domain)
+                .map_err(|e| anyhow!("--trust-domain: {e}\n{USAGE}"))?;
         }
         parsed
             .network
@@ -142,14 +187,26 @@ async fn serve(dns_sockets: Vec<(std::os::fd::OwnedFd, String)>) -> Result<()> {
         Err(e) => eprintln!("feosd: Failed to move into a leaf of its cgroup: {e}"),
     }
 
+    let fleet = args.fleet.map(|config| fleet_client::Config {
+        pod_prefix: args
+            .network
+            .pod_prefix
+            .map(|(prefix, len)| format!("{prefix}/{len}"))
+            .unwrap_or_default(),
+        version: feos_utils::version::full_version_string(),
+        ..config
+    });
     run_server(ServerOptions {
         tcp: args.tcp,
         network: args.network,
         dns_sockets,
         diskd_socket: args.diskd_socket,
+        fleet,
         ..ServerOptions::new(args.restarted_after_upgrade, args.self_upgrade)
     })
-    .await
+    .await?;
+    // SIGTERM, and the control plane knows: nothing is left to wait for.
+    std::process::exit(0)
 }
 
 #[cfg(test)]
@@ -168,6 +225,67 @@ mod tests {
         let args = parse(&["--diskd-socket", "/run/diskd.sock"]).unwrap();
         assert_eq!(args.diskd_socket, Some("/run/diskd.sock".into()));
         assert_eq!(parse(&[]).unwrap(), Args::default());
+    }
+
+    #[test]
+    fn the_control_plane_is_configured() {
+        assert_eq!(parse(&[]).unwrap().fleet, None);
+        let fleet = parse(&["--control-plane", "ferun.example.com:7443"])
+            .unwrap()
+            .fleet
+            .unwrap();
+        assert_eq!(fleet.address, "ferun.example.com:7443");
+        assert_eq!(fleet.name, "ferun.example.com");
+        assert_eq!(fleet.trust_domain, "feos.local");
+        assert_eq!(
+            fleet.join_token_file,
+            std::path::Path::new("/etc/feos/join-token")
+        );
+        assert_eq!(fleet.node_dir, std::path::Path::new("/var/lib/feos/node"));
+        let fleet = parse(&[
+            "--control-plane",
+            "10.43.0.17:7443",
+            "--control-plane-name",
+            "ferun-nodes.ferun.svc.cluster.local",
+            "--trust-domain",
+            "run.fecode.dev",
+            "--join-token-file",
+            "/run/credentials/feosd/join-token",
+            "--node-dir",
+            "/srv/feos/node",
+        ])
+        .unwrap()
+        .fleet
+        .unwrap();
+        assert_eq!(fleet.address, "10.43.0.17:7443");
+        assert_eq!(fleet.name, "ferun-nodes.ferun.svc.cluster.local");
+        assert_eq!(fleet.trust_domain, "run.fecode.dev");
+        assert_eq!(
+            fleet.join_token_file,
+            std::path::Path::new("/run/credentials/feosd/join-token")
+        );
+        assert_eq!(fleet.node_dir, std::path::Path::new("/srv/feos/node"));
+        for bad in [
+            &["--control-plane"][..],
+            &["--control-plane", "ferun.example.com"],
+            &["--control-plane", "10.43.0.17:7443"],
+            &[
+                "--control-plane",
+                "ferun.example.com:7443",
+                "--trust-domain",
+                "Feos",
+            ],
+            &[
+                "--control-plane",
+                "10.43.0.17:7443",
+                "--control-plane-name",
+                "10.43.0.17",
+            ],
+            &["--trust-domain", "feos.local:443"],
+            &["--node-dir"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

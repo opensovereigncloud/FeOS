@@ -1168,6 +1168,12 @@ impl DiskService for DiskSvc {
             s3_get_bytes: 0,
             memories: Vec::new(),
             object_store: self.s3.is_some(),
+            object_store_id: self
+                .s3
+                .as_ref()
+                .map(|s3| s3.id().to_string())
+                .unwrap_or_default(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
         };
         if let Ok(st) = self.cache.stats() {
             out.cache_bytes = st.bytes;

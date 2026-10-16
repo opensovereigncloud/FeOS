@@ -129,7 +129,7 @@ The guest's API is internal between `feosd` and `feos-guest`.
 | `feos-host-init` | sets the machine up as PID 1 and runs `feosd` |
 | `diskd` | the disk daemon (ADR 0011): ublk devices over sealed layers, a local cache and S3. Every pod has a disk from it, and hibernates into its object store: `HibernatePod` and `RestorePod`, here or on another node, with the pod's memory served lazily where the snapshot fits the node, and a boot on its disk where it does not (ADR 0008). Packaged beside `feosd`; no baked images, no sweep yet |
 | packages | `.deb` packages of `feosd`, `feosctl`, `diskd`, Firecracker and the guest, in a signed apt repository at apt.fecode.dev |
-| control plane connections | proposed (ADR 0015), not built |
+| control plane connections | `feosd --control-plane` (ADR 0015): joins with a one-time token, keeps its key and certificate and renews it, reports telemetry and its events (pods, start, stop) on the uplink, and serves its API on a node connection to every instance. The event buffer is in memory, not yet on disk; pods' credentials are not built |
 | control plane, node-side manager | in Go, still in the sandbox system's repository; the manager is being ported into `feosd`, the control plane becomes FeRun's `ferund` (ADR 0015) |
 | CaaS | not started; its open questions are in ADR 0001 |
 

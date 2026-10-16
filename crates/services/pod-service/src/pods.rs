@@ -1312,6 +1312,11 @@ impl Pods {
         self.inner.events.subscribe()
     }
 
+    /// diskd, as the pods use it.
+    pub fn disks(&self) -> &Disks {
+        &self.inner.disks
+    }
+
     /// Whether calls may go to the pod's guest: while its microVM runs.
     pub fn check_reachable(&self, pod_id: &str) -> Result<(), Status> {
         spec::check_id(pod_id)?;

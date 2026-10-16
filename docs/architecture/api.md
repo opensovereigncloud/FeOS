@@ -62,9 +62,9 @@ Container, Image, Tool or Watch service and the pod is pending or running
 
 Every public listener serves the same services. TCP has no
 authentication; `feos-host-init` starts `feosd` with `--tcp [::]:1337`.
-Decided, not built ([ADR 0015](../adr/0015-control-plane.md)): the
-connections `feosd` opens to the control plane, on which it serves the same
-services.
+With `--control-plane`, `feosd` serves them on the node connections it
+opens to the control plane too ([ADR 0015](../adr/0015-control-plane.md),
+[node.md](node.md#the-control-plane)).
 
 ## The pods' network
 

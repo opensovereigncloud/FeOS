@@ -38,10 +38,22 @@ pub struct RemoteObject {
     pub modified_unix: i64,
 }
 
+/// The lowercase hex SHA-256 of "<endpoint>\n<bucket>", which names an
+/// object store across nodes.
+pub fn store_id(endpoint: &str, bucket: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(format!("{endpoint}\n{bucket}"))
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 pub struct S3 {
     store: object_store::aws::AmazonS3,
     /// Key prefix, "" in production, "diskd-test/<run-id>/" in tests.
     prefix: String,
+    /// Which store this is, `store_id`; empty when it is not known.
+    id: String,
     pub bytes_up: std::sync::atomic::AtomicU64,
     pub bytes_down: std::sync::atomic::AtomicU64,
     /// Whole-object PUTs issued (chunks + manifests + objects); tests
@@ -63,6 +75,7 @@ impl S3 {
         S3 {
             store,
             prefix: prefix.into(),
+            id: String::new(),
             bytes_up: 0.into(),
             bytes_down: 0.into(),
             puts: 0.into(),
@@ -92,11 +105,27 @@ impl S3 {
             .with_secret_access_key(&sk)
             // Ceph/radosgw: path-style.
             .with_virtual_hosted_style_request(false);
+        // object_store's endpoint for the region when none is configured.
+        let id = store_id(
+            endpoint
+                .as_deref()
+                .unwrap_or(&format!("https://s3.{region}.amazonaws.com")),
+            &bucket,
+        );
         if let Some(ep) = endpoint {
             b = b.with_endpoint(ep);
         }
         let store = b.build().map_err(Error::from)?;
-        Ok(Some(S3::new(store, prefix)))
+        Ok(Some(S3 {
+            id,
+            ..S3::new(store, prefix)
+        }))
+    }
+
+    /// Which object store this is (feos.disk.v1 `object_store_id`): a pod
+    /// hibernated through one node restores through another with the same.
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     fn key(&self, kind: &str, name: &str) -> ObjPath {
@@ -342,4 +371,15 @@ pub async fn hydrate_chain(
         "hydrate_chain"
     );
     Ok(fetched)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_store_is_named_by_its_endpoint_and_bucket() {
+        assert_eq!(
+            super::store_id("https://s3.us-east-1.amazonaws.com", "fecode-dev"),
+            "797355f275ba0e52973553f7031adfec238e65a21d3478a401622fefd3ec01c9"
+        );
+    }
 }

@@ -35,4 +35,26 @@
 # A lab:
 #
 #   FEOSD_ARGS="--pod-prefix fd00:fe05:1::/64 --deny-prefix 10.0.0.0/8"
+#
+# With a control plane (ADR 0015), feosd joins it once with a join token
+# from its operator and then connects to every instance of it. Without
+# --control-plane, the node is on its own.
+#
+#   --control-plane HOST:PORT   the control plane's port for nodes, which
+#                               the join dials, e.g. 10.43.0.17:7443.
+#   --control-plane-name NAME   the DNS name of the control plane's
+#                               certificate, checked wherever feosd dials;
+#                               HOST by default, needed when HOST is an
+#                               address.
+#   --trust-domain NAME         the control plane's SPIFFE trust domain,
+#                               feos.local by default.
+#   --join-token-file PATH      the join token, feos-join-<secret>.<pin>,
+#                               readable by root alone; /etc/feos/join-token
+#                               by default. It is read until the node has
+#                               joined, and again when the control plane
+#                               removed the node.
+#   --node-dir PATH             the node's key, certificate and trust
+#                               bundle, /var/lib/feos/node by default.
+#
+#   FEOSD_ARGS="--control-plane 10.43.0.17:7443 --control-plane-name ferun.example.com --trust-domain run.example.com"
 FEOSD_ARGS=""

@@ -25,6 +25,9 @@ crates/
   feos-utils/           shared building blocks: logger, mounts, reaper, vsock,
                         resolvers, confined container file access, dispatch
   feosctl/              command-line client
+  fleet-client/         feosd's side of the control plane: the join, the
+                        node's certificate, the uplink, the node connections,
+                        telemetry and events
   services/
     container-service/  containers: overlay roots, exec, adoption, persistence
     dns-service/        the pods' resolver, which feosd serves
@@ -59,7 +62,10 @@ Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
   the public API on `/run/feos/api.sock`, and on TCP with `--tcp`. A pod's
   microVM runs in Firecracker, in its jailer
   ([ADR 0005](adr/0005-firecracker.md),
-  [ADR 0008](adr/0008-suspend-and-restore.md)).
+  [ADR 0008](adr/0008-suspend-and-restore.md)). With `--control-plane`, it
+  joins the control plane and serves the same API on the node connections
+  it opens to every instance (`crates/fleet-client`,
+  [ADR 0015](adr/0015-control-plane.md)).
 - **`feos-guest`** (`crates/feos`, `--no-default-features --features
   guest`): PID 1 in a microVM whose host configures it. Its API listens on
   vsock port 10000, not on TCP, and once it is ready it dials the host

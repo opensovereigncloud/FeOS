@@ -25,6 +25,16 @@ pub fn newest_guest() -> Option<PathBuf> {
     newest(Path::new(GUEST_DIR), &["vmlinuz", "initramfs"])
 }
 
+/// The Firecracker versions installed, newest first.
+pub fn firecracker_versions() -> Vec<String> {
+    versions(Path::new(FIRECRACKER_DIR), &["firecracker", "jailer"])
+}
+
+/// The guest versions installed, newest first.
+pub fn guest_versions() -> Vec<String> {
+    versions(Path::new(GUEST_DIR), &["vmlinuz", "initramfs"])
+}
+
 /// The directory of the installed Firecracker `version`, as Firecracker
 /// reports its version: what a snapshot of it needs.
 pub fn firecracker(version: &str) -> Option<PathBuf> {
@@ -54,6 +64,21 @@ fn newest(dir: &Path, files: &[&str]) -> Option<PathBuf> {
         .map(|entry| entry.path())
         .filter(|path| files.iter().all(|file| path.join(file).is_file()))
         .max_by(|a, b| compare_versions(&name(a), &name(b)))
+}
+
+/// The versions in `dir` that have all of `files`, newest first.
+fn versions(dir: &Path, files: &[&str]) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| files.iter().all(|file| path.join(file).is_file()))
+        .map(|path| name(&path))
+        .collect();
+    versions.sort_by(|a, b| compare_versions(b, a));
+    versions
 }
 
 fn name(path: &Path) -> String {
@@ -114,6 +139,11 @@ mod tests {
             Some(dir.path().join("1.17.0"))
         );
         assert_eq!(newest(&dir.path().join("none"), &["x"]), None);
+        assert_eq!(
+            versions(dir.path(), &["firecracker", "jailer"]),
+            ["1.17.0", "1.9.0"]
+        );
+        assert!(versions(&dir.path().join("none"), &["x"]).is_empty());
 
         // A snapshot needs its own version, not the newest.
         let files = ["firecracker", "jailer"];

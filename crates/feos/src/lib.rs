@@ -3,6 +3,8 @@
 
 #[cfg(feature = "host")]
 pub mod cgroup;
+#[cfg(feature = "host")]
+mod fleet;
 #[cfg(feature = "guest")]
 mod guest;
 mod setup;
@@ -79,6 +81,9 @@ pub struct ServerOptions {
     /// default when unset.
     #[cfg(feature = "host")]
     pub diskd_socket: Option<std::path::PathBuf>,
+    /// The control plane (ADR 0015); none for a node of its own.
+    #[cfg(feature = "host")]
+    pub fleet: Option<fleet_client::Config>,
 }
 
 impl ServerOptions {
@@ -95,6 +100,8 @@ impl ServerOptions {
             dns_sockets: Vec::new(),
             #[cfg(feature = "host")]
             diskd_socket: None,
+            #[cfg(feature = "host")]
+            fleet: None,
         }
     }
 }
@@ -216,11 +223,65 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     #[cfg(feature = "guest")]
     tokio::spawn(guest::run_uplink());
 
+    // The control plane's connections, once the listeners serve: the node
+    // connections serve the same services.
+    #[cfg(feature = "host")]
+    let (fleet, node_server) = {
+        let started = options.fleet.and_then(|config| {
+            fleet::start(config, services.pods.clone())
+                .map_err(|e| error!("Fleet: Not connecting to the control plane: {e}"))
+                .ok()
+        });
+        let (fleet, incoming) = started.unzip();
+        let router = services.router_with(fleet_client::server());
+        let server = async move {
+            match incoming {
+                // Never ends, whatever becomes of the dialers.
+                Some(incoming) => {
+                    let incoming =
+                        tokio_stream::StreamExt::chain(incoming, tokio_stream::pending());
+                    router.serve_with_incoming(incoming).await
+                }
+                None => std::future::pending().await,
+            }
+        };
+        (fleet, server)
+    };
+    #[cfg(not(feature = "host"))]
+    let node_server = std::future::pending::<Result<(), tonic::transport::Error>>();
+    let mut node_serving = true;
+
+    // With a control plane, SIGTERM tells it that feosd stops before feosd
+    // ends; without, feosd ends as the signal ends it.
+    #[cfg(feature = "host")]
+    let terminated = {
+        let fleet = fleet.clone();
+        let signal = fleet.is_some().then(|| {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| warn!("Main: Failed to handle SIGTERM: {e}"))
+                .ok()
+        });
+        async move {
+            match (fleet, signal.flatten()) {
+                (Some(fleet), Some(mut signal)) => {
+                    signal.recv().await;
+                    info!("Main: SIGTERM: feosd stops");
+                    fleet.stopping("feosd stops").await;
+                }
+                _ => std::future::pending().await,
+            }
+        }
+    };
+    #[cfg(not(feature = "host"))]
+    let terminated = std::future::pending::<()>();
+
     tokio::pin!(
         api_unix_socket_server,
         vsock_server,
         tcp_server,
-        image_unix_socket_server
+        image_unix_socket_server,
+        node_server,
+        terminated
     );
 
     // Serve until one of the servers stops. A failed upgrade leaves the
@@ -251,7 +312,17 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
                 }
                 break;
             },
+            // The node connections never end feosd.
+            res = &mut node_server, if node_serving => {
+                node_serving = false;
+                error!("Fleet: The node connections' server stopped: {res:?}");
+            },
+            () = &mut terminated => return Ok(()),
             Some(RestartSignal(new_binary_path)) = restart_rx.recv() => {
+                #[cfg(feature = "host")]
+                if let Some(fleet) = &fleet {
+                    fleet.stopping("feosd restarts for an upgrade").await;
+                }
                 if let Err(e) = handle_upgrade(&new_binary_path) {
                     error!("Upgrade failed: {e}");
                 }
@@ -287,10 +358,15 @@ type Layers = Identity;
 
 impl Services {
     fn router(&self) -> Router<Layers> {
+        self.router_with(Server::builder())
+    }
+
+    /// The services on `server`, as a listener configures it.
+    fn router_with(&self, server: Server) -> Router<Layers> {
         #[cfg(feature = "host")]
-        let mut server = Server::builder().layer(ForwardLayer::new(self.pods.clone()));
+        let mut server = server.layer(ForwardLayer::new(self.pods.clone()));
         #[cfg(not(feature = "host"))]
-        let mut server = Server::builder();
+        let mut server = server;
         let router = server
             .add_service(self.container.clone())
             .add_service(self.host.clone())

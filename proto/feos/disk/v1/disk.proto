@@ -236,6 +236,13 @@ message StatsResponse {
   // Whether diskd has an object store: without one, it pushes and pulls
   // nothing, and no pod hibernates on this node.
   bool object_store = 9;
+  // Which object store: the lowercase hex SHA-256 of "<endpoint>\n<bucket>",
+  // the endpoint as configured, or AWS's for the region when none is. A pod
+  // hibernated on one node restores on another that names the same store.
+  // Empty without one.
+  string object_store_id = 10;
+  // diskd's version.
+  string version = 11;
 }
 
 message FsckRequest {

@@ -8,6 +8,7 @@ members = [
     "crates/feos-proto",
     "crates/feos-utils",
     "crates/feosctl",
+    "crates/fleet-client",
     "crates/services/container-service",
     "crates/services/dns-service",
     "crates/services/forward-service",
@@ -86,13 +87,20 @@ linked-hash-map = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 proptest = "1"
-# Only for tests: real ClientHellos, with ring as reqwest has it.
+# TLS with ring, as reqwest has it: the control plane's connections
+# (ADR 0015), and real ClientHellos in tests.
 rustls = { version = "0.23.31", default-features = false }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring"] }
+# The node's key and signing request, and the certificates it checks.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+x509-parser = "0.18.1"
+pem = "4.0.0"
 
 # Workspace crates
 disk-store = { path = "crates/disk-store" }
 feos-proto = { path = "crates/feos-proto" }
 feos-utils = { path = "crates/feos-utils" }
+fleet-client = { path = "crates/fleet-client" }
 container-service = { path = "crates/services/container-service" }
 dns-service = { path = "crates/services/dns-service" }
 forward-service = { path = "crates/services/forward-service" }

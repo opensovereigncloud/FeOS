@@ -107,12 +107,65 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 | `/var/lib/feos/images/` | pulled images, a `metadata.json` each |
 | `/var/lib/feos/containers/` | the host's containers, a `container.json` each |
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
+| `/var/lib/feos/node/` | the node's identity for the control plane ([below](#the-control-plane)) |
 | `/run/feos/` | the API sockets, the task service's pid, the runtime state of containers |
 | `/usr/lib/feos/firecracker/<version>/` | Firecracker and its jailer, a version each, side by side |
 | `/usr/lib/feos/guest/<version>/` | the guest's `vmlinuz`, `initramfs` and blank data volume `data.img.zst`, a version each, side by side |
 
 `/var/lib/feos` is a tmpfs when FeOS is the node's operating system and a
 directory on disk on a distribution.
+
+## The control plane
+
+With `--control-plane`, `feosd` joins the control plane and connects to
+every instance of it ([ADR 0015](../adr/0015-control-plane.md),
+`crates/fleet-client`); without, the node is on its own. Nothing of it
+stops `feosd`: what fails is logged and tried again, and the socket
+serves on.
+
+| Option | Default | What it is |
+|---|---|---|
+| `--control-plane HOST:PORT` | none | the control plane's port for nodes: the join dials it, and so do the node connections and the uplink while the control plane lists no instances |
+| `--control-plane-name NAME` | HOST | the DNS name the control plane's certificate is checked for, wherever `feosd` dials; needed when HOST is an address |
+| `--trust-domain NAME` | `feos.local` | the control plane's SPIFFE trust domain |
+| `--join-token-file PATH` | `/etc/feos/join-token` | the operator's join token, `feos-join-<secret>.<pin>`, read while the node has not joined |
+| `--node-dir PATH` | `/var/lib/feos/node` | the node's identity |
+
+- **The join.** A node without an identity makes an ECDSA P-256 key and
+  keeps it, then sends the token's secret, its hostname as its name and a
+  signing request. Before the token is sent, the server's chain must hold
+  the root the token pins, and its certificate must name
+  `--control-plane-name` and carry the one URI `spiffe://<trust
+  domain>/ferun`; the answer's trust bundle must hold that root. A join
+  that fails is tried again with the same key; a refused token is not sent
+  again until the file holds another.
+- **The node's directory**, mode 0700: `key.pem` (PKCS#8, 0600),
+  `chain.pem` (the node's certificate, then the issuer), `bundle.pem` (the
+  platform CA's roots) and `node.json` (the name, the SPIFFE ID, the
+  certificate's end and renewal time, the instances listed last), each
+  written whole. The key stays across renewals.
+- **Node connections**, ALPN `feos-node/1`, one to every instance the
+  control plane lists: on each, `feosd` is the HTTP/2 server of the API it
+  serves on its socket, with up to 1024 streams and pings of its own. A
+  lost one is dialed again after 1 s, doubling up to 30 s.
+- **The uplink**, ALPN `h2`, to one instance at a time, moving to the next
+  at once when a call fails: telemetry, three seconds per report, as often
+  as the control plane asks; the certificate's renewal at its renewal
+  time, after which new node connections and a new uplink use the new
+  certificate while the old ones drain; the node's events, pods' and
+  `feosd`'s own (`started`, and `stopping` on SIGTERM and before an
+  upgrade), numbered from 1 per start and kept until the control plane
+  acknowledges them. The buffer is in memory, at most 16384 events, the
+  oldest dropped and counted; a buffer on disk is to follow.
+- **A refused node.** `PERMISSION_DENIED` on the uplink means the node was
+  removed or its certificate revoked: `feosd` closes its connections,
+  moves its identity into `removed-<time>/` in the node's directory, and
+  joins again once the token file holds a new token.
+
+All connections are TLS 1.3, without session resumption, and the server is
+always checked for `--control-plane-name` and the URI, later against the
+trust bundle. Their sockets have keepalive and a `TCP_USER_TIMEOUT` of
+20 s.
 
 ## A pod
 

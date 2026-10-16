@@ -20,7 +20,7 @@ use feos_proto::disk_service::{
     disk_service_client::DiskServiceClient, CloseMemoryRequest, CreateDiskRequest, GetHeadRequest,
     GetObjectRequest, Head, ImportBaseRequest, Layer, MemoryRef, OpenDiskRequest,
     OpenMemoryRequest, PutHeadRequest, PutObjectRequest, RemoveDeviceRequest, SealFileRequest,
-    SealRequest, StatsRequest, StopDiskRequest,
+    SealRequest, StatsRequest, StatsResponse, StopDiskRequest,
 };
 use feos_proto::volume_service::{Volume, VolumeState};
 use hyper_util::rt::TokioIo;
@@ -317,6 +317,17 @@ impl Disks {
         };
         self.client().remove_device(request).await.map_err(diskd)?;
         Ok(())
+    }
+
+    /// diskd's figures of the node, without those of its devices: its
+    /// object store, and its version.
+    pub async fn node_stats(&self) -> Result<StatsResponse, Status> {
+        // A name that no device has.
+        let request = StatsRequest {
+            pod_id: "-".to_string(),
+        };
+        let stats = self.client().stats(request).await.map_err(diskd)?;
+        Ok(stats.into_inner())
     }
 
     /// Fails unless diskd has an object store, which a pod hibernates
