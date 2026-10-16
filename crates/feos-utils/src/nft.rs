@@ -2469,7 +2469,7 @@ mod tests {
             .concat(),
             [
                 iifname_prefix(CmpOp::Eq, "pod-"),
-                ipv6_daddr(CmpOp::Eq, "fdfd:7b5:61d9::53".parse().unwrap()),
+                ipv6_daddr(CmpOp::Eq, "2001:db8:53::53".parse().unwrap()),
                 l4proto(UDP),
                 th_dport(CmpOp::Eq, 53),
                 accept(),
@@ -2477,7 +2477,7 @@ mod tests {
             .concat(),
             [
                 iifname_prefix(CmpOp::Eq, "pod-"),
-                ipv6_daddr_prefix("fdfd:7b5:61d9::".parse().unwrap(), 48),
+                ipv6_daddr_prefix("2001:db8:53::".parse().unwrap(), 48),
                 drop(),
             ]
             .concat(),
@@ -2653,8 +2653,8 @@ table inet NAME {
   chain input {
     type filter hook input priority 0; policy accept;
     iifname "pod-*" icmpv6 type nd-neighbor-solicit accept
-    iifname "pod-*" ip6 daddr fdfd:7b5:61d9::53 udp dport 53 accept
-    iifname "pod-*" ip6 daddr fdfd:7b5:61d9::/48 drop
+    iifname "pod-*" ip6 daddr 2001:db8:53::53 udp dport 53 accept
+    iifname "pod-*" ip6 daddr 2001:db8:53::/48 drop
     iifname "pod-*" ip daddr 169.254.0.53 tcp dport 53 accept
     iifname "pod-*" ip6 saddr != fe80::/10 drop
     iifname "pod-*" drop
