@@ -9,6 +9,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     libprotobuf-dev \
     sbsigntool systemd-boot \
     musl-tools \
+    libclang-dev \
     ca-certificates \
     binutils
 
