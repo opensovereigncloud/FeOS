@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# FeRun's control plane on the lab's k3s (deploy/k3s/README.md): ferund
+# (ADR 0015) and its PostgreSQL. The front doors, REST, MCP and the UI, are
+# https://run.fecode.dev through traefik; the nodes' port is service
+# ferund-nodes, TCP to the instances, never through the ingress: it is mTLS
+# end to end.
+#
+# The secrets are not here; README.md says how to make them:
+#   ferun-ca          ferund's CA directory: issuer.crt, issuer.key,
+#                     issuer.json, bundle.crt (never root.key)
+#   ferund-postgres   password: PostgreSQL's
+#   ferund            FERUN_DATABASE_URL, FERUN_ADMIN_USERS,
+#                     FERUN_BOOTSTRAP_TOKEN
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ferun

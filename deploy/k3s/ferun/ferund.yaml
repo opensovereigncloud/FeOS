@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ferund (ADR 0015) and its services: the front doors on :8100, the
+# nodes' port on :7443 (deploy/k3s/README.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferund
+  namespace: ferun
+spec:
+  # Instances are identical; one to start with.
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: ferund
+  template:
+    metadata:
+      labels:
+        app: ferund
+    spec:
+      imagePullSecrets:
+        - name: oci-pull
+      # The shutdown grace below and 30 s: a stopping instance lets its tool
+      # calls and operations finish.
+      terminationGracePeriodSeconds: 150
+      containers:
+        - name: ferund
+          image: oci.fecore.dev/ferund:dev
+          imagePullPolicy: Always
+          args: ["serve"]
+          envFrom:
+            - secretRef:
+                name: ferund
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: FERUN_LISTEN
+              value: ":8100"
+            - name: FERUN_NODE_LISTEN
+              value: ":7443"
+            # What the nodes dial to reach this instance: its pod's address,
+            # which the hosts reach over the cluster's network.
+            - name: FERUN_NODE_ADVERTISE_ADDRESS
+              value: "$(POD_IP):7443"
+            - name: FERUN_TRUST_DOMAIN
+              value: run.fecode.dev
+            - name: FERUN_CA_DIR
+              value: /etc/ferun/ca
+            # Paused after 10 s without a tool call, the default; into the
+            # object store after another two minutes.
+            - name: FERUN_HIBERNATE_AFTER
+              value: 2m
+            - name: FERUN_SHUTDOWN_GRACE
+              value: 2m
+          ports:
+            - name: http
+              containerPort: 8100
+            - name: nodes
+              containerPort: 7443
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            # /readyz waits up to 30 s for the nodes after a start.
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: ca
+              mountPath: /etc/ferun/ca
+              readOnly: true
+      volumes:
+        - name: ca
+          secret:
+            secretName: ferun-ca
+            defaultMode: 0400
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferund
+  namespace: ferun
+spec:
+  selector:
+    app: ferund
+  ports:
+    - name: http
+      port: 8100
+      targetPort: http
+---
+# The nodes' port. feosd runs on the hosts, which do not resolve the
+# cluster's names, so the service has a fixed address that the feos
+# DaemonSet configures (deploy/k3s/feos): feosd joins and bootstraps there,
+# then dials every instance at the address it advertises.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferund-nodes
+  namespace: ferun
+spec:
+  clusterIP: 10.43.70.70
+  selector:
+    app: ferund
+  ports:
+    - name: nodes
+      port: 7443
+      targetPort: nodes

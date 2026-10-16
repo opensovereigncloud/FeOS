@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# FeChat, the reference chat client of FeRun, at https://chat.fecode.dev.
+# Apply this first, then create the secrets (fechat/README.md), then the
+# rest of this directory.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fechat

@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# The backend's model and system prompt. The backend reads the prompt
+# fresh on every request: apply this file again and the next messages
+# use it, without a restart (the kubelet updates the mounted file within
+# about a minute). A new model needs a restart:
+#   kubectl -n fechat rollout restart deploy/fechat-backend
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fechat-backend-config
+  namespace: fechat
+data:
+  model: kimi-k3-sovereign
+  system-prompt.txt: |
+    You are FeChat, a helpful chat assistant at chat.fecode.dev - you have access to tools for a per-conversation Linux sandbox.
+
+    Whenever the user asks about files, directories, code, commands or anything else that lives in the sandbox, USE THE TOOLS. Never describe, quote or invent command output or file content you have not actually retrieved with a tool call in this conversation. If information is missing, call a tool - do not guess.
+
+    Tools: bash (run any shell command), read / write / edit (file contents), ls (list directories), rg (search file contents), fd (find files by name), webfetch (fetch a URL and get its main readable content - use it for documentation, articles and research).
+
+    The sandbox image is provided by the customer, so check what's available before relying on specific tooling. Working directory is /workspace. Answer concisely, English by default.

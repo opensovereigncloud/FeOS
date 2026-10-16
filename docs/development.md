@@ -50,6 +50,8 @@ crates/
     forward-service/    guest: port forwarding, kube and SSH credential offloading
 proto/feos/<api>/v1/    the gRPC APIs, package feos.<api>.v1
 fechat/                 FeChat, FeRun's reference client, at chat.fecode.dev
+deploy/k3s/             the lab's k3s deployment: FeOS on the nodes, FeRun,
+                        FeChat
 hack/                   kernel, initramfs, UKI, guest image and VM tooling
 docs/                   documentation and ADRs
 ```
