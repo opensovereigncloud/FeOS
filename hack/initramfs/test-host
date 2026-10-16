@@ -10,8 +10,10 @@
 # 2. the node: the initramfs of make initramfs, feos-host-init as init, on
 #    QEMU's user network (DHCPv4, router advertisements, NAT) and with
 #    feos.pod-prefix on the kernel's command line. It checks the serial log
-#    (the node's IPv4 by DHCPv4, its IPv6, diskd and feosd, the pods'
-#    network) and feosd's API through a port forward, with feosctl. With
+#    (the node's IPv4 by DHCPv4, its IPv6, its clock, diskd and feosd, the
+#    pods' network) and feosd's API through a port forward, with feosctl,
+#    and an upgrade of feosd by itself, which keeps its pid and hands the
+#    pods' resolver's sockets to the new binary. With
 #    PODS=1, a pod on the node too, a microVM one level of nesting deeper:
 #    its addresses of both families, a name through feosd's resolver, and
 #    IPv4 out through the node's masquerade and QEMU's NAT, to the
@@ -212,6 +214,40 @@ node_stage() {
     fi
   done
   log "the node runs, with IPv4 by DHCPv4 and IPv6, its clock, and the pods' network"
+
+  # feosd replaces itself from a URL, here QEMU's host, and runs the new
+  # binary at its pid, with the resolver's sockets that feos-host-init
+  # handed it.
+  local serve="${dir}/serve" http sum
+  mkdir -p "${serve}"
+  cp "${REPO_ROOT}/target/container/${MUSL_TARGET}/release/feosd" "${serve}/feosd"
+  sum="$(sha256sum "${serve}/feosd" | cut -d' ' -f1)"
+  http="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+  python3 -m http.server --bind 127.0.0.1 --directory "${serve}" "${http}" >"${dir}/http.log" 2>&1 &
+  HTTP_PID=$!
+  trap '${SUDO} kill "$(${SUDO} cat "${QEMU_PID}" 2>/dev/null)" 2>/dev/null || true
+    kill "${HTTP_PID}" 2>/dev/null || true' EXIT
+  sleep 1
+  "${feosctl}" host upgrade --url "http://10.0.2.2:${http}/feosd" --sha256-sum "${sum}" >/dev/null ||
+    fail "feosd refuses an upgrade"
+  wait_for_line "${serial}" 'Main: Executing new binary' 60 || {
+    tail -30 "${serial}" | tr -d '\r'
+    fail "feosd did not run its new binary"
+  }
+  start=${SECONDS}
+  until [ "$(grep -c "The resolver takes the UDP socket handed to feosd" "${serial}")" -ge 2 ] &&
+    "${feosctl}" host ping >/dev/null 2>&1; do
+    ((SECONDS - start <= 60)) || {
+      tail -30 "${serial}" | tr -d '\r'
+      fail "the upgraded feosd does not answer, or takes no sockets"
+    }
+    sleep 1
+  done
+  [ "$(grep -c 'Started feosd (pid' "${serial}")" = 1 ] || fail "feos-host-init started feosd again"
+  if grep -E -- 'exited with code' "${serial}"; then
+    fail "in the node's log after the upgrade: exited with code"
+  fi
+  log "feosd upgrades itself at its pid, and its resolver takes the handed sockets again"
 
   [ "${PODS:-0}" = 1 ] || return 0
   local pod info
