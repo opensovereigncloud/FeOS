@@ -18,17 +18,28 @@
 //! node goes. Until the head is up the pod stays suspended on the node. A
 //! restore opens the checkpoint's disk and restores the memory where the
 //! node can load the snapshot; elsewhere, it boots anew on the disk.
+//!
+//! A pod's volumes (ADR 0016) follow its disk: started for a boot, a resume
+//! and a restore, after the disk, stopped with it, sealed and uploaded
+//! with it, each with a head of its own before the pod's, which names
+//! them. A pod claims them at its creation and lets go of them at its
+//! deletion. After a boot, the guest mounts them before the containers
+//! are created, and formats those the node knows to be new.
 
-use crate::disk::Disks;
+use crate::disk::{volume_disk, Disks};
 use crate::network::{Attachment, Network};
 use crate::spec;
 use crate::store::Store;
+use crate::volumes::{self, Volumes};
 use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, ContainerConfig,
     ContainerState as GuestContainerState, CreateContainerRequest, GetContainerRequest,
-    ListContainersRequest, StartContainerRequest,
+    ListContainersRequest, StartContainerRequest, VolumeMount as GuestVolumeMount,
 };
 use feos_proto::disk_service::{Head, MemoryRef};
+use feos_proto::guest_service::{
+    guest_service_client::GuestServiceClient, MountVolumesRequest, Volume as GuestVolume,
+};
 use feos_proto::microvm::{
     micro_vm_service_server::MicroVmService, stream_vm_console_request as console_request,
     AttachConsoleMessage, ConsoleData, CreateVmRequest, DeleteVmRequest, GetVmRequest,
@@ -40,6 +51,7 @@ use feos_proto::pod_service::{
     Checkpoint, ContainerSpec, ContainerState, ContainerStatus, HibernatePodResponse, MicroVm,
     PodConsoleInput, PodConsoleOutput, PodEvent, PodInfo, PodSpec, PodState, RestorePodResponse,
 };
+use feos_proto::volume_service::{Volume, VolumeCheckpoint, VolumeState};
 use feos_utils::vsock::{self, API_PORT};
 use log::{info, warn};
 use microvm_service::api::VmApiHandler;
@@ -66,6 +78,9 @@ const POLL: Duration = Duration::from_millis(250);
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long GetPod waits for the guest's view of the containers.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the guest may take to mount the pod's volumes, formatting new
+/// ones: mke2fs writes some MiB for every TiB.
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the rules are written anew without a change of the pods or
 /// their groups: the node's own addresses, which no pod reaches, may have
 /// changed.
@@ -84,6 +99,7 @@ struct Inner {
     dir: PathBuf,
     network: Network,
     disks: Disks,
+    volumes: Volumes,
     pods: Mutex<HashMap<String, Pod>>,
     events: broadcast::Sender<PodEvent>,
 }
@@ -97,14 +113,15 @@ struct Pod {
 
 impl Pods {
     /// The pods kept in `dir`, on the pods' network, with their disks from
-    /// `disks`. Those that were coming up come up now, and what hibernated
-    /// pods left on the node goes; the others follow their microVMs from
-    /// here on.
+    /// `disks` and the node's `volumes`. Those that were coming up come up
+    /// now, and what hibernated pods left on the node goes; the others
+    /// follow their microVMs from here on.
     pub async fn new(
         vms: VmApiHandler,
         dir: &Path,
         network: Network,
         disks: Disks,
+        volumes: Volumes,
     ) -> io::Result<Self> {
         let store = Store::open(dir)?;
         // A hibernated pod has no addresses on the node.
@@ -121,6 +138,7 @@ impl Pods {
         }
         kept.extend(hibernated);
         network.sync(&kept);
+        volumes.reconcile(&kept);
         let (events, _) = broadcast::channel(256);
         let pods = Self {
             inner: Arc::new(Inner {
@@ -129,6 +147,7 @@ impl Pods {
                 dir: dir.to_path_buf(),
                 network,
                 disks,
+                volumes,
                 pods: Mutex::new(HashMap::new()),
                 events,
             }),
@@ -195,40 +214,70 @@ impl Pods {
         spec::check_id(&pod_id)?;
         let spec = spec::normalize(spec)?;
         self.inner.network.check(&spec)?;
-        let info = {
+        if let Some(existing) = self.pods().get(&pod_id).map(|pod| pod.info.clone()) {
+            return same_spec(existing, &spec);
+        }
+        // The pod claims its volumes before it is recorded, all or none.
+        self.inner
+            .volumes
+            .claim(&pod_id, &spec::volume_ids(&spec))
+            .await?;
+        let recorded = {
             let mut pods = self.pods();
-            if let Some(pod) = pods.get(&pod_id) {
-                return if pod.info.spec.as_ref() == Some(&spec) {
-                    Ok(pod.info.clone())
-                } else {
-                    Err(Status::already_exists(format!(
-                        "pod {pod_id} exists with another spec"
-                    )))
-                };
+            match pods.get(&pod_id) {
+                Some(pod) => Err(Ok(pod.info.clone())),
+                None => {
+                    let mut info = PodInfo {
+                        pod_id: pod_id.clone(),
+                        spec: Some(spec.clone()),
+                        state: PodState::Pending as i32,
+                        ..Default::default()
+                    };
+                    let mut allocated = Ok(());
+                    if info.spec.as_ref().is_some_and(spec::has_network) {
+                        let others = pods.values().map(|pod| &pod.info);
+                        allocated = self.inner.network.allocate(others, &mut info);
+                    }
+                    let kept = allocated.and_then(|()| {
+                        self.inner.store.save(&info).map_err(|e| {
+                            self.inner.network.release(&info);
+                            Status::internal(format!("keep pod {pod_id}: {e}"))
+                        })
+                    });
+                    match kept {
+                        Ok(()) => {
+                            pods.insert(
+                                pod_id.clone(),
+                                Pod {
+                                    info: info.clone(),
+                                    lock: Arc::default(),
+                                    bring_up: None,
+                                },
+                            );
+                            Ok(info)
+                        }
+                        Err(e) => Err(Err(e)),
+                    }
+                }
             }
-            let mut info = PodInfo {
-                pod_id: pod_id.clone(),
-                spec: Some(spec),
-                state: PodState::Pending as i32,
-                ..Default::default()
-            };
-            if info.spec.as_ref().is_some_and(spec::has_network) {
-                let others = pods.values().map(|pod| &pod.info);
-                self.inner.network.allocate(others, &mut info)?;
+        };
+        let info = match recorded {
+            Ok(info) => info,
+            // Another create was faster: what its pod does not name is let
+            // go of again.
+            Err(Ok(existing)) => {
+                let named = existing
+                    .spec
+                    .as_ref()
+                    .map(spec::volume_ids)
+                    .unwrap_or_default();
+                self.inner.volumes.release(&pod_id, &named).await;
+                return same_spec(existing, &spec);
             }
-            if let Err(e) = self.inner.store.save(&info) {
-                self.inner.network.release(&info);
-                return Err(Status::internal(format!("keep pod {pod_id}: {e}")));
+            Err(Err(e)) => {
+                self.inner.volumes.release(&pod_id, &[]).await;
+                return Err(e);
             }
-            pods.insert(
-                pod_id.clone(),
-                Pod {
-                    info: info.clone(),
-                    lock: Arc::default(),
-                    bring_up: None,
-                },
-            );
-            info
         };
         info!("Pods: {pod_id} created");
         // The pod's rules stand before its TAP device carries a frame.
@@ -303,7 +352,8 @@ impl Pods {
     }
 
     /// Deletes the pod: its microVM, its disk, its place on the network,
-    /// its record and its rules, and then frees its IPv4 address.
+    /// its record and its rules, and then frees its IPv4 address. Its
+    /// volumes stay, stopped, and are attached to no pod then.
     pub async fn delete(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         self.delete_vm(pod_id).await?;
@@ -319,6 +369,7 @@ impl Pods {
             return Err(e);
         }
         let info = self.info(pod_id)?;
+        self.stop_volumes(&info).await;
         self.inner
             .network
             .detach(&info)
@@ -331,6 +382,7 @@ impl Pods {
         if let Some(pod) = self.pods().remove(pod_id) {
             self.announce(&pod.info, true);
         }
+        self.inner.volumes.release(pod_id, &[]).await;
         if let Err(e) = self.apply_network().await {
             warn!("Pods: Failed to set the pods' rules: {e}");
         }
@@ -374,6 +426,7 @@ impl Pods {
         self.expect_state(pod_id, PodState::Suspended)?;
         let attachment = self.attach(pod_id).await?;
         self.open_disk(pod_id).await?;
+        self.open_volumes(pod_id).await?;
         let request = Request::new(ResumeVmRequest {
             vm_id: pod_id.to_string(),
             remote: None,
@@ -428,9 +481,12 @@ impl Pods {
             self.delete_vm(pod_id).await?;
         }
         self.inner.disks.stop(pod_id).await?;
-        let epoch = next_epoch(info.checkpoint.as_ref());
+        let spec = info.spec.clone().unwrap_or_default();
+        let epoch = next_epoch(self.checkpoint_epochs(&info));
         info!("Pods: {pod_id} hibernates, epoch {epoch}");
         let disk = self.inner.disks.seal(pod_id).await?;
+        let (volume_heads, volume_checkpoints) =
+            self.hibernate_volumes(pod_id, &spec, epoch).await?;
         let mut memory_bytes = 0;
         let memory = if memory {
             let host = snapshot::Host::load(pod_id)
@@ -457,23 +513,36 @@ impl Pods {
             None
         };
         // The spec, for a node that does not have the pod.
-        let spec = self.inner.dir.join(format!("{pod_id}.spec"));
-        std::fs::write(&spec, info.spec.unwrap_or_default().encode_to_vec())
-            .map_err(|e| Status::internal(format!("write {}: {e}", spec.display())))?;
-        let put = self
+        self.put_record(
+            &format!("{pod_id}.spec"),
+            &checkpoint_key(pod_id, epoch, SPEC_OBJECT),
+            &spec.encode_to_vec(),
+        )
+        .await?;
+        let head = self
             .inner
             .disks
-            .put_object(&checkpoint_key(pod_id, epoch, SPEC_OBJECT), &spec)
-            .await;
-        let _ = std::fs::remove_file(&spec);
-        put?;
-        let head = self.inner.disks.put_head(pod_id, epoch, memory).await?;
+            .put_head(pod_id, epoch, memory, volume_heads)
+            .await?;
         let checkpoint = Checkpoint {
             head_key: head.key,
             epoch,
             memory: head.memory.is_some(),
         };
         info!("Pods: {pod_id} is in {}", checkpoint.head_key);
+        // Its volumes are in it, too.
+        for (volume_id, volume_checkpoint) in volume_checkpoints {
+            let checkpointed = self.inner.volumes.update(&volume_id, |volume| {
+                volume.state = VolumeState::Checkpointed as i32;
+                volume.checkpoint = Some(volume_checkpoint);
+            });
+            if let Err(e) = checkpointed {
+                warn!(
+                    "Pods: Failed to record that volume {volume_id} is checkpointed: {}",
+                    e.message()
+                );
+            }
+        }
 
         // From here on, the checkpoint is the pod. It leaves the network
         // as a deleted pod does, its addresses last.
@@ -510,9 +579,31 @@ impl Pods {
         if let Err(e) = self.inner.disks.remove(pod_id).await {
             warn!("Pods: Failed to remove {pod_id}'s disk: {}", e.message());
         }
-        if let Ok(info) = self.info(pod_id)
-            && let Err(e) = self.inner.network.detach(&info).await
-        {
+        let Ok(info) = self.info(pod_id) else {
+            return;
+        };
+        // The volumes in its checkpoint.
+        for wanted in &info.spec.clone().unwrap_or_default().volumes {
+            let checkpointed = self
+                .inner
+                .volumes
+                .get(&wanted.volume_id)
+                .is_ok_and(|volume| volume.state() == VolumeState::Checkpointed);
+            if checkpointed
+                && let Err(e) = self
+                    .inner
+                    .disks
+                    .remove(&volume_disk(&wanted.volume_id))
+                    .await
+            {
+                warn!(
+                    "Pods: Failed to remove the disk of {pod_id}'s volume {}: {}",
+                    wanted.name,
+                    e.message()
+                );
+            }
+        }
+        if let Err(e) = self.inner.network.detach(&info).await {
             warn!("Pods: Failed to take {pod_id} off the network: {e}");
         }
     }
@@ -568,9 +659,21 @@ impl Pods {
                 head.pod_id
             )));
         }
+        // Its volumes come from the checkpoint, too, or the restore is
+        // refused before anything changes.
+        let spec = info.spec.clone().unwrap_or_default();
+        let volumes = self.checkpoint_volumes(pod_id, &spec, &head).await?;
 
-        // A disk the node has of the pod is the checkpoint's at best.
+        // A disk the node has of the pod is the checkpoint's at best, and
+        // so are its volumes'.
         self.inner.disks.remove(pod_id).await?;
+        for volume in &volumes {
+            self.inner
+                .disks
+                .remove(&volume_disk(&volume.volume_id))
+                .await?;
+        }
+        self.inner.volumes.take_over(pod_id, volumes).await?;
         self.place(pod_id)?;
         self.update(pod_id, |info| {
             info.checkpoint = Some(Checkpoint {
@@ -650,6 +753,9 @@ impl Pods {
             .map_err(|e| Status::invalid_argument(format!("{key}: {e}")))?;
         let spec = spec::normalize(spec)?;
         self.inner.network.check(&spec)?;
+        // Before the pod is recorded: a restore that cannot take its
+        // volumes leaves nothing on the node.
+        self.checkpoint_volumes(pod_id, &spec, &head).await?;
         let info = {
             let mut pods = self.pods();
             if pods.contains_key(pod_id) {
@@ -697,11 +803,14 @@ impl Pods {
             let info = self.info(pod_id)?;
             let attachment = self.attach(pod_id).await?;
             let disk = self.inner.disks.open_checkpoint(pod_id, &head.key).await?;
+            // The snapshot's drives: its volumes, from their heads.
+            let volumes = self.open_volumes(pod_id).await?;
             let config = spec::vm_config(
                 pod_id,
                 &info.spec.unwrap_or_default(),
                 attachment.as_ref(),
                 Some(&disk),
+                &volumes,
             );
             self.delete_vm(pod_id).await?;
             let request = Request::new(CreateVmRequest {
@@ -772,13 +881,31 @@ impl Pods {
         Ok(())
     }
 
-    /// Stops the pod's disk when its microVM has ended, and lets go of the
-    /// memory diskd served it. What fails is logged: the disk's next start
-    /// takes what is there.
+    /// Stops the pod's disk and its volumes' when its microVM has ended,
+    /// and lets go of the memory diskd served it. What fails is logged: the
+    /// disk's next start takes what is there.
     async fn release_disk(&self, pod_id: &str) {
         self.inner.disks.close_memory(pod_id).await;
         if let Err(e) = self.inner.disks.stop(pod_id).await {
             warn!("Pods: Failed to stop {pod_id}'s disk: {}", e.message());
+        }
+        if let Ok(info) = self.info(pod_id) {
+            self.stop_volumes(&info).await;
+        }
+    }
+
+    /// Stops the disks of the pod's volumes, which keep what it wrote.
+    async fn stop_volumes(&self, info: &PodInfo) {
+        for wanted in &info.spec.clone().unwrap_or_default().volumes {
+            let disk = volume_disk(&wanted.volume_id);
+            if let Err(e) = self.inner.disks.stop(&disk).await {
+                warn!(
+                    "Pods: Failed to stop the disk of {}'s volume {}: {}",
+                    info.pod_id,
+                    wanted.name,
+                    e.message()
+                );
+            }
         }
     }
 
@@ -792,6 +919,267 @@ impl Pods {
             .map(|checkpoint| checkpoint.head_key.as_str())
             .filter(|key| !key.is_empty());
         self.inner.disks.open(pod_id, head_key).await
+    }
+
+    /// Starts the disks of the pod's volumes, in the order of its spec: the
+    /// ones the node has, or their checkpoints', or blank ones for volumes
+    /// without their filesystem. Returns the paths Firecracker takes.
+    async fn open_volumes(&self, pod_id: &str) -> Result<Vec<String>, Status> {
+        let spec = self.info(pod_id)?.spec.unwrap_or_default();
+        let mut paths = Vec::with_capacity(spec.volumes.len());
+        for wanted in &spec.volumes {
+            let failed = |e: Status| {
+                Status::new(e.code(), format!("volume {}: {}", wanted.name, e.message()))
+            };
+            let volume = self.inner.volumes.get(&wanted.volume_id).map_err(|_| {
+                Status::failed_precondition(format!(
+                    "volume {}: no volume {} on this node",
+                    wanted.name, wanted.volume_id
+                ))
+            })?;
+            if volume.pod_id != pod_id {
+                return Err(Status::failed_precondition(format!(
+                    "volume {}: {} is attached to pod {:?}",
+                    wanted.name, volume.volume_id, volume.pod_id
+                )));
+            }
+            let path = self
+                .inner
+                .disks
+                .open_volume(&volume, self.inner.volumes.dir())
+                .await
+                .map_err(failed)?;
+            if volume.state() != VolumeState::Attached {
+                self.inner
+                    .volumes
+                    .update(&volume.volume_id, |volume| {
+                        volume.state = VolumeState::Attached as i32;
+                    })
+                    .map_err(failed)?;
+            }
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
+    /// Has the guest mount the pod's volumes, and format the ones the node
+    /// knows to be new, and records which have their filesystem now. Fails
+    /// unless every volume is mounted.
+    async fn mount_volumes(&self, pod_id: &str, spec: &PodSpec) -> Result<(), Status> {
+        if spec.volumes.is_empty() {
+            return Ok(());
+        }
+        let mut request = MountVolumesRequest::default();
+        for (index, wanted) in spec.volumes.iter().enumerate() {
+            let volume = self.inner.volumes.get(&wanted.volume_id)?;
+            request.volumes.push(GuestVolume {
+                name: wanted.name.clone(),
+                volume_id: volume.volume_id,
+                // The pod's disk is the first drive.
+                drive: index as u32 + 1,
+                size_bytes: volume.size_bytes,
+                format: !volume.formatted,
+            });
+        }
+        let mut guest = GuestServiceClient::new(guest_channel(pod_id).await?);
+        let response = timeout(MOUNT_TIMEOUT, guest.mount_volumes(request))
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "the guest did not mount the volumes within {}s",
+                    MOUNT_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|e| match e.code() {
+                Code::Unimplemented => Status::failed_precondition(
+                    "the guest mounts no volumes: it is older than volumes are",
+                ),
+                code => Status::new(code, format!("the guest's volumes: {}", e.message())),
+            })?
+            .into_inner();
+        let mut failed = Vec::new();
+        if response.volumes.len() != spec.volumes.len() {
+            failed.push(format!(
+                "the guest answered for {} of {} volumes",
+                response.volumes.len(),
+                spec.volumes.len()
+            ));
+        }
+        for (wanted, mounted) in spec.volumes.iter().zip(&response.volumes) {
+            if !mounted.error.is_empty() {
+                failed.push(format!("volume {}: {}", wanted.name, mounted.error));
+                continue;
+            }
+            if mounted.formatted {
+                info!(
+                    "Pods: {pod_id}'s guest made the filesystem of volume {} on {}",
+                    wanted.name, mounted.device
+                );
+            }
+            if !self.inner.volumes.get(&wanted.volume_id)?.formatted {
+                self.inner
+                    .volumes
+                    .update(&wanted.volume_id, |volume| volume.formatted = true)?;
+            }
+        }
+        if !failed.is_empty() {
+            return Err(Status::failed_precondition(failed.join("; ")));
+        }
+        Ok(())
+    }
+
+    /// Seals and uploads each of the pod's volumes into its checkpoint
+    /// `epoch`: its chain, its record and its head, which the pod's head
+    /// is to name. A volume that is checkpointed already, of a pod that has
+    /// not booted since, keeps its head. Returns the heads, and the new
+    /// checkpoints of the volumes.
+    async fn hibernate_volumes(
+        &self,
+        pod_id: &str,
+        spec: &PodSpec,
+        epoch: u64,
+    ) -> Result<(Vec<String>, Vec<(String, VolumeCheckpoint)>), Status> {
+        let mut heads = Vec::new();
+        let mut checkpoints = Vec::new();
+        for wanted in &spec.volumes {
+            let volume = self.inner.volumes.get(&wanted.volume_id)?;
+            if volume.pod_id != pod_id {
+                return Err(Status::failed_precondition(format!(
+                    "volume {} is attached to pod {:?}",
+                    volume.volume_id, volume.pod_id
+                )));
+            }
+            if volume.state() == VolumeState::Checkpointed
+                && let Some(checkpoint) = &volume.checkpoint
+            {
+                heads.push(checkpoint.head_key.clone());
+                continue;
+            }
+            let disk = volume_disk(&volume.volume_id);
+            // One that never booted gets its blank disk now.
+            self.inner
+                .disks
+                .open_volume(&volume, self.inner.volumes.dir())
+                .await?;
+            self.inner.disks.stop(&disk).await?;
+            self.inner.disks.seal(&disk).await?;
+            // Its record, for a node that does not have it.
+            let record = Volume {
+                volume_id: volume.volume_id.clone(),
+                size_bytes: volume.size_bytes,
+                labels: volume.labels.clone(),
+                formatted: volume.formatted,
+                ..Default::default()
+            };
+            self.put_record(
+                &format!("{disk}.volume"),
+                &checkpoint_key(&disk, epoch, VOLUME_OBJECT),
+                &record.encode_to_vec(),
+            )
+            .await?;
+            let head = self
+                .inner
+                .disks
+                .put_head(&disk, epoch, None, Vec::new())
+                .await?;
+            info!("Pods: {pod_id}'s volume {} is in {}", wanted.name, head.key);
+            heads.push(head.key.clone());
+            checkpoints.push((
+                volume.volume_id,
+                VolumeCheckpoint {
+                    head_key: head.key,
+                    epoch,
+                },
+            ));
+        }
+        Ok((heads, checkpoints))
+    }
+
+    /// The pod's volumes as its checkpoint, the head `head`, has them, for a
+    /// restore to take over. Fails before anything changes when the
+    /// checkpoint lacks a volume, or when the node has one that a restore
+    /// may not take: attached to another pod, or with data of its own.
+    async fn checkpoint_volumes(
+        &self,
+        pod_id: &str,
+        spec: &PodSpec,
+        head: &Head,
+    ) -> Result<Vec<Volume>, Status> {
+        let mut volumes = Vec::with_capacity(spec.volumes.len());
+        for wanted in &spec.volumes {
+            if let Ok(had) = self.inner.volumes.get(&wanted.volume_id) {
+                volumes::check_restorable(pod_id, &had)?;
+            }
+            let disk = volume_disk(&wanted.volume_id);
+            let prefix = format!("snapshots/{disk}/");
+            let key = head
+                .volume_heads
+                .iter()
+                .find(|key| key.starts_with(&prefix))
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "{} has no head of volume {}",
+                        head.key, wanted.volume_id
+                    ))
+                })?;
+            let volume_head = self.inner.disks.get_head(key).await?;
+            let record = self
+                .get_record(
+                    &format!("{disk}.volume"),
+                    &checkpoint_key(&disk, volume_head.epoch, VOLUME_OBJECT),
+                )
+                .await?;
+            let record = Volume::decode(record.as_slice())
+                .map_err(|e| Status::invalid_argument(format!("{key}'s record: {e}")))?;
+            volumes.push(Volume {
+                volume_id: wanted.volume_id.clone(),
+                size_bytes: volume_head.logical_size,
+                labels: record.labels,
+                state: VolumeState::Checkpointed as i32,
+                pod_id: pod_id.to_string(),
+                formatted: record.formatted,
+                checkpoint: Some(VolumeCheckpoint {
+                    head_key: key.clone(),
+                    epoch: volume_head.epoch,
+                }),
+            });
+        }
+        Ok(volumes)
+    }
+
+    /// Puts `bytes` into the object store at `key`, through a file `name`
+    /// in the pods' directory.
+    async fn put_record(&self, name: &str, key: &str, bytes: &[u8]) -> Result<(), Status> {
+        let path = self.inner.dir.join(name);
+        std::fs::write(&path, bytes)
+            .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
+        let put = self.inner.disks.put_object(key, &path).await;
+        let _ = std::fs::remove_file(&path);
+        put
+    }
+
+    /// Gets the object at `key` from the object store, through a file
+    /// `name` in the pods' directory.
+    async fn get_record(&self, name: &str, key: &str) -> Result<Vec<u8>, Status> {
+        let path = self.inner.dir.join(name);
+        let fetched = self.inner.disks.get_object(key, &path).await;
+        let read = fetched.and_then(|()| {
+            std::fs::read(&path).map_err(|e| Status::internal(format!("read {key}: {e}")))
+        });
+        let _ = std::fs::remove_file(&path);
+        read
+    }
+
+    /// The epochs of the pod's last checkpoint and of its volumes': its
+    /// next is past all of them.
+    fn checkpoint_epochs(&self, info: &PodInfo) -> Vec<u64> {
+        let mut epochs: Vec<u64> = info.checkpoint.iter().map(|c| c.epoch).collect();
+        for wanted in &info.spec.clone().unwrap_or_default().volumes {
+            if let Ok(volume) = self.inner.volumes.get(&wanted.volume_id) {
+                epochs.extend(volume.checkpoint.map(|checkpoint| checkpoint.epoch));
+            }
+        }
+        epochs
     }
 
     /// Whether a pod on the node names the security group.
@@ -821,12 +1209,16 @@ impl Pods {
         let (Ok(info), Ok(Some(vm))) = (self.info(pod_id), self.vm(pod_id).await) else {
             return;
         };
-        let disk = vm
-            .config
-            .as_ref()
-            .and_then(|config| config.data_disk.as_ref())
-            .map(|disk| disk.path.as_str());
-        let wanted = spec::vm_config(pod_id, &info.spec.unwrap_or_default(), attachment, disk);
+        let config = vm.config.clone().unwrap_or_default();
+        let disk = config.data_disk.as_ref().map(|disk| disk.path.as_str());
+        let volumes: Vec<String> = config.volumes.iter().map(|v| v.path.clone()).collect();
+        let wanted = spec::vm_config(
+            pod_id,
+            &info.spec.unwrap_or_default(),
+            attachment,
+            disk,
+            &volumes,
+        );
         if stale(&vm, &wanted) {
             warn!(
                 "Pods: {pod_id}'s microVM was made for another network; a stop and a start give it this one"
@@ -1021,6 +1413,7 @@ impl Pods {
     async fn bring_up(&self, pod_id: &str, spec: &PodSpec) -> Result<(), Status> {
         let booted = self.boot(pod_id, spec).await?;
         self.wait_for_guest(pod_id).await?;
+        self.mount_volumes(pod_id, spec).await?;
         let mut guest = ContainerServiceClient::new(guest_channel(pod_id).await?);
         for container in &spec.containers {
             run_container(&mut guest, container, booted)
@@ -1042,7 +1435,8 @@ impl Pods {
         self.place(pod_id)?;
         let attachment = self.attach(pod_id).await?;
         let disk = self.open_disk(pod_id).await?;
-        let config = spec::vm_config(pod_id, spec, attachment.as_ref(), Some(&disk));
+        let volumes = self.open_volumes(pod_id).await?;
+        let config = spec::vm_config(pod_id, spec, attachment.as_ref(), Some(&disk), &volumes);
         loop {
             let vm = self.vm(pod_id).await?;
             match vm.as_ref().map(|vm| vm.state()) {
@@ -1361,6 +1755,10 @@ fn why_cold(cold: bool, memory: Option<&MemoryRef>) -> Option<String> {
 /// The object of a checkpoint that holds the pod's spec, for a node that
 /// does not have the pod.
 const SPEC_OBJECT: &str = "pod.pb";
+/// The object of a volume's checkpoint that holds its record, a
+/// `feos.volume.v1.Volume`: its size, labels and whether it has its
+/// filesystem.
+const VOLUME_OBJECT: &str = "volume.pb";
 
 /// The key of an object of the pod's checkpoint `epoch`, beside its head.
 fn checkpoint_key(pod_id: &str, epoch: u64, name: &str) -> String {
@@ -1368,20 +1766,43 @@ fn checkpoint_key(pod_id: &str, epoch: u64, name: &str) -> String {
 }
 
 /// The epoch of the pod's next checkpoint: the seconds since 1970, or one
-/// more than the last one's, so that it grows and no head is written
-/// twice.
-fn next_epoch(last: Option<&Checkpoint>) -> u64 {
+/// more than the last one's of the pod and of its volumes, so that it grows
+/// and no head of the pod or of a volume is written twice.
+fn next_epoch(last: impl IntoIterator<Item = u64>) -> u64 {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    now.max(last.map_or(0, |checkpoint| checkpoint.epoch + 1))
+    now.max(last.into_iter().map(|epoch| epoch + 1).max().unwrap_or(0))
 }
 
-/// Whether the microVM's network or disk is not the one `wanted` has.
+/// Whether the microVM's network or disks are not the ones `wanted` has.
 fn stale(vm: &VmInfo, wanted: &VmConfig) -> bool {
     let config = vm.config.as_ref();
-    config.map(|config| (&config.net, &config.guest_network, &config.data_disk))
-        != Some((&wanted.net, &wanted.guest_network, &wanted.data_disk))
+    config.map(|config| {
+        (
+            &config.net,
+            &config.guest_network,
+            &config.data_disk,
+            &config.volumes,
+        )
+    }) != Some((
+        &wanted.net,
+        &wanted.guest_network,
+        &wanted.data_disk,
+        &wanted.volumes,
+    ))
+}
+
+/// A create of a pod that exists finds it if the spec is the same.
+fn same_spec(existing: PodInfo, spec: &PodSpec) -> Result<PodInfo, Status> {
+    if existing.spec.as_ref() == Some(spec) {
+        Ok(existing)
+    } else {
+        Err(Status::already_exists(format!(
+            "pod {} exists with another spec",
+            existing.pod_id
+        )))
+    }
 }
 
 /// A channel to the API of the pod's guest.
@@ -1406,7 +1827,15 @@ async fn run_container(
             image_ref: container.image_ref.clone(),
             command: container.command.clone(),
             env: container.env.clone(),
-            ..Default::default()
+            volume_mounts: container
+                .volume_mounts
+                .iter()
+                .map(|mount| GuestVolumeMount {
+                    volume: mount.volume.clone(),
+                    path: mount.path.clone(),
+                    read_only: mount.read_only,
+                })
+                .collect(),
         }),
         container_id: Some(container_id.clone()),
         // Without a container to adopt, a plain create.
@@ -1479,11 +1908,34 @@ mod tests {
     fn epochs_grow_and_are_never_written_twice() {
         let now = next_epoch(None);
         assert!(now > 1_700_000_000);
-        let ahead = Checkpoint {
-            epoch: now + 100,
+        assert_eq!(next_epoch(Some(now + 100)), now + 101);
+        // A volume's last checkpoint counts, too: it may come from a pod
+        // that hibernated later.
+        assert_eq!(next_epoch([now - 5, now + 200, now + 100]), now + 201);
+        assert_eq!(checkpoint_key("p", 7, SPEC_OBJECT), "snapshots/p/7/pod.pb");
+        assert_eq!(
+            checkpoint_key(&volume_disk("v"), 7, VOLUME_OBJECT),
+            "snapshots/volume-v/7/volume.pb"
+        );
+    }
+
+    #[test]
+    fn a_microvm_with_other_volumes_is_stale() {
+        let disk = |path: &str| feos_proto::microvm::DataDiskConfig {
+            path: path.to_string(),
+        };
+        let wanted = VmConfig {
+            data_disk: Some(disk("/d")),
+            volumes: vec![disk("/a")],
             ..Default::default()
         };
-        assert_eq!(next_epoch(Some(&ahead)), now + 101);
-        assert_eq!(checkpoint_key("p", 7, SPEC_OBJECT), "snapshots/p/7/pod.pb");
+        let mut vm = VmInfo {
+            config: Some(wanted.clone()),
+            ..Default::default()
+        };
+        assert!(!stale(&vm, &wanted));
+        // One made before the pod had volumes, or with others.
+        vm.config.as_mut().unwrap().volumes.clear();
+        assert!(stale(&vm, &wanted));
     }
 }

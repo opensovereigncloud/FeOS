@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package feos.volume.v1;
+
+// Persistent volumes on a node (ADR 0016): a disk of the node's disk
+// daemon with a life of its own, which a pod's spec names
+// (feos.pod.v1.PodSpec.volumes) and its containers mount. A volume is
+// attached to at most one pod at a time, from the pod's creation to its
+// deletion; deleting the pod leaves the volume. Its filesystem is made in
+// the pod's guest at the first boot that has it, and it goes into object
+// storage with its pod when the pod hibernates, and comes back with it,
+// here or on another node.
+service VolumeService {
+  // Creates a volume of a size, attached to no pod. A create with the ID
+  // of a volume that exists returns that volume if its size and labels are
+  // the same, and fails with ALREADY_EXISTS if not.
+  rpc CreateVolume(CreateVolumeRequest) returns (Volume);
+  // Deletes a volume and what the node holds of it. Fails with
+  // FAILED_PRECONDITION while a pod has it, hibernated or not. Its
+  // checkpoints stay in object storage until a sweep finds no head that
+  // names them (feos.disk.v1 Sweep).
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse);
+  rpc GetVolume(GetVolumeRequest) returns (Volume);
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+}
+
+message Volume {
+  // A UUID, chosen by the caller: the UUID of the volume's filesystem, too.
+  string volume_id = 1;
+  // From 64 MiB to 16 TiB, in whole MiB; it does not change.
+  uint64 size_bytes = 2;
+  // The caller's labels, which feosd keeps and returns.
+  map<string, string> labels = 3;
+  VolumeState state = 4;
+  // The pod the volume is attached to; empty for none.
+  string pod_id = 5;
+  // Whether it has its filesystem: false until a guest made it.
+  bool formatted = 6;
+  // The checkpoint its data came from last, or is in while it is
+  // checkpointed: a pod that runs with it reads layers of it.
+  VolumeCheckpoint checkpoint = 7;
+}
+
+enum VolumeState {
+  VOLUME_STATE_UNSPECIFIED = 0;
+  // On the node, attached to no pod.
+  VOLUME_STATE_AVAILABLE = 1;
+  // On the node, attached to a pod (pod_id), in whatever state the pod is
+  // but hibernated.
+  VOLUME_STATE_ATTACHED = 2;
+  // In object storage alone, in its checkpoint: the volume of a hibernated
+  // pod (pod_id), or of one that was deleted while it was hibernated. The
+  // next boot of a pod with it brings it back from there.
+  VOLUME_STATE_CHECKPOINTED = 3;
+}
+
+// A volume in object storage, as a hibernation of its pod wrote it.
+message VolumeCheckpoint {
+  // The S3 key of its head, snapshots/volume-<id>/<epoch>/head.json, which
+  // the head of its pod's checkpoint names.
+  string head_key = 1;
+  // Its pod's checkpoint's.
+  uint64 epoch = 2;
+}
+
+message CreateVolumeRequest {
+  string volume_id = 1;
+  uint64 size_bytes = 2;
+  map<string, string> labels = 3;
+}
+
+message DeleteVolumeRequest {
+  string volume_id = 1;
+}
+
+message DeleteVolumeResponse {}
+
+message GetVolumeRequest {
+  string volume_id = 1;
+}
+
+message ListVolumesRequest {}
+
+message ListVolumesResponse {
+  repeated Volume volumes = 1;
+}

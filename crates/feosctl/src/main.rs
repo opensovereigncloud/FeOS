@@ -13,6 +13,7 @@ mod security_group_commands;
 mod tool_commands;
 mod traffic_commands;
 mod transport;
+mod volume_commands;
 mod watch_commands;
 
 #[derive(Parser, Debug)]
@@ -29,6 +30,8 @@ enum Service {
     /// Security groups: what pods may send and receive
     #[command(alias = "sg")]
     SecurityGroup(security_group_commands::SecurityGroupArgs),
+    /// Volumes: disks that outlive the pods they are attached to
+    Volume(volume_commands::VolumeArgs),
     Host(host_commands::HostArgs),
     Image(image_commands::ImageArgs),
     Container(container_commands::ContainerArgs),
@@ -56,6 +59,7 @@ async fn main() -> Result<()> {
         Service::SecurityGroup(args) => {
             security_group_commands::handle_security_group_command(args).await?
         }
+        Service::Volume(args) => volume_commands::handle_volume_command(args).await?,
         Service::Host(args) => host_commands::handle_host_command(args).await?,
         Service::Image(args) => image_commands::handle_image_command(args).await?,
         Service::Container(args) => container_commands::handle_container_command(args).await?,

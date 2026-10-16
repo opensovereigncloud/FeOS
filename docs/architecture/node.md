@@ -9,7 +9,8 @@ restore), [ADR 0009](../adr/0009-node-os-and-packages.md) (operating system
 and packages), [ADR 0010](../adr/0010-pod-network.md) (the pods' network),
 [ADR 0011](../adr/0011-disk-daemon.md) (the disk daemon),
 [ADR 0012](../adr/0012-security-groups.md) (security groups),
-[ADR 0013](../adr/0013-traffic-records.md) (traffic records).
+[ADR 0013](../adr/0013-traffic-records.md) (traffic records),
+[ADR 0016](../adr/0016-volumes.md) (volumes).
 
 Parts that are decided but not built are marked as such.
 
@@ -72,6 +73,7 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 | `/var/lib/feos/pods/next-ipv6-address` | the counter of the pods' IPv6 addresses: the next one handed out |
 | `/var/lib/feos/pods/ipv4-addresses` | the pods' IPv4 addresses: the lowest never handed out, and those freed since, the longest free first, with when |
 | `/var/lib/feos/security-groups/<id>.pb` | a security group (a `feos.network.v1.SecurityGroup`) |
+| `/var/lib/feos/volumes/<id>.pb` | a volume (a `feos.volume.v1.Volume`); `empty-layer.img`, the image of the volumes' empty L0 |
 | `/var/lib/feos/vms.db` | the microVM records (SQLite) |
 | `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
 | `/var/lib/feos/disk/` | diskd's state: the pods' disks, the chunk cache ([disk.md](disk.md)) |
@@ -91,16 +93,17 @@ A pod ([ADR 0004](../adr/0004-pods.md)) is a microVM
 with the pod's ID, booted from the newest installed guest, on a disk of
 its own from diskd ([disk.md](disk.md)), and the containers its spec
 names, which the guest runs with the names as their IDs. Its spec gives
-vCPUs and memory, the containers (image, command, environment) and
-whether it has a network. The microVM has a balloon with free page
-reporting.
+vCPUs and memory, the containers (image, command, environment, the
+volumes they mount), whether it has a network, and its volumes. The
+microVM has a balloon with free page reporting.
 
-- **Create** records the pod as `PENDING` and brings it up in the
-  background: open its disk, create and start the microVM, wait for the guest to attach
-  (60 s at most), then create (which pulls) and start the containers, in
-  order. The pod is then `RUNNING`, or `FAILED` with the reason. Each step
-  looks at what is there first, so a bring-up that a restart of `feosd`
-  cut off is taken up again where it ended. A create with the ID of a pod
+- **Create** claims the pod's volumes, records the pod as `PENDING` and
+  brings it up in the background: open its disk and its volumes' disks,
+  create and start the microVM, wait for the guest to attach (60 s at
+  most), have it mount the volumes, then create (which pulls) and start
+  the containers, in order. The pod is then `RUNNING`, or `FAILED` with
+  the reason. Each step looks at what is there first, so a bring-up that
+  a restart of `feosd` cut off is taken up again where it ended. A create with the ID of a pod
   that exists returns that pod if the spec is the same, and fails with
   `ALREADY_EXISTS` if not.
 - **Stop** ends a bring-up, shuts the microVM down, or removes it if it
@@ -115,12 +118,50 @@ reporting.
   alone ([disk.md](disk.md#hibernation)). A hibernated pod is `HIBERNATED`,
   a record with its checkpoint; **Resume** restores it.
 - **Delete** ends a bring-up and removes the microVM, the disk and the
-  record.
+  record. Its volumes stay, their disks stopped, attached to no pod.
 - A running pod whose microVM crashes is `FAILED`; one whose microVM stops
-  is `STOPPED`. Either keeps its disk, and its disk stops.
+  is `STOPPED`. Either keeps its disk, and its disk stops. Volumes go as
+  the disk does.
 
 What changes a pod runs under a lock of the pod's. `GetPod` asks the guest
 for the containers' states while the pod runs.
+
+## Volumes
+
+A volume (`feos.volume.v1.VolumeService`,
+[ADR 0016](../adr/0016-volumes.md)) is a disk of diskd's that outlives
+the pods it is attached to ([disk.md](disk.md#the-volumes-disks)). The
+code is `crates/services/pod-service/src/volumes.rs`.
+
+- `CreateVolume(id, size, labels)` records a volume, `AVAILABLE`: a
+  lowercase UUID, from 64 MiB to 16 TiB in whole MiB. A create with the
+  same ID, size and labels finds it; another fails with
+  `ALREADY_EXISTS`. Its disk is made at its first boot.
+- `CreatePod` claims the volumes its spec names (`PodSpec.volumes`: a
+  name, 1 to 63 lowercase letters, digits and `-`, and the volume's ID;
+  at most eight), all or none: each must be on the node and attached to
+  no other pod, else `FAILED_PRECONDITION`. They are `ATTACHED` to it
+  then, until `DeletePod`, which leaves them `AVAILABLE`.
+- A hibernation makes them `CHECKPOINTED`, their data in object storage
+  alone; the next boot of a pod with one opens it from its checkpoint,
+  and it is `ATTACHED` again. A checkpointed volume whose pod was
+  deleted stays checkpointed.
+- `DeleteVolume` removes a volume that no pod has, with its disk, and
+  fails with `FAILED_PRECONDITION` while a pod has it.
+- `Volume.formatted` is false until the guest reported the volume
+  mounted: until then every boot asks the guest to format it
+  ([guest.md](guest.md#volumes)).
+- At its start, `feosd` lets go of volumes whose pod is gone and claims
+  the volumes of kept pods that name no pod, after a crash between the
+  two records.
+
+After a boot, once the guest attached, `feosd` calls
+`feos.guest.v1.GuestService.MountVolumes` with each volume's name, ID,
+drive (1 for the first volume; 0 is the pod's disk), size and whether to
+format it, records the volumes the guest mounted as formatted, and fails
+the bring-up with the reasons of those it did not. Then it creates the
+containers, whose `ContainerSpec.volume_mounts` (a volume's name, a path,
+`read_only`) go to the guest's `ContainerConfig.volume_mounts`.
 
 ## The pods' network
 
@@ -344,6 +385,7 @@ the chroot its Firecracker runs in:
 | `firecracker.pid`, `firecracker`, `dev/` | the jailer's |
 | `vmlinuz`, `initramfs` | the installed guest's files, linked in |
 | `data` | the data disk: a device node of the microVM's own, of the device the `data_disk` link names, made at every start and restore |
+| `volume0`, `volume1`, ... | the pod's volumes, as `data` |
 | `snapshot/` | the snapshot of a suspended microVM: `vmstate` and `memory` |
 | `memory.sock` | where diskd serves the memory of a microVM restored from object storage |
 
@@ -370,10 +412,10 @@ deletion undoes.
   devices and its directory.
 
 The layer records a change of state after the call that made it returns;
-the pod service waits for it. A microVM has one data disk at most,
-which Firecracker opens with a writeback cache, so that the guest's
-flushes reach diskd, and no huge pages, which Firecracker backs neither an
-initramfs nor a balloon with.
+the pod service waits for it. A microVM has one data disk at most and
+its volumes after it, in their order, which Firecracker opens with a
+writeback cache, so that the guest's flushes reach diskd, and no huge
+pages, which Firecracker backs neither an initramfs nor a balloon with.
 
 ### Jail, user and cgroup
 

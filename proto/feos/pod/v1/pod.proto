@@ -11,14 +11,18 @@ package feos.pod.v1;
 // which the guest mounts at /var/lib/feos: its images and containers
 // live there, and what the containers write survives a stop, a crash and
 // a hibernation. A pod's disk and memory can go to object storage and
-// come back on any node (ADR 0008).
+// come back on any node (ADR 0008). A pod may have volumes too
+// (feos.volume.v1, ADR 0016), which outlive it.
 service PodService {
   // Creates a pod and brings it up: its microVM boots the newest guest
-  // installed on the node, and its containers are pulled, created and
-  // started in it, in order. The call returns once the pod is recorded; the
-  // pod is POD_STATE_PENDING until it runs, or POD_STATE_FAILED. A create
-  // with the ID of a pod that exists returns that pod if the spec is the
-  // same, and fails with ALREADY_EXISTS if it is not.
+  // installed on the node, its volumes are mounted, formatted at their
+  // first boot, and its containers are pulled, created and started in it,
+  // in order. The call returns once the pod is recorded; the pod is
+  // POD_STATE_PENDING until it runs, or POD_STATE_FAILED. A create with
+  // the ID of a pod that exists returns that pod if the spec is the same,
+  // and fails with ALREADY_EXISTS if it is not. A create whose volumes are
+  // not on the node, or attached to another pod, fails with
+  // FAILED_PRECONDITION: a pod claims its volumes, all or none.
   rpc CreatePod(CreatePodRequest) returns (CreatePodResponse);
   // Brings a stopped or failed pod up again: a new boot on its disk, where
   // its containers are adopted with what they wrote, or created from the
@@ -29,7 +33,8 @@ service PodService {
   rpc StopPod(StopPodRequest) returns (StopPodResponse);
   // Removes the pod, its microVM and its disk, in whatever state. Its
   // checkpoints stay in object storage until a sweep finds no head that
-  // names them (feos.disk.v1 Sweep).
+  // names them (feos.disk.v1 Sweep). Its volumes stay, attached to no
+  // pod.
   rpc DeletePod(DeletePodRequest) returns (DeletePodResponse);
   rpc GetPod(GetPodRequest) returns (PodInfo);
   rpc ListPods(ListPodsRequest) returns (ListPodsResponse);
@@ -43,9 +48,9 @@ service PodService {
   // resume that came while the pod hibernated waits for it.
   rpc ResumePod(ResumePodRequest) returns (ResumePodResponse);
   // Takes the pod off the node into object storage: suspends it if it
-  // runs, seals its disk and its memory, uploads them with its spec, and
-  // frees what it held on the node: its microVM, its disk and its
-  // addresses. The pod is POD_STATE_HIBERNATED then, a record with its
+  // runs, seals its disk, its volumes and its memory, uploads them with
+  // its spec, and frees what it held on the node: its microVM, its disk,
+  // its volumes' disks and its addresses. The pod is POD_STATE_HIBERNATED then, a record with its
   // checkpoint, from which ResumePod and RestorePod bring it back, here or
   // on another node. A stopped or failed pod hibernates its disk alone.
   // A hibernation that fails leaves the pod suspended on the node. Needs
@@ -58,7 +63,10 @@ service PodService {
   // model and kernel): the pod runs before the call returns, and its
   // memory arrives while it runs. Elsewhere the pod boots anew on the
   // checkpoint's disk, with its containers adopted, and is
-  // POD_STATE_PENDING until it runs. The control plane places a pod on
+  // POD_STATE_PENDING until it runs. The checkpoint's volumes come with
+  // it; the restore fails with FAILED_PRECONDITION before anything changes
+  // when another pod on the node has one of them, or the node has one with
+  // data the checkpoint may not have. The control plane places a pod on
   // one node at a time: two restores of one checkpoint are two pods.
   rpc RestorePod(RestorePodRequest) returns (RestorePodResponse);
   // The serial console of the pod's microVM: the first message names the
@@ -74,6 +82,19 @@ message PodSpec {
   PodNetwork network = 3;
   // The caller's labels, which feosd keeps and returns.
   map<string, string> labels = 4;
+  // The pod's volumes (feos.volume.v1), at most eight, in the order of the
+  // microVM's drives. They are fixed at its creation, and attached to it
+  // until it is deleted.
+  repeated PodVolume volumes = 5;
+}
+
+// A volume of a pod, by the name its containers mount it by.
+message PodVolume {
+  // 1 to 63 lowercase letters, digits and "-", beginning and ending with a
+  // letter or a digit, unique in the pod.
+  string name = 1;
+  // The volume, which must be on the node and attached to no other pod.
+  string volume_id = 2;
 }
 
 message Resources {
@@ -93,6 +114,18 @@ message ContainerSpec {
   // The command; the image's when empty.
   repeated string command = 3;
   map<string, string> env = 4;
+  // The pod's volumes the container mounts.
+  repeated VolumeMount volume_mounts = 5;
+}
+
+message VolumeMount {
+  // A name of PodSpec.volumes.
+  string volume = 1;
+  // Where the container sees it: an absolute path other than "/", once in
+  // the container.
+  string path = 2;
+  // The container cannot write to it.
+  bool read_only = 3;
 }
 
 // Every pod has a network (ADR 0010): an IPv6 address of the node's pod

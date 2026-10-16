@@ -4,11 +4,13 @@
 //! A pod's spec: what is valid, and the microVM it becomes.
 
 use crate::network::{self, Attachment};
+use crate::volumes;
 use feos_proto::microvm::{
     BalloonConfig, CpuConfig, DataDiskConfig, GuestNetworkConfig, MemoryConfig, NetConfig,
     TapConfig, VmConfig,
 };
 use feos_proto::pod_service::{PodSpec, Resources};
+use feos_utils::filesystem::volume as feos_volume;
 use std::collections::HashSet;
 use tonic::Status;
 use uuid::Uuid;
@@ -21,6 +23,10 @@ const MAX_VCPUS: u32 = 32;
 const MIN_MEMORY_MIB: u64 = 128;
 /// The pod's interface in the guest.
 const INTERFACE: &str = "eth0";
+/// A pod's volumes, each a drive: Firecracker's microVM has interrupts for
+/// some 19 devices, of which the balloon, the disk, the network and vsock
+/// take four.
+const MAX_VOLUMES: usize = 8;
 
 /// Checks a pod's ID: a UUID, which also names its microVM and its paths.
 pub fn check_id(pod_id: &str) -> Result<(), Status> {
@@ -71,8 +77,69 @@ pub fn normalize(mut spec: PodSpec) -> Result<PodSpec, Status> {
             )));
         }
     }
+    check_volumes(&spec)?;
 
     Ok(spec)
+}
+
+/// Checks the pod's volumes and its containers' mounts of them: at most
+/// [`MAX_VOLUMES`], each under a name of its own and named once, and each
+/// mount of a volume of the pod at a path of its own.
+fn check_volumes(spec: &PodSpec) -> Result<(), Status> {
+    if spec.volumes.len() > MAX_VOLUMES {
+        return Err(Status::invalid_argument(format!(
+            "a pod has at most {MAX_VOLUMES} volumes"
+        )));
+    }
+    let mut names = HashSet::new();
+    let mut ids = HashSet::new();
+    for volume in &spec.volumes {
+        if !feos_volume::valid_name(&volume.name) {
+            return Err(Status::invalid_argument(format!(
+                "invalid volume name {:?}: 1 to 63 lowercase letters, digits and \"-\", beginning and ending with a letter or a digit",
+                volume.name
+            )));
+        }
+        volumes::check_id(&volume.volume_id)?;
+        if !names.insert(volume.name.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "two volumes are named {:?}",
+                volume.name
+            )));
+        }
+        if !ids.insert(volume.volume_id.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "volume {} is named twice",
+                volume.volume_id
+            )));
+        }
+    }
+    for container in &spec.containers {
+        let mut paths = HashSet::new();
+        for mount in &container.volume_mounts {
+            if !names.contains(mount.volume.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "container {:?} mounts volume {:?}, which the pod does not have",
+                    container.name, mount.volume
+                )));
+            }
+            if !feos_volume::valid_mount_path(&mount.path) || !paths.insert(mount.path.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "container {:?} cannot mount volume {:?} at {:?}: an absolute path other than \"/\", once",
+                    container.name, mount.volume, mount.path
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The IDs of the pod's volumes, in the order of its spec.
+pub fn volume_ids(spec: &PodSpec) -> Vec<String> {
+    spec.volumes
+        .iter()
+        .map(|volume| volume.volume_id.clone())
+        .collect()
 }
 
 /// Whether the pod has a network: unless its spec says none.
@@ -93,15 +160,17 @@ fn valid_name(name: &str) -> bool {
 
 /// The pod's microVM: the newest guest installed on the node, with a
 /// balloon that reports free pages, so that a suspend writes what the
-/// guest uses, the pod's disk if it has one started, and the pod's TAP
-/// device and addresses if it has a network (ADR 0010): an IPv6 /128
-/// behind the node at `fe80::1`, an IPv4 /32 behind `169.254.0.1`, which
-/// is on the link although outside the /32, and the node's resolver.
+/// guest uses, the pod's disk if it has one started and its volumes'
+/// disks after it, in the order of its spec, and the pod's TAP device and
+/// addresses if it has a network (ADR 0010): an IPv6 /128 behind the node
+/// at `fe80::1`, an IPv4 /32 behind `169.254.0.1`, which is on the link
+/// although outside the /32, and the node's resolver.
 pub fn vm_config(
     pod_id: &str,
     spec: &PodSpec,
     attachment: Option<&Attachment>,
     disk: Option<&str>,
+    volumes: &[String],
 ) -> VmConfig {
     let resources = spec.resources.unwrap_or_default();
     let mut config = VmConfig {
@@ -120,6 +189,10 @@ pub fn vm_config(
         data_disk: disk.map(|path| DataDiskConfig {
             path: path.to_string(),
         }),
+        volumes: volumes
+            .iter()
+            .map(|path| DataDiskConfig { path: path.clone() })
+            .collect(),
         ..Default::default()
     };
     if let Some(attachment) = attachment {
@@ -146,7 +219,7 @@ pub fn vm_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use feos_proto::pod_service::{ContainerSpec, PodNetwork};
+    use feos_proto::pod_service::{ContainerSpec, PodNetwork, PodVolume, VolumeMount};
 
     fn container(name: &str) -> ContainerSpec {
         ContainerSpec {
@@ -231,7 +304,7 @@ mod tests {
             ipv4: "169.254.16.9".parse().unwrap(),
             dns: "169.254.0.53".parse().unwrap(),
         };
-        let config = vm_config(id, &spec, Some(&attachment), None);
+        let config = vm_config(id, &spec, Some(&attachment), None, &[]);
         assert_eq!(config.net[0].tap.as_ref().unwrap().tap_name, "pod-11111111");
         assert_eq!(config.net[0].mac_address, "06:00:11:11:11:11");
         let guest = config.guest_network.unwrap();
@@ -246,7 +319,7 @@ mod tests {
         assert_eq!(guest.hostname, id);
         assert_eq!(config.memory.unwrap().size_mib, 512);
 
-        let config = vm_config(id, &spec, None, None);
+        let config = vm_config(id, &spec, None, None, &[]);
         assert!(config.net.is_empty() && config.guest_network.is_none());
     }
 
@@ -255,8 +328,80 @@ mod tests {
         let spec = normalize(spec(vec![])).unwrap();
         let id = "11111111-2222-3333-4444-555555555555";
         let link = format!("/var/lib/feos/disk/live/{id}/disk");
-        let config = vm_config(id, &spec, None, Some(&link));
+        let config = vm_config(id, &spec, None, Some(&link), &[]);
         assert_eq!(config.data_disk.unwrap().path, link);
-        assert!(vm_config(id, &spec, None, None).data_disk.is_none());
+        assert!(vm_config(id, &spec, None, None, &[]).data_disk.is_none());
+        let volumes = ["/a".to_string(), "/b".to_string()];
+        let config = vm_config(id, &spec, None, Some(&link), &volumes);
+        let paths: Vec<_> = config.volumes.iter().map(|v| v.path.as_str()).collect();
+        assert_eq!(paths, ["/a", "/b"]);
+    }
+
+    fn volume(name: &str, volume_id: &str) -> PodVolume {
+        PodVolume {
+            name: name.to_string(),
+            volume_id: volume_id.to_string(),
+        }
+    }
+
+    fn mount(volume: &str, path: &str) -> VolumeMount {
+        VolumeMount {
+            volume: volume.to_string(),
+            path: path.to_string(),
+            read_only: false,
+        }
+    }
+
+    const A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+    const B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
+
+    #[test]
+    fn volumes_are_named_once_and_mounted_by_name() {
+        let with = |volumes: Vec<PodVolume>, mounts: Vec<VolumeMount>| {
+            let mut main = container("main");
+            main.volume_mounts = mounts;
+            let mut spec = spec(vec![main]);
+            spec.volumes = volumes;
+            normalize(spec)
+        };
+        let good = with(
+            vec![volume("db", A), volume("logs", B)],
+            vec![mount("db", "/var/lib/db"), mount("logs", "/logs")],
+        )
+        .unwrap();
+        assert_eq!(volume_ids(&good), [A, B]);
+        // A volume no container mounts is fine.
+        assert!(with(vec![volume("db", A)], vec![]).is_ok());
+
+        for (volumes, mounts) in [
+            (vec![volume("db", A), volume("db", B)], vec![]),
+            (vec![volume("db", A), volume("logs", A)], vec![]),
+            (vec![volume("DB", A)], vec![]),
+            (vec![volume("db", "not-a-uuid")], vec![]),
+            (vec![volume("db", &A.to_uppercase())], vec![]),
+            (vec![volume("db", A)], vec![mount("logs", "/logs")]),
+            (vec![volume("db", A)], vec![mount("db", "/")]),
+            (vec![volume("db", A)], vec![mount("db", "relative")]),
+            (
+                vec![volume("db", A), volume("logs", B)],
+                vec![mount("db", "/data"), mount("logs", "/data")],
+            ),
+        ] {
+            let status = with(volumes.clone(), mounts.clone()).unwrap_err();
+            assert_eq!(
+                status.code(),
+                tonic::Code::InvalidArgument,
+                "{volumes:?} {mounts:?}"
+            );
+        }
+        let many = (0..9)
+            .map(|i| {
+                volume(
+                    &format!("v{i}"),
+                    &format!("aaaaaaaa-0000-0000-0000-00000000000{i}"),
+                )
+            })
+            .collect();
+        assert!(with(many, vec![]).is_err());
     }
 }

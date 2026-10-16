@@ -11,8 +11,9 @@ use crossterm::tty::IsTty;
 use feos_proto::pod_service::{
     pod_service_client::PodServiceClient, ContainerSpec, ContainerState, CreatePodRequest,
     DeletePodRequest, GetPodRequest, HibernatePodRequest, ListPodsRequest, PodConsoleInput,
-    PodInfo, PodNetwork, PodSpec, PodState, Resources, RestorePodRequest, ResumePodRequest,
-    StartPodRequest, StopPodRequest, StreamPodEventsRequest, SuspendPodRequest,
+    PodInfo, PodNetwork, PodSpec, PodState, PodVolume, Resources, RestorePodRequest,
+    ResumePodRequest, StartPodRequest, StopPodRequest, StreamPodEventsRequest, SuspendPodRequest,
+    VolumeMount,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -130,6 +131,23 @@ pub struct CreatePodOptions {
     )]
     dns_upstreams: Vec<String>,
 
+    #[arg(
+        long = "volume",
+        value_name = "NAME=VOLUME_ID",
+        value_parser = parse_volume,
+        help = "A volume of the pod, under a name of the pod's (repeatable); it must be attached to no other pod"
+    )]
+    volumes: Vec<PodVolume>,
+
+    #[arg(
+        long = "mount",
+        value_name = "NAME:PATH[:ro]",
+        requires = "image",
+        value_parser = parse_mount,
+        help = "Mounts the pod's volume NAME in the container at PATH, read-only with :ro (repeatable)"
+    )]
+    mounts: Vec<VolumeMount>,
+
     #[arg(long, help = "Wait until the pod runs")]
     wait: bool,
 
@@ -145,6 +163,26 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .ok_or_else(|| format!("invalid KEY=value format: {s}"))
+}
+
+fn parse_volume(s: &str) -> Result<PodVolume, String> {
+    let (name, volume_id) = parse_key_val(s).map_err(|_| format!("{s:?} is not NAME=VOLUME_ID"))?;
+    Ok(PodVolume { name, volume_id })
+}
+
+fn parse_mount(s: &str) -> Result<VolumeMount, String> {
+    let (volume, rest) = s
+        .split_once(':')
+        .ok_or_else(|| format!("{s:?} is not NAME:PATH[:ro]"))?;
+    let (path, read_only) = match rest.strip_suffix(":ro") {
+        Some(path) => (path, true),
+        None => (rest, false),
+    };
+    Ok(VolumeMount {
+        volume: volume.to_string(),
+        path: path.to_string(),
+        read_only,
+    })
 }
 
 pub async fn handle_pod_command(args: PodArgs) -> Result<()> {
@@ -279,11 +317,13 @@ fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
                     image_ref,
                     command: opts.command,
                     env: opts.env.into_iter().collect(),
+                    volume_mounts: opts.mounts,
                 })
                 .into_iter()
                 .collect(),
             network,
             labels: opts.label.into_iter().collect::<HashMap<_, _>>(),
+            volumes: opts.volumes,
         }),
     }
 }
@@ -419,6 +459,9 @@ fn print_pod(pod: &PodInfo) {
     }
     for (key, value) in &spec.labels {
         println!("  Label: {key}={value}");
+    }
+    for volume in &spec.volumes {
+        println!("  Volume: {} ({})", volume.name, volume.volume_id);
     }
     println!("  Containers:");
     for container in &spec.containers {
@@ -591,6 +634,43 @@ mod tests {
         assert_eq!(spec.containers[0].env["A"], "b");
         assert_eq!(spec.network, None, "a pod has a network by default");
         assert!(uuid::Uuid::parse_str(&request.pod_id).is_ok());
+    }
+
+    #[test]
+    fn a_create_names_volumes_and_mounts_them() {
+        let id = "aaaaaaaa-0000-0000-0000-000000000001";
+        let cli = Cli::try_parse_from([
+            "pod",
+            "create",
+            "--image",
+            "busybox",
+            "--volume",
+            &format!("db={id}"),
+            "--mount",
+            "db:/var/lib/db",
+            "--mount",
+            "db:/ro:ro",
+        ])
+        .unwrap();
+        let PodCommand::Create(opts) = cli.command else {
+            panic!("not a create");
+        };
+        let spec = create_pod_request(*opts).spec.unwrap();
+        assert_eq!(
+            spec.volumes,
+            [PodVolume {
+                name: "db".to_string(),
+                volume_id: id.to_string()
+            }]
+        );
+        let mounts: Vec<_> = spec.containers[0]
+            .volume_mounts
+            .iter()
+            .map(|m| (m.volume.as_str(), m.path.as_str(), m.read_only))
+            .collect();
+        assert_eq!(mounts, [("db", "/var/lib/db", false), ("db", "/ro", true)]);
+        assert!(parse_mount("db").is_err());
+        assert!(parse_volume("db").is_err());
     }
 
     #[test]

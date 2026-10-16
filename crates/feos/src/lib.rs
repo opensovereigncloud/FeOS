@@ -19,6 +19,8 @@ use feos_proto::network_service::{
 };
 #[cfg(feature = "host")]
 use feos_proto::pod_service::pod_service_server::PodServiceServer;
+#[cfg(feature = "host")]
+use feos_proto::volume_service::volume_service_server::VolumeServiceServer;
 use feos_proto::{
     container_service::container_service_server::ContainerServiceServer,
     host_service::host_service_server::HostServiceServer,
@@ -31,7 +33,7 @@ use log::{error, info, warn};
 use network_service::SecurityGroups;
 use nix::unistd::{chown, Group, Uid};
 #[cfg(feature = "host")]
-use pod_service::{forward::ForwardLayer, Pods};
+use pod_service::{forward::ForwardLayer, Pods, Volumes};
 use setup::*;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
@@ -131,11 +133,13 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     #[cfg(feature = "host")]
     let vms = initialize_vm_service(&setup_database().await?).await?;
     #[cfg(feature = "host")]
-    let (pods, groups, traffic) =
+    let (pods, volumes, groups, traffic) =
         initialize_pod_service(vms, options.network, options.diskd_socket).await?;
     let services = Services {
         #[cfg(feature = "host")]
         pods,
+        #[cfg(feature = "host")]
+        volumes,
         #[cfg(feature = "host")]
         groups,
         #[cfg(feature = "host")]
@@ -252,6 +256,8 @@ struct Services {
     #[cfg(feature = "host")]
     pods: Pods,
     #[cfg(feature = "host")]
+    volumes: Volumes,
+    #[cfg(feature = "host")]
     groups: SecurityGroups,
     #[cfg(feature = "host")]
     traffic: traffic_service::TrafficApi,
@@ -281,6 +287,7 @@ impl Services {
         #[cfg(feature = "host")]
         let router = router
             .add_service(PodServiceServer::new(self.pods.clone()))
+            .add_service(VolumeServiceServer::new(self.volumes.clone()))
             .add_service(SecurityGroupServiceServer::new(self.groups.clone()))
             .add_service(TrafficServiceServer::new(self.traffic.clone()));
         #[cfg(feature = "guest")]

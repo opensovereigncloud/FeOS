@@ -46,14 +46,14 @@ use tower::service_fn;
 const UP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// diskd's state directory, beside its socket.
-fn diskd_state() -> PathBuf {
+pub(super) fn diskd_state() -> PathBuf {
     Path::new(DISKD_SOCKET)
         .parent()
         .expect("the socket is in the state directory")
         .to_path_buf()
 }
 
-async fn diskd() -> Result<DiskServiceClient<Channel>> {
+pub(super) async fn diskd() -> Result<DiskServiceClient<Channel>> {
     let channel = Endpoint::from_static("http://diskd")
         .connect_with_connector(service_fn(|_: Uri| async {
             tokio::net::UnixStream::connect(DISKD_SOCKET)
@@ -80,7 +80,10 @@ fn spec() -> PodSpec {
 }
 
 /// Waits until the pod runs.
-async fn wait_until_up(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<PodInfo> {
+pub(super) async fn wait_until_up(
+    pods: &mut PodServiceClient<Channel>,
+    pod_id: &str,
+) -> Result<PodInfo> {
     timeout(UP_TIMEOUT, async {
         loop {
             let pod = get_pod(pods, pod_id).await?;
@@ -96,7 +99,7 @@ async fn wait_until_up(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Re
 }
 
 /// The pod's disk on the node: diskd's directory of it.
-fn disk_dir(pod_id: &str) -> PathBuf {
+pub(super) fn disk_dir(pod_id: &str) -> PathBuf {
     diskd_state().join("live").join(pod_id)
 }
 
@@ -170,7 +173,7 @@ fn marked(names: &[&str], marker: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-async fn start(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<PodInfo> {
+pub(super) async fn start(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<PodInfo> {
     pods.start_pod(StartPodRequest {
         pod_id: pod_id.to_string(),
     })
@@ -178,7 +181,7 @@ async fn start(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<Pod
     wait_until_up(pods, pod_id).await
 }
 
-async fn stop(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<()> {
+pub(super) async fn stop(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<()> {
     pods.stop_pod(StopPodRequest {
         pod_id: pod_id.to_string(),
     })
@@ -186,7 +189,7 @@ async fn stop(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result<()> 
     Ok(())
 }
 
-fn pid(pod: &PodInfo) -> Result<i32> {
+pub(super) fn pid(pod: &PodInfo) -> Result<i32> {
     Ok(pod
         .microvm
         .as_ref()

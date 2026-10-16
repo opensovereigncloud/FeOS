@@ -10,6 +10,7 @@ plane, and between `feosd` and `feos-guest`. They live in
 | Package | What it is for | Served by today |
 |---|---|---|
 | `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, hibernate, restore, console, events | `feosd` |
+| `feos.volume.v1` | persistent volumes: create, delete, get, list; a pod's spec names them ([node.md](node.md#volumes)) | `feosd` |
 | `feos.disk.v1` | the pods' disks and memory over a chunk store and the object store, internal to the node ([disk.md](disk.md)) | `diskd` |
 | `feos.network.v1` | the pods' security groups (`SecurityGroupService`) and the records of their traffic (`TrafficService`) | `feosd` |
 | `feos.microvm.v1` | the pods' microVMs, internal to `feosd`, served on no listener | – |
@@ -18,6 +19,7 @@ plane, and between `feosd` and `feos-guest`. They live in
 | `feos.host.v1` | the machine: hostname, memory, CPU, network, version, logs, power, upgrade; and, for now, the guest's pushed time and network, freezing and `PreparePause` | `feosd`, `feos-guest` |
 | `feos.task.v1` | the container runtime, internal between the main process and the task service | both, internally |
 | `feos.lifecycle.v1` | the guest's uplink: `Attach` is held open while the guest runs | `feosd` (server), `feos-guest` (client) |
+| `feos.guest.v1` | what only a guest does for its host: `MountVolumes` ([guest.md](guest.md#volumes)) | `feos-guest` |
 | `feos.tool.v1` | an agent's file and web tools on a container's files: read, write, edit, ls, rg, fd, webfetch | `feos-guest` |
 | `feos.watch.v1` | inotify subscriptions on a container's files | `feos-guest` |
 | `feos.portforward.v1` | streams to ports inside the guest | `feos-guest` |
@@ -25,10 +27,11 @@ plane, and between `feosd` and `feos-guest`. They live in
 
 Decided, not built:
 
-- `feos.guest.v1.GuestService` takes `SetTime`, `GetTime`,
-  `SetNetworkConfig`, `GetNetworkConfig`, `FreezeFilesystem`,
-  `ThawFilesystem` and `PreparePause` out of `HostService`; only
-  `feos-guest` serves it ([ADR 0007](../adr/0007-guest.md)).
+- `feos.guest.v1.GuestService`, which has `MountVolumes`, takes
+  `SetTime`, `GetTime`, `SetNetworkConfig`, `GetNetworkConfig`,
+  `FreezeFilesystem`, `ThawFilesystem` and `PreparePause` out of
+  `HostService`; only `feos-guest` serves it
+  ([ADR 0007](../adr/0007-guest.md)).
 
 ## Listeners
 
@@ -36,7 +39,7 @@ On a node (`feosd`):
 
 | Listener | Services |
 |---|---|
-| `/run/feos/api.sock`, and TCP with `--tcp` | Pod, SecurityGroup, Traffic, Container, Host, Image; and a pod's Container, Image, Tool and Watch |
+| `/run/feos/api.sock`, and TCP with `--tcp` | Pod, Volume, SecurityGroup, Traffic, Container, Host, Image; and a pod's Container, Image, Tool and Watch |
 | `/run/feos/image.sock` | Image, internal |
 | `/run/feos/task.sock` | Task, internal, in the task service process |
 | `<vm dir>/v.sock_10001`, per VM | Lifecycle, for the guest's uplink |
@@ -45,7 +48,7 @@ In a pod (`feos-guest`):
 
 | Listener | Services |
 |---|---|
-| vsock port 10000, `/run/feos/api.sock` | Container, Host, Image, Tool, Watch, PortForward, Kube, SSH |
+| vsock port 10000, `/run/feos/api.sock` | Container, Host, Image, Tool, Watch, PortForward, Kube, SSH, Guest |
 | `/run/feos/image.sock`, `/run/feos/task.sock` | Image and Task, internal |
 
 The guest dials the host on vsock port 10001 (the uplink) and pipes

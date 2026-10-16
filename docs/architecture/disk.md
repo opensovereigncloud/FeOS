@@ -3,9 +3,11 @@ The Disk Daemon
 
 `diskd` serves pods' disks as block devices over a chunk store that it
 tiers to an object store, and restores pods' memory from the same chunks.
-Every pod has a disk from it, and hibernates into its object store. The
-decisions behind it: [ADR 0011](../adr/0011-disk-daemon.md),
-[ADR 0008](../adr/0008-suspend-and-restore.md).
+Every pod has a disk from it, and hibernates into its object store, and
+so does every volume. The decisions behind it:
+[ADR 0011](../adr/0011-disk-daemon.md),
+[ADR 0008](../adr/0008-suspend-and-restore.md),
+[ADR 0016](../adr/0016-volumes.md).
 
 ## Processes
 
@@ -65,10 +67,11 @@ top      a sparse file: what the pod wrote since
   and the seal returns its newest layer. `Bake(pod)` seals the frozen top
   of a running device into a layer on L0 and changes nothing about the
   pod.
-- `PutHead(pod, epoch, memory)` uploads the head of a checkpoint of a
-  sealed, stopped disk: its chain, how much of it is shared, its size,
-  and the memory the caller sealed and put beside it. It refuses a head
-  whose layers or vmstate are not in the bucket, and one that exists:
+- `PutHead(pod, epoch, memory, volume_heads)` uploads the head of a
+  checkpoint of a sealed, stopped disk: its chain, how much of it is
+  shared, its size, the memory the caller sealed and put beside it, and
+  the heads of the pod's volumes. It refuses a head whose layers,
+  vmstate or volumes' heads are not in the bucket, and one that exists:
   heads are never overwritten. `GetHead(key)` reads one.
 - `RemoveDevice` forgets a stopped pod.
 
@@ -112,41 +115,72 @@ Every pod has one disk (`crates/services/pod-service/src/disk.rs`):
 A pod from before pods had disks gets one at its next boot, in a new
 microVM.
 
+## The volumes' disks
+
+A volume (`feos.volume.v1`, [node.md](node.md#volumes)) is a disk of its
+own, `volume-<id>` in diskd and in the bucket
+(`crates/services/pod-service/src/disk.rs`):
+
+- **Its L0** is empty: one chunk of zeroes, from
+  `/var/lib/feos/volumes/empty-layer.img`, which `feosd` writes and has
+  diskd import the first time a volume needs it; the same layer on every
+  node. The disk is as large as the volume (`CreateDisk(volume-<id>,
+  [L0], size)`), and what lies beyond the L0 reads as zeroes.
+- **A boot** of a pod opens each of its volumes after its disk, in the
+  order of its spec: `OpenDisk(volume-<id>)` if diskd has it, else
+  `OpenDisk(volume-<id>, head)` for a checkpointed volume, else a blank
+  disk for a volume without its filesystem. A volume that has its
+  filesystem and whose disk diskd lost fails the boot. The microVM gets
+  the links as `volume0`, `volume1`, ... after `data`.
+- The disks stop with the microVM, as the pod's does, and stay when the
+  pod is deleted. `DeleteVolume` stops and removes the disk.
+
 ## Hibernation
 
 `HibernatePod` (`feos.pod.v1`) takes a pod off the node, under its lock:
 
 1. a running pod is suspended (`purge_guest`), its snapshot in its jail;
 2. `StopDisk`, `Seal(upload)`: the disk's chain is in the bucket;
-3. `SealFile(memory, upload)`, and `PutObject` of the vmstate to
+3. for each volume: `StopDisk(volume-<id>)`, `Seal(upload)`, `PutObject`
+   of its record, a `feos.volume.v1.Volume` with its size, labels and
+   whether it has its filesystem, to
+   `snapshots/volume-<id>/<epoch>/volume.pb`, and `PutHead(volume-<id>,
+   epoch)`; a volume that is checkpointed already keeps its head;
+4. `SealFile(memory, upload)`, and `PutObject` of the vmstate to
    `snapshots/<pod>/<epoch>/vmstate` and of the pod's spec, a
    `feos.pod.v1.PodSpec`, to `snapshots/<pod>/<epoch>/pod.pb`;
-4. `PutHead(pod, epoch, memory)`: the head, with what the snapshot pins
-   (from its `host.json`);
-5. the pod is `HIBERNATED`, with `PodInfo.checkpoint`; its microVM and
-   snapshot, its disk (`RemoveDevice`), its addresses and its TAP device
+5. `PutHead(pod, epoch, memory, volume_heads)`: the head, with what the
+   snapshot pins (from its `host.json`) and the volumes' heads;
+6. the pod is `HIBERNATED`, with `PodInfo.checkpoint`, and its volumes
+   are `CHECKPOINTED`, with theirs; its microVM and snapshot, its disk
+   and its volumes' (`RemoveDevice`), its addresses and its TAP device
    go. A `feosd` that starts with a hibernated pod removes what is left.
 
 The epoch is the seconds since 1970, or one more than the last
-checkpoint's. A stopped or failed pod skips step 1 and the memory.
+checkpoint's of the pod and of each of its volumes. A stopped or failed
+pod skips step 1 and the memory.
 
 `RestorePod(pod, head, cold)` brings it back; `ResumePod` of a hibernated
 pod is `RestorePod` with its own checkpoint:
 
 1. a node that does not have the pod reads the head (`GetHead`) and the
    spec (`GetObject`) and records the pod, hibernated;
-2. the disk the node has of the pod goes (`RemoveDevice`); the pod gets
+2. each volume's head and record are read; the restore fails before
+   anything changes if one is missing, or if the node has the volume
+   attached to another pod, or available, with data of its own;
+3. the disk the node has of the pod goes (`RemoveDevice`), and so do its
+   volumes', which are recorded as the checkpoint has them; the pod gets
    addresses and is `PENDING`, `restoring from <head>`;
-3. with memory in the head, an installed Firecracker of its version and
+4. with memory in the head, an installed Firecracker of its version and
    the same CPU model and kernel, and unless `cold`: `OpenDisk(pod, head)`,
-   `CreateVm`, `GetObject` of the vmstate, `OpenMemory` on
+   `OpenDisk(volume-<id>, head)` for each volume, `CreateVm`, `GetObject` of the vmstate, `OpenMemory` on
    `memory.sock` in the microVM's directory, and `ResumeVm` with
    `RemoteSnapshot`: Firecracker loads the vmstate with the `Uffd`
    backend, `/memory.sock` in its jail, and the guest runs; it is pushed
    the time and its network. The pod is `RUNNING` when the call returns;
-4. otherwise, or if step 3 fails before the guest ran, the pod boots anew
-   on the checkpoint's disk, in the background, and adopts its
-   containers.
+5. otherwise, or if step 4 fails before the guest ran, the pod boots anew
+   on the checkpoint's disk and volumes, in the background, and adopts
+   its containers.
 
 ## Directories
 
@@ -169,18 +203,21 @@ The state directory belongs on a filesystem of its own, preferably XFS.
 | `chunks/<hh>/<hash>.zst` | chunks, zstd |
 | `layers/<layer>.manifest` | layer manifests, uploaded after their chunks |
 | `snapshots/<pod>/<epoch>/head.json`, `…/vmstate`, `…/pod.pb` | a checkpoint: its head (`PutHead`), last; the caller's own objects (`PutObject`) |
+| `snapshots/volume-<id>/<epoch>/head.json`, `…/volume.pb` | a volume's part of its pod's checkpoint, before the pod's head |
 
 A head (`head.json`) names the disk's chain, L0 first, how many of its
 layers are shared (`shared_depth`; the rest, at most one, is the pod's
 own and the next seal replaces it), the disk's size and chunk size, the
-epoch, and, for a checkpoint with memory, the memory layer, the vmstate's
-key and what the snapshot pins: the Firecracker version, the CPU model and
-the host's kernel.
+epoch, for a checkpoint with memory the memory layer, the vmstate's key
+and what the snapshot pins: the Firecracker version, the CPU model and
+the host's kernel, and the keys of the heads of the pod's volumes
+(`volumes`, left out when there are none).
 
 `Sweep` deletes what the bucket holds that the live heads and layers it is
-given do not reach, and nothing younger than a day. The live heads are
-every pod's `checkpoint.head_key`, on every node: a pod reads from the
-checkpoint it came from until its next one. `feosd` sweeps nothing; the
+given do not reach, and nothing younger than a day; a live head keeps the
+heads of its volumes. The live heads are every pod's
+`checkpoint.head_key`, on every node: a pod reads from the checkpoint it
+came from until its next one; and every volume's, whose pod may be gone. `feosd` sweeps nothing; the
 control plane, which knows all pods, will.
 
 ## Development
@@ -200,7 +237,8 @@ of their own.
 `make test-pods` runs a diskd beside `feosd` in its container, with the
 node's `/dev`, and the pods' integration tests against it: disks across a
 stop, a start and a crash, and hibernation with and without memory, from
-an evicted cache. With S3 in the environment, or in
+an evicted cache; volumes across stops and pods, formatted once, mounted
+read-only, attached to one pod, and hibernated with their pod. With S3 in the environment, or in
 `~/.config/feos/diskd/s3.env` (`FEOS_S3_ENV`), it hibernates under a key
 prefix of its own and sweeps it at the end; without, the hibernation test
 skips.

@@ -29,6 +29,7 @@ pub mod host_tests;
 pub mod image_tests;
 pub mod pod_disk_tests;
 pub mod pod_tests;
+pub mod pod_volume_tests;
 
 pub const PUBLIC_SERVER_ADDRESS: &str = "http://[::1]:1337";
 /// The pods' prefix: a ULA, as in labs.

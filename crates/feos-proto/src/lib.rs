@@ -50,3 +50,7 @@ pub mod network_service {
 pub mod guest_service {
     tonic::include_proto!("feos.guest.v1");
 }
+/// The node's persistent volumes.
+pub mod volume_service {
+    tonic::include_proto!("feos.volume.v1");
+}

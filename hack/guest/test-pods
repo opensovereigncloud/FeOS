@@ -2,8 +2,9 @@
 # Run pods against Firecracker: the pod integration tests install the
 # guest and Firecracker as their packages would, and create, stop, start,
 # crash, suspend, resume, hibernate, restore and delete pods, on disks
-# from a diskd of their own. The image test pulls the guest from a local
-# registry.
+# from a diskd of their own, and their volumes. The image test pulls the
+# guest from a local registry; the volumes' containers pull their image
+# (TEST_CONTAINER_IMAGE_REF, busybox) from the internet.
 #
 #   hack/guest/test-pods [test name filter...]
 #
@@ -30,7 +31,7 @@ REGISTRY_PORT=5000
 TEST_IMAGE_REF="127.0.0.1:${REGISTRY_PORT}/feos/guest:test"
 RUNNER_IMAGE="debian:13"
 FILTERS=("$@")
-[ ${#FILTERS[@]} -gt 0 ] || FILTERS=(pod_tests pod_disk_tests image_tests::test_image_lifecycle)
+[ ${#FILTERS[@]} -gt 0 ] || FILTERS=(pod_tests pod_disk_tests pod_volume_tests image_tests::test_image_lifecycle)
 S3_ENV="${FEOS_S3_ENV:-${HOME}/.config/feos/diskd/s3.env}"
 
 log() { printf '[test-pods] %s\n' "$*"; }

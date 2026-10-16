@@ -55,8 +55,9 @@ pub(crate) async fn initialize_vm_service(db_url: &str) -> Result<VmApiHandler> 
     Ok(vm_api_handler)
 }
 
-/// The pods, on top of the VM service, their disks from diskd, and their
-/// network: its security groups and the records of its traffic.
+/// The pods, on top of the VM service, their disks from diskd, their
+/// volumes, and their network: its security groups and the records of its
+/// traffic.
 #[cfg(feature = "host")]
 pub(crate) async fn initialize_pod_service(
     vms: VmApiHandler,
@@ -64,6 +65,7 @@ pub(crate) async fn initialize_pod_service(
     diskd_socket: Option<std::path::PathBuf>,
 ) -> Result<(
     pod_service::Pods,
+    pod_service::Volumes,
     network_service::SecurityGroups,
     traffic_service::TrafficApi,
 )> {
@@ -81,9 +83,15 @@ pub(crate) async fn initialize_pod_service(
         "Main: The pods' disks come from diskd on {}",
         disks.socket().display()
     );
-    let pods = pod_service::Pods::new(vms, dir, network, disks).await?;
+    let volumes = pod_service::Volumes::open(pod_service::volumes::VOLUME_DIR, disks.clone())?;
+    let pods = pod_service::Pods::new(vms, dir, network, disks, volumes.clone()).await?;
     info!("Main: Pod Service is configured.");
-    Ok((pods, groups, traffic_service::TrafficApi::new(records)))
+    Ok((
+        pods,
+        volumes,
+        groups,
+        traffic_service::TrafficApi::new(records),
+    ))
 }
 
 pub(crate) async fn initialize_container_service(
