@@ -20,7 +20,9 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 PACKAGES_DIR="${REPO_ROOT}/target/packages"
 IMAGE="feos-test-packages"
-NAME="feos-test-packages"
+# A node of this run's own, so that runs side by side do not remove each
+# other's.
+NAME="feos-test-packages-$$"
 TIMEOUT=60
 
 log() { printf '[test-packages] %s\n' "$*"; }

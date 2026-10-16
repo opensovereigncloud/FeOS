@@ -34,12 +34,20 @@ FEOSCTL="${REPO_ROOT}/target/debug/feosctl"
 IMAGE="${1:-docker.io/library/busybox:1.36}"
 TIMEOUT=60
 
-NS=feos-guest-test
+# Names and a /30 of this run's own, so that runs side by side do not
+# remove each other's.
+NS=feos-guest-test-$$
 # This machine's end of the veth pair; the namespace's is "uplink".
-UPLINK=feos-gt0
-UPLINK_NET=192.168.102.0/30
-UPLINK_IP=192.168.102.1
-NS_UPLINK_IP=192.168.102.2
+UPLINK=feos-gt$$
+# A /30 of 192.168.102.0/24 that holds no address of this machine, looked
+# for from one that the pid picks.
+for i in $(seq 0 63); do
+  base=$(((i + $$) % 64 * 4))
+  ip -4 -o addr show | grep -q " 192\.168\.102\.$((base + 1))/" || break
+done
+UPLINK_NET=192.168.102.${base}/30
+UPLINK_IP=192.168.102.$((base + 1))
+NS_UPLINK_IP=192.168.102.$((base + 2))
 UPSTREAM_DNS=1.1.1.1
 # The TAP is a link of its own, as feosd sets a pod's up (ADR 0010): the
 # node is fe80::1 on it and answers ARP for 169.254.0.1, and the guest's
