@@ -1,0 +1,23 @@
+{
+  "name": "ferun-web",
+  "private": true,
+  "version": "0.1.0",
+  "description": "The management UI of FeRun (ferund), embedded into ferund's binary.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.8",
+    "vitest": "^2.1.9"
+  }
+}
