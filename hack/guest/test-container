@@ -118,12 +118,14 @@ node ip addr add "${NS_UPLINK_IP}/30" dev uplink
 node ip link set uplink up
 node ip route add default via "${UPLINK_IP}"
 node sysctl -qw net.ipv4.ip_forward=1
-# As feosd sets a pod's TAP up: no IPv4 address on it, ARP answered for
-# 169.254.0.1 alone, by proxy and at once, while the namespace's route
-# there leaves through the uplink.
+# As feosd sets a pod's TAP up: the resolver's address its one IPv4
+# address, which its ARP asks from, and ARP answered for 169.254.0.1 by
+# proxy and at once, while the namespace's route there leaves through the
+# uplink.
 node ip tuntap add dev "${TAP}" mode tap
 node sysctl -qw "net.ipv4.conf.${TAP}.arp_ignore=1" "net.ipv4.conf.${TAP}.arp_announce=2" \
   "net.ipv4.neigh.${TAP}.proxy_delay=0"
+node ip addr add "${DNS}/32" dev "${TAP}"
 node ip neigh add proxy "${NODE_IP}" dev "${TAP}"
 node ip -6 addr add fe80::1/64 dev "${TAP}" nodad
 node ip -6 addr add "${NODE_IP6}/128" dev "${TAP}" nodad

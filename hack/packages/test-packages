@@ -186,8 +186,8 @@ fi
 log "a pod pulled its image and runs; feosd forwards its services"
 
 # Both families: an address of the prefix and one of 169.254.16.0/20,
-# each routed to the pod's TAP device, which holds no IPv4 address; the
-# node answers ARP for the pod's gateway 169.254.0.1 by proxy.
+# each routed to the pod's TAP device, which holds the resolver's address
+# alone; the node answers ARP for the pod's gateway 169.254.0.1 by proxy.
 address="$(pod_address "${pod}")"
 pod_ipv4="$(pod_ipv4 "${pod}")"
 case "${address}" in fd00:fe05:1:*) ;; *) fail "pod ${pod} has the address ${address}" ;; esac
@@ -199,7 +199,8 @@ in_pod ip -6 addr show dev eth0 | contains -F "inet6 ${address}/128" || fail "th
 in_pod ip -4 route show default | contains -F "default via 169.254.0.1 dev eth0" ||
   fail "the pod's IPv4 gateway is not 169.254.0.1: $(in_pod ip -4 route)"
 tap=pod-22222222
-in_node ip -4 addr show dev "${tap}" | contains inet && fail "${tap} holds an IPv4 address"
+[ "$(in_node ip -4 -o addr show dev "${tap}" | awk '{print $4}')" = 169.254.0.53/32 ] ||
+  fail "${tap} holds other IPv4 addresses than 169.254.0.53/32: $(in_node ip -4 addr show dev "${tap}")"
 in_node ip neigh show proxy dev "${tap}" | contains -x "169.254.0.1 *proxy *" ||
   fail "no proxy ARP for 169.254.0.1 on ${tap}: $(in_node ip neigh show proxy)"
 in_node ip route show "${pod_ipv4}" | contains "dev ${tap}" || fail "${pod_ipv4} is not routed to ${tap}"
@@ -220,6 +221,18 @@ in_pod ping -c 1 -W 5 1.1.1.1 >/dev/null || fail "the pod does not reach 1.1.1.1
 in_pod wget -q -O - http://example.com/ | contains "Example Domain" ||
   fail "busybox wget does not reach http://example.com/ by name"
 log "the pod resolves through 169.254.0.53 and reaches the internet over IPv4"
+
+# The node's ARP for a pod asks from its TAP's address, also where the
+# node holds 169.254.169.254, as hosts with a metadata service of their
+# own do: the pod's answers to that address would go to the microVM's
+# MMDS, and the node would not reach the pod until the pod asked it.
+in_node ip addr add 169.254.169.254/32 dev lo
+in_node ip neigh flush dev "${tap}"
+dns="$(in_pod nslookup dns.google 2>&1 || true)"
+in_node ip addr del 169.254.169.254/32 dev lo
+contains -F "8.8.8.8" <<<"${dns}" ||
+  fail "no answer once the node had to ask for the pod with 169.254.169.254 on lo: ${dns}"
+log "the node's ARP for the pod asks from 169.254.0.53, not a metadata service's address"
 
 # A pod whose security groups the node does not have does not start.
 in_node feosctl pod create --pod-id "${server}" --memory 256 --security-group server \

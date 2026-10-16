@@ -300,9 +300,14 @@ the pod:
 
 - no router advertisements, no address autoconfiguration and no
   link-local address of the kernel's, set before it goes up;
-- no IPv4 address; ARP answered only for addresses on the device
-  (`arp_ignore` 1), which has none, and asked from the best address for
-  the target (`arp_announce` 2); forwarding on;
+- the resolver's address, `169.254.0.53/32`, its one IPv4 address; ARP
+  answered only for addresses on the device (`arp_ignore` 1), and asked
+  from that address (`arp_announce` 2); forwarding on. Without an address
+  of its own, the TAP's ARP for the pod would ask from any address of the
+  node, such as `169.254.169.254`, which some hosts hold on `lo` for a
+  metadata service of their own; the microVM's MMDS takes every ARP frame
+  for that address, the pod's answers too, and the node would lose the
+  pod's link whenever its neighbor entry for the pod lapsed;
 - `fe80::1/64` without duplicate address detection: the pod's IPv6
   gateway;
 - a proxy neighbor entry (`NTF_PROXY`) for `169.254.0.1`, the pod's IPv4

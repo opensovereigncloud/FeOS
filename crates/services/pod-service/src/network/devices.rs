@@ -239,15 +239,21 @@ pub struct PodLink {
     /// The pod's IPv4 gateway, which the node answers ARP for by proxy,
     /// without holding it.
     pub gateway4: Ipv4Addr,
+    /// The node's IPv4 address on it, the resolver's, which the node's ARP
+    /// for the pod asks from. Without it, the kernel asks from any address
+    /// of the node, such as `169.254.169.254` where a host holds it for a
+    /// metadata service of its own; the microVM's MMDS takes the guest's
+    /// answers to that address for its own, and the node never hears them.
+    pub node4: Ipv4Addr,
     pub ipv6: Ipv6Addr,
     pub ipv4: Ipv4Addr,
 }
 
 /// Makes the pod's TAP device a link of its own between the node and the
 /// pod (ADR 0010): without router advertisements or addresses of the
-/// kernel's, and without IPv4 addresses; the node is `gateway` on it and
-/// answers ARP for `gateway4` by proxy, at once, and for none of its own
-/// addresses; the pod's addresses are routed to it.
+/// kernel's, and with one IPv4 address, `node4` as a /32; the node is
+/// `gateway` on it and answers ARP for `gateway4` by proxy, at once; the
+/// pod's addresses are routed to it.
 pub async fn tap(handle: &Handle, name: &str, pod: &PodLink) -> io::Result<()> {
     // The jail hands a TAP device to the pod's user; one that is there
     // may be in use.
@@ -258,13 +264,16 @@ pub async fn tap(handle: &Handle, name: &str, pod: &PodLink) -> io::Result<()> {
     own_ipv6(name)?;
     pod_ipv4(name)?;
     up(handle, index, name).await?;
+    let node4 = IpAddr::V4(pod.node4);
     let ipv4 = addresses(handle, index)
         .await?
         .into_iter()
         .filter(|message| message.header.family == AddressFamily::Inet)
+        .filter(|message| (address_of(message), message.header.prefix_len) != (Some(node4), 32))
         .collect();
     remove_addresses(handle, name, ipv4).await?;
     add_address(handle, index, pod.gateway.into(), 64).await?;
+    add_address(handle, index, node4, 32).await?;
     route_to(handle, index, name, pod.ipv6.into()).await?;
     route_to(handle, index, name, pod.ipv4.into()).await?;
     handle
@@ -281,10 +290,9 @@ pub async fn tap(handle: &Handle, name: &str, pod: &PodLink) -> io::Result<()> {
 }
 
 /// IPv4 on a pod's TAP device, before it goes up: ARP answered only for
-/// the addresses on the device, of which it has none, and asked from the
-/// best address for the target; forwarding, without which proxy ARP is
-/// not answered; and proxy ARP answered at once rather than after a random
-/// delay of up to 0.8 s.
+/// the addresses on the device, and asked from its own address; forwarding,
+/// without which proxy ARP is not answered; and proxy ARP answered at once
+/// rather than after a random delay of up to 0.8 s.
 fn pod_ipv4(name: &str) -> io::Result<()> {
     for (setting, value) in [
         ("arp_ignore", "1"),
@@ -373,6 +381,7 @@ mod tests {
     const POD: PodLink = PodLink {
         gateway: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
         gateway4: Ipv4Addr::new(169, 254, 0, 1),
+        node4: Ipv4Addr::new(169, 254, 0, 53),
         ipv6: Ipv6Addr::new(0xfd00, 0xfe05, 1, 0, 0, 0, 0, 2),
         ipv4: Ipv4Addr::new(169, 254, 16, 1),
     };
@@ -624,8 +633,8 @@ mod tests {
         }
         assert_eq!(
             addresses_on(&handle, tap).await,
-            [(IpAddr::V6(POD.gateway), 64)],
-            "fe80::1 alone, no IPv4"
+            [(IpAddr::V4(POD.node4), 32), (IpAddr::V6(POD.gateway), 64)],
+            "fe80::1 and the node's IPv4 /32 alone"
         );
         assert_eq!(
             routes_to(&handle, tap).await,

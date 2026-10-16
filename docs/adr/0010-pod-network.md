@@ -81,6 +81,11 @@ from node to node would need a route per pod, changed with every move.
   `fe80::1` on every TAP, and answers ARP for `169.254.0.1` on it by
   proxy, without holding the address: some clouds' gateways are
   `169.254.0.1`, and a node there would lose its own.
+- The node holds the resolver's address, `169.254.0.53`, on every TAP as
+  a /32, and its ARP for a pod asks from it. Without an address on the
+  TAP, the kernel takes any of the node's, and `169.254.169.254`, which
+  some hosts hold for their own metadata service, would send the pod's
+  answers to the microVM's MMDS instead of the node.
 - A packet from a TAP whose source address is not routed back out that
   TAP is dropped: one reverse path rule (`fib`) pins every pod to its
   addresses, in both families.

@@ -569,6 +569,7 @@ impl Network {
         let link = PodLink {
             gateway: GATEWAY,
             gateway4: GATEWAY4,
+            node4: self.config.dns_address,
             ipv6,
             ipv4,
         };
