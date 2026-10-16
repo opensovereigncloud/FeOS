@@ -2,24 +2,28 @@ The Guest
 =========
 
 What runs inside a pod's microVM. The decisions behind it:
-[ADR 0007](../adr/0007-guest.md). The guest is `feos-guest`, `crates/feos`
-built with the `guest` feature.
+[ADR 0007](../adr/0007-guest.md), [ADR 0016](../adr/0016-volumes.md)
+(volumes). The guest is `feos-guest`, `crates/feos` built with the
+`guest` feature.
 
 ## Boot
 
 The guest is a kernel and an initramfs. The kernel starts from
 Firecracker's minimal microVM config: virtio-mmio devices, balloon and
-vsock, IPv6 and IPv4, no modules. The initramfs holds the guest as `/init` and
-a static uutils coreutils, the toolbox for containers. Kernel, Firecracker
-and coreutils downloads are pinned by sha256 (`hack/guest/`).
+vsock, IPv6 and IPv4, no modules. The initramfs holds the guest as `/init`,
+`/sbin/mke2fs`, which formats the pod's new volumes, static from
+e2fsprogs built with musl, and a static uutils coreutils, the toolbox for
+containers. Kernel, Firecracker, e2fsprogs and coreutils downloads are
+pinned by sha256 (`hack/guest/`).
 
 As PID 1 the guest:
 
 1. moves its root off the initramfs and mounts `/proc`, `/sys`, `/dev`,
    `/dev/pts`, `/run`, a tmpfs at `/var/lib/feos` and the cgroup
    filesystem;
-2. mounts the data volume, the virtio disk that is not the root, at
-   `/var/lib/feos`, if the VM has one;
+2. mounts the data volume, the first virtio disk in the order of the
+   microVM's drives that is not the root, at `/var/lib/feos`, if the VM
+   has one;
 3. sets `vm.overcommit_memory` to 1, so that software that reserves more
    address space than it touches starts in a small VM;
 4. takes Ctrl-Alt-Del over: a SIGINT makes it sync and reboot;
@@ -62,6 +66,38 @@ addresses of both families, programs take IPv6, since the pod's IPv4
 address is link-local; IPv4 literals and programs that speak only IPv4
 leave over IPv4.
 
+## Volumes
+
+The pod's volumes are virtio disks after the data volume, in the order
+of the pod's spec. `feosd` calls `GuestService.MountVolumes`
+(`crates/feos/src/volumes.rs`, `feos_utils::filesystem::volume`) once the
+guest attached and before it creates the containers, with each volume's
+name, ID, drive, size and whether it is new. For each, the guest:
+
+1. orders its virtio disks by the start of their MMIO windows, from
+   `/proc/iomem` for the platform device under
+   `/sys/block/vd*/device`, or else by their virtio devices' indexes, and
+   takes the drive's disk; Firecracker answers no drive's ID;
+2. checks that the disk has the volume's size;
+3. reads its first 68 KiB: an ext4 superblock, valid, its checksum
+   included, whose mount time or count say whether it was ever mounted,
+   or another filesystem's signature, a partition table, zeroes or other
+   data;
+4. formats it with `mke2fs -t ext4 -b 4096 -m 0 -U <volume ID> -E
+   lazy_itable_init=1,lazy_journal_init=1,nodiscard` only if the host
+   says it is new and it holds no filesystem that was mounted; a
+   filesystem that was mounted and is the volume's own, by its UUID, is
+   mounted as it is; anything else fails the volume;
+5. without the host saying it is new, mounts only the volume's own
+   filesystem: a blank disk or another UUID fails it;
+6. mounts it at `/run/feos/volumes/<name>`, ext4 with `noinit_itable`,
+   `nosuid` and `nodev`.
+
+A volume that fails is an answer, with its reason; the others are
+mounted all the same. A call for a volume that is mounted already checks
+it and leaves it. `mke2fs` runs as a child of PID 1, which the reaper
+reaps.
+
 ## Listeners and vsock ports
 
 | Port or path | What |
@@ -79,6 +115,7 @@ leave over IPv4.
 | `/var/lib/feos/images/` | pulled images, a `metadata.json` each |
 | `/var/lib/feos/containers/` | containers, a `container.json` and the writable layer each |
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
+| `/run/feos/volumes/<name>` | the pod's volumes, mounted |
 | `/run/feos/containers/` | the runtime's state of running containers |
 | `/run/feos/share/` | what every container sees read-only at `/run/feos` |
 | `/usr/lib/feos-tools/` | the toolbox |
@@ -91,6 +128,10 @@ leave over IPv4.
   share directory read-only at `/run/feos`: the pushed resolvers
   (`/run/feos/resolv.conf`) and, while SSH bindings exist, the SSH agent
   socket (`/run/feos/ssh-agent.sock`).
+- A container's volume mounts (`ContainerConfig.volume_mounts`) are bind
+  mounts of `/run/feos/volumes/<name>`, read-write or read-only,
+  `nosuid` and `nodev`, after FeOS's own. A create, and an adoption,
+  fails while a volume it mounts is not mounted.
 - A container's hostname is its ID.
 - The task service runs containers with libcontainer and is the subreaper
   of their processes. Exec joins a container's namespaces from the task

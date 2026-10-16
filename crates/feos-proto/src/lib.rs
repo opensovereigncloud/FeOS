@@ -46,3 +46,7 @@ pub mod disk_service {
 pub mod network_service {
     tonic::include_proto!("feos.network.v1");
 }
+/// What only a guest does: feosd's calls into feos-guest.
+pub mod guest_service {
+    tonic::include_proto!("feos.guest.v1");
+}

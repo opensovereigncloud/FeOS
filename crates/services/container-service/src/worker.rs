@@ -165,6 +165,12 @@ pub async fn create_container(
             "image_ref is required".to_string(),
         ));
     }
+    // The volumes it mounts are mounted, before its image is pulled.
+    let mounts = config.volume_mounts.clone();
+    tokio::task::spawn_blocking(move || bundle::volume_mounts(&mounts))
+        .await
+        .map_err(|e| ContainerServiceError::Adapter(format!("task: {e}")))?
+        .map_err(ContainerServiceError::InvalidState)?;
 
     // The record claims the ID while the image is pulled.
     let mut record = ContainerRecord {
@@ -183,9 +189,11 @@ pub async fn create_container(
         let image_dir = image_dir(record.image_uuid);
         let id = container_id.clone();
         let (command, env) = (config.command.clone(), config.env.clone());
+        let mounts = config.volume_mounts.clone();
         blocking(move || {
             let process = bundle::process(&image_dir, &command, &env)?;
-            let spec = bundle::runtime_spec(&id, &process);
+            let volumes = bundle::volume_mounts(&mounts)?;
+            let spec = bundle::runtime_spec(&id, &process, &volumes);
             bundle::provision(&id, &image_dir, &spec, false)
         })
         .await?;
@@ -228,6 +236,9 @@ async fn adopt_container(
         merged.command = config.command.clone();
     }
     merged.env.extend(config.env.clone());
+    if !config.volume_mounts.is_empty() {
+        merged.volume_mounts = config.volume_mounts.clone();
+    }
     if merged.image_ref.is_empty() {
         return Err(ContainerServiceError::InvalidArgument(format!(
             "no image known for container {container_id}; set config.image_ref"
@@ -237,6 +248,7 @@ async fn adopt_container(
     let image_uuid = pull_image(&merged.image_ref).await?;
     let image_dir = image_dir(image_uuid);
     let id = container_id.clone();
+    let mounts = merged.volume_mounts.clone();
     let resolver_error = blocking(move || {
         // The spec it ran with: its command and environment, with the
         // request's on top.
@@ -262,7 +274,8 @@ async fn adopt_container(
             }
             None => bundle::process(&image_dir, &config.command, &config.env)?,
         };
-        let spec = bundle::runtime_spec(&id, &process);
+        let volumes = bundle::volume_mounts(&mounts)?;
+        let spec = bundle::runtime_spec(&id, &process, &volumes);
         bundle::provision(&id, &image_dir, &spec, true)
     })
     .await?;

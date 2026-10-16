@@ -165,6 +165,7 @@ async fn create_container(
         image_ref,
         command: cmd,
         env: env.into_iter().collect(),
+        ..Default::default()
     };
 
     let request = CreateContainerRequest {

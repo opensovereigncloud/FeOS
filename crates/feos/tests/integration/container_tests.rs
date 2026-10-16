@@ -53,7 +53,7 @@ async fn test_create_and_start_container() -> Result<()> {
     let container_config = ContainerConfig {
         image_ref: image_ref.clone(),
         command: vec!["sleep".to_string(), "300".to_string()],
-        env: Default::default(),
+        ..Default::default()
     };
 
     let create_req = CreateContainerRequest {

@@ -64,7 +64,9 @@ Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
   guest`): PID 1 in a microVM whose host configures it. Its API listens on
   vsock port 10000, not on TCP, and once it is ready it dials the host
   (vsock port 10001) and holds a `LifecycleService.Attach` call open. A data
-  volume, if the microVM has one, holds images and containers. It also serves
+  volume, if the microVM has one, holds images and containers; the pod's
+  volumes are mounted for its containers, and a new one is formatted with
+  the guest's static `mke2fs` ([ADR 0016](adr/0016-volumes.md)). It also serves
   the tool, watch, port forward, kube and SSH services for the agent in its
   containers. None of the node's code or dependencies are in this binary.
 - **`feos-host-init`** (`crates/feos-host-init`): PID 1 when FeOS is the
@@ -94,7 +96,8 @@ useful for development.
 ## Building, linting, testing
 
 You need the toolchain from `rust-toolchain.toml` (rustup installs it on first
-use) and `protoc`.
+use) and `protoc`; for the guest also `musl-gcc` and the kernel's headers
+(Debian: `musl-tools`, `linux-libc-dev`), which build its `mke2fs`.
 
     make clippy          # lint feosd's and feos-guest's features, -D warnings
     make fmt-check

@@ -45,9 +45,12 @@ The guest kernel (`hack/guest/kernel`) starts from Firecracker's minimal
 microVM config with FeOS's changes on top: virtio-mmio devices, balloon and
 vsock, IPv6 and IPv4, no modules, no RTC sync. `make guest-kernel-config`
 regenerates it. The initramfs (`hack/guest/rootfs/mk-rootfs`) holds
-feos-guest as `/init` and a static uutils coreutils that containers
-get as a toolbox. Kernel, Firecracker and coreutils downloads are pinned by
-sha256. Builds run natively, without the build container and without root.
+feos-guest as `/init`, `mke2fs` for the pods' new volumes, built from
+e2fsprogs with `musl-gcc` and the kernel's headers (Debian: `musl-tools`,
+`linux-libc-dev`), and a static uutils coreutils that containers get as a
+toolbox. Kernel, Firecracker, e2fsprogs and coreutils downloads are pinned
+by sha256. Builds run natively, without the build container and without
+root.
 
 `make test-guest` attaches a data volume, which FeOS mounts at
 /var/lib/feos, and checks the vsock API, the clock, filesystem freezing and

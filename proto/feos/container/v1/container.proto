@@ -60,6 +60,20 @@ message ContainerConfig {
   repeated string command = 2;
   // Optional environment variables to set inside the container.
   map<string, string> env = 3;
+  // Volumes of the pod (ADR 0016) that the guest mounted, bind-mounted
+  // into the container. A create fails while one of them is not mounted.
+  repeated VolumeMount volume_mounts = 4;
+}
+
+// A volume in a container.
+message VolumeMount {
+  // The volume's name in its pod, as the guest mounted it
+  // (feos.guest.v1.GuestService.MountVolumes).
+  string volume = 1;
+  // Where the container sees it: an absolute path other than "/".
+  string path = 2;
+  // The container cannot write to it.
+  bool read_only = 3;
 }
 
 message CreateContainerRequest {

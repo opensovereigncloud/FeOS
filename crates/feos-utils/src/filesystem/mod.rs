@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod data_volume;
+pub mod disks;
 mod fsmount;
 mod mount;
 mod r#move;
+pub mod volume;
 
 pub use data_volume::mount_data_volume;
 

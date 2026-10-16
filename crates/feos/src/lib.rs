@@ -7,6 +7,8 @@ pub mod cgroup;
 mod guest;
 mod setup;
 mod task_supervisor;
+#[cfg(feature = "guest")]
+mod volumes;
 
 use anyhow::{Context, Result};
 use container_service::api::ContainerApiHandler;

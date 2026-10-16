@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! The data volume of a guest: the virtio disk that does not hold the root
-//! filesystem. In a microVM booted from an initramfs it is the only disk.
-//! Images and container state live on it, so they survive pause and resume.
+//! The data volume of a guest: the first virtio disk, in the order of the
+//! microVM's drives, that does not hold the root filesystem. In a microVM
+//! booted from an initramfs it is the first drive, the pod's disk; the
+//! pod's volumes follow it (ADR 0016). Images and container state live on
+//! it, so they survive pause and resume.
 
+use super::disks::virtio_disks;
 use log::{info, warn};
 use nix::mount::{mount, MsFlags};
-use std::path::Path;
 use std::time::Duration;
 
 /// virtio-blk probes asynchronously: the disk can appear after PID 1 starts.
@@ -50,18 +52,18 @@ pub fn mount_data_volume(target: &str) -> Option<String> {
     }
 }
 
-/// The first virtio disk (vda, vdb, vdc) that does not back the root mount.
+/// The first virtio disk, in the order of the microVM's drives, that does
+/// not back the root mount.
 fn find_data_device() -> Option<String> {
     let root_disk = root_major_minor().and_then(|majmin| {
         std::fs::read_link(format!("/sys/dev/block/{majmin}"))
             .ok()
             .and_then(|target| target.file_name().map(|n| n.to_string_lossy().into_owned()))
     });
-    ["vda", "vdb", "vdc"]
+    virtio_disks()
         .into_iter()
-        .filter(|disk| root_disk.as_deref() != Some(disk))
-        .map(|disk| format!("/dev/{disk}"))
-        .find(|path| Path::new(path).exists())
+        .find(|disk| root_disk.as_deref() != Some(disk.name.as_str()))
+        .map(|disk| disk.path())
 }
 
 /// major:minor of the device mounted at /, from /proc/self/mountinfo.

@@ -1406,6 +1406,7 @@ async fn run_container(
             image_ref: container.image_ref.clone(),
             command: container.command.clone(),
             env: container.env.clone(),
+            ..Default::default()
         }),
         container_id: Some(container_id.clone()),
         // Without a container to adopt, a plain create.

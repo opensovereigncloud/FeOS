@@ -8,6 +8,8 @@
 //! LifecycleService call open: that call is how the host learns that the
 //! guest is ready, and its end tells the host that the guest is gone.
 
+use crate::volumes::GuestApi;
+use feos_proto::guest_service::guest_service_server::GuestServiceServer;
 use feos_proto::kube_service::kube_service_server::KubeServiceServer;
 use feos_proto::lifecycle_service::lifecycle_service_client::LifecycleServiceClient;
 use feos_proto::lifecycle_service::{hello, Hello};
@@ -45,9 +47,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(1);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The services only the guest serves: what an agent in a container uses.
-/// One instance serves every listener, so that state they keep (watches,
-/// listeners) is the guest's, whichever transport a call came in on.
+/// The services only the guest serves: what an agent in a container uses,
+/// and what the host asks of the guest. One instance serves every
+/// listener, so that state they keep (watches, listeners) is the guest's,
+/// whichever transport a call came in on.
 #[derive(Clone)]
 pub(crate) struct GuestServices {
     tool: ToolServiceServer<ToolApiHandler>,
@@ -58,6 +61,8 @@ pub(crate) struct GuestServices {
     forward: PortForwardServiceServer<PortForwardApiHandler>,
     // The guest's one SSH agent socket.
     ssh: SshServiceServer<SshApiHandler>,
+    // What only a guest does for its host: the pod's volumes.
+    guest: GuestServiceServer<GuestApi>,
 }
 
 impl GuestServices {
@@ -70,6 +75,7 @@ impl GuestServices {
             kube: KubeServiceServer::new(kube),
             forward: PortForwardServiceServer::new(forward),
             ssh: SshServiceServer::new(SshApiHandler::default()),
+            guest: GuestServiceServer::new(GuestApi::default()),
         }
     }
 
@@ -80,6 +86,7 @@ impl GuestServices {
             .add_service(self.kube.clone())
             .add_service(self.forward.clone())
             .add_service(self.ssh.clone())
+            .add_service(self.guest.clone())
     }
 }
 

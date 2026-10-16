@@ -22,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_dir}/feos/ssh/v1/ssh.proto"),
                 format!("{proto_dir}/feos/disk/v1/disk.proto"),
                 format!("{proto_dir}/feos/network/v1/network.proto"),
+                format!("{proto_dir}/feos/guest/v1/guest.proto"),
             ],
             &[proto_dir],
         )?;

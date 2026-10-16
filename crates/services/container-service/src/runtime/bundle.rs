@@ -14,9 +14,11 @@
 //!
 //! Every container sees the FeOS toolbox read-only at /feos-tools and the
 //! share directory read-only at /run/feos; its /etc/resolv.conf links to
-//! the resolvers in the share directory (feos_utils::resolver).
+//! the resolvers in the share directory (feos_utils::resolver). The pod's
+//! volumes it mounts are bind mounts of where the guest mounted them.
 
-use feos_utils::filesystem::CONTAINERS_DIR;
+use feos_proto::container_service::VolumeMount;
+use feos_utils::filesystem::{volume, CONTAINERS_DIR};
 use feos_utils::resolver;
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use serde_json::{json, Value};
@@ -114,11 +116,52 @@ pub fn process(
     })
 }
 
-/// The OCI runtime spec. No network namespace: containers share the
-/// host's network.
-pub fn runtime_spec(id: &str, process: &Process) -> Value {
+/// The mounts of the pod's volumes into a container (ADR 0016): bind
+/// mounts of the directories the guest mounted them at, read-only where the
+/// container says so, without devices and setuid. A volume that is not
+/// mounted is an error: the container would write into memory.
+pub fn volume_mounts(mounts: &[VolumeMount]) -> Result<Vec<Value>, String> {
+    volume_mounts_in(Path::new(volume::VOLUMES_DIR), mounts)
+}
+
+fn volume_mounts_in(dir: &Path, mounts: &[VolumeMount]) -> Result<Vec<Value>, String> {
+    let mut paths = std::collections::HashSet::new();
+    mounts
+        .iter()
+        .map(|mount| {
+            if !volume::valid_name(&mount.volume) {
+                return Err(format!("invalid volume name {:?}", mount.volume));
+            }
+            if !volume::valid_mount_path(&mount.path) {
+                return Err(format!(
+                    "volume {} cannot be mounted at {:?}: an absolute path other than \"/\"",
+                    mount.volume, mount.path
+                ));
+            }
+            if !paths.insert(mount.path.as_str()) {
+                return Err(format!("two volumes are mounted at {}", mount.path));
+            }
+            let source = dir.join(&mount.volume);
+            if !volume::is_mount_point(&source) {
+                return Err(format!("volume {} is not mounted", mount.volume));
+            }
+            let access = if mount.read_only { "ro" } else { "rw" };
+            Ok(json!({
+                "destination": mount.path,
+                "type": "bind",
+                "source": source,
+                "options": ["bind", access, "nosuid", "nodev"],
+            }))
+        })
+        .collect()
+}
+
+/// The OCI runtime spec, with the volumes' mounts from [`volume_mounts`]
+/// after FeOS's own. No network namespace: containers share the host's
+/// network.
+pub fn runtime_spec(id: &str, process: &Process, volumes: &[Value]) -> Value {
     let namespace = |kind: &str| json!({ "type": kind });
-    json!({
+    let mut spec = json!({
         "ociVersion": "1.0.2",
         "process": {
             "terminal": false,
@@ -155,7 +198,11 @@ pub fn runtime_spec(id: &str, process: &Process) -> Value {
                 "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"
             ],
         },
-    })
+    });
+    if let Some(mounts) = spec["mounts"].as_array_mut() {
+        mounts.extend(volumes.iter().cloned());
+    }
+    spec
 }
 
 /// The process of an existing bundle: an adopted container keeps the
@@ -352,6 +399,51 @@ mod tests {
             ]
         );
         assert_eq!(p.cwd, "/");
+    }
+
+    #[test]
+    fn volumes_are_bind_mounted_once_they_are_mounted() {
+        let mount = |volume: &str, path: &str, read_only: bool| VolumeMount {
+            volume: volume.to_string(),
+            path: path.to_string(),
+            read_only,
+        };
+        // /proc and /sys stand for volumes the guest mounted.
+        let root = Path::new("/");
+        let mounts = volume_mounts_in(
+            root,
+            &[mount("proc", "/data", false), mount("sys", "/ro", true)],
+        )
+        .unwrap();
+        assert_eq!(
+            mounts[0],
+            json!({"destination": "/data", "type": "bind", "source": "/proc",
+                   "options": ["bind", "rw", "nosuid", "nodev"]})
+        );
+        assert_eq!(mounts[1]["options"][1], "ro");
+
+        let process = Process {
+            args: vec!["sh".to_string()],
+            env: vec![],
+            cwd: "/".to_string(),
+        };
+        let spec = runtime_spec("c", &process, &mounts);
+        let all = spec["mounts"].as_array().unwrap();
+        assert_eq!(all[all.len() - 2..], mounts[..]);
+
+        // A volume the guest did not mount would be memory.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("db")).unwrap();
+        let error = volume_mounts_in(dir.path(), &[mount("db", "/data", false)]).unwrap_err();
+        assert!(error.contains("not mounted"), "{error}");
+        for bad in [
+            vec![mount("db", "/", false)],
+            vec![mount("db", "data", false)],
+            vec![mount("../db", "/data", false)],
+            vec![mount("proc", "/data", false), mount("sys", "/data", true)],
+        ] {
+            assert!(volume_mounts_in(root, &bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
