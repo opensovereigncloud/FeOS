@@ -11,7 +11,9 @@ Hard rules:
 - **Static musl.** Binaries build for `x86_64-unknown-linux-musl`, statically
   linked. Check new binaries with `file`.
 - **Syscalls first**, through `nix` (or `libc` where nix lacks a wrapper). No
-  shelling out to userspace tools, no glibc-specific behaviour.
+  shelling out to userspace tools, no glibc-specific behaviour. The one
+  exception: `mke2fs` in the guest, to format a new volume (ADR 0016);
+  nothing else.
 - **PID 1 must not die.** No panics on the PID 1 path; return errors, log,
   keep serving.
 - **Both feature sets must build.** `make clippy` lints `feosd`'s features

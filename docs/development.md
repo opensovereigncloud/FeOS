@@ -137,7 +137,9 @@ push. Their modules say how to run them, with `--ignored`.
 - **Syscalls first.** Talk to the kernel through syscalls, using
   [`nix`](https://docs.rs/nix) (or `libc` where nix has no wrapper). Do not
   shell out to userspace tools such as `ip` or `mount`, and do not depend on
-  glibc-specific behaviour.
+  glibc-specific behaviour. The one exception: the guest runs its static
+  `mke2fs` to format a new volume ([ADR 0016](adr/0016-volumes.md));
+  nothing else runs a tool, and nothing else runs `mke2fs`.
 - **PID 1 must not die.** When PID 1 exits, the kernel panics. Code on the
   PID 1 path returns errors instead of panicking, and `main` idles rather
   than exit. It must keep working when filesystems are read-only.

@@ -75,6 +75,9 @@ builds on.
   node, and a hibernation that fails leaves it so; what it uploaded is
   garbage for the sweep. A stopped or failed pod hibernates its disk
   alone.
+- The pod's volumes (ADR 0016) go with it: each is sealed and uploaded
+  beside the disk, with a head of its own before the pod's, which names
+  them. They leave the node with the pod's disk.
 - The guest's filesystem is not frozen. A restore with memory brings the
   memory and the disk back together; a boot on the disk alone sees it as
   after a power cut at the snapshot, synced a moment before, which ext4's
@@ -89,7 +92,9 @@ builds on.
 - `RestorePod` takes a checkpoint's head. A node that does not have the
   pod records it from the checkpoint's spec; one that has a disk of the
   pod drops it for the checkpoint's. The pod gets the node's addresses,
-  which the guest is pushed after the restore.
+  which the guest is pushed after the restore. Its volumes come from the
+  checkpoint too; a restore whose volumes another pod on the node holds
+  is refused before anything changes (ADR 0016).
 - Whether the memory is restored is decided before anything starts, from
   what the snapshot pins: the Firecracker that wrote it must be installed,
   on the same CPU model and kernel. Then the disk daemon serves the memory

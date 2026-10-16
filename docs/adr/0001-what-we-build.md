@@ -100,8 +100,8 @@ CaaS needs what the sandboxes ruled out for themselves:
   stands in front of services is open: load balancers for HTTPS with
   ACME and for L4, and the way in for IPv4 clients.
 - **What a service's pod needs** beyond ADR 0004 (restarts, health
-  checks, jobs, credentials): persistent volumes and images from private
-  registries (the sandboxes pull public images only).
+  checks, jobs, credentials): images from private registries (the
+  sandboxes pull public images only). Persistent volumes are ADR 0016's.
 
 For both products:
 

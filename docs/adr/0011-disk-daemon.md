@@ -89,7 +89,8 @@ meanwhile. `feosd` does not bake yet.
   without a disk, no disk of another kind. A disk is a capability of every
   pod, like its memory, so the pod's spec has no field for it. `feosd`
   reaches diskd on its socket; while diskd cannot be reached, pods do not
-  come up.
+  come up. A pod's volumes (ADR 0016) are disks of diskd's too, beside
+  its disk, with lives of their own.
 - A disk starts from a blank data volume, an ext4 filesystem that comes
   with the guest, which mounts it at `/var/lib/feos`: the guest's images,
   its containers and what they write live there. The volume is built with
@@ -170,13 +171,16 @@ builds in XFS, for the state directory's filesystem.
   for that.
 - **mkfs on the node**, by `feosd` or the guest: a tool to shell out to, or
   an ext4 writer of our own. A blank volume built with the guest is the
-  same file everywhere.
+  same file everywhere. The guest runs `mke2fs` for volumes now
+  (ADR 0016); the pods' disks keep the blank volume, whose chunks every
+  pod shares, and no pod waits for a mkfs.
 - **The blank volume uncompressed in the package**: dpkg writes holes as
   zeroes, 8 GiB per guest version.
 - **A disk size per pod**, by a blank volume per size or by growing the
   filesystem online in the guest (`EXT4_IOC_RESIZE_FS`). Possible later;
   the kernel zeroes the inode tables of what it grows, 1.6 % of it,
-  written into the top.
+  written into the top. With `mke2fs` in the guest (ADR 0016), a disk of
+  the pod's size could also start empty and be formatted there.
 - **Devices that stay started** while their pod is stopped or suspended,
   as the sandbox system's did: 128 MiB locked per pod that runs nothing.
 - **feosd linking the chunk store** instead of a daemon of its own: a
@@ -208,7 +212,8 @@ builds in XFS, for the state directory's filesystem.
 
 - Where baking happens: in a tenant's pod, or in a pod of its own with a
   neutral configuration, so that no tenant's state lands in a shared layer.
-- A disk size per pod, and how the guest grows its filesystem to it.
+- A disk size per pod: a filesystem the guest grows, or one it formats
+  with `mke2fs`, as it does volumes (ADR 0016).
 - Where diskd keeps its state on a node whose operating system is FeOS: in
   the tmpfs, every pod's top is in memory, and diskd has no object store's
   credentials there.
