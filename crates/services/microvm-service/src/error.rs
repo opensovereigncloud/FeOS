@@ -27,7 +27,17 @@ pub enum VmServiceError {
 
 impl From<VmServiceError> for Status {
     fn from(err: VmServiceError) -> Self {
-        log::error!("VmServiceError: {err}");
+        // A VM that is not there is an answer: the pods' service asks
+        // before it creates one.
+        if matches!(
+            err,
+            VmServiceError::Vmm(crate::vmm::VmmError::VmNotFound(_))
+                | VmServiceError::Persistence(PersistenceError::Database(sqlx::Error::RowNotFound))
+        ) {
+            log::debug!("VmServiceError: {err}");
+        } else {
+            log::error!("VmServiceError: {err}");
+        }
         match err {
             VmServiceError::Vmm(vmm_err) => vmm_err.into(),
             VmServiceError::Persistence(PersistenceError::Database(ref e))
