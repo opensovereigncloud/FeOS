@@ -177,8 +177,10 @@ node_stage() {
   "${feosctl}" host version-info
   "${feosctl}" pod list >/dev/null || fail "the pods' service does not answer"
 
-  # The node's network, as host-init and feosd log it. Host-init logs its
-  # uplink's addresses once DHCPv6 is through, which QEMU does not serve.
+  # The node's network and clock, as host-init and feosd log them.
+  # Host-init logs its uplink's addresses once DHCPv6 is through, which QEMU
+  # does not serve, and sets the clock by pool.ntp.org over IPv4, as QEMU
+  # names no NTP server.
   local check
   for check in \
     'feos-host-init .* is setting the machine up' \
@@ -189,7 +191,8 @@ node_stage() {
     "The pods' prefix, from the kernel's command line: ${POD_PREFIX}" \
     'Started diskd \(pid' \
     'Started feosd \(pid' \
-    "Network: Pods get addresses of ${POD_PREFIX%/*}/${POD_PREFIX#*/} and 169\.254\.16\.0/20, DNS at 169\.254\.0\.53"; do
+    "Network: Pods get addresses of ${POD_PREFIX%/*}/${POD_PREFIX#*/} and 169\.254\.16\.0/20, DNS at 169\.254\.0\.53" \
+    'TimeSyncWorker: System clock updated'; do
     wait_for_line "${serial}" "${check}" 60 || {
       tail -60 "${serial}" | tr -d '\r'
       fail "not in the node's log: ${check}"
@@ -208,7 +211,7 @@ node_stage() {
       fail "in the node's log: ${check}"
     fi
   done
-  log "the node runs, with IPv4 by DHCPv4 and IPv6, and the pods' network"
+  log "the node runs, with IPv4 by DHCPv4 and IPv6, its clock, and the pods' network"
 
   [ "${PODS:-0}" = 1 ] || return 0
   local pod info

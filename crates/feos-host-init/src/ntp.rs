@@ -4,17 +4,30 @@
 use chrono::{DateTime, Local, TimeZone};
 use log::{error, info, warn};
 use sntpc::{NtpContext, StdTimestampGen};
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const FALLBACK_NTP_SERVER: &str = "pool.ntp.org";
 const SYNC_INTERVAL: Duration = Duration::from_secs(86400); // 24 Hours
 const RETRY_INTERVAL: Duration = Duration::from_secs(300); // 5 Minutes
 const NTP_PORT: u16 = 123;
+/// How long a server has to answer.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The NTP servers of the DHCPv4 lease, which comes and changes on its own
+/// schedule: each sync takes those it names then.
+static DHCPV4_SERVERS: Mutex<Vec<Ipv4Addr>> = Mutex::new(Vec::new());
+
+/// The NTP servers DHCPv4 named.
+pub fn set_ipv4_servers(servers: &[Ipv4Addr]) {
+    *DHCPV4_SERVERS.lock().unwrap_or_else(|e| e.into_inner()) = servers.to_vec();
+}
 
 pub struct TimeSyncWorker {
+    /// Those DHCPv6 named.
     ntp_servers: Vec<Ipv6Addr>,
 }
 
@@ -50,15 +63,20 @@ impl TimeSyncWorker {
     }
 
     async fn synchronize_time(&self) -> Result<(), String> {
-        let socket = UdpSocket::bind("[::]:0")
-            .await
-            .map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
+        let dhcpv4 = DHCPV4_SERVERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let servers = self
+            .ntp_servers
+            .iter()
+            .map(|ip| (IpAddr::V6(*ip), "DHCPv6"))
+            .chain(dhcpv4.into_iter().map(|ip| (IpAddr::V4(ip), "DHCPv4")));
+        for (server_ip, source) in servers {
+            info!("TimeSyncWorker: Attempting sync with {source} server: {server_ip}");
+            let target = SocketAddr::from((server_ip, NTP_PORT));
 
-        for server_ip in &self.ntp_servers {
-            info!("TimeSyncWorker: Attempting sync with DHCPv6 server: {server_ip}");
-            let target = SocketAddr::from((*server_ip, NTP_PORT));
-
-            match self.query_ntp_server(&socket, target, server_ip).await {
+            match self.query_ntp_server(target).await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     warn!("TimeSyncWorker: Failed to sync with {server_ip}: {e}");
@@ -68,52 +86,52 @@ impl TimeSyncWorker {
 
         info!("TimeSyncWorker: Attempting sync with fallback server: {FALLBACK_NTP_SERVER}");
 
-        match self.resolve_and_sync(&socket, FALLBACK_NTP_SERVER).await {
+        match self.resolve_and_sync(FALLBACK_NTP_SERVER).await {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("Failed to sync with fallback server: {e}")),
         }
     }
 
-    async fn resolve_and_sync(&self, socket: &UdpSocket, hostname: &str) -> Result<(), String> {
+    async fn resolve_and_sync(&self, hostname: &str) -> Result<(), String> {
         use tokio::net::lookup_host;
 
         let server_with_port = format!("{hostname}:{NTP_PORT}");
-        let mut addrs = lookup_host(&server_with_port)
+        let mut addrs: Vec<SocketAddr> = lookup_host(&server_with_port)
             .await
-            .map_err(|e| format!("Failed to resolve {hostname}: {e}"))?;
+            .map_err(|e| format!("Failed to resolve {hostname}: {e}"))?
+            .collect();
+        // IPv6 first; a node without it, or without a route, takes IPv4.
+        addrs.sort_by_key(SocketAddr::is_ipv4);
+        info!("TimeSyncWorker: Resolved {hostname} to {addrs:?}");
 
-        let target = addrs
-            .find(|addr| addr.is_ipv6())
-            .or_else(|| {
-                warn!("TimeSyncWorker: No IPv6 address found for {hostname}, trying IPv4");
-                None
-            })
-            .ok_or_else(|| format!("No suitable address found for {hostname}"))?;
-
-        info!("TimeSyncWorker: Resolved {hostname} to {target}");
-
-        let server_ip = match target.ip() {
-            std::net::IpAddr::V6(ip) => ip,
-            std::net::IpAddr::V4(_) => {
-                return Err(format!(
-                    "Only IPv6 addresses are supported, got IPv4 for {hostname}"
-                ));
+        let mut failure = format!("No address found for {hostname}");
+        for target in addrs {
+            match self.query_ntp_server(target).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!("TimeSyncWorker: Failed to sync with {target}: {e}");
+                    failure = e;
+                }
             }
-        };
-
-        self.query_ntp_server(socket, target, &server_ip).await
+        }
+        Err(failure)
     }
 
-    async fn query_ntp_server(
-        &self,
-        socket: &UdpSocket,
-        target: SocketAddr,
-        server_ip: &Ipv6Addr,
-    ) -> Result<(), String> {
+    async fn query_ntp_server(&self, target: SocketAddr) -> Result<(), String> {
+        // Of the server's family: sntpc wants the answer from the address it
+        // asked, which a socket of both families would give as IPv6.
+        let local = match target {
+            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        };
+        let socket = UdpSocket::bind(local)
+            .await
+            .map_err(|e| format!("Failed to bind UDP socket: {e}"))?;
         let context = NtpContext::new(StdTimestampGen::default());
 
-        let result = sntpc::get_time(target, socket, context)
+        let result = timeout(QUERY_TIMEOUT, sntpc::get_time(target, &socket, context))
             .await
+            .map_err(|_| format!("No answer within {}s", QUERY_TIMEOUT.as_secs()))?
             .map_err(|e| format!("NTP query failed: {e:?}"))?;
 
         let seconds = result.sec();
@@ -133,7 +151,7 @@ impl TimeSyncWorker {
             server_time.format("%Y-%m-%d %H:%M:%S%.6f"),
             offset_sec,
             delay_sec,
-            server_ip,
+            target.ip(),
             result.stratum()
         );
 

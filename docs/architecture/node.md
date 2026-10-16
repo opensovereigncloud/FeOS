@@ -41,15 +41,17 @@ filesystem, configures SR-IOV VFs, and configures the uplink `eth0`:
   gets 30 seconds: an address, a delegated prefix, resolvers and NTP
   servers.
 - **IPv4** from DHCPv4: the lease's address and prefix, a default route by
-  its router (on the link if outside the prefix), and resolvers. The
-  client renews the lease at T1 and rebinds at T2 for as long as the node
-  runs, and asks again, without end, where no server answers or a lease
-  ends.
+  its router (on the link if outside the prefix), resolvers and NTP
+  servers. The client renews the lease at T1 and rebinds at T2 for as
+  long as the node runs, and asks again, without end, where no server
+  answers or a lease ends.
 
 The resolvers DHCPv4 and DHCPv6 name, of both families in turn, replace
 `/etc/resolv.conf`; until one names any, the initramfs's stay (Google's
 and Cloudflare's). It keeps the clock with NTP from the servers DHCPv6
-names. It takes Ctrl-Alt-Del over (a SIGINT makes it
+names, then those DHCPv4 names, then `pool.ntp.org` by IPv6, else by
+IPv4, each given five seconds to answer.
+It takes Ctrl-Alt-Del over (a SIGINT makes it
 sync and reboot), reboots on `SIGRTMIN+5` and powers off on `SIGRTMIN+4`,
 reaps orphans, runs `/usr/sbin/diskd --state-dir /var/lib/feos/disk`
 without an object store, and `/usr/sbin/feosd --self-upgrade --tcp [::]:1337`,

@@ -3,8 +3,9 @@
 
 //! The node's IPv4 (ADR 0010): a DHCPv4 client (RFC 2131) on the uplink.
 //! It takes a lease, puts its address, its default route and its resolvers
-//! on the node, and keeps the lease while the node runs. A node without
-//! DHCPv4 goes on without IPv4, and the client keeps asking.
+//! on the node, hands its NTP servers to the clock's worker, and keeps the
+//! lease while the node runs. A node without DHCPv4 goes on without IPv4,
+//! and the client keeps asking.
 
 use super::resolv;
 use dhcproto::v4::{DhcpOption, Flags, Message, MessageType, Opcode, OptionCode};
@@ -46,6 +47,7 @@ pub struct Lease {
     pub prefix_len: u8,
     pub router: Option<Ipv4Addr>,
     pub dns: Vec<Ipv4Addr>,
+    pub ntp: Vec<Ipv4Addr>,
     pub server: Ipv4Addr,
     /// The lease's time, its renewal (T1) and rebinding (T2) times, from
     /// the moment it was granted; none for a lease without end.
@@ -89,6 +91,10 @@ impl Lease {
             Some(DhcpOption::DomainNameServer(servers)) => servers.clone(),
             _ => Vec::new(),
         };
+        let ntp = match opts.get(OptionCode::NtpServers) {
+            Some(DhcpOption::NtpServers(servers)) => servers.clone(),
+            _ => Vec::new(),
+        };
         let seconds = |code| match opts.get(code) {
             Some(DhcpOption::AddressLeaseTime(s))
             | Some(DhcpOption::Renewal(s))
@@ -109,6 +115,7 @@ impl Lease {
             prefix_len,
             router,
             dns,
+            ntp,
             server,
             times,
         })
@@ -225,6 +232,7 @@ fn message(kind: MessageType, xid: u32, mac: &[u8], ciaddr: Ipv4Addr, broadcast:
         OptionCode::SubnetMask,
         OptionCode::Router,
         OptionCode::DomainNameServer,
+        OptionCode::NtpServers,
         OptionCode::AddressLeaseTime,
         OptionCode::Renewal,
         OptionCode::Rebinding,
@@ -422,6 +430,7 @@ async fn apply(handle: &Handle, interface: &str, index: u32, old: Option<&Lease>
         warn!("DHCPv4: Failed to route by {router} on {interface}: {e}");
     }
     resolv::set_ipv4(&new.dns);
+    crate::ntp::set_ipv4_servers(&new.ntp);
     let until = match new.times {
         Some(times) => format!("for {}s", times.end.as_secs()),
         None => "without end".to_string(),
@@ -524,6 +533,7 @@ mod tests {
             DhcpOption::SubnetMask(Ipv4Addr::new(255, 255, 255, 0)),
             DhcpOption::Router(vec![Ipv4Addr::new(10, 0, 2, 2)]),
             DhcpOption::DomainNameServer(vec![Ipv4Addr::new(10, 0, 2, 3)]),
+            DhcpOption::NtpServers(vec![Ipv4Addr::new(10, 0, 2, 4)]),
             DhcpOption::AddressLeaseTime(86400),
         ]))
         .unwrap();
@@ -534,6 +544,7 @@ mod tests {
                 prefix_len: 24,
                 router: Some(Ipv4Addr::new(10, 0, 2, 2)),
                 dns: vec![Ipv4Addr::new(10, 0, 2, 3)],
+                ntp: vec![Ipv4Addr::new(10, 0, 2, 4)],
                 server: Ipv4Addr::new(10, 0, 2, 2),
                 times: Some(Times {
                     renew: Duration::from_secs(43200),
