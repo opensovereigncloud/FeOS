@@ -132,7 +132,7 @@ from node to node would need a route per pod, changed with every move.
   that allows the internet says which addresses that is.
 - `--deny-prefix` lists prefixes of either family that no pod reaches,
   whatever a group says: a cloud's metadata service, the control plane,
-  Valkey, management networks. The node's own addresses and link-local,
+  its database, management networks. The node's own addresses and link-local,
   loopback and multicast addresses of both families are denied always.
   Other pods' IPv4 addresses are among them: pods reach each other over
   IPv6 alone.

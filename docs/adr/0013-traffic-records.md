@@ -56,9 +56,9 @@ ECH configuration of its own is not seen.
 
 ### Where records go
 
-- `feosd` publishes records in batches on a stream of its node in Valkey
-  (ADR 0006). While it cannot reach Valkey, it buffers them, bounded;
-  what overflows is dropped and counted.
+- `feosd` publishes records in batches on its uplink to the control plane
+  (ADR 0015). While it cannot reach the control plane, it buffers them,
+  bounded; what overflows is dropped and counted.
 - Records name the pod. The control plane joins them to tenants, stores
   them, and decides how long they are kept and who sees them.
 

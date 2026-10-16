@@ -52,10 +52,10 @@ pods on every other node.
 - The control plane owns the groups and knows their members: the pods in
   each group, at the addresses that `feosd` reports.
 - It sends a node the groups of the node's pods, and every group that
-  their rules name as a peer, through `feos.network.v1` over Valkey
-  (ADR 0006). A group comes whole, with its rules, members and version,
-  or as a delta from one version to the next: the members added and
-  removed.
+  their rules name as a peer, through `feos.network.v1` on the node's
+  connection (ADR 0015). A group comes whole, with its rules, members and
+  version, or as a delta from one version to the next: the members added
+  and removed.
 - `feosd` refuses a delta that does not start at the version it has; the
   control plane then sends the group whole. `feosd` keeps its groups on
   disk, so that a restart loses none.

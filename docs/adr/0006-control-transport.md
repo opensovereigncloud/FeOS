@@ -1,6 +1,6 @@
 # ADR 0006: The control plane's calls travel through Valkey
 
-**Status:** Proposed · **Date:** 2026-10-14
+**Status:** Superseded by [ADR 0015](0015-control-plane.md) · **Date:** 2026-10-14
 
 ## Context
 

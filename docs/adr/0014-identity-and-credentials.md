@@ -133,7 +133,7 @@ where there is one, is FeID.
   start. Its certificate signing request goes to the control plane,
   which issues a short-lived certificate. The private key never exists
   outside the process that signs with it: not on a disk, not in
-  `feosd`, not in Valkey and not in the control plane.
+  `feosd` and not in the control plane.
 - It renews the certificate at three quarters of its lifetime. An issuer
   that cannot be reached is retried; until the certificate expires, the
   old one serves. After that, the signer refuses, loudly.
@@ -149,9 +149,9 @@ where there is one, is FeID.
   not name is gone.
 - At start, `feos-authn` makes a second key pair, for HPKE (RFC 9180),
   and its public half goes out in the certificate signing request. The
-  control plane seals the bindings to it. `feosd` and Valkey relay
-  ciphertext. Only the pod's own process can open them, and it keeps
-  them in memory only.
+  control plane seals the bindings to it. `feosd` relays ciphertext.
+  Only the pod's own process can open them, and it keeps them in memory
+  only.
 - `feosctl` does the same for a node without a control plane: it asks
   `feosd` for the process's public key and seals the bindings itself.
 - A new run has a new key, so the control plane seals again after every
@@ -261,7 +261,7 @@ where there is one, is FeID.
 - **Bindings over Valkey in plaintext, or pushed directly from the
   control plane to the node**, as the sandbox system did. The first
   shows them to everything that reads the bus. The second needs a
-  listener on the node (ADR 0006 has none), and the plaintext would
+  listener on the node (ADR 0015 has none), and the plaintext would
   still pass through `feosd`.
 - **Audit records to `feosd` only, without a file.** No signature is
   given before its record is written, so every restart of `feosd` would
@@ -323,10 +323,8 @@ where there is one, is FeID.
 
 ## Open questions
 
-- The node's own identity and its attestation: a join token first, the
-  node's TPM later. Until then, that a signing request comes from pod X
-  on node N rests on Valkey's ACLs (ADR 0006). With it, `feosd` could
-  authenticate to Valkey and the control plane by mTLS, too.
+- Attestation of the node at its join: the node's TPM. ADR 0015 gives
+  the node its identity from a join token.
 - The trust domain and the layout of the IDs: tenant and workload, and
   what a sandbox is called.
 - Python and TypeScript. An OpenSSL provider that delegates to the

@@ -55,12 +55,13 @@ FeOS is everything that runs on a node: `feosd`, `feos-guest`,
 what joins them on the node (a disk daemon, `feos-authn`). FeOS's APIs
 speak of pods, containers and images, not of sandboxes or services.
 
-### The control plane is one or two central services
+### The control plane is one central service
 
 Tenants, tokens, the registry of sandboxes and services, placement, the
 policies that pause, hibernate and scale to zero, and the front doors (a
-REST API, MCP, HTTP to the ports of pods) run centrally, in one or two
-services. They reach nodes only through Valkey.
+REST API, MCP, HTTP to the ports of pods) run centrally, in one service,
+replicated (ADR 0015). It reaches nodes only over the connections the
+nodes open to it.
 
 ### One repository
 
@@ -107,8 +108,6 @@ For both products:
 
 - **Suspend tiers.** When a suspended pod stays on its node and when it
   goes to object storage: this shapes the cost as much as the formats do.
-- **The split of the control plane** into one or two services: whether the
-  front doors run apart from the registry and placement.
 
 ## Alternatives considered
 

@@ -4,8 +4,8 @@ FeOS Overview
 This repository builds two products on one platform: **agent sandboxes**
 and a **container as a service** (CaaS). **FeOS** is everything that runs on
 the nodes: it runs serverless pods, microVMs with containers in them that
-cost no memory while idle and are back in under a second. One or two
-central services, the **control plane**, orchestrate the nodes for both
+cost no memory while idle and are back in under a second. A replicated
+central service, the **control plane**, orchestrates the nodes for both
 products. Node and control plane are coupled through their APIs, so they
 live in one repository.
 
@@ -51,10 +51,10 @@ Both products run on one unit: the **pod**, a Firecracker microVM that runs
      clients: agents (MCP), apps (REST), users (HTTP to their ports)
                                   │
   ┌───────────────────────────────┴───────────────────────────────┐
-  │ control plane: one or two central services                    │
+  │ control plane: FeRun, ferund in replicas                      │
   │ tenants, registry, placement, idle policies, front doors      │
   └───────────────────────────────┬───────────────────────────────┘
-                                  │ feos.* APIs, carried by Valkey
+                                  │ feos.* APIs over mTLS
                                   │ (the node connects out)
   ┌───────────────────────────────┴───────────────────────────────┐
   │ node, FeOS                                                    │
@@ -70,7 +70,7 @@ Both products run on one unit: the **pod**, a Firecracker microVM that runs
 
 | Program | Runs | Does |
 |---|---|---|
-| `feosd` | on every node, under systemd or `feos-host-init` | runs pods: Firecracker in its jailer, snapshots, the pods' network, each pod's `feos-authn`; serves the local API and takes the control plane's calls from Valkey |
+| `feosd` | on every node, under systemd or `feos-host-init` | runs pods: Firecracker in its jailer, snapshots, the pods' network, each pod's `feos-authn`; serves the local API and the control plane's calls on the connections it opens to it |
 | `feos-guest` | as PID 1 in every pod | runs the pod's containers with libcontainer, serves the guest's API to `feosd` over vsock; its time and network are pushed |
 | `feos-host-init` | as PID 1 when FeOS is the node's operating system | sets the machine up and keeps `feosd` running; otherwise the node runs Debian or Garden Linux |
 | `feosctl` | anywhere | the command-line client |
@@ -82,23 +82,25 @@ process beside each pod that holds its identity and credentials
 
 ### The control plane
 
-One or two central services hold what is more than one node's business:
-tenants and their tokens, the registry of sandboxes and services, placement
-on nodes, the policies that pause, hibernate and scale to zero, and the
-front doors: a REST API, MCP for agents, and HTTP to the ports of pods.
-They reach nodes only through Valkey: a command stream per node, response
-streams, events and node telemetry.
+One program, `ferund`, FeRun's daemon, in replicas over one database,
+holds what is more than one node's business: tenants and their tokens,
+the registry of sandboxes and services, placement on nodes, the policies
+that pause, hibernate and scale to zero, and the front doors: a REST API,
+MCP for agents, and HTTP to the ports of pods. It reaches nodes only over
+the connections the nodes open to it, mTLS both ways: it calls the node's
+API on one, the node reports telemetry and events on the other
+(ADR 0015).
 
 ### The contract
 
 The `feos.*` gRPC APIs (`proto/feos/<api>/v1/`) are the contract between
 the layers. `feosctl` and tests call them on the node's Unix socket; the
-control plane calls the same APIs with Valkey as the transport. The
-guest's API is internal between `feosd` and `feos-guest`.
+control plane calls the same APIs on the connection the node opens to it.
+The guest's API is internal between `feosd` and `feos-guest`.
 
 ## Principles
 
-- **Nodes open no port for control.** They connect out to Valkey.
+- **Nodes open no port for control.** They connect out to the control plane.
 - **No credential enters a pod.** What a workload may use, `feos-authn` on
   the host adds or signs with: its keys and tokens, and its own identity.
 - **Pods outlive their node agent.** A restart or an upgrade of `feosd`
@@ -123,12 +125,12 @@ guest's API is internal between `feosd` and `feos-guest`.
 | Part | State |
 |---|---|
 | `feos-guest` | runs containers, tools, watches, port forwarding and credential offloading in a Firecracker guest |
-| `feosd` | runs pods (`feos.pod.v1`): a microVM in Firecracker's jailer and its containers, with snapshots, the balloon and the guest's uplink, and their persistent volumes (`feos.volume.v1`, ADR 0016), under systemd or `feos-host-init`; forwards a pod's container, image, tool and watch calls to its guest; gives every pod its network (ADR 0010): an IPv6 address of the node's prefix and a link-local IPv4 address on a routed TAP device, with proxy ARP for the IPv4 gateway and masquerade for leaving over IPv4, DNS from its own resolver; enforces security groups with nftables (ADR 0012) and records flows, drops, DNS queries and server names (ADR 0013), served as `feos.network.v1`. Credentials and proxies are not built; groups and records do not reach Valkey yet |
+| `feosd` | runs pods (`feos.pod.v1`): a microVM in Firecracker's jailer and its containers, with snapshots, the balloon and the guest's uplink, and their persistent volumes (`feos.volume.v1`, ADR 0016), under systemd or `feos-host-init`; forwards a pod's container, image, tool and watch calls to its guest; gives every pod its network (ADR 0010): an IPv6 address of the node's prefix and a link-local IPv4 address on a routed TAP device, with proxy ARP for the IPv4 gateway and masquerade for leaving over IPv4, DNS from its own resolver; enforces security groups with nftables (ADR 0012) and records flows, drops, DNS queries and server names (ADR 0013), served as `feos.network.v1`. Credentials and proxies are not built; groups and records do not reach the control plane yet |
 | `feos-host-init` | sets the machine up as PID 1 and runs `feosd` |
 | `diskd` | the disk daemon (ADR 0011): ublk devices over sealed layers, a local cache and S3. Every pod has a disk from it, and hibernates into its object store: `HibernatePod` and `RestorePod`, here or on another node, with the pod's memory served lazily where the snapshot fits the node, and a boot on its disk where it does not (ADR 0008). Packaged beside `feosd`; no baked images, no sweep yet |
 | packages | `.deb` packages of `feosd`, `feosctl`, `diskd`, Firecracker and the guest, in a signed apt repository at apt.fecode.dev |
-| Valkey bridge | proposed, not built |
-| control plane, node-side manager | in Go, still in the sandbox system's repository; the manager is being ported into `feosd` |
+| control plane connections | proposed (ADR 0015), not built |
+| control plane, node-side manager | in Go, still in the sandbox system's repository; the manager is being ported into `feosd`, the control plane becomes FeRun's `ferund` (ADR 0015) |
 | CaaS | not started; its open questions are in ADR 0001 |
 
 ## Glossary

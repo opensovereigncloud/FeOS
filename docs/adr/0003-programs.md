@@ -98,7 +98,7 @@ and the pods keep running.
 - **The order of the port.** Suggested, each step usable on its own, the
   Go manager doing what has not moved yet:
   1. pods on top of the microVM layer (ADR 0004), done;
-  2. the Valkey transport, events and telemetry (ADR 0006);
+  2. the control plane's connections, events and telemetry (ADR 0015);
   3. network isolation and the guest's DNS (ADR 0010);
   4. `feos-authn`, with Kubernetes, SSH and mTLS (ADR 0014), and port
      forwarding;
