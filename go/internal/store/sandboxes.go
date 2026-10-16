@@ -1,0 +1,677 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/model"
+)
+
+// Sandbox is a row of sandboxes: every column, Go-typed. A sandbox's row
+// exists exactly while the sandbox exists.
+type Sandbox struct {
+	ID          uuid.UUID // = the pod's ID on feosd
+	Incarnation uuid.UUID // the pod label ferun.incarnation
+	Owner       string    // the tenant
+	Image       string    // as the client gave it
+	ImageRef    string    // resolved repo@sha256:..., fixed at the first materialisation
+	VCPUs       int
+	MemoryMiB   int
+
+	ClientState       string // model.State*
+	StatusDescription string
+	Node              string // "" = NULL: no node
+	Materialised      bool   // a pod of this incarnation was seen on Node
+	LostFrom          string // "" = NULL
+	AvoidNodes        []string
+
+	Op          string    // "" when no op is in flight
+	OpID        uuid.UUID // uuid.Nil when no op is in flight
+	OpOwner     string
+	OpDeadline  time.Time
+	OpTarget    string
+	OpFromState string
+
+	Gen int64 // +1 on every lifecycle write
+
+	CheckpointEpoch  int64
+	CheckpointHead   string
+	CheckpointMemory bool
+	CheckpointAt     time.Time
+	CheckpointStore  string
+
+	PendingSince     time.Time
+	UnreachableSince time.Time
+	RunID            string
+	KubeVersion      string
+	SSHVersion       string
+
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	LastActiveAt time.Time
+	PausedAt     time.Time
+}
+
+// HasCheckpoint reports whether the sandbox has a checkpoint to restore.
+func (s *Sandbox) HasCheckpoint() bool { return s.CheckpointHead != "" }
+
+// sandboxColumns lists the columns of sandboxes in the order scanSandbox
+// reads them, each prefixed with p and a dot when p is not empty.
+func sandboxColumns(p string) string {
+	cols := []string{"id", "incarnation", "owner", "image", "image_ref", "vcpus", "memory_mib",
+		"client_state", "status_description", "node", "materialised", "lost_from", "avoid_nodes",
+		"op", "op_id", "op_owner", "op_deadline", "op_target", "op_from_state", "gen",
+		"checkpoint_epoch", "checkpoint_head", "checkpoint_memory", "checkpoint_at", "checkpoint_store",
+		"pending_since", "unreachable_since", "run_id", "kube_version", "ssh_version",
+		"created_at", "updated_at", "last_active_at", "paused_at"}
+	if p != "" {
+		for i, c := range cols {
+			cols[i] = p + "." + c
+		}
+	}
+	return strings.Join(cols, ", ")
+}
+
+var sandboxCols = sandboxColumns("")
+
+func scanSandbox(row pgx.Row) (Sandbox, error) {
+	var s Sandbox
+	var node, lostFrom *string
+	var opID *uuid.UUID
+	var opDeadline, cpAt, pendingSince, unreachableSince, pausedAt *time.Time
+	err := row.Scan(&s.ID, &s.Incarnation, &s.Owner, &s.Image, &s.ImageRef, &s.VCPUs, &s.MemoryMiB,
+		&s.ClientState, &s.StatusDescription, &node, &s.Materialised, &lostFrom, &s.AvoidNodes,
+		&s.Op, &opID, &s.OpOwner, &opDeadline, &s.OpTarget, &s.OpFromState, &s.Gen,
+		&s.CheckpointEpoch, &s.CheckpointHead, &s.CheckpointMemory, &cpAt, &s.CheckpointStore,
+		&pendingSince, &unreachableSince, &s.RunID, &s.KubeVersion, &s.SSHVersion,
+		&s.CreatedAt, &s.UpdatedAt, &s.LastActiveAt, &pausedAt)
+	if err != nil {
+		return Sandbox{}, err
+	}
+	s.Node, s.LostFrom, s.OpID = stringOf(node), stringOf(lostFrom), uuidOf(opID)
+	s.OpDeadline, s.CheckpointAt, s.PendingSince = timeOf(opDeadline), timeOf(cpAt), timeOf(pendingSince)
+	s.UnreachableSince, s.PausedAt = timeOf(unreachableSince), timeOf(pausedAt)
+	s.AvoidNodes = nonNil(s.AvoidNodes)
+	return s, nil
+}
+
+func collectSandboxes(rows pgx.Rows, err error) ([]Sandbox, error) {
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Sandbox, error) { return scanSandbox(r) })
+}
+
+// RowLock is the lock a read takes on the rows it returns.
+type RowLock string
+
+const (
+	NoLock         RowLock = ""
+	ForUpdate      RowLock = "FOR UPDATE"
+	ForNoKeyUpdate RowLock = "FOR NO KEY UPDATE"
+	ForShare       RowLock = "FOR SHARE"
+)
+
+// GetSandbox reads a sandbox without a lock; model.ErrNotFound if it does
+// not exist.
+func (s *Store) GetSandbox(ctx context.Context, id uuid.UUID) (Sandbox, error) {
+	return s.LockSandbox(ctx, id, NoLock)
+}
+
+// LockSandbox reads a sandbox and locks its row with lock (inside a
+// transaction); model.ErrNotFound if it does not exist.
+func (s *Store) LockSandbox(ctx context.Context, id uuid.UUID, lock RowLock) (Sandbox, error) {
+	sb, err := scanSandbox(s.q.QueryRow(ctx, "SELECT "+sandboxCols+" FROM sandboxes WHERE id = $1 "+string(lock), id))
+	if err != nil {
+		return Sandbox{}, noRow(err, model.ErrNotFound)
+	}
+	return sb, nil
+}
+
+// NewSandbox is what a create request sets; every other column takes its
+// default (a new incarnation, client_state pending).
+type NewSandbox struct {
+	ID        uuid.UUID
+	Owner     string
+	Image     string
+	VCPUs     int
+	MemoryMiB int
+}
+
+// CreateSandbox inserts the sandbox unless its ID exists. It returns the
+// new row and true, or the existing row (of whatever owner) and false. An
+// insert sends ferun_sandbox.
+func (s *Store) CreateSandbox(ctx context.Context, n NewSandbox) (Sandbox, bool, error) {
+	for range 3 {
+		sb, err := scanSandbox(s.q.QueryRow(ctx, `INSERT INTO sandboxes (id, owner, image, vcpus, memory_mib)
+			VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING RETURNING `+sandboxCols,
+			n.ID, n.Owner, n.Image, n.VCPUs, n.MemoryMiB))
+		if err == nil {
+			return sb, true, s.Notify(ctx, chanSandbox, sb.ID.String())
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return Sandbox{}, false, err
+		}
+		sb, err = s.GetSandbox(ctx, n.ID)
+		if err == nil {
+			return sb, false, nil
+		}
+		if !errors.Is(err, model.ErrNotFound) {
+			return Sandbox{}, false, err
+		}
+		// Deleted between the insert and the read: insert again.
+	}
+	return Sandbox{}, false, fmt.Errorf("create sandbox %s: the id keeps being deleted and re-created", n.ID)
+}
+
+// DeleteSandbox removes the row (its tokens, holds, watches, bindings and
+// booking cascade) and sends ferun_sandbox. It reports whether a row was
+// there.
+func (s *Store) DeleteSandbox(ctx context.Context, id uuid.UUID) (bool, error) {
+	tag, err := s.q.Exec(ctx, "DELETE FROM sandboxes WHERE id = $1", id)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	return true, s.Notify(ctx, chanSandbox, id.String())
+}
+
+// ListSandboxes returns the sandboxes of owner, or every sandbox when owner
+// is "", ordered by created_at and id.
+func (s *Store) ListSandboxes(ctx context.Context, owner string) ([]Sandbox, error) {
+	if owner == "" {
+		return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+" FROM sandboxes ORDER BY created_at, id"))
+	}
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+" FROM sandboxes WHERE owner = $1 ORDER BY created_at, id", owner))
+}
+
+// LockSandboxesOfOwner locks up to limit sandboxes of owner, ordered by id:
+// a batch of a tenant's deletion.
+func (s *Store) LockSandboxesOfOwner(ctx context.Context, owner string, limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+" FROM sandboxes WHERE owner = $1 ORDER BY id LIMIT $2 FOR UPDATE",
+		owner, limit))
+}
+
+// CountSandboxesOfOwner counts a tenant's sandboxes.
+func (s *Store) CountSandboxesOfOwner(ctx context.Context, owner string) (int64, error) {
+	var n int64
+	err := s.q.QueryRow(ctx, "SELECT count(*) FROM sandboxes WHERE owner = $1", owner).Scan(&n)
+	return n, err
+}
+
+// SandboxesOfNode returns the sandboxes whose node or lost_from is node:
+// the snapshot an inventory reconcile starts from.
+func (s *Store) SandboxesOfNode(ctx context.Context, node string) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+" FROM sandboxes WHERE node = $1 OR lost_from = $1 ORDER BY id", node))
+}
+
+// CountSandboxesOnNode counts the sandboxes whose node is node.
+func (s *Store) CountSandboxesOnNode(ctx context.Context, node string) (int64, error) {
+	var n int64
+	err := s.q.QueryRow(ctx, "SELECT count(*) FROM sandboxes WHERE node = $1", node).Scan(&n)
+	return n, err
+}
+
+// SandboxStateCounts counts the sandboxes of every node by client_state:
+// node → state → count.
+func (s *Store) SandboxStateCounts(ctx context.Context) (map[string]map[string]int64, error) {
+	rows, err := s.q.Query(ctx, "SELECT node, client_state, count(*) FROM sandboxes WHERE node IS NOT NULL GROUP BY node, client_state")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]map[string]int64{}
+	var node, state string
+	var n int64
+	_, err = pgx.ForEachRow(rows, []any{&node, &state, &n}, func() error {
+		if out[node] == nil {
+			out[node] = map[string]int64{}
+		}
+		out[node][state] = n
+		return nil
+	})
+	return out, err
+}
+
+// SteadyPod is a sandbox the registry holds as RUNNING or SUSPENDED on a
+// node: running or paused, without an op.
+type SteadyPod struct {
+	ID    uuid.UUID
+	State string // model.StateRunning or model.StatePaused
+}
+
+// SteadyPods returns the steady sandboxes of node ordered by ID (the
+// lowercase hyphenated form sorts the same): the lines of the registry's
+// inventory hash.
+func (s *Store) SteadyPods(ctx context.Context, node string) ([]SteadyPod, error) {
+	rows, err := s.q.Query(ctx, `SELECT id, client_state FROM sandboxes
+		WHERE node = $1 AND op = '' AND client_state IN ('running', 'paused') ORDER BY id`, node)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (SteadyPod, error) {
+		var p SteadyPod
+		err := r.Scan(&p.ID, &p.State)
+		return p, err
+	})
+}
+
+// tapHolds is the condition on a sandbox row s under which its pod may hold
+// a TAP device on s.node: not hibernated, pending or lost, or an op in
+// flight.
+const tapHolds = "(s.client_state NOT IN ('hibernated', 'pending', 'lost') OR s.op <> '')"
+
+// TAPConflict returns another sandbox on node whose ID shares id's first 8
+// hex digits and whose pod may hold a TAP device there (placement's TAP
+// prefix gate: feosd names a pod's TAP device after them);
+// uuid.Nil when there is none.
+func (s *Store) TAPConflict(ctx context.Context, node string, id uuid.UUID) (uuid.UUID, error) {
+	var other uuid.UUID
+	err := s.q.QueryRow(ctx, `SELECT s.id FROM sandboxes s
+		WHERE s.node = $1 AND left(s.id::text, 8) = left($2::uuid::text, 8) AND s.id <> $2::uuid AND `+tapHolds+`
+		ORDER BY s.id LIMIT 1`, node, id).Scan(&other)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, nil
+	}
+	return other, err
+}
+
+// TAPConflicts returns, per node, a sandbox that blocks id there as
+// TAPConflict does.
+func (s *Store) TAPConflicts(ctx context.Context, id uuid.UUID) (map[string]uuid.UUID, error) {
+	rows, err := s.q.Query(ctx, `SELECT DISTINCT ON (s.node) s.node, s.id FROM sandboxes s
+		WHERE s.node IS NOT NULL AND left(s.id::text, 8) = left($1::uuid::text, 8) AND s.id <> $1::uuid AND `+tapHolds+`
+		ORDER BY s.node, s.id`, id)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]uuid.UUID{}
+	var node string
+	var other uuid.UUID
+	_, err = pgx.ForEachRow(rows, []any{&node, &other}, func() error {
+		out[node] = other
+		return nil
+	})
+	return out, err
+}
+
+// Attribution is the sandbox a node's record about a pod belongs to.
+type Attribution struct {
+	SandboxID uuid.UUID
+	TenantID  string
+}
+
+// AttributePod decides whether a pod-scoped record from node about podID
+// is the sandbox's: the row exists and the pod is or was on node (node,
+// op_target or lost_from is node, a tombstone (podID, node) exists, or a
+// pod certificate for it on node was issued within a day). ok is false for
+// a foreign record.
+func (s *Store) AttributePod(ctx context.Context, podID uuid.UUID, node string) (a Attribution, ok bool, err error) {
+	err = s.q.QueryRow(ctx, `SELECT s.id, s.owner FROM sandboxes s WHERE s.id = $1 AND (
+			s.node = $2 OR s.op_target = $2 OR s.lost_from = $2
+			OR EXISTS (SELECT 1 FROM pod_tombstones t WHERE t.pod_id = $1 AND t.node = $2)
+			OR EXISTS (SELECT 1 FROM issued_certs c WHERE c.pod_id = $1 AND c.node = $2
+				AND c.issued_at > now() - interval '1 day'))`, podID, node).Scan(&a.SandboxID, &a.TenantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Attribution{}, false, nil
+	}
+	if err != nil {
+		return Attribution{}, false, err
+	}
+	return a, true, nil
+}
+
+// sandboxColumn describes a column UpdateSandbox may write.
+type sandboxColumn struct {
+	name string
+	// lifecycle: a write bumps gen and sends ferun_sandbox.
+	lifecycle bool
+	equal     func(a, b *Sandbox) bool
+	value     func(s *Sandbox) any
+}
+
+func plainColumn[T comparable](name string, lifecycle bool, get func(*Sandbox) T) sandboxColumn {
+	return sandboxColumn{name: name, lifecycle: lifecycle,
+		equal: func(a, b *Sandbox) bool { return get(a) == get(b) },
+		value: func(s *Sandbox) any { return get(s) }}
+}
+
+func timeColumn(name string, lifecycle bool, get func(*Sandbox) time.Time) sandboxColumn {
+	return sandboxColumn{name: name, lifecycle: lifecycle,
+		equal: func(a, b *Sandbox) bool { return get(a).Equal(get(b)) },
+		value: func(s *Sandbox) any { return nullTime(get(s)) }}
+}
+
+func nullableColumn(name string, lifecycle bool, get func(*Sandbox) string) sandboxColumn {
+	return sandboxColumn{name: name, lifecycle: lifecycle,
+		equal: func(a, b *Sandbox) bool { return get(a) == get(b) },
+		value: func(s *Sandbox) any { return nullString(get(s)) }}
+}
+
+// sandboxWritable lists the columns UpdateSandbox writes. A lifecycle
+// write is one of client_state, node, op*, incarnation, materialised or
+// the checkpoint columns. id, owner, image, vcpus, memory_mib and
+// created_at are never written; gen and updated_at are UpdateSandbox's.
+var sandboxWritable = []sandboxColumn{
+	plainColumn("incarnation", true, func(s *Sandbox) uuid.UUID { return s.Incarnation }),
+	plainColumn("image_ref", false, func(s *Sandbox) string { return s.ImageRef }),
+	plainColumn("client_state", true, func(s *Sandbox) string { return s.ClientState }),
+	plainColumn("status_description", false, func(s *Sandbox) string { return s.StatusDescription }),
+	nullableColumn("node", true, func(s *Sandbox) string { return s.Node }),
+	plainColumn("materialised", true, func(s *Sandbox) bool { return s.Materialised }),
+	nullableColumn("lost_from", false, func(s *Sandbox) string { return s.LostFrom }),
+	{name: "avoid_nodes", equal: func(a, b *Sandbox) bool { return slices.Equal(a.AvoidNodes, b.AvoidNodes) },
+		value: func(s *Sandbox) any { return nonNil(s.AvoidNodes) }},
+	plainColumn("op", true, func(s *Sandbox) string { return s.Op }),
+	{name: "op_id", lifecycle: true, equal: func(a, b *Sandbox) bool { return a.OpID == b.OpID },
+		value: func(s *Sandbox) any { return nullUUID(s.OpID) }},
+	plainColumn("op_owner", true, func(s *Sandbox) string { return s.OpOwner }),
+	timeColumn("op_deadline", true, func(s *Sandbox) time.Time { return s.OpDeadline }),
+	plainColumn("op_target", true, func(s *Sandbox) string { return s.OpTarget }),
+	plainColumn("op_from_state", true, func(s *Sandbox) string { return s.OpFromState }),
+	plainColumn("checkpoint_epoch", true, func(s *Sandbox) int64 { return s.CheckpointEpoch }),
+	plainColumn("checkpoint_head", true, func(s *Sandbox) string { return s.CheckpointHead }),
+	plainColumn("checkpoint_memory", true, func(s *Sandbox) bool { return s.CheckpointMemory }),
+	timeColumn("checkpoint_at", true, func(s *Sandbox) time.Time { return s.CheckpointAt }),
+	plainColumn("checkpoint_store", true, func(s *Sandbox) string { return s.CheckpointStore }),
+	timeColumn("pending_since", false, func(s *Sandbox) time.Time { return s.PendingSince }),
+	timeColumn("unreachable_since", false, func(s *Sandbox) time.Time { return s.UnreachableSince }),
+	plainColumn("run_id", false, func(s *Sandbox) string { return s.RunID }),
+	plainColumn("kube_version", false, func(s *Sandbox) string { return s.KubeVersion }),
+	plainColumn("ssh_version", false, func(s *Sandbox) string { return s.SSHVersion }),
+	timeColumn("last_active_at", false, func(s *Sandbox) time.Time { return s.LastActiveAt }),
+	timeColumn("paused_at", false, func(s *Sandbox) time.Time { return s.PausedAt }),
+}
+
+// sandboxFixed lists the columns UpdateSandbox refuses to change.
+var sandboxFixed = []sandboxColumn{
+	plainColumn("owner", false, func(s *Sandbox) string { return s.Owner }),
+	plainColumn("image", false, func(s *Sandbox) string { return s.Image }),
+	plainColumn("vcpus", false, func(s *Sandbox) int { return s.VCPUs }),
+	plainColumn("memory_mib", false, func(s *Sandbox) int { return s.MemoryMiB }),
+	plainColumn("gen", false, func(s *Sandbox) int64 { return s.Gen }),
+	timeColumn("created_at", false, func(s *Sandbox) time.Time { return s.CreatedAt }),
+	timeColumn("updated_at", false, func(s *Sandbox) time.Time { return s.UpdatedAt }),
+}
+
+// UpdateSandbox writes the columns in which after differs from before, the
+// row as the caller read it (normally locked FOR UPDATE in the same
+// transaction), and returns the row as written. A change of a lifecycle
+// column (client_state, node, op*, incarnation, materialised, checkpoint)
+// increments gen and sends ferun_sandbox; such a change or one of the
+// status description also sets updated_at = now(). Times the caller sets
+// should come from Now, the transaction's clock. When the row's gen or
+// incarnation are no longer before's, nothing is written and ErrStale is
+// returned; when nothing differs, before is returned unwritten.
+func (s *Store) UpdateSandbox(ctx context.Context, before, after Sandbox) (Sandbox, error) {
+	if before.ID != after.ID {
+		return Sandbox{}, fmt.Errorf("update sandbox %s: the id changed to %s", before.ID, after.ID)
+	}
+	for _, c := range sandboxFixed {
+		if !c.equal(&before, &after) {
+			return Sandbox{}, fmt.Errorf("update sandbox %s: column %s is not written by UpdateSandbox", before.ID, c.name)
+		}
+	}
+	var sets []string
+	args := []any{before.ID, before.Gen, before.Incarnation}
+	lifecycle, described := false, false
+	for _, c := range sandboxWritable {
+		if c.equal(&before, &after) {
+			continue
+		}
+		args = append(args, c.value(&after))
+		sets = append(sets, fmt.Sprintf("%s = $%d", c.name, len(args)))
+		lifecycle = lifecycle || c.lifecycle
+		described = described || c.name == "status_description"
+	}
+	if len(sets) == 0 {
+		return before, nil
+	}
+	if lifecycle {
+		sets = append(sets, "gen = gen + 1")
+	}
+	if lifecycle || described {
+		sets = append(sets, "updated_at = now()")
+	}
+	row, err := scanSandbox(s.q.QueryRow(ctx, "UPDATE sandboxes SET "+strings.Join(sets, ", ")+
+		" WHERE id = $1 AND gen = $2 AND incarnation = $3 RETURNING "+sandboxCols, args...))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Sandbox{}, ErrStale
+	}
+	if err != nil {
+		return Sandbox{}, fmt.Errorf("update sandbox %s: %w", before.ID, err)
+	}
+	if lifecycle {
+		if err := s.Notify(ctx, chanSandbox, before.ID.String()); err != nil {
+			return Sandbox{}, err
+		}
+	}
+	return row, nil
+}
+
+// TouchSandbox sets last_active_at = now(): activity, no lifecycle write.
+func (s *Store) TouchSandbox(ctx context.Context, id uuid.UUID) error {
+	_, err := s.q.Exec(ctx, "UPDATE sandboxes SET last_active_at = now() WHERE id = $1", id)
+	return err
+}
+
+// MarkUnreachable records that the guest of a running sandbox did not
+// answer: unreachable_since = coalesce(unreachable_since, now()). It
+// reports whether the row is running.
+func (s *Store) MarkUnreachable(ctx context.Context, id uuid.UUID) (bool, error) {
+	tag, err := s.q.Exec(ctx, `UPDATE sandboxes SET unreachable_since = coalesce(unreachable_since, now())
+		WHERE id = $1 AND client_state = 'running'`, id)
+	return tag.RowsAffected() > 0, err
+}
+
+// ClearUnreachable clears unreachable_since: the guest answered.
+func (s *Store) ClearUnreachable(ctx context.Context, id uuid.UUID) error {
+	_, err := s.q.Exec(ctx, "UPDATE sandboxes SET unreachable_since = NULL WHERE id = $1 AND unreachable_since IS NOT NULL", id)
+	return err
+}
+
+// MarkPending records the first observation of the sandbox's pod (of
+// incarnation) as PENDING: pending_since = coalesce(pending_since, now()),
+// a write of its own that bumps no gen. It reports whether the row of that
+// incarnation exists.
+func (s *Store) MarkPending(ctx context.Context, id, incarnation uuid.UUID) (bool, error) {
+	tag, err := s.q.Exec(ctx, `UPDATE sandboxes SET pending_since = coalesce(pending_since, now())
+		WHERE id = $1 AND incarnation = $2`, id, incarnation)
+	return tag.RowsAffected() > 0, err
+}
+
+// SetStatusDescription writes only the status description (no gen bump,
+// no notification), when the row is still of incarnation.
+func (s *Store) SetStatusDescription(ctx context.Context, id, incarnation uuid.UUID, description string) error {
+	_, err := s.q.Exec(ctx, `UPDATE sandboxes SET status_description = $3, updated_at = now()
+		WHERE id = $1 AND incarnation = $2 AND status_description <> $3`, id, incarnation, description)
+	return err
+}
+
+// ReleaseOpsOf releases the ops still owned by a stopping instance: the op
+// columns cleared, client_state unknown with the description "op <op> of
+// stopping instance <id> was released", node and booking kept, gen + 1.
+// It returns the ids and notifies them.
+func (s *Store) ReleaseOpsOf(ctx context.Context, instanceID string) ([]uuid.UUID, error) {
+	rows, err := s.q.Query(ctx, `UPDATE sandboxes SET op = '', op_id = NULL, op_owner = '', op_deadline = NULL,
+			op_target = '', op_from_state = '', client_state = 'unknown',
+			status_description = 'op ' || op || ' of stopping instance ' || $1 || ' was released',
+			gen = gen + 1, updated_at = now()
+		WHERE op_owner = $1 AND op <> '' RETURNING id`, instanceID)
+	return s.notifyReturned(ctx, rows, err)
+}
+
+func (s *Store) notifyReturned(ctx context.Context, rows pgx.Rows, err error) ([]uuid.UUID, error) {
+	if err != nil {
+		return nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return nil, err
+	}
+	return ids, s.notifySandboxes(ctx, ids)
+}
+
+// rfc3339 renders a timestamptz expression as RFC 3339 in UTC, in SQL.
+func rfc3339(expr string) string {
+	return "to_char(" + expr + " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+}
+
+// nodeDownSince is the time a node n went out of service, as RFC 3339 in
+// SQL: since it was down, or, for a node removed while it was not down,
+// since its removal. It is the <t> of the down sweep's and lost grace's
+// "node <n> down since <t>".
+var nodeDownSince = rfc3339("coalesce(n.down_since, n.removed_at, now())")
+
+// DownSweep moves up to limit sandboxes without an op whose node is down
+// or removed, and which are running, paused, creating, stopped or failed,
+// to unknown ("node <n> down since <t>; it was <state>"), gen + 1, booking
+// unchanged. Rows locked by others are skipped. It returns the ids and
+// notifies them.
+func (s *Store) DownSweep(ctx context.Context, limit int) ([]uuid.UUID, error) {
+	rows, err := s.q.Query(ctx, `WITH c AS (
+			SELECT s.id FROM sandboxes s
+			WHERE s.node IN (SELECT name FROM nodes WHERE status IN ('down', 'removed')) AND s.op = ''
+				AND s.client_state IN ('running', 'paused', 'creating', 'stopped', 'failed')
+			ORDER BY s.id LIMIT $1 FOR UPDATE SKIP LOCKED)
+		UPDATE sandboxes s SET client_state = 'unknown',
+			status_description = 'node ' || n.name || ' down since ' || `+nodeDownSince+`
+				|| '; it was ' || s.client_state,
+			gen = s.gen + 1, updated_at = now()
+		FROM c, nodes n WHERE s.id = c.id AND n.name = s.node RETURNING s.id`, limit)
+	return s.notifyReturned(ctx, rows, err)
+}
+
+// LostRow is a sandbox lost grace resolved.
+type LostRow struct {
+	ID       uuid.UUID
+	Owner    string
+	Node     string
+	State    string // model.StateHibernated or model.StateLost
+	RunID    string // the run still open, for the caller to close
+	Previous string // the description before
+}
+
+// LostGrace resolves up to limit unknown sandboxes without an op on a node
+// that is down for longer than grace, or removed: with a checkpoint to
+// hibernated, else to lost; lost_from = node, node kept, gen + 1, "node
+// <n> down since <t>[; restored from the checkpoint of <checkpoint_at> on
+// the next use]". Their bookings and process holds are deleted (both
+// states end the pod's use of the node and its processes); no tombstone is
+// written. Rows locked by others are skipped. It returns the rows and
+// notifies them.
+func (s *Store) LostGrace(ctx context.Context, grace time.Duration, limit int) ([]LostRow, error) {
+	rows, err := s.q.Query(ctx, `WITH c AS (
+			SELECT s.id FROM sandboxes s JOIN nodes n ON n.name = s.node
+			WHERE s.client_state = 'unknown' AND s.op = ''
+				AND (n.status = 'removed' OR (n.status = 'down' AND n.down_since < now() - $1::interval))
+			ORDER BY s.id LIMIT $2 FOR UPDATE OF s SKIP LOCKED),
+		old AS (SELECT s.id, s.status_description FROM sandboxes s JOIN c ON c.id = s.id)
+		UPDATE sandboxes s SET
+			client_state = CASE WHEN s.checkpoint_head <> '' THEN 'hibernated' ELSE 'lost' END,
+			lost_from = s.node,
+			status_description = 'node ' || n.name || ' down since ' || `+nodeDownSince+`
+				|| CASE WHEN s.checkpoint_head <> '' THEN '; restored from the checkpoint of '
+					|| `+rfc3339("coalesce(s.checkpoint_at, now())")+` || ' on the next use' ELSE '' END,
+			gen = s.gen + 1, updated_at = now()
+		FROM c, nodes n, old WHERE s.id = c.id AND old.id = s.id AND n.name = s.node
+		RETURNING s.id, s.owner, s.node, s.client_state, s.run_id, old.status_description`, interval(grace), limit)
+	if err != nil {
+		return nil, err
+	}
+	lost, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (LostRow, error) {
+		var l LostRow
+		err := r.Scan(&l.ID, &l.Owner, &l.Node, &l.State, &l.RunID, &l.Previous)
+		return l, err
+	})
+	if err != nil || len(lost) == 0 {
+		return lost, err
+	}
+	ids := make([]uuid.UUID, len(lost))
+	for i, l := range lost {
+		ids[i] = l.ID
+	}
+	if _, err := s.q.Exec(ctx, "DELETE FROM bookings WHERE pod_id = ANY($1)", ids); err != nil {
+		return nil, err
+	}
+	if _, err := s.q.Exec(ctx, "DELETE FROM sandbox_holds WHERE sandbox_id = ANY($1) AND kind = 'process'", ids); err != nil {
+		return nil, err
+	}
+	return lost, s.notifySandboxes(ctx, ids)
+}
+
+// StaleOps returns up to limit sandboxes with an op in flight whose owner
+// is not live (dead or stopping), or whose op deadline passed more than
+// overdue ago, oldest deadline first.
+func (s *Store) StaleOps(ctx context.Context, overdue time.Duration, limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
+		WHERE s.op <> '' AND (NOT EXISTS (SELECT 1 FROM instances i WHERE i.id = s.op_owner AND `+instanceLive("i")+`)
+			OR s.op_deadline < now() - $1::interval)
+		ORDER BY s.op_deadline LIMIT $2`, interval(overdue), limit))
+}
+
+// IdleSandboxes returns up to limit running sandboxes without an op on one
+// of nodes whose last_active_at is older than idle and that have no live
+// hold of any kind, the least recently active first.
+func (s *Store) IdleSandboxes(ctx context.Context, idle time.Duration, nodes []string, limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
+		WHERE s.client_state = 'running' AND s.op = '' AND s.last_active_at < now() - $1::interval
+			AND s.node = ANY($2)
+			AND NOT EXISTS (SELECT 1 FROM sandbox_holds h WHERE h.sandbox_id = s.id AND h.lease_until > now())
+		ORDER BY s.last_active_at LIMIT $3`, interval(idle), nonNil(nodes), limit))
+}
+
+// HibernateCandidates returns up to limit paused sandboxes without an op,
+// paused for longer than after, on one of nodes that has an object store.
+func (s *Store) HibernateCandidates(ctx context.Context, after time.Duration, nodes []string, limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s JOIN nodes n ON n.name = s.node
+		WHERE s.client_state = 'paused' AND s.op = '' AND s.paused_at < now() - $1::interval
+			AND s.node = ANY($2) AND n.object_store_id <> ''
+		ORDER BY s.paused_at LIMIT $3`, interval(after), nonNil(nodes), limit))
+}
+
+// UnknownSandboxes returns up to limit unknown sandboxes without an op on
+// one of nodes that is ready.
+func (s *Store) UnknownSandboxes(ctx context.Context, nodes []string, limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s JOIN nodes n ON n.name = s.node
+		WHERE s.client_state = 'unknown' AND s.op = '' AND s.node = ANY($1) AND n.status = 'ready'
+		ORDER BY s.updated_at LIMIT $2`, nonNil(nodes), limit))
+}
+
+// RepairCandidates returns up to limit sandboxes without an op on one of
+// nodes that need a repair: creating with pending_since older than
+// pendingAfter (a pod stuck PENDING), or running with unreachable_since
+// older than unreachableAfter.
+func (s *Store) RepairCandidates(ctx context.Context, pendingAfter, unreachableAfter time.Duration, nodes []string, limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
+		WHERE s.op = '' AND s.node = ANY($3) AND (
+			(s.client_state = 'creating' AND s.pending_since < now() - $1::interval)
+			OR (s.client_state = 'running' AND s.unreachable_since < now() - $2::interval))
+		ORDER BY s.id LIMIT $4`, interval(pendingAfter), interval(unreachableAfter), nonNil(nodes), limit))
+}
+
+// PendingWithoutCapacity returns up to limit pending sandboxes without an
+// op whose description begins "no capacity".
+func (s *Store) PendingWithoutCapacity(ctx context.Context, limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+` FROM sandboxes
+		WHERE client_state = 'pending' AND op = '' AND status_description LIKE 'no capacity%'
+		ORDER BY created_at LIMIT $1`, limit))
+}
+
+// SandboxesInState returns up to limit sandboxes without an op on node in
+// one of states, ordered by id.
+func (s *Store) SandboxesInState(ctx context.Context, node string, states []string, limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+` FROM sandboxes
+		WHERE node = $1 AND op = '' AND client_state = ANY($2) ORDER BY id LIMIT $3`, node, nonNil(states), limit))
+}
