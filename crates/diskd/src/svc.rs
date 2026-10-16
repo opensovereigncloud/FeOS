@@ -1386,8 +1386,20 @@ impl DiskService for DiskSvc {
         // --- pass 1: snapshots/ ------------------------------------
         let snaps = s3.list("snapshots/").await.map_err(internal)?;
         rep.snapshot_objects_seen = snaps.len() as u64;
-        let live_heads: std::collections::HashSet<String> =
+        let mut live_heads: std::collections::HashSet<String> =
             req.live_heads.iter().cloned().collect();
+        // A live head keeps the heads of its pod's volumes (ADR 0016).
+        for key in &req.live_heads {
+            let buf = match s3.find_object(key).await {
+                Ok(Some(buf)) => buf,
+                // A head that is gone names nothing; pass 1 sees it.
+                Ok(None) => continue,
+                Err(e) => return Err(internal(format!("sweep: live head {key}: {e}"))),
+            };
+            let head = disk_store::head::PodHead::decode(&buf)
+                .map_err(|e| internal(format!("sweep: live head {key}: {e}")))?;
+            live_heads.extend(head.volumes);
+        }
         let plan = disk_store::sweep::plan_snapshots(&snaps, &live_heads, now, grace);
         rep.snapshot_objects_deleted = plan.dead_snapshot_keys.len() as u64;
         rep.bytes_deleted += plan.dead_bytes;
@@ -1670,8 +1682,16 @@ impl DiskService for DiskSvc {
             cpu_model: m.cpu_model,
             kernel_release: m.kernel_release,
         });
+        head.volumes = req.volume_heads;
         head.validate()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        let own = format!("snapshots/{}/", req.pod_id);
+        if let Some(key) = head.volumes.iter().find(|key| key.starts_with(&own)) {
+            return Err(Status::invalid_argument(format!(
+                "{key} is a head of pod {}'s own disk, not of a volume",
+                req.pod_id
+            )));
+        }
 
         let mut layers = head.chain.clone();
         layers.extend(head.memory.as_ref().map(|m| m.layer.clone()));
@@ -1692,6 +1712,13 @@ impl DiskService for DiskSvc {
                 m.vmstate_key
             )));
         }
+        for key in &head.volumes {
+            if !s3.has_object(key).await {
+                return Err(Status::failed_precondition(format!(
+                    "the volume's head {key} is not in the object store; put it first"
+                )));
+            }
+        }
         let key = disk_store::head::head_key(&req.pod_id, req.epoch);
         if s3.has_object(&key).await {
             return Err(Status::already_exists(format!(
@@ -1701,7 +1728,13 @@ impl DiskService for DiskSvc {
         head.stamp();
         let buf = head.encode().map_err(internal)?;
         s3.put_object(&key, buf).await.map_err(internal)?;
-        info!(pod = %req.pod_id, key = %key, memory = head.memory.is_some(), "put_head");
+        info!(
+            pod = %req.pod_id,
+            key = %key,
+            memory = head.memory.is_some(),
+            volumes = head.volumes.len(),
+            "put_head"
+        );
         Ok(Response::new(head_message(key, head)))
     }
 
@@ -1743,6 +1776,7 @@ fn head_message(key: String, head: disk_store::head::PodHead) -> pb::Head {
             cpu_model: m.cpu_model,
             kernel_release: m.kernel_release,
         }),
+        volume_heads: head.volumes,
     }
 }
 

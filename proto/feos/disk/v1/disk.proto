@@ -63,10 +63,11 @@ service DiskService {
   rpc PutObject(PutObjectRequest) returns (Empty);
   rpc GetObject(GetObjectRequest) returns (Empty);
   // Uploads the head of a checkpoint of a pod whose disk is sealed and
-  // stopped: its chain and geometry, and the memory the caller sealed
-  // and put beside it, at snapshots/<pod>/<epoch>/head.json. A head is
-  // the last object of a checkpoint and names only what is uploaded
-  // already; it is never overwritten.
+  // stopped: its chain and geometry, the memory the caller sealed and
+  // put beside it, and the heads of the pod's volumes, at
+  // snapshots/<pod>/<epoch>/head.json. A head is the last object of a
+  // checkpoint and names only what is uploaded already; it is never
+  // overwritten.
   rpc PutHead(PutHeadRequest) returns (Head);
   // Reads a head from the object store.
   rpc GetHead(GetHeadRequest) returns (Head);
@@ -250,7 +251,8 @@ message FsckReport {
 }
 
 message SweepRequest {
-  // S3 keys of the heads still in use.
+  // S3 keys of the heads still in use; the heads of the volumes they name
+  // are, too.
   repeated string live_heads = 1;
   // Layer ids still in use outside a head, such as baked layers.
   repeated string live_layers = 2;
@@ -341,6 +343,10 @@ message PutHeadRequest {
   uint64 epoch = 2;
   // The pod's memory, if the checkpoint has it.
   MemoryRef memory = 3;
+  // The S3 keys of the heads of the pod's volumes, each a disk of its
+  // own, which must be in the object store: a sweep that keeps this head
+  // keeps theirs.
+  repeated string volume_heads = 4;
 }
 
 message GetHeadRequest {
@@ -372,4 +378,6 @@ message Head {
   uint64 logical_size = 5;
   // Unset for a checkpoint of the disk alone.
   MemoryRef memory = 6;
+  // The heads of the pod's volumes.
+  repeated string volume_heads = 7;
 }

@@ -58,6 +58,11 @@ pub struct PodHead {
     /// Memory checkpoint refs (ADR 0011).
     #[serde(default)]
     pub memory: Option<MemoryRef>,
+    /// The S3 keys of the heads of the pod's volumes (ADR 0016), each a
+    /// disk with a head of its own: in the bucket before this head, and
+    /// live as long as it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
     /// RFC 3339 for operators' eyes only.
     pub updated_at: String,
 }
@@ -67,6 +72,16 @@ pub struct PodHead {
 /// decides which one is current).
 pub fn head_key(pod_id: &str, epoch: u64) -> String {
     format!("snapshots/{pod_id}/{epoch}/head.json")
+}
+
+/// Whether `key` is that of a head: `snapshots/<id>/<epoch>/head.json`.
+pub fn is_head_key(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("snapshots/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    matches!(parts.as_slice(), [id, epoch, "head.json"]
+        if !id.is_empty() && !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// S3 key of the Firecracker vmstate object of pause epoch `epoch`.
@@ -91,6 +106,7 @@ impl PodHead {
             has_top: false,
             epoch: 0,
             memory: None,
+            volumes: Vec::new(),
             updated_at: String::new(),
         }
     }
@@ -153,6 +169,12 @@ impl PodHead {
                 "head.json for {}: {depth} shared layers of a chain of {}",
                 self.pod_id,
                 self.chain.len()
+            )));
+        }
+        if let Some(key) = self.volumes.iter().find(|key| !is_head_key(key)) {
+            return Err(Error::Head(format!(
+                "head.json for {}: {key:?} is not the key of a head",
+                self.pod_id
             )));
         }
         Ok(())
@@ -248,5 +270,28 @@ mod tests {
         let old = PodHead::decode(old).unwrap();
         assert_eq!(old.shared_depth(), 1);
         assert_eq!(old.memory.unwrap().kernel_release, "");
+        assert!(old.volumes.is_empty());
+    }
+
+    #[test]
+    fn a_head_names_its_volumes_heads() {
+        let mut h = PodHead::new("sb", 1 << 30, 1 << 16, vec!["aa".into()]);
+        // A head without volumes is written as before.
+        assert!(!String::from_utf8(h.encode().unwrap())
+            .unwrap()
+            .contains("volumes"));
+        h.volumes = vec![head_key("volume-v", 7)];
+        let back = PodHead::decode(&h.encode().unwrap()).unwrap();
+        assert_eq!(back.volumes, ["snapshots/volume-v/7/head.json"]);
+        for bad in [
+            "layers/aa.manifest",
+            "snapshots/v/7/vmstate",
+            "snapshots//7/head.json",
+            "snapshots/v/x/head.json",
+            "snapshots/v/7/8/head.json",
+        ] {
+            h.volumes = vec![bad.to_string()];
+            PodHead::decode(&h.encode().unwrap()).expect_err(bad);
+        }
     }
 }

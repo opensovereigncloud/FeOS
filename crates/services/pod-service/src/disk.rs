@@ -286,6 +286,7 @@ impl Disks {
             pod_id: pod_id.to_string(),
             epoch,
             memory,
+            volume_heads: Vec::new(),
         };
         Ok(self
             .client()

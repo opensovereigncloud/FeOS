@@ -163,6 +163,9 @@ enum Cmd {
         cpu_model: String,
         #[arg(long, default_value = "")]
         kernel_release: String,
+        /// The head of one of the pod's volumes (repeatable).
+        #[arg(long = "volume-head")]
+        volume_heads: Vec<String>,
     },
     /// Read a head from the object store.
     GetHead { key: String },
@@ -181,6 +184,7 @@ fn head_json(h: &pb::Head) -> String {
             "firecracker_version": m.firecracker_version,
             "cpu_model": m.cpu_model, "kernel_release": m.kernel_release,
         })),
+        "volume_heads": h.volume_heads,
     }))
     .unwrap_or_default()
 }
@@ -448,6 +452,7 @@ async fn main() -> Result<(), String> {
             firecracker_version,
             cpu_model,
             kernel_release,
+            volume_heads,
         } => {
             let memory = memory_layer.map(|layer| pb::MemoryRef {
                 layer,
@@ -461,6 +466,7 @@ async fn main() -> Result<(), String> {
                     pod_id,
                     epoch,
                     memory,
+                    volume_heads,
                 })
                 .await
                 .map_err(|e| format!("{}: {}", e.code(), e.message()))?
