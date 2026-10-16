@@ -710,7 +710,13 @@ type VmConfig struct {
 	// The pod's volumes (ADR 0016), each a disk from diskd, attached after
 	// the data disk in this order: Firecracker's drives volume0, volume1,
 	// ..., which the guest tells apart by their order.
-	Volumes       []*DataDiskConfig `protobuf:"bytes,9,rep,name=volumes,proto3" json:"volumes,omitempty"`
+	Volumes []*DataDiskConfig `protobuf:"bytes,9,rep,name=volumes,proto3" json:"volumes,omitempty"`
+	// A JSON object, the microVM's metadata: Firecracker serves it to the
+	// guest at 169.254.169.254 on the first network interface (MMDS,
+	// version 2, which wants a session token first). A snapshot does not
+	// hold it: the VM service puts it in again after every load. Empty: no
+	// metadata service.
+	MetadataJson  string `protobuf:"bytes,10,opt,name=metadata_json,json=metadataJson,proto3" json:"metadata_json,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -785,6 +791,13 @@ func (x *VmConfig) GetVolumes() []*DataDiskConfig {
 		return x.Volumes
 	}
 	return nil
+}
+
+func (x *VmConfig) GetMetadataJson() string {
+	if x != nil {
+		return x.MetadataJson
+	}
+	return ""
 }
 
 type DataDiskConfig struct {
@@ -2122,14 +2135,16 @@ const file_feos_microvm_v1_microvm_proto_rawDesc = "" +
 	"\x10CreateVmResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"#\n" +
 	"\fGetVmRequest\x12\x13\n" +
-	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"\x90\x03\n" +
+	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\"\xb5\x03\n" +
 	"\bVmConfig\x12.\n" +
 	"\x04cpus\x18\x01 \x01(\v2\x1a.feos.microvm.v1.CpuConfigR\x04cpus\x125\n" +
 	"\x06memory\x18\x02 \x01(\v2\x1d.feos.microvm.v1.MemoryConfigR\x06memory\x12,\n" +
 	"\x03net\x18\x05 \x03(\v2\x1a.feos.microvm.v1.NetConfigR\x03net\x12H\n" +
 	"\rguest_network\x18\a \x01(\v2#.feos.microvm.v1.GuestNetworkConfigR\fguestNetwork\x12<\n" +
 	"\tdata_disk\x18\b \x01(\v2\x1f.feos.microvm.v1.DataDiskConfigR\bdataDisk\x129\n" +
-	"\avolumes\x18\t \x03(\v2\x1f.feos.microvm.v1.DataDiskConfigR\avolumesJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x06\x10\aR\timage_refR\x05disksR\bignition\"$\n" +
+	"\avolumes\x18\t \x03(\v2\x1f.feos.microvm.v1.DataDiskConfigR\avolumes\x12#\n" +
+	"\rmetadata_json\x18\n" +
+	" \x01(\tR\fmetadataJsonJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x06\x10\aR\timage_refR\x05disksR\bignition\"$\n" +
 	"\x0eDataDiskConfig\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\"\xd7\x01\n" +
 	"\x12GuestNetworkConfig\x12\x1c\n" +

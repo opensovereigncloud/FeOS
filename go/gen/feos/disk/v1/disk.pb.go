@@ -1260,7 +1260,14 @@ type StatsResponse struct {
 	Memories []*MemoryStats `protobuf:"bytes,8,rep,name=memories,proto3" json:"memories,omitempty"`
 	// Whether diskd has an object store: without one, it pushes and pulls
 	// nothing, and no pod hibernates on this node.
-	ObjectStore   bool `protobuf:"varint,9,opt,name=object_store,json=objectStore,proto3" json:"object_store,omitempty"`
+	ObjectStore bool `protobuf:"varint,9,opt,name=object_store,json=objectStore,proto3" json:"object_store,omitempty"`
+	// Which object store: the lowercase hex SHA-256 of "<endpoint>\n<bucket>",
+	// the endpoint as configured, or AWS's for the region when none is. A pod
+	// hibernated on one node restores on another that names the same store.
+	// Empty without one.
+	ObjectStoreId string `protobuf:"bytes,10,opt,name=object_store_id,json=objectStoreId,proto3" json:"object_store_id,omitempty"`
+	// diskd's version.
+	Version       string `protobuf:"bytes,11,opt,name=version,proto3" json:"version,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1356,6 +1363,20 @@ func (x *StatsResponse) GetObjectStore() bool {
 		return x.ObjectStore
 	}
 	return false
+}
+
+func (x *StatsResponse) GetObjectStoreId() string {
+	if x != nil {
+		return x.ObjectStoreId
+	}
+	return ""
+}
+
+func (x *StatsResponse) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
 }
 
 type FsckRequest struct {
@@ -2492,7 +2513,7 @@ const file_feos_disk_v1_disk_proto_rawDesc = "" +
 	"\x06errors\x18\r \x01(\x04R\x06errors\x127\n" +
 	"\n" +
 	"histograms\x18\x0e \x03(\v2\x17.feos.disk.v1.HistogramR\n" +
-	"histograms\"\xda\x02\n" +
+	"histograms\"\x9c\x03\n" +
 	"\rStatsResponse\x123\n" +
 	"\adevices\x18\x01 \x03(\v2\x19.feos.disk.v1.DeviceStatsR\adevices\x12\x1f\n" +
 	"\vcache_bytes\x18\x02 \x01(\x04R\n" +
@@ -2505,7 +2526,10 @@ const file_feos_disk_v1_disk_proto_rawDesc = "" +
 	"\fs3_get_bytes\x18\a \x01(\x04R\n" +
 	"s3GetBytes\x125\n" +
 	"\bmemories\x18\b \x03(\v2\x19.feos.disk.v1.MemoryStatsR\bmemories\x12!\n" +
-	"\fobject_store\x18\t \x01(\bR\vobjectStore\"(\n" +
+	"\fobject_store\x18\t \x01(\bR\vobjectStore\x12&\n" +
+	"\x0fobject_store_id\x18\n" +
+	" \x01(\tR\robjectStoreId\x12\x18\n" +
+	"\aversion\x18\v \x01(\tR\aversion\"(\n" +
 	"\vFsckRequest\x12\x19\n" +
 	"\bcheck_s3\x18\x01 \x01(\bR\acheckS3\"\xaa\x01\n" +
 	"\n" +
