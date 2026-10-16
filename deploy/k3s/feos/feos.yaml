@@ -28,12 +28,14 @@ data:
   # The nodes' network, 10.0.0.0/24, and the cluster's pods and services
   # (10.42/16, 10.43/16) are in 10/8; the rest of RFC 1918 and CGNAT too.
   DENY_PREFIXES: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
-  # The chunk cache, 16 GiB.
-  DISKD_ARGS: "--budget-bytes 17179869184"
+  # The chunk cache, 16 GiB. A hibernation puts its disk's 64 KiB chunks
+  # one by one, and R2 answers about 6 PUTs a second per stream: 16 streams
+  # (the default) take over ten minutes for a pod with a 2 GB image.
+  DISKD_ARGS: "--budget-bytes 17179869184 --s3-concurrency 64"
   # ferund's nodes' port: the fixed ClusterIP of service ferund-nodes
   # (deploy/k3s/ferun), which the hosts reach without the cluster's DNS,
   # and the name its certificate carries. Empty: no control plane.
-  CONTROL_PLANE: ""
+  CONTROL_PLANE: "10.43.70.70:7443"
   CONTROL_PLANE_NAME: "ferun.run.fecode.dev"
   TRUST_DOMAIN: "run.fecode.dev"
 ---

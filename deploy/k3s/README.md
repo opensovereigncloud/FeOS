@@ -69,6 +69,8 @@ instances' certificates on the nodes' port carry and the nodes check
 
 ### Once: the secrets
 
+    kubectl -n ferun create secret docker-registry oci-pull --docker-server=oci.fecore.dev \
+      --docker-username='<registry user>' --docker-password='<registry password>'
     kubectl -n ferun create secret generic ferund-postgres --from-literal=password=$(openssl rand -hex 24)
     kubectl -n ferun create secret generic ferund \
       --from-literal=FERUN_DATABASE_URL="postgres://ferun:<password>@postgres.ferun.svc.cluster.local:5432/ferun?sslmode=disable" \
@@ -85,19 +87,26 @@ group `admins` there gets the admin surface. ferund's client at the IdP:
 
 ### Deploy
 
+    make -C deploy/k3s push-ferund           # build and push the image
     kubectl apply -f deploy/k3s/ferun/
-    kubectl -n ferun rollout restart deploy/ferund      # a new :dev image
+
+Afterwards, a new image: `make -C deploy/k3s deploy-ferund`.
 
 ### Join the nodes
 
-Every node joins once, with a token of its own; afterwards its key and
-certificate are in `/var/lib/feos/node` on the node:
+Every node joins once, with a token of its own, under its hostname;
+afterwards its key and certificate are in `/var/lib/feos/node` on the node:
 
+    args=""
     for n in debian13 debian13-vm-2 debian13-vm-3; do
-      echo "--from-literal=$n=$(kubectl -n ferun exec deploy/ferund -- ferund join-token)"
-    done   # → kubectl -n feos create secret generic feosd-join <those flags>
-    kubectl -n feos patch configmap feos-node -p '{"data":{"CONTROL_PLANE":"10.43.70.70:7443"}}'
+      args="$args --from-literal=$n=$(kubectl -n ferun exec deploy/ferund -- /ferund join-token --ttl 2h)"
+    done
+    kubectl -n feos create secret generic feosd-join $args
+    kubectl apply -f deploy/k3s/feos/feos.yaml     # CONTROL_PLANE: 10.43.70.70:7443
     kubectl -n feos rollout restart daemonset/feos-node
+
+A node that lost its key joins again with a token pinned to its name
+(`join-token --node <name>`).
 
 ## FeChat
 

@@ -22,6 +22,11 @@ spec:
     spec:
       imagePullSecrets:
         - name: oci-pull
+      # The image runs as distroless's nonroot (65532); the group makes the
+      # secrets' files below readable to it.
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
       # The shutdown grace below and 30 s: a stopping instance lets its tool
       # calls and operations finish.
       terminationGracePeriodSeconds: 150
@@ -51,9 +56,11 @@ spec:
             - name: FERUN_CA_DIR
               value: /etc/ferun/ca
             # Paused after 10 s without a tool call, the default; into the
-            # object store after another two minutes.
+            # object store after another half hour. A paused sandbox costs
+            # the node disk only and resumes in a second; a hibernation
+            # uploads its disk, minutes for a big image.
             - name: FERUN_HIBERNATE_AFTER
-              value: 2m
+              value: 30m
             - name: FERUN_SHUTDOWN_GRACE
               value: 2m
             # People sign in to the UI and the admin API with their FeCode ID
@@ -105,12 +112,12 @@ spec:
         - name: ca
           secret:
             secretName: ferun-ca
-            defaultMode: 0400
+            defaultMode: 0440
         # ~/idp/create-client.sh ferun ferun
         - name: oidc
           secret:
             secretName: oidc-client-ferun
-            defaultMode: 0400
+            defaultMode: 0440
             items:
               - key: client_secret
                 path: secret

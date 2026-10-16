@@ -12,7 +12,7 @@ TAG ?= dev
 PACKAGES_DIR ?= $(REPO_ROOT)/target/packages
 CONTEXT := $(REPO_ROOT)/target/k3s/feos-node
 
-.PHONY: feos-node push-feos-node deploy-feos
+.PHONY: feos-node push-feos-node deploy-feos ferund push-ferund deploy-ferund
 
 # The packages are make packages' output; their version is feosd's.
 feos-node: ## Build the feos DaemonSet's image from target/packages.
@@ -28,3 +28,14 @@ push-feos-node: feos-node ## Build and push the feos DaemonSet's image.
 deploy-feos: push-feos-node ## Push and roll the feos DaemonSet, a node at a time.
 	kubectl -n feos rollout restart daemonset/feos-node
 	kubectl -n feos rollout status daemonset/feos-node --timeout=15m
+
+# ferund's image builds from the repository's root (go/Dockerfile).
+ferund: ## Build ferund's image.
+	$(DOCKER) build -f $(REPO_ROOT)/go/Dockerfile -t $(REGISTRY)/ferund:$(TAG) $(REPO_ROOT)
+
+push-ferund: ferund ## Build and push ferund's image.
+	$(DOCKER) push $(REGISTRY)/ferund:$(TAG)
+
+deploy-ferund: push-ferund ## Push and roll ferund, an instance at a time.
+	kubectl -n ferun rollout restart deploy/ferund
+	kubectl -n ferun rollout status deploy/ferund --timeout=10m
