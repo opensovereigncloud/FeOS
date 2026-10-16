@@ -49,6 +49,7 @@ crates/
     watch-service/      guest: inotify subscriptions on a container's files
     forward-service/    guest: port forwarding, kube and SSH credential offloading
 proto/feos/<api>/v1/    the gRPC APIs, package feos.<api>.v1
+fechat/                 FeChat, FeRun's reference client, at chat.fecode.dev
 hack/                   kernel, initramfs, UKI, guest image and VM tooling
 docs/                   documentation and ADRs
 ```

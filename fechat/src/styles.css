@@ -1,0 +1,922 @@
+/*
+ * SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+:root {
+  --bg: #061026;
+  --panel: #0a1a33;
+  --panel-2: #133e7c;
+  --text: #d6f5ff;
+  --text-dim: #7d8fb3;
+  --cyan: #0abdc6;
+  --magenta: #ea00d9;
+  --yellow: #ea00d9;
+  --accent: var(--cyan);
+  font-family: 'Share Tech Mono', ui-monospace, 'Cascadia Mono', Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -10%, rgba(10, 189, 198, 0.08), transparent),
+    radial-gradient(ellipse 62% 42% at 80% 112%, rgba(113, 28, 145, 0.35), transparent);
+}
+
+/* scanlines overlay */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 2px,
+    rgba(0, 0, 0, 0.12) 3px,
+    transparent 4px
+  );
+  opacity: 0.35;
+}
+
+::selection {
+  background: var(--magenta);
+  color: #fff;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+  background: #133e7c;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--cyan);
+}
+
+html {
+  scrollbar-color: #133e7c #061026;
+  scrollbar-width: thin;
+}
+
+/* The page itself does not scroll; only .chat scrolls inside. Otherwise
+   Android scrolls the whole document away (header gone) when the
+   keyboard opens, to bring the input into view. */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+.app {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  /* --app-height comes from visualViewport (the keyboard resizes it), else dvh */
+  height: var(--app-height, 100dvh);
+}
+
+/* Content column: 960px, centred; the chat scroller itself is full screen,
+   so its scrollbar runs at the far right over the full height */
+.topbar,
+.composer {
+  width: min(960px, 100%);
+  margin-inline: auto;
+}
+
+.topbar {
+  position: relative;
+  z-index: 10;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding: 0.6rem 1rem 1.1rem;
+}
+
+/* The logo starts a new chat (a button without a button's look).
+   The text sits at the bottom of the bolt's box (align-items: flex-end);
+   padding-bottom is the optical middle between centring on the bolt and
+   compensating fully for the descenders: full compensation
+   (calc(0.4rem + 2px)) sat visibly too low. */
+.logo {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.45rem;
+  font-family: inherit;
+  background: none;
+  border: 0;
+  padding: 0 0 0.3rem;
+  cursor: pointer;
+  font-weight: 700;
+  font-size: 1.15rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--cyan);
+  text-shadow:
+    0 0 8px rgba(10, 189, 198, 0.7),
+    0 0 24px rgba(10, 189, 198, 0.3);
+}
+
+.bolt {
+  width: 1.55rem;
+  height: 1.55rem;
+  filter:
+    drop-shadow(0 0 4px rgba(10, 189, 198, 0.8))
+    drop-shadow(0 0 12px rgba(10, 189, 198, 0.35));
+  animation: boltflicker 4s infinite;
+}
+
+/* optical fine-tuning in the logo only: the bolt otherwise sits slightly
+   too high next to FECHAT (in the assistant's avatar box it stays centred) */
+.logo .bolt {
+  transform: translateY(0.2rem);
+}
+
+@keyframes boltflicker {
+  0%, 91%, 94%, 100% { opacity: 1; }
+  92%, 93% { opacity: 0.55; }
+}
+
+/* Who is signed in, and the way out, beside the image field. */
+.user-box {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  opacity: 0.85;
+}
+
+.user-avatar {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+}
+
+.user-signout {
+  background: none;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+  color: inherit;
+  font: inherit;
+  padding: 0.1rem 0.45rem;
+  cursor: pointer;
+  opacity: 0.7;
+}
+
+.user-signout:hover {
+  opacity: 1;
+}
+
+.boot-error {
+  padding: 3rem;
+  font-family: sans-serif;
+}
+
+@media (max-width: 640px) {
+  .user-name {
+    display: none;
+  }
+}
+
+/* The sandbox image field, at the right of the topbar. Editable until
+   the first message; the check's status below it. */
+.topbar-right {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.8rem;
+}
+
+.image-box {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+/* The tooltip that explains the sandbox image: shows on hover or focus
+   over the field, positioned absolutely, so it changes neither the
+   topbar's height nor the alignment (the same technique as .image-status).
+   pointer-events: none, so it does not catch the hover itself and flicker. */
+.image-tooltip {
+  position: absolute;
+  top: calc(100% + 0.9rem);
+  right: 0;
+  z-index: 30;
+  width: max-content;
+  max-width: min(46ch, 82vw);
+  padding: 0.7rem 0.85rem;
+  background: rgba(6, 16, 38, 0.97);
+  border: 1px solid var(--cyan);
+  border-radius: 3px;
+  box-shadow:
+    0 0 12px rgba(10, 189, 198, 0.35),
+    0 0 36px rgba(10, 189, 198, 0.15),
+    0 8px 24px rgba(0, 0, 0, 0.6);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--text);
+  text-align: left;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-4px);
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease,
+    visibility 0.18s;
+  pointer-events: none;
+}
+
+/* small corner at the top right, pointing at the field */
+.image-tooltip::before {
+  content: '';
+  position: absolute;
+  top: -5px;
+  right: 1.2rem;
+  width: 8px;
+  height: 8px;
+  background: inherit;
+  border-top: 1px solid var(--cyan);
+  border-left: 1px solid var(--cyan);
+  transform: rotate(45deg);
+}
+
+.image-box:hover .image-tooltip,
+.image-box:focus-within .image-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+
+.image-tooltip-title {
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  color: var(--cyan);
+  text-shadow: 0 0 8px rgba(10, 189, 198, 0.6);
+  margin-bottom: 0.35rem;
+}
+
+.image-tooltip code {
+  color: var(--cyan);
+  background: rgba(10, 189, 198, 0.12);
+  padding: 0.05rem 0.35rem;
+  border-radius: 2px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.image-input {
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.85rem;
+  border: 1px solid var(--panel-2);
+  border-radius: 2px;
+  padding: 0.4rem 0.6rem;
+  width: min(34ch, 46vw);
+  transition: all 0.15s ease;
+}
+
+.image-input:focus:not(:disabled) {
+  border-color: var(--cyan);
+  outline: none;
+  box-shadow: 0 0 10px rgba(10, 189, 198, 0.35);
+}
+
+/* The check's status on the field itself, in the palette's colours:
+   cyan = available, magenta (once the new-chat button's) = cannot be pulled */
+.image-input.ok {
+  border-color: var(--cyan);
+  color: var(--cyan);
+  box-shadow:
+    0 0 8px rgba(10, 189, 198, 0.5),
+    0 0 20px rgba(10, 189, 198, 0.25);
+}
+
+.image-input.invalid {
+  border-color: var(--yellow);
+  color: var(--yellow);
+  animation: image-invalid-glow 1.4s ease-in-out infinite;
+}
+
+@keyframes image-invalid-glow {
+  0%, 100% {
+    box-shadow: 0 0 6px rgba(234, 0, 217, 0.3);
+  }
+  50% {
+    box-shadow:
+      0 0 14px rgba(234, 0, 217, 0.75),
+      0 0 32px rgba(234, 0, 217, 0.4);
+  }
+}
+
+.image-input:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* The status hangs absolutely below the box: it affects neither the
+   topbar's height nor the bottom alignment of the logo and the field. */
+.image-status {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  padding-top: 0.15rem;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  max-width: min(60ch, 70vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-status.ok {
+  color: var(--cyan);
+}
+
+.image-status.error {
+  color: var(--magenta);
+}
+
+/* Full-screen scroller: the scrollbar at the right edge of the screen,
+   full height. --topbar-h and --composer-h are measured by a ResizeObserver. */
+.chat {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  /* the content starts below the fade zone (nothing blurred away) and
+     ends above the composer bar */
+  padding:
+    calc(var(--topbar-h, 4.25rem) + 2.4rem) 1rem
+    calc(var(--composer-h, 5rem) + 1.2rem);
+  /* the content itself fades to alpha 0 at both edges (no overlays) */
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0,
+    /* the whole header zone fully transparent ... */
+    rgba(0, 0, 0, 0) var(--topbar-h, 4.25rem),
+    /* ... the gradient only below it */
+    #000 calc(var(--topbar-h, 4.25rem) + 2.4rem),
+    #000 calc(100% - var(--composer-h, 5rem) - 1.2rem),
+    rgba(0, 0, 0, 0) calc(100% - var(--composer-h, 5rem))
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    rgba(0, 0, 0, 0) 0,
+    /* the whole header zone fully transparent ... */
+    rgba(0, 0, 0, 0) var(--topbar-h, 4.25rem),
+    /* ... the gradient only below it */
+    #000 calc(var(--topbar-h, 4.25rem) + 2.4rem),
+    #000 calc(100% - var(--composer-h, 5rem) - 1.2rem),
+    rgba(0, 0, 0, 0) calc(100% - var(--composer-h, 5rem))
+  );
+}
+
+.messages,
+.empty {
+  width: min(928px, 100%);
+  margin-inline: auto;
+}
+
+.empty {
+  min-height: 65vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.empty h1 {
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text);
+  text-shadow:
+    0 0 10px rgba(10, 189, 198, 0.5),
+    2px 0 0 rgba(234, 0, 217, 0.5),
+    -2px 0 0 rgba(10, 189, 198, 0.5);
+}
+
+.hint {
+  color: var(--text-dim);
+  margin: 0;
+}
+
+.messages {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.message {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  animation: message-fade-in 150ms ease-out;
+}
+
+@keyframes message-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.message.user {
+  flex-direction: row-reverse;
+}
+
+.avatar {
+  flex-shrink: 0;
+  width: 2.898rem;
+  height: 2.898rem;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* A diamond with two asymmetric cuts, as an SVG with a stroke: a long
+   cut left->top, a short cut bottom->right */
+.avatar-shape {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.avatar-inner {
+  position: relative;
+  z-index: 1;
+  font-size: 0.852rem;
+  letter-spacing: 0.03em;
+  color: var(--cyan);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.avatar-inner.user {
+  color: var(--magenta);
+  transform: translateY(1px);
+}
+
+.avatar .bolt {
+  width: 1.38rem;
+  height: 1.38rem;
+}
+
+
+
+.bubble {
+  padding: 0.1rem 0;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* the flex child must be allowed to shrink, or long code overflows */
+  min-width: 0;
+}
+
+.markdown {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.message.assistant .bubble {
+  white-space: normal;
+  /* all the remaining width -> code blocks always as wide, whatever their content */
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* The same technique as the old .new-chat button: a 1px border and a
+   clip-path, straight edges clipped 2px outside the box, so subpixel
+   rounding does not eat the hairline. The corner cuts (TL/BR) stay
+   open, no glow. */
+.message.user .bubble {
+  max-width: 75%;
+  background: rgba(234, 0, 217, 0.08);
+  border: 1px solid var(--magenta);
+  border-radius: 0;
+  padding: 0.6rem 0.9rem;
+  clip-path: polygon(-2px 14px, 14px -2px, calc(100% + 2px) -2px, calc(100% + 2px) calc(100% - 12px), calc(100% - 12px) calc(100% + 2px), -2px calc(100% + 2px));
+}
+
+.cursor {
+  animation: blink 1s step-start infinite;
+  color: var(--cyan);
+  text-shadow: 0 0 8px var(--cyan);
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Markdown in assistant bubbles */
+.markdown > :first-child { margin-top: 0; }
+.markdown > :last-child { margin-bottom: 0; }
+.markdown p { margin: 0.5em 0; }
+.markdown h1,
+.markdown h2,
+.markdown h3 {
+  margin: 0.8em 0 0.4em;
+  line-height: 1.3;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+.markdown h1 { font-size: 1.3em; }
+.markdown h2 { font-size: 1.15em; }
+.markdown h3 { font-size: 1.05em; }
+.markdown ul,
+.markdown ol { margin: 0.5em 0; padding-left: 1.4em; }
+.markdown li { margin: 0.2em 0; }
+.markdown li::marker { color: var(--magenta); }
+.markdown code {
+  background: #050e1c;
+  border: 1px solid #133e7c;
+  border-radius: 2px;
+  padding: 0.15em 0.35em;
+  font-size: 0.9em;
+  color: var(--yellow);
+}
+.markdown pre {
+  background: #050e1c;
+  border: 1px solid #133e7c;
+  border-left: 3px solid var(--cyan);
+  border-radius: 0;
+  padding: 0.8rem 1rem;
+  /* long lines: scroll horizontally instead of breaking the layout */
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 0.6em 0;
+  box-shadow: 0 0 14px rgba(10, 189, 198, 0.12);
+}
+
+.markdown pre code {
+  white-space: pre;
+}
+
+/* tool call chips (open to show params and output) */
+.tool-calls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.6rem;
+}
+
+.tool-call {
+  border: 1px solid #133e7c;
+  border-left: 3px solid var(--magenta);
+  background: #050e1c;
+  font-size: 0.8rem;
+}
+
+.tool-call summary {
+  cursor: pointer;
+  padding: 0.35rem 0.6rem;
+  color: var(--text-dim);
+  list-style: none;
+  user-select: none;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  overflow: hidden;
+}
+
+.tool-call summary .tool-name {
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+
+.tool-call summary .tool-args {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 0.75rem;
+  color: var(--cyan);
+}
+
+.tool-call summary::before {
+  content: '▸ ';
+  color: var(--magenta);
+}
+
+.tool-call[open] summary::before {
+  content: '▾ ';
+}
+
+.tool-call summary:hover .tool-name,
+.tool-call summary:hover .tool-args {
+  color: var(--cyan);
+}
+
+.tool-call pre {
+  /* the tool-body scrolls vertically, here only horizontally */
+  overflow-x: auto;
+}
+
+/* pending: the tool is running, a pulsing frame and a spinner */
+.tool-call.pending {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.35rem 0.6rem;
+  color: var(--text-dim);
+  border-left-color: var(--cyan);
+}
+
+/* pending: the parameters in the colour of finished tool calls (cyan),
+   with a moving streak of light through background-clip: text */
+.tool-call.pending .tool-args {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 0.75rem;
+  text-shadow: 0 0 10px rgba(10, 189, 198, 0.4);
+  background: linear-gradient(
+    90deg,
+    var(--cyan) 0%,
+    var(--cyan) 42%,
+    #eaffff 50%,
+    var(--cyan) 58%,
+    var(--cyan) 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  /* negative = the streak runs from left to right */
+  animation: shine 2.5s linear infinite;
+}
+
+@keyframes shine {
+  to { background-position: -200% center; }
+}
+
+.tool-call .tool-spinner {
+  flex-shrink: 0;
+  width: 0.65em;
+  height: 0.65em;
+  align-self: center;
+  border: 2px solid rgba(10, 189, 198, 0.25);
+  border-top-color: var(--cyan);
+  border-radius: 50%;
+  animation: tool-spin 0.7s linear infinite;
+}
+
+@keyframes tool-spin {
+  to { transform: rotate(360deg); }
+}
+
+.tool-call .tool-pending-label {
+  margin-left: auto;
+  margin-right: 1ch; /* one character of space to the right edge */
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--cyan);
+}
+
+/* animated dots in a fixed space -> the text does not move */
+.tool-call .tool-pending-label::after {
+  display: inline-block;
+  width: 2.2ch;
+  text-align: left;
+  content: '';
+  animation: running-dots 1.2s steps(1, end) infinite;
+}
+
+@keyframes running-dots {
+  0% { content: ''; }
+  25% { content: '.'; }
+  50% { content: '..'; }
+  75% { content: '...'; }
+  100% { content: ''; }
+}
+
+/* webfetch output may wrap */
+.tool-call pre.wrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-call .tool-body {
+  padding: 0 0.6rem 0.5rem;
+  /* opened content: bounded height, scrolls inside when needed */
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+.tool-call .tool-label {
+  color: var(--magenta);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin: 0.4rem 0 0.15rem;
+}
+
+.tool-call pre {
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  background: #071224;
+  border: 1px solid #133e7c;
+  overflow-x: auto;
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+  font-size: 0.78rem;
+  white-space: pre;
+  color: var(--text);
+}
+
+/* copy button in code blocks */
+.markdown pre {
+  position: relative;
+}
+
+.copy-btn {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  background: rgba(19, 62, 124, 0.85);
+  color: var(--text-dim);
+  border: 1px solid #133e7c;
+  font-family: inherit;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  padding: 0.25rem 0.6rem;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.markdown pre:hover .copy-btn,
+.copy-btn.copied {
+  opacity: 1;
+}
+
+.copy-btn:hover {
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
+
+.copy-btn.copied {
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
+.markdown code {
+  font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+}
+
+.markdown pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text);
+}
+
+/* github-dark brings its own background and padding -> neutralise them */
+.markdown pre code.hljs {
+  background: transparent;
+  padding: 0;
+}
+
+/* hljs syntax colours matched to the palette */
+.markdown .hljs-keyword,
+.markdown .hljs-selector-tag,
+.markdown .hljs-meta { color: #ea00d9; }
+.markdown .hljs-string,
+.markdown .hljs-regexp { color: #0abdc6; }
+.markdown .hljs-number,
+.markdown .hljs-literal,
+.markdown .hljs-symbol { color: #c77dff; }
+.markdown .hljs-comment,
+.markdown .hljs-quote { color: #5a6f9a; font-style: italic; }
+.markdown .hljs-title,
+.markdown .hljs-title.function_,
+.markdown .hljs-section { color: #7ee7ee; }
+.markdown .hljs-title.class_,
+.markdown .hljs-type { color: #c77dff; }
+.markdown .hljs-attr,
+.markdown .hljs-attribute,
+.markdown .hljs-variable,
+.markdown .hljs-template-variable { color: #d6f5ff; }
+.markdown .hljs-built_in,
+.markdown .hljs-name { color: #8899ff; }
+.markdown a { color: var(--magenta); }
+.markdown blockquote {
+  border-left: 3px solid var(--magenta);
+  margin: 0.5em 0;
+  padding-left: 0.8em;
+  color: var(--text-dim);
+}
+.markdown table { border-collapse: collapse; margin: 0.6em 0; width: 100%; }
+.markdown th,
+.markdown td { border: 1px solid #133e7c; padding: 0.3em 0.6em; }
+.markdown th { color: var(--cyan); text-transform: uppercase; letter-spacing: 0.05em; }
+.markdown strong { color: var(--yellow); }
+
+.composer {
+  position: relative;
+  z-index: 10;
+  margin-top: auto;
+  display: flex;
+  gap: 0.5rem;
+  padding: 1rem 1rem calc(1rem + env(safe-area-inset-bottom, 0px));
+  align-items: flex-end;
+}
+
+.composer textarea {
+  flex: 1;
+  resize: none;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid #133e7c;
+  border-radius: 0;
+  padding: 0.75rem 1rem;
+  font: inherit;
+  max-height: 200px;
+  /* the JS sets overflow-y: auto once max-height is reached */
+  overflow-y: hidden;
+  line-height: 1.5;
+  transition: box-shadow 0.15s ease, border-color 0.15s ease;
+}
+
+.composer textarea::placeholder {
+  color: var(--text-dim);
+}
+
+.composer textarea:focus {
+  outline: none;
+  border-color: var(--cyan);
+  box-shadow:
+    0 0 12px rgba(10, 189, 198, 0.35),
+    inset 0 0 8px rgba(10, 189, 198, 0.08);
+}
+
+.composer button {
+  background: transparent;
+  color: var(--cyan);
+  border: 1px solid var(--cyan);
+  border-radius: 0;
+  width: 3rem;
+  height: 3rem;
+  font-size: 1.1rem;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s ease;
+  /* clip 2px outside the edge, or clip-path eats the 1px border as soon
+     as the height lands on a subpixel */
+  clip-path: polygon(-2px 10px, 10px -2px, calc(100% + 2px) -2px, calc(100% + 2px) calc(100% - 8px), calc(100% - 8px) calc(100% + 2px), -2px calc(100% + 2px));
+}
+
+.composer button:hover:not(:disabled) {
+  background: rgba(10, 189, 198, 0.12);
+  box-shadow: 0 0 14px rgba(10, 189, 198, 0.5);
+}
+
+.composer button:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* stop button while streaming */
+.composer button.stop {
+  color: var(--magenta);
+  border-color: var(--magenta);
+  animation: stoppulse 1.2s ease-in-out infinite;
+}
+
+.composer button.stop:hover {
+  background: rgba(234, 0, 217, 0.12);
+  box-shadow: 0 0 14px rgba(234, 0, 217, 0.5);
+}
+
+@keyframes stoppulse {
+  50% {
+    box-shadow: 0 0 10px rgba(234, 0, 217, 0.45);
+  }
+}

@@ -25,7 +25,9 @@ path = [
     "proto/**/*.proto",
     "go/go.mod",
     "go/go.sum",
-    "go/gen/**"
+    "go/gen/**",
+    "fechat/backend/go.mod",
+    "fechat/backend/go.sum"
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "SAP SE or an SAP affiliate company and IronCore contributors"
