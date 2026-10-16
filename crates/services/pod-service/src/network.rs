@@ -586,8 +586,8 @@ impl Network {
     }
 
     /// Takes a deleted pod off the network: its resolver, its TAP device
-    /// with its routes and its proxy ARP, and the connections its IPv4
-    /// address has in connection tracking, so that the next pod with the
+    /// with its routes and its proxy ARP, and the connections its addresses
+    /// have in connection tracking, so that the next pod with its IPv4
     /// address finds none of them. Before the pod leaves the directory, so
     /// that their ends are recorded as the pod's.
     pub async fn detach(&self, info: &PodInfo) -> io::Result<()> {
@@ -601,21 +601,25 @@ impl Network {
             }
             _ => None,
         };
+        let ipv6 = match (&self.parts, info.ipv6_address.parse::<Ipv6Addr>()) {
+            (Ok(parts), Ok(address)) if parts.ipv6.contains(address) => Some(address),
+            _ => None,
+        };
         let tap = tap_name(&info.pod_id);
         microvm_service::vmm::jail::tap::delete(&tap)
             .map_err(|e| io::Error::new(e.kind(), format!("delete {tap}: {e}")))?;
-        let Some(ipv4) = ipv4 else {
-            return Ok(());
-        };
-        let deleted =
-            tokio::task::spawn_blocking(move || traffic_service::delete_connections(ipv4.into()))
-                .await
-                .map_err(io::Error::other)
-                .and_then(|deleted| deleted);
-        match deleted {
-            Ok(0) => {}
-            Ok(n) => info!("Network: Deleted {n} connections of {ipv4}"),
-            Err(e) => warn!("Network: Failed to delete the connections of {ipv4}: {e}"),
+        let addresses = ipv4.map(IpAddr::V4).into_iter().chain(ipv6.map(IpAddr::V6));
+        for address in addresses {
+            let deleted =
+                tokio::task::spawn_blocking(move || traffic_service::delete_connections(address))
+                    .await
+                    .map_err(io::Error::other)
+                    .and_then(|deleted| deleted);
+            match deleted {
+                Ok(0) => {}
+                Ok(n) => info!("Network: Deleted {n} connections of {address}"),
+                Err(e) => warn!("Network: Failed to delete the connections of {address}: {e}"),
+            }
         }
         Ok(())
     }

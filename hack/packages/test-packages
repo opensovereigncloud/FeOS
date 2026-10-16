@@ -363,11 +363,15 @@ contains -F "169.254.169.254" <<<"${records}" &&
   fail "a packet to the metadata service reached the node: ${records}"
 log "nftables has the pods' sets, chains and masquerade; feosctl traffic watch shows DNS, flows of both families with the pods' own addresses, drops and server names"
 
-# Deleting a pod deletes its TAP device and the connections of its IPv4
-# address, which comes round again only after the never used ones.
+# Deleting a pod deletes its TAP device and the connections of its
+# addresses; its IPv4 address comes round again only after the never used
+# ones.
 in_client curl -sS -m 10 -o /dev/null http://1.1.1.1/ || true
+in_client curl -sS -m 5 -o /dev/null "http://[${server_address}]:8080/" || true
 in_node conntrack -L -s "${client_ipv4}" 2>/dev/null | contains "src=${client_ipv4}" ||
   fail "no connections of ${client_ipv4} to be deleted"
+in_node conntrack -L -f ipv6 -s "${client_address}" 2>/dev/null | contains "src=${client_address}" ||
+  fail "no connections of ${client_address} to be deleted"
 for id in "${client}" "${server}"; do
   in_node feosctl pod delete "${id}" >/dev/null
 done
@@ -379,6 +383,8 @@ done
 in_node ip neigh show proxy | contains -E "pod-(33333333|44444444)" && fail "a deleted pod's proxy entry stays"
 in_node conntrack -L -s "${client_ipv4}" 2>/dev/null | contains "src=${client_ipv4}" &&
   fail "the deleted pod's connections stay: $(in_node conntrack -L -s "${client_ipv4}" 2>&1)"
+in_node conntrack -L -f ipv6 -s "${client_address}" 2>/dev/null | contains "src=${client_address}" &&
+  fail "the deleted pod's IPv6 connections stay: $(in_node conntrack -L -f ipv6 -s "${client_address}" 2>&1)"
 next=55555555-3333-4444-5555-666666666666
 in_node feosctl pod create --pod-id "${next}" --memory 256 --wait >/dev/null ||
   fail "pod ${next} did not come up: $(in_node feosctl pod get "${next}")"
