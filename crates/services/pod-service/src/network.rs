@@ -23,6 +23,7 @@ use feos_proto::pod_service::{PodInfo, PodNetwork, PodSpec};
 use feos_utils::nft::{self, Family, Table};
 use log::{error, info, warn};
 use network_service::{compile, delta, Delta, Policy, Prefix, SecurityGroups};
+use rtnetlink::Handle;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -57,6 +58,12 @@ pub const DNS_UPSTREAMS: [&str; 4] = [
 pub const RECORDS: usize = 4096;
 /// The bridge of the first version of the network, with IPv4 on it.
 const OLD_BRIDGE: &str = "feos-pods";
+/// The NAT64 version's translator: its device, with its routes and its
+/// program, the maps it pinned, and the counter of its IPv4 pool in the
+/// pods' directory.
+const OLD_NAT64_DEVICE: &str = "feos-nat64";
+const OLD_NAT64_PINS: &str = "/sys/fs/bpf/feos/nat64";
+const OLD_NAT64_COUNTER: &str = "next-address";
 /// How often the network's setup is tried, and how long apart.
 const SET_UP_ATTEMPTS: u32 = 3;
 const SET_UP_PAUSE: Duration = Duration::from_secs(1);
@@ -218,10 +225,10 @@ struct Parts {
 
 impl Network {
     /// Sets the node up for pods: removes the first version's bridge and
-    /// tables, turns forwarding on, routes the pod prefix as unreachable,
-    /// and gives the resolver its address and sockets. A failure is logged,
-    /// and fails the pods with a network from then on: feosd goes on
-    /// serving the others.
+    /// tables and the NAT64 version's translator, turns forwarding on,
+    /// routes the pod prefix as unreachable, and gives the resolver its
+    /// address and sockets. A failure is logged, and fails the pods with a
+    /// network from then on: feosd goes on serving the others.
     pub async fn start(
         config: Config,
         dir: &Path,
@@ -246,7 +253,7 @@ impl Network {
                 }
             },
             None => {
-                if let Err(e) = remove_old_network(true).await {
+                if let Err(e) = remove_old_network(true, dir).await {
                     warn!("Network: Failed to remove the IPv4 network: {e}");
                 }
                 warn!("Network: No --pod-prefix: pods with a network fail");
@@ -704,7 +711,7 @@ async fn set_up(
     records: &broadcast::Sender<TrafficRecord>,
 ) -> io::Result<Parts> {
     config.check().map_err(io::Error::other)?;
-    remove_old_network(false).await?;
+    remove_old_network(false, dir).await?;
     let handle = devices::connect().await?;
     devices::enable_forwarding()?;
     devices::route_unreachable(&handle, prefix, len).await?;
@@ -768,8 +775,8 @@ async fn set_up_again(
 /// Removes the first version of the network: its bridge and the table
 /// `bridge feos`, on a node whose kernel has the bridge family; with
 /// `inet`, the table `inet feos` too, which a working network replaces
-/// anyway.
-async fn remove_old_network(inet: bool) -> io::Result<()> {
+/// anyway. Removes what the NAT64 version left, too.
+async fn remove_old_network(inet: bool, dir: &Path) -> io::Result<()> {
     match nft::delete(Family::Bridge, TABLE) {
         Ok(()) => {}
         // No bridge family, as in feos-host-init's kernel.
@@ -784,7 +791,52 @@ async fn remove_old_network(inet: bool) -> io::Result<()> {
     if devices::delete_link(&handle, OLD_BRIDGE).await? {
         info!("Network: Removed the bridge {OLD_BRIDGE} of the IPv4 network");
     }
+    remove_old_nat64(&handle, Path::new(OLD_NAT64_PINS), dir).await;
     Ok(())
+}
+
+/// Removes what the NAT64 version left on the node: its device, which
+/// takes its routes and its program with it, the maps pinned in `pins`,
+/// and the counter of its IPv4 pool in `dir`. A failure is logged.
+async fn remove_old_nat64(handle: &Handle, pins: &Path, dir: &Path) {
+    match devices::delete_link(handle, OLD_NAT64_DEVICE).await {
+        Ok(true) => info!("Network: Removed the device {OLD_NAT64_DEVICE} of NAT64"),
+        Ok(false) => {}
+        Err(e) => warn!("Network: Failed to remove the device {OLD_NAT64_DEVICE}: {e}"),
+    }
+    remove_old_pins(pins);
+    match std::fs::remove_file(dir.join(OLD_NAT64_COUNTER)) {
+        Ok(()) => info!("Network: Removed the counter of NAT64's IPv4 pool"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => warn!("Network: Failed to remove the counter of NAT64's IPv4 pool: {e}"),
+    }
+}
+
+/// Removes the maps that NAT64 pinned in `dir` on the bpf filesystem, the
+/// directory, and its parent if that is empty then. Unlinking a pin needs
+/// no bpf(2): the kernel frees a map that nothing holds.
+fn remove_old_pins(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) => {
+            warn!("Network: Failed to read {}: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            warn!("Network: Failed to remove {}: {e}", entry.path().display());
+        }
+    }
+    match std::fs::remove_dir(dir) {
+        Ok(()) => info!("Network: Removed NAT64's maps in {}", dir.display()),
+        Err(e) => warn!("Network: Failed to remove {}: {e}", dir.display()),
+    }
+    if let Some(parent) = dir.parent() {
+        // Another program's pins may be there.
+        let _ = std::fs::remove_dir(parent);
+    }
 }
 
 /// Whether the record is the flow of a pod's query to the resolver, which
@@ -1283,5 +1335,66 @@ mod tests {
         // What was left out counts as missed.
         assert_eq!(record.missed, 3);
         assert!(records.try_recv().is_err());
+    }
+
+    #[test]
+    fn nat64s_pins_go() {
+        let bpffs = tempfile::tempdir().unwrap();
+        let feos = bpffs.path().join("feos");
+        let pins = feos.join("nat64");
+        fs::create_dir_all(&pins).unwrap();
+        for map in ["nat64_pod_ipv4", "nat64_ipv4_pod", "nat64_stats"] {
+            fs::write(pins.join(map), "").unwrap();
+        }
+        // Another program's pins keep the parent.
+        fs::write(feos.join("other"), "").unwrap();
+        remove_old_pins(&pins);
+        assert!(!pins.exists());
+        assert!(feos.join("other").exists());
+
+        fs::remove_file(feos.join("other")).unwrap();
+        fs::create_dir(&pins).unwrap();
+        remove_old_pins(&pins);
+        assert!(!feos.exists());
+        // Nothing to remove.
+        remove_old_pins(&pins);
+    }
+
+    /// Removes a NAT64 device, its pins and its counter. Needs
+    /// CAP_NET_ADMIN, in a network namespace of its own:
+    /// `sudo unshare -n <the test binary> --ignored nat64s_device_goes`.
+    #[tokio::test]
+    #[ignore]
+    async fn nat64s_device_goes() {
+        let alone = fs::read_to_string("/proc/self/net/dev").is_ok_and(|dev| {
+            dev.lines()
+                .skip(2)
+                .all(|line| line.trim_start().starts_with("lo:"))
+        });
+        assert!(alone, "run this in a network namespace of its own");
+        let handle = devices::connect().await.unwrap();
+        handle
+            .link()
+            .add(rtnetlink::LinkDummy::new(OLD_NAT64_DEVICE).build())
+            .execute()
+            .await
+            .unwrap();
+        let bpffs = tempfile::tempdir().unwrap();
+        let pins = bpffs.path().join("feos/nat64");
+        fs::create_dir_all(&pins).unwrap();
+        fs::write(pins.join("nat64_stats"), "").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(OLD_NAT64_COUNTER), "10.200.0.9").unwrap();
+        fs::write(dir.path().join("next-ipv6-address"), "7").unwrap();
+
+        remove_old_nat64(&handle, &pins, dir.path()).await;
+        assert!(!devices::delete_link(&handle, OLD_NAT64_DEVICE)
+            .await
+            .unwrap());
+        assert!(!bpffs.path().join("feos").exists());
+        assert!(!dir.path().join(OLD_NAT64_COUNTER).exists());
+        assert!(dir.path().join("next-ipv6-address").exists());
+        // Again, with nothing left.
+        remove_old_nat64(&handle, &pins, dir.path()).await;
     }
 }

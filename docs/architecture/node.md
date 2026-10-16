@@ -198,7 +198,10 @@ At its start `feosd`:
 
 1. removes the first version's network: the bridge `feos-pods` and the
    table `bridge feos` (a kernel without the bridge family, as
-   `feos-host-init`'s, has none to remove);
+   `feos-host-init`'s, has none to remove); and what the NAT64 version
+   left: the device `feos-nat64` with its routes and its program, the
+   maps pinned in `/sys/fs/bpf/feos/nat64`, and the counter of its IPv4
+   pool, `/var/lib/feos/pods/next-address`;
 2. turns IPv4 and IPv6 forwarding on; interfaces that take router
    advertisements (`accept_ra` 1) go on taking them (2);
 3. routes the pod prefix as `unreachable`: a packet for a pod that is not
