@@ -139,14 +139,18 @@ message VmConfig {
   // The guest's data volume, which it mounts at /var/lib/feos: a pod's
   // disk from diskd. Unset, the guest keeps its data in memory.
   DataDiskConfig data_disk = 8;
+  // The pod's volumes (ADR 0016), each a disk from diskd, attached after
+  // the data disk in this order: Firecracker's drives volume0, volume1,
+  // ..., which the guest tells apart by their order.
+  repeated DataDiskConfig volumes = 9;
 }
 
 message DataDiskConfig {
   // A block device or a file on the node, or a link to one, as diskd's
   // <state>/live/<pod>/disk is: it is resolved again at every boot and
   // restore, since a device's number changes when it is started anew.
-  // Firecracker opens it in its jail, as /data, with a writeback cache,
-  // so that the guest's flushes reach it.
+  // Firecracker opens it in its jail, as /data or /volume<N>, with a
+  // writeback cache, so that the guest's flushes reach it.
   string path = 1;
 }
 

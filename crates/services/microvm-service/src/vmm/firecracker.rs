@@ -15,6 +15,7 @@
 //! - `vmlinuz`, `initramfs`: the guest's files, linked in
 //! - `data`: the data disk, a device node of the VM's own or a file
 //!   linked in
+//! - `volume0`, `volume1`, ...: the pod's volumes, the same way
 //! - `snapshot/`: the snapshot of a suspended VM (see `snapshot`)
 //! - `memory.sock`: where a userfaultfd handler serves the memory of a
 //!   snapshot written elsewhere
@@ -76,6 +77,8 @@ const VSOCK: &str = "v.sock";
 const VMM_LOG: &str = "vmm.log";
 /// The data disk in the jail.
 const DATA_DISK: &str = "data";
+/// A volume in the jail, and its drive: `volume<N>`.
+const VOLUME_DISK: &str = "volume";
 
 /// How a VMM process ended: its exit code, 128 + the signal when signalled,
 /// or `None` when it was not this process's child and the code is unknown.
@@ -249,18 +252,31 @@ fn firecracker_config(
     // A writeback cache, so that the guest's flushes reach the device: a
     // pod's disk is written back to its top in diskd only then.
     let mut drives = Vec::new();
+    let mut drive = |id: String, path: &str| {
+        drives.push(json!({
+            "drive_id": id,
+            "path_on_host": link(PathBuf::from(path), id.clone(), true),
+            "is_root_device": false,
+            "is_read_only": false,
+            "cache_type": "Writeback",
+        }));
+    };
     if let Some(disk) = config
         .data_disk
         .as_ref()
         .filter(|disk| !disk.path.is_empty())
     {
-        drives.push(json!({
-            "drive_id": DATA_DISK,
-            "path_on_host": link(PathBuf::from(&disk.path), DATA_DISK.to_string(), true),
-            "is_root_device": false,
-            "is_read_only": false,
-            "cache_type": "Writeback",
-        }));
+        drive(DATA_DISK.to_string(), &disk.path);
+    }
+    // Firecracker attaches the drives in this order, and the guest tells
+    // the volumes apart by it (ADR 0016).
+    for (index, volume) in config.volumes.iter().enumerate() {
+        if volume.path.is_empty() {
+            return Err(VmmError::InvalidConfig(format!(
+                "volume {index} has no disk"
+            )));
+        }
+        drive(format!("{VOLUME_DISK}{index}"), &volume.path);
     }
 
     let (vcpus, memory_mib) = machine_size(config);
@@ -1106,6 +1122,59 @@ mod tests {
             PathBuf::from("/var/lib/feos/disk/live/pod/disk")
         );
         assert!(disk.disk && disk.name == "data");
+    }
+
+    #[test]
+    fn volumes_follow_the_data_disk_in_their_order() {
+        let image = image(&["vmlinuz", "initramfs"]);
+        let disk = |path: &str| DataDiskConfig {
+            path: path.to_string(),
+        };
+        let config = VmConfig {
+            data_disk: Some(disk("/var/lib/feos/disk/live/pod/disk")),
+            volumes: vec![
+                disk("/var/lib/feos/disk/live/volume-a/disk"),
+                disk("/var/lib/feos/disk/live/volume-b/disk"),
+            ],
+            ..Default::default()
+        };
+        let (fc, links) = firecracker_config(&config, image.path()).unwrap();
+        let drives: Vec<_> = fc["drives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|drive| {
+                (
+                    drive["drive_id"].as_str().unwrap(),
+                    drive["path_on_host"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            drives,
+            [
+                ("data", "/data"),
+                ("volume0", "/volume0"),
+                ("volume1", "/volume1")
+            ]
+        );
+        assert!(fc["drives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|drive| drive["cache_type"] == "Writeback" && drive["is_read_only"] == false));
+        let volume = links.last().unwrap();
+        assert_eq!(
+            volume.source,
+            PathBuf::from("/var/lib/feos/disk/live/volume-b/disk")
+        );
+        assert!(volume.disk && volume.name == "volume1");
+
+        let config = VmConfig {
+            volumes: vec![disk("")],
+            ..Default::default()
+        };
+        assert!(firecracker_config(&config, image.path()).is_err());
     }
 
     #[test]
