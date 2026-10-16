@@ -62,6 +62,11 @@ to `169.254.0.53:53` before the node holds the address (`IP_FREEBIND`),
 keeps them, and hands them to every `feosd` it starts, as systemd would
 ([DNS](#dns)). It serves no API and logs to `/dev/kmsg`.
 
+`make test-host` boots the host kernel in QEMU: the tests of `feosd`'s
+network against the kernel, then the node on QEMU's user network, with
+a pod prefix from the kernel's command line, and with `PODS=1` a pod on
+it that reaches the internet.
+
 On a distribution all of this is the operating system's
 ([ADR 0009](../adr/0009-node-os-and-packages.md)).
 

@@ -359,7 +359,7 @@ pub async fn node_addresses(handle: &Handle) -> io::Result<Vec<IpAddr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtnetlink::packet_route::link::LinkAttribute;
+    use rtnetlink::packet_route::link::{LinkAttribute, State};
     use rtnetlink::packet_route::neighbour::{
         NeighbourAddress, NeighbourAttribute, NeighbourState,
     };
@@ -477,10 +477,12 @@ mod tests {
     /// holds the pod's IPv4 /32 and routes everything via the gateway on
     /// its link, as feos-guest does. It sends `OUTSIDE` a packet and
     /// returns how long the gateway's MAC address took to resolve, and
-    /// what it resolved to.
+    /// what it resolved to. The node says when the link is here, and when
+    /// its end is up after the guest's (`up`).
     fn guest(
         namespace: mpsc::Sender<File>,
         link_is_here: mpsc::Receiver<()>,
+        up: mpsc::Sender<()>,
     ) -> io::Result<(Duration, Vec<u8>)> {
         // A thread's own network namespace: the node's stays the process's.
         if unsafe { libc::unshare(libc::CLONE_NEWNET) } != 0 {
@@ -497,7 +499,9 @@ mod tests {
             let handle = connect().await?;
             let index = index(&handle, "eth0").await?;
             add_address(&handle, index, POD.ipv4.into(), 32).await?;
-            up(&handle, index, "eth0").await?;
+            super::up(&handle, index, "eth0").await?;
+            up.send(()).map_err(io::Error::other)?;
+            link_is_here.recv().map_err(io::Error::other)?;
             let on_link = RouteMessageBuilder::<Ipv4Addr>::new()
                 .destination_prefix(POD.gateway4, 32)
                 .scope(RouteScope::Link)
@@ -599,7 +603,8 @@ mod tests {
             .unwrap();
         let (namespace, from_guest) = mpsc::channel();
         let (link_is_here, to_guest) = mpsc::channel();
-        let guest = std::thread::spawn(move || guest(namespace, to_guest));
+        let (guest_up, guest_is_up) = mpsc::channel();
+        let guest = std::thread::spawn(move || guest(namespace, to_guest, guest_up));
         let namespace = from_guest.recv().unwrap();
         let peer = index(&handle, "eth0").await.unwrap();
         handle
@@ -639,9 +644,30 @@ mod tests {
             assert_eq!(read(&format!("/proc/sys/net/{path}")), value, "{path}");
         }
 
+        // Until the kernel has the node's end up after the guest's, which
+        // it does a moment later, the node's answers do not leave. A pod's
+        // TAP device is up long before its guest asks.
+        link_is_here.send(()).unwrap();
+        guest_is_up.recv().unwrap();
+        let start = Instant::now();
+        while !link(&handle, "pod-test")
+            .await
+            .unwrap()
+            .is_some_and(|link| {
+                link.attributes
+                    .contains(&LinkAttribute::OperState(State::Up))
+            })
+        {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "pod-test is not up"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        link_is_here.send(()).unwrap();
+
         // The guest asks for its gateway, and the node answers by proxy,
         // at once, with the TAP device's MAC address.
-        link_is_here.send(()).unwrap();
         let (took, mac) = guest.join().unwrap().unwrap();
         let device = link(&handle, "pod-test").await.unwrap().unwrap();
         let tap_mac = device

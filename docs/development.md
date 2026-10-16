@@ -121,6 +121,15 @@ use) and `protoc`; for the guest also `musl-gcc` and the kernel's headers
     make diskd-lab             # diskd's lab tests: ublk, recovery, writes,
                                # flatten, S3; needs sudo and fio, S3 from the env
 
+    make kernel                # the host kernel: target/kernel/;
+                               # REBUILD_KERNEL=1 builds it again
+    make initramfs             # FeOS as the node's operating system:
+                               # target/initramfs.zst
+    make test-host             # boot the host kernel in QEMU: the kernel's
+                               # tests, then the node on QEMU's user network,
+                               # PODS=1 a pod on it; needs /dev/kvm,
+                               # qemu-system-x86_64, docker
+
 Build release artifacts per package (`cargo build -p <crate>`), never with
 `--workspace`: a workspace build unifies the features of all crates into every
 binary.
@@ -130,7 +139,8 @@ Tests against the kernel need root and are ignored by default: those of
 `pod-service` (in a network namespace of their own, `unshare -n`, with
 `nft` in `$NFT`), of
 `traffic-service`, which make their namespaces, and of the guest's network
-push. Their modules say how to run them, with `--ignored`.
+push. Their modules say how to run them, with `--ignored`. `make test-host`
+runs those of the node in the host kernel.
 
 ## Rules
 

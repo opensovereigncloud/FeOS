@@ -17,3 +17,7 @@ initramfs: target/firecracker/firecracker guest container-release
 	sudo chown -R `whoami` target/rootfs/etc/feos/
 	cd target/rootfs && rm -f init && ln -s usr/sbin/feos-host-init init
 	docker run --rm -u $${UID} -v "`pwd`:/feos" feos-builder bash -c "cd hack/initramfs && ./mk-initramfs"
+
+.PHONY: test-host
+test-host: ## Boot the host kernel in QEMU: its kernel tests, then the node (after make kernel initramfs).
+	hack/initramfs/test-host
