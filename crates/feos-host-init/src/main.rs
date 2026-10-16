@@ -36,6 +36,7 @@ async fn main() {
     leave_initramfs();
     kmsg::init();
     mount_virtual_filesystems();
+    kmsg::lift_limit();
     info!(
         "feos-host-init {} is setting the machine up",
         feos_utils::version::full_version_string()

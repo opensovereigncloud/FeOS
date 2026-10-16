@@ -22,6 +22,18 @@ pub fn init() {
     }
 }
 
+/// Lifts the kernel's limit on writes to /dev/kmsg, ten records in five
+/// seconds per open file, past which it drops the rest and says so only
+/// when the file is closed, which this logger never does. A
+/// `printk.devkmsg=` on the kernel's command line locks the setting and
+/// keeps the limit.
+pub fn lift_limit() {
+    // The kernel wants the newline, and refuses "on" without it.
+    if let Err(e) = std::fs::write("/proc/sys/kernel/printk_devkmsg", "on\n") {
+        log::warn!("The kernel's log keeps its limit on our writes: {e}");
+    }
+}
+
 /// The syslog priority of a level.
 fn priority(level: Level) -> u8 {
     match level {

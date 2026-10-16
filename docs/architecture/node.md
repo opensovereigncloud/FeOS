@@ -60,7 +60,8 @@ delegated, which it also routes as unreachable. It starts each again a
 second after it ends. It binds the pods' resolver's UDP and TCP sockets
 to `169.254.0.53:53` before the node holds the address (`IP_FREEBIND`),
 keeps them, and hands them to every `feosd` it starts, as systemd would
-([DNS](#dns)). It serves no API and logs to `/dev/kmsg`.
+([DNS](#dns)). It serves no API and logs to `/dev/kmsg`, whose limit of
+ten records in five seconds it lifts (`kernel.printk_devkmsg=on`).
 
 `make test-host` boots the host kernel in QEMU: the tests of `feosd`'s
 network against the kernel, then the node on QEMU's user network, with

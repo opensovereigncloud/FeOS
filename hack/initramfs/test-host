@@ -194,10 +194,12 @@ node_stage() {
     }
     log "ok: ${check}"
   done
-  # Nothing ended and was started again, and the pods' network is whole.
+  # Nothing ended and was started again, the kernel's log takes every
+  # line, and the pods' network is whole.
   sleep 5
   for check in \
     'exited with code' \
+    "The kernel's log keeps its limit" \
     "The pods' network is not set up" \
     'pods with a network fail'; do
     if grep -E -- "${check}" "${serial}"; then
