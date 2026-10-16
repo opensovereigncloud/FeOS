@@ -1,0 +1,274 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"errors"
+	"flag"
+	"log/slog"
+	"net/netip"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+func env(m map[string]string) func(string) string {
+	return func(k string) string { return m[k] }
+}
+
+const testURL = "postgres://u:p@db:5432/ferun"
+
+// Without flags or variables, every default of §3.
+func TestDefaults(t *testing.T) {
+	t.Parallel()
+	c, err := Parse([]string{"--database-url", testURL}, env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Default()
+	want.DatabaseURL = testURL
+	want.AdminUsers = map[string]string{}
+	if !reflect.DeepEqual(c, want) {
+		t.Fatalf("got\n%+v\nwant\n%+v", c, want)
+	}
+	for name, got := range map[string]any{
+		"listen": c.Listen, "node-listen": c.NodeListen, "trust-domain": c.TrustDomain, "ca-dir": c.CADir,
+		"oidc-client-id": c.OIDCClientID, "oidc-admin-group": c.OIDCAdminGroup, "session-ttl": c.SessionTTL,
+		"default-image": c.DefaultImage, "default-vcpus": c.DefaultVCPUs, "default-memory-mib": c.DefaultMemoryMiB,
+		"placement": c.Placement, "disk-budget": c.DiskBudget, "idle-pause": c.IdlePause, "hibernate-after": c.HibernateAfter,
+		"node-ttl": c.NodeTTL, "lost-grace": c.LostGrace, "node-wait": c.NodeWait, "rollout-grace": c.RolloutGrace,
+		"drain-timeout": c.DrainTimeout, "pending-repair-after": c.PendingRepairAfter,
+		"unreachable-repair-after": c.UnreachableRepairAfter, "node-cert-ttl": c.NodeCertTTL, "pod-cert-ttl": c.PodCertTTL,
+		"node-max-streams": c.NodeMaxStreams, "conn-drain-timeout": c.ConnDrainTimeout, "shutdown-grace": c.ShutdownGrace,
+		"activity-retention": c.ActivityRetention, "traffic-retention": c.TrafficRetention, "log-level": c.LogLevel,
+		"oidc-scopes": strings.Join(c.OIDCScopes, " "),
+	} {
+		wantV := map[string]any{
+			"listen": ":8100", "node-listen": ":7443", "trust-domain": "feos.local", "ca-dir": "/etc/ferun/ca",
+			"oidc-client-id": "ferun", "oidc-admin-group": "admins", "session-ttl": 12 * time.Hour,
+			"default-image": "ghcr.io/maltej/debian-ai:latest", "default-vcpus": 2, "default-memory-mib": 512,
+			"placement": "binpack", "disk-budget": int64(4 << 30), "idle-pause": 10 * time.Second,
+			"hibernate-after": time.Duration(0), "node-ttl": 15 * time.Second, "lost-grace": 10 * time.Minute,
+			"node-wait": 5 * time.Second, "rollout-grace": 30 * time.Second, "drain-timeout": time.Hour,
+			"pending-repair-after": 10 * time.Minute, "unreachable-repair-after": 2 * time.Minute,
+			"node-cert-ttl": 168 * time.Hour, "pod-cert-ttl": time.Hour, "node-max-streams": 1024,
+			"conn-drain-timeout": 20 * time.Minute, "shutdown-grace": 10 * time.Minute,
+			"activity-retention": 720 * time.Hour, "traffic-retention": 168 * time.Hour, "log-level": slog.LevelInfo,
+			"oidc-scopes": "openid profile email",
+		}[name]
+		if !reflect.DeepEqual(got, wantV) {
+			t.Errorf("--%s default %v, want %v", name, got, wantV)
+		}
+	}
+	if c.ReadinessDelay != 5*time.Second || c.ReadyWindow != 30*time.Second {
+		t.Errorf("readiness %v %v", c.ReadinessDelay, c.ReadyWindow)
+	}
+}
+
+// The lab deployment's variables (deploy/k3s/ferun/ferund.yaml), each of
+// them read.
+func TestDeploymentEnv(t *testing.T) {
+	t.Parallel()
+	got, err := Parse(nil, env(map[string]string{
+		"FERUN_DATABASE_URL":            testURL,
+		"FERUN_LISTEN":                  ":8100",
+		"FERUN_NODE_LISTEN":             ":7443",
+		"FERUN_NODE_ADVERTISE_ADDRESS":  "10.42.0.7:7443",
+		"FERUN_TRUST_DOMAIN":            "run.fecode.dev",
+		"FERUN_CA_DIR":                  "/etc/ferun/ca",
+		"FERUN_HIBERNATE_AFTER":         "2m",
+		"FERUN_SHUTDOWN_GRACE":          "2m",
+		"FERUN_PUBLIC_URL":              "https://run.fecode.dev",
+		"FERUN_OIDC_ISSUER":             "https://id.fecode.dev/",
+		"FERUN_OIDC_CLIENT_ID":          "client-123",
+		"FERUN_OIDC_CLIENT_SECRET_FILE": "/etc/ferun/oidc/secret",
+		"FERUN_OIDC_ADMIN_GROUP":        "admins",
+		"FERUN_SESSION_TTL":             "12h",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DatabaseURL != testURL || got.Listen != ":8100" || got.NodeListen != ":7443" ||
+		got.NodeAdvertiseAddress != "10.42.0.7:7443" || got.TrustDomain != "run.fecode.dev" || got.CADir != "/etc/ferun/ca" ||
+		got.HibernateAfter != 2*time.Minute || got.ShutdownGrace != 2*time.Minute || got.PublicURL != "https://run.fecode.dev" ||
+		got.OIDCIssuer != "https://id.fecode.dev/" || got.OIDCClientID != "client-123" ||
+		got.OIDCClientSecretFile != "/etc/ferun/oidc/secret" || got.OIDCAdminGroup != "admins" || got.SessionTTL != 12*time.Hour {
+		t.Fatalf("parsed %+v", got)
+	}
+}
+
+// A flag wins over its variable, a variable over the default; lists,
+// sizes, admin users, scopes and the log level parse.
+func TestFlagsAndEnv(t *testing.T) {
+	t.Parallel()
+	c, err := Parse([]string{
+		"--database-url", testURL, "--listen", "127.0.0.1:0", "--node-server-names", "a.ferun.x,b.ferun.x",
+		"--node-server-names", "c.ferun.x", "--deny-prefix", "10.0.0.0/8", "--admin-users", "a:p:with:colons, b:q ",
+		"--oidc-scopes", "openid  groups", "--bindings", "--disk-budget", "2GiB",
+	}, env(map[string]string{
+		"FERUN_LISTEN":              ":9999", // the flag wins
+		"FERUN_PLACEMENT":           "spread",
+		"FERUN_DENY_PREFIX":         "192.168.0.0/16", // the flag wins
+		"FERUN_MCP_ALLOWED_ORIGINS": "https://a.example, https://b.example",
+		"FERUN_IDLE_PAUSE":          "0",
+		"FERUN_LOG_LEVEL":           "debug",
+		"FERUN_DEFAULT_VCPUS":       "4",
+		"FERUN_BOOTSTRAP_TOKEN":     "tok",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen != "127.0.0.1:0" || c.Placement != "spread" || c.IdlePause != 0 || c.LogLevel != slog.LevelDebug ||
+		c.DefaultVCPUs != 4 || c.BootstrapToken != "tok" || !c.Bindings || c.DiskBudget != 2<<30 {
+		t.Fatalf("parsed %+v", c)
+	}
+	if strings.Join(c.NodeServerNames, ",") != "a.ferun.x,b.ferun.x,c.ferun.x" {
+		t.Fatalf("names %v", c.NodeServerNames)
+	}
+	if !reflect.DeepEqual(c.DenyPrefixes, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}) {
+		t.Fatalf("deny %v", c.DenyPrefixes)
+	}
+	if !reflect.DeepEqual(c.AdminUsers, map[string]string{"a": "p:with:colons", "b": "q"}) {
+		t.Fatalf("admins %v", c.AdminUsers)
+	}
+	if strings.Join(c.MCPAllowedOrigins, "|") != "https://a.example|https://b.example" ||
+		strings.Join(c.OIDCScopes, ",") != "openid,groups" {
+		t.Fatalf("origins %v scopes %v", c.MCPAllowedOrigins, c.OIDCScopes)
+	}
+}
+
+// The refusals: missing, malformed or contradictory settings.
+func TestValidation(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		args []string
+		env  map[string]string
+		msg  string
+	}{
+		{nil, nil, "--database-url is required"},
+		{[]string{"--trust-domain", "Bad_Domain"}, nil, "--trust-domain"},
+		{[]string{"--placement", "random"}, nil, `--placement must be binpack or spread, not "random"`},
+		{[]string{"--default-vcpus", "64"}, nil, "--default-vcpus must be between 1 and 32"},
+		{[]string{"--default-memory-mib", "64"}, nil, "--default-memory-mib must be between 256 and 65536"},
+		{[]string{"--tls-cert", "c.pem"}, nil, "--tls-cert and --tls-key go together"},
+		{[]string{"--admin-users", "nopassword"}, nil, `--admin-users: "…" is not a user:password pair`},
+		{[]string{"--oidc-issuer", "https://id.example/"}, nil, "--public-url is required with --oidc-issuer"},
+		{[]string{"--oidc-issuer", "https://id.example/", "--public-url", "https://run.example"}, nil,
+			"--oidc-client-secret-file is required with --oidc-issuer"},
+		{[]string{"--oidc-issuer", "https://id.example/", "--public-url", "https://run.example", "--oidc-client-secret-file",
+			"s", "--oidc-scopes", "profile"}, nil, "--oidc-scopes must contain openid"},
+		{[]string{"--public-url", "https://run.example/app"}, nil, "--public-url"},
+		{[]string{"--node-advertise-address", "10.0.0.1"}, nil, `--node-advertise-address "10.0.0.1" is not host:port`},
+		{[]string{"--node-server-names", "10.0.0.1"}, nil, "is an IP address"},
+		{[]string{"--node-ttl", "0s"}, nil, "--node-ttl must be positive"},
+		{[]string{"--disk-budget", "4GB"}, nil, "is not a byte size"},
+		{nil, map[string]string{"FERUN_NODE_TTL": "soon"}, "FERUN_NODE_TTL"},
+		{[]string{"extra"}, nil, `unexpected arguments ["extra"]`},
+	} {
+		args := c.args
+		if !(len(args) > 0 && args[0] == "extra") && c.msg != "--database-url is required" {
+			args = append([]string{"--database-url", testURL}, args...)
+		}
+		_, err := Parse(args, env(c.env))
+		if err == nil || !strings.Contains(err.Error(), c.msg) {
+			t.Errorf("%v %v: %v, want %q", c.args, c.env, err, c.msg)
+		}
+	}
+	if _, err := Parse([]string{"--help"}, env(nil)); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("--help: %v", err)
+	}
+	// A public URL loses its trailing slash.
+	c, err := Parse([]string{"--database-url", testURL, "--public-url", "https://run.example/"}, env(nil))
+	if err != nil || c.PublicURL != "https://run.example" {
+		t.Fatalf("%q %v", c.PublicURL, err)
+	}
+}
+
+func TestByteSize(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]int64{"0": 0, "4096": 4096, "1KiB": 1 << 10, "3 MiB": 3 << 20, "4GiB": 4 << 30} {
+		got, err := ParseByteSize(in)
+		if err != nil || got != want {
+			t.Errorf("%q: %d %v", in, got, err)
+		}
+	}
+	for _, in := range []string{"", "-1", "1TB", "x", "1.5GiB"} {
+		if _, err := ParseByteSize(in); err == nil {
+			t.Errorf("%q parsed", in)
+		}
+	}
+}
+
+// The subcommands' flags, with serve's variable names and defaults where
+// they share them.
+func TestSubcommands(t *testing.T) {
+	t.Parallel()
+	ic, err := ParseInitCA([]string{"--root-dir", "/r", "--dir", "/d", "--dns-domain", "a.example", "--dns-domain", "b.example"},
+		env(map[string]string{"FERUN_TRUST_DOMAIN": "feos.test", "FERUN_CONTROL_PLANE_DOMAIN": "cp.a.example"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ic.RootDir != "/r" || ic.Dir != "/d" || ic.TrustDomain != "feos.test" || ic.ControlPlaneDomain != "cp.a.example" ||
+		strings.Join(ic.DNSDomains, ",") != "a.example,b.example" {
+		t.Fatalf("init-ca %+v", ic)
+	}
+	if _, err := ParseInitCA([]string{"--root-dir", "/r"}, env(nil)); err == nil ||
+		!strings.Contains(err.Error(), "--dir is required") || !strings.Contains(err.Error(), "--dns-domain is required") {
+		t.Fatalf("init-ca refusal: %v", err)
+	}
+
+	jt, err := ParseJoinToken([]string{"--node", "n7", "--ttl", "30m"},
+		env(map[string]string{"FERUN_DATABASE_URL": testURL, "FERUN_TRUST_DOMAIN": "run.fecode.dev"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jt.DatabaseURL != testURL || jt.CADir != "/etc/ferun/ca" || jt.TrustDomain != "run.fecode.dev" || jt.Node != "n7" ||
+		jt.TTL != 30*time.Minute {
+		t.Fatalf("join-token %+v", jt)
+	}
+	jt, err = ParseJoinToken(nil, env(map[string]string{"FERUN_DATABASE_URL": testURL}))
+	if err != nil || jt.TTL != time.Hour || jt.TrustDomain != "feos.local" {
+		t.Fatalf("join-token defaults %+v %v", jt, err)
+	}
+	for _, args := range [][]string{{"--node", "Bad_Name"}, {"--ttl", "0s"}, {"--trust-domain", "x_y"}} {
+		if _, err := ParseJoinToken(args, env(map[string]string{"FERUN_DATABASE_URL": testURL})); err == nil {
+			t.Errorf("join-token %v parsed", args)
+		}
+	}
+	if _, err := ParseJoinToken(nil, env(nil)); err == nil || !strings.Contains(err.Error(), "--database-url is required") {
+		t.Fatalf("join-token without a database: %v", err)
+	}
+
+	m, err := ParseMigrate(nil, env(map[string]string{"FERUN_DATABASE_URL": testURL}))
+	if err != nil || m.DatabaseURL != testURL {
+		t.Fatalf("migrate %+v %v", m, err)
+	}
+	if _, err := ParseMigrate(nil, env(nil)); err == nil {
+		t.Fatal("migrate without a database")
+	}
+}
+
+// The help names every flag with its variable.
+func TestUsage(t *testing.T) {
+	t.Parallel()
+	var b strings.Builder
+	Usage(&b, CmdServe)
+	for _, s := range []string{"--database-url (FERUN_DATABASE_URL)", "--oidc-client-secret-file (FERUN_OIDC_CLIENT_SECRET_FILE)",
+		`--shutdown-grace (FERUN_SHUTDOWN_GRACE, default "10m0s")`, "--node-advertise-address (FERUN_NODE_ADVERTISE_ADDRESS)"} {
+		if !strings.Contains(b.String(), s) {
+			t.Errorf("serve help lacks %q", s)
+		}
+	}
+	for _, cmd := range []string{"", CmdInitCA, CmdJoinToken, CmdMigrate} {
+		b.Reset()
+		Usage(&b, cmd)
+		if !strings.Contains(b.String(), "Usage: ferund") {
+			t.Errorf("help of %q: %s", cmd, b.String())
+		}
+	}
+	if EnvName("oidc-client-secret-file") != "FERUN_OIDC_CLIENT_SECRET_FILE" {
+		t.Fatal(EnvName("oidc-client-secret-file"))
+	}
+}

@@ -26,6 +26,7 @@ path = [
     "go/go.mod",
     "go/go.sum",
     "go/gen/**",
+    "go/internal/ui/dist/.keep",
     "fechat/backend/go.mod",
     "fechat/backend/go.sum"
 ]

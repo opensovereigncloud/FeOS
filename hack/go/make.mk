@@ -35,9 +35,10 @@ go-gen: $(LOCALBIN)/protoc-gen-go $(LOCALBIN)/protoc-gen-go-grpc ## Generate go/
 		$(foreach m,$(GO_PROTO_MAP),'--go-grpc_opt=$(m)') \
 		$(GO_PROTOS)
 
-go-build: ## Build ferund, static, into target/go/.
+go-build: ## Build ferund and ferun-testnode, static, into target/go/.
 	mkdir -p $(GO_OUT)
 	cd $(GO_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -o ../$(GO_OUT)/ferund ./cmd/ferund
+	cd $(GO_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -o ../$(GO_OUT)/ferun-testnode ./cmd/ferun-testnode
 
 go-fmt-check: ## Check the Go code's formatting.
 	@out=$$(cd $(GO_DIR) && gofmt -l $$(find . -name '*.go' -not -path './gen/*')); \

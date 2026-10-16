@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,8 +82,8 @@ func TestMigrateConcurrent(t *testing.T) {
 		t.Fatalf("bootstrap ran %d times, want at least %d", n, len(handles))
 	}
 	d := handles[0]
-	var migrations, tenants, secrets int
-	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&migrations); err != nil {
+	var applied, tenants, secrets int
+	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&applied); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM tenants").Scan(&tenants); err != nil {
@@ -91,8 +92,13 @@ func TestMigrateConcurrent(t *testing.T) {
 	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM cluster_secrets WHERE name = 'mcp-session' AND length(value) = 32").Scan(&secrets); err != nil {
 		t.Fatal(err)
 	}
-	if migrations != 1 || tenants != 1 || secrets != 1 {
-		t.Fatalf("migrations %d, tenants %d, secrets %d; want 1 each", migrations, tenants, secrets)
+	// Every file in migrations/ is applied once.
+	ms, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied != len(ms) || tenants != 1 || secrets != 1 {
+		t.Fatalf("migrations %d, tenants %d, secrets %d; want %d, 1, 1", applied, tenants, secrets, len(ms))
 	}
 	var secret []byte
 	if err := d.Pool.QueryRow(ctx, "SELECT value FROM cluster_secrets WHERE name = 'mcp-session'").Scan(&secret); err != nil {

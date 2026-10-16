@@ -3,9 +3,9 @@
 
 // Package auth carries who a request is from through its context. The REST
 // router authenticates a request by the credential its route takes (a
-// sandbox's token, a tenant's token or an operator's password) and puts the
-// result here; the handlers of the other packages read it and never look at
-// the credential themselves.
+// sandbox's token, a tenant's token, or an operator's password or sign-in
+// session) and puts the result here; the handlers of the other packages
+// read it and never look at the credential themselves.
 package auth
 
 import (
@@ -30,10 +30,25 @@ type Tenant struct {
 	Name string
 }
 
-// Admin is a request made with an operator's password.
+// Admin is a request made by an operator: with a password of
+// --admin-users, or with the session of a person who signed in through
+// OIDC and is in the admin group.
 type Admin struct {
+	// User is who acted, as the admin views record it (join tokens'
+	// created_by, tenant creation, node removal): the Basic user, or the
+	// signed-in person's username, else their email.
 	User string
+	// Sub is the OIDC subject of a signed-in person; "" for Basic.
+	Sub string
+	// Method is how the operator authenticated: AdminBasic or AdminOIDC.
+	Method string
 }
+
+// The methods an operator authenticates with.
+const (
+	AdminBasic = "basic"
+	AdminOIDC  = "oidc"
+)
 
 type sandboxKey struct{}
 type tenantKey struct{}

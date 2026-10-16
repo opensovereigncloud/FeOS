@@ -34,6 +34,14 @@ TABLE activity PARTITION BY RANGE (day)
   CREATE INDEX activity_span ON ONLY public.activity USING btree (span_id) WHERE (span_id <> ''::text)
   CREATE UNIQUE INDEX activity_pkey ON ONLY public.activity USING btree (day, id)
   CREATE UNIQUE INDEX activity_seq ON ONLY public.activity USING btree (node, start_id, seq, day) WHERE (seq IS NOT NULL)
+TABLE auth_logins
+  COLUMN state_hash text NOT NULL
+  COLUMN verifier text NOT NULL
+  COLUMN nonce text NOT NULL
+  COLUMN next text NOT NULL
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT PRIMARY KEY (state_hash)
+  CREATE UNIQUE INDEX auth_logins_pkey ON public.auth_logins USING btree (state_hash)
 TABLE bookings
   COLUMN pod_id uuid NOT NULL
   COLUMN node text NOT NULL
@@ -367,6 +375,23 @@ TABLE traffic_records PARTITION BY RANGE (day)
   CREATE INDEX traffic_sandbox ON ONLY public.traffic_records USING btree (sandbox_id, ts_ns) WHERE (sandbox_id IS NOT NULL)
   CREATE UNIQUE INDEX traffic_records_pkey ON ONLY public.traffic_records USING btree (day, id)
   CREATE UNIQUE INDEX traffic_seq ON ONLY public.traffic_records USING btree (node, start_id, seq, day)
+TABLE ui_sessions
+  COLUMN id_hash text NOT NULL
+  COLUMN sub text NOT NULL
+  COLUMN email text NOT NULL
+  COLUMN name text NOT NULL
+  COLUMN username text NOT NULL
+  COLUMN picture text NOT NULL
+  COLUMN groups text[] NOT NULL
+  COLUMN admin boolean NOT NULL
+  COLUMN id_token text NOT NULL
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN expires_at timestamp with time zone NOT NULL
+  COLUMN last_seen_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT PRIMARY KEY (id_hash)
+  CREATE INDEX ui_sessions_expires ON public.ui_sessions USING btree (expires_at)
+  CREATE INDEX ui_sessions_sub ON public.ui_sessions USING btree (sub)
+  CREATE UNIQUE INDEX ui_sessions_pkey ON public.ui_sessions USING btree (id_hash)
 TABLE watches
   COLUMN id uuid NOT NULL
   COLUMN sandbox_id uuid NOT NULL
