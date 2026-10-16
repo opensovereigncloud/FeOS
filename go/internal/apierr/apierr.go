@@ -1,0 +1,72 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package apierr is the REST API's error: a status, a message and, for the
+// surfaces that have them, a machine-readable code. Clients match on all
+// three, so their texts are part of the API.
+package apierr
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+)
+
+// Error is an error the API answers with its own status and body
+// {"error": Msg, "code": Code}; Code is left out when empty.
+type Error struct {
+	Status int
+	Msg    string
+	Code   string
+	// Header is set on the response, e.g. Retry-After.
+	Header http.Header
+}
+
+func (e *Error) Error() string { return e.Msg }
+
+// New returns an Error with a status and a message.
+func New(status int, format string, args ...any) *Error {
+	return &Error{Status: status, Msg: fmt.Sprintf(format, args...)}
+}
+
+// WithCode returns an Error with a status, a code and a message.
+func WithCode(status int, code, format string, args ...any) *Error {
+	return &Error{Status: status, Code: code, Msg: fmt.Sprintf(format, args...)}
+}
+
+// RetryAfter sets the response's Retry-After, in seconds.
+func (e *Error) RetryAfter(seconds int) *Error {
+	if e.Header == nil {
+		e.Header = http.Header{}
+	}
+	e.Header.Set("Retry-After", fmt.Sprint(seconds))
+	return e
+}
+
+type body struct {
+	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
+}
+
+// Write answers err: an *Error with its status and body, anything else with
+// 500 and the error's text, as the sandbox system's API did.
+func Write(w http.ResponseWriter, err error) {
+	var e *Error
+	if !errors.As(err, &e) {
+		e = &Error{Status: http.StatusInternalServerError, Msg: err.Error()}
+	}
+	for k, vs := range e.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	WriteJSON(w, e.Status, body{Error: e.Msg, Code: e.Code})
+}
+
+// WriteJSON answers v as JSON with status.
+func WriteJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}

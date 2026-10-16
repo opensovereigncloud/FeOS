@@ -54,3 +54,7 @@ pub mod guest_service {
 pub mod volume_service {
     tonic::include_proto!("feos.volume.v1");
 }
+/// The control plane's API for nodes: the uplink (ADR 0015).
+pub mod fleet_service {
+    include!(concat!(env!("OUT_DIR"), "/fleet/feos.fleet.v1.rs"));
+}

@@ -8,6 +8,7 @@ include hack/firecracker/make.mk
 include hack/guest/make.mk
 include hack/packages/make.mk
 include hack/diskd/make.mk
+include hack/go/make.mk
 
 # The build container builds into target/container: build scripts that the
 # host built would not run on the container's older glibc.

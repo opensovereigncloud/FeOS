@@ -4,3 +4,6 @@
 /.idea
 /.vscode
 /.zed
+/web/node_modules
+/go/internal/ui/dist/*
+!/go/internal/ui/dist/.keep

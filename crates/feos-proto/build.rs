@@ -27,5 +27,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ],
             &[proto_dir],
         )?;
+    // The uplink's API names the pods' and the network's messages: they are
+    // the modules above, not modules nested in feos.fleet.v1's. Its own
+    // directory, since this pass writes the files it imports again.
+    let fleet_dir = format!("{}/fleet", std::env::var("OUT_DIR")?);
+    std::fs::create_dir_all(&fleet_dir)?;
+    tonic_build::configure()
+        .out_dir(&fleet_dir)
+        .extern_path(".feos.pod.v1", "crate::pod_service")
+        .extern_path(".feos.network.v1", "crate::network_service")
+        .compile_protos(
+            &[format!("{proto_dir}/feos/fleet/v1/fleet.proto")],
+            &[proto_dir],
+        )?;
     Ok(())
 }

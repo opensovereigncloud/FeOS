@@ -22,7 +22,10 @@ path = [
     "**/*.json",
     "**/clippy.toml",
     "**/*.proptest-regressions",
-    "proto/**/*.proto"
+    "proto/**/*.proto",
+    "go/go.mod",
+    "go/go.sum",
+    "go/gen/**"
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "SAP SE or an SAP affiliate company and IronCore contributors"
