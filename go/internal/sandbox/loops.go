@@ -234,9 +234,10 @@ func (e *Engine) hibernateAfter(ctx context.Context) error {
 // forward does not keep a sandbox (the port door closes its upgraded
 // connections once it leaves running); after --drain-timeout, minutes, the
 // execs that still run are cancelled (ferun_cancel) and everything is
-// paused and hibernated regardless of holds. A sandbox that ran is
-// restored on another node at once, where the calls that waited for it
-// go on. A node without an object store cannot drain; one that holds
+// paused and hibernated regardless of holds. A sandbox that ran when the
+// drain began, running or paused since, by the drain or by a call that
+// met it, is restored on another node at once, where the calls that
+// waited for it go on. A node without an object store cannot drain; one that holds
 // nothing but hibernated, lost and pending sandboxes is drained. A pass
 // only starts evacuations, at most drainPerNode per node at a time across
 // passes, and never waits for them (a hibernation takes minutes per GiB,
@@ -283,7 +284,9 @@ func (e *Engine) drainNode(ctx context.Context, dn store.DrainingNode) error {
 				continue
 			}
 		}
-		if !e.startEvacuation(ctx, row, trigger, dn.Overdue) {
+		ran := row.ClientState == model.StateRunning ||
+			(row.ClientState == model.StatePaused && !row.PausedAt.Before(dn.Node.DrainStartedAt))
+		if !e.startEvacuation(ctx, row, trigger, dn.Overdue, ran) {
 			break // the node's evacuations are at their limit: the rest on a later pass
 		}
 	}
@@ -311,7 +314,7 @@ func (e *Engine) evacuating(id uuid.UUID) bool {
 // already (false). Past the drain timeout (forced) the execs that still
 // run in a running sandbox are cancelled first. The worker outlives the
 // loop's pass; it ends with the leader's term (ctx) or the engine.
-func (e *Engine) startEvacuation(ctx context.Context, row store.Sandbox, trigger OpTrigger, forced bool) bool {
+func (e *Engine) startEvacuation(ctx context.Context, row store.Sandbox, trigger OpTrigger, forced, ran bool) bool {
 	node := row.Node
 	e.mu.Lock()
 	if e.evacuatingOn[node] >= drainPerNode {
@@ -333,7 +336,7 @@ func (e *Engine) startEvacuation(ctx context.Context, row store.Sandbox, trigger
 		e.cancelExecs(ctx, row.ID)
 	}
 	started := e.goBackground(func(bg context.Context) {
-		ran := func() bool {
+		hibernated := func() bool {
 			defer done()
 			wctx, cancel := context.WithCancel(ctx)
 			defer cancel()
@@ -341,7 +344,7 @@ func (e *Engine) startEvacuation(ctx context.Context, row store.Sandbox, trigger
 			defer stop()
 			return e.evacuate(wctx, row, trigger)
 		}()
-		if ran {
+		if hibernated && ran {
 			e.restoreElsewhere(bg, row.ID)
 		}
 	})
@@ -352,12 +355,11 @@ func (e *Engine) startEvacuation(ctx context.Context, row store.Sandbox, trigger
 }
 
 // evacuate moves one sandbox off a draining node: a running one is paused
-// first, then hibernated. It reports whether a sandbox that ran is
-// hibernated now, to be restored elsewhere.
+// first, then hibernated. It reports whether the sandbox is hibernated
+// now.
 func (e *Engine) evacuate(ctx context.Context, row store.Sandbox, trigger OpTrigger) bool {
 	in := OpIntent{Kind: OpHibernate, Trigger: trigger, Target: row.Node, Incarnation: row.Incarnation}
-	ran := row.ClientState == model.StateRunning
-	if ran {
+	if row.ClientState == model.StateRunning {
 		in.Kind = OpPause
 	}
 	for {
@@ -373,7 +375,7 @@ func (e *Engine) evacuate(ctx context.Context, row store.Sandbox, trigger OpTrig
 			return false
 		}
 		if h.kind != OpPause {
-			return ran && res.State == model.StateHibernated
+			return res.State == model.StateHibernated
 		}
 		if res.State != model.StatePaused {
 			return false
@@ -382,10 +384,11 @@ func (e *Engine) evacuate(ctx context.Context, row store.Sandbox, trigger OpTrig
 	}
 }
 
-// restoreElsewhere brings a sandbox that a drain hibernated while it ran
-// back up on another node, as its next call would: the calls that waited
-// for the move go on there, and its pod is not left cold. Without room
-// elsewhere it stays hibernated until it is used.
+// restoreElsewhere brings a sandbox that ran when its node's drain began,
+// and that the drain hibernated, back up on another node, as its next
+// call would: the calls that waited for the move go on there, and its pod
+// is not left cold. Without room elsewhere it stays hibernated until it
+// is used.
 func (e *Engine) restoreElsewhere(ctx context.Context, id uuid.UUID) {
 	ctx, cancel := context.WithTimeout(ctx, restoreTimeout)
 	defer cancel()

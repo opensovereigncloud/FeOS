@@ -296,6 +296,36 @@ func TestDrainLoop(t *testing.T) {
 	}
 }
 
+// TestDrainRestoresWhatRan: a sandbox that ran when the drain began is
+// restored on another node once it is hibernated, also when a call that
+// met the drain paused it (and gave up waiting); one that was paused
+// before stays hibernated until it is used.
+func TestDrainRestoresWhatRan(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	idle := h.running(512)
+	h.startOp(idle.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+	h.exec("UPDATE sandboxes SET paused_at = now() - interval '1 minute' WHERE id = $1", idle.ID)
+	met := h.running(512)
+	busy := h.running(512)
+	h.exec("UPDATE nodes SET draining = true, drain_started_at = now() WHERE name = 'n1'")
+	h.addNode("n2")
+	h.startOp(met.ID, OpIntent{Kind: OpPause, Trigger: TriggerEnsure, Target: "n1"})
+	for _, id := range []uuid.UUID{met.ID, busy.ID} {
+		h.drainUntil("a sandbox that ran restored on n2", func() bool {
+			row := h.row(id)
+			return row.ClientState == model.StateRunning && row.Node == "n2" && row.Op == ""
+		})
+	}
+	h.drainUntil("the idle one hibernated", func() bool {
+		row := h.row(idle.ID)
+		return row.ClientState == model.StateHibernated && row.Op == ""
+	})
+	never(t, 500*time.Millisecond, "the idle one restored", func() bool {
+		return h.row(idle.ID).ClientState != model.StateHibernated
+	})
+}
+
 // drainUntil runs drain passes until cond holds: a pass only starts the
 // evacuations, at most drainPerNode per node at a time.
 func (h *harness) drainUntil(what string, cond func() bool) {
