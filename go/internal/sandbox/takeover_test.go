@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
@@ -496,8 +497,9 @@ func TestTakeoverCreateKeepsImageAndSpec(t *testing.T) {
 	}
 	row = h.row(sb.ID)
 	wantState(t, row, model.StateRunning)
+	h.activityNamed(sb.ID, activity.KindLifecycleStart, "create on node n1 (taken over from instance dead)")
 	var placements int
-	h.scalar(&placements, "SELECT count(*) FROM placements WHERE pod_id = $1", sb.ID)
+	h.scalar(&placements, "SELECT count(*) FROM activity WHERE sandbox_id = $1 AND kind = 'placement'", sb.ID)
 	if placements != 0 {
 		t.Fatalf("a takeover wrote %d placement rows", placements)
 	}

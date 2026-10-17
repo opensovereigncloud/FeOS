@@ -316,11 +316,7 @@ func TestEnsureMeetsAnotherInstancesHibernate(t *testing.T) {
 	}
 	row := h.row(sb.ID)
 	wantState(t, row, model.StateRunning)
-	var restores int
-	h.scalar(&restores, "SELECT count(*) FROM placements WHERE pod_id = $1 AND instance_id = 'i1'", sb.ID)
-	if restores != 3 { // the create and two restores
-		t.Fatalf("%d placements of i1", restores)
-	}
+	h.placements(sb.ID, "i1", 3) // the create and two restores
 }
 
 // TestEnsurePreemptsAnotherInstancesHibernate: a hibernate of another live

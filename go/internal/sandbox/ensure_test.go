@@ -100,11 +100,7 @@ func TestEnsureRestorePlacesOnceMore(t *testing.T) {
 	if lease.Node != "n2" {
 		t.Fatalf("restored on %s", lease.Node)
 	}
-	var restores int
-	h.scalar(&restores, "SELECT count(*) FROM placements WHERE pod_id = $1", sb.ID)
-	if restores != 3 { // the create, the restore on n1, the one on n2
-		t.Fatalf("%d placements", restores)
-	}
+	h.placements(sb.ID, "", 3) // the create, the restore on n1, the one on n2
 }
 
 func TestPauseAndResumeREST(t *testing.T) {

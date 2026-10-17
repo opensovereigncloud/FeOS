@@ -177,13 +177,10 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 			return err
 		}
 		if in.Kind == OpCreate || in.Kind == OpRestore {
+			// The placement's audit is its activity row.
 			verdicts := in.verdicts
 			if len(verdicts) == 0 {
 				verdicts = []store.PlacementCandidate{{Node: target, Feasible: true}}
-			}
-			if _, err := tx.InsertPlacement(ctx, store.Placement{PodID: id, ChosenNode: target, Candidates: verdicts,
-				Trigger: string(in.Trigger), InstanceID: e.id}); err != nil {
-				return err
 			}
 			events = append(events, activity.Event{SandboxID: id, TenantID: row.Owner, Node: target,
 				Kind: activity.KindPlacement, Name: fmt.Sprintf("placed on %s (%s)", target, in.Kind),

@@ -186,11 +186,15 @@ updates a second at 512 nodes, never locked by placement), `node_certs`
 (every node certificate issued), `join_tokens`, `node_starts`,
 `event_gaps`; `pod_network` (the mesh's ULA and its peers' version, one
 row while the cluster is meshed); `sandboxes`, `sandbox_tokens`, `sandbox_holds`,
-`pod_tombstones`, `bookings`, `placements` (the audit of placement
-decisions); `activity` and `traffic_records`, partitioned by day;
-`issued_certs` (pods' certificates); `watches`; `kube_bindings`,
-`ssh_bindings`; `auth_logins`, `ui_sessions`. Tokens are stored as SHA-256
-hashes only, and shown once, at their creation.
+`pod_tombstones`, `bookings`; `activity` and `traffic_records`,
+partitioned by day; `issued_certs` (pods' certificates); `watches`;
+`kube_bindings`, `ssh_bindings`; `auth_logins`, `ui_sessions`. Tokens are
+stored as SHA-256 hashes only, and shown once, at their creation.
+`placements`, which held the placement decisions, is written and read by
+nothing, and goes in a later migration: the
+previous version, which a rolling deploy runs beside this one, still
+inserts into it in every create's and restore's begin. A placement's
+audit is its activity row.
 
 ## Leader and instances
 
@@ -712,7 +716,8 @@ the sandbox until the process is stopped or found ended.
 ### Placement
 
 Gates, in order, each with the reason that the description and the
-placement audit show: the node is `ready`; not draining; not forked;
+placement audit (the placement's activity row, with every node's
+verdict) show: the node is `ready`; not draining; not forked;
 connected to this instance; no tombstone of this pod ID on it; not
 avoided after a failed create; no other sandbox on it whose ID starts with
 the same 8 hex digits and may hold a TAP device (feosd derives the TAP

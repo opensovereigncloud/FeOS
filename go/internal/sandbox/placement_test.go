@@ -5,12 +5,14 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
@@ -112,11 +114,12 @@ func TestPlacementPolicies(t *testing.T) {
 			if second.Node != want {
 				t.Fatalf("%s placed the second sandbox on %s after the first on %s", policy, second.Node, first.Node)
 			}
-			// The audit names every candidate's verdict.
-			ps, err := h.st.ListPlacements(bg, second.ID, 10)
-			if err != nil || len(ps) != 1 || ps[0].ChosenNode != want || len(ps[0].Candidates) != 2 ||
-				ps[0].Trigger != string(TriggerEnsure) || ps[0].InstanceID != "i1" {
-				t.Fatalf("placements %+v %v", ps, err)
+			// The audit, the placement's activity row, names every
+			// candidate's verdict.
+			h.placements(second.ID, "i1", 1)
+			d := h.activityNamed(second.ID, activity.KindPlacement, fmt.Sprintf("placed on %s (create)", want))
+			if cands, _ := d["candidates"].([]any); len(cands) != 2 || d["node"] != want || d["trigger"] != string(TriggerEnsure) {
+				t.Fatalf("placement %v", d)
 			}
 		})
 	}

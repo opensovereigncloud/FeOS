@@ -640,6 +640,18 @@ func (h *harness) runOrigin(id uuid.UUID) string {
 	return origin
 }
 
+// placements waits until the sandbox's activity has want rows of kind
+// placement written by instance ("": by any), the audit of its placements.
+func (h *harness) placements(id uuid.UUID, instance string, want int) {
+	h.t.Helper()
+	got := -1
+	eventually(h.t, 10*time.Second, fmt.Sprintf("%d placements of sandbox %s", want, id), func() bool {
+		h.scalar(&got, `SELECT count(*) FROM activity WHERE sandbox_id = $1 AND kind = 'placement'
+			AND ($2 = '' OR instance_id = $2)`, id, instance)
+		return got == want
+	})
+}
+
 // activityNamed waits until the sandbox's activity has a row of kind named
 // name, and returns its detail.
 func (h *harness) activityNamed(id uuid.UUID, kind, name string) map[string]any {

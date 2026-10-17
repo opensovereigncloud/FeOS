@@ -404,19 +404,3 @@ func TestClusterSecret(t *testing.T) {
 		t.Fatalf("missing secret: %v", err)
 	}
 }
-
-func TestPlacementAudit(t *testing.T) {
-	s, _ := newStore(t)
-	pod := uuid.New()
-	p, err := s.InsertPlacement(bg, store.Placement{PodID: pod, ChosenNode: "n1", Trigger: "ensure", InstanceID: "i1",
-		Candidates: []store.PlacementCandidate{{Node: "n1", Feasible: true, Score: 0.5}, {Node: "n2", Reason: "draining"}}})
-	if err != nil || p.ID == 0 || p.At.IsZero() {
-		t.Fatalf("insert %+v %v", p, err)
-	}
-	_, err = s.InsertPlacement(bg, store.Placement{PodID: pod, ChosenNode: "n2", InstanceID: "i1"})
-	must(t, err)
-	l, err := s.ListPlacements(bg, pod, 10)
-	if err != nil || len(l) != 2 || l[0].ChosenNode != "n2" || len(l[0].Candidates) != 0 || l[1].Candidates[1].Reason != "draining" {
-		t.Fatalf("list %+v %v", l, err)
-	}
-}
