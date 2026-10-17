@@ -5,8 +5,11 @@ package store
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -46,6 +49,70 @@ type Instance struct {
 // InstanceInfo is what an instance writes about itself.
 type InstanceInfo struct {
 	ID, Address, NodeAddress, Version string
+}
+
+// InstanceInUseError is ClaimInstance's refusal: the row of the ID was
+// written within the TTL.
+type InstanceInUseError struct {
+	ID       string
+	LastSeen time.Time     // the row's last write
+	Age      time.Duration // its age, on the database clock
+	Stopping bool          // the row says stopping
+}
+
+func (e *InstanceInUseError) Error() string {
+	state := "running"
+	if e.Stopping {
+		state = "stopping"
+	}
+	return fmt.Sprintf("instance id %s is in use: a %s instance wrote its row %v ago", e.ID, state,
+		e.Age.Round(time.Millisecond))
+}
+
+// ClaimInstance begins a run of the instance in.ID, in one transaction: it
+// writes the row anew (started_at = last_seen = now(), not stopping) and
+// releases the ops the ID still owns, which no process runs any more: they
+// are an earlier run's that ended without its stop's release. The release
+// is ReleaseOpsOf's, with the description "op <op> of instance <id> was
+// released: the instance started again"; the released sandboxes are
+// notified and returned. A row written within the TTL refuses the claim
+// with *InstanceInUseError: a process still runs under the ID, or stops
+// (its last steps release the ops the ID owns and delete the row), or one
+// ended without deleting it less than the TTL ago.
+func (s *Store) ClaimInstance(ctx context.Context, in InstanceInfo) ([]uuid.UUID, error) {
+	var released []uuid.UUID
+	err := s.InTx(ctx, func(tx *Store) error {
+		released = nil
+		var claimed bool
+		err := tx.q.QueryRow(ctx, `INSERT INTO instances (id, address, node_address, version) VALUES ($1, $2, $3, $4)
+			ON CONFLICT (id) DO UPDATE SET address = excluded.address, node_address = excluded.node_address,
+				version = excluded.version, started_at = now(), last_seen = now(), stopping = NULL
+			WHERE NOT (`+instanceFresh("instances")+`)
+			RETURNING true`, in.ID, in.Address, in.NodeAddress, in.Version).Scan(&claimed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			e := &InstanceInUseError{ID: in.ID}
+			var ageUs int64
+			if err := tx.q.QueryRow(ctx, `SELECT last_seen, (extract(epoch FROM now() - last_seen) * 1000000)::bigint,
+				stopping IS NOT NULL FROM instances WHERE id = $1`, in.ID).Scan(&e.LastSeen, &ageUs, &e.Stopping); err != nil {
+				return err
+			}
+			e.Age = time.Duration(ageUs) * time.Microsecond
+			return e
+		}
+		if err != nil {
+			return err
+		}
+		// The release of a stop's step 4 (ReleaseOpsOf), with the reason
+		// that holds here: no stop released these ops.
+		rows, err := tx.q.Query(ctx, `UPDATE sandboxes SET op = '', op_id = NULL, op_owner = '', op_deadline = NULL,
+				op_target = '', op_from_state = '', client_state = 'unknown',
+				status_description = 'op ' || op || ' of instance ' || $1 || ' was released: the instance started again',
+				gen = gen + 1, updated_at = now()
+			WHERE op_owner = $1 AND op <> '' RETURNING id`, in.ID)
+		released, err = tx.notifyReturned(ctx, rows, err)
+		return err
+	})
+	return released, err
 }
 
 // UpsertInstance writes the instance's heartbeat: its row with last_seen =

@@ -58,7 +58,7 @@ that.
 | `--tls-cert`, `--tls-key` | none | TLS on `--listen`; without, plain HTTP behind the balancer |
 | `--node-listen` | `:7443` | the nodes' port |
 | `--node-advertise-address` | none | `host:port` at which nodes reach this instance's nodes' port; listed to nodes. Empty: the instance is not listed, and nodes reach it only by the name they were configured with (one machine) |
-| `--instance-id` | `<hostname>-<8 random hex>` | the instance's ID, new at every start |
+| `--instance-id` | `<hostname>-<8 random hex>` | the instance's ID; the default is new at every start. A fixed one (a StatefulSet's pod name) must be unique among the running instances: a start under an ID whose row was written within 15 s waits until the row is older, and is refused if it is written meanwhile ([Leader and instances](#leader-and-instances)) |
 | `--trust-domain` | `feos.local` | the SPIFFE trust domain |
 | `--ca-dir` | `/etc/ferun/ca` | the issuer: `issuer.crt`, `issuer.key`, `issuer.json`, `bundle.crt`; never `root.key` |
 | `--node-server-names` | the control-plane domain | the DNS names of the instance's certificate on the nodes' port, each under the control-plane domain |
@@ -203,6 +203,15 @@ audit is its activity row.
 - **Instances.** Every instance writes its row in `instances` every 5 s.
   An instance is live while its row is younger than 15 s and not marked
   stopping. The leader deletes rows not seen for an hour.
+- **The start** claims the instance's ID before anything serves, in one
+  transaction: its row is written anew (started now, not stopping), and
+  the ops the ID still owns are released as in a stop's step 4, since no
+  process runs them: they are an earlier run's that ended without its
+  stop, crashed or killed. Their sandboxes say "op <op> of instance <id>
+  was released: the instance started again". A row younger than 15 s,
+  stopping or not, is another process's under the same ID, or a run's
+  that ended less than 15 s ago: the start tries again every second until
+  the row is older, and is refused when the row is written meanwhile.
 - **The lease.** One instance at a time leads, by the row `leader` of
   `leases`: a TTL of 15 s and an epoch that grows by one on every
   acquisition, also by the holder of an expired lease. The epoch is the

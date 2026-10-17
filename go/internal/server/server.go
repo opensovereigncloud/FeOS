@@ -109,6 +109,9 @@ const (
 	// readHeaderTimeout bounds a request's headers; there is no write
 	// timeout (tool calls run minutes).
 	readHeaderTimeout = 10 * time.Second
+	// claimRetry is how often a start tries again to claim a fresh row of
+	// its instance ID.
+	claimRetry = time.Second
 )
 
 // Instance is one ferund instance.
@@ -472,12 +475,64 @@ func (i *Instance) ready(ctx context.Context) error {
 
 // Run serves until ctx ends, then stops the instance (§7) and returns.
 // It returns an error when a listener fails; the instance is stopped then
-// as well. An instance runs once, and not after Close.
+// as well. Before it serves, it claims the instance's row (claim): it
+// refuses to run under an ID another process runs under. An instance runs
+// once, and not after Close.
 func (i *Instance) Run(ctx context.Context) error {
 	if !i.claimed.CompareAndSwap(false, true) {
 		return errors.New("an instance runs once, and not after Close")
 	}
+	if err := i.claim(ctx); err != nil {
+		i.close()
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
 	return i.run(ctx)
+}
+
+// claim makes the instance's row this run's before anything serves
+// (store.ClaimInstance): written anew, not stopping, and the ops an earlier
+// run under the same ID left released. A row written within the TTL is
+// another process's under this ID, running or stopping, or the row of a
+// run that ended without its stop (a crash, a kill) less than the TTL
+// ago. claim tries again every second until the row is older than the TTL
+// and claims it then; a row written meanwhile refuses the start, within a
+// heartbeat interval.
+func (i *Instance) claim(ctx context.Context) error {
+	info := store.InstanceInfo{ID: i.id, Address: i.httpLn.Addr().String(), NodeAddress: i.cfg.NodeAdvertiseAddress,
+		Version: i.version}
+	var seen time.Time
+	for {
+		cctx, cancel := context.WithTimeout(ctx, stepTimeout)
+		released, err := i.Store.ClaimInstance(cctx, info)
+		cancel()
+		var inUse *store.InstanceInUseError
+		switch {
+		case err == nil:
+			if len(released) > 0 {
+				i.log.Warn("released the ops an earlier run under this instance id left", "sandboxes", len(released))
+			}
+			return nil
+		case !errors.As(err, &inUse):
+			return fmt.Errorf("claim the instance's row: %w", err)
+		case !seen.IsZero() && !inUse.LastSeen.Equal(seen):
+			return fmt.Errorf("%w; another process runs under this --instance-id, which must be unique among the running instances", err)
+		}
+		if seen.IsZero() {
+			i.log.Warn("the row of this instance id is fresh; waiting for it to age past the TTL",
+				"last_seen", inUse.LastSeen, "stopping", inUse.Stopping, "age", inUse.Age.Round(time.Millisecond))
+		}
+		seen = inUse.LastSeen
+		t := time.NewTimer(min(claimRetry, store.InstanceTTL-inUse.Age+100*time.Millisecond))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
 }
 
 func (i *Instance) run(ctx context.Context) error {
