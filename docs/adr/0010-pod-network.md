@@ -40,7 +40,8 @@ from node to node would need a route per pod, changed with every move.
   security group allows it (ADR 0012). IPv4 is for leaving only.
 - Where a name has addresses of both families, programs take IPv6, since
   the pod's IPv4 address is link-local (RFC 6724); IPv4 carries what has
-  no IPv6.
+  no IPv6. A pod whose IPv6 address is a ULA has no default route over
+  IPv6, and leaves for the internet over IPv4 (ADR 0017).
 - A pod that resumes on another node gets both addresses there. Nothing
   stores a pod's addresses: the control plane's registry, the security
   groups and the load balancers follow the pod's record.
@@ -53,6 +54,9 @@ from node to node would need a route per pod, changed with every move.
   interface, is enough. A prefix that is only on-link, for which the node
   would answer neighbor discovery on behalf of every pod, is not
   supported.
+- Where the network routes no prefix to its nodes, a node's prefix is a
+  /64 of its cluster's ULA, and a WireGuard mesh carries the pods' IPv6
+  between the nodes (ADR 0017).
 - `feosd` gives a pod an address of the node's prefix when the pod comes
   to the node, keeps it in the pod's record while the pod is there, and
   never hands an address out twice.
@@ -188,8 +192,8 @@ from node to node would need a route per pod, changed with every move.
   not run in.
 - **ULA addresses, an overlay between nodes and NAT66 to the internet**,
   as Fly.io does since 2026: no prefix routed to a node, but an overlay
-  mesh between all nodes. It stays the way for networks that cannot route
-  a prefix to a node.
+  mesh between all nodes. ADR 0017 takes the overlay, without NAT66, for
+  networks that route no prefix to a node.
 - **Addresses that move with a pod**, a route per pod over BGP: stable
   addresses, and a routing table that changes with every resume
   elsewhere.
@@ -233,8 +237,8 @@ from node to node would need a route per pod, changed with every move.
   that speak only IPv4 work. A program that listens only on `0.0.0.0`
   cannot be reached from outside; listeners bind to `[::]`.
 - A pod's connections do not survive a resume on another node.
-- Every node needs a prefix routed to it, and IPv4 of its own, through
-  which its pods leave. A node whose operating system is FeOS takes its
+- Every node needs a prefix routed to it, or a /64 of its cluster's mesh
+  (ADR 0017), and IPv4 of its own, through which its pods leave. A node whose operating system is FeOS takes its
   IPv4 by DHCPv4, as a distribution does, and its prefix by DHCPv6
   delegation or, where it is routed statically, from the kernel's
   command line.
