@@ -18,6 +18,9 @@ use feos_proto::pod_service::{
     PodConsoleInput, PodInfo, PodNetwork, PodSpec, PodState, Resources, ResumePodRequest,
     StartPodRequest, StopPodRequest, SuspendPodRequest,
 };
+use feos_proto::portforward_service::{
+    forward_request, port_forward_service_client::PortForwardServiceClient, ForwardRequest, Open,
+};
 use feos_utils::nft;
 use feos_utils::vsock::API_PORT;
 use futures::TryStreamExt;
@@ -355,6 +358,21 @@ async fn test_pod_lifecycle() -> Result<()> {
     assert_eq!(network.gateway, "169.254.0.1");
     assert_eq!(network.dns, ["169.254.0.53"]);
     assert_eq!(network.hostname, pod_id);
+    // A port forward goes through feosd to the guest's loopback, where
+    // nothing listens on port 1: the guest's own answer comes back.
+    let open = ForwardRequest {
+        frame: Some(forward_request::Frame::Open(Open { port: 1 })),
+    };
+    let refused = PortForwardServiceClient::connect(PUBLIC_SERVER_ADDRESS)
+        .await?
+        .forward(for_pod(&pod_id, tokio_stream::iter([open])))
+        .await
+        .expect_err("a forward to a port nothing listens on");
+    assert_eq!(refused.code(), tonic::Code::Unavailable, "{refused:?}");
+    assert!(
+        refused.message().starts_with("127.0.0.1:1: "),
+        "{refused:?}"
+    );
     // Firecracker serves the pod its metadata at 169.254.169.254, version
     // 2: the pod's identity and the spec's.
     assert_eq!(
@@ -385,8 +403,11 @@ async fn test_pod_lifecycle() -> Result<()> {
         std::fs::read_to_string(Path::new("/sys/class/net").join(&tap_name).join("ifindex"))?
             .trim()
             .parse()?;
+    // Of IPv4, the node holds only the resolver's address on it, which its
+    // ARP for the pod asks from, and answers for the gateway by proxy.
     let (tap_ipv4, proxied) = device_ipv4(index).await?;
-    assert!(tap_ipv4.is_empty(), "{tap_name} holds {tap_ipv4:?}");
+    let resolver: IpAddr = network.dns[0].parse()?;
+    assert_eq!(tap_ipv4, [resolver], "{tap_name}");
     assert_eq!(proxied, [network::GATEWAY4]);
     for (path, value) in [
         (format!("ipv4/neigh/{tap_name}/proxy_delay"), "0"),

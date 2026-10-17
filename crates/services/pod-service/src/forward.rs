@@ -4,6 +4,12 @@
 //! A pod's services through feosd (ADR 0004): a call that carries the
 //! metadata `feos-pod-id` goes unchanged to that pod's guest, on vsock; a
 //! call without it is for feosd's own services.
+//!
+//! A call that does not reach the guest fails `UNAVAILABLE` with "the
+//! guest of pod <id>: …", or with the pod's state when it does not run;
+//! what the guest answers comes back as it is. So a port forward to a
+//! port nothing listens on fails `UNAVAILABLE` with "127.0.0.1:<port>: …",
+//! the guest's text, and to a Kubernetes listener `FAILED_PRECONDITION`.
 
 use crate::pods::{guest_channel, Pods};
 use std::convert::Infallible;
@@ -19,11 +25,13 @@ use tower::{Layer, Service, ServiceExt};
 pub const POD_ID_METADATA: &str = "feos-pod-id";
 
 /// The services of a guest that clients reach through feosd. The others
-/// are feosd's business: the guest's host service, port forwards and the
-/// Kubernetes and SSH listeners.
+/// are feosd's business: the guest's host service and its Kubernetes and
+/// SSH listeners. A port forward reaches the guest's loopback, but never a
+/// Kubernetes listener there: the guest refuses those itself.
 const FORWARDED: &[&str] = &[
     "/feos.container.v1.ContainerService/",
     "/feos.image.v1.ImageService/",
+    "/feos.portforward.v1.PortForwardService/",
     "/feos.tool.v1.ToolService/",
     "/feos.watch.v1.WatchService/",
 ];
@@ -133,9 +141,11 @@ mod tests {
     fn only_the_pod_services_are_forwarded() {
         assert!(check_forwarded("/feos.container.v1.ContainerService/Exec").is_ok());
         assert!(check_forwarded("/feos.tool.v1.ToolService/Read").is_ok());
+        assert!(check_forwarded("/feos.portforward.v1.PortForwardService/Forward").is_ok());
         let refused = check_forwarded("/feos.host.v1.HostService/Shutdown").unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unimplemented);
         assert!(check_forwarded("/feos.container.v1.ContainerServiceX/Exec").is_err());
         assert!(check_forwarded("/feos.kube.v1.KubeService/SetListeners").is_err());
+        assert!(check_forwarded("/feos.ssh.v1.SshService/SetListeners").is_err());
     }
 }
