@@ -45,6 +45,8 @@ const (
 	idleConcurrency      = 16
 	tombstoneConcurrency = 8
 	drainPerNode         = 2
+	// restoreTimeout bounds the restore of a drained sandbox elsewhere.
+	restoreTimeout = 10 * time.Minute
 )
 
 // Loops returns the engine's leader loops (§9 "Policies"): the down sweep
@@ -227,11 +229,14 @@ func (e *Engine) hibernateAfter(ctx context.Context) error {
 }
 
 // drain evacuates the draining nodes the leader is connected to: paused
-// sandboxes are hibernated, running ones without live exec or forward
-// holds are paused and hibernated, stopped and failed ones hibernate their
-// disk; after --drain-timeout the execs that still run are cancelled
-// (ferun_cancel) and everything is paused and hibernated regardless of
-// holds. A node without an object store cannot drain; one that holds
+// sandboxes are hibernated, running ones without a live exec hold are
+// paused and hibernated, stopped and failed ones hibernate their disk; a
+// forward does not keep a sandbox (the port door closes its upgraded
+// connections once it leaves running); after --drain-timeout, minutes, the
+// execs that still run are cancelled (ferun_cancel) and everything is
+// paused and hibernated regardless of holds. A sandbox that ran is
+// restored on another node at once, where the calls that waited for it
+// go on. A node without an object store cannot drain; one that holds
 // nothing but hibernated, lost and pending sandboxes is drained. A pass
 // only starts evacuations, at most drainPerNode per node at a time across
 // passes, and never waits for them (a hibernation takes minutes per GiB,
@@ -274,7 +279,7 @@ func (e *Engine) drainNode(ctx context.Context, dn store.DrainingNode) error {
 			continue
 		}
 		if row.ClientState == model.StateRunning && !dn.Overdue {
-			if held, err := e.st.HasLiveHold(ctx, row.ID, model.HoldExec, model.HoldForward); err != nil || held {
+			if held, err := e.st.HasLiveHold(ctx, row.ID, model.HoldExec); err != nil || held {
 				continue
 			}
 		}
@@ -328,12 +333,17 @@ func (e *Engine) startEvacuation(ctx context.Context, row store.Sandbox, trigger
 		e.cancelExecs(ctx, row.ID)
 	}
 	started := e.goBackground(func(bg context.Context) {
-		defer done()
-		wctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-		stop := context.AfterFunc(bg, cancel)
-		defer stop()
-		e.evacuate(wctx, row, trigger)
+		ran := func() bool {
+			defer done()
+			wctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			stop := context.AfterFunc(bg, cancel)
+			defer stop()
+			return e.evacuate(wctx, row, trigger)
+		}()
+		if ran {
+			e.restoreElsewhere(bg, row.ID)
+		}
 	})
 	if !started {
 		done()
@@ -342,10 +352,12 @@ func (e *Engine) startEvacuation(ctx context.Context, row store.Sandbox, trigger
 }
 
 // evacuate moves one sandbox off a draining node: a running one is paused
-// first, then hibernated.
-func (e *Engine) evacuate(ctx context.Context, row store.Sandbox, trigger OpTrigger) {
+// first, then hibernated. It reports whether a sandbox that ran is
+// hibernated now, to be restored elsewhere.
+func (e *Engine) evacuate(ctx context.Context, row store.Sandbox, trigger OpTrigger) bool {
 	in := OpIntent{Kind: OpHibernate, Trigger: trigger, Target: row.Node, Incarnation: row.Incarnation}
-	if row.ClientState == model.StateRunning {
+	ran := row.ClientState == model.StateRunning
+	if ran {
 		in.Kind = OpPause
 	}
 	for {
@@ -354,14 +366,37 @@ func (e *Engine) evacuate(ctx context.Context, row store.Sandbox, trigger OpTrig
 			if !quiet(err) {
 				e.rl.warn("drain", "a drain's op was not begun", "sandbox", row.ID, "op", in.Kind, "err", err)
 			}
-			return
+			return false
 		}
 		res, err := h.Wait(ctx)
-		if err != nil || res.Err != nil || h.kind != OpPause || res.State != model.StatePaused {
-			return
+		if err != nil || res.Err != nil {
+			return false
+		}
+		if h.kind != OpPause {
+			return ran && res.State == model.StateHibernated
+		}
+		if res.State != model.StatePaused {
+			return false
 		}
 		in.Kind = OpHibernate
 	}
+}
+
+// restoreElsewhere brings a sandbox that a drain hibernated while it ran
+// back up on another node, as its next call would: the calls that waited
+// for the move go on there, and its pod is not left cold. Without room
+// elsewhere it stays hibernated until it is used.
+func (e *Engine) restoreElsewhere(ctx context.Context, id uuid.UUID) {
+	ctx, cancel := context.WithTimeout(ctx, restoreTimeout)
+	defer cancel()
+	lease, err := e.Ensure(ctx, id)
+	if err != nil {
+		if !quiet(err) {
+			e.rl.warn("drain", "a drained sandbox stays hibernated", "sandbox", id, "err", err)
+		}
+		return
+	}
+	e.log.Info("drained sandbox restored", "sandbox", id, "node", lease.Node)
 }
 
 // cancelExecs tells every instance to cancel the execs of a sandbox

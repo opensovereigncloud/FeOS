@@ -312,14 +312,16 @@ func (en *ensurer) running(ctx context.Context, row store.Sandbox) (model.Lease,
 }
 
 // drainingRunning starts no new work on a draining node: a sandbox
-// without exec or forward holds is paused and hibernated, to be restored
-// elsewhere; one with holds waits until the row moves.
+// without an exec hold is paused and hibernated, to be restored elsewhere
+// (its forwards are closed as it leaves running); one whose execs still
+// run waits until the row moves, within --drain-timeout of the drain's
+// start, past which the drain cancels them.
 func (en *ensurer) drainingRunning(ctx context.Context, row store.Sandbox, n store.Node) error {
 	e := en.e
 	if !hasObjectStore(n) {
 		return errorf(model.ErrNoCapacity, "node %s is draining", n.Name)
 	}
-	held, err := e.st.HasLiveHold(ctx, row.ID, model.HoldExec, model.HoldForward)
+	held, err := e.st.HasLiveHold(ctx, row.ID, model.HoldExec)
 	if err != nil {
 		return err
 	}

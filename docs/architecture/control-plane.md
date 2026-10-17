@@ -86,7 +86,7 @@ that.
 | `--lost-grace` | `10m` | how long a node is down before its sandboxes count as lost |
 | `--node-wait` | `5s` | how long a call waits for a node's connection |
 | `--rollout-grace` | `30s` | how long a call waits for a node that announced its restart |
-| `--drain-timeout` | `1h` | after this, the execs still running on a draining node are cancelled |
+| `--drain-timeout` | `2m` | how long a draining node waits for the execs still running in its sandboxes; then they are cancelled and the sandboxes move |
 | `--pending-repair-after` | `10m` | a pod pending this long without an op is repaired |
 | `--unreachable-repair-after` | `2m` | a running pod whose guest stays unreachable this long is repaired |
 | `--node-cert-ttl`, `--pod-cert-ttl` | `168h`, `1h` | the certificates' lifetimes; renewed at three quarters |
@@ -620,7 +620,7 @@ checkpoint inside the call.
   deadline, since every call is idempotent or answered from the pod's
   state. An idle pause and a hibernate-after recheck, in later statements,
   that the sandbox is still idle and holds nothing; a pause for a drain
-  only that nothing executes or forwards; an explicit pause nothing. An
+  only that nothing executes; an explicit pause nothing. An
   admission locks the target node's row, rechecks the gates and books.
 - **Preempt.** A hibernate of a paused sandbox that a resume abandons now
   is replaced by a resume, in one transaction under the row's lock: the
@@ -772,11 +772,18 @@ leaving those with an op in flight to the op. After `--lost-grace` they
 become `hibernated` (with a checkpoint, restored elsewhere on the next
 use) or `lost`; no tombstone is written, since the pod may still run, and
 a returning node's pod is adopted. Idle pause, hibernate-after, drain and
-repair begin ops as their triggers; a drain hibernates what is paused,
-pauses and hibernates what runs without execs or forwards, and after
-`--drain-timeout` cancels the execs and moves the rest regardless; a
-resume never abandons its hibernations. A node without an object store
-cannot be drained.
+repair begin ops as their triggers. A drain hibernates what is paused,
+and pauses and hibernates what runs without execs; a forward does not
+keep a sandbox, since the port door closes its upgraded connections, a
+preview's WebSocket among them, once the sandbox leaves running, and
+their clients reconnect to where it runs next. A call for a sandbox on a
+draining node starts nothing there: it waits until the sandbox has
+moved. After `--drain-timeout`, minutes after the drain's start, the
+execs that still run are cancelled and the rest moves regardless. A
+sandbox that ran is restored on another node as soon as its hibernation
+is done, where the calls that waited go on; without room elsewhere it
+stays hibernated until its next use. A resume never abandons a drain's
+hibernation. A node without an object store cannot be drained.
 
 ### Delete
 

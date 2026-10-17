@@ -33,5 +33,8 @@
 // as it is open, holds the sandbox awake (a forward hold), and its end
 // counts as activity. At an instance's stop the upgraded connections are
 // closed once no request is left (CloseUpgraded); their clients reconnect
-// to another instance.
+// to another instance. So are those to a pod that stops running on its
+// node, as when a drain moves its sandbox: a forward does not keep a
+// sandbox on a draining node, and its client reconnects to where it runs
+// next.
 package ports

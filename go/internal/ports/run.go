@@ -18,12 +18,13 @@ import (
 )
 
 // Run keeps the pools true to the sandboxes until ctx ends: on
-// ferun_sandbox for a sandbox with pools, it reads the row and retires
-// the pools whose pod is no longer the running one on their node (the
-// sandbox left running, moved, or was deleted and created again); when a
-// node's last connection to this instance is gone, it retires the pools
-// on that node; and it evicts the pools unused for a while. At its end
-// every Forward stream ends.
+// ferun_sandbox for a sandbox with pools or upgraded connections, it reads
+// the row, retires the pools whose pod is no longer the running one on
+// their node (the sandbox left running, moved, or was deleted and created
+// again) and closes the upgraded connections to such a pod, whose clients
+// reconnect to where it runs next; when a node's last connection to this
+// instance is gone, it retires the pools on that node; and it evicts the
+// pools unused for a while. At its end every Forward stream ends.
 func (h *Handler) Run(ctx context.Context) error {
 	defer h.cancelBase()
 	var notes <-chan string
@@ -59,25 +60,24 @@ func (h *Handler) Run(ctx context.Context) error {
 }
 
 // recheck reads the rows of the sandboxes a ferun_sandbox payload names
-// ("" or "*": every sandbox with pools) and retires their stale pools.
+// ("" or "*": every sandbox with pools or upgraded connections), retires
+// their stale pools and closes their stale upgraded connections.
 func (h *Handler) recheck(ctx context.Context, payload string) {
 	var ids []uuid.UUID
 	h.mu.Lock()
+	known := map[uuid.UUID]bool{}
+	for k := range h.transports {
+		known[k.id] = true
+	}
+	for u := range h.upgraded {
+		known[u.lease.SandboxID] = true
+	}
 	if payload == "" || payload == "*" {
-		seen := map[uuid.UUID]bool{}
-		for k := range h.transports {
-			if !seen[k.id] {
-				seen[k.id] = true
-				ids = append(ids, k.id)
-			}
+		for id := range known {
+			ids = append(ids, id)
 		}
-	} else if id, err := uuid.Parse(payload); err == nil {
-		for k := range h.transports {
-			if k.id == id {
-				ids = append(ids, id)
-				break
-			}
-		}
+	} else if id, err := uuid.Parse(payload); err == nil && known[id] {
+		ids = append(ids, id)
 	}
 	h.mu.Unlock()
 	if h.st == nil {
@@ -90,6 +90,7 @@ func (h *Handler) recheck(ctx context.Context, payload string) {
 		switch {
 		case errors.Is(err, model.ErrNotFound):
 			h.retireWhere(func(e *entry) bool { return e.key.id == id })
+			h.closeUpgradedWhere(func(l model.Lease) bool { return l.SandboxID == id })
 		case err != nil:
 			if ctx.Err() == nil {
 				h.rl.warn("row", "forward: cannot read a sandbox's row", "sandbox", id, "err", err)
@@ -99,6 +100,10 @@ func (h *Handler) recheck(ctx context.Context, payload string) {
 				return e.key.id == id && (row.ClientState != model.StateRunning || row.Node != e.node ||
 					row.Incarnation != e.incarnation)
 			})
+			h.closeUpgradedWhere(func(l model.Lease) bool {
+				return l.SandboxID == id && (row.ClientState != model.StateRunning || row.Node != l.Node ||
+					row.Incarnation != l.Incarnation)
+			})
 		}
 	}
 }
@@ -106,10 +111,12 @@ func (h *Handler) recheck(ctx context.Context, payload string) {
 // upgradedConn is the backend side of an upgraded connection (a
 // WebSocket, a hot-reload socket): the body of the 101 response, which
 // the proxy pipes to the client's hijacked connection until either ends.
+// lease is where it goes: the sandbox's pod on its node.
 type upgradedConn struct {
 	io.ReadWriteCloser
-	h    *Handler
-	once sync.Once
+	h     *Handler
+	lease model.Lease
+	once  sync.Once
 }
 
 // Close ends the connection and forgets it; it may be called more than
@@ -127,8 +134,8 @@ func (u *upgradedConn) Close() error {
 // trackUpgrade records an upgraded connection and counts its request,
 // which upgradeEnded uncounts once its hold is released. After
 // CloseUpgraded it is closed at once.
-func (h *Handler) trackUpgrade(rwc io.ReadWriteCloser) *upgradedConn {
-	u := &upgradedConn{ReadWriteCloser: rwc, h: h}
+func (h *Handler) trackUpgrade(rwc io.ReadWriteCloser, lease model.Lease) *upgradedConn {
+	u := &upgradedConn{ReadWriteCloser: rwc, h: h, lease: lease}
 	h.mu.Lock()
 	h.upgraded[u] = struct{}{}
 	if h.upActive == 0 {
@@ -141,6 +148,23 @@ func (h *Handler) trackUpgrade(rwc io.ReadWriteCloser) *upgradedConn {
 		_ = u.Close()
 	}
 	return u
+}
+
+// closeUpgradedWhere closes the upgraded connections whose lease match
+// holds: their holds go once their requests end, so that a sandbox that
+// leaves running, as a drain moves it (§9), is not kept by a WebSocket.
+func (h *Handler) closeUpgradedWhere(match func(model.Lease) bool) {
+	h.mu.Lock()
+	var conns []*upgradedConn
+	for u := range h.upgraded {
+		if match(u.lease) {
+			conns = append(conns, u)
+		}
+	}
+	h.mu.Unlock()
+	for _, u := range conns {
+		_ = u.Close()
+	}
 }
 
 func (h *Handler) upgradeEnded() {

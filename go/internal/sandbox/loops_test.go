@@ -206,6 +206,7 @@ func TestDrainLoop(t *testing.T) {
 	e := h.eng()
 	free := h.running(512)
 	held := h.running(512)
+	viewed := h.running(512)
 	stopped := h.running(512)
 	paused := h.running(512)
 	h.startOp(paused.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
@@ -217,13 +218,22 @@ func TestDrainLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// An open WebSocket of a preview: the port door closes it once the
+	// sandbox leaves running.
+	_, releaseForward, err := e.Acquire(bg, viewed.ID, model.HoldForward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseForward()
 	if err := e.HoldProcess(bg, free.ID, "p", 0); err != nil {
 		t.Fatal(err)
 	}
 	h.exec("UPDATE nodes SET draining = true, drain_started_at = now() WHERE name = 'n1'")
-	// Everything without an exec or forward hold goes to object storage
-	// (process holds do not keep a drain away); the held one runs.
-	unheld := []uuid.UUID{free.ID, stopped.ID, paused.ID}
+	// Everything without an exec hold goes to object storage (forward and
+	// process holds do not keep a drain away); the one whose exec runs
+	// stays, within the drain timeout. Without another node, what ran
+	// stays hibernated.
+	unheld := []uuid.UUID{free.ID, viewed.ID, stopped.ID, paused.ID}
 	h.drainUntil("the sandboxes without an exec hibernated", func() bool {
 		for _, id := range unheld {
 			if row := h.row(id); row.ClientState != model.StateHibernated || row.Op != "" {
@@ -251,7 +261,8 @@ func TestDrainLoop(t *testing.T) {
 		t.Fatalf("restored on %s", lease.Node)
 	}
 	// Past the drain timeout, the execs that still run are cancelled and
-	// the sandbox goes regardless of its holds.
+	// the sandbox goes regardless of its holds; as it ran, it is restored
+	// on another node at once.
 	cancels, unsubscribe := h.d.Subscribe(db.ChanCancel)
 	defer unsubscribe()
 	h.exec("UPDATE nodes SET drain_started_at = now() - interval '2 hours' WHERE name = 'n1'")
@@ -268,7 +279,10 @@ func TestDrainLoop(t *testing.T) {
 	if err := json.Unmarshal([]byte(cancel), &c); err != nil || c.Kind != "exec" || c.Sandbox != held.ID.String() {
 		t.Fatalf("ferun_cancel %q", cancel)
 	}
-	h.waitState(held.ID, model.StateHibernated, 10*time.Second)
+	eventually(t, 20*time.Second, "the held sandbox restored on n2", func() bool {
+		row := h.row(held.ID)
+		return row.ClientState == model.StateRunning && row.Node == "n2" && row.Op == ""
+	})
 	release()
 	h.drainUntil("the node drained", func() bool {
 		nd, _ := h.st.GetNode(bg, "n1")

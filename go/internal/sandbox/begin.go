@@ -425,9 +425,11 @@ func (r *runner) precheck(ctx context.Context, tx *store.Store, row store.Sandbo
 			return recheckFailed(row.ID, "it was resumed since", err)
 		}
 	case TriggerDrain, TriggerEnsure:
-		held, err := tx.HasLiveHold(ctx, row.ID, model.HoldExec, model.HoldForward)
+		// A forward does not keep a sandbox on a draining node: the port
+		// door closes it once the sandbox leaves running.
+		held, err := tx.HasLiveHold(ctx, row.ID, model.HoldExec)
 		if err != nil || held {
-			return recheckFailed(row.ID, "an exec or a forward holds it", err)
+			return recheckFailed(row.ID, "an exec holds it", err)
 		}
 	}
 	return nil

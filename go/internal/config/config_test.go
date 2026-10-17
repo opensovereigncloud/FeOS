@@ -51,7 +51,7 @@ func TestDefaults(t *testing.T) {
 			"default-image": "ghcr.io/maltej/debian-ai:latest", "default-vcpus": 2, "default-memory-mib": 512,
 			"placement": "binpack", "disk-budget": int64(4 << 30), "idle-pause": 10 * time.Second,
 			"hibernate-after": time.Duration(0), "node-ttl": 15 * time.Second, "lost-grace": 10 * time.Minute,
-			"node-wait": 5 * time.Second, "rollout-grace": 30 * time.Second, "drain-timeout": time.Hour,
+			"node-wait": 5 * time.Second, "rollout-grace": 30 * time.Second, "drain-timeout": 2 * time.Minute,
 			"pending-repair-after": 10 * time.Minute, "unreachable-repair-after": 2 * time.Minute,
 			"node-cert-ttl": 168 * time.Hour, "pod-cert-ttl": time.Hour, "node-max-streams": 1024,
 			"conn-drain-timeout": 20 * time.Minute, "shutdown-grace": 10 * time.Minute,

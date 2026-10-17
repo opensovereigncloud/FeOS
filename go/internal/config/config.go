@@ -226,7 +226,7 @@ func Default() Config {
 		LostGrace:              10 * time.Minute,
 		NodeWait:               5 * time.Second,
 		RolloutGrace:           30 * time.Second,
-		DrainTimeout:           time.Hour,
+		DrainTimeout:           2 * time.Minute,
 		PendingRepairAfter:     10 * time.Minute,
 		UnreachableRepairAfter: 2 * time.Minute,
 		NodeCertTTL:            168 * time.Hour,
@@ -320,7 +320,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.DurationVar(&c.LostGrace, "lost-grace", c.LostGrace, "how long a node is down before its sandboxes count as lost")
 	fs.DurationVar(&c.NodeWait, "node-wait", c.NodeWait, "how long a call waits for a node's connection")
 	fs.DurationVar(&c.RolloutGrace, "rollout-grace", c.RolloutGrace, "how long a call waits for a node that announced it is stopping")
-	fs.DurationVar(&c.DrainTimeout, "drain-timeout", c.DrainTimeout, "then running execs of a draining node are cancelled")
+	fs.DurationVar(&c.DrainTimeout, "drain-timeout", c.DrainTimeout, "how long a draining node waits for running execs; then they are cancelled and their sandboxes move")
 	fs.DurationVar(&c.PendingRepairAfter, "pending-repair-after", c.PendingRepairAfter, "a pod pending without an op this long is repaired")
 	fs.DurationVar(&c.UnreachableRepairAfter, "unreachable-repair-after", c.UnreachableRepairAfter,
 		"a running pod whose guest stays unreachable this long is repaired")

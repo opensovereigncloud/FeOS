@@ -487,7 +487,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, lease model.Leas
 				return nil
 			}
 			if rwc, ok := res.Body.(io.ReadWriteCloser); ok {
-				*up = h.trackUpgrade(rwc)
+				*up = h.trackUpgrade(rwc, lease)
 				res.Body = *up
 			}
 			return nil

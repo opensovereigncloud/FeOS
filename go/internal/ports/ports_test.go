@@ -561,6 +561,47 @@ func TestRunRetiresPools(t *testing.T) {
 	}
 }
 
+// Run closes an upgraded connection when its sandbox leaves running
+// where it goes, as a drain moves it: its hold goes, and its client
+// reconnects; a notification that changes nothing keeps it.
+func TestRunClosesUpgradedWhenTheSandboxLeaves(t *testing.T) {
+	w := newWorld(t)
+	conn, br := w.rawUpgrade("/ws")
+	if n := w.eng.Holds(w.sb.ID); n != 1 {
+		t.Fatalf("%d holds while upgraded", n)
+	}
+	w.h.mu.Lock()
+	var lease model.Lease
+	for u := range w.h.upgraded {
+		lease = u.lease
+	}
+	w.h.mu.Unlock()
+	ctx := context.Background()
+	setRow := func(state string) {
+		t.Helper()
+		if _, err := w.env.DB.Pool.Exec(ctx, "UPDATE sandboxes SET client_state = $2, node = $3, incarnation = $4 WHERE id = $1",
+			w.sb.ID, state, lease.Node, lease.Incarnation); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Notify(ctx, w.env.DB.Pool, db.ChanSandbox, w.sb.ID.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setRow(model.StateRunning)
+	time.Sleep(300 * time.Millisecond)
+	if n := w.eng.Holds(w.sb.ID); n != 1 {
+		t.Fatalf("%d holds after a notification that changed nothing", n)
+	}
+	setRow(model.StatePaused)
+	eventually(t, 5*time.Second, "the upgraded connection's hold released", func() bool {
+		return w.eng.Holds(w.sb.ID) == 0
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := br.ReadByte(); err == nil {
+		t.Error("the upgraded connection is still open")
+	}
+}
+
 // The pools evict themselves when unused, and stay within their bound.
 func TestPoolEviction(t *testing.T) {
 	w := newWorld(t, func(tm *timings) {
