@@ -277,3 +277,42 @@ func TestCheckSemaphore(t *testing.T) {
 		t.Error("connected or checked without a check slot")
 	}
 }
+
+// OnPresented runs in the accept check's slot: a node that redials as
+// fast as it can never has more presentations recorded at once than
+// there are check slots, and while they all wait (on the node's row lock,
+// say), the next accept waits for a slot like any check.
+func TestPresentedInCheckSlot(t *testing.T) {
+	block := make(chan struct{})
+	entered := make(chan struct{}, 4)
+	e := newEnv(t, envOpt{
+		cfg: func(c *Config) {
+			c.OnPresented = func(node, serial, addr string) {
+				if node == "slow" {
+					entered <- struct{}{}
+					<-block
+				}
+			}
+		},
+		tune: func(s *Server) {
+			s.checks = make(chan struct{}, 1)
+			s.checkWait = 200 * time.Millisecond
+		},
+	})
+	defer close(block)
+	slow := e.node("slow", time.Hour)
+	go e.tryDialNode(slow, "slow")
+	<-entered
+	if e.chk.count(slow.serial, true) != 1 {
+		t.Fatal("the presentation came before the check")
+	}
+	n1 := e.node("n1", time.Hour)
+	ns, err := e.tryDialNode(n1, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns.waitClosed(t, 3*time.Second)
+	if e.srv.Connected("n1") || e.chk.count(n1.serial, true) != 0 {
+		t.Error("checked or connected while a presentation held the only slot")
+	}
+}

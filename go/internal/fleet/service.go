@@ -143,6 +143,9 @@ const (
 	joinRetryWindow = 10 * time.Minute
 	// presentTimeout bounds the recording of a certificate presentation.
 	presentTimeout = 10 * time.Second
+	// maxPresentations is how many presentations one instance records
+	// under a node's row lock at once.
+	maxPresentations = 4
 	// rpcTimeout bounds the database work of one unary call.
 	rpcTimeout = 15 * time.Second
 )
@@ -166,6 +169,8 @@ type Service struct {
 	joins        *tokenBucket
 	joinSlots    chan struct{}
 	joinSlotWait time.Duration
+	// presents are the slots of OnPresented's locked passes (4).
+	presents chan struct{}
 
 	// The inputs of node expiry's health gate; tests replace them.
 	leadingSince func() time.Time
@@ -227,6 +232,7 @@ func New(cfg Config, deps Deps) *Service {
 		joins:        newTokenBucket(10, 20),
 		joinSlots:    make(chan struct{}, 4),
 		joinSlotWait: 2 * time.Second,
+		presents:     make(chan struct{}, maxPresentations),
 		leadingSince: func() time.Time { return time.Time{} },
 		lastFailure:  deps.DB.LastFailure,
 		expiryBatch:  fencedBatch,

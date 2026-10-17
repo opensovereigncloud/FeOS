@@ -149,11 +149,32 @@ func (s *Service) fork(ctx context.Context, node, serial, peerAddr string) (time
 // and every older certificate is revoked one superseded grace ahead
 // (--conn-drain-timeout + 10 min), with ferun_node, so that every instance
 // re-checks the node's connections.
+//
+// Most presentations change nothing (the certificate was seen and is
+// current): one read without a lock tells, and they end there. The others
+// take the node's row lock, at most 4 at once on this instance, so that
+// presentations queued on one node's lock never hold more of the pool.
 func (s *Service) OnPresented(node, serial, peerAddr string) {
 	ctx, cancel := context.WithTimeout(s.bg, presentTimeout)
 	defer cancel()
+	news, err := s.st.PresentationNews(ctx, node, serial)
+	if err != nil {
+		s.rl.warn("present", "cannot read a node's certificate lineage", "node", node, "serial", serial, "peer", peerAddr, "err", err)
+		return
+	}
+	if !news {
+		return
+	}
+	select {
+	case s.presents <- struct{}{}:
+		defer func() { <-s.presents }()
+	case <-ctx.Done():
+		s.rl.warn("present", "cannot record a node's certificate presentation: too many in flight", "node", node,
+			"serial", serial, "peer", peerAddr)
+		return
+	}
 	var p store.Presentation
-	err := s.st.InTx(ctx, func(tx *store.Store) (err error) {
+	err = s.st.InTx(ctx, func(tx *store.Store) (err error) {
 		p, err = tx.RecordPresentation(ctx, node, serial, s.supersededGrace())
 		return err
 	})

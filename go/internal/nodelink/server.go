@@ -65,8 +65,9 @@ type Config struct {
 	// The text of a definitive refusal at accept is what the refusal server
 	// answers an uplink with (see Refusal).
 	CheckNode func(ctx context.Context, node, serial, peerAddr string, atAccept bool) (revokeAt time.Time, err error)
-	// OnPresented is called after a successful accept check, before the
-	// connection takes calls.
+	// OnPresented is called after a successful accept check, in the
+	// check's slot of the 32 (so that its database work is bounded as the
+	// checks' is), before the connection takes calls.
 	OnPresented func(node, serial, peerAddr string)
 	// OnNodeConn is called, in a goroutine of its own, when a node gets a
 	// current connection on this instance after having none.
@@ -383,9 +384,6 @@ func (s *Server) acceptNode(tc *tls.Conn, state tls.ConnectionState) {
 		s.rl.warn("refused", "nodes' port: node connection refused", "node", node, "serial", serial, "peer", addr, "err", err)
 		return
 	}
-	if s.cfg.OnPresented != nil {
-		s.cfg.OnPresented(node, serial, addr)
-	}
 	l := &link{
 		kind: nodeLink, node: node, serial: serial, addr: addr,
 		notBefore: leaf.NotBefore, notAfter: leaf.NotAfter, raw: tc,
@@ -422,9 +420,6 @@ func (s *Server) acceptH2(tc *tls.Conn, state tls.ConnectionState) {
 		tc.Close()
 		s.rl.warn("check", "nodes' port: uplink not checked; closed", "node", node, "peer", addr, "err", err)
 		return
-	}
-	if s.cfg.OnPresented != nil {
-		s.cfg.OnPresented(node, serial, addr)
 	}
 	l := &link{
 		kind: uplinkLink, node: node, serial: serial, addr: addr,
@@ -471,7 +466,9 @@ func (s *Server) handLimited(tc *tls.Conn, state tls.ConnectionState, lis *chanL
 }
 
 // check runs CheckNode within the port's limit of 32 concurrent checks,
-// waiting at most checkWait for a slot.
+// waiting at most checkWait for a slot. At accept, a certificate that
+// passes is reported to OnPresented in the same slot: what an accept does
+// in the database stays within the limit, however fast a node redials.
 func (s *Server) check(ctx context.Context, node, serial, addr string, atAccept bool) (time.Time, error) {
 	t := time.NewTimer(s.checkWait)
 	select {
@@ -484,9 +481,13 @@ func (s *Server) check(ctx context.Context, node, serial, addr string, atAccept 
 		return time.Time{}, ctx.Err()
 	}
 	defer func() { <-s.checks }()
-	ctx, cancel := context.WithTimeout(ctx, s.checkTimeout)
-	defer cancel()
-	return s.cfg.CheckNode(ctx, node, serial, addr, atAccept)
+	cctx, cancel := context.WithTimeout(ctx, s.checkTimeout)
+	revokeAt, err := s.cfg.CheckNode(cctx, node, serial, addr, atAccept)
+	cancel()
+	if err == nil && atAccept && s.cfg.OnPresented != nil {
+		s.cfg.OnPresented(node, serial, addr)
+	}
+	return revokeAt, err
 }
 
 // definitive reports whether a CheckNode error refuses for good.

@@ -152,6 +152,30 @@ type Presentation struct {
 	Superseded int64
 }
 
+// certNewer is the condition under which the certificate c of node n was
+// issued after the node's current certificate, or the node has none.
+const certNewer = `n.current_serial <> c.serial AND coalesce(
+	c.issued_at > (SELECT cur.issued_at FROM node_certs cur WHERE cur.serial = n.current_serial AND cur.node = n.name),
+	true)`
+
+// PresentationNews reports, without a lock, whether RecordPresentation of
+// serial would change anything: the certificate was never presented, or
+// it is newer than the node's current one. first_seen_at is never
+// cleared, and current_serial moves only to newer certificates but at a
+// rejoin, which revokes every certificate before it; so a stale answer can
+// only ask for a needless locked pass, never skip one that a certificate
+// still valid needs. True when the node or certificate does not exist, for
+// RecordPresentation to report.
+func (s *Store) PresentationNews(ctx context.Context, node, serial string) (bool, error) {
+	var news bool
+	err := s.q.QueryRow(ctx, `SELECT c.first_seen_at IS NULL OR (`+certNewer+`)
+		FROM node_certs c JOIN nodes n ON n.name = c.node WHERE c.serial = $1 AND c.node = $2`, serial, node).Scan(&news)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, nil
+	}
+	return news, err
+}
+
 // RecordPresentation records that node presented the certificate serial in
 // a handshake that passed checkNode (the certificate lineage): with the
 // node row locked, the certificate's first_seen_at is set if unset; if it
@@ -173,9 +197,7 @@ func (s *Store) RecordPresentation(ctx context.Context, node, serial string, gra
 	p.FirstSeen = tag.RowsAffected() > 0
 	var newer bool
 	var issuedAt time.Time
-	err = s.q.QueryRow(ctx, `SELECT c.issued_at, n.current_serial <> c.serial AND coalesce(
-			c.issued_at > (SELECT cur.issued_at FROM node_certs cur WHERE cur.serial = n.current_serial AND cur.node = n.name),
-			true)
+	err = s.q.QueryRow(ctx, `SELECT c.issued_at, `+certNewer+`
 		FROM node_certs c JOIN nodes n ON n.name = c.node WHERE c.serial = $1 AND c.node = $2`, serial, node).Scan(&issuedAt, &newer)
 	if err != nil {
 		return p, noRow(err, ErrNoRow)

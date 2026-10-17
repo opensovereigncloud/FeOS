@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -236,4 +237,78 @@ func TestRenewCertificate(t *testing.T) {
 	h.exec("UPDATE nodes SET status = 'removed', removed_at = now() WHERE name = 'n1'")
 	_, err = h.s.UplinkServer().RenewCertificate(uplinkCtx("n1", renewed), &fleetv1.RenewCertificateRequest{Csr: csr})
 	wantCode(t, err, codes.PermissionDenied, "node n1 was removed; join it again")
+}
+
+// A presentation that changes nothing, the steady state of every accept,
+// neither takes the node's row lock nor writes: it is not held up by a
+// writer of the row. A presentation that changes the lineage takes the
+// lock, at most 4 at once per instance, however many arrive.
+func TestPresentationLocks(t *testing.T) {
+	h := newHarness(t)
+	first := h.joined("n1")
+	if news, err := h.st.PresentationNews(bg, "n1", first); err != nil || news {
+		t.Fatalf("the current certificate, presented: news %v %v", news, err)
+	}
+	if news, err := h.st.PresentationNews(bg, "n1", "abcdef"); err != nil || !news {
+		t.Fatalf("an unknown certificate: news %v %v", news, err)
+	}
+	resp, err := h.s.UplinkServer().RenewCertificate(uplinkCtx("n1", first), &fleetv1.RenewCertificateRequest{Csr: newCSR(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := serialOf(t, resp.GetCertificate())
+	if news, err := h.st.PresentationNews(bg, "n1", second); err != nil || !news {
+		t.Fatalf("a renewed certificate, not presented: news %v %v", news, err)
+	}
+
+	// Another transaction holds the node's row.
+	tx, err := h.d.Pool.Begin(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(bg)
+	if _, err := tx.Exec(bg, "SELECT 1 FROM nodes WHERE name = 'n1' FOR UPDATE"); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for range 20 {
+		h.s.OnPresented("n1", first, "198.51.100.1:5000")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("20 presentations of the current certificate took %v behind the row lock", took)
+	}
+
+	// The renewed certificate's first presentations queue on the lock,
+	// four at a time.
+	var done sync.WaitGroup
+	for range 10 {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			h.s.OnPresented("n1", second, "198.51.100.1:6000")
+		}()
+	}
+	waiting := func() int {
+		var n int
+		h.scalar(&n, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`)
+		return n
+	}
+	waitFor(t, "four presentations waiting on the lock", 5*time.Second, func() bool { return waiting() == maxPresentations })
+	never := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(never) {
+		if n := waiting(); n > maxPresentations {
+			t.Fatalf("%d presentations wait on the node's row lock", n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := tx.Rollback(bg); err != nil {
+		t.Fatal(err)
+	}
+	done.Wait()
+	if n := h.node("n1"); n.CurrentSerial != second {
+		t.Fatalf("current serial %q after the presentations, want %q", n.CurrentSerial, second)
+	}
+	if news, err := h.st.PresentationNews(bg, "n1", first); err != nil || news {
+		t.Fatalf("the superseded certificate: news %v %v", news, err)
+	}
 }

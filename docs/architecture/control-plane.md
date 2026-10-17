@@ -301,13 +301,16 @@ One TLS 1.3 listener, routed strictly by ALPN:
 - **The node's identity** is its certificate's one URI,
   `spiffe://<trust domain>/node/<name>`, never what it sends. The
   certificate is checked against the database at accept and on every
-  re-check, never from a cache (at most 32 checks at once): its serial
-  must exist and not be revoked, the node neither removed nor forked. A
-  definitive refusal (unknown serial, revoked, removed, forked) refuses
-  the connection; any other error, such as a database failover, refuses a
-  new connection but never closes one that is open: its re-check is
-  retried with backoff. A connection is closed when its certificate
-  expires.
+  re-check, never from a cache (at most 32 checks at once; a check waits
+  at most 5 s for a slot): its serial must exist and not be revoked, the
+  node neither removed nor forked. A certificate that passes at accept
+  has its presentation recorded ([certificate lineage](#nodes)) in the
+  same slot, so that a node that redials as fast as it can never has more
+  database work under way at accept than the 32 slots. A definitive refusal
+  (unknown serial, revoked, removed, forked) refuses the connection; any
+  other error, such as a database failover, refuses a new connection but
+  never closes one that is open: its re-check is retried with backoff. A
+  connection is closed when its certificate expires.
 - **Node connections.** The instance dials gRPC over the TLS connection
   it accepted, with keepalive pings every 10 s (5 s timeout) also without
   streams, no idle timeout and no service config, and registers it only
@@ -437,7 +440,10 @@ row is never deleted: removal is a status. Its statuses: `joined`, `ready`
   means two holders use the node's identity: the node is marked forked,
   all its certificates are revoked, and it must join again with a pinned
   token. An old connection of the node's own, re-checked after the grace,
-  is only closed.
+  is only closed. Almost every accept presents a certificate seen before
+  and not newer than the current one: one read without a lock tells so,
+  and nothing is written. A presentation that changes the lineage is
+  recorded under the node's row lock, at most 4 at once per instance.
 - **Instances for nodes.** Join and every telemetry answer list the
   instances with a `--node-advertise-address` whose row is younger than
   15 s, stopping ones included: a stopping instance stays listed until its
