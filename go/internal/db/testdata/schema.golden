@@ -393,6 +393,7 @@ TABLE traffic_records PARTITION BY RANGE (day)
   COLUMN detail jsonb NOT NULL
   CONSTRAINT CHECK ((kind = ANY (ARRAY['flow'::text, 'drop'::text, 'dns'::text, 'server_name'::text])))
   CONSTRAINT PRIMARY KEY (day, id)
+  CREATE INDEX traffic_node_foreign ON ONLY public.traffic_records USING btree (node, ts_ns, id) WHERE (sandbox_id IS NULL)
   CREATE INDEX traffic_sandbox ON ONLY public.traffic_records USING btree (sandbox_id, ts_ns) WHERE (sandbox_id IS NOT NULL)
   CREATE UNIQUE INDEX traffic_records_pkey ON ONLY public.traffic_records USING btree (day, id)
   CREATE UNIQUE INDEX traffic_seq ON ONLY public.traffic_records USING btree (node, start_id, seq, day)

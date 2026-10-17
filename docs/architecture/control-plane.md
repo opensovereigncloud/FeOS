@@ -159,10 +159,12 @@ replicate synchronously ([Operations](#operations)).
 - **Migrations** are embedded (`internal/db/migrations/`: `0001_init.sql`,
   the schema; `0002_auth.sql`, sign-in;
   `0003_policy_backoff_and_placements.sql`, the policies' backoff
-  ([Policies](#policies)) and an empty `placements`; `0005_mesh.sql`, the
-  pods' mesh) and applied under an advisory lock, recorded in
-  `schema_migrations`. The same locked section creates the cluster's MCP
-  session key, reconciles `--pod-network` with the database's ([The pods'
+  ([Policies](#policies)) and an empty `placements`;
+  `0004_traffic_node_foreign.sql`, the partial index of a node's foreign
+  traffic records ([Nodes](#nodes)); `0005_mesh.sql`, the pods' mesh) and
+  applied under an advisory lock, recorded in `schema_migrations`. The
+  same locked section creates the cluster's MCP session key, reconciles
+  `--pod-network` with the database's ([The pods'
   mesh](#the-pods-mesh)) and, with `--bootstrap-token`, creates the tenant
   `operator` and its token, when no tenant exists.
 - **Notifications.** One connection per instance listens on the channels
@@ -473,7 +475,8 @@ row is never deleted: removal is a status. Its statuses: `joined`, `ready`
   `stopping` sets the node's rollout deadline, `--rollout-grace` ahead,
   during which calls wait for it. A record about a pod is attributed to
   its sandbox only when the pod is or was on that node; otherwise it is
-  kept for the node's audit as foreign.
+  kept for the node's audit as foreign, and a partial index of the foreign
+  records serves the node's activity a page at a time.
 - **Pods' credentials.** `IssuePodCredentials` issues a pod's certificate
   when the sandbox is placed on the asking node and has a run there
   (creating, running, resuming), at most 5 per pod per minute

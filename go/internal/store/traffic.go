@@ -86,17 +86,24 @@ func scanTraffic(row pgx.Row) (TrafficRow, error) {
 	return r, nil
 }
 
-// listTraffic returns the page of records matching where (with its first
-// argument), ascending by ts_ns.
-func (s *Store) listTraffic(ctx context.Context, where string, arg any, q ActivityQuery) ([]TrafficRow, error) {
+// trafficPage is the statement and the arguments of a page of the
+// records matching where (with its first argument), newest first.
+func trafficPage(where string, arg any, q ActivityQuery) (string, []any) {
 	args := []any{arg}
 	if q.BeforeTsNs != 0 {
 		args = append(args, q.BeforeTsNs)
 		where += fmt.Sprintf(" AND ts_ns < $%d", len(args))
 	}
 	args = append(args, q.Limit)
-	rows, err := s.q.Query(ctx, "SELECT "+trafficCols+" FROM traffic_records WHERE "+where+
-		fmt.Sprintf(" ORDER BY ts_ns DESC, id DESC LIMIT $%d", len(args)), args...)
+	return "SELECT " + trafficCols + " FROM traffic_records WHERE " + where +
+		fmt.Sprintf(" ORDER BY ts_ns DESC, id DESC LIMIT $%d", len(args)), args
+}
+
+// listTraffic returns the page of records matching where (with its first
+// argument), ascending by ts_ns.
+func (s *Store) listTraffic(ctx context.Context, where string, arg any, q ActivityQuery) ([]TrafficRow, error) {
+	sql, args := trafficPage(where, arg, q)
+	rows, err := s.q.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -108,15 +115,23 @@ func (s *Store) listTraffic(ctx context.Context, where string, arg any, q Activi
 	return out, nil
 }
 
+// The filters of a sandbox's and a node's traffic records. A node's is
+// served, with the order, by the partial index traffic_node_foreign: a
+// page reads only its own rows, not every record of the node.
+const (
+	sandboxTrafficWhere = "sandbox_id = $1"
+	nodeTrafficWhere    = "node = $1 AND sandbox_id IS NULL"
+)
+
 // ListSandboxTraffic returns a page of a sandbox's attributed traffic
 // records (Source of q is ignored), ascending by ts_ns.
 func (s *Store) ListSandboxTraffic(ctx context.Context, sandboxID uuid.UUID, q ActivityQuery) ([]TrafficRow, error) {
-	return s.listTraffic(ctx, "sandbox_id = $1", sandboxID, q)
+	return s.listTraffic(ctx, sandboxTrafficWhere, sandboxID, q)
 }
 
 // ListNodeTraffic returns a page of the foreign traffic records a node
 // sent: those attributed to no sandbox (Source of q is ignored), ascending
 // by ts_ns. With ListNodeActivity it makes up the activity of a node.
 func (s *Store) ListNodeTraffic(ctx context.Context, node string, q ActivityQuery) ([]TrafficRow, error) {
-	return s.listTraffic(ctx, "node = $1 AND sandbox_id IS NULL", node, q)
+	return s.listTraffic(ctx, nodeTrafficWhere, node, q)
 }
