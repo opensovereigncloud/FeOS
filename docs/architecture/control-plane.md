@@ -872,8 +872,13 @@ test nodes share, and have a fake guest: commands run in a directory per
 pod, the tools work on it, watches answer from a script, ports dial local
 addresses. It can restart, crash and be partitioned, and its mutating pod
 calls can stop where today's feosd stops when their request is cancelled,
-which proves that ferund never cancels them. `ferun-testnode` runs one for
-development:
+which proves that ferund never cancels them. Its hibernations run as
+feosd's do: in a task of their own, which further calls join and a resume
+abandons until the head is put; the script points `HibernateUpload` and
+`HibernateHead` hold one in its upload or right after its point of no
+return. With `ResumeWaitsForHibernation` it plays a feosd that does not
+report its hibernations, whose resume waits for one. `ferun-testnode`
+runs one for development:
 
     ferun-testnode --join-token feos-join-<secret>.<pin> \
         --server-name ferun.example.com --addr 127.0.0.1:7443 \

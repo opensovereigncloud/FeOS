@@ -22,7 +22,11 @@
 // and calls that carry "feos-pod-id" reach a fake guest: commands run with
 // a temporary directory per pod as their working directory, the tools work
 // on that directory, watches answer with scripted events, and port
-// forwards dial local addresses. A Script injects faults and scripted
-// answers while the node runs; Restart, Crash and Partition play what
+// forwards dial local addresses. A hibernation runs on its own: every
+// HibernatePod that comes while it runs joins it, and a ResumePod abandons
+// it until its head is being put (Config.ResumeWaitsForHibernation plays
+// feosd from before that). A Script injects faults and scripted answers
+// while the node runs, before a call or at a point inside its work
+// (HibernateUpload, HibernateHead); Restart, Crash and Partition play what
 // happens to a real node.
 package testnode

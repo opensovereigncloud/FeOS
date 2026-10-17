@@ -64,8 +64,17 @@ type Config struct {
 	// feosd does when their request is cancelled (a cancelled RestorePod
 	// leaves the pod PENDING without a bring-up, a cancelled SuspendPod
 	// leaves the record RUNNING); without it they finish whatever happens
-	// to the request, as feosd will (§19.2 of the design).
+	// to the request, as feosd will (§19.2 of the design). A HibernatePod
+	// runs on its own either way, unless ResumeWaitsForHibernation.
 	AbortOnCancel bool
+	// ResumeWaitsForHibernation plays feosd before a resume could abandon a
+	// hibernation: a HibernatePod runs as AbortOnCancel says, a ResumePod
+	// waits for the pod's lock behind it, PodInfo.Hibernation is never set,
+	// and HibernatePodRequest's no_abandon and request_id are ignored.
+	// Without it the node does what feosd does now: a hibernation runs on
+	// its own, a HibernatePod that comes while it runs joins it, and a
+	// ResumePod abandons it until its head is being put (ADR 0008).
+	ResumeWaitsForHibernation bool
 	// MaxStreams is the HTTP/2 stream limit the node advertises on its node
 	// connections; 1024 when zero.
 	MaxStreams uint32

@@ -7,11 +7,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -690,5 +694,699 @@ func TestInventoryHash(t *testing.T) {
 	}
 	if InventoryHash(nil) != sha256Hex("") {
 		t.Fatal("empty hash")
+	}
+}
+
+// holder holds the first call that reaches a hook point.
+type holder struct {
+	arrived chan struct{} // closed when the first call is held
+	ended   chan struct{} // closed when it was let go
+	byCtx   atomic.Bool   // its ctx ended before release
+	out     chan struct{}
+	once    sync.Once
+}
+
+// release lets the held call go.
+func (h *holder) release() { h.once.Do(func() { close(h.out) }) }
+
+// hold holds the first call that reaches the hook point name until
+// release, or until its ctx ends; later calls pass.
+func hold(n *Node, name string) *holder {
+	h := &holder{arrived: make(chan struct{}), ended: make(chan struct{}), out: make(chan struct{})}
+	var first sync.Once
+	n.Script().SetHook(name, func(ctx context.Context, _ string, _ any) error {
+		held := false
+		first.Do(func() { held = true })
+		if !held {
+			return nil
+		}
+		close(h.arrived)
+		defer close(h.ended)
+		select {
+		case <-h.out:
+		case <-ctx.Done():
+			h.byCtx.Store(true)
+		}
+		return nil
+	})
+	return h
+}
+
+// waitFor waits for ch, or fails the test.
+func waitFor(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("not within 10s: %s", what)
+	}
+}
+
+type hibernated struct {
+	resp *podv1.HibernatePodResponse
+	err  error
+}
+
+// hibernateAsync sends a HibernatePod and delivers its answer.
+func hibernateAsync(ctx context.Context, pc podv1.PodServiceClient, req *podv1.HibernatePodRequest) <-chan hibernated {
+	ch := make(chan hibernated, 1)
+	go func() {
+		resp, err := pc.HibernatePod(ctx, req)
+		ch <- hibernated{resp, err}
+	}()
+	return ch
+}
+
+// resumeAsync sends a ResumePod and delivers its error.
+func resumeAsync(pc podv1.PodServiceClient, id string) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		_, err := pc.ResumePod(context.Background(), &podv1.ResumePodRequest{PodId: id})
+		ch <- err
+	}()
+	return ch
+}
+
+func answer[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(10 * time.Second):
+		t.Fatalf("not within 10s: %s", what)
+	}
+	var zero T
+	return zero
+}
+
+// notYet checks that ch delivers nothing for d.
+func notYet[T any](t *testing.T, ch <-chan T, d time.Duration, what string) {
+	t.Helper()
+	select {
+	case v := <-ch:
+		t.Fatalf("happened: %s (%v)", what, v)
+	case <-time.After(d):
+	}
+}
+
+// hibernationOf is the pod's hibernation in flight, as GetPod reports it.
+func hibernationOf(t *testing.T, pc podv1.PodServiceClient, id string) *podv1.Hibernation {
+	t.Helper()
+	info, err := pc.GetPod(context.Background(), &podv1.GetPodRequest{PodId: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Hibernation
+}
+
+// waitHibernation waits until GetPod reports the pod's hibernation in
+// phase, and returns it.
+func waitHibernation(t *testing.T, pc podv1.PodServiceClient, id string, phase podv1.HibernationPhase) *podv1.Hibernation {
+	t.Helper()
+	var h *podv1.Hibernation
+	eventually(t, 10*time.Second, fmt.Sprintf("pod %s hibernating in %s", id, phase), func() bool {
+		h = hibernationOf(t, pc, id)
+		return h.GetPhase() == phase
+	})
+	return h
+}
+
+const abandonedText = "pod %s is resumed: its hibernation was abandoned"
+
+// A resume abandons a hibernation at its upload: the hibernation's call
+// fails with ABORTED, the pod resumes from its snapshot on the node, and
+// nothing is in the store.
+func TestHibernationAbandonedByResume(t *testing.T) {
+	e := newEnv(t)
+	in := e.instance("i1", caIss)
+	store := NewObjectStore("s")
+	n := e.start("n1", in, func(c *Config) { c.ObjectStore = store })
+	pc := pods(t, in, "n1")
+	uid, _ := createRunning(t, pc)
+	id := uid.String()
+	if err := os.WriteFile(filepath.Join(n.PodDir(uid), "work.txt"), []byte("kept"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	up := hold(n, HibernateUpload)
+	defer up.release()
+
+	hib := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	waitFor(t, up.arrived, "the upload")
+	h := hibernationOf(t, pc, id)
+	if h.GetPhase() != podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK || !h.Abandonable || h.Epoch == 0 || !slices.Equal(h.RequestIds, []string{"a"}) {
+		t.Fatalf("hibernation %v", h)
+	}
+	list, err := pc.ListPods(context.Background(), &podv1.ListPodsRequest{})
+	if err != nil || len(list.Pods) != 1 || !proto.Equal(list.Pods[0].Hibernation, h) {
+		t.Fatalf("ListPods: %v, %v", list, err)
+	}
+	if info := waitState(t, pc, id, podv1.PodState_POD_STATE_SUSPENDED); info.Reason != "suspended" {
+		t.Fatalf("reason %q", info.Reason)
+	}
+
+	if _, err := pc.ResumePod(context.Background(), &podv1.ResumePodRequest{PodId: id}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	waitFor(t, up.ended, "the upload's end")
+	if !up.byCtx.Load() {
+		t.Fatal("the upload's ctx did not end")
+	}
+	r := answer(t, hib, "the hibernation's answer")
+	wantCode(t, r.err, codes.Aborted, fmt.Sprintf(abandonedText, id))
+	info := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+	if info.Hibernation != nil || info.Checkpoint != nil || info.Ipv6Address == "" {
+		t.Fatalf("resumed: %v", info)
+	}
+	if heads := store.Heads(); len(heads) != 0 {
+		t.Fatalf("heads %v", heads)
+	}
+	if data, err := os.ReadFile(filepath.Join(n.PodDir(uid), "work.txt")); err != nil || string(data) != "kept" {
+		t.Fatalf("the pod's disk: %q, %v", data, err)
+	}
+	// A second resume finds it running.
+	_, err = pc.ResumePod(context.Background(), &podv1.ResumePodRequest{PodId: id})
+	wantCode(t, err, codes.FailedPrecondition, "pod "+id+" is POD_STATE_RUNNING, not POD_STATE_SUSPENDED")
+	// A late call of the abandoned hibernation starts nothing.
+	_, err = pc.HibernatePod(context.Background(), &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	wantCode(t, err, codes.Aborted, fmt.Sprintf(abandonedText, id))
+	if info := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING); info.Hibernation != nil {
+		t.Fatalf("a hibernation started: %v", info)
+	}
+}
+
+// A HibernatePod that comes while a hibernation runs joins it: one
+// hibernation, one head, the same answer to all; a request id is kept
+// once.
+func TestHibernationJoins(t *testing.T) {
+	e := newEnv(t)
+	in := e.instance("i1", caIss)
+	store := NewObjectStore("s")
+	n := e.start("n1", in, func(c *Config) { c.ObjectStore = store })
+	pc := pods(t, in, "n1")
+	uid, _ := createRunning(t, pc)
+	id := uid.String()
+	up := hold(n, HibernateUpload)
+	defer up.release()
+	var headPoints atomic.Int32
+	n.Script().SetHook(HibernateHead, func(context.Context, string, any) error {
+		headPoints.Add(1)
+		return nil
+	})
+
+	var calls atomic.Int32
+	n.Script().SetHook(podv1.PodService_HibernatePod_FullMethodName, func(context.Context, string, any) error {
+		calls.Add(1)
+		return nil
+	})
+
+	first := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	waitFor(t, up.arrived, "the upload")
+	second := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "b"})
+	third := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "c"})
+	// The second and the third call race: their ids come in either order.
+	eventually(t, 10*time.Second, "three request ids", func() bool {
+		return slices.Equal(slices.Sorted(slices.Values(hibernationOf(t, pc, id).GetRequestIds())), []string{"a", "b", "c"})
+	})
+	// A fourth call with the first one's id joins and adds no id; the
+	// hook runs just before the handler, which the wait leaves time for.
+	fourth := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	eventually(t, 10*time.Second, "the fourth call", func() bool { return calls.Load() == 4 })
+	notYet(t, second, 200*time.Millisecond, "a joined call answered before the hibernation ended")
+	if ids := slices.Sorted(slices.Values(hibernationOf(t, pc, id).GetRequestIds())); !slices.Equal(ids, []string{"a", "b", "c"}) {
+		t.Fatalf("request ids %v", ids)
+	}
+	up.release()
+	a, b := answer(t, first, "the first call"), answer(t, second, "the second call")
+	c, d := answer(t, third, "the third call"), answer(t, fourth, "the fourth call")
+	if a.err != nil || b.err != nil || c.err != nil || d.err != nil || a.resp.MemoryBytes == 0 ||
+		!proto.Equal(a.resp, b.resp) || !proto.Equal(a.resp, c.resp) || !proto.Equal(a.resp, d.resp) {
+		t.Fatalf("answers %v, %v, %v, %v", a, b, c, d)
+	}
+	if heads := store.Heads(); len(heads) != 1 || heads[0] != a.resp.Checkpoint.HeadKey || headPoints.Load() != 1 {
+		t.Fatalf("heads %v, %d hibernations", heads, headPoints.Load())
+	}
+	info := waitState(t, pc, id, podv1.PodState_POD_STATE_HIBERNATED)
+	if info.Hibernation != nil {
+		t.Fatalf("the hibernation stays: %v", info.Hibernation)
+	}
+	// After its end a HibernatePod starts anew, and finds it hibernated.
+	again, err := pc.HibernatePod(context.Background(), &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	if err != nil || !proto.Equal(again.Checkpoint, a.resp.Checkpoint) || again.MemoryBytes != 0 {
+		t.Fatalf("hibernate of a hibernated pod: %v, %v", again, err)
+	}
+}
+
+// A hibernation runs on its own: a call that is cancelled leaves it
+// running, also with AbortOnCancel.
+func TestHibernationOutlivesItsCall(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		t.Run(map[bool]string{true: "abort", false: "detached"}[abort], func(t *testing.T) {
+			e := newEnv(t)
+			in := e.instance("i1", caIss)
+			store := NewObjectStore("s")
+			n := e.start("n1", in, func(c *Config) { c.ObjectStore = store; c.AbortOnCancel = abort })
+			pc := pods(t, in, "n1")
+			uid, _ := createRunning(t, pc)
+			id := uid.String()
+			up := hold(n, HibernateUpload)
+			defer up.release()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			hib := hibernateAsync(ctx, pc, &podv1.HibernatePodRequest{PodId: id})
+			waitFor(t, up.arrived, "the upload")
+			cancel()
+			wantCode(t, answer(t, hib, "the cancelled call").err, codes.Canceled, "")
+			never(t, 200*time.Millisecond, "the hibernation ended with its call", func() bool {
+				return hibernationOf(t, pc, id).GetPhase() != podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK
+			})
+			up.release()
+			waitFor(t, up.ended, "the upload's end")
+			if up.byCtx.Load() {
+				t.Fatal("the upload's ctx ended")
+			}
+			info := waitState(t, pc, id, podv1.PodState_POD_STATE_HIBERNATED)
+			// The slot ends after the state (as on feosd), so a GetPod may
+			// still show the hibernation leaving here.
+			if info.Checkpoint == nil {
+				t.Fatalf("hibernated: %v", info)
+			}
+			eventually(t, 5*time.Second, "no hibernation", func() bool { return hibernationOf(t, pc, id) == nil })
+			if heads := store.Heads(); len(heads) != 1 || heads[0] != info.Checkpoint.HeadKey {
+				t.Fatalf("heads %v", heads)
+			}
+		})
+	}
+}
+
+// A hibernation started with request id "a" and joined with "b" is
+// abandoned: a later HibernatePod with either answers ABORTED and starts
+// nothing; one with another id hibernates the pod.
+func TestHibernationAbandonedRequestID(t *testing.T) {
+	e := newEnv(t)
+	in := e.instance("i1", caIss)
+	store := NewObjectStore("s")
+	n := e.start("n1", in, func(c *Config) { c.ObjectStore = store })
+	pc := pods(t, in, "n1")
+	uid, _ := createRunning(t, pc)
+	id := uid.String()
+	up := hold(n, HibernateUpload)
+	defer up.release()
+	var seen []string
+	var mu sync.Mutex
+	n.Script().SetHook(HibernateHead, func(_ context.Context, _ string, req any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, req.(*podv1.HibernatePodRequest).GetRequestId())
+		return nil
+	})
+
+	a := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	waitFor(t, up.arrived, "the upload")
+	b := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "b"})
+	eventually(t, 10*time.Second, "both request ids", func() bool {
+		return slices.Equal(hibernationOf(t, pc, id).GetRequestIds(), []string{"a", "b"})
+	})
+	if _, err := pc.ResumePod(context.Background(), &podv1.ResumePodRequest{PodId: id}); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	for _, r := range []hibernated{answer(t, a, "a"), answer(t, b, "b")} {
+		wantCode(t, r.err, codes.Aborted, fmt.Sprintf(abandonedText, id))
+	}
+	waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+	for _, rid := range []string{"b", "a"} {
+		_, err := pc.HibernatePod(context.Background(), &podv1.HibernatePodRequest{PodId: id, RequestId: rid})
+		wantCode(t, err, codes.Aborted, fmt.Sprintf(abandonedText, id))
+	}
+	if info := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING); info.Hibernation != nil || len(store.Heads()) != 0 {
+		t.Fatalf("a hibernation started: %v, heads %v", info, store.Heads())
+	}
+	// Another id hibernates it, past the hold, which held only the first.
+	c, err := pc.HibernatePod(context.Background(), &podv1.HibernatePodRequest{PodId: id, RequestId: "c"})
+	if err != nil || c.Checkpoint == nil {
+		t.Fatalf("hibernate c: %v, %v", c, err)
+	}
+	waitState(t, pc, id, podv1.PodState_POD_STATE_HIBERNATED)
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(seen, []string{"c"}) {
+		t.Fatalf("hibernations that put a head: %v", seen)
+	}
+}
+
+// A hibernation that may not be abandoned, because its first call or one
+// that joined it says so, makes a resume wait; the resume then restores
+// the pod from the new checkpoint.
+func TestHibernationNoAbandon(t *testing.T) {
+	for _, joined := range []bool{false, true} {
+		t.Run(map[bool]string{false: "started", true: "joined"}[joined], func(t *testing.T) {
+			e := newEnv(t)
+			in := e.instance("i1", caIss)
+			store := NewObjectStore("s")
+			n := e.start("n1", in, func(c *Config) { c.ObjectStore = store })
+			pc := pods(t, in, "n1")
+			uid, _ := createRunning(t, pc)
+			id := uid.String()
+			up := hold(n, HibernateUpload)
+			defer up.release()
+
+			hib := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "drain", NoAbandon: !joined})
+			waitFor(t, up.arrived, "the upload")
+			var join <-chan hibernated
+			if joined {
+				if h := hibernationOf(t, pc, id); !h.GetAbandonable() {
+					t.Fatalf("abandonable before the join: %v", h)
+				}
+				join = hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "drain2", NoAbandon: true})
+				eventually(t, 10*time.Second, "the join", func() bool { return len(hibernationOf(t, pc, id).GetRequestIds()) == 2 })
+			}
+			if h := hibernationOf(t, pc, id); h.GetAbandonable() || h.GetPhase() != podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK {
+				t.Fatalf("hibernation %v", h)
+			}
+			resumed := resumeAsync(pc, id)
+			notYet(t, resumed, 300*time.Millisecond, "the resume did not wait")
+			up.release()
+			waitFor(t, up.ended, "the upload's end")
+			if up.byCtx.Load() {
+				t.Fatal("the upload was abandoned")
+			}
+			r := answer(t, hib, "the hibernation")
+			if r.err != nil || r.resp.Checkpoint == nil {
+				t.Fatalf("hibernate: %v, %v", r.resp, r.err)
+			}
+			if joined {
+				if j := answer(t, join, "the joined call"); j.err != nil || !proto.Equal(j.resp, r.resp) {
+					t.Fatalf("joined: %v, %v", j.resp, j.err)
+				}
+			}
+			if err := answer(t, resumed, "the resume"); err != nil {
+				t.Fatalf("resume: %v", err)
+			}
+			info := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+			if !proto.Equal(info.Checkpoint, r.resp.Checkpoint) || info.Hibernation != nil {
+				t.Fatalf("restored: %v", info)
+			}
+		})
+	}
+}
+
+// A resume that comes after the point of no return waits for the
+// hibernation and restores the pod from its new checkpoint.
+func TestHibernationTooLate(t *testing.T) {
+	e := newEnv(t)
+	in := e.instance("i1", caIss)
+	store := NewObjectStore("s")
+	n := e.start("n1", in, func(c *Config) { c.ObjectStore = store })
+	pc := pods(t, in, "n1")
+	uid, _ := createRunning(t, pc)
+	id := uid.String()
+	up := hold(n, HibernateHead)
+	defer up.release()
+
+	hib := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	waitFor(t, up.arrived, "the head")
+	h := hibernationOf(t, pc, id)
+	if h.GetPhase() != podv1.HibernationPhase_HIBERNATION_PHASE_HEAD || h.Abandonable || h.Epoch == 0 {
+		t.Fatalf("hibernation %v", h)
+	}
+	resumed := resumeAsync(pc, id)
+	notYet(t, resumed, 300*time.Millisecond, "the resume did not wait")
+	up.release()
+	r := answer(t, hib, "the hibernation")
+	if r.err != nil || r.resp.Checkpoint.GetEpoch() != h.Epoch || !r.resp.Checkpoint.Memory {
+		t.Fatalf("hibernate: %v, %v", r.resp, r.err)
+	}
+	if err := answer(t, resumed, "the resume"); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	info := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+	if !proto.Equal(info.Checkpoint, r.resp.Checkpoint) || info.Hibernation != nil {
+		t.Fatalf("restored: %v", info)
+	}
+}
+
+// A hibernation whose pod has no memory to resume ignores an abandon that
+// was asked while it waited for the pod's lock and did not know that yet:
+// it hibernates the disk, and the resume then restores the pod from it.
+func TestHibernationNoMemoryIgnoresAbandon(t *testing.T) {
+	e := newEnv(t)
+	in := e.instance("i1", caIss)
+	store := NewObjectStore("s")
+	logs := &logRecords{}
+	n := e.start("n1", in, func(c *Config) { c.ObjectStore = store; c.Log = slog.New(logs) })
+	pc := pods(t, in, "n1")
+	ctx := context.Background()
+	uid, _ := createRunning(t, pc)
+	id := uid.String()
+	if _, err := pc.StopPod(ctx, &podv1.StopPodRequest{PodId: id}); err != nil {
+		t.Fatal(err)
+	}
+	// A bring-up holds the pod's lock, and fails the pod when let go.
+	inBringUp, letGo := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	n.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+		once.Do(func() { close(inBringUp) })
+		select {
+		case <-letGo:
+		case <-ctx.Done():
+		}
+		return status.Error(codes.Internal, "container main: exited 1")
+	})
+	if _, err := pc.StartPod(ctx, &podv1.StartPodRequest{PodId: id}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, inBringUp, "the bring-up")
+
+	hib := hibernateAsync(ctx, pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	if h := waitHibernation(t, pc, id, podv1.HibernationPhase_HIBERNATION_PHASE_WAITING); !h.Abandonable || !slices.Equal(h.RequestIds, []string{"a"}) {
+		t.Fatalf("waiting hibernation %v", h)
+	}
+	resumed := resumeAsync(pc, id)
+	eventually(t, 10*time.Second, "the resume asks for the abandon", func() bool {
+		return logs.has("test node: a resume abandons a hibernation", id, podv1.HibernationPhase_HIBERNATION_PHASE_WAITING)
+	})
+	notYet(t, resumed, 100*time.Millisecond, "the resume did not wait")
+	n.Script().SetBringUp(nil)
+	close(letGo)
+
+	r := answer(t, hib, "the hibernation")
+	if r.err != nil || r.resp.Checkpoint == nil || r.resp.Checkpoint.Memory || r.resp.MemoryBytes != 0 {
+		t.Fatalf("hibernate: %v, %v", r.resp, r.err)
+	}
+	if err := answer(t, resumed, "the resume"); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	info := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+	if !proto.Equal(info.Checkpoint, r.resp.Checkpoint) || info.Hibernation != nil {
+		t.Fatalf("restored: %v", info)
+	}
+	if heads := store.Heads(); len(heads) != 1 {
+		t.Fatalf("heads %v", heads)
+	}
+	// The abandon was ignored for good: nothing was abandoned, and the
+	// hibernation's request id hibernates the restored pod again.
+	if logs.has("test node: a hibernation is abandoned for a resume", id, nil) {
+		t.Fatal("the hibernation was abandoned")
+	}
+	if again, err := pc.HibernatePod(ctx, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"}); err != nil || again.Checkpoint.GetEpoch() <= r.resp.Checkpoint.GetEpoch() {
+		t.Fatalf("hibernate again: %v, %v", again, err)
+	}
+}
+
+// ResumeWaitsForHibernation plays feosd before a resume could abandon a
+// hibernation: no PodInfo.Hibernation, a resume waits and restores, and a
+// cancelled call cuts the hibernation with AbortOnCancel.
+func TestResumeWaitsForHibernation(t *testing.T) {
+	e := newEnv(t)
+	in := e.instance("i1", caIss)
+	store := NewObjectStore("s")
+	n := e.start("n1", in, func(c *Config) { c.ObjectStore = store; c.ResumeWaitsForHibernation = true })
+	pc := pods(t, in, "n1")
+	uid, _ := createRunning(t, pc)
+	id := uid.String()
+	up := hold(n, HibernateUpload)
+	defer up.release()
+	var heads atomic.Int32
+	n.Script().SetHook(HibernateHead, func(context.Context, string, any) error {
+		heads.Add(1)
+		return nil
+	})
+
+	hib := hibernateAsync(context.Background(), pc, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	waitFor(t, up.arrived, "the upload")
+	if info := waitState(t, pc, id, podv1.PodState_POD_STATE_SUSPENDED); info.Hibernation != nil {
+		t.Fatalf("hibernation reported: %v", info.Hibernation)
+	}
+	list, err := pc.ListPods(context.Background(), &podv1.ListPodsRequest{})
+	if err != nil || len(list.Pods) != 1 || list.Pods[0].Hibernation != nil {
+		t.Fatalf("ListPods: %v, %v", list, err)
+	}
+	resumed := resumeAsync(pc, id)
+	notYet(t, resumed, 300*time.Millisecond, "the resume did not wait")
+	up.release()
+	r := answer(t, hib, "the hibernation")
+	if r.err != nil || r.resp.Checkpoint == nil {
+		t.Fatalf("hibernate: %v, %v", r.resp, r.err)
+	}
+	if err := answer(t, resumed, "the resume"); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	info := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+	if !proto.Equal(info.Checkpoint, r.resp.Checkpoint) || heads.Load() != 1 {
+		t.Fatalf("restored: %v, %d heads", info, heads.Load())
+	}
+
+	// With AbortOnCancel a cancelled call cuts it at the upload: the pod
+	// stays suspended, no head.
+	e2 := newEnv(t)
+	in2 := e2.instance("i1", caIss)
+	store2 := NewObjectStore("s2")
+	n2 := e2.start("n1", in2, func(c *Config) {
+		c.ObjectStore = store2
+		c.ResumeWaitsForHibernation = true
+		c.AbortOnCancel = true
+	})
+	pc2 := pods(t, in2, "n1")
+	uid2, _ := createRunning(t, pc2)
+	id2 := uid2.String()
+	up2 := hold(n2, HibernateUpload)
+	defer up2.release()
+	ctx, cancel := context.WithCancel(context.Background())
+	hib2 := hibernateAsync(ctx, pc2, &podv1.HibernatePodRequest{PodId: id2})
+	waitFor(t, up2.arrived, "the upload")
+	cancel()
+	wantCode(t, answer(t, hib2, "the cancelled call").err, codes.Canceled, "")
+	waitFor(t, up2.ended, "the upload's end")
+	if !up2.byCtx.Load() {
+		t.Fatal("the upload's ctx did not end")
+	}
+	never(t, 300*time.Millisecond, "the cut hibernation went on", func() bool {
+		info, err := pc2.GetPod(context.Background(), &podv1.GetPodRequest{PodId: id2})
+		return err != nil || info.State != podv1.PodState_POD_STATE_SUSPENDED
+	})
+	if len(store2.Heads()) != 0 {
+		t.Fatalf("heads %v", store2.Heads())
+	}
+	if _, err := pc2.ResumePod(context.Background(), &podv1.ResumePodRequest{PodId: id2}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, pc2, id2, podv1.PodState_POD_STATE_RUNNING)
+}
+
+// logRecords is a slog.Handler that keeps the node's log records.
+type logRecords struct {
+	mu   sync.Mutex
+	recs []slog.Record
+}
+
+func (l *logRecords) Enabled(context.Context, slog.Level) bool { return true }
+
+func (l *logRecords) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.recs = append(l.recs, r.Clone())
+	return nil
+}
+
+func (l *logRecords) WithAttrs([]slog.Attr) slog.Handler { return l }
+
+func (l *logRecords) WithGroup(string) slog.Handler { return l }
+
+// has reports whether a record msg was logged for the pod, in phase
+// unless phase is nil.
+func (l *logRecords) has(msg, pod string, phase any) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, r := range l.recs {
+		if r.Message != msg {
+			continue
+		}
+		podOK, phaseOK := false, phase == nil
+		r.Attrs(func(a slog.Attr) bool {
+			switch a.Key {
+			case "pod":
+				podOK = a.Value.String() == pod
+			case "phase":
+				phaseOK = phaseOK || a.Value.Any() == phase
+			}
+			return true
+		})
+		if podOK && phaseOK {
+			return true
+		}
+	}
+	return false
+}
+
+// A hibernation keeps the last maxRequestIDs request ids of its calls,
+// each once, as feosd does: the newest caller's id is always among them.
+func TestHibernationRequestIDsKeepTheLast(t *testing.T) {
+	h := &hibernation{}
+	var want []string
+	for i := range maxRequestIDs + 2 {
+		id := fmt.Sprintf("r%d", i)
+		h.addRequest(id)
+		want = append(want, id)
+	}
+	h.addRequest("")
+	h.addRequest(fmt.Sprintf("r%d", maxRequestIDs+1))
+	want = want[2:]
+	if !slices.Equal(h.requestIDs, want) {
+		t.Fatalf("request ids %v, want %v", h.requestIDs, want)
+	}
+}
+
+// An ABORTED from the upload (diskd's, say) fails the hibernation but does
+// not abandon it: its request id hibernates the pod afterwards.
+func TestHibernationAbortedIsNotAbandoned(t *testing.T) {
+	e := newEnv(t)
+	in := e.instance("i1", caIss)
+	store := NewObjectStore("s")
+	n := e.start("n1", in, func(c *Config) { c.ObjectStore = store })
+	pc := pods(t, in, "n1")
+	uid, _ := createRunning(t, pc)
+	id := uid.String()
+	n.Script().SetHook(HibernateUpload, func(context.Context, string, any) error {
+		return status.Error(codes.Aborted, "diskd: the upload is aborted")
+	})
+	_, err := pc.HibernatePod(context.Background(), &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	wantCode(t, err, codes.Aborted, "diskd: the upload is aborted")
+	waitState(t, pc, id, podv1.PodState_POD_STATE_SUSPENDED)
+	n.Script().SetHook(HibernateUpload, nil)
+	resp, err := pc.HibernatePod(context.Background(), &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	if err != nil || resp.Checkpoint == nil || !resp.Checkpoint.Memory {
+		t.Fatalf("hibernate again: %v, %v", resp, err)
+	}
+	waitState(t, pc, id, podv1.PodState_POD_STATE_HIBERNATED)
+}
+
+// A hibernation whose pod was deleted and created anew under its id
+// before it took the lock ends NOT_FOUND and leaves the new pod alone.
+func TestHibernationOfAReplacedPod(t *testing.T) {
+	e := newEnv(t)
+	in := e.instance("i1", caIss)
+	store := NewObjectStore("s")
+	n := e.start("n1", in, func(c *Config) { c.ObjectStore = store })
+	pc := pods(t, in, "n1")
+	uid, info := createRunning(t, pc)
+	id := uid.String()
+	p := n.pods
+	p.mu.Lock()
+	old := p.pods[id]
+	h := &hibernation{done: make(chan struct{}), abandon: make(chan struct{}), phase: podv1.HibernationPhase_HIBERNATION_PHASE_WAITING}
+	old.hib = h
+	p.mu.Unlock()
+	if _, err := pc.DeletePod(context.Background(), &podv1.DeletePodRequest{PodId: id}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := create(t, pc, id, info.Spec); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+
+	p.runHibernation(context.Background(), old, h, &podv1.HibernatePodRequest{PodId: id, RequestId: "a"})
+	waitFor(t, h.done, "the hibernation's end")
+	wantCode(t, h.err, codes.NotFound, "")
+	if info := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING); info.Hibernation != nil || len(store.Heads()) != 0 {
+		t.Fatalf("the new pod: %v, heads %v", info, store.Heads())
 	}
 }

@@ -71,6 +71,78 @@ type pod struct {
 	// snapshot: a suspended pod has its memory in a snapshot.
 	snapshot bool
 	pid      int64
+	// hib is the hibernation in flight, from its HibernatePod until it
+	// ends; never set with Config.ResumeWaitsForHibernation.
+	hib *hibernation
+	// abandonedIDs are the request ids of the pod's abandoned hibernations,
+	// the last maxRequestIDs: a late HibernatePod with one of them is
+	// answered ABORTED instead of starting a hibernation of the resumed pod.
+	abandonedIDs []string
+}
+
+// maxRequestIDs is how many request ids a hibernation keeps of the calls
+// that started or joined it, and a pod of its abandoned hibernations.
+const maxRequestIDs = 16
+
+// hibernation is a hibernation in flight (ADR 0008): it runs in a
+// goroutine of the node that holds the pod's lock, and every HibernatePod
+// that comes while it runs waits for its answer.
+type hibernation struct {
+	done chan struct{} // closed when it ended; resp and err are set then
+	resp *podv1.HibernatePodResponse
+	err  error
+	// abandon is closed by a ResumePod that abandons it, which sets
+	// abandoned under podService.mu.
+	abandon   chan struct{}
+	abandoned bool
+	// noAbandon: a HibernatePod said it may not be abandoned (a drain).
+	// Sticky: the OR of every call that started or joined it.
+	noAbandon bool
+	// requestIDs are the request ids of the calls that started or joined
+	// it: non-empty ones, each once, the last maxRequestIDs.
+	requestIDs []string
+	// memory is whether the pod's memory goes with it; nil until decided.
+	memory *bool
+	phase  podv1.HibernationPhase
+	// epoch is the checkpoint's epoch; 0 until chosen.
+	epoch uint64
+}
+
+// abandonable reports whether a ResumePod abandons it now.
+func (h *hibernation) abandonable() bool {
+	return !h.noAbandon && (h.memory == nil || *h.memory) && h.phase < podv1.HibernationPhase_HIBERNATION_PHASE_HEAD
+}
+
+// addRequest records the request id of a call that started or joined it;
+// past maxRequestIDs the oldest goes, as on feosd.
+func (h *hibernation) addRequest(id string) {
+	if id == "" || slices.Contains(h.requestIDs, id) {
+		return
+	}
+	if len(h.requestIDs) >= maxRequestIDs {
+		h.requestIDs = slices.Delete(h.requestIDs, 0, 1)
+	}
+	h.requestIDs = append(h.requestIDs, id)
+}
+
+// info is what GetPod and ListPods report of it.
+func (h *hibernation) info() *podv1.Hibernation {
+	return &podv1.Hibernation{
+		Phase:       h.phase,
+		Abandonable: h.abandonable(),
+		Epoch:       h.epoch,
+		RequestIds:  slices.Clone(h.requestIDs),
+	}
+}
+
+// errAbandoned is what hibernate returns when a ResumePod abandoned the
+// hibernation; runHibernation turns it into abandonedErr. Only it marks a
+// hibernation abandoned, not any ABORTED (a hook may return one).
+var errAbandoned = errors.New("the hibernation is abandoned for a resume")
+
+// abandonedErr is the answer of an abandoned hibernation's calls.
+func abandonedErr(id string) error {
+	return status.Errorf(codes.Aborted, "pod %s is resumed: its hibernation was abandoned", id)
 }
 
 // podSub is a StreamPodEvents reader.
@@ -706,6 +778,9 @@ func (p *podService) ResumePod(ctx context.Context, req *podv1.ResumePodRequest)
 }
 
 func (p *podService) resume(ctx context.Context, id string) error {
+	if err := p.abandonHibernation(ctx, id); err != nil {
+		return err
+	}
 	unlock, err := p.lock(ctx, id)
 	if err != nil {
 		return err
@@ -727,18 +802,184 @@ func (p *podService) resume(ctx context.Context, id string) error {
 	return nil
 }
 
-func (p *podService) HibernatePod(ctx context.Context, req *podv1.HibernatePodRequest) (*podv1.HibernatePodResponse, error) {
-	return mutate(p, ctx, func(ctx context.Context) (*podv1.HibernatePodResponse, error) {
-		return p.hibernate(ctx, req.GetPodId())
-	})
+// abandonHibernation is a ResumePod's look at the pod's hibernation in
+// flight: it abandons one that may be abandoned, and waits for it to end
+// either way. (feosd queues the resume for the pod's lock first, which is
+// FIFO there; the test node's lock is not, so it waits for the end of the
+// hibernation instead, before it takes the lock.)
+func (p *podService) abandonHibernation(ctx context.Context, id string) error {
+	if p.n.cfg.ResumeWaitsForHibernation {
+		return nil
+	}
+	p.mu.Lock()
+	pd := p.pods[id]
+	if pd == nil || pd.hib == nil {
+		p.mu.Unlock()
+		return nil
+	}
+	h := pd.hib
+	if h.abandonable() && !h.abandoned {
+		h.abandoned = true
+		close(h.abandon)
+		p.n.log.Info("test node: a resume abandons a hibernation", "pod", id, "phase", h.phase)
+	} else if !h.abandoned {
+		p.n.log.Info("test node: a resume waits for a hibernation", "pod", id, "phase", h.phase)
+	}
+	p.mu.Unlock()
+	select {
+	case <-h.done:
+		return nil
+	case <-ctx.Done():
+		return status.FromContextError(ctx.Err()).Err()
+	}
 }
 
-func (p *podService) hibernate(ctx context.Context, id string) (*podv1.HibernatePodResponse, error) {
+func (p *podService) HibernatePod(ctx context.Context, req *podv1.HibernatePodRequest) (*podv1.HibernatePodResponse, error) {
+	if p.n.cfg.ResumeWaitsForHibernation {
+		return mutate(p, ctx, func(ctx context.Context) (*podv1.HibernatePodResponse, error) {
+			unlock, err := p.lock(ctx, req.GetPodId())
+			if err != nil {
+				return nil, err
+			}
+			defer unlock()
+			return p.hibernate(ctx, req, nil)
+		})
+	}
+	id := req.GetPodId()
+	p.mu.Lock()
+	pd := p.pods[id]
+	if pd == nil {
+		p.mu.Unlock()
+		return nil, notFound(id)
+	}
+	if req.GetRequestId() != "" && slices.Contains(pd.abandonedIDs, req.GetRequestId()) {
+		// A late call of an abandoned hibernation: the pod is resumed.
+		p.mu.Unlock()
+		return nil, abandonedErr(id)
+	}
+	h := pd.hib
+	start := h == nil
+	if start {
+		h = &hibernation{
+			done:      make(chan struct{}),
+			abandon:   make(chan struct{}),
+			noAbandon: req.GetNoAbandon(),
+			phase:     podv1.HibernationPhase_HIBERNATION_PHASE_WAITING,
+		}
+		pd.hib = h
+	} else {
+		h.noAbandon = h.noAbandon || req.GetNoAbandon()
+	}
+	h.addRequest(req.GetRequestId())
+	p.mu.Unlock()
+	if start {
+		first := proto.Clone(req).(*podv1.HibernatePodRequest)
+		if !p.n.goPods(func(ctx context.Context) { p.runHibernation(ctx, pd, h, first) }) {
+			p.endHibernation(pd, h, nil, status.Error(codes.Unavailable, "the node is stopping"), false)
+		}
+	}
+	// The hibernation runs on its own: a call that goes leaves it running.
+	select {
+	case <-h.done:
+		return h.resp, h.err
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+}
+
+// runHibernation is the goroutine of a hibernation: it takes the pod's
+// lock (the hibernation waits in HIBERNATION_PHASE_WAITING until then),
+// runs it, and ends its slot before it releases the lock, so that a
+// HibernatePod that comes afterwards starts a new one.
+func (p *podService) runHibernation(ctx context.Context, pd *pod, h *hibernation, req *podv1.HibernatePodRequest) {
+	id := req.GetPodId()
 	unlock, err := p.lock(ctx, id)
 	if err != nil {
-		return nil, err
+		p.endHibernation(pd, h, nil, err, false)
+		return
 	}
 	defer unlock()
+	// The lock is that of the pod now under id: a pod deleted and created
+	// anew since HibernatePod found pd is not the one hibernated here.
+	p.mu.Lock()
+	same := p.pods[id] == pd
+	p.mu.Unlock()
+	if !same {
+		p.endHibernation(pd, h, nil, notFound(id), false)
+		return
+	}
+	resp, err := p.hibernate(ctx, req, h)
+	abandoned := errors.Is(err, errAbandoned)
+	if abandoned {
+		p.n.log.Info("test node: a hibernation is abandoned for a resume", "pod", id)
+		err = abandonedErr(id)
+	}
+	p.endHibernation(pd, h, resp, err, abandoned)
+}
+
+// endHibernation sets a hibernation's answer and clears its slot, if the
+// slot is still its own; an abandoned one leaves its request ids in the
+// pod's abandonedIDs.
+func (p *podService) endHibernation(pd *pod, h *hibernation, resp *podv1.HibernatePodResponse, err error, abandoned bool) {
+	p.mu.Lock()
+	h.resp, h.err = resp, err
+	if pd.hib == h {
+		pd.hib = nil
+		if abandoned {
+			pd.abandonedIDs = append(pd.abandonedIDs, h.requestIDs...)
+			if over := len(pd.abandonedIDs) - maxRequestIDs; over > 0 {
+				pd.abandonedIDs = slices.Delete(pd.abandonedIDs, 0, over)
+			}
+		}
+	}
+	p.mu.Unlock()
+	close(h.done)
+}
+
+// hibernating changes a hibernation in flight under p.mu; nothing with
+// Config.ResumeWaitsForHibernation, where h is nil.
+func (p *podService) hibernating(h *hibernation, f func(h *hibernation)) {
+	if h == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f(h)
+}
+
+// isClosed reports whether ch is closed; never for a nil ch.
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// untilClosed is a context that ends with ctx or when ch is closed.
+func untilClosed(ctx context.Context, ch <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	if ch != nil {
+		go func() {
+			select {
+			case <-ch:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	return ctx, cancel
+}
+
+// hibernate is a hibernation, with the pod's lock held. h is its slot, nil
+// with Config.ResumeWaitsForHibernation: there ctx is the request's or
+// the node's as AbortOnCancel says, and nothing abandons it. Its phases
+// are feosd's; an abandon stops it before the suspend (a running pod
+// stays running), after it, or at the upload, leaves the pod suspended
+// on the node with its snapshot, and returns errAbandoned.
+func (p *podService) hibernate(ctx context.Context, req *podv1.HibernatePodRequest, h *hibernation) (*podv1.HibernatePodResponse, error) {
+	id := req.GetPodId()
 	info, err := p.get(id)
 	if err != nil {
 		return nil, err
@@ -753,9 +994,6 @@ func (p *podService) hibernate(ctx context.Context, id string) (*podv1.Hibernate
 	case podv1.PodState_POD_STATE_HIBERNATED:
 		return &podv1.HibernatePodResponse{Checkpoint: info.Checkpoint}, nil
 	case podv1.PodState_POD_STATE_RUNNING:
-		p.setState(id, podv1.PodState_POD_STATE_RUNNING, "hibernating")
-		p.change(id, func(pd *pod) { pd.snapshot = true })
-		p.setState(id, podv1.PodState_POD_STATE_SUSPENDED, "suspended")
 		memory = true
 	case podv1.PodState_POD_STATE_SUSPENDED:
 		p.mu.Lock()
@@ -765,11 +1003,27 @@ func (p *podService) hibernate(ctx context.Context, id string) (*podv1.Hibernate
 	default:
 		return nil, status.Errorf(codes.FailedPrecondition, "pod %s is %s", id, info.State)
 	}
-	// The upload: a hibernation that fails or is cut leaves the pod
-	// suspended on the node (or as it was, without memory).
-	if err := p.n.script.wait(ctx, podv1.PodService_HibernatePod_FullMethodName); err != nil {
-		return nil, err
+	// Only a hibernation that takes the pod's memory along may be
+	// abandoned: without memory there is nothing to resume, and an abandon
+	// asked while that was not known yet is ignored for good.
+	var abandon chan struct{}
+	if h != nil && memory {
+		abandon = h.abandon
 	}
+	p.hibernating(h, func(h *hibernation) { h.memory = &memory })
+	if isClosed(abandon) {
+		return nil, errAbandoned
+	}
+	if info.State == podv1.PodState_POD_STATE_RUNNING {
+		p.hibernating(h, func(h *hibernation) { h.phase = podv1.HibernationPhase_HIBERNATION_PHASE_SUSPENDING })
+		p.setState(id, podv1.PodState_POD_STATE_RUNNING, "hibernating")
+		p.change(id, func(pd *pod) { pd.snapshot = true })
+		p.setState(id, podv1.PodState_POD_STATE_SUSPENDED, "suspended")
+		if isClosed(abandon) {
+			return nil, errAbandoned
+		}
+	}
+	p.hibernating(h, func(h *hibernation) { h.phase = podv1.HibernationPhase_HIBERNATION_PHASE_SEALING })
 	dir := p.dirOf(id)
 	files, diskBytes, err := snapshotDir(dir)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -779,10 +1033,45 @@ func (p *podService) hibernate(ctx context.Context, id string) (*podv1.Hibernate
 	if last := info.GetCheckpoint().GetEpoch(); last+1 > epoch {
 		epoch = last + 1
 	}
+	p.hibernating(h, func(h *hibernation) {
+		h.phase, h.epoch = podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK, epoch
+	})
+	// The upload: a hibernation that fails, is cut or is abandoned here
+	// leaves the pod suspended on the node (or as it was, without memory).
+	actx, cancel := untilClosed(ctx, abandon)
+	err = p.n.script.point(actx, HibernateUpload, req)
+	if err == nil {
+		err = p.n.script.wait(actx, podv1.PodService_HibernatePod_FullMethodName)
+	}
+	cancel()
+	if isClosed(abandon) {
+		return nil, errAbandoned
+	}
+	if err != nil {
+		return nil, err
+	}
+	if memory {
+		p.hibernating(h, func(h *hibernation) { h.phase = podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_MEMORY })
+	}
+	// The point of no return: under p.mu, where a ResumePod decides too,
+	// either the abandon came first or the head is being put.
+	if h != nil {
+		p.mu.Lock()
+		if isClosed(abandon) {
+			p.mu.Unlock()
+			return nil, errAbandoned
+		}
+		h.phase = podv1.HibernationPhase_HIBERNATION_PHASE_HEAD
+		p.mu.Unlock()
+	}
+	if err := p.n.script.point(ctx, HibernateHead, req); err != nil {
+		return nil, err
+	}
 	key, err := store.put(&checkpoint{podID: id, epoch: epoch, memory: memory, spec: cloneSpec(info.Spec), files: files, bytes: diskBytes})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "diskd: upload the checkpoint of pod %s: %v", id, err)
 	}
+	p.hibernating(h, func(h *hibernation) { h.phase = podv1.HibernationPhase_HIBERNATION_PHASE_LEAVING })
 	cp := &podv1.Checkpoint{HeadKey: key, Epoch: epoch, Memory: memory}
 	p.change(id, func(pd *pod) {
 		pd.info.Checkpoint = proto.Clone(cp).(*podv1.Checkpoint)
@@ -943,6 +1232,9 @@ func (p *podService) GetPod(_ context.Context, req *podv1.GetPodRequest) (*podv1
 		return nil, notFound(req.GetPodId())
 	}
 	info := clonePod(pd.info)
+	if pd.hib != nil {
+		info.Hibernation = pd.hib.info()
+	}
 	if info.State == podv1.PodState_POD_STATE_RUNNING {
 		info.Microvm = &podv1.MicroVm{
 			Pid:           pd.pid,
@@ -964,7 +1256,11 @@ func (p *podService) list() []*podv1.PodInfo {
 	defer p.mu.Unlock()
 	out := make([]*podv1.PodInfo, 0, len(p.pods))
 	for _, pd := range p.pods {
-		out = append(out, clonePod(pd.info))
+		info := clonePod(pd.info)
+		if pd.hib != nil {
+			info.Hibernation = pd.hib.info()
+		}
+		out = append(out, info)
 	}
 	slices.SortFunc(out, func(a, b *podv1.PodInfo) int { return strings.Compare(a.PodId, b.PodId) })
 	return out

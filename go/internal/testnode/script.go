@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -75,7 +76,21 @@ func newScript(n *Node) *Script {
 	}
 }
 
-// SetHook runs h before every call of method; nil removes it.
+// HibernateUpload is the point of a hibernation where its disk and memory
+// upload: a hook there holds it where a ResumePod abandons it; its ctx ends
+// then (return nil). An error fails the hibernation as an upload's does.
+const HibernateUpload = "testnode/HibernatePod/upload"
+
+// HibernateHead is the point right after a hibernation's point of no
+// return, before its head is put: a hook there holds it where a ResumePod
+// waits for it and then restores the pod. An error fails the hibernation
+// as a failed head does.
+const HibernateHead = "testnode/HibernatePod/head"
+
+// SetHook runs h before every call of method; nil removes it. method may
+// also be one of the points inside a call's work, HibernateUpload and
+// HibernateHead, where h runs with the HibernatePodRequest that started
+// the hibernation.
 func (s *Script) SetHook(method string, h Hook) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -93,7 +108,9 @@ func (s *Script) SetHook(method string, h Hook) {
 // begins; StartPod before the pod goes PENDING; StopPod and DeletePod
 // while the microVM goes; SuspendPod while the snapshot is written;
 // ResumePod while the microVM resumes; HibernatePod while the checkpoint
-// uploads; RestorePod after the pod went PENDING "restoring from <key>".
+// uploads, right after the hook at HibernateUpload, where a ResumePod
+// that abandons the hibernation ends the wait; RestorePod after the pod
+// went PENDING "restoring from <key>".
 func (s *Script) SetDelay(method string, d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -256,6 +273,22 @@ func (s *Script) isKubePort(pod uuid.UUID, port uint32) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.kubePorts[pod][port]
+}
+
+// point runs the hook set for a point inside a call's work (HibernateUpload,
+// HibernateHead), with the call's request; its error as the call's.
+func (s *Script) point(ctx context.Context, name string, req any) error {
+	h := s.hook(name)
+	if h == nil {
+		return nil
+	}
+	if err := h(ctx, name, req); err != nil {
+		if _, ok := status.FromError(err); ok {
+			return err
+		}
+		return status.Error(codes.Unknown, err.Error())
+	}
+	return nil
 }
 
 // wait waits the delay set for method, or until ctx ends: the point at
