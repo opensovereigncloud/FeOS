@@ -14,11 +14,17 @@ import (
 // heartbeat.
 const InstanceTTL = 15 * time.Second
 
+// instanceFresh is the condition under which the instances row a was
+// written within the TTL: a process runs under its ID, stopping or not.
+func instanceFresh(a string) string {
+	return a + ".last_seen > now() - interval '15 seconds'"
+}
+
 // instanceLive is the condition under which the instances row a is live:
 // seen within the TTL and not stopping. A stopping or dead instance's ops
 // may be taken over.
 func instanceLive(a string) string {
-	return a + ".last_seen > now() - interval '15 seconds' AND " + a + ".stopping IS NULL"
+	return instanceFresh(a) + " AND " + a + ".stopping IS NULL"
 }
 
 // Instance is a row of instances.
@@ -30,7 +36,10 @@ type Instance struct {
 	StartedAt   time.Time
 	LastSeen    time.Time
 	Stopping    time.Time // zero unless the instance is stopping
-	// Live: seen within the TTL and not stopping.
+	// Fresh: seen within the TTL, stopping or not. A stopping instance
+	// that is fresh still serves its requests and ops.
+	Fresh bool
+	// Live: fresh and not stopping.
 	Live bool
 }
 
@@ -75,13 +84,14 @@ func (s *Store) GetInstance(ctx context.Context, id string) (Instance, error) {
 	return in, noRow(err, ErrNoRow)
 }
 
-const instanceCols = "i.id, i.address, i.node_address, i.version, i.started_at, i.last_seen, i.stopping, " +
-	"(i.last_seen > now() - interval '15 seconds' AND i.stopping IS NULL)"
+var instanceCols = "i.id, i.address, i.node_address, i.version, i.started_at, i.last_seen, i.stopping, " +
+	"(" + instanceFresh("i") + "), (" + instanceLive("i") + ")"
 
 func scanInstance(row pgx.Row) (Instance, error) {
 	var in Instance
 	var stopping *time.Time
-	if err := row.Scan(&in.ID, &in.Address, &in.NodeAddress, &in.Version, &in.StartedAt, &in.LastSeen, &stopping, &in.Live); err != nil {
+	if err := row.Scan(&in.ID, &in.Address, &in.NodeAddress, &in.Version, &in.StartedAt, &in.LastSeen, &stopping,
+		&in.Fresh, &in.Live); err != nil {
 		return Instance{}, err
 	}
 	in.Stopping = timeOf(stopping)
@@ -106,8 +116,8 @@ type InstanceAddress struct {
 // a node address and seen within the TTL, stopping ones included (they
 // serve until they delete their row), ordered by id.
 func (s *Store) InstancesForNodes(ctx context.Context) ([]InstanceAddress, error) {
-	rows, err := s.q.Query(ctx, `SELECT id, node_address FROM instances
-		WHERE node_address <> '' AND last_seen > now() - interval '15 seconds' ORDER BY id`)
+	rows, err := s.q.Query(ctx, `SELECT i.id, i.node_address FROM instances i
+		WHERE i.node_address <> '' AND `+instanceFresh("i")+` ORDER BY i.id`)
 	if err != nil {
 		return nil, err
 	}

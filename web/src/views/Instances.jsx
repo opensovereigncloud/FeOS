@@ -11,6 +11,53 @@ import { fmtDateTime } from '../format.js';
 // recently) and which of them leads, running the loops that only one may
 // run.
 
+// instanceState is an instance's dot: running while it is live; stopping
+// while it is stopping but still writes its row, for it serves its
+// requests and ops until its last step; gone once its row aged past the
+// TTL. The database decides fresh and live, never the browser's clock.
+export function instanceState(i) {
+  if (i.live) return { state: 'running', title: 'live' };
+  if (i.fresh) return { state: 'paused', title: 'stopping' };
+  return { state: 'absent', title: 'gone' };
+}
+
+// InstancesTable lists the instances; a row is dimmed once the instance is
+// gone.
+export function InstancesTable({ instances, leader }) {
+  return (
+    <div className="tblwrap">
+      <table className="tbl">
+        <thead>
+          <tr>
+            <th className="col-state">live</th><th>instance</th><th>address</th><th>nodes' address</th>
+            <th>version</th><th>started</th><th>last seen</th><th>stopping</th>
+          </tr>
+        </thead>
+        <tbody>
+          {instances.map((i) => {
+            const st = instanceState(i);
+            return (
+              <tr key={i.id} className={st.state === 'absent' ? 'dim' : ''}>
+                <td className="col-state"><StateDot state={st.state} title={st.title} /></td>
+                <td className="mono">
+                  {i.id}
+                  {leader && leader.id === i.id && <span className="badge acc"><Icon name="crown" size={11} /> leader</span>}
+                </td>
+                <td className="mono small">{i.address || '—'}</td>
+                <td className="mono small">{i.nodeAddress || <span className="muted" title="not listed to nodes">—</span>}</td>
+                <td className="mono small">{i.version || '—'}</td>
+                <td className="small">{fmtDateTime(i.startedAt)}</td>
+                <td className="small"><Ago iso={i.lastSeen} /></td>
+                <td className="small">{i.stopping ? <span className="warn">since <Ago iso={i.stopping} /></span> : <span className="muted">—</span>}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export function Instances() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState('');
@@ -48,39 +95,13 @@ export function Instances() {
             </span>
           </div>
         )}
-        <div className="tblwrap">
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th className="col-state">live</th><th>instance</th><th>address</th><th>nodes' address</th>
-                <th>version</th><th>started</th><th>last seen</th><th>stopping</th>
-              </tr>
-            </thead>
-            <tbody>
-              {instances.map((i) => (
-                <tr key={i.id} className={i.live ? '' : 'dim'}>
-                  <td className="col-state"><StateDot state={i.live ? (i.stopping ? 'paused' : 'running') : 'absent'} title={i.live ? 'live' : 'gone'} /></td>
-                  <td className="mono">
-                    {i.id}
-                    {leader && leader.id === i.id && <span className="badge acc"><Icon name="crown" size={11} /> leader</span>}
-                  </td>
-                  <td className="mono small">{i.address || '—'}</td>
-                  <td className="mono small">{i.nodeAddress || <span className="muted" title="not listed to nodes">—</span>}</td>
-                  <td className="mono small">{i.version || '—'}</td>
-                  <td className="small">{fmtDateTime(i.startedAt)}</td>
-                  <td className="small"><Ago iso={i.lastSeen} /></td>
-                  <td className="small">{i.stopping ? <span className="warn">since <Ago iso={i.stopping} /></span> : <span className="muted">—</span>}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <InstancesTable instances={instances} leader={leader} />
         {data && instances.length === 0 && <p className="empty">No instances.</p>}
         {!data && !err && <p className="empty">Loading…</p>}
         <p className="muted small footnote">
-          An instance writes its row every few seconds and counts as live while the row is fresh. A stopping
-          instance finishes its requests and ops, and stays listed to the nodes until it closes their
-          connections.
+          An instance writes its row every few seconds and counts as live while the row is fresh and it is not
+          stopping. A stopping instance finishes its requests and ops, and stays listed to the nodes until it
+          closes their connections; it is gone once its row is older than 15 s.
         </p>
       </section>
     </div>

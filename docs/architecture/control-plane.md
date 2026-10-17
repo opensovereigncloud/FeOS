@@ -1002,7 +1002,10 @@ table fits a 1280 px wide window, and its memory bar fills by, and is
 labelled with, the host's memory in use against its total. Its node
 connections are those to the instance that answered, which with several
 replicas need not be the one a node dialled; so it calls a node not
-connected only when the node is down or removed.
+connected only when the node is down or removed. An instance is shown
+live, stopping while it stops but still writes its row (it serves on),
+or gone once its row is older than 15 s; the API's `live` and `fresh`
+say which, on the database clock.
 
 ## The activity log
 

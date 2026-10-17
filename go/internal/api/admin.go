@@ -714,7 +714,9 @@ func (s *server) revokeJoinToken(w http.ResponseWriter, r *http.Request) error {
 // -------------------------------------------------------------- instances --
 
 // listInstances is GET /api/v1/admin/instances: the instances and who
-// leads.
+// leads. fresh says that the instance wrote its row within the TTL,
+// stopping or not (a stopping one still serves); live that it is fresh and
+// not stopping. Both are decided on the database clock.
 func (s *server) listInstances(w http.ResponseWriter, r *http.Request) error {
 	ins, err := s.st.ListInstances(r.Context())
 	if err != nil {
@@ -733,6 +735,7 @@ func (s *server) listInstances(w http.ResponseWriter, r *http.Request) error {
 		StartedAt   string `json:"startedAt"`
 		LastSeen    string `json:"lastSeen"`
 		Stopping    string `json:"stopping"`
+		Fresh       bool   `json:"fresh"`
 		Live        bool   `json:"live"`
 	}
 	out := struct {
@@ -751,7 +754,8 @@ func (s *server) listInstances(w http.ResponseWriter, r *http.Request) error {
 	for _, in := range ins {
 		out.Instances = append(out.Instances, instanceInfo{
 			ID: in.ID, Address: in.Address, NodeAddress: in.NodeAddress, Version: in.Version,
-			StartedAt: rfc3339(in.StartedAt), LastSeen: rfc3339(in.LastSeen), Stopping: rfc3339(in.Stopping), Live: in.Live,
+			StartedAt: rfc3339(in.StartedAt), LastSeen: rfc3339(in.LastSeen), Stopping: rfc3339(in.Stopping),
+			Fresh: in.Fresh, Live: in.Live,
 		})
 	}
 	return writeJSON(w, http.StatusOK, out)
