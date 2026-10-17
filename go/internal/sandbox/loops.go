@@ -482,18 +482,111 @@ func (e *Engine) staleOps(ctx context.Context) error {
 			e.log.Error("an op of a live instance is past its deadline; releasing it", "sandbox", row.ID, "op", row.Op,
 				"owner", row.OpOwner, "deadline", row.OpDeadline)
 		}
-		if err := e.releaseOp(ctx, row); err != nil {
+		if err := e.releaseOp(ctx, row, true); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// releaseOp releases a stale op in a fenced transaction, when the row
-// still has it: the op columns cleared, unknown, node and booking kept.
-func (e *Engine) releaseOp(ctx context.Context, read store.Sandbox) error {
+// followOrphans looks for this instance's orphaned ops (runner.runs) every
+// orphanEvery until ctx ends, so that no instance waits for an op that
+// nobody runs until its deadline: the leader's stale ops leave a live
+// owner's alone.
+func (e *Engine) followOrphans(ctx context.Context) {
+	t := time.NewTicker(e.t.orphanEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if err := e.orphans(ctx); err != nil && ctx.Err() == nil {
+			e.rl.warn("orphans", "cannot resolve the orphaned ops of this instance", "err", err)
+		}
+	}
+}
+
+// orphans takes over the ops the rows say are this instance's and that
+// its runner does not run, when it is connected to their target, and
+// releases the others (unknown, for Sync), as the leader does with a dead
+// instance's. It reads them all, a page at a time, without the ops the
+// runner ran when it began: an orphan is found however many ops of this
+// instance run, whatever their deadlines. A release is decided under the
+// sandbox's begin lock, where an op whose begin committed is registered
+// with the runner.
+func (e *Engine) orphans(ctx context.Context) error {
+	if e.runner.isRefusing() {
+		return nil // Stop releases the instance's ops
+	}
+	running := e.runner.opIDs()
+	var after store.OpCursor
+	var errs []error
+	for {
+		rows, err := e.st.OpsOf(ctx, e.id, running, after, e.t.orphanBatch)
+		if err != nil {
+			return errors.Join(append(errs, fmt.Errorf("orphaned ops: %w", err))...)
+		}
+		errs = append(errs, e.orphanPage(ctx, rows))
+		if len(rows) == 0 || len(rows) < e.t.orphanBatch || ctx.Err() != nil {
+			return errors.Join(errs...)
+		}
+		after = after.Next(rows)
+	}
+}
+
+// orphanPage takes over or releases the orphaned ops among rows.
+func (e *Engine) orphanPage(ctx context.Context, rows []store.Sandbox) error {
+	var errs []error
+	for _, row := range rows {
+		if e.runner.runs(row) {
+			continue
+		}
+		if e.conns.Connected(row.OpTarget) {
+			h, err := e.runner.start(ctx, row.ID, OpIntent{Kind: OpKind(row.Op), Trigger: TriggerRepair,
+				Target: row.OpTarget, Incarnation: row.Incarnation, takeover: row.OpID}, false)
+			if err == nil && h.takeover {
+				e.log.Warn("an op of this instance ran nowhere; took it over", "sandbox", row.ID, "op", row.Op,
+					"op_id", row.OpID)
+			}
+			if err == nil || quiet(err) {
+				continue
+			}
+			e.rl.warn("orphans", "cannot take over an orphaned op; releasing it", "sandbox", row.ID, "err", err)
+		}
+		if err := e.releaseOrphan(ctx, row); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// releaseOrphan releases an orphaned op of this instance's under the
+// sandbox's begin lock, unless the runner runs it by then.
+func (e *Engine) releaseOrphan(ctx context.Context, row store.Sandbox) error {
+	unlock, err := e.runner.lockBegin(ctx, row.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if e.runner.runs(row) {
+		return nil
+	}
+	e.log.Warn("an op of this instance runs nowhere; releasing it", "sandbox", row.ID, "op", row.Op, "op_id", row.OpID)
+	return e.releaseOp(ctx, row, false)
+}
+
+// releaseOp releases a stale or orphaned op, when the row still has it:
+// the op columns cleared, unknown, node and booking kept. The leader's
+// release of another instance's op is fenced.
+func (e *Engine) releaseOp(ctx context.Context, read store.Sandbox, fenced bool) error {
+	inTx := e.st.InTx
+	if fenced {
+		inTx = e.fenced
+	}
 	var events []activity.Event
-	err := e.fenced(ctx, func(tx *store.Store) error {
+	err := inTx(ctx, func(tx *store.Store) error {
 		events = nil
 		row, err := tx.LockSandbox(ctx, read.ID, store.ForUpdate)
 		if errors.Is(err, model.ErrNotFound) {

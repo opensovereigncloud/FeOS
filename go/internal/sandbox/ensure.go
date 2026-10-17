@@ -199,7 +199,10 @@ func (en *ensurer) step(ctx context.Context, row store.Sandbox) (model.Lease, er
 // that a resume abandons now it preempts, whoever owns it, and waits for
 // another of a live owner only within the hibernate wait. An op of this
 // instance's that is not the row's (taken over by another instance, or of
-// an earlier incarnation) is not waited for.
+// an earlier incarnation) is not waited for. An op the row says is this
+// instance's and that it does not run is orphaned, and taken over as a
+// dead owner's: the takeover's begin, under the sandbox's begin lock,
+// joins it instead when its begin had not registered it yet.
 func (en *ensurer) opInFlight(ctx context.Context, row store.Sandbox) error {
 	e := en.e
 	if h := e.runner.Running(en.id); h != nil && h.opID == row.OpID {
@@ -210,9 +213,12 @@ func (en *ensurer) opInFlight(ctx context.Context, row store.Sandbox) error {
 		}
 		return en.await(ctx, h)
 	}
-	live, err := e.st.InstanceLive(ctx, row.OpOwner)
-	if err != nil {
-		return err
+	live := false
+	if row.OpOwner != e.id {
+		var err error
+		if live, err = e.st.InstanceLive(ctx, row.OpOwner); err != nil {
+			return err
+		}
 	}
 	if OpKind(row.Op) == OpHibernate {
 		// A dead owner's hibernate that a resume abandons is preempted

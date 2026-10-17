@@ -628,7 +628,12 @@ checkpoint inside the call.
   that the sandbox is still idle, holds nothing and is not backed off
   ([Policies](#policies)); a pause for a drain only that nothing executes;
   an explicit pause nothing. An admission locks the target node's row,
-  rechecks the gates and books.
+  rechecks the gates and books. The begin's transaction runs on a context
+  of its own, bounded by 30 s, never its caller's: a client that hangs up,
+  or a leader term that ends, while the COMMIT is on its way would leave
+  the row in an op that nobody runs. A COMMIT whose answer is lost all the
+  same (the connection broke) is judged by the row: an op that committed
+  runs.
 - **Preempt.** A hibernate of a paused sandbox that a resume abandons now
   is replaced by a resume, in one transaction under the row's lock: the
   resume gets a new op ID, this instance as its owner and its own
@@ -683,8 +688,15 @@ holds; a repair that found the pod healthy and made no call ends nothing.
 **Stale ops.** The leader takes over the op of an instance that died or
 stops, when it is connected to the op's node; otherwise it releases the
 op and the sandbox becomes `unknown`. An op of a live instance is never
-taken over; one more than 5 minutes past its deadline is released and
-logged as an error.
+taken over by another; one more than 5 minutes past its deadline is
+released and logged as an error. An op that the row says is an
+instance's own and that the instance does not run is orphaned (its begin
+committed, but nothing ran it): Ensure on that instance takes it over at
+once, as a dead owner's, and every instance looks for its orphans every
+10 s, taking over those on nodes it is connected to and releasing the
+others. That look reads all of the instance's ops but those it runs, 64
+at a time in deadline order, so an orphaned hibernate, whose deadline
+sorts last, is found however many ops the instance runs.
 
 ### Ensure
 

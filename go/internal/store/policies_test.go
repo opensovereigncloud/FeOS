@@ -202,6 +202,23 @@ func TestOpsOfInstances(t *testing.T) {
 		r.StatusDescription != "op pause of stopping instance stopping was released" || r.Gen != b.Gen+1 || r.Node != "n1" {
 		t.Fatalf("released row %+v", r)
 	}
+
+	// An instance's ops, by deadline and ID, a page at a time, without
+	// those it names (the ones it runs).
+	startOp(t, s, c.ID, "pause", "live", "n1", 2*time.Minute)
+	opID := func(id uuid.UUID) uuid.UUID { return get(t, s, id).OpID }
+	page, err := s.OpsOf(bg, "live", nil, store.OpCursor{}, 2)
+	if err != nil || !slices.Equal(ids(page), []uuid.UUID{e.ID, a.ID}) {
+		t.Fatalf("first page %v %v", ids(page), err)
+	}
+	next := store.OpCursor{}.Next(page)
+	if page, err := s.OpsOf(bg, "live", nil, next, 2); err != nil || !slices.Equal(ids(page), []uuid.UUID{c.ID}) {
+		t.Fatalf("second page %v %v", ids(page), err)
+	}
+	if page, err := s.OpsOf(bg, "live", []uuid.UUID{opID(e.ID), opID(a.ID)}, store.OpCursor{}, 2); err != nil ||
+		!slices.Equal(ids(page), []uuid.UUID{c.ID}) {
+		t.Fatalf("without the ops it runs %v %v", ids(page), err)
+	}
 }
 
 func TestLoopCandidates(t *testing.T) {

@@ -238,6 +238,28 @@ func (r *runner) Running(id uuid.UUID) *OpHandle {
 	return r.ops[id]
 }
 
+// runs reports whether this instance runs the op of row. An op that row
+// says is this instance's and that it does not run is orphaned: its begin
+// committed, but no goroutine ran it (a COMMIT whose answer was lost and
+// whose row could not be read then, or an earlier process under the same
+// instance ID). Reliable under the sandbox's begin lock, where every
+// begin of this instance that committed has registered its op.
+func (r *runner) runs(row store.Sandbox) bool {
+	h := r.Running(row.ID)
+	return h != nil && h.opID == row.OpID
+}
+
+// opIDs returns the op IDs of the ops this instance runs.
+func (r *runner) opIDs() []uuid.UUID {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ids := make([]uuid.UUID, 0, len(r.ops))
+	for _, h := range r.ops {
+		ids = append(ids, h.opID)
+	}
+	return ids
+}
+
 func (r *runner) isRefusing() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -5,9 +5,14 @@ package sandbox
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -533,5 +538,200 @@ func TestTakeoverIntentNeverBeginsAnOp(t *testing.T) {
 	wantErr(t, err, model.ErrPrecondition, "the op to take over ended")
 	if row := h.row(sb.ID); row.OpOwner != "dead" {
 		t.Fatalf("taken over: %+v", row)
+	}
+}
+
+// A begin's transaction is not its caller's: a caller whose context ends
+// while the begin's transaction runs (a client that hangs up, a leader
+// term that ends) neither cuts the transaction, which would leave a COMMIT
+// on its way without an answer, nor loses the op.
+func TestBeginOutlivesItsCaller(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	sb := h.running(512)
+	h.settle(sb.ID)
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	e.beginHook = func(_ context.Context, id uuid.UUID, kind OpKind) {
+		if id == sb.ID && kind == OpPause {
+			cancel()
+		}
+	}
+	hd, err := e.runner.Start(ctx, sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1",
+		Incarnation: sb.Incarnation})
+	if err != nil {
+		t.Fatalf("a begin whose caller hung up: %v", err)
+	}
+	wctx, wcancel := context.WithTimeout(bg, 30*time.Second)
+	defer wcancel()
+	if res, err := hd.Wait(wctx); err != nil || res.State != model.StatePaused {
+		t.Fatalf("the op: %+v %v", res, err)
+	}
+	wantState(t, h.row(sb.ID), model.StatePaused)
+}
+
+// A begin whose COMMIT's answer was lost reads the row: the op committed,
+// and it runs; nothing is left in an op that nobody runs.
+func TestBeginAdoptsALostCommit(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	sb := h.running(512)
+	h.settle(sb.ID)
+	var once sync.Once
+	e.beginTxHook = func(id uuid.UUID, err error) error {
+		if id == sb.ID && err == nil {
+			once.Do(func() { err = errors.New("unexpected EOF") })
+		}
+		return err
+	}
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	hd, err := e.runner.Start(ctx, sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1",
+		Incarnation: sb.Incarnation})
+	if err != nil {
+		t.Fatalf("a begin that committed: %v", err)
+	}
+	if res, err := hd.Wait(ctx); err != nil || res.State != model.StatePaused {
+		t.Fatalf("the op: %+v %v", res, err)
+	}
+	row := h.row(sb.ID)
+	wantState(t, row, model.StatePaused)
+	if row.Op != "" {
+		t.Fatalf("an op was left: %+v", row)
+	}
+}
+
+// An op the row says is this instance's and that its runner does not run
+// (its begin committed, but nothing ran it) is not waited for: Ensure
+// takes it over at once, as a dead owner's, and so does the instance on
+// its own, or releases it when it cannot reach the op's node. An op the
+// runner runs is left alone.
+func TestOrphanedOps(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	a := h.running(512)
+	b := h.running(512)
+	c := h.running(512)
+	d := h.running(512)
+	for _, sb := range []store.Sandbox{a, b, c, d} {
+		h.settle(sb.ID)
+	}
+
+	// Ensure.
+	before := h.opOfDeadOwner(a, OpPause, "i1")
+	ctx, cancel := context.WithTimeout(bg, 20*time.Second)
+	defer cancel()
+	if _, err := e.Ensure(ctx, a.ID); err != nil {
+		t.Fatalf("Ensure meeting an orphaned op: %v", err)
+	}
+	wantState(t, h.row(a.ID), model.StateRunning)
+	detail := h.activityNamed(a.ID, activity.KindLifecycleStart, "pause on node n1 (taken over from instance i1)")
+	if detail["trigger"] != string(TriggerEnsure) {
+		t.Fatalf("taken over by %v", detail["trigger"])
+	}
+	if row := h.row(a.ID); row.OpID == before.OpID {
+		t.Fatal("the orphaned op stayed")
+	}
+
+	// The instance: b's is taken over and ends; c's, whose node it cannot
+	// reach, is released; d's runs, held at its call, and stays.
+	h.opOfDeadOwner(b, OpPause, "i1")
+	h.opOfDeadOwner(c, OpPause, "i1")
+	h.exec("UPDATE sandboxes SET op_target = 'nowhere' WHERE id = $1", c.ID)
+	arrived, release := h.gate("n1", podv1.PodService_SuspendPod_FullMethodName)
+	defer release()
+	hd, err := e.runner.Start(ctx, d.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1",
+		Incarnation: d.Incarnation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitClosed(t, arrived, "d's pause at its call")
+	running := h.row(d.ID)
+	if err := e.orphans(bg); err != nil {
+		t.Fatal(err)
+	}
+	if row := h.row(d.ID); row.OpID != running.OpID || row.ClientState != model.StatePausing {
+		t.Fatalf("an op that runs was touched: %+v", row)
+	}
+	release()
+	if res, err := hd.Wait(ctx); err != nil || res.State != model.StatePaused {
+		t.Fatalf("d's pause: %+v %v", res, err)
+	}
+	h.waitState(b.ID, model.StatePaused, 10*time.Second)
+	rc := h.row(c.ID)
+	wantState(t, rc, model.StateUnknown)
+	if rc.Op != "" || rc.Node != "n1" || rc.StatusDescription != "op pause of instance i1 was abandoned" {
+		t.Fatalf("released row %+v", rc)
+	}
+}
+
+// An orphan is found however many ops of the instance run before it in
+// deadline order, and however many orphans there are: the look reads
+// them all, a page at a time, without the ops it runs.
+func TestOrphansPastABatch(t *testing.T) {
+	h := newHarness(t)
+	n := h.addNode("n1")
+	e := h.eng()
+	e.t.orphanBatch = 1
+	var sbs []store.Sandbox
+	for range 4 {
+		sb := h.running(512)
+		h.settle(sb.ID)
+		sbs = append(sbs, sb)
+	}
+	// Two pauses run, held at their calls, their deadlines first.
+	held := make(chan struct{})
+	release := sync.OnceFunc(func() { close(held) })
+	defer release()
+	var arrived atomic.Int64
+	n.Script().SetHook(podv1.PodService_SuspendPod_FullMethodName, func(ctx context.Context, _ string, _ any) error {
+		arrived.Add(1)
+		select {
+		case <-held:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	var handles []*OpHandle
+	for _, sb := range sbs[:2] {
+		hd, err := e.runner.Start(ctx, sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1",
+			Incarnation: sb.Incarnation})
+		if err != nil {
+			t.Fatal(err)
+		}
+		handles = append(handles, hd)
+	}
+	eventually(t, 10*time.Second, "both pauses at their calls", func() bool { return arrived.Load() == 2 })
+	// Two orphans of this instance, their deadlines (a hibernate's) later.
+	var orphaned []store.Sandbox
+	for i, sb := range sbs[2:] {
+		h.opOfDeadOwner(sb, OpPause, "i1")
+		h.exec("UPDATE sandboxes SET op_deadline = now() + $2::interval WHERE id = $1", sb.ID,
+			fmt.Sprintf("%d hours", i+1))
+		orphaned = append(orphaned, h.row(sb.ID))
+	}
+
+	if err := e.orphans(bg); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range orphaned {
+		row := h.row(o.ID)
+		if row.OpID == o.OpID || !e.runner.runs(row) {
+			t.Fatalf("orphan %s not taken over: %+v", o.ID, row)
+		}
+	}
+	for i, hd := range handles {
+		if row := h.row(sbs[i].ID); row.OpID != hd.opID {
+			t.Fatalf("a pause that runs was touched: %+v", row)
+		}
+	}
+	release()
+	for _, sb := range sbs {
+		h.waitState(sb.ID, model.StatePaused, 10*time.Second)
 	}
 }

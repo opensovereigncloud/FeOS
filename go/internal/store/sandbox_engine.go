@@ -61,6 +61,33 @@ func (s *Store) RepairRecheck(ctx context.Context, id uuid.UUID, pendingAfter, u
 	return ok, err
 }
 
+// OpCursor is a place in the order of OpsOf: past the op of the sandbox
+// ID, whose deadline is Deadline. The zero OpCursor is the start.
+type OpCursor struct {
+	Deadline time.Time
+	ID       uuid.UUID
+}
+
+// Next is the cursor past the last of a page of OpsOf.
+func (c OpCursor) Next(page []Sandbox) OpCursor {
+	if len(page) == 0 {
+		return c
+	}
+	last := page[len(page)-1]
+	return OpCursor{Deadline: last.OpDeadline, ID: last.ID}
+}
+
+// OpsOf returns up to limit sandboxes with an op owned by instanceID whose
+// op ID is none of except, past after, by op deadline and then ID.
+func (s *Store) OpsOf(ctx context.Context, instanceID string, except []uuid.UUID, after OpCursor,
+	limit int) ([]Sandbox, error) {
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+` FROM sandboxes
+		WHERE op_owner = $1 AND op <> '' AND op_id <> ALL($2)
+			AND ($3::timestamptz IS NULL OR (op_deadline, id) > ($3::timestamptz, $4::uuid))
+		ORDER BY op_deadline, id LIMIT $5`,
+		instanceID, nonNil(except), nullTime(after.Deadline), after.ID, limit))
+}
+
 // OlderThan reports whether t lies more than d before the database's now()
 // (within a transaction, its start). A zero t is not older than anything.
 func (s *Store) OlderThan(ctx context.Context, t time.Time, d time.Duration) (bool, error) {

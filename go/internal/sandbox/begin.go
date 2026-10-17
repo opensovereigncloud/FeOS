@@ -44,6 +44,11 @@ func (r *runner) begin(ctx context.Context, id uuid.UUID, in OpIntent) (*OpHandl
 	if pinnedTarget(in) == "" {
 		var refused []string
 		for _, c := range in.Candidates {
+			// Between two transactions nothing is in flight: a caller
+			// that is gone tries no further candidate.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			h, err := r.beginOn(ctx, id, in, c)
 			if rf, ok := asRefusal(err); ok {
 				refused = append(refused, c+": "+rf.text)
@@ -77,9 +82,20 @@ func refuseVerdict(vs []store.PlacementCandidate, node, reason string) []store.P
 	return out
 }
 
-// beginOn is one begin transaction towards target.
+// beginTimeout bounds a begin's transaction, which runs on a context of
+// its own.
+const beginTimeout = 30 * time.Second
+
+// beginOn is one begin transaction towards target. The transaction runs on
+// a context of its own, never its caller's: a caller that hangs up, or a
+// leader term that ends, while the COMMIT is on its way would leave its
+// outcome unknown, and the row in an op of this instance that nobody runs.
+// A COMMIT whose answer was lost all the same (the connection broke) is
+// judged by the row: an op that committed is this begin's, and runs.
 func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target string) (*OpHandle, error) {
 	e := r.e
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), beginTimeout)
+	defer cancel()
 	var h *OpHandle
 	var events []activity.Event
 	err := e.st.InTx(ctx, func(tx *store.Store) error {
@@ -196,6 +212,15 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 		events = append(events, h.startEvent(row))
 		return nil
 	})
+	if e.beginTxHook != nil {
+		err = e.beginTxHook(id, err)
+	}
+	if err != nil && h != nil && r.committed(ctx, h) {
+		// The transaction got to its COMMIT, whose answer was lost.
+		e.log.Warn("the answer to a begin's commit was lost; the op committed and runs", "sandbox", id,
+			"op", string(h.kind), "err", err)
+		err = nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +234,15 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 		e.log.Info("took over an op", "sandbox", id, "op", string(h.kind), "target", h.target, "from", h.from)
 	}
 	return h, nil
+}
+
+// committed reports whether the op of h, whose begin's COMMIT failed,
+// committed nonetheless: the row has its op id.
+func (r *runner) committed(ctx context.Context, h *OpHandle) bool {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	row, err := r.e.st.GetSandbox(rctx, h.id)
+	return err == nil && row.Incarnation == h.inc && row.OpID == h.opID
 }
 
 func containsKey(ks []store.TombstoneKey, node string) bool {
@@ -230,16 +264,23 @@ func (r *runner) newHandle(row store.Sandbox, kind OpKind, trigger OpTrigger, ta
 }
 
 // takeover takes over the op in flight in row when its owner is not live
-// (dead or stopping): the same op towards the same target with a new op
-// id and deadline. Nothing but the op's ownership is written: the row is
-// in the op's transitional state, and its booking stands. A live owner
-// finishes its op by its deadline: ErrBusy.
+// (dead or stopping), or is this instance and its runner does not run the
+// op (orphaned): the same op towards the same target with a new op id and
+// deadline. Nothing but the op's ownership is written: the row is in the
+// op's transitional state, and its booking stands. A live owner finishes
+// its op by its deadline: ErrBusy. It runs under the sandbox's begin lock
+// (begin), so that an op of this instance's that committed is registered
+// with the runner by then.
 func (r *runner) takeover(ctx context.Context, tx *store.Store, row store.Sandbox, trigger OpTrigger) (*OpHandle, []activity.Event, error) {
-	live, err := tx.InstanceLive(ctx, row.OpOwner)
-	if err != nil {
-		return nil, nil, err
+	busy := r.runs(row)
+	if row.OpOwner != r.e.id {
+		live, err := tx.InstanceLive(ctx, row.OpOwner)
+		if err != nil {
+			return nil, nil, err
+		}
+		busy = live
 	}
-	if live || row.OpOwner == r.e.id {
+	if busy {
 		return nil, nil, errorf(model.ErrBusy, "an op %s of instance %s is in flight", row.Op, row.OpOwner)
 	}
 	now, err := tx.Now(ctx)

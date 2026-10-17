@@ -141,6 +141,10 @@ type timings struct {
 	// in it yet, the node did not answer); preemptGet bounds one such
 	// GetPod.
 	preemptRecheck, preemptGet time.Duration
+	// orphanEvery is how often an instance looks for its orphaned ops;
+	// orphanBatch is how many ops one read of that look returns.
+	orphanEvery time.Duration
+	orphanBatch int
 	// policyBackoffMin and policyBackoffMax bound the backoff of a
 	// policy whose op failed (backOff).
 	policyBackoffMin, policyBackoffMax time.Duration
@@ -176,6 +180,8 @@ func defaultTimings(hibernateTimeout time.Duration) timings {
 
 		preemptRecheck: time.Second,
 		preemptGet:     5 * time.Second,
+		orphanEvery:    10 * time.Second,
+		orphanBatch:    loopBatch,
 
 		policyBackoffMin: 30 * time.Second,
 		policyBackoffMax: 30 * time.Minute,
@@ -277,6 +283,9 @@ type Engine struct {
 	// connHook, when set, runs where an op gets its connection; an error
 	// is taken for a connection that could not be had: tests inject it.
 	connHook func(h *OpHandle) error
+	// beginTxHook, when set, replaces the error of a begin's transaction:
+	// tests make a COMMIT's answer get lost.
+	beginTxHook func(id uuid.UUID, err error) error
 }
 
 // New returns the engine of an instance.
@@ -356,9 +365,10 @@ func (e *Engine) processLister() ProcessLister {
 
 // Run runs the engine's background work until ctx ends: the deferred
 // syncs (on ferun_sandbox and every 5 s), the renewals of this instance's
-// holds, and the activity recorder when the engine made it. When ctx ends
-// it ends the engine's background work, detached node calls included, and
-// waits for it, so ctx is the instance's last (§7 step 5), after Stop.
+// holds, the look for its orphaned ops (every 10 s), and the activity
+// recorder when the engine made it. When ctx ends it ends the engine's
+// background work, detached node calls included, and waits for it, so ctx
+// is the instance's last (§7 step 5), after Stop.
 func (e *Engine) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	if e.ownAct {
@@ -368,7 +378,7 @@ func (e *Engine) Run(ctx context.Context) error {
 			_ = e.act.Run(ctx)
 		}()
 	}
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		e.followSandboxes(ctx)
@@ -376,6 +386,10 @@ func (e *Engine) Run(ctx context.Context) error {
 	go func() {
 		defer wg.Done()
 		e.renewHolds(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		e.followOrphans(ctx)
 	}()
 	<-ctx.Done()
 	// No op begins any more, so that the runner's WaitGroup is not added
