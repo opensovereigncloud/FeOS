@@ -188,6 +188,54 @@ func TestSignIn(t *testing.T) {
 	expect(t, w, http.StatusUnauthorized, errBody("admin sign-in required"))
 }
 
+// Basic credentials a browser cached from its own dialog do not carry a
+// cross-site page's POST: a request the browser marks as cross-origin is
+// refused, while a script's (no Origin, no Sec-Fetch-Site), the UI's and
+// a same-origin one go through.
+func TestBasicCrossOrigin(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, envOptions{publicURL: testPublicURL})
+	ctx := context.Background()
+	if _, err := e.st.InsertNode(ctx, "n1"); err != nil {
+		t.Fatal(err)
+	}
+	drain := func(h http.Header) *httptest.ResponseRecorder {
+		h.Set("Authorization", adminAuth())
+		return e.serve(request{method: "POST", path: "/api/v1/admin/nodes/n1/drain", header: h})
+	}
+	for name, h := range map[string]http.Header{
+		"foreign origin":           {"Origin": {"https://evil.example"}},
+		"cross-site":               {"Sec-Fetch-Site": {"cross-site"}, "Origin": {"https://evil.example"}},
+		"same-site":                {"Sec-Fetch-Site": {"same-site"}, "Origin": {"https://chat.example.test"}},
+		"opaque origin":            {"Origin": {"null"}},
+		"cross-site with a header": {"Sec-Fetch-Site": {"cross-site"}, "X-Requested-With": {"ferun"}},
+	} {
+		expect(t, drain(h), http.StatusForbidden, errBody("cross-origin request refused"))
+		if n, err := e.st.GetNode(ctx, "n1"); err != nil || n.Draining {
+			t.Fatalf("%s: node %+v %v", name, n, err)
+		}
+	}
+	// A safe method is not checked.
+	w := e.serve(request{method: "GET", path: "/api/v1/admin/nodes",
+		header: http.Header{"Authorization": {adminAuth()}, "Sec-Fetch-Site": {"cross-site"}, "Origin": {"https://evil.example"}}})
+	expect(t, w, http.StatusOK, "")
+	for name, h := range map[string]http.Header{
+		"script":          {},
+		"UI":              {"Sec-Fetch-Site": {"same-origin"}, "Origin": {testPublicURL}, "X-Requested-With": {"ferun"}},
+		"typed":           {"Sec-Fetch-Site": {"none"}},
+		"old, host":       {"Origin": {"http://example.com"}},
+		"old, public URL": {"Origin": {testPublicURL}},
+	} {
+		if w := drain(h); w.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", name, w.Code, w.Body.String())
+		}
+	}
+	// Wrong credentials stay a 401, whatever the origin.
+	w = e.serve(request{method: "POST", path: "/api/v1/admin/nodes/n1/undrain",
+		header: http.Header{"Authorization": {basicOf(testAdmin, "wrong")}, "Origin": {"https://evil.example"}}})
+	expect(t, w, http.StatusUnauthorized, "")
+}
+
 // ES256 and EdDSA keys sign in as RS256 ones do.
 func TestSignInKeyTypes(t *testing.T) {
 	t.Parallel()

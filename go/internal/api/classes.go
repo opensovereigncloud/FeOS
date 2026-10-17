@@ -185,6 +185,30 @@ func (s *server) checkCSRF(r *http.Request) error {
 	return nil
 }
 
+// basicCrossOrigin is net/http's cross-origin check: Sec-Fetch-Site, or
+// without it Origin against Host. Its zero value trusts no origin;
+// checkBasicOrigin adds the public URL's.
+var basicCrossOrigin http.CrossOriginProtection
+
+// checkBasicOrigin refuses a request with Basic credentials that a page of
+// another origin could have sent. A browser caches the credentials typed
+// into its own dialog (challengeBasic) and attaches them to every request
+// to the origin, a cross-site form's POST among them. So a method other
+// than GET, HEAD and OPTIONS is refused when the browser marks it as
+// cross-origin: Sec-Fetch-Site other than same-origin or none, or,
+// without it, an Origin that is neither the Host's nor the public URL's.
+// A script (curl -u) sends neither header and passes; so does the UI,
+// whose requests are same-origin.
+func (s *server) checkBasicOrigin(r *http.Request) error {
+	if err := basicCrossOrigin.Check(r); err != nil {
+		if o := r.Header.Get("Origin"); s.origin != "" && strings.EqualFold(o, s.origin) {
+			return nil
+		}
+		return apierr.New(http.StatusForbidden, "cross-origin request refused")
+	}
+	return nil
+}
+
 // admin is the admin class: an admin's UI session, or Basic credentials of
 // --admin-users, which are checked first and win when present.
 func (s *server) admin(h apiHandler) http.Handler {
@@ -196,6 +220,9 @@ func (s *server) admin(h apiHandler) http.Handler {
 		if present {
 			if err != nil {
 				s.challengeBasic(w, r)
+				return err
+			}
+			if err := s.checkBasicOrigin(r); err != nil {
 				return err
 			}
 			return h(w, r.WithContext(auth.WithAdmin(r.Context(), a)))

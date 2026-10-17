@@ -919,7 +919,14 @@ begun on one instance completes on another and a sign-out ends it
 everywhere; anyone else gets "no access" and no session. A request with
 the session cookie that changes something must carry `X-Requested-With:
 ferun` and, with an `Origin`, the public URL's; ferund sends no CORS
-headers. Basic credentials, when present, are checked first. Without
+headers. Basic credentials, when present, are checked first, and a
+request with them that changes something is refused, 403 "cross-origin
+request refused", when the browser marks it as another origin's
+(net/http's `CrossOriginProtection`): a `Sec-Fetch-Site` other than
+`same-origin` or `none`, or without one an `Origin` that is neither the
+`Host`'s nor the public URL's. A browser keeps the credentials typed
+into its own dialog and would send them with another site's form; `curl
+-u` sends neither header, and the UI's requests are same-origin. Without
 OIDC and `--admin-users`, the admin routes answer 503. An admin route's
 401 carries `WWW-Authenticate: Basic`, which makes a browser show its
 login dialog, only with `--admin-users` and only to a request without
