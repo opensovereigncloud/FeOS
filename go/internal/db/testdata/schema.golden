@@ -318,6 +318,9 @@ TABLE sandboxes
   COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN last_active_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN paused_at timestamp with time zone
+  COLUMN policy_failed text NOT NULL DEFAULT ''::text
+  COLUMN policy_failures integer NOT NULL DEFAULT 0
+  COLUMN policy_not_before timestamp with time zone
   CONSTRAINT CHECK (((memory_mib >= 256) AND (memory_mib <= 65536)))
   CONSTRAINT CHECK (((op = ''::text) = (op_id IS NULL)))
   CONSTRAINT CHECK (((vcpus >= 1) AND (vcpus <= 32)))

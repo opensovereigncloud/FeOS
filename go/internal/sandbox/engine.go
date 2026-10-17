@@ -141,6 +141,9 @@ type timings struct {
 	// in it yet, the node did not answer); preemptGet bounds one such
 	// GetPod.
 	preemptRecheck, preemptGet time.Duration
+	// policyBackoffMin and policyBackoffMax bound the backoff of a
+	// policy whose op failed (backOff).
+	policyBackoffMin, policyBackoffMax time.Duration
 }
 
 // defaultTimings are the timings of an instance whose hibernates may run
@@ -173,6 +176,9 @@ func defaultTimings(hibernateTimeout time.Duration) timings {
 
 		preemptRecheck: time.Second,
 		preemptGet:     5 * time.Second,
+
+		policyBackoffMin: 30 * time.Second,
+		policyBackoffMax: 30 * time.Minute,
 	}
 }
 

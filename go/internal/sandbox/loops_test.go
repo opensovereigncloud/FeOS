@@ -12,11 +12,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -198,6 +201,122 @@ func TestHibernateAfterLoop(t *testing.T) {
 	h.waitState(sb.ID, model.StateHibernated, 10*time.Second)
 	time.Sleep(200 * time.Millisecond)
 	wantState(t, h.row(other.ID), model.StatePaused)
+}
+
+// A policy's op that fails backs its policy off: the idle pause and the
+// hibernate-after loops begin none for the sandbox before
+// policy_not_before, 30 s after the first failure and doubling per
+// consecutive one, instead of asking a node that cannot snapshot or
+// upload again on their next pass; a pause or hibernation that succeeds
+// clears it, and so does a move to another node.
+func TestPolicyBackoff(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		c.IdlePause = 50 * time.Millisecond
+		c.HibernateAfter = time.Minute
+	})
+	n := h.addNode("n1")
+	e := h.eng()
+	sb := h.running(512)
+	h.settle(sb.ID)
+	var suspends, hibernates atomic.Int64
+	failSuspend := func(context.Context, string, any) error {
+		suspends.Add(1)
+		return status.Error(codes.Internal, "snapshot failed: no space left on device")
+	}
+	n.Script().SetHook(podv1.PodService_SuspendPod_FullMethodName, failSuspend)
+	// wantBackoff waits for the op's end and checks the sandbox's state and
+	// backoff (the finish's clock is the row's updated_at).
+	wantBackoff := func(state, policy string, failures int, backoff time.Duration) {
+		t.Helper()
+		eventually(t, 10*time.Second, "the op ended", func() bool { return h.row(sb.ID).Op == "" })
+		r := h.row(sb.ID)
+		wantState(t, r, state)
+		if r.PolicyFailed != policy || r.PolicyFailures != failures || (backoff == 0) != r.PolicyNotBefore.IsZero() ||
+			(backoff > 0 && r.PolicyNotBefore.Sub(r.UpdatedAt) != backoff) {
+			t.Fatalf("%q: %d failures, not before %v (updated %v); want %q: %d, %v", r.PolicyFailed, r.PolicyFailures,
+				r.PolicyNotBefore, r.UpdatedAt, policy, failures, backoff)
+		}
+	}
+	pass := func(loop func(context.Context) error) {
+		t.Helper()
+		if err := loop(bg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pastBackoff := func() {
+		h.exec("UPDATE sandboxes SET policy_not_before = now() - interval '1 second' WHERE id = $1", sb.ID)
+	}
+
+	// The idle pause fails: backed off for 30 s; the next pass leaves it.
+	time.Sleep(100 * time.Millisecond)
+	pass(e.idlePause)
+	wantBackoff(model.StateRunning, store.PolicyIdle, 1, 30*time.Second)
+	pass(e.idlePause)
+	if r := h.row(sb.ID); r.Op != "" || suspends.Load() != 1 {
+		t.Fatalf("the next pass began a pause: %d SuspendPod, op %q", suspends.Load(), r.Op)
+	}
+	// Past the backoff, it fails again: twice as long.
+	pastBackoff()
+	pass(e.idlePause)
+	wantBackoff(model.StateRunning, store.PolicyIdle, 2, time.Minute)
+	if suspends.Load() != 2 {
+		t.Fatalf("%d SuspendPod", suspends.Load())
+	}
+	// It succeeds: cleared.
+	n.Script().SetHook(podv1.PodService_SuspendPod_FullMethodName, nil)
+	pastBackoff()
+	pass(e.idlePause)
+	wantBackoff(model.StatePaused, "", 0, 0)
+
+	// The hibernate-after fails: backed off; the next pass leaves it; past
+	// the backoff it fails again.
+	n.Script().SetHook(podv1.PodService_HibernatePod_FullMethodName, func(context.Context, string, any) error {
+		hibernates.Add(1)
+		return status.Error(codes.Unavailable, "upload failed: quota exceeded")
+	})
+	h.exec("UPDATE sandboxes SET paused_at = now() - interval '2 minutes' WHERE id = $1", sb.ID)
+	pass(e.hibernateAfter)
+	wantBackoff(model.StatePaused, store.PolicyHibernateAfter, 1, 30*time.Second)
+	pass(e.hibernateAfter)
+	if r := h.row(sb.ID); r.Op != "" || hibernates.Load() != 1 {
+		t.Fatalf("the next pass began a hibernation: %d HibernatePod, op %q", hibernates.Load(), r.Op)
+	}
+	pastBackoff()
+	pass(e.hibernateAfter)
+	wantBackoff(model.StatePaused, store.PolicyHibernateAfter, 2, time.Minute)
+
+	// Resumed, it idles: the hibernate-after's backoff does not hold the
+	// idle pause back, whose failures count from 1.
+	if res := h.startOp(sb.ID, OpIntent{Kind: OpResume, Trigger: TriggerExplicit, Target: "n1"}); res.State != model.StateRunning {
+		t.Fatalf("resume: %+v", res)
+	}
+	if r := h.row(sb.ID); r.PolicyFailed != store.PolicyHibernateAfter || r.PolicyFailures != 2 {
+		t.Fatalf("the resume changed the hibernate-after's backoff: %q %d", r.PolicyFailed, r.PolicyFailures)
+	}
+	n.Script().SetHook(podv1.PodService_SuspendPod_FullMethodName, failSuspend)
+	time.Sleep(100 * time.Millisecond)
+	pass(e.idlePause)
+	wantBackoff(model.StateRunning, store.PolicyIdle, 1, 30*time.Second)
+	if suspends.Load() != 3 {
+		t.Fatalf("%d SuspendPod", suspends.Load())
+	}
+	n.Script().SetHook(podv1.PodService_SuspendPod_FullMethodName, nil)
+	pastBackoff()
+	pass(e.idlePause)
+	wantBackoff(model.StatePaused, "", 0, 0)
+	n.Script().SetHook(podv1.PodService_HibernatePod_FullMethodName, nil)
+	h.exec("UPDATE sandboxes SET paused_at = now() - interval '2 minutes' WHERE id = $1", sb.ID)
+	pass(e.hibernateAfter)
+	wantBackoff(model.StateHibernated, "", 0, 0)
+
+	// A move to another node clears a backoff (here: a restore of a row
+	// whose node went).
+	h.exec(`UPDATE sandboxes SET node = NULL, policy_failed = 'hibernate_after', policy_failures = 3,
+		policy_not_before = now() + interval '1 hour' WHERE id = $1`, sb.ID)
+	h.ensure(sb.ID)
+	if r := h.row(sb.ID); r.PolicyFailed != "" || r.PolicyFailures != 0 || !r.PolicyNotBefore.IsZero() {
+		t.Fatalf("after the restore: %q %d failures, not before %v", r.PolicyFailed, r.PolicyFailures, r.PolicyNotBefore)
+	}
 }
 
 func TestDrainLoop(t *testing.T) {

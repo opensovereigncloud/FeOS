@@ -143,7 +143,9 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 			after.Node = target
 		}
 		if after.Node != row.Node {
+			// A pod on another node; a policy's backoff was the old node's.
 			after.Materialised, after.LostFrom = false, ""
+			after.PolicyFailed, after.PolicyFailures, after.PolicyNotBefore = "", 0, time.Time{}
 		}
 		if in.Kind == OpCreate && row.ImageRef == "" {
 			after.ImageRef = in.ImageRef
@@ -408,7 +410,7 @@ func (r *runner) precheck(ctx context.Context, tx *store.Store, row store.Sandbo
 			break
 		}
 		if pass, err = tx.IdleRecheck(ctx, row.ID, r.e.cfg.IdlePause); err != nil || !pass {
-			return recheckFailed(row.ID, "it was active since", err)
+			return recheckFailed(row.ID, "it was active since, or a failed idle pause backs it off", err)
 		}
 		held, err := tx.HasLiveHold(ctx, row.ID)
 		if err != nil || held {
@@ -419,7 +421,7 @@ func (r *runner) precheck(ctx context.Context, tx *store.Store, row store.Sandbo
 			break
 		}
 		if pass, err = tx.HibernateAfterRecheck(ctx, row.ID, r.e.cfg.HibernateAfter); err != nil || !pass {
-			return recheckFailed(row.ID, "it was resumed since", err)
+			return recheckFailed(row.ID, "it was resumed since, or a failed hibernation backs it off", err)
 		}
 	case TriggerDrain, TriggerEnsure:
 		// A forward does not keep a sandbox on a draining node: the port

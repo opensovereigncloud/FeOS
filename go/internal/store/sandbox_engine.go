@@ -17,12 +17,13 @@ import (
 
 // IdleRecheck is the recheck of an idle pause's begin (§9 begin step 3), a
 // statement of its own with a fresh snapshot: the sandbox runs without an
-// op and was last active more than idle ago. A sandbox that does not exist
-// fails it.
+// op, was last active more than idle ago, and no failed idle pause backs
+// it off. A sandbox that does not exist fails it.
 func (s *Store) IdleRecheck(ctx context.Context, id uuid.UUID, idle time.Duration) (bool, error) {
 	var ok bool
 	err := s.q.QueryRow(ctx, `SELECT client_state = 'running' AND op = '' AND last_active_at < now() - $2::interval
-		FROM sandboxes WHERE id = $1`, id, interval(idle)).Scan(&ok)
+			AND `+policyDue(PolicyIdle)+`
+		FROM sandboxes s WHERE id = $1`, id, interval(idle)).Scan(&ok)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -30,12 +31,13 @@ func (s *Store) IdleRecheck(ctx context.Context, id uuid.UUID, idle time.Duratio
 }
 
 // HibernateAfterRecheck is the recheck of a hibernate-after begin: the
-// sandbox is paused without an op since more than after ago.
+// sandbox is paused without an op since more than after ago, and no
+// failed hibernate-after backs it off.
 func (s *Store) HibernateAfterRecheck(ctx context.Context, id uuid.UUID, after time.Duration) (bool, error) {
 	var ok bool
 	err := s.q.QueryRow(ctx, `SELECT client_state = 'paused' AND op = '' AND paused_at IS NOT NULL
-			AND paused_at < now() - $2::interval
-		FROM sandboxes WHERE id = $1`, id, interval(after)).Scan(&ok)
+			AND paused_at < now() - $2::interval AND `+policyDue(PolicyHibernateAfter)+`
+		FROM sandboxes s WHERE id = $1`, id, interval(after)).Scan(&ok)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}

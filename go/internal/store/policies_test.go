@@ -234,6 +234,31 @@ func TestLoopCandidates(t *testing.T) {
 	if got, _ := s.IdleSandboxes(bg, 10*time.Second, nil, 64); len(got) != 0 {
 		t.Fatal("idle without nodes")
 	}
+	// A failed hibernate-after does not back the idle pause off.
+	exec(t, s, `UPDATE sandboxes SET policy_failed = 'hibernate_after', policy_failures = 3,
+		policy_not_before = now() + interval '1 minute' WHERE id = $1`, other.ID)
+	if got, _ := s.IdleSandboxes(bg, 10*time.Second, []string{"n1", "n2"}, 64); len(got) != 3 {
+		t.Fatalf("idle while the hibernate-after is backed off %v", ids(got))
+	}
+	if ok, err := s.IdleRecheck(bg, other.ID, 10*time.Second); !ok || err != nil {
+		t.Fatalf("idle recheck while the hibernate-after is backed off: %v %v", ok, err)
+	}
+	// A failed idle pause backs the policy off until policy_not_before.
+	exec(t, s, `UPDATE sandboxes SET policy_failed = 'idle', policy_failures = 1,
+		policy_not_before = now() + interval '1 minute' WHERE id = $1`, other.ID)
+	if got, _ := s.IdleSandboxes(bg, 10*time.Second, []string{"n1", "n2"}, 64); len(got) != 2 || slices.Contains(ids(got), other.ID) {
+		t.Fatalf("idle while backed off %v", ids(got))
+	}
+	if ok, err := s.IdleRecheck(bg, other.ID, 10*time.Second); ok || err != nil {
+		t.Fatalf("idle recheck while backed off: %v %v", ok, err)
+	}
+	exec(t, s, "UPDATE sandboxes SET policy_not_before = now() - interval '1 second' WHERE id = $1", other.ID)
+	if got, _ := s.IdleSandboxes(bg, 10*time.Second, []string{"n1", "n2"}, 64); len(got) != 3 {
+		t.Fatalf("idle after the backoff %v", ids(got))
+	}
+	if ok, err := s.IdleRecheck(bg, other.ID, 10*time.Second); !ok || err != nil {
+		t.Fatalf("idle recheck after the backoff: %v %v", ok, err)
+	}
 
 	// Hibernate-after: paused long enough, on a node with an object store.
 	place(t, s, idle.ID, "n1", model.StatePaused)
@@ -242,6 +267,30 @@ func TestLoopCandidates(t *testing.T) {
 	got, err = s.HibernateCandidates(bg, 30*time.Minute, []string{"n1", "n2"}, 10)
 	if err != nil || !slices.Equal(ids(got), []uuid.UUID{idle.ID}) {
 		t.Fatalf("hibernate %v %v", ids(got), err)
+	}
+	if ok, err := s.HibernateAfterRecheck(bg, idle.ID, 30*time.Minute); !ok || err != nil {
+		t.Fatalf("hibernate-after recheck: %v %v", ok, err)
+	}
+	// A failed idle pause does not back the hibernate-after off; a failed
+	// hibernate-after does.
+	exec(t, s, `UPDATE sandboxes SET policy_failed = 'idle', policy_failures = 3,
+		policy_not_before = now() + interval '1 minute' WHERE id = $1`, idle.ID)
+	if got, _ := s.HibernateCandidates(bg, 30*time.Minute, []string{"n1", "n2"}, 10); len(got) != 1 {
+		t.Fatalf("hibernate while the idle pause is backed off %v", ids(got))
+	}
+	if ok, err := s.HibernateAfterRecheck(bg, idle.ID, 30*time.Minute); !ok || err != nil {
+		t.Fatalf("hibernate-after recheck while the idle pause is backed off: %v %v", ok, err)
+	}
+	exec(t, s, "UPDATE sandboxes SET policy_failed = 'hibernate_after', policy_failures = 1 WHERE id = $1", idle.ID)
+	if got, _ := s.HibernateCandidates(bg, 30*time.Minute, []string{"n1", "n2"}, 10); len(got) != 0 {
+		t.Fatalf("hibernate while backed off %v", ids(got))
+	}
+	if ok, err := s.HibernateAfterRecheck(bg, idle.ID, 30*time.Minute); ok || err != nil {
+		t.Fatalf("hibernate-after recheck while backed off: %v %v", ok, err)
+	}
+	if sb := get(t, s, idle.ID); sb.PolicyFailed != store.PolicyHibernateAfter || sb.PolicyFailures != 1 ||
+		sb.PolicyNotBefore.IsZero() {
+		t.Fatalf("the backoff columns read %q %d %v", sb.PolicyFailed, sb.PolicyFailures, sb.PolicyNotBefore)
 	}
 
 	// Unknown sweep: unknown rows without an op on ready nodes.

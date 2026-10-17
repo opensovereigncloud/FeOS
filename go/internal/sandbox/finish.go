@@ -264,6 +264,49 @@ func applyOutcome(c *change, h *OpHandle, res callResult, obs observation) {
 		}
 		c.notFound(target, why)
 	}
+	backOff(c, h)
+}
+
+// backOff makes a policy's op that failed push that policy back: an idle
+// pause that left the pod running, a hibernate-after that left it
+// suspended. Its loop (and its begin's recheck) begins none before
+// policy_not_before, policyBackoffMin after the first failure, doubling
+// per consecutive one of the same policy up to policyBackoffMax, so that
+// a node that cannot snapshot, or an object store that refuses uploads,
+// is not asked again every pass. The other policy is not held back: a
+// sandbox whose hibernation failed and that was resumed since is paused
+// when it idles. A pause that ends paused and a hibernate that ends
+// hibernated, of any trigger, clear the backoff.
+func backOff(c *change, h *OpHandle) {
+	a := &c.after
+	var policy string
+	switch {
+	case h.kind == OpPause && a.ClientState == model.StatePaused,
+		h.kind == OpHibernate && a.ClientState == model.StateHibernated:
+		a.PolicyFailed, a.PolicyFailures, a.PolicyNotBefore = "", 0, time.Time{}
+		return
+	case h.trigger == TriggerIdle && h.kind == OpPause && a.ClientState == model.StateRunning:
+		policy = store.PolicyIdle
+	case h.trigger == TriggerHibernateAfter && h.kind == OpHibernate && a.ClientState == model.StatePaused:
+		policy = store.PolicyHibernateAfter
+	default:
+		return
+	}
+	if a.PolicyFailed != policy {
+		a.PolicyFailed, a.PolicyFailures = policy, 0
+	}
+	a.PolicyFailures++
+	a.PolicyNotBefore = c.now.Add(policyBackoff(a.PolicyFailures, c.e.t.policyBackoffMin, c.e.t.policyBackoffMax))
+}
+
+// policyBackoff is the backoff after the nth consecutive failure: least
+// doubled n-1 times, at most most.
+func policyBackoff(n int, least, most time.Duration) time.Duration {
+	d := least
+	for i := 1; i < n && d < most; i++ {
+		d *= 2
+	}
+	return min(d, most)
 }
 
 // applyOurs applies the state of the op's own pod on its target. The

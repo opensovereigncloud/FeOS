@@ -60,7 +60,21 @@ type Sandbox struct {
 	UpdatedAt    time.Time
 	LastActiveAt time.Time
 	PausedAt     time.Time
+
+	// PolicyFailed names the policy, PolicyIdle or PolicyHibernateAfter,
+	// whose last PolicyFailures ops for the sandbox failed in a row; that
+	// policy's loop begins none before PolicyNotBefore. Empty (0, zero):
+	// no policy is backed off. Each policy heeds only its own backoff.
+	PolicyFailed    string
+	PolicyFailures  int
+	PolicyNotBefore time.Time
 }
+
+// The policies that back off after a failed op (Sandbox.PolicyFailed).
+const (
+	PolicyIdle           = "idle"
+	PolicyHibernateAfter = "hibernate_after"
+)
 
 // HasCheckpoint reports whether the sandbox has a checkpoint to restore.
 func (s *Sandbox) HasCheckpoint() bool { return s.CheckpointHead != "" }
@@ -73,7 +87,8 @@ func sandboxColumns(p string) string {
 		"op", "op_id", "op_owner", "op_deadline", "op_target", "op_from_state", "gen",
 		"checkpoint_epoch", "checkpoint_head", "checkpoint_memory", "checkpoint_at", "checkpoint_store",
 		"pending_since", "unreachable_since", "run_id", "kube_version", "ssh_version",
-		"created_at", "updated_at", "last_active_at", "paused_at"}
+		"created_at", "updated_at", "last_active_at", "paused_at", "policy_failed", "policy_failures",
+		"policy_not_before"}
 	if p != "" {
 		for i, c := range cols {
 			cols[i] = p + "." + c
@@ -88,19 +103,20 @@ func scanSandbox(row pgx.Row) (Sandbox, error) {
 	var s Sandbox
 	var node, lostFrom *string
 	var opID *uuid.UUID
-	var opDeadline, cpAt, pendingSince, unreachableSince, pausedAt *time.Time
+	var opDeadline, cpAt, pendingSince, unreachableSince, pausedAt, policyNotBefore *time.Time
 	err := row.Scan(&s.ID, &s.Incarnation, &s.Owner, &s.Image, &s.ImageRef, &s.VCPUs, &s.MemoryMiB,
 		&s.ClientState, &s.StatusDescription, &node, &s.Materialised, &lostFrom, &s.AvoidNodes,
 		&s.Op, &opID, &s.OpOwner, &opDeadline, &s.OpTarget, &s.OpFromState, &s.Gen,
 		&s.CheckpointEpoch, &s.CheckpointHead, &s.CheckpointMemory, &cpAt, &s.CheckpointStore,
 		&pendingSince, &unreachableSince, &s.RunID, &s.KubeVersion, &s.SSHVersion,
-		&s.CreatedAt, &s.UpdatedAt, &s.LastActiveAt, &pausedAt)
+		&s.CreatedAt, &s.UpdatedAt, &s.LastActiveAt, &pausedAt, &s.PolicyFailed, &s.PolicyFailures,
+		&policyNotBefore)
 	if err != nil {
 		return Sandbox{}, err
 	}
 	s.Node, s.LostFrom, s.OpID = stringOf(node), stringOf(lostFrom), uuidOf(opID)
 	s.OpDeadline, s.CheckpointAt, s.PendingSince = timeOf(opDeadline), timeOf(cpAt), timeOf(pendingSince)
-	s.UnreachableSince, s.PausedAt = timeOf(unreachableSince), timeOf(pausedAt)
+	s.UnreachableSince, s.PausedAt, s.PolicyNotBefore = timeOf(unreachableSince), timeOf(pausedAt), timeOf(policyNotBefore)
 	s.AvoidNodes = nonNil(s.AvoidNodes)
 	return s, nil
 }
@@ -392,6 +408,9 @@ var sandboxWritable = []sandboxColumn{
 	plainColumn("ssh_version", false, func(s *Sandbox) string { return s.SSHVersion }),
 	timeColumn("last_active_at", false, func(s *Sandbox) time.Time { return s.LastActiveAt }),
 	timeColumn("paused_at", false, func(s *Sandbox) time.Time { return s.PausedAt }),
+	plainColumn("policy_failed", false, func(s *Sandbox) string { return s.PolicyFailed }),
+	plainColumn("policy_failures", false, func(s *Sandbox) int { return s.PolicyFailures }),
+	timeColumn("policy_not_before", false, func(s *Sandbox) time.Time { return s.PolicyNotBefore }),
 }
 
 // sandboxFixed lists the columns UpdateSandbox refuses to change.
@@ -621,23 +640,32 @@ func (s *Store) StaleOps(ctx context.Context, overdue time.Duration, limit int) 
 		ORDER BY s.op_deadline LIMIT $2`, interval(overdue), limit))
 }
 
+// policyDue is the condition on a sandbox row s under which policy
+// (PolicyIdle or PolicyHibernateAfter) may begin an op for it: no failed
+// op of that policy backs it off. Another policy's backoff does not count.
+func policyDue(policy string) string {
+	return "(s.policy_failed <> '" + policy + "' OR s.policy_not_before IS NULL OR s.policy_not_before <= now())"
+}
+
 // IdleSandboxes returns up to limit running sandboxes without an op on one
-// of nodes whose last_active_at is older than idle and that have no live
-// hold of any kind, the least recently active first.
+// of nodes whose last_active_at is older than idle, that have no live
+// hold of any kind and that no failed idle pause backs off, the least
+// recently active first.
 func (s *Store) IdleSandboxes(ctx context.Context, idle time.Duration, nodes []string, limit int) ([]Sandbox, error) {
 	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
 		WHERE s.client_state = 'running' AND s.op = '' AND s.last_active_at < now() - $1::interval
-			AND s.node = ANY($2)
+			AND s.node = ANY($2) AND `+policyDue(PolicyIdle)+`
 			AND NOT EXISTS (SELECT 1 FROM sandbox_holds h WHERE h.sandbox_id = s.id AND h.lease_until > now())
 		ORDER BY s.last_active_at LIMIT $3`, interval(idle), nonNil(nodes), limit))
 }
 
 // HibernateCandidates returns up to limit paused sandboxes without an op,
-// paused for longer than after, on one of nodes that has an object store.
+// paused for longer than after, on one of nodes that has an object store,
+// that no failed hibernate-after backs off.
 func (s *Store) HibernateCandidates(ctx context.Context, after time.Duration, nodes []string, limit int) ([]Sandbox, error) {
 	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s JOIN nodes n ON n.name = s.node
 		WHERE s.client_state = 'paused' AND s.op = '' AND s.paused_at < now() - $1::interval
-			AND s.node = ANY($2) AND n.object_store_id <> ''
+			AND s.node = ANY($2) AND n.object_store_id <> '' AND `+policyDue(PolicyHibernateAfter)+`
 		ORDER BY s.paused_at LIMIT $3`, interval(after), nonNil(nodes), limit))
 }
 

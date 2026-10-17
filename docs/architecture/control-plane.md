@@ -157,10 +157,12 @@ replicate synchronously ([Operations](#operations)).
 - **Time.** Every lease, TTL, grace and deadline is decided on the
   database's clock (`now()`), never on a node's or an instance's.
 - **Migrations** are embedded (`internal/db/migrations/`: `0001_init.sql`,
-  the schema; `0002_auth.sql`, sign-in; `0005_mesh.sql`, the pods' mesh)
-  and applied under an advisory lock, recorded in `schema_migrations`. The
-  same locked section creates the cluster's MCP session key, reconciles
-  `--pod-network` with the database's ([The pods'
+  the schema; `0002_auth.sql`, sign-in;
+  `0003_policy_backoff_and_placements.sql`, the policies' backoff
+  ([Policies](#policies)) and an empty `placements`; `0005_mesh.sql`, the
+  pods' mesh) and applied under an advisory lock, recorded in
+  `schema_migrations`. The same locked section creates the cluster's MCP
+  session key, reconciles `--pod-network` with the database's ([The pods'
   mesh](#the-pods-mesh)) and, with `--bootstrap-token`, creates the tenant
   `operator` and its token, when no tenant exists.
 - **Notifications.** One connection per instance listens on the channels
@@ -191,7 +193,7 @@ partitioned by day; `issued_certs` (pods' certificates); `watches`;
 `kube_bindings`, `ssh_bindings`; `auth_logins`, `ui_sessions`. Tokens are
 stored as SHA-256 hashes only, and shown once, at their creation.
 `placements`, which held the placement decisions, is written and read by
-nothing, and goes in a later migration: the
+nothing since `0003` emptied it, and goes in a later migration: the
 previous version, which a rolling deploy runs beside this one, still
 inserts into it in every create's and restore's begin. A placement's
 audit is its activity row.
@@ -221,8 +223,8 @@ audit is its activity row.
 | mesh peers | 15 s | sends every node on the pods' mesh that the leader is connected to its peers ([The pods' mesh](#the-pods-mesh)) |
 | down sweep | 5 s | sandboxes of down and removed nodes become `unknown` |
 | lost grace | 30 s | `unknown` sandboxes of nodes down past `--lost-grace` become `hibernated` or `lost` |
-| idle pause | 1 s | pauses running sandboxes idle for `--idle-pause` |
-| hibernate-after | 5 s | hibernates sandboxes paused for `--hibernate-after` |
+| idle pause | 1 s | pauses running sandboxes idle for `--idle-pause`, unless a failed pause backs off |
+| hibernate-after | 5 s | hibernates sandboxes paused for `--hibernate-after`, unless a failed hibernation backs off |
 | drain | 5 s | moves sandboxes off draining nodes |
 | tombstones | 10 s | deletes pods that belong to no sandbox |
 | stale ops | 10 s | takes over or releases the ops of dead or stopping instances |
@@ -623,9 +625,10 @@ checkpoint inside the call.
   stopping): the takeover runs the same op again with a new ID and
   deadline, since every call is idempotent or answered from the pod's
   state. An idle pause and a hibernate-after recheck, in later statements,
-  that the sandbox is still idle and holds nothing; a pause for a drain
-  only that nothing executes; an explicit pause nothing. An
-  admission locks the target node's row, rechecks the gates and books.
+  that the sandbox is still idle, holds nothing and is not backed off
+  ([Policies](#policies)); a pause for a drain only that nothing executes;
+  an explicit pause nothing. An admission locks the target node's row,
+  rechecks the gates and books.
 - **Preempt.** A hibernate of a paused sandbox that a resume abandons now
   is replaced by a resume, in one transaction under the row's lock: the
   resume gets a new op ID, this instance as its owner and its own
@@ -797,6 +800,19 @@ sandbox that ran is restored on another node as soon as its hibernation
 is done, where the calls that waited go on; without room elsewhere it
 stays hibernated until its next use. A resume never abandons a drain's
 hibernation. A node without an object store cannot be drained.
+
+An idle pause that leaves the pod running, and a hibernate-after that
+leaves it suspended, back their own policy off, so that a node that
+cannot write a snapshot, or an object store that refuses uploads, is not
+asked again on every pass: the row names the policy (`policy_failed`),
+and that policy's loop, and the recheck of its begin, begin no op for the
+sandbox before `policy_not_before`, 30 s after the first failure and
+doubling per consecutive one of the same policy up to 30 min. The other
+policy is not held back: a sandbox whose hibernation failed, resumed
+since, is paused when it idles, and its idle pause's failures count from
+one. A pause that ends paused and a hibernation that ends hibernated,
+whatever began them, and a move to another node clear the backoff. Drain
+and repair do not back off.
 
 ### Delete
 
