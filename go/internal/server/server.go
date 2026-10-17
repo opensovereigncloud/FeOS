@@ -257,7 +257,8 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 		DefaultVCPUs: cfg.DefaultVCPUs, DefaultMemoryMiB: cfg.DefaultMemoryMiB, DiskBudget: cfg.DiskBudget,
 		IdlePause: cfg.IdlePause, HibernateAfter: cfg.HibernateAfter, LostGrace: cfg.LostGrace, NodeWait: cfg.NodeWait,
 		DrainTimeout: cfg.DrainTimeout, PendingRepairAfter: cfg.PendingRepairAfter,
-		UnreachableRepairAfter: cfg.UnreachableRepairAfter, HibernateTimeout: cfg.HibernateTimeout, Log: i.log,
+		UnreachableRepairAfter: cfg.UnreachableRepairAfter, HibernateTimeout: cfg.HibernateTimeout,
+		DenyPrefixes: cfg.DenyPrefixes, Log: i.log,
 	}, sandbox.Deps{DB: i.DB, Store: i.Store, Conns: i.Links, Elector: i.Elector, Activity: i.Activity}); err != nil {
 		return nil, fmt.Errorf("the sandbox engine: %w", err)
 	}

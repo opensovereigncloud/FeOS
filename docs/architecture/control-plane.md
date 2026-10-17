@@ -64,7 +64,7 @@ that.
 | `--node-server-names` | the control-plane domain | the DNS names of the instance's certificate on the nodes' port, each under the control-plane domain |
 | `--secret-key-file` | none | 32 bytes (raw, hex or base64) that seal the bindings at rest |
 | `--bindings` | off | serve the Kubernetes and SSH bindings; only with `--secret-key-file` |
-| `--deny-prefix` | a built-in set | a destination that preflights and bindings may not reach, repeatable |
+| `--deny-prefix` | a built-in set | a destination that preflights, bindings and the image resolver may not reach, repeatable |
 | `--admin-users` | none | `user:password,...` for the admin API: Basic, beside or instead of OIDC |
 | `--public-url` | none | the front door's external URL, e.g. `https://run.fecode.dev`; required with `--oidc-issuer` |
 | `--oidc-issuer` | none | the OIDC issuer of human sign-in, exactly as its discovery document states it |
@@ -735,7 +735,15 @@ A sandbox's image is resolved once, before its first create, to
 `linux/amd64` from an index, anonymous registry tokens, a tag cache of
 60 s), and pinned in the row: every retry and every later create sends the
 same digest, so a moved tag never changes a sandbox. Private registries
-are not supported.
+are not supported. The tenant names the image, and the image names the
+registry, so the resolver reaches registries as bindings reach servers:
+over https only, without a proxy, and at IPv4 addresses outside the deny
+set (`--deny-prefix`, by default the private, shared, link-local,
+loopback, "this network", multicast and reserved ranges), judged on the
+address it dials, for the registry, every redirect and the token realm
+alike. Its errors
+name the address refused, or that the registry is unreachable, never
+what a dial found there.
 
 ### Sync and reconcile
 

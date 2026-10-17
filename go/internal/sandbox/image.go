@@ -10,22 +10,28 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/ironcore-dev/feos/go/internal/bindings"
 )
 
 // The image resolver pins an image to the digest of its linux/amd64
 // manifest, so that a sandbox never silently changes image and a tag that
 // moves never breaks CreatePod's idempotency (§9 "Image resolution"). It
-// speaks the anonymous registry protocol only: private registries are not
-// supported.
+// speaks the anonymous registry protocol only, over https: private
+// registries are not supported.
 const (
 	resolveTTL          = 60 * time.Second
 	resolveTimeout      = 30 * time.Second
+	resolveDialTimeout  = 10 * time.Second
 	resolveManifestMax  = 8 << 20
 	dockerHub           = "docker.io"
 	dockerHubRegistry   = "registry-1.docker.io"
@@ -105,10 +111,9 @@ func parseImageRef(s string) (imageRef, error) {
 // resolver resolves image references with a cache of tags.
 type resolver struct {
 	client *http.Client
-	// scheme returns the URL scheme of a registry host: http for the
-	// loopback, https for everything else.
-	scheme func(host string) string
-	now    func() time.Time
+	// transport is the client's; the tests give it their TLS roots.
+	transport *http.Transport
+	now       func() time.Time
 
 	mu    sync.Mutex
 	cache map[string]resolved
@@ -119,16 +124,78 @@ type resolved struct {
 	expires time.Time
 }
 
-func newResolver() *resolver {
-	return &resolver{client: &http.Client{}, scheme: registryScheme, now: time.Now, cache: map[string]resolved{}}
+// newResolver returns a resolver that reaches registries over https only,
+// without a proxy, and dials only IPv4 addresses outside deny: the
+// destination rule of bindings and preflights (--deny-prefix), since an
+// image names its registry and the tenant names the image. Every
+// connection is judged on the address actually dialled, to a registry,
+// to the target of a redirect and to a token realm alike, so that a name
+// that resolves to an internal address, at once or a moment later, is
+// refused too.
+func newResolver(deny []netip.Prefix) *resolver {
+	allow := bindings.DenyPolicy(deny)
+	d := &net.Dialer{Timeout: resolveDialTimeout, Control: func(_, address string, _ syscall.RawConn) error {
+		ap, err := netip.ParseAddrPort(address)
+		if err != nil {
+			return &deniedError{fmt.Errorf("unparseable address %q", address)}
+		}
+		if err := allow(ap.Addr()); err != nil {
+			return &deniedError{err}
+		}
+		return nil
+	}}
+	t := &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return d.DialContext(ctx, "tcp4", addr)
+		},
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        16,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	return &resolver{client: &http.Client{Transport: t, CheckRedirect: httpsRedirect}, transport: t, now: time.Now,
+		cache: map[string]resolved{}}
 }
 
-func registryScheme(host string) string {
-	if host == "localhost" || strings.HasPrefix(host, "localhost:") || strings.HasPrefix(host, "127.0.0.1") ||
-		strings.HasPrefix(host, "[::1]") {
-		return "http"
+// deniedError is a dial the destination rule refused.
+type deniedError struct{ err error }
+
+func (e *deniedError) Error() string { return "destination denied: " + e.err.Error() }
+
+// errNotHTTPS is a redirect to a URL that is not https.
+var errNotHTTPS = errors.New("redirect to a URL that is not https")
+
+// httpsRedirect follows at most 10 redirects, each to an https URL.
+func httpsRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
 	}
-	return "https"
+	if req.URL.Scheme != "https" {
+		return errNotHTTPS
+	}
+	return nil
+}
+
+// unreachable is the error of a request to what (a registry, a token
+// realm) that got no answer. It says that the destination rule refused
+// the address, or that a redirect was not https, or that the host does
+// not exist; otherwise only that what is unreachable: the dial's own
+// error would tell an open port from a closed or filtered one. The end of
+// ctx stays in the chain, for the caller's budget.
+func unreachable(ctx context.Context, what string, err error) error {
+	var denied *deniedError
+	var dns *net.DNSError
+	switch {
+	case ctx.Err() != nil:
+		return fmt.Errorf("%s unreachable: %w", what, ctx.Err())
+	case errors.As(err, &denied):
+		return fmt.Errorf("%s is not reachable from the control plane: %v", what, denied.err)
+	case errors.Is(err, errNotHTTPS):
+		return fmt.Errorf("%s redirected to a URL that is not https", what)
+	case errors.As(err, &dns) && dns.IsNotFound:
+		return fmt.Errorf("%s unreachable: no such host", what)
+	}
+	return fmt.Errorf("%s unreachable", what)
 }
 
 // resolve returns "<registry>/<repository>@sha256:<manifest digest>" for
@@ -203,7 +270,7 @@ func (r *resolver) resolve(ctx context.Context, image string) (string, error) {
 // with an anonymous token; it returns the body and the digest the
 // registry names (Docker-Content-Digest), if any.
 func (r *resolver) manifest(ctx context.Context, ref imageRef, tagOrDigest string) ([]byte, string, error) {
-	u := fmt.Sprintf("%s://%s/v2/%s/manifests/%s", r.scheme(ref.host), ref.host, ref.repo, tagOrDigest)
+	u := fmt.Sprintf("https://%s/v2/%s/manifests/%s", ref.host, ref.repo, tagOrDigest)
 	get := func(token string) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
@@ -217,7 +284,7 @@ func (r *resolver) manifest(ctx context.Context, ref imageRef, tagOrDigest strin
 	}
 	resp, err := get("")
 	if err != nil {
-		return nil, "", fmt.Errorf("registry unreachable: %w", err)
+		return nil, "", unreachable(ctx, "registry "+ref.host, err)
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		challenge := resp.Header.Get("WWW-Authenticate")
@@ -228,7 +295,7 @@ func (r *resolver) manifest(ctx context.Context, ref imageRef, tagOrDigest strin
 			return nil, "", err
 		}
 		if resp, err = get(token); err != nil {
-			return nil, "", fmt.Errorf("registry unreachable: %w", err)
+			return nil, "", unreachable(ctx, "registry "+ref.host, err)
 		}
 	}
 	defer resp.Body.Close()
@@ -261,20 +328,27 @@ func (r *resolver) token(ctx context.Context, challenge string) (string, error) 
 	if realm == "" {
 		return "", errors.New("unsupported auth challenge (anonymous pulls only)")
 	}
-	q := url.Values{}
+	// The realm is fetched as the registry is: over https, under the
+	// destination rule.
+	u, err := url.Parse(realm)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return "", errors.New("unsupported auth challenge: the token realm is not an https URL")
+	}
+	q := u.Query()
 	if v := params["service"]; v != "" {
 		q.Set("service", v)
 	}
 	if v := params["scope"]; v != "" {
 		q.Set("scope", v)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, realm+"?"+q.Encode(), nil)
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return "", err
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("token realm unreachable: %w", err)
+		return "", unreachable(ctx, "token realm "+u.Host, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -288,7 +362,7 @@ func (r *resolver) token(ctx context.Context, challenge string) (string, error) 
 		AccessToken string `json:"access_token"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&tok); err != nil {
-		return "", fmt.Errorf("token realm: %w", err)
+		return "", errors.New("token realm returned no token")
 	}
 	if tok.Token != "" {
 		return tok.Token, nil

@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/ironcore-dev/feos/go/internal/activity"
+	"github.com/ironcore-dev/feos/go/internal/bindings"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
@@ -44,7 +46,11 @@ type Config struct {
 	// runs the hibernation in a task of its own goes on after the call
 	// ends, and its end arrives as the pod's event.
 	HibernateTimeout time.Duration
-	Log              *slog.Logger
+	// DenyPrefixes are the destinations the image resolver may not reach,
+	// as bindings and preflights may not (--deny-prefix); nil:
+	// bindings.DefaultDenyPrefixes.
+	DenyPrefixes []netip.Prefix
+	Log          *slog.Logger
 }
 
 // Defaults of Config when zero (§3).
@@ -317,7 +323,11 @@ func New(cfg Config, deps Deps) (*Engine, error) {
 		e.act = activity.NewRecorder(st, cfg.InstanceID, cfg.Log)
 		e.ownAct = true
 	}
-	e.resolveImage = newResolver().resolve
+	deny := cfg.DenyPrefixes
+	if deny == nil {
+		deny = bindings.DefaultDenyPrefixes()
+	}
+	e.resolveImage = newResolver(deny).resolve
 	e.runner = newRunner(e)
 	e.syncs.m = map[uuid.UUID]*syncEntry{}
 	e.bg, e.bgCancel = context.WithCancel(context.Background())

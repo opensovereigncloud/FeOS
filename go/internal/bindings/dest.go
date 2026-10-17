@@ -31,6 +31,12 @@ func DefaultDenyPrefixes() []netip.Prefix {
 	}
 }
 
+// DenyPolicy is the destination rule of bindings and preflights as a
+// function, for the control plane's other outbound clients (the image
+// resolver): nil for an IPv4 address outside deny, else an error saying
+// why not.
+func DenyPolicy(deny []netip.Prefix) func(netip.Addr) error { return denyPolicy(deny) }
+
 // denyPolicy judges one address: IPv4 outside the deny set, or an error
 // saying why not. The platform reaches servers over IPv4 only, so an IPv6
 // address is never a destination either.

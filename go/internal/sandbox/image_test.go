@@ -9,11 +9,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ironcore-dev/feos/go/internal/bindings"
+	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/model"
 )
 
@@ -44,7 +48,8 @@ func TestParseImageRef(t *testing.T) {
 	}
 }
 
-// registry is an anonymous OCI registry with a Bearer token flow.
+// registry is an anonymous OCI registry with a Bearer token flow, over
+// https.
 type registry struct {
 	srv   *httptest.Server
 	mu    sync.Mutex
@@ -53,12 +58,26 @@ type registry struct {
 	// manifests by repo and reference: content type and body.
 	manifests map[string][2]string
 	digests   map[string]string // Docker-Content-Digest per reference ("" = none)
+	// realm, when set, is the challenge's realm instead of the registry's
+	// own /token; redirects answer a reference with a 307 to their URL.
+	realm     string
+	redirects map[string]string
+	// badToken: /token answers something that is not JSON.
+	badToken bool
 }
 
 func newRegistry(t *testing.T) *registry {
-	r := &registry{hits: map[string]int{}, token: "anon-token", manifests: map[string][2]string{}, digests: map[string]string{}}
+	r := &registry{hits: map[string]int{}, token: "anon-token", manifests: map[string][2]string{}, digests: map[string]string{},
+		redirects: map[string]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", func(w http.ResponseWriter, req *http.Request) {
+		r.mu.Lock()
+		bad := r.badToken
+		r.mu.Unlock()
+		if bad {
+			fmt.Fprint(w, "<html>not a token</html>")
+			return
+		}
 		if req.URL.Query().Get("scope") == "" || req.URL.Query().Get("service") != "test-registry" {
 			http.Error(w, "bad token request", http.StatusBadRequest)
 			return
@@ -71,11 +90,19 @@ func newRegistry(t *testing.T) *registry {
 		r.hits[key]++
 		m, ok := r.manifests[key]
 		d := r.digests[key]
+		realm, redirect := r.realm, r.redirects[key]
 		r.mu.Unlock()
+		if redirect != "" {
+			http.Redirect(w, req, redirect, http.StatusTemporaryRedirect)
+			return
+		}
 		if req.Header.Get("Authorization") != "Bearer "+r.token {
 			repo := strings.Split(key, "/manifests/")[0]
-			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token",service="test-registry",scope="repository:%s:pull"`,
-				r.srv.URL, repo))
+			if realm == "" {
+				realm = r.srv.URL + "/token"
+			}
+			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s",service="test-registry",scope="repository:%s:pull"`,
+				realm, repo))
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -97,12 +124,26 @@ func newRegistry(t *testing.T) *registry {
 		}
 		fmt.Fprint(w, m[1])
 	})
-	r.srv = httptest.NewServer(mux)
+	r.srv = httptest.NewTLSServer(mux)
 	t.Cleanup(r.srv.Close)
 	return r
 }
 
-func (r *registry) host() string { return strings.TrimPrefix(r.srv.URL, "http://") }
+func (r *registry) host() string { return strings.TrimPrefix(r.srv.URL, "https://") }
+
+// resolver returns a resolver that trusts the registry's certificate,
+// under the destination rule deny (none: every IPv4 address).
+func (r *registry) resolver(deny ...netip.Prefix) *resolver {
+	res := newResolver(deny)
+	res.transport.TLSClientConfig = r.srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	return res
+}
+
+func (r *registry) set(f func(r *registry)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f(r)
+}
 
 func (r *registry) put(key, mediaType, body, digest string) {
 	r.mu.Lock()
@@ -129,7 +170,7 @@ func TestResolver(t *testing.T) {
 		`{"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"sha256:arm","platform":{"os":"linux","architecture":"arm64"}}]}`, "")
 
 	now := time.Unix(1_700_000_000, 0)
-	r := newResolver()
+	r := reg.resolver()
 	r.now = func() time.Time { return now }
 	host := reg.host()
 
@@ -176,8 +217,99 @@ func TestResolver(t *testing.T) {
 	if _, err := r.resolve(bg, host+"/limited/x"); err == nil || !strings.Contains(err.Error(), "rate-limited") {
 		t.Fatalf("rate limited: %v", err)
 	}
-	if _, err := r.resolve(bg, "127.0.0.1:1/nothing/here:v1"); err == nil || !strings.Contains(err.Error(), "registry unreachable") {
+	if _, err := r.resolve(bg, "127.0.0.1:1/nothing/here:v1"); err == nil || err.Error() != "registry 127.0.0.1:1 unreachable" {
 		t.Fatalf("unreachable: %v", err)
+	}
+	reg.set(func(r *registry) { r.badToken = true })
+	if _, err := r.resolve(bg, host+"/team/plain:v2"); err == nil || err.Error() != "token realm returned no token" {
+		t.Fatalf("a token realm that answers no JSON: %v", err)
+	}
+}
+
+// The resolver reaches what a tenant's image names under the destination
+// rule of bindings, on the address it dials: a registry, the target of a
+// redirect and a token realm alike, each over https only; it tells which
+// address it refused, never what a dial found there.
+func TestResolverDestinationRule(t *testing.T) {
+	reg := newRegistry(t)
+	reg.put("team/app/manifests/v1", "application/vnd.oci.image.manifest.v1+json", `{"config":{}}`, "sha256:"+strings.Repeat("d", 64))
+	host := reg.host()
+	// A plain-http server that nothing may reach.
+	var plainHits atomic.Int64
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plainHits.Add(1)
+		fmt.Fprint(w, `{"token": "leaked"}`)
+	}))
+	defer plain.Close()
+
+	// The default rule refuses the loopback, an address as a name, and a
+	// cluster address, before anything is sent.
+	def := reg.resolver(bindings.DefaultDenyPrefixes()...)
+	port := strings.Split(host, ":")[1]
+	for image, want := range map[string]string{
+		host + "/team/app:v1": "registry " + host + " is not reachable from the control plane: " +
+			"127.0.0.1 is an internal address (127.0.0.0/8)",
+		"localhost:" + port + "/team/app:v1": "registry localhost:" + port + " is not reachable from the control plane: " +
+			"127.0.0.1 is an internal address (127.0.0.0/8)",
+		"10.43.0.1:5432/x/y:z": "registry 10.43.0.1:5432 is not reachable from the control plane: " +
+			"10.43.0.1 is an internal address (10.0.0.0/8)",
+	} {
+		if _, err := def.resolve(bg, image); err == nil || err.Error() != want {
+			t.Errorf("%s: %v, want %q", image, err, want)
+		}
+	}
+	if reg.hitsOf("team/app/manifests/v1") != 0 {
+		t.Fatal("the registry was reached")
+	}
+
+	// A rule that allows the registry's address: the realm and the
+	// redirects are judged on their own.
+	r := reg.resolver(netip.MustParsePrefix("10.0.0.0/8"))
+	for _, c := range []struct {
+		name, realm, redirect, want string
+	}{
+		{"realm over http", plain.URL + "/token", "",
+			"unsupported auth challenge: the token realm is not an https URL"},
+		{"realm on a denied address", "https://10.255.0.1/token", "",
+			"token realm 10.255.0.1 is not reachable from the control plane: 10.255.0.1 is an internal address (10.0.0.0/8)"},
+		{"redirect to http", "", plain.URL + "/v2/team/app/manifests/v1",
+			"registry " + host + " redirected to a URL that is not https"},
+		{"redirect to a denied address", "", "https://10.1.2.3/v2/team/app/manifests/v1",
+			"registry " + host + " is not reachable from the control plane: 10.1.2.3 is an internal address (10.0.0.0/8)"},
+	} {
+		reg.set(func(r *registry) {
+			r.realm = c.realm
+			r.redirects["team/app/manifests/v1"] = c.redirect
+		})
+		r.cache = map[string]resolved{}
+		if _, err := r.resolve(bg, host+"/team/app:v1"); err == nil || err.Error() != c.want {
+			t.Errorf("%s: %v, want %q", c.name, err, c.want)
+		}
+	}
+	if n := plainHits.Load(); n != 0 {
+		t.Fatalf("the plain-http server was reached %d times", n)
+	}
+	reg.set(func(r *registry) {
+		r.realm = ""
+		r.redirects = map[string]string{}
+	})
+	if got, err := r.resolve(bg, host+"/team/app:v1"); err != nil || got != host+"/team/app@sha256:"+strings.Repeat("d", 64) {
+		t.Fatalf("allowed: %q %v", got, err)
+	}
+}
+
+// The engine's resolver applies the default rule when --deny-prefix names
+// none.
+func TestEngineResolverDefaultRule(t *testing.T) {
+	h := newHarness(t)
+	e, err := New(Config{InstanceID: "resolver", Log: dbtest.Logger(t)}, Deps{DB: h.d, Conns: h.ins[0].srv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = e.resolveImage(bg, "127.0.0.1:1/x/y:z")
+	if want := "registry 127.0.0.1:1 is not reachable from the control plane: 127.0.0.1 is an internal address (127.0.0.0/8)"; err == nil ||
+		err.Error() != want {
+		t.Fatalf("%v, want %q", err, want)
 	}
 }
 
@@ -189,7 +321,7 @@ func TestEnsureResolvesAndPinsImage(t *testing.T) {
 	const amd = "sha256:" + "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
 	reg.put("team/app/manifests/v1", "application/vnd.oci.image.index.v1+json",
 		`{"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"digest":"`+amd+`","platform":{"os":"linux","architecture":"amd64"}}]}`, "")
-	e.resolveImage = newResolver().resolve
+	e.resolveImage = reg.resolver().resolve
 	image := reg.host() + "/team/app:v1"
 	sb := h.sandbox(512)
 	h.exec("UPDATE sandboxes SET image = $2 WHERE id = $1", sb.ID, image)

@@ -120,8 +120,8 @@ type Config struct {
 	// Bindings serves the Kubernetes and SSH binding surfaces; it takes
 	// effect only with SecretKeyFile.
 	Bindings bool
-	// DenyPrefixes are the destinations preflights and bindings may not
-	// reach; nil: the built-in set.
+	// DenyPrefixes are the destinations preflights, bindings and the image
+	// resolver may not reach; nil: the built-in set.
 	DenyPrefixes []netip.Prefix
 	// AdminUsers are the operators' Basic credentials (user → password),
 	// the fallback beside OIDC sign-in.
@@ -294,7 +294,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.StringVar(&c.SecretKeyFile, "secret-key-file", c.SecretKeyFile, "file of the 32-byte key (raw, hex or base64) sealing bindings at rest")
 	fs.BoolVar(&c.Bindings, "bindings", c.Bindings, "serve the Kubernetes and SSH binding surfaces (only with --secret-key-file)")
 	fs.Var((*prefixList)(&c.DenyPrefixes), "deny-prefix",
-		"a destination prefix preflights and bindings may not reach, comma-separated or repeated (default: the built-in set)")
+		"a destination prefix preflights, bindings and the image resolver may not reach, comma-separated or repeated (default: the built-in set)")
 	fs.StringVar(&t.adminUsers, "admin-users", "", "user:password,user:password for the admin API: the Basic fallback beside OIDC")
 	fs.StringVar(&c.PublicURL, "public-url", c.PublicURL, "the front door's external URL, e.g. https://run.fecode.dev; required with --oidc-issuer")
 	fs.StringVar(&c.OIDCIssuer, "oidc-issuer", c.OIDCIssuer, "OIDC issuer of human sign-in, exactly as its discovery document states it; empty: no OIDC")
