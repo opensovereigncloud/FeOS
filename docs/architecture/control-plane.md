@@ -1192,8 +1192,12 @@ On Debian 13, `ferund` comes as a `.deb`, built by `make ferund-package`
 into `target/packages/ferund/`, apart from the node's packages of `make
 packages` ([node.md](node.md#packages)), so that a node image never holds
 it, and published with them to https://apt.fecode.dev by `make
-publish-apt`. `make test-ferund-package` installs it in a container and
-checks what it leaves:
+publish-apt`, which refuses to build while the sources (`crates`,
+`proto`, `hack`, `go`, `web`, the Cargo files) have uncommitted changes
+or untracked files: a build takes untracked files too (every `.go` file
+of a package, every migration), and the version names `HEAD`. `make
+test-ferund-package` installs it in a container and checks what it
+leaves:
 
 | Path | What it is |
 |---|---|

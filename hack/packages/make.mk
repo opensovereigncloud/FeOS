@@ -82,6 +82,11 @@ DEV_VERSION := $(FEOS_VERSION)~dev.$(shell date -u +%Y%m%d%H%M).$(shell git rev-
 publish-apt: ## Build the packages of HEAD, ferund's too, as a dev version and publish them to apt.fecode.dev.
 	@git diff --quiet HEAD -- crates proto hack go web Cargo.toml Cargo.lock || \
 		{ echo "publish-apt: commit what the packages hold first"; exit 1; }
+	@# The builds take untracked files too: go build compiles every .go file
+	@# of a package, and ferund embeds every migration.
+	@test -z "$$(git ls-files --others --exclude-standard -- crates proto hack go web Cargo.toml Cargo.lock)" || \
+		{ echo "publish-apt: untracked files in the sources; commit or remove them first:"; \
+		  git ls-files --others --exclude-standard -- crates proto hack go web Cargo.toml Cargo.lock; exit 1; }
 	$(MAKE) packages FEOS_VERSION=$(DEV_VERSION)
 	$(MAKE) ferund-package FEOS_VERSION=$(DEV_VERSION)
 	hack/packages/publish-apt $(PACKAGES_DIR)/*.deb $(FERUND_PACKAGES_DIR)/*.deb
