@@ -276,7 +276,8 @@ func TestUsage(t *testing.T) {
 	for _, s := range []string{"--database-url (FERUN_DATABASE_URL)", "--oidc-client-secret-file (FERUN_OIDC_CLIENT_SECRET_FILE)",
 		`--shutdown-grace (FERUN_SHUTDOWN_GRACE, default "10m0s")`, "--node-advertise-address (FERUN_NODE_ADVERTISE_ADDRESS)",
 		`--hibernate-timeout (FERUN_HIBERNATE_TIMEOUT, default "1h0m0s")`,
-		"how long ferund waits for a hibernate (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB, and the node's hibernation goes on after the wait"} {
+		"how long ferund waits for a hibernate (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB, and the node's hibernation goes on after the wait",
+		"lifetime of node certificates; renewed at half of it, so that a node switched off for up to half of it needs nothing"} {
 		if !strings.Contains(b.String(), s) {
 			t.Errorf("serve help lacks %q", s)
 		}

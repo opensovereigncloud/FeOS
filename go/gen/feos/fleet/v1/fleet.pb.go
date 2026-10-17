@@ -312,7 +312,8 @@ type Certificate struct {
 	TrustBundle [][]byte               `protobuf:"bytes,3,rep,name=trust_bundle,json=trustBundle,proto3" json:"trust_bundle,omitempty"`
 	NotBefore   *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=not_before,json=notBefore,proto3" json:"not_before,omitempty"`
 	NotAfter    *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=not_after,json=notAfter,proto3" json:"not_after,omitempty"`
-	// When the holder renews: at three quarters of the lifetime.
+	// When the holder renews: a node at half the lifetime, so that a node
+	// switched off at any time keeps half of it; a pod at three quarters.
 	RenewAfter    *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=renew_after,json=renewAfter,proto3" json:"renew_after,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -324,7 +324,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.DurationVar(&c.PendingRepairAfter, "pending-repair-after", c.PendingRepairAfter, "a pod pending without an op this long is repaired")
 	fs.DurationVar(&c.UnreachableRepairAfter, "unreachable-repair-after", c.UnreachableRepairAfter,
 		"a running pod whose guest stays unreachable this long is repaired")
-	fs.DurationVar(&c.NodeCertTTL, "node-cert-ttl", c.NodeCertTTL, "lifetime of node certificates (renewed at three quarters)")
+	fs.DurationVar(&c.NodeCertTTL, "node-cert-ttl", c.NodeCertTTL, "lifetime of node certificates; renewed at half of it, so that a node switched off for up to half of it needs nothing")
 	fs.DurationVar(&c.PodCertTTL, "pod-cert-ttl", c.PodCertTTL, "lifetime of pod certificates (renewed at three quarters)")
 	fs.IntVar(&c.NodeMaxStreams, "node-max-streams", c.NodeMaxStreams, "HTTP/2 stream limit of a node connection; the stream budgets derive from it")
 	fs.DurationVar(&c.ConnDrainTimeout, "conn-drain-timeout", c.ConnDrainTimeout, "a draining node connection is closed after this at the latest")

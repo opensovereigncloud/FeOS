@@ -135,8 +135,9 @@ of an instance.
 ### The node's identity
 
 - A node's certificate carries `spiffe://<trust domain>/node/<name>`. It
-  is short-lived and renewed over the uplink at three quarters of its
-  lifetime, like a pod's (ADR 0014). The private key lives in the node's
+  is short-lived and renewed over the uplink at half its lifetime, so
+  that a node switched off for up to half of it needs nothing; a pod's
+  at three quarters (ADR 0014). The private key lives in the node's
   state directory, readable by root alone; a TPM is a later ADR.
 - The first certificate comes from a join. `feosd` presents a one-time
   join token, issued by an operator through the control plane, over a

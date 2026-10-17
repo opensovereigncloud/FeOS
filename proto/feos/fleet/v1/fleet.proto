@@ -36,9 +36,9 @@ service FleetService {
   // within ten minutes, whose answer was lost, is answered again. From
   // then on everything is mTLS.
   rpc Join(JoinRequest) returns (JoinResponse);
-  // Issues the node a new certificate, for its name, at three quarters of
-  // the old one's lifetime. A node that was removed is refused with
-  // PERMISSION_DENIED and has to join again.
+  // Issues the node a new certificate, for its name, at the old one's
+  // renew_after. A node that was removed is refused with PERMISSION_DENIED
+  // and has to join again.
   rpc RenewCertificate(RenewCertificateRequest) returns (RenewCertificateResponse);
   // The node's telemetry, every few seconds: the heartbeat. The control
   // plane marks a node down when it stops, never on one missed report. The
@@ -134,7 +134,8 @@ message Certificate {
   repeated bytes trust_bundle = 3;
   google.protobuf.Timestamp not_before = 4;
   google.protobuf.Timestamp not_after = 5;
-  // When the holder renews: at three quarters of the lifetime.
+  // When the holder renews: a node at half the lifetime, so that a node
+  // switched off at any time keeps half of it; a pod at three quarters.
   google.protobuf.Timestamp renew_after = 6;
 }
 

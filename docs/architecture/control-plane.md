@@ -89,7 +89,7 @@ that.
 | `--drain-timeout` | `2m` | how long a draining node waits for the execs still running in its sandboxes; then they are cancelled and the sandboxes move |
 | `--pending-repair-after` | `10m` | a pod pending this long without an op is repaired |
 | `--unreachable-repair-after` | `2m` | a running pod whose guest stays unreachable this long is repaired |
-| `--node-cert-ttl`, `--pod-cert-ttl` | `168h`, `1h` | the certificates' lifetimes; renewed at three quarters |
+| `--node-cert-ttl`, `--pod-cert-ttl` | `168h`, `1h` | the certificates' lifetimes; a node's is renewed at half of it, so that a node switched off for up to half of it needs nothing, a pod's at three quarters |
 | `--node-max-streams` | 1024 | the HTTP/2 stream limit nodes advertise on a node connection; the stream budgets derive from it |
 | `--conn-drain-timeout` | `20m` | a draining node connection is closed after this at the latest |
 | `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
@@ -388,7 +388,9 @@ secrets.
   ignored. Nodes: client auth, `spiffe://<td>/node/<name>`, Ed25519 or
   ECDSA P-256, `--node-cert-ttl`. Pods: client and server auth, the
   sandbox's SPIFFE ID `spiffe://<td>/tenant/<tenant>/sandbox/<id>`,
-  Ed25519, `--pod-cert-ttl`. Renewal at three quarters of the lifetime.
+  Ed25519, `--pod-cert-ttl`. Each says when its holder renews it
+  (`renew_after`): a node's at half its lifetime, so that a node switched
+  off at any time keeps at least half of it; a pod's at three quarters.
 - **Join tokens.** A token is 32 random bytes. The node sends
   `feos-join-<secret>`; the operator gets `feos-join-<secret>.<pin>`, where
   the pin is the SHA-256 of the root that anchors the issuer (its
@@ -1122,12 +1124,15 @@ that dial the instances.
    `--control-plane`, `--control-plane-name` (a name of
    `--node-server-names`) and `--trust-domain`.
 
-A node's certificate lives 7 days and is renewed at three quarters of
-that, so an outage of hours, or a node switched off for a weekend, needs
-nothing. A node whose certificate expired, that lost its key, or that was
-removed joins again with a token pinned to its name. `bundle.crt` may
-hold several roots, for a rotation; a join token's pin is always the root
-that anchors the issuer.
+A node's certificate lives 7 days and is renewed at half of that, so a
+node switched off at any time still has at least 3.5 days of it: an
+outage of hours, or a node switched off for a weekend, needs nothing. A
+node switched off for longer than half of `--node-cert-ttl` may come
+back with its certificate expired, which the nodes' port refuses in the
+handshake. A node whose certificate expired, that lost its key, or that
+was removed joins again with a token pinned to its name. `bundle.crt`
+may hold several roots, for a rotation; a join token's pin is always the
+root that anchors the issuer.
 
 ### Moving from the sandbox system
 

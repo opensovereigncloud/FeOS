@@ -169,7 +169,9 @@ func (i *Issuer) Root() *x509.Certificate { return i.root }
 // IssueNode issues a node's client certificate for the key of csrDER:
 // ClientAuth, the URI spiffe://<td>/node/<name> and no DNS name, subject CN
 // name, valid for ttl. The CSR's own subject and names are ignored. The
-// key is Ed25519 or ECDSA P-256.
+// key is Ed25519 or ECDSA P-256. The node renews it at half its lifetime,
+// so that a node switched off at any time keeps half of it (3.5 days of
+// the default 7: a weekend) before it has to join again.
 func (i *Issuer) IssueNode(csrDER []byte, name string, ttl time.Duration) (*fleetv1.Certificate, *x509.Certificate, error) {
 	if !isDNSLabel(name) {
 		return nil, nil, fmt.Errorf("node name %q is not a DNS label", name)
@@ -191,7 +193,7 @@ func (i *Issuer) IssueNode(csrDER []byte, name string, ttl time.Duration) (*flee
 	if err != nil {
 		return nil, nil, err
 	}
-	return i.certificateProto(id, leaf), leaf, nil
+	return i.certificateProto(id, leaf, leaf.NotBefore.Add(leaf.NotAfter.Sub(leaf.NotBefore)/2)), leaf, nil
 }
 
 // IssuePod issues a pod's certificate (ADR 0014) for the Ed25519 key of
@@ -200,7 +202,8 @@ func (i *Issuer) IssueNode(csrDER []byte, name string, ttl time.Duration) (*flee
 // control plane's SPIFFE ID and every ID in the node namespace, any
 // wildcard name, any name equal to or under the control-plane domain and
 // any name outside the issuer's permitted DNS domains. The CSR's own
-// subject and names are ignored.
+// subject and names are ignored. It is renewed at three quarters of its
+// lifetime.
 func (i *Issuer) IssuePod(csrDER []byte, spiffeID string, dnsNames []string, ttl time.Duration) (*fleetv1.Certificate, *x509.Certificate, error) {
 	if err := validatePodID(i.td, spiffeID); err != nil {
 		return nil, nil, err
@@ -236,7 +239,7 @@ func (i *Issuer) IssuePod(csrDER []byte, spiffeID string, dnsNames []string, ttl
 	if err != nil {
 		return nil, nil, err
 	}
-	return i.certificateProto(spiffeID, leaf), leaf, nil
+	return i.certificateProto(spiffeID, leaf, leaf.NotBefore.Add(leaf.NotAfter.Sub(leaf.NotBefore)/4*3)), leaf, nil
 }
 
 // IssueServer issues an instance's certificate for the nodes' port with a
@@ -320,16 +323,15 @@ func (i *Issuer) sign(tmpl *x509.Certificate, pub crypto.PublicKey, ttl time.Dur
 }
 
 // certificateProto fills fleet.proto's Certificate: the chain without the
-// root, the bundle, and the renewal at three quarters of the lifetime.
-func (i *Issuer) certificateProto(id string, leaf *x509.Certificate) *fleetv1.Certificate {
-	life := leaf.NotAfter.Sub(leaf.NotBefore)
+// root, the bundle, and the time of its renewal.
+func (i *Issuer) certificateProto(id string, leaf *x509.Certificate, renewAfter time.Time) *fleetv1.Certificate {
 	return &fleetv1.Certificate{
 		SpiffeId:    id,
 		Chain:       [][]byte{leaf.Raw, i.cert.Raw},
 		TrustBundle: i.BundleDER(),
 		NotBefore:   timestamppb.New(leaf.NotBefore),
 		NotAfter:    timestamppb.New(leaf.NotAfter),
-		RenewAfter:  timestamppb.New(leaf.NotBefore.Add(life / 4 * 3)),
+		RenewAfter:  timestamppb.New(renewAfter),
 	}
 }
 

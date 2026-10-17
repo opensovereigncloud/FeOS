@@ -514,9 +514,14 @@ func TestIssueNode(t *testing.T) {
 	if string(pc.Chain[1]) != string(iss.Certificate().Raw) || string(pc.TrustBundle[0]) != string(iss.Root().Raw) {
 		t.Error("chain or bundle")
 	}
+	// Renewed at half the lifetime: a node switched off right before its
+	// renewal still has 3.5 days of the 7, a weekend and more.
 	life := leaf.NotAfter.Sub(leaf.NotBefore)
-	if !pc.RenewAfter.AsTime().Equal(leaf.NotBefore.Add(life / 4 * 3)) {
+	if !pc.RenewAfter.AsTime().Equal(leaf.NotBefore.Add(life / 2)) {
 		t.Errorf("renew_after %v", pc.RenewAfter.AsTime())
+	}
+	if left := leaf.NotAfter.Sub(pc.RenewAfter.AsTime()); left < 84*time.Hour {
+		t.Errorf("%v left at renew_after; a weekend off (62 h) must not outlive the certificate", left)
 	}
 
 	// ECDSA P-256 is accepted for nodes, other keys are not.
@@ -581,6 +586,9 @@ func TestIssuePod(t *testing.T) {
 		t.Errorf("short CN %q", cn)
 	}
 	checkBackdated(t, leaf, before, time.Hour)
+	if life := leaf.NotAfter.Sub(leaf.NotBefore); !pc.RenewAfter.AsTime().Equal(leaf.NotBefore.Add(life / 4 * 3)) {
+		t.Errorf("renew_after %v, want three quarters of the lifetime", pc.RenewAfter.AsTime())
+	}
 	for _, u := range []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth} {
 		if err := verifyLeaf(iss, leaf, u); err != nil {
 			t.Errorf("verify %v: %v", u, err)

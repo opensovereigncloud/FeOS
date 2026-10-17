@@ -61,9 +61,9 @@ type FleetServiceClient interface {
 	// within ten minutes, whose answer was lost, is answered again. From
 	// then on everything is mTLS.
 	Join(ctx context.Context, in *JoinRequest, opts ...grpc.CallOption) (*JoinResponse, error)
-	// Issues the node a new certificate, for its name, at three quarters of
-	// the old one's lifetime. A node that was removed is refused with
-	// PERMISSION_DENIED and has to join again.
+	// Issues the node a new certificate, for its name, at the old one's
+	// renew_after. A node that was removed is refused with PERMISSION_DENIED
+	// and has to join again.
 	RenewCertificate(ctx context.Context, in *RenewCertificateRequest, opts ...grpc.CallOption) (*RenewCertificateResponse, error)
 	// The node's telemetry, every few seconds: the heartbeat. The control
 	// plane marks a node down when it stops, never on one missed report. The
@@ -212,9 +212,9 @@ type FleetServiceServer interface {
 	// within ten minutes, whose answer was lost, is answered again. From
 	// then on everything is mTLS.
 	Join(context.Context, *JoinRequest) (*JoinResponse, error)
-	// Issues the node a new certificate, for its name, at three quarters of
-	// the old one's lifetime. A node that was removed is refused with
-	// PERMISSION_DENIED and has to join again.
+	// Issues the node a new certificate, for its name, at the old one's
+	// renew_after. A node that was removed is refused with PERMISSION_DENIED
+	// and has to join again.
 	RenewCertificate(context.Context, *RenewCertificateRequest) (*RenewCertificateResponse, error)
 	// The node's telemetry, every few seconds: the heartbeat. The control
 	// plane marks a node down when it stops, never on one missed report. The

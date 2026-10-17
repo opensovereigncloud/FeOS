@@ -63,9 +63,9 @@ func TestRenewRedialsWithTheNewCertificate(t *testing.T) {
 // minimum gap.
 func TestRenewAtRenewAfter(t *testing.T) {
 	e := newEnv(t)
-	// NotBefore lies 10 minutes back: renew_after = NotBefore + 3/4 of
+	// NotBefore lies 10 minutes back: renew_after = NotBefore + 1/2 of
 	// (10 min + ttl) is about 1.5 s ahead with this ttl.
-	e.f.ttl = 202 * time.Second
+	e.f.ttl = 603 * time.Second
 	in := e.instance("i1", caIss)
 	cfg := e.config("n1", in)
 	n := e.newNode(cfg)
@@ -427,7 +427,7 @@ func TestRenewKeepsCallsInFlight(t *testing.T) {
 func TestSlowRenewalKeepsReporting(t *testing.T) {
 	e := newEnv(t)
 	// renew_after about 1.5 s ahead, as in TestRenewAtRenewAfter.
-	e.f.ttl = 202 * time.Second
+	e.f.ttl = 603 * time.Second
 	e.f.renewGate, e.f.renewEntered = make(chan struct{}), make(chan struct{}, 1)
 	gateCh, entered := e.f.renewGate, e.f.renewEntered
 	in := e.instance("i1", caIss)
