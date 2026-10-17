@@ -3,6 +3,11 @@ Description=FeRun control plane (ferund)
 Documentation=https://github.com/ironcore-dev/FeOS
 After=network-online.target postgresql.service
 Wants=network-online.target
+# ferund exits when it cannot reach its database at start. It is started
+# again for as long as that lasts (a remote PostgreSQL after a power cycle
+# or during a failover) and never given up on, as systemd's default start
+# limit would after five starts in 10 s.
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -12,7 +17,7 @@ Group=ferun
 EnvironmentFile=/etc/ferun/ferund.env
 ExecStart=/usr/bin/ferund serve
 Restart=always
-RestartSec=1
+RestartSec=5
 # On SIGTERM an instance keeps serving its requests and finishing its ops
 # for up to --shutdown-grace (10 minutes by default), then closes its node
 # connections. The stop timeout is that grace plus 30 s; a longer

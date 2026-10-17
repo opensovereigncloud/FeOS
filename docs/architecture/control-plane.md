@@ -1206,7 +1206,10 @@ checks what it leaves:
 `ferund.service` runs `ferund serve` as `ferun`, with
 `EnvironmentFile=/etc/ferun/ferund.env` and `TimeoutStopSec=630`, the
 default `--shutdown-grace` plus 30 s; a longer grace needs a drop-in with
-a longer timeout. The unit has a read-only view of the system: ferund
+a longer timeout. It starts ferund again 5 s after it exits, without a
+start limit (`StartLimitIntervalSec=0`): an instance that cannot reach
+its database at its start exits, and keeps being started until the
+database is back. The unit has a read-only view of the system: ferund
 writes nothing locally. Installing the package creates the user and
 neither enables nor starts the unit: an instance needs its database and
 the issuer first (`FERUN_DATABASE_URL`, the files from `init-ca` in
