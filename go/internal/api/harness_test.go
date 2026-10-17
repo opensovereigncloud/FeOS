@@ -97,6 +97,7 @@ func newEnv(t *testing.T, o envOptions) *env {
 	cfg := Config{
 		InstanceID: testInstance, PreparationWaitMs: 425000, PublicURL: o.publicURL, OIDC: o.oidc,
 		SessionTTL: time.Hour, DefaultImage: "ghcr.io/maltej/debian-ai:latest", DefaultVCPUs: 2, DefaultMemoryMiB: 512,
+		NodeTTL: 20 * time.Second, LostGrace: 7 * time.Minute, DrainTimeout: 90 * time.Minute,
 		Log: log,
 	}
 	if !o.noAdminUsers {

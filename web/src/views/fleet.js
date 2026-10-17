@@ -182,3 +182,63 @@ export function tokenRows(tokens, heldHash) {
     .map((t) => ({ ...t, held: !!heldHash && t.hash === heldHash }))
     .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
 }
+
+// fmtSeconds renders a duration in seconds as the flags' values read:
+// "5 s", "1.5 s", "90 s", "10 min", "1 h", "1 h 30 min"; whole minutes
+// as minutes, anything else in seconds; '' when unset.
+export function fmtSeconds(sec) {
+  const v = Number(sec);
+  if (!Number.isFinite(v) || v <= 0) return '';
+  if (v % 60 !== 0) return `${Number(v.toFixed(3))} s`;
+  const min = v / 60;
+  if (min < 60) return `${min} min`;
+  const h = Math.floor(min / 60);
+  const rest = min % 60;
+  return rest ? `${h} h ${rest} min` : `${h} h`;
+}
+
+// fleetDefaults reads the defaults of GET /api/v1/admin/nodes: the
+// instance's timings (rendered) and the size and image of a sandbox
+// created without one, with the bounds a create accepts. A field the
+// answer lacks (an older ferund) is '' or 0, and the views then name the
+// flag without a value.
+export function fleetDefaults(d) {
+  const n = (k) => Number((d && d[k]) || 0);
+  return {
+    telemetryInterval: fmtSeconds(n('telemetryIntervalSeconds')),
+    nodeTtl: fmtSeconds(n('nodeTtlSeconds')),
+    lostGrace: fmtSeconds(n('lostGraceSeconds')),
+    drainTimeout: fmtSeconds(n('drainTimeoutSeconds')),
+    vcpus: n('defaultVcpus'),
+    memoryMib: n('defaultMemoryMib'),
+    image: (d && d.defaultImage) || '',
+    minVcpus: n('minVcpus'),
+    maxVcpus: n('maxVcpus'),
+    minMemoryMib: n('minMemoryMib'),
+    maxMemoryMib: n('maxMemoryMib'),
+  };
+}
+
+// createHints are the create form's placeholders, titles and bounds from
+// fleetDefaults: an empty field takes the default, which the form names.
+export function createHints(fd) {
+  const range = (min, max) => (min && max ? `${min}–${max}` : '');
+  const empty = (v) => `empty: ${v || 'the default'}`;
+  const vr = range(fd.minVcpus, fd.maxVcpus);
+  const mr = range(fd.minMemoryMib, fd.maxMemoryMib);
+  return {
+    image: `image (${empty(fd.image)})`,
+    vcpus: {
+      placeholder: fd.vcpus ? `vCPUs (${fd.vcpus})` : 'vCPUs',
+      title: `vCPUs${vr ? ', ' + vr : ''} (${empty(fd.vcpus)})`,
+      min: fd.minVcpus || undefined,
+      max: fd.maxVcpus || undefined,
+    },
+    memory: {
+      placeholder: fd.memoryMib ? `MiB (${fd.memoryMib})` : 'MiB',
+      title: `memory in MiB${mr ? ', ' + mr : ''} (${empty(fd.memoryMib)})`,
+      min: fd.minMemoryMib || undefined,
+      max: fd.maxMemoryMib || undefined,
+    },
+  };
+}

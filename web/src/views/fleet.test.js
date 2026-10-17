@@ -3,8 +3,8 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  canDrain, certState, fmtBytes, fmtSize, joinTokenState, nodeRows, sandboxCounts, settingsForm, settingsPatch,
-  stopping, tokenRows, vcpuCapacityText,
+  canDrain, certState, createHints, fleetDefaults, fmtBytes, fmtSeconds, fmtSize, joinTokenState, nodeRows,
+  sandboxCounts, settingsForm, settingsPatch, stopping, tokenRows, vcpuCapacityText,
 } from './fleet.js';
 
 // The node view's rows, from GET /api/v1/admin/nodes as ferund renders
@@ -184,5 +184,45 @@ describe('sizes and counts', () => {
     ]);
     expect(c).toEqual({ running: 2, paused: 1, hibernated: 1, error: 2, other: 2 });
     expect(sandboxCounts(null)).toEqual({ running: 0, paused: 0, hibernated: 0, error: 0, other: 0 });
+  });
+});
+
+describe('fmtSeconds', () => {
+  it('renders whole minutes and hours as such, anything else in seconds', () => {
+    expect([5, 1.5, 15, 59, 60, 90, 420, 600, 3600, 5400, 7200].map(fmtSeconds)).toEqual([
+      '5 s', '1.5 s', '15 s', '59 s', '1 min', '90 s', '7 min', '10 min', '1 h', '1 h 30 min', '2 h',
+    ]);
+  });
+
+  it('is empty when unset', () => {
+    expect([0, -1, undefined, null, 'x'].map(fmtSeconds)).toEqual(['', '', '', '', '']);
+  });
+});
+
+describe('fleetDefaults and createHints', () => {
+  it('read the defaults of GET /api/v1/admin/nodes', () => {
+    const fd = fleetDefaults({
+      telemetryIntervalSeconds: 5, nodeTtlSeconds: 15, lostGraceSeconds: 600, drainTimeoutSeconds: 3600,
+      defaultVcpus: 2, defaultMemoryMib: 512, defaultImage: 'img', minVcpus: 1, maxVcpus: 32,
+      minMemoryMib: 256, maxMemoryMib: 65536,
+    });
+    expect(fd).toEqual({
+      telemetryInterval: '5 s', nodeTtl: '15 s', lostGrace: '10 min', drainTimeout: '1 h', vcpus: 2,
+      memoryMib: 512, image: 'img', minVcpus: 1, maxVcpus: 32, minMemoryMib: 256, maxMemoryMib: 65536,
+    });
+    const h = createHints(fd);
+    expect(h.image).toBe('image (empty: img)');
+    expect(h.vcpus).toEqual({ placeholder: 'vCPUs (2)', title: 'vCPUs, 1–32 (empty: 2)', min: 1, max: 32 });
+    expect(h.memory).toEqual({
+      placeholder: 'MiB (512)', title: 'memory in MiB, 256–65536 (empty: 512)', min: 256, max: 65536,
+    });
+  });
+
+  it('without an answer: nothing invented', () => {
+    const fd = fleetDefaults(undefined);
+    expect([fd.nodeTtl, fd.image, fd.vcpus, fd.maxVcpus]).toEqual(['', '', 0, 0]);
+    const h = createHints(fd);
+    expect(h.vcpus).toEqual({ placeholder: 'vCPUs', title: 'vCPUs (empty: the default)', min: undefined, max: undefined });
+    expect(h.image).toBe('image (empty: the default)');
   });
 });

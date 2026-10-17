@@ -478,6 +478,73 @@ func TestSignInConfig(t *testing.T) {
 	expect(t, basic.do("GET", "/auth/me", "", nil), http.StatusUnauthorized, errBody("not signed in"))
 }
 
+// The UI's requests (X-Requested-With: ferun) never get the Basic
+// challenge, so that a session that expires brings up the UI's sign-in
+// screen and not the browser's login dialog; a script's request without
+// the header still gets it while Basic is on.
+func TestBasicChallengeNotForUI(t *testing.T) {
+	t.Parallel()
+	p := newTestProvider(t, algRS256)
+	for _, o := range []envOptions{{}, {oidc: p.config(), publicURL: testPublicURL}} {
+		e := newEnv(t, o)
+		expired := &http.Cookie{Name: cookieSession, Value: "expired-or-unknown"}
+		for _, c := range []struct {
+			method, authz string
+			ui            bool
+			cookie        *http.Cookie
+			challenge     bool
+			msg           string
+		}{
+			{"GET", "", false, nil, true, "admin sign-in required"},
+			{"GET", "", true, nil, false, "admin sign-in required"},
+			{"POST", "", true, nil, false, "admin sign-in required"},
+			{"GET", "", true, expired, false, "admin sign-in required"},
+			{"GET", "", false, expired, true, "admin sign-in required"},
+			{"GET", basicOf(testAdmin, "wrong"), false, nil, true, `admin basic auth failed for user "admin"`},
+			{"GET", basicOf(testAdmin, "wrong"), true, nil, false, `admin basic auth failed for user "admin"`},
+		} {
+			h := http.Header{}
+			if c.authz != "" {
+				h.Set("Authorization", c.authz)
+			}
+			if c.ui {
+				h.Set(csrfHeader, csrfValue)
+			}
+			rq := request{method: c.method, path: "/api/v1/admin/join-tokens", header: h}
+			if c.cookie != nil {
+				rq.cookies = []*http.Cookie{c.cookie}
+			}
+			w := e.serve(rq)
+			expect(t, w, http.StatusUnauthorized, errBody(c.msg))
+			want := ""
+			if c.challenge {
+				want = `Basic realm="ferun"`
+			}
+			if got := w.Header().Get("WWW-Authenticate"); got != want {
+				t.Fatalf("oidc %v, %s ui %v cookie %v authz %q: WWW-Authenticate %q, want %q",
+					o.oidc != nil, c.method, c.ui, c.cookie != nil, c.authz, got, want)
+			}
+		}
+		// The UI's request with good credentials passes as before.
+		w := e.serve(request{method: "GET", path: "/api/v1/admin/join-tokens",
+			header: http.Header{"Authorization": {adminAuth()}, csrfHeader: {csrfValue}}})
+		expect(t, w, http.StatusOK, "")
+	}
+	// Without Basic, no request gets the challenge, the UI's or not.
+	only := newEnv(t, envOptions{oidc: p.config(), publicURL: testPublicURL, noAdminUsers: true})
+	for _, ui := range []bool{false, true} {
+		h := http.Header{}
+		if ui {
+			h.Set(csrfHeader, csrfValue)
+		}
+		w := only.serve(request{method: "GET", path: "/api/v1/admin/nodes", header: h})
+		expect(t, w, http.StatusUnauthorized, errBody("admin sign-in required"))
+		if got := w.Header().Get("WWW-Authenticate"); got != "" {
+			t.Fatalf("ui %v: WWW-Authenticate %q with OIDC only", ui, got)
+		}
+	}
+}
+
 func TestLocalPath(t *testing.T) {
 	t.Parallel()
 	for in, want := range map[string]string{

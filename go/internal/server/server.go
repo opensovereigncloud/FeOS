@@ -291,7 +291,8 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 		AdminUsers: cfg.AdminUsers, InstanceID: i.id, PreparationWaitMs: config.PreparationBudget.Milliseconds(),
 		PublicURL: cfg.PublicURL, OIDC: oidc, SessionTTL: cfg.SessionTTL, DefaultImage: cfg.DefaultImage,
 		DefaultVCPUs: cfg.DefaultVCPUs, DefaultMemoryMiB: cfg.DefaultMemoryMiB, JoinTokenTTL: config.JoinTokenTTL,
-		Log: i.log,
+		TelemetryInterval: config.TelemetryInterval, NodeTTL: cfg.NodeTTL, LostGrace: cfg.LostGrace,
+		DrainTimeout: cfg.DrainTimeout, Log: i.log,
 	}, deps)
 
 	// The front doors' listener, last.

@@ -18,6 +18,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/auth"
+	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
@@ -385,13 +386,49 @@ func (s *server) listNodes(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("list nodes: %w", err)
 	}
 	out := struct {
-		Nodes []nodeInfo `json:"nodes"`
-	}{Nodes: make([]nodeInfo, 0, len(nodes))}
+		Nodes    []nodeInfo   `json:"nodes"`
+		Defaults nodeDefaults `json:"defaults"`
+	}{Nodes: make([]nodeInfo, 0, len(nodes)), Defaults: s.nodeDefaults()}
 	for _, n := range nodes {
 		out.Nodes = append(out.Nodes, s.nodeOf(nodeView{node: n, telemetry: tel[n.Name], booked: booked[n.Name],
 			certAfter: expiries[n.CurrentSerial]}))
 	}
 	return writeJSON(w, http.StatusOK, out)
+}
+
+// nodeDefaults are the instance's settings that the UI explains the fleet
+// with, so that it shows this deployment's values and not a copy of the
+// built-in ones: the timings of the node statuses and of a drain (in
+// seconds), and the size and image of a sandbox created without one, with
+// the bounds a create accepts.
+type nodeDefaults struct {
+	TelemetryIntervalSeconds float64 `json:"telemetryIntervalSeconds"`
+	NodeTTLSeconds           float64 `json:"nodeTtlSeconds"`
+	LostGraceSeconds         float64 `json:"lostGraceSeconds"`
+	DrainTimeoutSeconds      float64 `json:"drainTimeoutSeconds"`
+	DefaultVCPUs             int     `json:"defaultVcpus"`
+	DefaultMemoryMiB         int     `json:"defaultMemoryMib"`
+	DefaultImage             string  `json:"defaultImage"`
+	MinVCPUs                 int     `json:"minVcpus"`
+	MaxVCPUs                 int     `json:"maxVcpus"`
+	MinMemoryMiB             int     `json:"minMemoryMib"`
+	MaxMemoryMiB             int     `json:"maxMemoryMib"`
+}
+
+func (s *server) nodeDefaults() nodeDefaults {
+	return nodeDefaults{
+		TelemetryIntervalSeconds: s.cfg.TelemetryInterval.Seconds(),
+		NodeTTLSeconds:           s.cfg.NodeTTL.Seconds(),
+		LostGraceSeconds:         s.cfg.LostGrace.Seconds(),
+		DrainTimeoutSeconds:      s.cfg.DrainTimeout.Seconds(),
+		DefaultVCPUs:             s.cfg.DefaultVCPUs,
+		DefaultMemoryMiB:         s.cfg.DefaultMemoryMiB,
+		DefaultImage:             s.cfg.DefaultImage,
+		MinVCPUs:                 config.MinVCPUs,
+		MaxVCPUs:                 config.MaxVCPUs,
+		MinMemoryMiB:             config.MinMemoryMiB,
+		MaxMemoryMiB:             config.MaxMemoryMiB,
+	}
 }
 
 // nodeAnswer reads one node's info after a change.
@@ -430,6 +467,14 @@ func (s *server) undrainNode(w http.ResponseWriter, r *http.Request) error {
 	return s.setDraining(w, r, false)
 }
 
+// isDrainDescription reports whether a node's status description is one
+// the engine's drain loop wrote ("draining: <n> remain", "drained",
+// "cannot drain: …"); the other writers' texts (a down node's, the
+// fleet's) stay on an undrain.
+func isDrainDescription(d string) bool {
+	return strings.HasPrefix(d, "draining") || d == "drained" || strings.HasPrefix(d, "cannot drain")
+}
+
 func (s *server) setDraining(w http.ResponseWriter, r *http.Request, draining bool) error {
 	name := r.PathValue("node")
 	var n store.Node
@@ -446,6 +491,16 @@ func (s *server) setDraining(w http.ResponseWriter, r *http.Request, draining bo
 		}
 		if n, err = tx.SetNodeDraining(r.Context(), name, draining); err != nil {
 			return err
+		}
+		// The drain loop's progress text ends with the drain. The loop
+		// writes it only while the node drains (in the same statement
+		// that checks it), so a pass that read the node before this
+		// commit does not write it back.
+		if !draining && isDrainDescription(n.StatusDescription) {
+			if err := tx.SetNodeDescription(r.Context(), name, ""); err != nil {
+				return err
+			}
+			n.StatusDescription = ""
 		}
 		return tx.Notify(r.Context(), db.ChanLeader, "drain")
 	})

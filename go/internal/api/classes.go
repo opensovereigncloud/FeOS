@@ -195,7 +195,7 @@ func (s *server) admin(h apiHandler) http.Handler {
 		a, present, err := s.basicAdmin(r)
 		if present {
 			if err != nil {
-				w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`"`)
+				s.challengeBasic(w, r)
 				return err
 			}
 			return h(w, r.WithContext(auth.WithAdmin(r.Context(), a)))
@@ -210,12 +210,21 @@ func (s *server) admin(h apiHandler) http.Handler {
 			}
 			return h(w, r.WithContext(auth.WithAdmin(r.Context(), adminOf(sess))))
 		}
-		// The browser shows a Basic prompt only where Basic is a way in.
-		if len(s.cfg.AdminUsers) > 0 {
-			w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`"`)
-		}
+		s.challengeBasic(w, r)
 		return apierr.New(http.StatusUnauthorized, "admin sign-in required")
 	})
+}
+
+// challengeBasic sets the Basic challenge of an admin route's 401, which
+// makes a browser show its own login dialog: only where Basic is a way in
+// (--admin-users), and never to the UI, which marks every request with
+// X-Requested-With: ferun and shows its own sign-in screen on a 401 (a
+// session that expired must not bring up the browser's dialog over it).
+func (s *server) challengeBasic(w http.ResponseWriter, r *http.Request) {
+	if len(s.cfg.AdminUsers) == 0 || r.Header.Get(csrfHeader) == csrfValue {
+		return
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="`+realm+`"`)
 }
 
 // tenant is the tenant class: the bearer is a tenant's token.

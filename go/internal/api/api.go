@@ -39,6 +39,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
@@ -105,7 +106,16 @@ type Config struct {
 	DefaultVCPUs, DefaultMemoryMiB int
 	// JoinTokenTTL is a join token's lifetime when the request names none.
 	JoinTokenTTL time.Duration
-	Log          *slog.Logger
+
+	// The fleet's timings, which the nodes view shows (its "defaults"):
+	// the interval nodes report telemetry at (zero:
+	// config.TelemetryInterval), how long a node may stay silent before it
+	// is down (--node-ttl), how long it is down before its sandboxes count
+	// as lost (--lost-grace), and how long a drain waits for running execs
+	// (--drain-timeout).
+	TelemetryInterval, NodeTTL, LostGrace, DrainTimeout time.Duration
+
+	Log *slog.Logger
 }
 
 // OIDCConfig is the OIDC client of human sign-in.
@@ -190,6 +200,9 @@ func newServer(cfg Config, deps Deps) *server {
 	}
 	if cfg.SessionTTL <= 0 {
 		cfg.SessionTTL = 12 * time.Hour
+	}
+	if cfg.TelemetryInterval <= 0 {
+		cfg.TelemetryInterval = config.TelemetryInterval
 	}
 	cfg.PublicURL = strings.TrimSuffix(cfg.PublicURL, "/")
 	st := deps.Store

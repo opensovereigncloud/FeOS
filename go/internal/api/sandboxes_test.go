@@ -334,6 +334,9 @@ func TestPauseResume(t *testing.T) {
 	}{
 		{fmt.Errorf("x: %w", model.ErrPrecondition), 200, ""},
 		{errors.New("sandbox is creating"), 500, errBody("pause: sandbox is creating")},
+		// §11: a sandbox on its way to sleep is not paused; the old pause
+		// had no state check either, so there is no 200 to keep.
+		{errors.New("sandbox is hibernating"), 500, errBody("pause: sandbox is hibernating")},
 		{&stoppingErr{"instance i1 is stopping"}, 500, errBody("pause: instance i1 is stopping")},
 		{model.ErrNotFound, 404, errBody("unknown sandbox " + id)},
 	} {

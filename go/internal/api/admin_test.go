@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -303,6 +305,27 @@ func TestNodes(t *testing.T) {
 	}
 }
 
+// The nodes view carries the instance's defaults, which the UI explains
+// the fleet and fills the create form with: the configured timings (the
+// telemetry interval config's when the Config names none), the default
+// size and image, and the bounds of a create. Without nodes too.
+func TestNodeDefaults(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, envOptions{})
+	w := e.do("GET", "/api/v1/admin/nodes", adminAuth(), nil)
+	expect(t, w, http.StatusOK, "")
+	want := `{"nodes":[],"defaults":{"telemetryIntervalSeconds":5,"nodeTtlSeconds":20,"lostGraceSeconds":420,` +
+		`"drainTimeoutSeconds":5400,"defaultVcpus":2,"defaultMemoryMib":512,"defaultImage":"ghcr.io/maltej/debian-ai:latest",` +
+		`"minVcpus":1,"maxVcpus":32,"minMemoryMib":256,"maxMemoryMib":65536}}` + "\n"
+	if w.Body.String() != want {
+		t.Fatalf("answer\n%s\nwant\n%s", w.Body.String(), want)
+	}
+	e.srv.cfg.TelemetryInterval = 1500 * time.Millisecond
+	if d := e.srv.nodeDefaults(); d.TelemetryIntervalSeconds != 1.5 {
+		t.Fatalf("defaults %+v", d)
+	}
+}
+
 // Drain and undrain under the node's lock; a down node is not drained;
 // PATCH of the settings; removal with and without force; certificates.
 func TestNodeChanges(t *testing.T) {
@@ -388,6 +411,143 @@ func TestNodeChanges(t *testing.T) {
 	acts, err := e.st.ListNodeActivity(ctx, "n1", store.ActivityQuery{Limit: 10})
 	if err != nil || len(acts) != 1 || acts[0].Kind != "node_removed" {
 		t.Fatalf("activity %+v %v", acts, err)
+	}
+}
+
+// An undrain clears the drain loop's progress text at once, and the loop's
+// statement (SetNodeDescriptionIfDraining) does not write it back for an
+// undrained node: neither a pass that runs after the undrain nor one that
+// was blocked behind the undrain's row lock. Another writer's text stays.
+func TestUndrainClearsDrainText(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, envOptions{})
+	ctx := context.Background()
+	if _, err := e.st.InsertNode(ctx, "n1"); err != nil {
+		t.Fatal(err)
+	}
+	description := func() string {
+		t.Helper()
+		n, err := e.st.GetNode(ctx, "n1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n.StatusDescription
+	}
+	for _, text := range []string{"draining: 3 remain", "drained", "cannot drain: the node has no object store"} {
+		expect(t, e.do("POST", "/api/v1/admin/nodes/n1/drain", adminAuth(), nil), http.StatusOK, "")
+		if err := e.st.SetNodeDescriptionIfDraining(ctx, "n1", text); err != nil {
+			t.Fatal(err)
+		}
+		w := e.do("GET", "/api/v1/admin/nodes", adminAuth(), nil)
+		if n := decode[struct {
+			Nodes []map[string]any `json:"nodes"`
+		}](t, w).Nodes[0]; n["statusDescription"] != text {
+			t.Fatalf("draining node %+v", n)
+		}
+		w = e.do("POST", "/api/v1/admin/nodes/n1/undrain", adminAuth(), nil)
+		expect(t, w, http.StatusOK, "")
+		if n := decode[map[string]any](t, w); n["draining"] != false || n["statusDescription"] != "" {
+			t.Fatalf("undrained %q: %+v", text, n)
+		}
+		if d := description(); d != "" {
+			t.Fatalf("undrained %q: description %q", text, d)
+		}
+		// A late pass of the drain loop.
+		if err := e.st.SetNodeDescriptionIfDraining(ctx, "n1", "draining: 2 remain"); err != nil {
+			t.Fatal(err)
+		}
+		if d := description(); d != "" {
+			t.Fatalf("a pass after the undrain wrote %q", d)
+		}
+	}
+
+	// A pass of the drain loop that queues behind the undrain on the node's
+	// row lock re-checks draining once the undrain commits, and writes
+	// nothing. The test holds the row lock itself, lets the undrain
+	// request and then the pass queue behind it (seen waiting in
+	// pg_stat_activity, in that order), and releases it.
+	expect(t, e.do("POST", "/api/v1/admin/nodes/n1/drain", adminAuth(), nil), http.StatusOK, "")
+	if err := e.st.SetNodeDescriptionIfDraining(ctx, "n1", "draining: 5 remain"); err != nil {
+		t.Fatal(err)
+	}
+	// waiting waits until n sessions of this test's database wait for a
+	// lock with a statement that starts with prefix.
+	waiting := func(prefix string, n int) error {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var got int
+			if err := e.st.Q().QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND wait_event_type = 'Lock'
+				AND ltrim(query) LIKE $1 || '%'`, prefix).Scan(&got); err != nil {
+				return err
+			}
+			if got >= n {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("%d sessions wait with %q, want %d", got, prefix, n)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	undrained := make(chan *httptest.ResponseRecorder, 1)
+	passDone := make(chan error, 1)
+	err := e.st.InTx(ctx, func(tx *store.Store) error {
+		if _, err := tx.LockNode(ctx, "n1", store.ForUpdate); err != nil {
+			return err
+		}
+		go func() { undrained <- e.do("POST", "/api/v1/admin/nodes/n1/undrain", adminAuth(), nil) }()
+		if err := waiting("SELECT ", 1); err != nil {
+			return fmt.Errorf("the undrain: %w", err)
+		}
+		go func() { passDone <- e.st.SetNodeDescriptionIfDraining(ctx, "n1", "draining: 4 remain") }()
+		if err := waiting("UPDATE nodes SET status_description", 1); err != nil {
+			return fmt.Errorf("the pass: %w", err)
+		}
+		select {
+		case <-undrained:
+			return errors.New("the undrain did not wait for the row lock")
+		case err := <-passDone:
+			return fmt.Errorf("the pass did not wait for the row lock: %v", err)
+		default:
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := <-undrained
+	expect(t, w, http.StatusOK, "")
+	if n := decode[map[string]any](t, w); n["draining"] != false || n["statusDescription"] != "" {
+		t.Fatalf("undrained %+v", n)
+	}
+	if err := <-passDone; err != nil {
+		t.Fatal(err)
+	}
+	if d := description(); d != "" {
+		t.Fatalf("a pass queued behind the undrain wrote %q", d)
+	}
+
+	// Another writer's text is not the drain's: an undrain keeps it.
+	expect(t, e.do("POST", "/api/v1/admin/nodes/n1/drain", adminAuth(), nil), http.StatusOK, "")
+	if err := e.st.SetNodeDescription(ctx, "n1", "heartbeat expired"); err != nil {
+		t.Fatal(err)
+	}
+	w = e.do("POST", "/api/v1/admin/nodes/n1/undrain", adminAuth(), nil)
+	if n := decode[map[string]any](t, w); n["statusDescription"] != "heartbeat expired" {
+		t.Fatalf("undrained %+v", n)
+	}
+}
+
+func TestIsDrainDescription(t *testing.T) {
+	t.Parallel()
+	for d, want := range map[string]bool{
+		"draining: 1 remain": true, "drained": true, "cannot drain: the node has no object store": true,
+		"": false, "heartbeat expired": false, "node n1 down since 2026-01-01": false,
+	} {
+		if got := isDrainDescription(d); got != want {
+			t.Errorf("%q: %v, want %v", d, got, want)
+		}
 	}
 }
 

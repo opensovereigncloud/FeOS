@@ -8,7 +8,7 @@ import {
   Ago, ArmButton, CopyBtn, ErrBox, LiveBadge, StateDot, StateLabel, TokenOnce, useArm, useNow, usePoll,
 } from '../components.jsx';
 import { fmtDate } from '../format.js';
-import { fmtSize, sandboxCounts } from './fleet.js';
+import { createHints, fleetDefaults, fmtSize, sandboxCounts } from './fleet.js';
 import { Activity } from './Activity.jsx';
 import { Network } from './Network.jsx';
 import { Access } from './Access.jsx';
@@ -17,16 +17,12 @@ import { Access } from './Access.jsx';
 // (overview, activity, tokens, access, network). The selection and the
 // tab are the route's: /tenants/:t/sandboxes/:id/:tab.
 
-// The bounds of a sandbox's size that ferund accepts; 0 takes the
-// platform's default.
-const VCPUS = { min: 1, max: 32 };
-const MEMORY_MIB = { min: 256, max: 65536 };
-
 export function Sandboxes({ tenant, sel, tab, navigate }) {
   const [sandboxes, setSandboxes] = useState(null);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState('');
   const [showCreate, setShowCreate] = useState(false);
+  const [defaults, setDefaults] = useState(null);
   const [createdToken, setCreatedToken] = useState(null);
   const [q, setQ] = useState('');
   const base = `/tenants/${encodeURIComponent(tenant)}/sandboxes`;
@@ -42,6 +38,16 @@ export function Sandboxes({ tenant, sel, tab, navigate }) {
   }, []);
   const lastOk = usePoll(refresh, 3000);
   useNow(1000);
+
+  // The create form names the platform's defaults and bounds, which the
+  // nodes view's answer carries (GET /api/v1/admin/nodes); read once, when
+  // the form first opens. Without them the form says "the default".
+  useEffect(() => {
+    if (!showCreate || defaults) return undefined;
+    let live = true;
+    api.listNodes().then((res) => { if (live && res.defaults) setDefaults(res.defaults); }, () => {});
+    return () => { live = false; };
+  }, [showCreate, defaults]);
 
   // Escape closes the detail.
   useEffect(() => {
@@ -112,7 +118,7 @@ export function Sandboxes({ tenant, sel, tab, navigate }) {
         </div>
 
         {showCreate && (
-          <CreatePanel busy={busy} act={act}
+          <CreatePanel busy={busy} act={act} defaults={defaults}
             onDone={(tok) => { setCreatedToken(tok); setShowCreate(false); }}
             onCancel={() => setShowCreate(false)} />
         )}
@@ -184,7 +190,11 @@ export function Sandboxes({ tenant, sel, tab, navigate }) {
   );
 }
 
-function CreatePanel({ act, busy, onDone, onCancel }) {
+// CreatePanel is the create form. An empty image or size takes the
+// platform's default, which the fields name from defaults (the nodes
+// view's), as they name the bounds ferund accepts.
+export function CreatePanel({ act, busy, defaults, onDone, onCancel }) {
+  const hints = createHints(fleetDefaults(defaults));
   const [newId, setNewId] = useState('');
   const [newImage, setNewImage] = useState('');
   const [vcpus, setVcpus] = useState('');
@@ -200,12 +210,13 @@ function CreatePanel({ act, busy, onDone, onCancel }) {
     }}>
       <input placeholder="sandbox ID (a UUID; empty: ferund makes one)" value={newId}
         onChange={(e) => setNewId(e.target.value)} autoFocus />
-      <input placeholder="image (empty: the default)" value={newImage}
+      <input placeholder={hints.image} title={hints.image} value={newImage}
         onChange={(e) => setNewImage(e.target.value)} />
-      <input className="num" type="number" min={VCPUS.min} max={VCPUS.max} placeholder="vCPUs" value={vcpus}
-        onChange={(e) => setVcpus(e.target.value)} title={`vCPUs, ${VCPUS.min}–${VCPUS.max} (empty: the default)`} />
-      <input className="num" type="number" min={MEMORY_MIB.min} max={MEMORY_MIB.max} step="256" placeholder="MiB" value={memMiB}
-        onChange={(e) => setMemMiB(e.target.value)} title={`memory in MiB, ${MEMORY_MIB.min}–${MEMORY_MIB.max} (empty: the default)`} />
+      <input className="num" type="number" min={hints.vcpus.min} max={hints.vcpus.max} placeholder={hints.vcpus.placeholder}
+        value={vcpus} onChange={(e) => setVcpus(e.target.value)} title={hints.vcpus.title} />
+      <input className="num" type="number" min={hints.memory.min} max={hints.memory.max} step="256"
+        placeholder={hints.memory.placeholder} value={memMiB}
+        onChange={(e) => setMemMiB(e.target.value)} title={hints.memory.title} />
       <button type="submit" className="primary" disabled={!!busy}><Icon name="plus" size={14} /> Create</button>
       <button type="button" className="ghost" onClick={onCancel}><Icon name="x" size={14} /></button>
     </form>

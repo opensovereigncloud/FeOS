@@ -6,7 +6,7 @@ import { api } from '../api.js';
 import { Icon } from '../Icon.jsx';
 import { Ago, ArmButton, ErrBox, LiveBadge, StateDot, useArm, useNow, usePoll } from '../components.jsx';
 import { fmtNs, nsToDate } from '../format.js';
-import { canDrain, fmtBytes, nodeRows, stopping, vcpuCapacityText } from './fleet.js';
+import { canDrain, fleetDefaults, fmtBytes, nodeRows, stopping, vcpuCapacityText } from './fleet.js';
 
 // The nodes: one row per node that joined, with its telemetry, what
 // placement booked on it, its connection to this instance and its
@@ -14,6 +14,7 @@ import { canDrain, fmtBytes, nodeRows, stopping, vcpuCapacityText } from './flee
 
 export function Nodes({ navigate }) {
   const [nodes, setNodes] = useState(null);
+  const [defaults, setDefaults] = useState(null);
   const [err, setErr] = useState('');
   const [lastOk, setLastOk] = useState(0);
   const [armed, arm, disarm] = useArm();
@@ -21,7 +22,9 @@ export function Nodes({ navigate }) {
 
   const load = useCallback(async () => {
     try {
-      setNodes((await api.listNodes()).nodes || []);
+      const res = await api.listNodes();
+      setNodes(res.nodes || []);
+      setDefaults(res.defaults || null);
       setErr('');
       setLastOk(Date.now());
     } catch (e) {
@@ -154,16 +157,37 @@ export function Nodes({ navigate }) {
           )}
           {!nodes && !err && <p className="empty">Loading…</p>}
         </div>
-        <p className="muted small footnote">
-          A node is <code>joined</code> from its join until its first telemetry, then <code>ready</code>; it goes{' '}
-          <code>down</code> when its telemetry stops for longer than ferund's <code>--node-ttl</code>, and{' '}
-          <code>removed</code> when an operator removes it. Memory is the host's. <code>booked</code> is what
-          placement promised the node's running and starting sandboxes, against floor(cores × CPU overcommit)
-          vCPUs (∞: CPU not gated) and memory less the headroom; a paused sandbox books nothing. A drain
-          hibernates every sandbox of the node into the object store and keeps placement off it: drain, wait for
-          it to be empty, act, undrain.
-        </p>
+        <NodesFootnote defaults={defaults} />
       </section>
     </div>
+  );
+}
+
+// Flag names one of ferund's flags with this instance's value, when the
+// API told it.
+function Flag({ name, value }) {
+  return <><code>{name}</code>{value ? ` (${value})` : ''}</>;
+}
+
+// NodesFootnote explains the statuses, the bookings and a drain with the
+// timings of the instance that answered (GET /api/v1/admin/nodes's
+// defaults), not with built-in numbers.
+export function NodesFootnote({ defaults }) {
+  const fd = fleetDefaults(defaults);
+  return (
+    <p className="muted small footnote">
+      A node is <code>joined</code> from its join until its first telemetry, then <code>ready</code>; it reports
+      telemetry{fd.telemetryInterval ? ` every ${fd.telemetryInterval}` : ''} and goes <code>down</code> when its
+      telemetry stops for longer than ferund's <Flag name="--node-ttl" value={fd.nodeTtl} />; once it has been
+      down for <Flag name="--lost-grace" value={fd.lostGrace} />, its sandboxes with a checkpoint
+      become <code>hibernated</code> and are restored elsewhere on their next use, those without one
+      count as <code>lost</code>. It is{' '}
+      <code>removed</code> when an operator removes it. Memory is the host's. <code>booked</code> is what
+      placement promised the node's running and starting sandboxes, against floor(cores × CPU overcommit)
+      vCPUs (∞: CPU not gated) and memory less the headroom; a paused sandbox books nothing. A drain
+      hibernates every sandbox of the node into the object store and keeps placement off it; execs that still
+      run after <Flag name="--drain-timeout" value={fd.drainTimeout} /> are cancelled. Drain, wait for the node
+      to be empty, act, undrain.
+    </p>
   );
 }
