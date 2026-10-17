@@ -8,6 +8,7 @@ import (
 	"flag"
 	"log/slog"
 	"net/netip"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -186,6 +187,20 @@ func TestValidation(t *testing.T) {
 	c, err := Parse([]string{"--database-url", testURL, "--public-url", "https://run.example/"}, env(nil))
 	if err != nil || c.PublicURL != "https://run.example" {
 		t.Fatalf("%q %v", c.PublicURL, err)
+	}
+}
+
+// Validate wraps the causes it names (%w), so that errors.Is and errors.As
+// find them: the *url.Error of a public URL that does not parse.
+func TestValidationWrapsCauses(t *testing.T) {
+	t.Parallel()
+	c := Default()
+	c.DatabaseURL = testURL
+	c.PublicURL = "https://run.example/%zz"
+	err := c.Validate()
+	var ue *url.Error
+	if !errors.As(err, &ue) || !strings.Contains(err.Error(), "--public-url: ") {
+		t.Fatalf("%v: the cause is not wrapped", err)
 	}
 }
 

@@ -376,7 +376,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	if err := pki.ValidateTrustDomain(c.TrustDomain); err != nil {
-		bad("--trust-domain: %v", err)
+		bad("--trust-domain: %w", err)
 	}
 	if c.CADir == "" {
 		bad("--ca-dir must not be empty")
@@ -393,7 +393,7 @@ func (c *Config) Validate() error {
 	}
 	if c.PublicURL != "" {
 		if err := checkPublicURL(c.PublicURL); err != nil {
-			bad("--public-url: %v", err)
+			bad("--public-url: %w", err)
 		}
 	}
 	if c.OIDCIssuer != "" {
@@ -421,7 +421,7 @@ func (c *Config) Validate() error {
 	}
 	if c.PodNetwork != PodNetworkRouted && c.PodNetwork != PodNetworkMesh {
 		if _, err := ParsePodNetwork(c.PodNetwork); err != nil {
-			bad("--pod-network: %v", err)
+			bad("--pod-network: %w", err)
 		}
 	}
 	if c.DefaultImage == "" {
