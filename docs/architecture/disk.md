@@ -171,20 +171,28 @@ own, `volume-<id>` in diskd and in the bucket
 
 ## Hibernation
 
-`HibernatePod` (`feos.pod.v1`) takes a pod off the node, under its lock:
+`HibernatePod` (`feos.pod.v1`) takes a pod off the node, in a task of
+`feosd`'s that holds the pod's lock. The call waits for it and gets its
+answer, and so does a `HibernatePod` that comes while it runs; a call that
+is cancelled, or whose connection goes, leaves it running. Until it ends,
+`PodInfo.hibernation` shows its phase, whether a resume abandons it, its
+epoch and the request ids of its calls.
 
 1. a running pod is suspended (`purge_guest`), its snapshot in its jail;
-2. `StopDisk`, `Seal(upload)`: the disk's chain is in the bucket;
-3. for each volume: `StopDisk(volume-<id>)`, `Seal(upload)`, `PutObject`
-   of its record, a `feos.volume.v1.Volume` with its size, labels and
-   whether it has its filesystem, to
-   `snapshots/volume-<id>/<epoch>/volume.pb`, and `PutHead(volume-<id>,
-   epoch)`; a volume that is checkpointed already keeps its head;
+2. `StopDisk`, `Seal` without upload, then `Seal(upload)`: the disk's
+   chain is in the bucket;
+3. for each volume: `StopDisk(volume-<id>)`, `Seal` without upload, then
+   `Seal(upload)`; a volume that is checkpointed already keeps its head;
 4. `SealFile(memory, upload)`, and `PutObject` of the vmstate to
    `snapshots/<pod>/<epoch>/vmstate` and of the pod's spec, a
    `feos.pod.v1.PodSpec`, to `snapshots/<pod>/<epoch>/pod.pb`;
-5. `PutHead(pod, epoch, memory, volume_heads)`: the head, with what the
-   snapshot pins (from its `host.json`) and the volumes' heads;
+5. past the point of no return, for each volume sealed in step 3:
+   `PutObject` of its record, a `feos.volume.v1.Volume` with its size,
+   labels and whether it has its filesystem, to
+   `snapshots/volume-<id>/<epoch>/volume.pb`, and `PutHead(volume-<id>,
+   epoch)`; then `PutHead(pod, epoch, memory, volume_heads)`: the head,
+   with what the snapshot pins (from its `host.json`) and the volumes'
+   heads;
 6. the pod is `HIBERNATED`, with `PodInfo.checkpoint`, and its volumes
    are `CHECKPOINTED`, with theirs; its microVM and snapshot, its disk
    and its volumes' (`RemoveDevice`), its addresses and its TAP device
@@ -193,6 +201,21 @@ own, `volume-<id>` in diskd and in the bucket
 The epoch is the seconds since 1970, or one more than the last
 checkpoint's of the pod and of each of its volumes. A stopped or failed
 pod skips step 1 and the memory.
+
+A `ResumePod` that comes before step 5 abandons the hibernation, unless a
+`HibernatePod` of it said `no_abandon`, as the control plane's drains do,
+or the pod has no memory. The hibernation stops before its next step, or
+drops the call that uploads, whose push diskd stops where it is; the
+suspend and the seals without upload run to their end. Every
+`HibernatePod` of it fails with `ABORTED`, and so does a later one with
+one of its request ids. The resume then takes the pod's lock and resumes
+the pod from its snapshot, on its disk and volumes as the hibernation
+left them: `OpenDisk` starts a sealed one over its sealed layer, with a
+fresh top. Nothing names what was uploaded: the next hibernation's push
+skips the chunks that have their markers ([the cache](#the-cache)), and
+a sweep deletes the rest. A resume that comes in step 5 or later, or to a
+hibernation it may not abandon, waits for it, and restores the pod from
+its new checkpoint.
 
 `RestorePod(pod, head, cold)` brings it back; `ResumePod` of a hibernated
 pod is `RestorePod` with its own checkpoint:
@@ -277,7 +300,13 @@ of their own.
 node's `/dev`, and the pods' integration tests against it: disks across a
 stop, a start and a crash, and hibernation with and without memory, from
 an evicted cache; volumes across stops and pods, formatted once, mounted
-read-only, attached to one pod, and hibernated with their pod. With S3 in the environment, or in
+read-only, attached to one pod, and hibernated with their pod. `feosd`
+reaches diskd there through a gate of the tests'
+(`crates/feos/tests/integration/diskd_gate.rs`), which holds the calls a
+test names: a resume abandons a hibernation while the disk, a volume or
+the memory uploads, and waits for a drain's and for one past its point
+of no return; a hibernation outlives its call, and two calls join one.
+With S3 in the environment, or in
 `~/.config/feos/diskd/s3.env` (`FEOS_S3_ENV`), it hibernates under a key
-prefix of its own and sweeps it at the end; without, the hibernation test
-skips.
+prefix of its own and sweeps it at the end; without, the hibernation tests
+skip.

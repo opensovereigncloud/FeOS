@@ -64,17 +64,19 @@ builds on.
   seconds since 1970, or one more than the last one's, so that no head is
   written twice. All of a node's traffic with the object store runs
   through the disk daemon.
-- A hibernation runs under the pod's lock, in this order, on a node whose
-  disk daemon has an object store; elsewhere it is refused before the pod
-  changes. The pod is suspended, as above, if it runs (the guest syncs,
-  Firecracker flushes the disk); its disk stops, is sealed and uploaded;
-  its memory is sealed and uploaded; its vmstate and its spec are put
-  beside them; the head goes last. Then the pod is hibernated, and what it
-  held on the node goes: its microVM and snapshot, its disk, its addresses
-  and its TAP device. Until the head is up the pod stays suspended on the
-  node, and a hibernation that fails leaves it so; what it uploaded is
-  garbage for the sweep. A stopped or failed pod hibernates its disk
-  alone.
+- A hibernation runs on its own, in a task of `feosd`'s that holds the
+  pod's lock, in this order, on a node whose disk daemon has an object
+  store; elsewhere it is refused before the pod changes. The pod is
+  suspended, as above, if it runs (the guest syncs, Firecracker flushes
+  the disk); its disk stops, is sealed on the node and uploaded; its
+  memory is sealed and uploaded; its vmstate and its spec are put beside
+  them; the head goes last. Then the pod is hibernated, and what it held
+  on the node goes: its microVM and snapshot, its disk, its addresses and
+  its TAP device. A `HibernatePod` whose call is cancelled, or whose
+  connection goes, leaves it running; one that comes while it runs gets
+  its answer. Until the head is up the pod stays suspended on the node,
+  and a hibernation that fails leaves it so; what it uploaded is garbage
+  for the sweep. A stopped or failed pod hibernates its disk alone.
 - The pod's volumes (ADR 0016) go with it: each is sealed and uploaded
   beside the disk, with a head of its own before the pod's, which names
   them. They leave the node with the pod's disk.
@@ -82,8 +84,16 @@ builds on.
   memory and the disk back together; a boot on the disk alone sees it as
   after a power cut at the snapshot, synced a moment before, which ext4's
   journal keeps whole.
-- A resume that comes while a pod hibernates waits for the pod's lock and
-  finds it hibernated: it restores it, from the node's cache. `ResumePod`
+- A resume that comes while a pod hibernates abandons the hibernation,
+  unless the control plane said it may not (a drain), the pod has no
+  memory to resume, or its head is being put: the hibernation stops at
+  its next step, between two of the disk daemon's calls or by dropping
+  the one that uploads, and the pod resumes on the node from its
+  snapshot, on its disk sealed or not. What was uploaded stays, and its
+  chunks serve the next hibernation. The volumes' heads are put with the
+  pod's, after the point of no return, so an abandon leaves no head. A
+  resume that comes later waits for the pod's lock and finds it
+  hibernated: it restores it, from the node's cache. `ResumePod`
   restores a hibernated pod like `RestorePod` does with the pod's own
   checkpoint.
 
@@ -129,9 +139,9 @@ builds on.
 - **Uploading outside the pod's lock**, so that a pod stays resumable
   while its checkpoint uploads, as the sandbox system did: a resume during
   the upload resumes on the node, and the checkpoint stays but does not
-  count. The lock is simpler to reason about; a resume pays for it by
-  waiting for the upload, after which it restores from chunks the node
-  still has.
+  count. The lock stays: a resume stops the upload instead of racing it,
+  and the pod's disk is the sealed layer plus a new top, so nothing on the
+  node is shared between the two.
 - **Trying the snapshot and booting anew if the load fails**, whatever the
   pins say: a snapshot loaded on the wrong host can corrupt the guest
   instead of failing. The pins decide; a load that fails all the same

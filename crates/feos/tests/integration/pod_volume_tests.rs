@@ -9,11 +9,17 @@
 //! have a network; the format test looks at the volume's superblock from
 //! the node and needs no container.
 
+use super::diskd_gate::{diskd_gate, GateCall};
 use super::fixtures::{verify_microvm_cleanup, PodGuard};
-use super::pod_disk_tests::{disk_dir, diskd, diskd_state, pid, start, stop, wait_until_up};
+use super::pod_disk_tests::{
+    assert_abandoned, can_hibernate, disk_dir, diskd, diskd_state, has_head, head_key, hibernation,
+    pid, resume, spawn_hibernation, start, stop, wait_until_up,
+};
 use super::pod_tests::{get_pod, new_pod_id};
-use super::PUBLIC_SERVER_ADDRESS;
-use super::{ensure_server, get_public_clients, installed_guest, TEST_CONTAINER_IMAGE_REF};
+use super::{
+    ensure_server, get_public_clients, installed_guest, OBJECT_STORE, PUBLIC_SERVER_ADDRESS,
+    TEST_CONTAINER_IMAGE_REF,
+};
 use anyhow::{bail, Context, Result};
 use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, exec_stream_frame, ExecRequest,
@@ -23,8 +29,8 @@ use feos_proto::disk_service::{
 };
 use feos_proto::pod_service::{
     pod_service_client::PodServiceClient, ContainerSpec, CreatePodRequest, DeletePodRequest,
-    HibernatePodRequest, PodNetwork, PodSpec, PodState, PodVolume, Resources, RestorePodRequest,
-    VolumeMount,
+    HibernatePodRequest, HibernationPhase, PodNetwork, PodSpec, PodState, PodVolume, Resources,
+    RestorePodRequest, VolumeMount,
 };
 use feos_proto::volume_service::{
     volume_service_client::VolumeServiceClient, CreateVolumeRequest, DeleteVolumeRequest,
@@ -414,6 +420,7 @@ async fn test_volume_hibernates_with_its_pod() -> Result<()> {
         return Ok(());
     }
     ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
     let (mut pods, _, _) = get_public_clients().await?;
     let mut volumes = volumes().await?;
     let mut disks = diskd().await?;
@@ -572,6 +579,96 @@ async fn test_volume_hibernates_with_its_pod() -> Result<()> {
         .into_inner();
     assert!(!restored.memory_restored);
     let pod = wait_until_up(&mut pods, &pod_id).await?;
+    guard.set_pid(pid(&pod)?);
+    let (code, stdout, stderr) = sh(&pod_id, "cat /data/file").await?;
+    assert_eq!((code, stdout.as_str()), (0, "before\nafter\n"), "{stderr}");
+
+    delete_pod(&mut pods, &pod_id).await?;
+    guard.disable_cleanup();
+    delete_volume(&mut volumes, &volume_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_resume_abandons_a_volume_upload() -> Result<()> {
+    if !can_hibernate()? {
+        return Ok(());
+    }
+    ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let mut volumes = volumes().await?;
+    let mut disks = diskd().await?;
+    let volume = create_volume(&mut volumes).await?;
+    let volume_id = volume.volume_id.clone();
+    let volume_disk = format!("volume-{volume_id}");
+
+    let (pod_id, mut guard) = create_pod(&mut pods, &volume_id, true).await?;
+    let (code, _, stderr) = sh(&pod_id, "echo before > /data/file && sync").await?;
+    assert_eq!(code, 0, "{stderr}");
+
+    info!("Hibernating pod {pod_id}, and resuming it while its volume uploads");
+    let disk = volume_disk.clone();
+    let upload = diskd_gate().hold(
+        move |call| matches!(call, GateCall::Seal(seal) if seal.pod_id == disk && seal.upload),
+    );
+    let hibernating = spawn_hibernation(&pods, &pod_id, "v1", false);
+    timeout(Duration::from_secs(120), upload.arrived())
+        .await
+        .context("the volume's upload did not begin")?;
+    let shown = hibernation(&mut pods, &pod_id).await?;
+    assert_eq!(shown.phase(), HibernationPhase::Volumes);
+    assert!(shown.abandonable);
+    resume(&mut pods, &pod_id, Duration::from_secs(30)).await?;
+    assert_abandoned(&hibernating.await?.unwrap_err(), &pod_id);
+    assert!(
+        timeout(Duration::from_secs(30), upload.dropped()).await?,
+        "the held call was not dropped"
+    );
+    // The volume stays the pod's, with no head of its own.
+    let attached = get_volume(&mut volumes, &volume_id).await?;
+    assert_eq!(attached.state(), VolumeState::Attached);
+    assert_eq!(attached.pod_id, pod_id);
+    assert_eq!(attached.checkpoint, None);
+    assert!(!has_head(&mut disks, head_key(&volume_disk, shown.epoch)).await?);
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    guard.set_pid(pid(&pod)?);
+    // Its disk opened again over its sealed layer.
+    let (code, stdout, stderr) = sh(
+        &pod_id,
+        "cat /data/file && echo after >> /data/file && sync",
+    )
+    .await?;
+    assert_eq!((code, stdout.as_str()), (0, "before\n"), "{stderr}");
+
+    // The volumes' heads are past the point of no return.
+    info!("Hibernating pod {pod_id} again, and holding its volume's head");
+    let disk = volume_disk.clone();
+    let head = diskd_gate()
+        .hold(move |call| matches!(call, GateCall::PutHead(head) if head.pod_id == disk));
+    let hibernating = spawn_hibernation(&pods, &pod_id, "v2", false);
+    timeout(Duration::from_secs(120), head.arrived())
+        .await
+        .context("the volume's head was not put")?;
+    let shown = hibernation(&mut pods, &pod_id).await?;
+    assert_eq!(shown.phase(), HibernationPhase::Head);
+    assert!(!shown.abandonable);
+    head.release();
+    let checkpoint = hibernating
+        .await??
+        .checkpoint
+        .context("a hibernation has a checkpoint")?;
+    let checkpointed = get_volume(&mut volumes, &volume_id).await?;
+    assert_eq!(checkpointed.state(), VolumeState::Checkpointed);
+    assert_eq!(
+        checkpointed.checkpoint.map(|c| c.head_key),
+        Some(head_key(&volume_disk, checkpoint.epoch))
+    );
+
+    resume(&mut pods, &pod_id, Duration::from_secs(120)).await?;
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
     guard.set_pid(pid(&pod)?);
     let (code, stdout, stderr) = sh(&pod_id, "cat /data/file").await?;
     assert_eq!((code, stdout.as_str()), (0, "before\nafter\n"), "{stderr}");

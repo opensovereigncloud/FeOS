@@ -11,18 +11,23 @@
 //! the pod's containers adopts them. What changes a pod runs under its
 //! lock; a stop or a delete ends a bring-up first.
 //!
-//! A pod hibernates (ADR 0008) under its lock, in this order: it is
-//! suspended, its disk is stopped, sealed and uploaded, its memory sealed
-//! and uploaded, its vmstate and its spec put beside them, and its head
-//! last; then it is a record with its checkpoint, and what it held on the
-//! node goes. Until the head is up the pod stays suspended on the node. A
-//! restore opens the checkpoint's disk and restores the memory where the
-//! node can load the snapshot; elsewhere, it boots anew on the disk.
+//! A pod hibernates (ADR 0008) in a task of its own, which holds the pod's
+//! lock, in this order: it is suspended, its disk is stopped, sealed on the
+//! node and uploaded, its volumes likewise, its memory sealed and uploaded,
+//! its vmstate and its spec put beside them; then, past the point of no
+//! return, its volumes' heads and its head, last. Then it is a record with
+//! its checkpoint, and what it held on the node goes. A HibernatePod that
+//! comes while it runs joins it, and one whose caller goes away leaves it
+//! running. Until the head is up the pod stays suspended on the node; until
+//! the heads are being put, a resume abandons the hibernation and resumes
+//! the pod from its snapshot. A restore opens the checkpoint's disk and
+//! restores the memory where the node can load the snapshot; elsewhere, it
+//! boots anew on the disk.
 //!
 //! A pod's volumes (ADR 0016) follow its disk: started for a boot, a resume
 //! and a restore, after the disk, stopped with it, sealed and uploaded
-//! with it, each with a head of its own before the pod's, which names
-//! them. A pod claims them at its creation and lets go of them at its
+//! with it, each with a head of its own, put right before the pod's, which
+//! names them. A pod claims them at its creation and lets go of them at its
 //! deletion. After a boot, the guest mounts them before the containers
 //! are created, and formats those the node knows to be new.
 
@@ -48,23 +53,28 @@ use feos_proto::microvm::{
     VmState, VmStateChangedEvent,
 };
 use feos_proto::pod_service::{
-    Checkpoint, ContainerSpec, ContainerState, ContainerStatus, HibernatePodResponse, MicroVm,
-    PodConsoleInput, PodConsoleOutput, PodEvent, PodInfo, PodSpec, PodState, RestorePodResponse,
+    Checkpoint, ContainerSpec, ContainerState, ContainerStatus, HibernatePodResponse,
+    Hibernation as HibernationInfo, HibernationPhase, MicroVm, PodConsoleInput, PodConsoleOutput,
+    PodEvent, PodInfo, PodSpec, PodState, RestorePodResponse,
 };
 use feos_proto::volume_service::{Volume, VolumeCheckpoint, VolumeState};
 use feos_utils::vsock::{self, API_PORT};
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
 use log::{info, warn};
 use microvm_service::api::VmApiHandler;
 use microvm_service::vmm::snapshot;
 use microvm_service::{memory_socket_path, vsock_path};
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::Poll;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{broadcast, OwnedMutexGuard};
-use tokio::task::AbortHandle;
+use tokio::sync::{broadcast, watch, OwnedMutexGuard};
+use tokio::task::{AbortHandle, JoinError};
 use tokio::time::{sleep, timeout, Instant};
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
@@ -85,6 +95,9 @@ const MOUNT_TIMEOUT: Duration = Duration::from_secs(300);
 /// their groups: the node's own addresses, which no pod reaches, may have
 /// changed.
 const REFRESH: Duration = Duration::from_secs(60);
+/// How many request ids a hibernation keeps of the calls that started or
+/// joined it, and a pod of its abandoned hibernations: the last ones.
+const REQUEST_IDS: usize = 16;
 
 #[derive(Clone)]
 pub struct Pods {
@@ -109,6 +122,109 @@ struct Pod {
     /// Held by what changes the pod: an operation, or its bring-up.
     lock: Arc<tokio::sync::Mutex<()>>,
     bring_up: Option<AbortHandle>,
+    /// The hibernation in flight, from its first HibernatePod until its
+    /// task ends.
+    hibernation: Option<Hibernation>,
+    /// The request ids of the pod's abandoned hibernations, the last 16, in
+    /// memory only: a late HibernatePod with one of them is answered
+    /// ABORTED instead of hibernating the resumed pod.
+    abandoned: VecDeque<String>,
+}
+
+impl Pod {
+    fn new(info: PodInfo) -> Self {
+        Self {
+            info,
+            lock: Arc::default(),
+            bring_up: None,
+            hibernation: None,
+            abandoned: VecDeque::new(),
+        }
+    }
+
+    /// Its record, with its hibernation in flight, which is never kept.
+    fn shown(&self) -> PodInfo {
+        let mut info = self.info.clone();
+        info.hibernation = self.hibernation.as_ref().map(Hibernation::shown);
+        info
+    }
+}
+
+/// What every HibernatePod of a hibernation is answered.
+type Answer = Result<HibernatePodResponse, Status>;
+
+/// A hibernation in flight (ADR 0008): its task holds the pod's lock.
+struct Hibernation {
+    /// Which hibernation this is: its task ends the slot only while the
+    /// slot holds this token.
+    token: Arc<()>,
+    /// The task's answer, for every HibernatePod that joins it.
+    answer: Shared<BoxFuture<'static, Answer>>,
+    /// Set by a resume that abandons the hibernation; its task looks at it.
+    abandon: watch::Sender<bool>,
+    /// A HibernatePod said that it may not be abandoned, as a drain does:
+    /// one call that started or joined it says so for all.
+    no_abandon: bool,
+    /// The request ids of the HibernatePods that started or joined it, the
+    /// last 16 that carried one: the control plane abandons only a
+    /// hibernation that its own call reached.
+    request_ids: Vec<String>,
+    phase: HibernationPhase,
+    /// Whether the pod's memory goes with it; unknown until its task
+    /// decided.
+    memory: Option<bool>,
+    /// The epoch of its checkpoint; 0 until it is chosen.
+    epoch: u64,
+}
+
+impl Hibernation {
+    fn new(
+        token: Arc<()>,
+        answer: Shared<BoxFuture<'static, Answer>>,
+        abandon: watch::Sender<bool>,
+        no_abandon: bool,
+        request_id: &str,
+    ) -> Self {
+        let mut hibernation = Self {
+            token,
+            answer,
+            abandon,
+            no_abandon,
+            request_ids: Vec::new(),
+            phase: HibernationPhase::Waiting,
+            memory: None,
+            epoch: 0,
+        };
+        hibernation.add_request(request_id);
+        hibernation
+    }
+
+    /// Whether a resume abandons it now: unless it may not be abandoned,
+    /// the pod has no memory to resume, or its heads are being put.
+    fn abandonable(&self) -> bool {
+        !self.no_abandon && self.memory != Some(false) && self.phase < HibernationPhase::Head
+    }
+
+    /// Adds the request id of a HibernatePod that started or joined it.
+    fn add_request(&mut self, request_id: &str) {
+        if request_id.is_empty() || self.request_ids.iter().any(|id| id == request_id) {
+            return;
+        }
+        if self.request_ids.len() == REQUEST_IDS {
+            self.request_ids.remove(0);
+        }
+        self.request_ids.push(request_id.to_string());
+    }
+
+    /// As GetPod shows it.
+    fn shown(&self) -> HibernationInfo {
+        HibernationInfo {
+            phase: self.phase as i32,
+            abandonable: self.abandonable(),
+            epoch: self.epoch,
+            request_ids: self.request_ids.clone(),
+        }
+    }
 }
 
 impl Pods {
@@ -163,14 +279,7 @@ impl Pods {
                 PodState::Hibernated => purge.push(info.pod_id.clone()),
                 _ => {}
             }
-            pods.pods().insert(
-                info.pod_id.clone(),
-                Pod {
-                    info,
-                    lock: Arc::default(),
-                    bring_up: None,
-                },
-            );
+            pods.pods().insert(info.pod_id.clone(), Pod::new(info));
         }
         info!("Pods: {} kept", pods.pods().len());
         match pods.apply_network().await {
@@ -247,14 +356,7 @@ impl Pods {
                     });
                     match kept {
                         Ok(()) => {
-                            pods.insert(
-                                pod_id.clone(),
-                                Pod {
-                                    info: info.clone(),
-                                    lock: Arc::default(),
-                                    bring_up: None,
-                                },
-                            );
+                            pods.insert(pod_id.clone(), Pod::new(info.clone()));
                             Ok(info)
                         }
                         Err(e) => Err(Err(e)),
@@ -415,10 +517,12 @@ impl Pods {
     }
 
     /// Restores a suspended pod from its snapshot, or a hibernated one from
-    /// its checkpoint. A resume that comes while the pod hibernates waits
-    /// for its lock, and finds it hibernated.
+    /// its checkpoint. A resume that comes while the pod hibernates
+    /// abandons the hibernation if it may, and resumes the pod from its
+    /// snapshot once the hibernation stopped; otherwise it waits for the
+    /// hibernation, and finds the pod hibernated.
     pub async fn resume(&self, pod_id: &str) -> Result<(), Status> {
-        let lock = self.lock(pod_id).await?;
+        let lock = self.lock_for_resume(pod_id).await?;
         if self.info(pod_id)?.state() == PodState::Hibernated {
             drop(lock);
             self.restore(pod_id, "", false).await?;
@@ -440,33 +544,128 @@ impl Pods {
         Ok(())
     }
 
-    /// Takes the pod off the node into object storage (ADR 0008): under
-    /// its lock, so that a resume waits for it. Until its head is up, the
-    /// pod stays on the node, suspended if it ran.
-    pub async fn hibernate(&self, pod_id: &str) -> Result<HibernatePodResponse, Status> {
-        let _lock = self.lock(pod_id).await?;
-        let info = self.info(pod_id)?;
-        if info.state() != PodState::Hibernated {
-            // Before anything changes: without one, the pod stays as it is.
-            self.inner.disks.require_object_store(pod_id).await?;
-        }
-        let memory = match info.state() {
-            PodState::Hibernated => {
-                return Ok(HibernatePodResponse {
-                    checkpoint: info.checkpoint,
-                    ..Default::default()
-                });
-            }
-            PodState::Running => {
-                self.set_state(pod_id, PodState::Running, "hibernating");
-                if let Err(e) = self.suspend_locked(pod_id).await {
-                    if self.info(pod_id)?.state() == PodState::Running {
-                        self.set_state(pod_id, PodState::Running, "");
-                    }
-                    return Err(e);
+    /// Takes the pod off the node into object storage (ADR 0008), in a task
+    /// of its own that holds the pod's lock: a HibernatePod that comes
+    /// while it runs joins it and gets its answer, and one whose caller
+    /// goes away leaves it running. Until its heads are being put, a resume
+    /// abandons it, unless a HibernatePod said `no_abandon`: it is answered
+    /// ABORTED then, and so is a later HibernatePod with one of its
+    /// `request_id`s. Until its head is up, the pod stays on the node,
+    /// suspended if it ran.
+    pub async fn hibernate(&self, pod_id: &str, request_id: &str, no_abandon: bool) -> Answer {
+        let answer = {
+            let mut pods = self.pods();
+            let pod = pods
+                .get_mut(pod_id)
+                .ok_or_else(|| Status::not_found(format!("no pod {pod_id}")))?;
+            match join(
+                &mut pod.hibernation,
+                &pod.abandoned,
+                pod_id,
+                request_id,
+                no_abandon,
+            )? {
+                Some(answer) => answer,
+                None => {
+                    let (abandon, asked) = watch::channel(false);
+                    let token = Arc::new(());
+                    let task = tokio::spawn({
+                        let pods = self.clone();
+                        let pod_id = pod_id.to_string();
+                        let token = token.clone();
+                        async move { pods.run_hibernation(&pod_id, token, asked).await }
+                    });
+                    let id = pod_id.to_string();
+                    let answer = async move { joined(&id, task.await) }.boxed().shared();
+                    pod.hibernation = Some(Hibernation::new(
+                        token,
+                        answer.clone(),
+                        abandon,
+                        no_abandon,
+                        request_id,
+                    ));
+                    answer
                 }
-                true
             }
+        };
+        // A caller that goes away drops this, never the task.
+        answer.await
+    }
+
+    /// A hibernation's task: it takes the pod's lock and hibernates the
+    /// pod, and however it ends, a panic too, ends its slot before it lets
+    /// go of the lock. A hibernation that a resume asked to abandon, and
+    /// that did not hibernate the pod, was abandoned.
+    async fn run_hibernation(
+        &self,
+        pod_id: &str,
+        token: Arc<()>,
+        abandon: watch::Receiver<bool>,
+    ) -> Answer {
+        let mut slot = SlotGuard {
+            end: Some(Box::new({
+                let pods = self.clone();
+                let pod_id = pod_id.to_string();
+                let token = token.clone();
+                move |abandoned| {
+                    if let Some(pod) = pods.pods().get_mut(&pod_id) {
+                        end_slot(&mut pod.hibernation, &mut pod.abandoned, &token, abandoned);
+                    }
+                }
+            })),
+            abandoned: false,
+            lock: None,
+        };
+        slot.lock = Some(self.lock(pod_id).await?);
+        let mut run = Run {
+            pod_id,
+            token,
+            abandon,
+            obeys: false,
+            phase: HibernationPhase::Waiting,
+        };
+        match self.hibernate_locked(&mut run).await {
+            Err(e) if run.asked() => {
+                if e.code() != Code::Aborted {
+                    warn!(
+                        "Pods: {pod_id}'s hibernation failed while a resume abandoned it: {}",
+                        e.message()
+                    );
+                }
+                info!(
+                    "Pods: {pod_id}'s hibernation is abandoned for a resume, in {}",
+                    run.phase.as_str_name()
+                );
+                slot.abandoned = true;
+                Err(abandoned(pod_id))
+            }
+            Err(e) => {
+                warn!("Pods: {pod_id}'s hibernation failed: {}", e.message());
+                Err(e)
+            }
+            Ok(response) => Ok(response),
+        }
+    }
+
+    /// The hibernation, under the pod's lock, step by step. Until its heads
+    /// are being put, a resume may abandon it: it stops then between two
+    /// steps, or drops the call to diskd that uploads, and leaves the pod
+    /// as the steps before it left it, suspended on the node with its disk
+    /// sealed or not. The steps that a dropped call would cut, a suspend
+    /// and a seal on the node, run to their end.
+    async fn hibernate_locked(&self, run: &mut Run<'_>) -> Answer {
+        let pod_id = run.pod_id;
+        let info = self.info(pod_id)?;
+        if info.state() == PodState::Hibernated {
+            return Ok(HibernatePodResponse {
+                checkpoint: info.checkpoint,
+                ..Default::default()
+            });
+        }
+        // Before anything changes: without one, the pod stays as it is.
+        self.inner.disks.require_object_store(pod_id).await?;
+        let memory = match info.state() {
+            PodState::Running => true,
             // One whose snapshot is gone has its disk.
             PodState::Suspended => snapshot::exists(pod_id),
             PodState::Stopped | PodState::Failed => false,
@@ -477,6 +676,20 @@ impl Pods {
                 )));
             }
         };
+        // Only a pod whose memory goes with it can be resumed instead.
+        self.set_memory(run, memory);
+        run.check()?;
+        if info.state() == PodState::Running {
+            self.set_phase(run, HibernationPhase::Suspending);
+            self.set_state(pod_id, PodState::Running, "hibernating");
+            if let Err(e) = self.suspend_locked(pod_id).await {
+                if self.info(pod_id)?.state() == PodState::Running {
+                    self.set_state(pod_id, PodState::Running, "");
+                }
+                return Err(e);
+            }
+            run.check()?;
+        }
         if !memory {
             // A failed pod's microVM may have left its disk started.
             self.delete_vm(pod_id).await?;
@@ -484,25 +697,32 @@ impl Pods {
         self.inner.disks.stop(pod_id).await?;
         let spec = info.spec.clone().unwrap_or_default();
         let epoch = next_epoch(self.checkpoint_epochs(&info));
+        self.set_epoch(run, epoch);
         info!("Pods: {pod_id} hibernates, epoch {epoch}");
-        let disk = self.inner.disks.seal(pod_id).await?;
-        let (volume_heads, volume_checkpoints) =
-            self.hibernate_volumes(pod_id, &spec, epoch).await?;
+        run.check()?;
+        self.set_phase(run, HibernationPhase::Sealing);
+        self.inner.disks.seal_local(pod_id).await?;
+        run.check()?;
+        self.set_phase(run, HibernationPhase::UploadingDisk);
+        let disk = run.abandonable(self.inner.disks.seal(pod_id)).await?;
+        self.set_phase(run, HibernationPhase::Volumes);
+        let volumes = self.seal_volumes(run, &spec).await?;
+        self.set_phase(run, HibernationPhase::UploadingMemory);
         let mut memory_bytes = 0;
         let memory = if memory {
             let host = snapshot::Host::load(pod_id)
                 .map_err(|e| Status::internal(format!("the snapshot's host record: {e}")))?;
-            let layer = self
-                .inner
-                .disks
-                .seal_memory(&snapshot::memory(pod_id))
+            let layer = run
+                .abandonable(self.inner.disks.seal_memory(&snapshot::memory(pod_id)))
                 .await?;
             memory_bytes = layer.logical_bytes;
             let vmstate_key = checkpoint_key(pod_id, epoch, "vmstate");
-            self.inner
-                .disks
-                .put_object(&vmstate_key, &snapshot::vmstate(pod_id))
-                .await?;
+            run.abandonable(
+                self.inner
+                    .disks
+                    .put_object(&vmstate_key, &snapshot::vmstate(pod_id)),
+            )
+            .await?;
             Some(MemoryRef {
                 layer: layer.layer_id,
                 vmstate_key,
@@ -514,17 +734,23 @@ impl Pods {
             None
         };
         // The spec, for a node that does not have the pod.
-        self.put_record(
+        run.abandonable(self.put_record(
             &format!("{pod_id}.spec"),
             &checkpoint_key(pod_id, epoch, SPEC_OBJECT),
             &spec.encode_to_vec(),
-        )
+        ))
         .await?;
+
+        // The point of no return: a head that was asked for may be up, so
+        // from here on a resume waits for the hibernation.
+        self.enter_head(run)?;
+        let (volume_heads, volume_checkpoints) = self.head_volumes(pod_id, epoch, volumes).await?;
         let head = self
             .inner
             .disks
             .put_head(pod_id, epoch, memory, volume_heads)
             .await?;
+        self.set_phase(run, HibernationPhase::Leaving);
         let checkpoint = Checkpoint {
             head_key: head.key,
             epoch,
@@ -779,14 +1005,7 @@ impl Pods {
                 .store
                 .save(&info)
                 .map_err(|e| Status::internal(format!("keep pod {pod_id}: {e}")))?;
-            pods.insert(
-                pod_id.to_string(),
-                Pod {
-                    info: info.clone(),
-                    lock: Arc::default(),
-                    bring_up: None,
-                },
-            );
+            pods.insert(pod_id.to_string(), Pod::new(info.clone()));
             info
         };
         info!("Pods: {pod_id} comes from {head_key}");
@@ -1029,20 +1248,20 @@ impl Pods {
         Ok(())
     }
 
-    /// Seals and uploads each of the pod's volumes into its checkpoint
-    /// `epoch`: its chain, its record and its head, which the pod's head
-    /// is to name. A volume that is checkpointed already, of a pod that has
-    /// not booted since, keeps its head. Returns the heads, and the new
-    /// checkpoints of the volumes.
-    async fn hibernate_volumes(
+    /// Seals and uploads each of the pod's volumes for a hibernation's
+    /// checkpoint, in the order of the pod's spec: its chain, whose head
+    /// `head_volumes` puts. A volume that is checkpointed already, of a pod
+    /// that has not booted since, keeps its head. A resume may abandon the
+    /// hibernation between two volumes, and during an upload.
+    async fn seal_volumes(
         &self,
-        pod_id: &str,
+        run: &mut Run<'_>,
         spec: &PodSpec,
-        epoch: u64,
-    ) -> Result<(Vec<String>, Vec<(String, VolumeCheckpoint)>), Status> {
-        let mut heads = Vec::new();
-        let mut checkpoints = Vec::new();
+    ) -> Result<Vec<VolumePart>, Status> {
+        let pod_id = run.pod_id;
+        let mut parts = Vec::with_capacity(spec.volumes.len());
         for wanted in &spec.volumes {
+            run.check()?;
             let volume = self.inner.volumes.get(&wanted.volume_id)?;
             if volume.pod_id != pod_id {
                 return Err(Status::failed_precondition(format!(
@@ -1053,7 +1272,7 @@ impl Pods {
             if volume.state() == VolumeState::Checkpointed
                 && let Some(checkpoint) = &volume.checkpoint
             {
-                heads.push(checkpoint.head_key.clone());
+                parts.push(VolumePart::Kept(checkpoint.head_key.clone()));
                 continue;
             }
             let disk = volume_disk(&volume.volume_id);
@@ -1063,7 +1282,38 @@ impl Pods {
                 .open_volume(&volume, self.inner.volumes.dir())
                 .await?;
             self.inner.disks.stop(&disk).await?;
-            self.inner.disks.seal(&disk).await?;
+            self.inner.disks.seal_local(&disk).await?;
+            run.check()?;
+            run.abandonable(self.inner.disks.seal(&disk)).await?;
+            parts.push(VolumePart::Sealed {
+                name: wanted.name.clone(),
+                volume,
+            });
+        }
+        Ok(parts)
+    }
+
+    /// Puts the record and the head of each volume that `seal_volumes`
+    /// sealed into the checkpoint `epoch`, past the hibernation's point of
+    /// no return: the pod's head, put next, names them. Returns the heads
+    /// of all the pod's volumes, and the new checkpoints of the sealed ones.
+    async fn head_volumes(
+        &self,
+        pod_id: &str,
+        epoch: u64,
+        parts: Vec<VolumePart>,
+    ) -> Result<(Vec<String>, Vec<(String, VolumeCheckpoint)>), Status> {
+        let mut heads = Vec::new();
+        let mut checkpoints = Vec::new();
+        for part in parts {
+            let (name, volume) = match part {
+                VolumePart::Kept(head) => {
+                    heads.push(head);
+                    continue;
+                }
+                VolumePart::Sealed { name, volume } => (name, volume),
+            };
+            let disk = volume_disk(&volume.volume_id);
             // Its record, for a node that does not have it.
             let record = Volume {
                 volume_id: volume.volume_id.clone(),
@@ -1083,7 +1333,7 @@ impl Pods {
                 .disks
                 .put_head(&disk, epoch, None, Vec::new())
                 .await?;
-            info!("Pods: {pod_id}'s volume {} is in {}", wanted.name, head.key);
+            info!("Pods: {pod_id}'s volume {name} is in {}", head.key);
             heads.push(head.key.clone());
             checkpoints.push((
                 volume.volume_id,
@@ -1152,11 +1402,7 @@ impl Pods {
     /// in the pods' directory.
     async fn put_record(&self, name: &str, key: &str, bytes: &[u8]) -> Result<(), Status> {
         let path = self.inner.dir.join(name);
-        std::fs::write(&path, bytes)
-            .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
-        let put = self.inner.disks.put_object(key, &path).await;
-        let _ = std::fs::remove_file(&path);
-        put
+        put_through_file(&path, bytes, |path| self.inner.disks.put_object(key, path)).await
     }
 
     /// Gets the object at `key` from the object store, through a file
@@ -1257,10 +1503,14 @@ impl Pods {
         }
     }
 
-    /// The pod, with its microVM and its containers as the guest reports
-    /// them if it runs.
+    /// The pod, with its hibernation in flight, and its microVM and its
+    /// containers as the guest reports them if it runs.
     pub async fn get(&self, pod_id: &str) -> Result<PodInfo, Status> {
-        let mut info = self.info(pod_id)?;
+        let mut info = self
+            .pods()
+            .get(pod_id)
+            .map(Pod::shown)
+            .ok_or_else(|| Status::not_found(format!("no pod {pod_id}")))?;
         if info.state() == PodState::Running {
             info.microvm = self.microvm(pod_id).await;
             info.containers = self.container_status(&info).await;
@@ -1303,7 +1553,7 @@ impl Pods {
     }
 
     pub fn list(&self) -> Vec<PodInfo> {
-        let mut pods: Vec<PodInfo> = self.pods().values().map(|pod| pod.info.clone()).collect();
+        let mut pods: Vec<PodInfo> = self.pods().values().map(Pod::shown).collect();
         pods.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
         pods
     }
@@ -1360,9 +1610,108 @@ impl Pods {
             .get(pod_id)
             .map(|pod| pod.lock.clone())
             .ok_or_else(|| Status::not_found(format!("no pod {pod_id}")))?;
-        let guard = lock.lock_owned().await;
-        self.info(pod_id)?;
+        let guard = lock.clone().lock_owned().await;
+        self.still_its_lock(pod_id, &lock)?;
         Ok(guard)
+    }
+
+    /// Fails unless the pod is there with the lock `lock`: a call that
+    /// waited behind a delete of the pod does not act on a pod that was
+    /// created again with its ID.
+    fn still_its_lock(
+        &self,
+        pod_id: &str,
+        lock: &Arc<tokio::sync::Mutex<()>>,
+    ) -> Result<(), Status> {
+        match self.pods().get(pod_id) {
+            Some(pod) if Arc::ptr_eq(&pod.lock, lock) => Ok(()),
+            _ => Err(Status::not_found(format!("no pod {pod_id}"))),
+        }
+    }
+
+    /// Takes the pod's lock for a resume, and abandons a hibernation in
+    /// flight that may be abandoned. The resume queues for the lock first,
+    /// so that it takes it right after the hibernation's task, before
+    /// anything that comes later.
+    async fn lock_for_resume(&self, pod_id: &str) -> Result<OwnedMutexGuard<()>, Status> {
+        let lock = self
+            .pods()
+            .get(pod_id)
+            .map(|pod| pod.lock.clone())
+            .ok_or_else(|| Status::not_found(format!("no pod {pod_id}")))?;
+        // A first poll queues the resume, tokio's mutex being fair, unless
+        // the task's budget is spent: it is not counted.
+        let mut acquire = std::pin::pin!(tokio::task::unconstrained(lock.clone().lock_owned()));
+        let early = futures::poll!(acquire.as_mut());
+        match self.request_abandon(pod_id) {
+            None => {}
+            Some(Meets::Abandons(phase)) => info!(
+                "Pods: A resume of {pod_id} abandons its hibernation, in {}",
+                phase.as_str_name()
+            ),
+            Some(Meets::Waits(phase, why)) => info!(
+                "Pods: A resume of {pod_id} waits for its hibernation, in {}: {why}",
+                phase.as_str_name()
+            ),
+        }
+        let guard = match early {
+            Poll::Ready(guard) => guard,
+            Poll::Pending => acquire.await,
+        };
+        self.still_its_lock(pod_id, &lock)?;
+        Ok(guard)
+    }
+
+    /// What a resume does about the pod's hibernation in flight, if it has
+    /// one: under the pods' mutex, as the hibernation's `enter_head`.
+    fn request_abandon(&self, pod_id: &str) -> Option<Meets> {
+        self.pods()
+            .get(pod_id)?
+            .hibernation
+            .as_ref()
+            .map(request_abandon)
+    }
+
+    /// Changes the pod's hibernation `token` while it is in flight.
+    fn with_hibernation<R>(
+        &self,
+        pod_id: &str,
+        token: &Arc<()>,
+        change: impl FnOnce(&mut Hibernation) -> R,
+    ) -> Option<R> {
+        let mut pods = self.pods();
+        let hibernation = pods
+            .get_mut(pod_id)?
+            .hibernation
+            .as_mut()
+            .filter(|hibernation| Arc::ptr_eq(&hibernation.token, token))?;
+        Some(change(hibernation))
+    }
+
+    fn set_phase(&self, run: &mut Run<'_>, phase: HibernationPhase) {
+        run.phase = phase;
+        self.with_hibernation(run.pod_id, &run.token, |h| h.phase = phase);
+    }
+
+    /// Records whether the pod's memory goes with the hibernation: only
+    /// then does a resume abandon it.
+    fn set_memory(&self, run: &mut Run<'_>, memory: bool) {
+        run.obeys = memory;
+        self.with_hibernation(run.pod_id, &run.token, |h| h.memory = Some(memory));
+    }
+
+    fn set_epoch(&self, run: &mut Run<'_>, epoch: u64) {
+        self.with_hibernation(run.pod_id, &run.token, |h| h.epoch = epoch);
+    }
+
+    /// Passes the hibernation's point of no return, unless a resume
+    /// abandoned it first.
+    fn enter_head(&self, run: &mut Run<'_>) -> Result<(), Status> {
+        let pod_id = run.pod_id;
+        self.with_hibernation(pod_id, &run.token, |h| enter_head(h, pod_id))
+            .unwrap_or_else(|| run.check())?;
+        run.phase = HibernationPhase::Head;
+        Ok(())
     }
 
     async fn end_bring_up_and_lock(&self, pod_id: &str) -> Result<OwnedMutexGuard<()>, Status> {
@@ -1755,6 +2104,220 @@ impl Pods {
     }
 }
 
+/// A hibernation's task, as its steps see it.
+struct Run<'a> {
+    pod_id: &'a str,
+    /// Its slot's token.
+    token: Arc<()>,
+    /// Whether a resume asked for its abandon.
+    abandon: watch::Receiver<bool>,
+    /// Whether the abandon stops it: once the pod's memory goes with it,
+    /// for good. Without, a resume waits for the hibernation and restores
+    /// the pod from its checkpoint.
+    obeys: bool,
+    phase: HibernationPhase,
+}
+
+impl Run<'_> {
+    /// Whether a resume asked for an abandon that stops the hibernation.
+    fn asked(&self) -> bool {
+        self.obeys && *self.abandon.borrow()
+    }
+
+    /// An abandon point between two steps.
+    fn check(&self) -> Result<(), Status> {
+        if self.asked() {
+            return Err(abandoned(self.pod_id));
+        }
+        Ok(())
+    }
+
+    /// A step that an abandon drops, a call to diskd that uploads.
+    async fn abandonable<T>(
+        &mut self,
+        step: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        if !self.obeys {
+            return step.await;
+        }
+        abandonable(&mut self.abandon, self.pod_id, step).await
+    }
+}
+
+/// What a resume does about a hibernation in flight.
+#[derive(Debug, PartialEq)]
+enum Meets {
+    /// It asked the hibernation to stop, in this phase.
+    Abandons(HibernationPhase),
+    /// It waits for the hibernation, in this phase, for this reason.
+    Waits(HibernationPhase, &'static str),
+}
+
+/// A resume asks the hibernation to stop, if it may.
+fn request_abandon(hibernation: &Hibernation) -> Meets {
+    if !hibernation.abandonable() {
+        let why = if hibernation.no_abandon {
+            "it may not be abandoned"
+        } else if hibernation.memory == Some(false) {
+            "its pod has no memory to resume"
+        } else {
+            "its head is being put"
+        };
+        return Meets::Waits(hibernation.phase, why);
+    }
+    hibernation.abandon.send_replace(true);
+    Meets::Abandons(hibernation.phase)
+}
+
+/// The hibernation passes its point of no return, unless a resume asked
+/// for its abandon first. It runs under the pods' mutex, as
+/// `request_abandon` does, so that one of the two comes first: a resume
+/// that comes later waits for the hibernation.
+fn enter_head(hibernation: &mut Hibernation, pod_id: &str) -> Result<(), Status> {
+    if hibernation.memory == Some(true) && *hibernation.abandon.borrow() {
+        return Err(abandoned(pod_id));
+    }
+    hibernation.phase = HibernationPhase::Head;
+    Ok(())
+}
+
+/// What a HibernatePod does about the pod's hibernation in flight `slot`:
+/// it joins it, and gets its answer, or starts one (None). One with the
+/// request id of an abandoned hibernation fails with ABORTED, and starts
+/// nothing.
+fn join(
+    slot: &mut Option<Hibernation>,
+    abandoned_ids: &VecDeque<String>,
+    pod_id: &str,
+    request_id: &str,
+    no_abandon: bool,
+) -> Result<Option<Shared<BoxFuture<'static, Answer>>>, Status> {
+    if !request_id.is_empty() && abandoned_ids.iter().any(|id| id == request_id) {
+        return Err(abandoned(pod_id));
+    }
+    Ok(slot.as_mut().map(|hibernation| {
+        hibernation.no_abandon |= no_abandon;
+        hibernation.add_request(request_id);
+        hibernation.answer.clone()
+    }))
+}
+
+/// Ends the slot of the hibernation `token`, if the slot is still its; the
+/// request ids of an abandoned one join the pod's abandoned ones.
+fn end_slot(
+    slot: &mut Option<Hibernation>,
+    abandoned_ids: &mut VecDeque<String>,
+    token: &Arc<()>,
+    abandoned: bool,
+) {
+    if !slot
+        .as_ref()
+        .is_some_and(|hibernation| Arc::ptr_eq(&hibernation.token, token))
+    {
+        return;
+    }
+    let Some(hibernation) = slot.take() else {
+        return;
+    };
+    if abandoned {
+        abandoned_ids.extend(hibernation.request_ids);
+        while abandoned_ids.len() > REQUEST_IDS {
+            abandoned_ids.pop_front();
+        }
+    }
+}
+
+/// Ends a hibernation's slot, and then lets go of the pod's lock, on
+/// every way out of its task, a panic too: a HibernatePod that comes later
+/// starts a hibernation of its own.
+struct SlotGuard {
+    /// Ends the slot; for an abandoned hibernation with true.
+    end: Option<Box<dyn FnOnce(bool) + Send>>,
+    abandoned: bool,
+    /// The pod's lock, which drops after the slot ended.
+    lock: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if let Some(end) = self.end.take() {
+            end(self.abandoned);
+        }
+    }
+}
+
+/// A hibernation's answer, from its task: one that panicked ended with an
+/// internal error.
+fn joined(pod_id: &str, joined: Result<Answer, JoinError>) -> Answer {
+    joined.unwrap_or_else(|e| {
+        Err(Status::internal(format!(
+            "the hibernation of pod {pod_id} ended: {e}"
+        )))
+    })
+}
+
+/// The answer of a hibernation that a resume abandoned.
+fn abandoned(pod_id: &str) -> Status {
+    Status::aborted(format!(
+        "pod {pod_id} is resumed: its hibernation was abandoned"
+    ))
+}
+
+/// Runs a step of a hibernation until a resume asks for the abandon: the
+/// step is dropped then, and with it its call to diskd, whose handler stops
+/// where it is.
+async fn abandonable<T>(
+    abandon: &mut watch::Receiver<bool>,
+    pod_id: &str,
+    step: impl Future<Output = Result<T, Status>>,
+) -> Result<T, Status> {
+    tokio::select! {
+        biased;
+        () = asked(abandon) => Err(abandoned(pod_id)),
+        result = step => result,
+    }
+}
+
+/// Returns once a resume asked for the abandon; never, once none can.
+async fn asked(abandon: &mut watch::Receiver<bool>) {
+    if abandon.wait_for(|asked| *asked).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// A volume of a hibernating pod's: checkpointed already, with its head,
+/// or sealed and uploaded, its head to come.
+enum VolumePart {
+    Kept(String),
+    Sealed { name: String, volume: Volume },
+}
+
+/// Puts `bytes` into the object store through the file `path`, which `put`
+/// uploads. The file goes when `put` ends, and when the future is dropped,
+/// as an abandoned hibernation drops it.
+async fn put_through_file<'a, F>(
+    path: &'a Path,
+    bytes: &[u8],
+    put: impl FnOnce(&'a Path) -> F,
+) -> Result<(), Status>
+where
+    F: Future<Output = Result<(), Status>>,
+{
+    let _file = Removed(path);
+    std::fs::write(path, bytes)
+        .map_err(|e| Status::internal(format!("write {}: {e}", path.display())))?;
+    put(path).await
+}
+
+/// Removes its file when it drops.
+struct Removed<'a>(&'a Path);
+
+impl Drop for Removed<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
 /// What a restore of a pod's memory left.
 enum Restore {
     /// The guest did not run: the disk is as the checkpoint has it.
@@ -1992,5 +2555,282 @@ mod tests {
         // One made before pods had a metadata service.
         vm.config.as_mut().unwrap().metadata_json.clear();
         assert!(stale(&vm, &wanted));
+    }
+
+    /// A hibernation in flight, started by a HibernatePod with
+    /// `request_id`, and the receiver its task looks at.
+    fn hibernation(no_abandon: bool, request_id: &str) -> (Hibernation, watch::Receiver<bool>) {
+        let (abandon, asked) = watch::channel(false);
+        let answer = futures::future::ready(Ok(HibernatePodResponse::default()))
+            .boxed()
+            .shared();
+        let hibernation = Hibernation::new(Arc::new(()), answer, abandon, no_abandon, request_id);
+        (hibernation, asked)
+    }
+
+    const PHASES: [HibernationPhase; 8] = [
+        HibernationPhase::Waiting,
+        HibernationPhase::Suspending,
+        HibernationPhase::Sealing,
+        HibernationPhase::UploadingDisk,
+        HibernationPhase::Volumes,
+        HibernationPhase::UploadingMemory,
+        HibernationPhase::Head,
+        HibernationPhase::Leaving,
+    ];
+
+    fn assert_abandoned(status: &Status) {
+        assert_eq!(status.code(), Code::Aborted, "{status:?}");
+        assert_eq!(
+            status.message(),
+            "pod p is resumed: its hibernation was abandoned"
+        );
+    }
+
+    #[test]
+    fn a_hibernation_is_abandonable_until_its_head() {
+        let (mut h, _asked) = hibernation(false, "");
+        for phase in PHASES {
+            h.phase = phase;
+            let before_head = phase < HibernationPhase::Head;
+            for memory in [None, Some(true)] {
+                h.memory = memory;
+                assert_eq!(h.abandonable(), before_head, "{phase:?}, {memory:?}");
+                assert_eq!(h.shown().abandonable, before_head);
+            }
+            // Without the memory, there is nothing to resume.
+            h.memory = Some(false);
+            assert!(!h.abandonable(), "{phase:?} without memory");
+        }
+        // A drain's never is.
+        let (mut h, _asked) = hibernation(true, "");
+        for phase in PHASES {
+            h.phase = phase;
+            for memory in [None, Some(true), Some(false)] {
+                h.memory = memory;
+                assert!(!h.abandonable(), "{phase:?}, {memory:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_resume_and_the_head_come_one_after_the_other() {
+        // The resume first: the head is never put.
+        let (mut h, asked) = hibernation(false, "r");
+        h.phase = HibernationPhase::UploadingDisk;
+        h.memory = Some(true);
+        assert_eq!(
+            request_abandon(&h),
+            Meets::Abandons(HibernationPhase::UploadingDisk)
+        );
+        assert!(*asked.borrow());
+        assert_abandoned(&enter_head(&mut h, "p").unwrap_err());
+        assert_eq!(h.phase, HibernationPhase::UploadingDisk);
+
+        // The head first: the resume waits.
+        let (mut h, asked) = hibernation(false, "r");
+        h.phase = HibernationPhase::UploadingMemory;
+        h.memory = Some(true);
+        enter_head(&mut h, "p").unwrap();
+        assert_eq!(h.phase, HibernationPhase::Head);
+        assert_eq!(
+            request_abandon(&h),
+            Meets::Waits(HibernationPhase::Head, "its head is being put")
+        );
+        assert!(!*asked.borrow());
+
+        // A resume that asked before the pod turned out to have no memory
+        // does not stop the hibernation.
+        let (mut h, _asked) = hibernation(false, "r");
+        assert_eq!(
+            request_abandon(&h),
+            Meets::Abandons(HibernationPhase::Waiting)
+        );
+        h.memory = Some(false);
+        enter_head(&mut h, "p").unwrap();
+        assert_eq!(
+            request_abandon(&h),
+            Meets::Waits(HibernationPhase::Head, "its pod has no memory to resume")
+        );
+
+        // A join with no_abandon makes it a drain's.
+        let (mut h, asked) = hibernation(false, "r");
+        h.memory = Some(true);
+        let mut slot = Some(h);
+        let joined = join(&mut slot, &VecDeque::new(), "p", "d", true).unwrap();
+        assert!(joined.is_some(), "it joins");
+        let h = slot.as_mut().unwrap();
+        assert_eq!(
+            request_abandon(h),
+            Meets::Waits(HibernationPhase::Waiting, "it may not be abandoned")
+        );
+        assert!(!*asked.borrow());
+        enter_head(h, "p").unwrap();
+    }
+
+    #[test]
+    fn a_hibernatepod_joins_or_starts() {
+        let mut abandoned_ids = VecDeque::from(["gone".to_string()]);
+        let mut slot = None;
+        // One of an abandoned hibernation starts nothing.
+        assert_abandoned(&join(&mut slot, &abandoned_ids, "p", "gone", false).unwrap_err());
+        assert!(slot.is_none());
+        // Without a hibernation in flight, it starts one.
+        assert!(join(&mut slot, &abandoned_ids, "p", "a", false)
+            .unwrap()
+            .is_none());
+
+        let (h, _asked) = hibernation(false, "a");
+        slot = Some(h);
+        let answer = join(&mut slot, &abandoned_ids, "p", "b", false).unwrap();
+        assert!(answer.is_some(), "it joins");
+        // A call without an id, and one again, add nothing.
+        join(&mut slot, &abandoned_ids, "p", "", false).unwrap();
+        join(&mut slot, &abandoned_ids, "p", "b", false).unwrap();
+        let h = slot.as_ref().unwrap();
+        assert_eq!(h.request_ids, ["a", "b"]);
+        assert!(!h.no_abandon);
+        assert_eq!(h.shown().request_ids, ["a", "b"]);
+        // One that may not be abandoned is sticky.
+        join(&mut slot, &abandoned_ids, "p", "c", true).unwrap();
+        join(&mut slot, &abandoned_ids, "p", "d", false).unwrap();
+        assert!(slot.as_ref().unwrap().no_abandon);
+        // The last 16 are kept.
+        for i in 0..20 {
+            join(&mut slot, &abandoned_ids, "p", &format!("n{i}"), false).unwrap();
+        }
+        let ids = &slot.as_ref().unwrap().request_ids;
+        assert_eq!(ids.len(), REQUEST_IDS);
+        assert_eq!(ids.first().map(String::as_str), Some("n4"));
+        assert_eq!(ids.last().map(String::as_str), Some("n19"));
+
+        // The slot ends only for its own token.
+        let token = slot.as_ref().unwrap().token.clone();
+        end_slot(&mut slot, &mut abandoned_ids, &Arc::new(()), true);
+        assert!(slot.is_some(), "another hibernation's guard ended the slot");
+        assert_eq!(abandoned_ids, ["gone"]);
+        end_slot(&mut slot, &mut abandoned_ids, &token, true);
+        assert!(slot.is_none());
+        // An abandoned one's ids are remembered, the last 16.
+        assert_eq!(abandoned_ids.len(), REQUEST_IDS);
+        assert_eq!(abandoned_ids.front().map(String::as_str), Some("n4"));
+        assert_abandoned(&join(&mut slot, &abandoned_ids, "p", "n19", false).unwrap_err());
+
+        // One that was not abandoned leaves no ids.
+        let (h, _asked) = hibernation(false, "x");
+        let token = h.token.clone();
+        slot = Some(h);
+        end_slot(&mut slot, &mut abandoned_ids, &token, false);
+        assert!(slot.is_none());
+        assert!(!abandoned_ids.contains(&"x".to_string()));
+    }
+
+    /// Sets its flag when it drops.
+    struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_abandon_drops_the_step() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (abandon, mut asked) = watch::channel(false);
+        let step = {
+            let dropped = Dropped(flag.clone());
+            async move {
+                let _dropped = dropped;
+                std::future::pending::<Result<u8, Status>>().await
+            }
+        };
+        let task = tokio::spawn(async move { abandonable(&mut asked, "p", step).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!task.is_finished(), "the step ended by itself");
+        abandon.send_replace(true);
+        let result = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the abandon did not stop the step")
+            .unwrap();
+        assert_abandoned(&result.unwrap_err());
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Without an abandon, the step's answer.
+        let (_abandon, mut asked) = watch::channel(false);
+        let answer = abandonable(&mut asked, "p", async { Ok::<_, Status>(7) }).await;
+        assert_eq!(answer.unwrap(), 7);
+        // With no one left to ask, too.
+        let (abandon, mut asked) = watch::channel(false);
+        drop(abandon);
+        let answer = abandonable(&mut asked, "p", async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok::<_, Status>(8)
+        })
+        .await;
+        assert_eq!(answer.unwrap(), 8);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_hibernation_ends_its_slot() {
+        let (h, _asked) = hibernation(false, "a");
+        let token = h.token.clone();
+        let slots = Arc::new(Mutex::new((Some(h), VecDeque::<String>::new())));
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let task = tokio::spawn({
+            let slots = slots.clone();
+            let lock = lock.clone();
+            async move {
+                let mut slot = SlotGuard {
+                    end: Some(Box::new(move |abandoned| {
+                        let mut slots = slots.lock().unwrap();
+                        let (slot, ids) = &mut *slots;
+                        end_slot(slot, ids, &token, abandoned);
+                    })),
+                    abandoned: false,
+                    lock: None,
+                };
+                slot.lock = Some(lock.lock_owned().await);
+                if slot.lock.is_some() {
+                    panic!("a hibernation's bug");
+                }
+                Ok::<_, Status>(HibernatePodResponse::default())
+            }
+        });
+        let answer = joined("p", task.await);
+        let status = answer.unwrap_err();
+        assert_eq!(status.code(), Code::Internal);
+        assert!(
+            status
+                .message()
+                .starts_with("the hibernation of pod p ended"),
+            "{status:?}"
+        );
+        assert!(slots.lock().unwrap().0.is_none(), "the slot stayed");
+        assert!(lock.try_lock().is_ok(), "the pod's lock stayed held");
+    }
+
+    #[tokio::test]
+    async fn a_record_put_through_a_file_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.spec");
+        // Dropped while it puts, as an abandon drops it.
+        let put = put_through_file(&path, b"spec", |file| {
+            assert_eq!(std::fs::read(file).unwrap(), b"spec");
+            std::future::pending()
+        });
+        assert!(timeout(Duration::from_millis(20), put).await.is_err());
+        assert!(!path.exists(), "a dropped put left its file");
+        // A put that fails.
+        let failed = put_through_file(&path, b"spec", |_| async {
+            Err(Status::unavailable("diskd"))
+        })
+        .await;
+        assert_eq!(failed.unwrap_err().code(), Code::Unavailable);
+        assert!(!path.exists());
+        put_through_file(&path, b"spec", |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert!(!path.exists());
     }
 }

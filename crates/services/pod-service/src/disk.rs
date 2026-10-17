@@ -346,11 +346,23 @@ impl Disks {
     }
 
     /// Seals the stopped disk's writes into its own layer and uploads its
-    /// chain: a pod's, or a volume's.
+    /// chain: a pod's, or a volume's. After `seal_local` it finds the disk
+    /// sealed, and uploads. A call that is dropped stops the upload where
+    /// it is; what is uploaded stays, and the next one skips it.
     pub async fn seal(&self, pod_id: &str) -> Result<Layer, Status> {
+        self.seal_with(pod_id, true).await
+    }
+
+    /// Seals the stopped disk's writes into its own layer, on the node: a
+    /// pod's, or a volume's. The disk opens again over that layer.
+    pub async fn seal_local(&self, pod_id: &str) -> Result<Layer, Status> {
+        self.seal_with(pod_id, false).await
+    }
+
+    async fn seal_with(&self, pod_id: &str, upload: bool) -> Result<Layer, Status> {
         let request = SealRequest {
             pod_id: pod_id.to_string(),
-            upload: true,
+            upload,
         };
         Ok(self
             .client()

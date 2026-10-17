@@ -196,15 +196,26 @@ microVM has a balloon with free page reporting.
 - **Hibernate** and **Restore** take a pod into the object store and
   bring it back, on this node or another, with its memory or on its disk
   alone ([disk.md](disk.md#hibernation)). A hibernated pod is `HIBERNATED`,
-  a record with its checkpoint; **Resume** restores it.
+  a record with its checkpoint; **Resume** restores it. A hibernation
+  runs in a task of its own, which holds the pod's lock: a call that goes
+  away leaves it running, one that comes while it runs joins it and gets
+  its answer, and `GetPod` shows it in `PodInfo.hibernation` until it
+  ends. A **Resume** that comes while the pod hibernates abandons the
+  hibernation until its heads are being put, unless a call said
+  `no_abandon` (a drain) or the pod has no memory: the hibernation stops,
+  its calls fail with `ABORTED`, and the pod resumes from its snapshot on
+  the node. Otherwise the resume waits for the hibernation and restores
+  the pod.
 - **Delete** ends a bring-up and removes the microVM, the disk and the
   record. Its volumes stay, their disks stopped, attached to no pod.
 - A running pod whose microVM crashes is `FAILED`; one whose microVM stops
   is `STOPPED`. Either keeps its disk, and its disk stops. Volumes go as
   the disk does.
 
-What changes a pod runs under a lock of the pod's. `GetPod` asks the guest
-for the containers' states while the pod runs.
+What changes a pod runs under a lock of the pod's; a call that waited for
+it acts only if the lock is still its pod's, not on a pod created again
+with the ID after a delete. `GetPod` asks the guest for the containers'
+states while the pod runs.
 
 ## Volumes
 

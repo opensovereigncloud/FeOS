@@ -10,12 +10,18 @@
 //! data volume and lists. A test puts a record on a stopped pod's disk
 //! from the node; the guest's own changes are a record it deletes.
 //! Hibernation needs diskd with an object store, as `make test-pods` gives
-//! it when it has one; without, that test skips.
+//! it when it has one; without, those tests skip. feosd reaches diskd
+//! through the tests' gate (`diskd_gate`), which holds a hibernation at the
+//! call a test names, so that a resume comes while it uploads, or after its
+//! point of no return.
 
+use super::diskd_gate::{diskd_gate, GateCall};
 use super::fixtures::{verify_microvm_cleanup, PodGuard};
 use super::pod_tests::{for_pod, get_pod, guest_ping, microvm_metadata, new_pod_id};
-use super::{ensure_server, get_public_clients, installed_guest, PUBLIC_SERVER_ADDRESS};
-use anyhow::{bail, Context, Result};
+use super::{
+    ensure_server, get_public_clients, installed_guest, OBJECT_STORE, PUBLIC_SERVER_ADDRESS,
+};
+use anyhow::{bail, ensure, Context, Result};
 use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, DeleteContainerRequest, ListContainersRequest,
 };
@@ -25,8 +31,8 @@ use feos_proto::disk_service::{
 };
 use feos_proto::pod_service::{
     pod_service_client::PodServiceClient, CreatePodRequest, DeletePodRequest, HibernatePodRequest,
-    PodInfo, PodNetwork, PodSpec, PodState, Resources, RestorePodRequest, ResumePodRequest,
-    StartPodRequest, StopPodRequest,
+    HibernatePodResponse, Hibernation, HibernationPhase, PodInfo, PodNetwork, PodSpec, PodState,
+    Resources, RestorePodRequest, ResumePodRequest, StartPodRequest, StopPodRequest,
 };
 use hyper_util::rt::TokioIo;
 use log::info;
@@ -36,10 +42,13 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use pod_service::disk::DISKD_SOCKET;
 use pod_service::network;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint, Uri};
+use tonic::{Code, Status};
 use tower::service_fn;
 
 /// How long a pod may take to come up.
@@ -345,6 +354,7 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
         return Ok(());
     }
     ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
     let (mut pods, _, _) = get_public_clients().await?;
     let mut disks = diskd().await?;
 
@@ -455,39 +465,9 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
         "the memory came from the object store"
     );
 
-    // A resume that comes while the pod hibernates waits, and restores it.
-    info!("Hibernating pod {pod_id} again, and resuming it meanwhile");
-    let hibernation = {
-        let mut pods = pods.clone();
-        let pod_id = pod_id.clone();
-        tokio::spawn(async move { hibernate(&mut pods, &pod_id).await })
-    };
-    timeout(Duration::from_secs(30), async {
-        loop {
-            let pod = get_pod(&mut pods, &pod_id).await?;
-            if pod.reason == "hibernating" || pod.state() != PodState::Running {
-                return anyhow::Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .context("the hibernation did not start")??;
-    pods.resume_pod(ResumePodRequest {
-        pod_id: pod_id.clone(),
-    })
-    .await?;
-    let second = hibernation.await??;
-    assert_ne!(second, head_key, "every hibernation has a head of its own");
-    let pod = get_pod(&mut pods, &pod_id).await?;
-    assert_eq!(pod.state(), PodState::Running);
-    guard.set_pid(pid(&pod)?);
-    assert_eq!(guest_ping(&pod_id).await?.boot_id, before.boot_id);
-    assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
-
     // Without its memory: a new boot on the checkpoint's disk.
     info!("Hibernating pod {pod_id}, and restoring it without its memory");
-    let third = hibernate(&mut pods, &pod_id).await?;
+    let second = hibernate(&mut pods, &pod_id).await?;
     let restored = pods
         .restore_pod(RestorePodRequest {
             pod_id: pod_id.clone(),
@@ -507,7 +487,7 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
     assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
     // Hibernation after hibernation, the chain keeps its shape.
     let head = disks
-        .get_head(GetHeadRequest { key: third })
+        .get_head(GetHeadRequest { key: second })
         .await?
         .into_inner();
     assert_eq!(head.chain.len(), 2, "the chain grew: {:?}", head.chain);
@@ -520,4 +500,586 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
     assert!(!disk_dir(&pod_id).exists());
     guard.disable_cleanup();
     Ok(())
+}
+
+/// Whether pods hibernate here: with the guest, Firecracker, diskd and an
+/// object store.
+pub(super) fn can_hibernate() -> Result<bool> {
+    if installed_guest()?.is_none() {
+        return Ok(false);
+    }
+    if std::env::var("S3_BUCKET").map_or(true, |bucket| bucket.is_empty()) {
+        log::warn!("Skipping test: no object store (S3_BUCKET) to hibernate to.");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// How long a hibernation may take to reach a call of diskd's: a suspend
+/// and a seal on the node come first.
+const STEP_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a resume may take that abandons a hibernation.
+const ABANDON_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Starts a hibernation of the pod, as the control plane asks for it with
+/// its op's id; its answer.
+pub(super) fn spawn_hibernation(
+    pods: &PodServiceClient<Channel>,
+    pod_id: &str,
+    request_id: &str,
+    no_abandon: bool,
+) -> JoinHandle<Result<HibernatePodResponse, Status>> {
+    let mut pods = pods.clone();
+    let request = HibernatePodRequest {
+        pod_id: pod_id.to_string(),
+        no_abandon,
+        request_id: request_id.to_string(),
+    };
+    tokio::spawn(async move {
+        pods.hibernate_pod(request)
+            .await
+            .map(|response| response.into_inner())
+    })
+}
+
+/// The pod's hibernation in flight, as GetPod shows it.
+pub(super) async fn hibernation(
+    pods: &mut PodServiceClient<Channel>,
+    pod_id: &str,
+) -> Result<Hibernation> {
+    get_pod(pods, pod_id)
+        .await?
+        .hibernation
+        .context("GetPod shows no hibernation in flight")
+}
+
+/// Resumes the pod, and fails unless it does within `within`.
+pub(super) async fn resume(
+    pods: &mut PodServiceClient<Channel>,
+    pod_id: &str,
+    within: Duration,
+) -> Result<()> {
+    let request = ResumePodRequest {
+        pod_id: pod_id.to_string(),
+    };
+    timeout(within, pods.resume_pod(request))
+        .await
+        .with_context(|| format!("the resume did not return within {}s", within.as_secs()))??;
+    Ok(())
+}
+
+/// Whether the object store has the head `key`.
+pub(super) async fn has_head(disks: &mut DiskServiceClient<Channel>, key: String) -> Result<bool> {
+    match disks.get_head(GetHeadRequest { key }).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.code() == Code::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The key of the pod's head of the checkpoint `epoch`.
+pub(super) fn head_key(pod_id: &str, epoch: u64) -> String {
+    format!("snapshots/{pod_id}/{epoch}/head.json")
+}
+
+/// Fails unless `status` is a hibernation's that a resume abandoned.
+pub(super) fn assert_abandoned(status: &Status, pod_id: &str) {
+    assert_eq!(status.code(), Code::Aborted, "{status:?}");
+    assert_eq!(
+        status.message(),
+        format!("pod {pod_id} is resumed: its hibernation was abandoned")
+    );
+}
+
+/// diskd's uploads to the object store so far, whole-object PUTs.
+async fn s3_puts(disks: &mut DiskServiceClient<Channel>) -> Result<u64> {
+    let request = StatsRequest {
+        pod_id: "-".to_string(),
+    };
+    Ok(disks.stats(request).await?.into_inner().s3_puts)
+}
+
+/// Waits until diskd uploaded `count` more objects than `since`.
+async fn s3_puts_rise(
+    disks: &mut DiskServiceClient<Channel>,
+    since: u64,
+    count: u64,
+) -> Result<u64> {
+    timeout(Duration::from_secs(120), async {
+        loop {
+            let puts = s3_puts(disks).await?;
+            if puts >= since + count {
+                return anyhow::Ok(puts);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("diskd did not upload {count} objects"))?
+}
+
+/// The size of the data `fill` writes, and how many chunks of 64 KiB it is
+/// in diskd.
+const FILL_BYTES: u64 = 256 << 20;
+const FILL_CHUNKS: u64 = FILL_BYTES >> 16;
+
+/// Writes `FILL_BYTES` of data that no disk has into a file on the stopped
+/// pod's disk, from the node, so that the disk's next upload takes a while.
+async fn fill(pod_id: &str) -> Result<()> {
+    let mut disks = diskd().await?;
+    let device = disks
+        .open_disk(OpenDiskRequest {
+            pod_id: pod_id.to_string(),
+            head_key: String::new(),
+        })
+        .await?
+        .into_inner();
+    let dir = tempfile::tempdir()?;
+    mount(
+        Some(device.dev_path.as_str()),
+        dir.path(),
+        Some("ext4"),
+        MsFlags::empty(),
+        None::<&str>,
+    )
+    .context("mount the pod's disk")?;
+    let written = (|| -> Result<()> {
+        // xorshift64, from a seed of this run's.
+        let mut state = uuid::Uuid::new_v4().as_u64_pair().0 | 1;
+        let mut file = std::fs::File::create(dir.path().join("fill"))?;
+        let mut block = vec![0u8; 1 << 20];
+        for _ in 0..FILL_BYTES / block.len() as u64 {
+            for word in block.as_chunks_mut::<8>().0 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *word = state.to_le_bytes();
+            }
+            file.write_all(&block)?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    nix::unistd::sync();
+    umount(dir.path()).context("unmount the pod's disk")?;
+    disks
+        .stop_disk(StopDiskRequest {
+            pod_id: pod_id.to_string(),
+        })
+        .await?;
+    written
+}
+
+/// A pod of `spec()`, up.
+async fn up_pod(pods: &mut PodServiceClient<Channel>) -> Result<(String, PodGuard)> {
+    let pod_id = new_pod_id();
+    pods.create_pod(CreatePodRequest {
+        pod_id: pod_id.clone(),
+        spec: Some(spec()),
+    })
+    .await?;
+    let mut guard = PodGuard::new(pod_id.clone());
+    let pod = wait_until_up(pods, &pod_id).await?;
+    guard.set_pid(pid(&pod)?);
+    Ok((pod_id, guard))
+}
+
+async fn delete(
+    pods: &mut PodServiceClient<Channel>,
+    pod_id: &str,
+    mut guard: PodGuard,
+) -> Result<()> {
+    pods.delete_pod(DeletePodRequest {
+        pod_id: pod_id.to_string(),
+    })
+    .await?;
+    verify_microvm_cleanup(pod_id);
+    assert!(!disk_dir(pod_id).exists());
+    guard.disable_cleanup();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_resume_abandons_the_disk_upload() -> Result<()> {
+    if !can_hibernate()? {
+        return Ok(());
+    }
+    ensure_server().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let mut disks = diskd().await?;
+    let (pod_id, mut guard) = up_pod(&mut pods).await?;
+
+    // A checkpoint first: one that the abandoned hibernation does not
+    // replace.
+    let earlier = {
+        let _store = OBJECT_STORE.read().await;
+        let head_key = hibernate(&mut pods, &pod_id).await?;
+        resume(&mut pods, &pod_id, STEP_TIMEOUT).await?;
+        let pod = get_pod(&mut pods, &pod_id).await?;
+        assert_eq!(pod.state(), PodState::Running);
+        guard.set_pid(pid(&pod)?);
+        let earlier = pod
+            .checkpoint
+            .context("a restored pod has its checkpoint")?;
+        assert_eq!(earlier.head_key, head_key);
+        earlier
+    };
+    // Then data to upload, which takes a while.
+    stop(&mut pods, &pod_id).await?;
+    let marker = format!("marker/{}", uuid::Uuid::new_v4());
+    plant(&pod_id, &["keep", "drop"], &marker).await?;
+    fill(&pod_id).await?;
+    let pod = start(&mut pods, &pod_id).await?;
+    guard.set_pid(pid(&pod)?);
+    let before = guest_ping(&pod_id).await?;
+
+    info!("Hibernating pod {pod_id}, and resuming it while its disk uploads");
+    let (epoch, abandoned_puts) = {
+        // The only uploads now, so that they can be counted.
+        let _store = OBJECT_STORE.write().await;
+        let puts = s3_puts(&mut disks).await?;
+        let id = pod_id.clone();
+        let upload = diskd_gate().pass(
+            move |call| matches!(call, GateCall::Seal(seal) if seal.pod_id == id && seal.upload),
+        );
+        let hibernation = spawn_hibernation(&pods, &pod_id, "r1", false);
+        timeout(STEP_TIMEOUT, upload.arrived())
+            .await
+            .context("the disk's upload did not begin")?;
+        // The upload is under way in diskd.
+        s3_puts_rise(&mut disks, puts, 1000).await?;
+        let shown = self::hibernation(&mut pods, &pod_id).await?;
+        assert_eq!(shown.phase(), HibernationPhase::UploadingDisk);
+        assert!(shown.abandonable);
+        assert!(shown.epoch > earlier.epoch, "{shown:?}");
+        assert_eq!(shown.request_ids, ["r1"]);
+
+        resume(&mut pods, &pod_id, ABANDON_TIMEOUT).await?;
+        assert_abandoned(&hibernation.await?.unwrap_err(), &pod_id);
+        assert!(
+            timeout(ABANDON_TIMEOUT, upload.dropped()).await?,
+            "diskd's upload was not dropped"
+        );
+        // diskd stopped uploading.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let stopped = s3_puts(&mut disks).await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(s3_puts(&mut disks).await?, stopped, "diskd uploads on");
+        (shown.epoch, stopped - puts)
+    };
+    info!("The abandoned upload uploaded {abandoned_puts} of the {FILL_CHUNKS} chunks filled");
+
+    // The pod runs on, from its snapshot on the node.
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    assert_eq!(pod.hibernation, None);
+    assert_eq!(pod.checkpoint.as_ref(), Some(&earlier));
+    guard.set_pid(pid(&pod)?);
+    let after = guest_ping(&pod_id).await?;
+    assert_eq!(after.boot_id, before.boot_id, "the same boot");
+    assert!(after.tick > before.tick, "the guest forgot its pings");
+    assert!(!has_head(&mut disks, head_key(&pod_id, epoch)).await?);
+    // A late call of the abandoned hibernation starts no other.
+    let late = spawn_hibernation(&pods, &pod_id, "r1", false).await?;
+    assert_abandoned(&late.unwrap_err(), &pod_id);
+    assert_eq!(
+        get_pod(&mut pods, &pod_id).await?.state(),
+        PodState::Running
+    );
+
+    // The disk opened again over its sealed layer: what the guest writes
+    // now goes into the next checkpoint, with what was there.
+    let mut containers = ContainerServiceClient::connect(PUBLIC_SERVER_ADDRESS).await?;
+    containers
+        .delete_container(for_pod(
+            &pod_id,
+            DeleteContainerRequest {
+                container_id: "drop".to_string(),
+            },
+        ))
+        .await?;
+    info!("Hibernating pod {pod_id} again: the chunks uploaded before count");
+    let (checkpoint, upload_puts) = {
+        let _store = OBJECT_STORE.write().await;
+        let puts = s3_puts(&mut disks).await?;
+        let id = pod_id.clone();
+        let upload = diskd_gate().pass(
+            move |call| matches!(call, GateCall::Seal(seal) if seal.pod_id == id && seal.upload),
+        );
+        let id = pod_id.clone();
+        let memory = diskd_gate()
+            .hold(move |call| matches!(call, GateCall::SealFile(seal) if seal.path.contains(&id)));
+        let hibernation = spawn_hibernation(&pods, &pod_id, "r2", false);
+        timeout(Duration::from_secs(600), memory.arrived())
+            .await
+            .context("the memory's upload did not begin")?;
+        assert!(!upload.dropped().await, "the disk's upload was dropped");
+        let upload_puts = s3_puts(&mut disks).await? - puts;
+        memory.release();
+        let response = hibernation.await??;
+        (
+            response
+                .checkpoint
+                .context("a hibernation has a checkpoint")?,
+            upload_puts,
+        )
+    };
+    info!(
+        "The disk's upload took {upload_puts} objects after the abandoned one's {abandoned_puts}"
+    );
+    assert!(
+        upload_puts < FILL_CHUNKS,
+        "the upload took {upload_puts} objects: the {abandoned_puts} uploaded before did not count"
+    );
+    assert!(has_head(&mut disks, checkpoint.head_key.clone()).await?);
+    resume(&mut pods, &pod_id, STEP_TIMEOUT).await?;
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    assert_eq!(pod.checkpoint.as_ref(), Some(&checkpoint));
+    guard.set_pid(pid(&pod)?);
+    assert_eq!(guest_ping(&pod_id).await?.boot_id, before.boot_id);
+    assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
+
+    delete(&mut pods, &pod_id, guard).await
+}
+
+#[tokio::test]
+async fn test_resume_abandons_the_memory_upload() -> Result<()> {
+    if !can_hibernate()? {
+        return Ok(());
+    }
+    ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let mut disks = diskd().await?;
+    let (pod_id, mut guard) = up_pod(&mut pods).await?;
+    let before = guest_ping(&pod_id).await?;
+
+    info!("Hibernating pod {pod_id}, and resuming it while its memory uploads");
+    let id = pod_id.clone();
+    let memory = diskd_gate()
+        .hold(move |call| matches!(call, GateCall::SealFile(seal) if seal.path.contains(&id)));
+    let hibernation = spawn_hibernation(&pods, &pod_id, "m1", false);
+    timeout(STEP_TIMEOUT, memory.arrived())
+        .await
+        .context("the memory's upload did not begin")?;
+    let shown = self::hibernation(&mut pods, &pod_id).await?;
+    assert_eq!(shown.phase(), HibernationPhase::UploadingMemory);
+    assert!(shown.abandonable);
+    assert_eq!(shown.request_ids, ["m1"]);
+    resume(&mut pods, &pod_id, ABANDON_TIMEOUT).await?;
+    assert_abandoned(&hibernation.await?.unwrap_err(), &pod_id);
+    assert!(
+        timeout(ABANDON_TIMEOUT, memory.dropped()).await?,
+        "the held call was not dropped"
+    );
+
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    assert_eq!(pod.hibernation, None);
+    assert_eq!(pod.checkpoint, None);
+    guard.set_pid(pid(&pod)?);
+    let after = guest_ping(&pod_id).await?;
+    assert_eq!(after.boot_id, before.boot_id, "the same boot");
+    assert!(after.tick > before.tick, "the guest forgot its pings");
+    assert!(!has_head(&mut disks, head_key(&pod_id, shown.epoch)).await?);
+
+    // Its disk, sealed and uploaded, opened again: the next hibernation
+    // takes it from there.
+    hibernate(&mut pods, &pod_id).await?;
+    resume(&mut pods, &pod_id, STEP_TIMEOUT).await?;
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    guard.set_pid(pid(&pod)?);
+    assert_eq!(guest_ping(&pod_id).await?.boot_id, before.boot_id);
+
+    delete(&mut pods, &pod_id, guard).await
+}
+
+/// Holds a hibernation of the pod at the first call that `matches`, has a
+/// resume come meanwhile, and checks that the resume waits for the
+/// hibernation and then restores the pod from its checkpoint, with its
+/// memory. Returns the hibernation as GetPod showed it while it was held.
+async fn resume_waits(
+    pods: &mut PodServiceClient<Channel>,
+    pod_id: &str,
+    guard: &mut PodGuard,
+    no_abandon: bool,
+    matches: impl Fn(&GateCall) -> bool + Send + Sync + 'static,
+) -> Result<Hibernation> {
+    let before = guest_ping(pod_id).await?;
+    let held = diskd_gate().hold(matches);
+    let hibernation = spawn_hibernation(pods, pod_id, "w1", no_abandon);
+    timeout(STEP_TIMEOUT, held.arrived())
+        .await
+        .context("the hibernation did not reach the call")?;
+    let shown = self::hibernation(pods, pod_id).await?;
+    assert!(!shown.abandonable, "{shown:?}");
+
+    let resumed = {
+        let mut pods = pods.clone();
+        let pod_id = pod_id.to_string();
+        tokio::spawn(async move { resume(&mut pods, &pod_id, STEP_TIMEOUT).await })
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ensure!(!resumed.is_finished(), "the resume did not wait");
+    held.release();
+    let checkpoint = hibernation
+        .await??
+        .checkpoint
+        .context("a hibernation has a checkpoint")?;
+    resumed.await??;
+    let pod = get_pod(pods, pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    assert_eq!(pod.hibernation, None);
+    assert_eq!(pod.checkpoint.as_ref(), Some(&checkpoint), "not restored");
+    guard.set_pid(pid(&pod)?);
+    assert_eq!(guest_ping(pod_id).await?.boot_id, before.boot_id);
+    Ok(shown)
+}
+
+#[tokio::test]
+async fn test_resume_waits_for_a_drain() -> Result<()> {
+    if !can_hibernate()? {
+        return Ok(());
+    }
+    ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let (pod_id, mut guard) = up_pod(&mut pods).await?;
+
+    info!("Hibernating pod {pod_id} for a drain, and resuming it while its disk uploads");
+    let id = pod_id.clone();
+    let shown = resume_waits(
+        &mut pods,
+        &pod_id,
+        &mut guard,
+        true,
+        move |call| matches!(call, GateCall::Seal(seal) if seal.pod_id == id && seal.upload),
+    )
+    .await?;
+    assert_eq!(shown.phase(), HibernationPhase::UploadingDisk);
+
+    delete(&mut pods, &pod_id, guard).await
+}
+
+#[tokio::test]
+async fn test_resume_after_the_point_of_no_return() -> Result<()> {
+    if !can_hibernate()? {
+        return Ok(());
+    }
+    ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let (pod_id, mut guard) = up_pod(&mut pods).await?;
+
+    info!("Hibernating pod {pod_id}, and resuming it while its head is put");
+    let id = pod_id.clone();
+    let shown = resume_waits(
+        &mut pods,
+        &pod_id,
+        &mut guard,
+        false,
+        move |call| matches!(call, GateCall::PutHead(head) if head.pod_id == id),
+    )
+    .await?;
+    assert_eq!(shown.phase(), HibernationPhase::Head);
+
+    delete(&mut pods, &pod_id, guard).await
+}
+
+#[tokio::test]
+async fn test_hibernation_outlives_its_call() -> Result<()> {
+    if !can_hibernate()? {
+        return Ok(());
+    }
+    ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let mut disks = diskd().await?;
+    let (pod_id, guard) = up_pod(&mut pods).await?;
+
+    info!("Hibernating pod {pod_id} with a call that gives up after a second");
+    let id = pod_id.clone();
+    let upload = diskd_gate()
+        .hold(move |call| matches!(call, GateCall::Seal(seal) if seal.pod_id == id && seal.upload));
+    let mut request = tonic::Request::new(HibernatePodRequest {
+        pod_id: pod_id.clone(),
+        ..Default::default()
+    });
+    request.set_timeout(Duration::from_secs(1));
+    let status = pods
+        .hibernate_pod(request)
+        .await
+        .expect_err("a hibernation that held answered within a second");
+    assert!(
+        matches!(status.code(), Code::DeadlineExceeded | Code::Cancelled),
+        "{status:?}"
+    );
+    timeout(STEP_TIMEOUT, upload.arrived())
+        .await
+        .context("the hibernation did not go on")?;
+    upload.release();
+    // The pod is HIBERNATED before its hibernation ends: in LEAVING, it
+    // still leaves the node.
+    let pod = timeout(STEP_TIMEOUT, async {
+        loop {
+            let pod = get_pod(&mut pods, &pod_id).await?;
+            if pod.state() == PodState::Hibernated {
+                match &pod.hibernation {
+                    None => return anyhow::Ok(pod),
+                    Some(shown) => assert_eq!(shown.phase(), HibernationPhase::Leaving),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .context("the pod did not hibernate")??;
+    let checkpoint = pod
+        .checkpoint
+        .context("a hibernated pod has a checkpoint")?;
+    assert!(has_head(&mut disks, checkpoint.head_key).await?);
+
+    delete(&mut pods, &pod_id, guard).await
+}
+
+#[tokio::test]
+async fn test_hibernate_pod_joins() -> Result<()> {
+    if !can_hibernate()? {
+        return Ok(());
+    }
+    ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let (pod_id, guard) = up_pod(&mut pods).await?;
+
+    info!("Hibernating pod {pod_id} with two calls");
+    let id = pod_id.clone();
+    let upload = diskd_gate()
+        .hold(move |call| matches!(call, GateCall::Seal(seal) if seal.pod_id == id && seal.upload));
+    let first = spawn_hibernation(&pods, &pod_id, "j1", false);
+    timeout(STEP_TIMEOUT, upload.arrived())
+        .await
+        .context("the hibernation did not reach the upload")?;
+    let second = spawn_hibernation(&pods, &pod_id, "j2", false);
+    timeout(Duration::from_secs(10), async {
+        while self::hibernation(&mut pods, &pod_id).await?.request_ids != ["j1", "j2"] {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .context("the second call did not join")??;
+    upload.release();
+    let first = first.await??;
+    let second = second.await??;
+    assert!(first.checkpoint.is_some() && first.disk_bytes > 0);
+    assert_eq!(first, second, "one hibernation, one answer");
+    assert_eq!(
+        get_pod(&mut pods, &pod_id).await?.state(),
+        PodState::Hibernated
+    );
+
+    delete(&mut pods, &pod_id, guard).await
 }

@@ -24,6 +24,7 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 pub mod container_tests;
+pub mod diskd_gate;
 pub mod fixtures;
 pub mod host_tests;
 pub mod image_tests;
@@ -47,6 +48,10 @@ pub static TEST_CONTAINER_IMAGE_REF: Lazy<String> = Lazy::new(|| {
 
 static SERVER_RUNTIME: TokioOnceCell<Arc<tokio::runtime::Runtime>> = TokioOnceCell::const_new();
 static TEMP_DIR_GUARD: SyncOnceCell<tempfile::TempDir> = SyncOnceCell::new();
+
+/// The tests that use the object store: one that counts diskd's uploads
+/// takes it alone, the others share it.
+pub static OBJECT_STORE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 pub async fn ensure_server() {
     SERVER_RUNTIME
@@ -84,6 +89,13 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
         .build()
         .expect("Failed to create a new Tokio runtime for the server");
 
+    // feosd reaches diskd through the tests' gate.
+    let gate = temp_dir.path().join("diskd-gate.sock");
+    {
+        let _runtime = runtime.enter();
+        diskd_gate::serve(&gate).expect("Failed to serve the diskd gate");
+    }
+
     runtime.spawn(async move {
         let options = main_server::ServerOptions {
             tcp: Some("[::]:1337".parse().expect("an address")),
@@ -91,6 +103,7 @@ async fn setup_server() -> Arc<tokio::runtime::Runtime> {
                 pod_prefix: pod_service::network::parse_pod_prefix(POD_PREFIX).ok(),
                 ..Default::default()
             },
+            diskd_socket: Some(gate),
             ..Default::default()
         };
         if let Err(e) = main_server::run_server(options).await {

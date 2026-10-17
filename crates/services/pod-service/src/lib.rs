@@ -149,8 +149,10 @@ impl PodService for Pods {
         &self,
         request: Request<HibernatePodRequest>,
     ) -> Result<Response<HibernatePodResponse>, Status> {
+        let request = request.into_inner();
         Ok(Response::new(
-            self.hibernate(&request.into_inner().pod_id).await?,
+            self.hibernate(&request.pod_id, &request.request_id, request.no_abandon)
+                .await?,
         ))
     }
 
