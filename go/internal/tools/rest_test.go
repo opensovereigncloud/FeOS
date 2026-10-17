@@ -240,8 +240,9 @@ func TestRESTResultShape(t *testing.T) {
 }
 
 // A call that failed is a 502 "<tool>: <err>" on every tool route, with
-// Retry-After for causes worth a retry, whatever another door answers for
-// the same cause; a client that hung up gets nothing.
+// Retry-After for causes worth a retry (the error's own time, else 5),
+// whatever another door answers for the same cause; a client that hung up
+// gets nothing.
 func TestRESTErrors(t *testing.T) {
 	env := toolstest.New(t, toolstest.Options{MaxStreams: 4}) // 2 long streams
 	r := newRunner(env)
@@ -263,7 +264,7 @@ func TestRESTErrors(t *testing.T) {
 		{fmt.Errorf("instance i1 is stopping: %w", model.ErrStopping), "/processes", ``,
 			`{"error":"process_list: ensure sandbox: instance i1 is stopping: instance is stopping"}` + "\n", "5"},
 		{hibernating{sb.ID}, "/exec", `{"command":"x"}`,
-			`{"error":"bash: ensure sandbox: sandbox ` + sb.ID.String() + ` is hibernating; retry in a minute"}` + "\n", "5"},
+			`{"error":"bash: ensure sandbox: sandbox ` + sb.ID.String() + ` is hibernating; retry in a minute"}` + "\n", "60"},
 	} {
 		env.Engine.FailAcquire(sb.ID, tc.err)
 		method := "GET"

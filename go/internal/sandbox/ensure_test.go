@@ -6,6 +6,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -278,6 +280,11 @@ func wantHibernating(t *testing.T, id uuid.UUID, took time.Duration, err error) 
 	want := "sandbox " + id.String() + " is hibernating; retry in a minute"
 	if err == nil || err.Error() != want || !errors.Is(err, model.ErrBusy) {
 		t.Fatalf("got error %v, want ErrBusy %q", err, want)
+	}
+	// It asks for a retry in a minute, as it says, also as the tools wrap
+	// it: the REST tool routes' Retry-After.
+	if got := apierr.RetryAfterOf(fmt.Errorf("ensure sandbox: %w", err), 5); got != 60 {
+		t.Fatalf("Retry-After %d, want 60", got)
 	}
 	if took < 300*time.Millisecond || took > 10*time.Second {
 		t.Fatalf("the answer took %v", took)

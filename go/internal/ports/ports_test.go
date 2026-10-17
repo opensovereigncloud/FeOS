@@ -26,6 +26,15 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
 )
 
+// later is an engine error that asks for a retry after a time, as the
+// engine's "sandbox <id> is hibernating; retry in a minute".
+type later struct {
+	error
+	after time.Duration
+}
+
+func (e later) RetryAfter() time.Duration { return e.after }
+
 // wantAnswer checks a plain-text answer of the door.
 func wantAnswer(t *testing.T, what string, code int, retry, body string, wantCode int, wantRetry, wantBody string) {
 	t.Helper()
@@ -460,6 +469,10 @@ func TestErrorMapping(t *testing.T) {
 	code, retry, body = w.do("GET", w.url(guestPort, "/"), nil, "")
 	wantAnswer(t, "not brought up", code, retry, body, 503, "5",
 		"the sandbox could not be brought up: no capacity on node n1")
+	w.eng.FailAcquire(w.sb.ID, later{errors.New("sandbox is hibernating; retry in a minute"), time.Minute})
+	code, retry, body = w.do("GET", w.url(guestPort, "/"), nil, "")
+	wantAnswer(t, "hibernating", code, retry, body, 503, "60",
+		"the sandbox could not be brought up: sandbox is hibernating; retry in a minute")
 	w.noHoldsLeft()
 
 	// No connection to the node: the lease says it runs there, the node

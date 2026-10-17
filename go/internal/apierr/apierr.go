@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // Error is an error the API answers with its own status and body
@@ -42,6 +43,22 @@ func (e *Error) RetryAfter(seconds int) *Error {
 	}
 	e.Header.Set("Retry-After", fmt.Sprint(seconds))
 	return e
+}
+
+// RetryAfterOf is the Retry-After, in seconds, that err asks for: the
+// first error in its chain with a method RetryAfter() time.Duration (the
+// engine's "sandbox <id> is hibernating; retry in a minute" says 60),
+// rounded up to whole seconds, or def when none says a positive time.
+func RetryAfterOf(err error, def int) int {
+	var later interface{ RetryAfter() time.Duration }
+	if !errors.As(err, &later) {
+		return def
+	}
+	d := later.RetryAfter()
+	if d <= 0 {
+		return def
+	}
+	return int((d + time.Second - 1) / time.Second)
 }
 
 type body struct {

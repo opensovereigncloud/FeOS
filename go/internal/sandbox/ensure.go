@@ -662,10 +662,16 @@ func (en *ensurer) hibernateDeadline() time.Time {
 	return en.hibernateSince.Add(en.e.t.hibernateWait)
 }
 
+// hibernatingRetry is when a caller told that the sandbox is hibernating
+// should come back: a hibernation takes minutes, and a later Ensure
+// restores the sandbox.
+const hibernatingRetry = time.Minute
+
 // hibernating is the answer of a call whose hibernate did not end within
-// the wait: retryable, the op goes on.
+// the wait: ErrBusy, retryable after a minute (Retry-After: 60 where a
+// door sends one); the op goes on.
 func (en *ensurer) hibernating() error {
-	return errorf(model.ErrBusy, "sandbox %s is hibernating; retry in a minute", en.id)
+	return laterf(hibernatingRetry, model.ErrBusy, "sandbox %s is hibernating; retry in a minute", en.id)
 }
 
 // waitHibernateOp waits for a hibernate this instance runs (joined, or

@@ -20,6 +20,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
@@ -389,7 +390,9 @@ func (h *Handler) detached(ctx context.Context, f func(ctx context.Context) erro
 	}
 }
 
-// acquireFailed answers a sandbox that could not be brought up and held.
+// acquireFailed answers a sandbox that could not be brought up and held:
+// a retry after the time the error asks for (60 s for a hibernation in
+// flight), else after 5 s.
 func (h *Handler) acquireFailed(ctx context.Context, w http.ResponseWriter, id uuid.UUID, err error) {
 	switch {
 	case ctx.Err() != nil:
@@ -400,7 +403,7 @@ func (h *Handler) acquireFailed(ctx context.Context, w http.ResponseWriter, id u
 		reply{http.StatusServiceUnavailable, "the sandbox's node is unavailable", 5}.write(w)
 	default:
 		h.rl.warn("acquire", "forward: the sandbox could not be brought up", "sandbox", id, "err", err)
-		reply{http.StatusServiceUnavailable, "the sandbox could not be brought up: " + err.Error(), 5}.write(w)
+		reply{http.StatusServiceUnavailable, "the sandbox could not be brought up: " + err.Error(), apierr.RetryAfterOf(err, 5)}.write(w)
 	}
 }
 

@@ -740,11 +740,13 @@ hibernation reported yet, the op's call not in it yet, no answer), Ensure
 asks again every second. Any other hibernation in flight (a drain's, one
 past its point of no return, every one on a feosd that does not report
 its hibernations) is waited for at most 30 s; after that the caller gets
-"sandbox <id> is hibernating; retry in a minute", and a later call
-restores the sandbox. Ensure starts at most one op of each kind per node
-per call, and returns the error of an op that failed instead of trying
-again: "<op> on node <n> failed: <description>". Every error of Ensure
-reaches the client as `ensure sandbox: <error>`.
+`ErrBusy`, "sandbox <id> is hibernating; retry in a minute", which
+carries a retry time of 60 s (`apierr.RetryAfterOf`) that the tool routes
+and the port door send as `Retry-After`, and a later call restores the
+sandbox. Ensure starts at most one op of each kind per node per call,
+and returns the error of an op that failed instead of trying again:
+"<op> on node <n> failed: <description>". Every error of Ensure reaches
+the client as `ensure sandbox: <error>`.
 
 `Acquire` is Ensure and a **hold**: a row in `sandbox_holds` that keeps
 the sandbox from being paused while a call or a forward runs, leased for
@@ -949,9 +951,10 @@ A call that finds the pod not running or not there syncs, acquires again
 and retries once. REST and MCP share the one entry point:
 
 - **REST** answers 200 whenever the tool ran, its exit code being its
-  verdict, and 502 `{"error": "<tool>: <error>"}` otherwise, with
-  `Retry-After: 5` when a retry is worth it (no capacity, a node or
-  instance unavailable or stopping, a hibernation in flight, a budget).
+  verdict, and 502 `{"error": "<tool>: <error>"}` otherwise, with a
+  `Retry-After` when a retry is worth it (no capacity, a node or instance
+  unavailable or stopping, a hibernation in flight, a budget): 60 for a
+  hibernation in flight, 5 for the others.
   `PUT …/files/{path}` writes its body byte for byte, whatever the bytes;
   the activity log records the write with its content when that is UTF-8
   text, as MCP's, and by its path and size otherwise.
@@ -999,8 +1002,11 @@ connections into this sandbox on this instance, try again" with
 pooled connections. The 30 s bounds that wait only: a dial that has its
 slot waits for the node (up to its rollout deadline when it announced a
 restart) and for the guest's ready as long as they take, and the request
-gets their answer. A forward holds the sandbox awake. A failed dial is
-read by its code and feosd's text,
+gets their answer. A forward holds the sandbox awake. A sandbox that
+cannot be brought up is 503 "the sandbox could not be brought up:
+<error>" with `Retry-After: 5`, 60 for a hibernation in flight; one whose
+node is unavailable is 503 "the sandbox's node is unavailable", also with
+`Retry-After: 5`. A failed dial is read by its code and feosd's text,
 since both failures that matter come as `UNAVAILABLE`: "127.0.0.1:<port>:
 …", the guest's, means nothing listens on the port (502), "the guest of
 pod …" that the guest does not answer (503), anything else that the node

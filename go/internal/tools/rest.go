@@ -24,7 +24,7 @@ import (
 const maxRequestBody = 32 << 20
 
 // retryAfter is the Retry-After of a tool route's 502 for a cause worth
-// retrying.
+// retrying that says no time of its own.
 const retryAfter = 5
 
 // REST serves the tool baseline over REST: each handler fills a tool's
@@ -35,8 +35,10 @@ const retryAfter = 5
 // A tool that ran is a 200 whatever its exit code, which is a field of the
 // answer: {"exitCode", "output", "truncated"?, "image"?}. A call that
 // failed, the sandbox not prepared or the node not answering, is a 502
-// {"error": "<tool>: <err>"}, with Retry-After: 5 when a retry is worth it
-// (Retryable); these routes never map errors to other statuses. A bad
+// {"error": "<tool>: <err>"}, with a Retry-After when a retry is worth it
+// (Retryable): the time the error asks for (apierr.RetryAfterOf; 60 for a
+// hibernation in flight), else 5. These routes never map errors to other
+// statuses. A bad
 // request is a 400. A body larger than 32 MiB is a 413, and so is a write,
 // an edit or a command larger than the guest takes (TooLargeError), with
 // its limit in the text. A client that hung up gets nothing.
@@ -100,7 +102,7 @@ func (h *REST) answer(w http.ResponseWriter, r *http.Request, tool string,
 	if err != nil {
 		e := apierr.New(http.StatusBadGateway, "%s: %v", tool, err)
 		if Retryable(err) {
-			e.RetryAfter(retryAfter)
+			e.RetryAfter(apierr.RetryAfterOf(err, retryAfter))
 		}
 		apierr.Write(w, e)
 		return

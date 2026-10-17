@@ -81,7 +81,8 @@ func TestEnsureSandboxWrapping(t *testing.T) {
 }
 
 // hibernating is the engine's answer for a sandbox whose hibernation did
-// not end within Ensure's wait: a text of its own that is model.ErrBusy.
+// not end within Ensure's wait: a text of its own that is model.ErrBusy,
+// and a retry after a minute.
 type hibernating struct{ id uuid.UUID }
 
 func (e hibernating) Error() string {
@@ -89,6 +90,8 @@ func (e hibernating) Error() string {
 }
 
 func (e hibernating) Unwrap() error { return model.ErrBusy }
+
+func (e hibernating) RetryAfter() time.Duration { return time.Minute }
 
 // An op in flight that Ensure does not wait for (a hibernation) is worth
 // a retry, however it is wrapped.
