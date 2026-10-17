@@ -149,34 +149,113 @@ body {
   92%, 93% { opacity: 0.55; }
 }
 
-/* Who is signed in, and the way out, beside the image field. */
-.user-box {
+/* Who is signed in, beside the image field: the avatar, centred on the
+   field, opens a menu with the name and the way out. */
+.user-menu {
+  position: relative;
   display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  font-size: 0.8rem;
-  opacity: 0.85;
+}
+
+.user-button {
+  display: flex;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: box-shadow 0.15s ease;
+}
+
+.user-button:hover,
+.user-button:focus-visible,
+.user-button.open {
+  outline: none;
+  box-shadow:
+    0 0 0 1px var(--cyan),
+    0 0 10px rgba(10, 189, 198, 0.5);
 }
 
 .user-avatar {
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
 }
 
-.user-signout {
-  background: none;
-  border: 1px solid currentColor;
-  border-radius: 4px;
-  color: inherit;
-  font: inherit;
-  padding: 0.1rem 0.45rem;
-  cursor: pointer;
-  opacity: 0.7;
+.user-initial {
+  display: grid;
+  place-items: center;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 0.85rem;
 }
 
-.user-signout:hover {
-  opacity: 1;
+/* The menu hangs below the avatar, in the image tooltip's look. */
+.user-dropdown {
+  position: absolute;
+  top: calc(100% + 0.7rem);
+  right: 0;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  min-width: 12rem;
+  padding: 0.7rem 0.85rem;
+  background: rgba(6, 16, 38, 0.97);
+  border: 1px solid var(--cyan);
+  border-radius: 3px;
+  box-shadow:
+    0 0 12px rgba(10, 189, 198, 0.35),
+    0 0 36px rgba(10, 189, 198, 0.15),
+    0 8px 24px rgba(0, 0, 0, 0.6);
+  font-size: 0.8rem;
+}
+
+/* small corner at the top right, pointing at the avatar */
+.user-dropdown::before {
+  content: '';
+  position: absolute;
+  top: -5px;
+  right: 10px;
+  width: 8px;
+  height: 8px;
+  background: inherit;
+  border-top: 1px solid var(--cyan);
+  border-left: 1px solid var(--cyan);
+  transform: rotate(45deg);
+}
+
+.user-name {
+  font-weight: 700;
+  color: var(--cyan);
+  text-shadow: 0 0 8px rgba(10, 189, 198, 0.6);
+}
+
+.user-email {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+}
+
+.user-signout {
+  align-self: stretch;
+  margin-top: 0.5rem;
+  background: none;
+  border: 1px solid var(--panel-2);
+  border-radius: 2px;
+  color: var(--text);
+  font: inherit;
+  padding: 0.3rem 0.6rem;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.user-signout:hover,
+.user-signout:focus-visible {
+  border-color: var(--magenta);
+  color: var(--magenta);
+  outline: none;
+  box-shadow: 0 0 10px rgba(234, 0, 217, 0.35);
 }
 
 .boot-error {
@@ -184,17 +263,13 @@ body {
   font-family: sans-serif;
 }
 
-@media (max-width: 640px) {
-  .user-name {
-    display: none;
-  }
-}
-
 /* The sandbox image field, at the right of the topbar. Editable until
-   the first message; the check's status below it. */
+   the first message; the check's status below it. The row is as high as
+   the field (status and tooltip hang absolutely), so the avatar beside it
+   sits centred on it. */
 .topbar-right {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 0.8rem;
 }
 

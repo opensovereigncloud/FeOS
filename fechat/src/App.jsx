@@ -196,6 +196,54 @@ function renderMarkdown(text) {
   return DOMPurify.sanitize(marked.parse(text))
 }
 
+// Who is signed in: the avatar, which opens a menu with the name and the
+// way out. A click outside or Escape closes it.
+function UserMenu({ user }) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef(null)
+  useEffect(() => {
+    if (!open) return
+    const outside = (e) => {
+      if (!ref.current?.contains(e.target)) setOpen(false)
+    }
+    const escape = (e) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('pointerdown', outside)
+    document.addEventListener('keydown', escape)
+    return () => {
+      document.removeEventListener('pointerdown', outside)
+      document.removeEventListener('keydown', escape)
+    }
+  }, [open])
+  return (
+    <div className="user-menu" ref={ref}>
+      <button
+        className={`user-button${open ? ' open' : ''}`}
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={`Signed in as ${user.login}`}
+      >
+        {user.picture ? (
+          <img className="user-avatar" src={user.picture} alt="" />
+        ) : (
+          <span className="user-avatar user-initial">{user.login.slice(0, 1).toUpperCase()}</span>
+        )}
+      </button>
+      {open && (
+        <div className="user-dropdown" role="menu">
+          <div className="user-name">{user.login}</div>
+          {user.email && <div className="user-email">{user.email}</div>}
+          <button className="user-signout" role="menuitem" onClick={signOut}>
+            Sign out
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 let nextId = 1
 
 // Remember the last sandbox image in the browser: it survives reloads and
@@ -570,13 +618,7 @@ export default function App({ user }) {
               {imageCheck.state === 'error' && '✗ error'}
             </div>
           </div>
-          {user.login && (
-            <div className="user-box">
-              {user.picture && <img className="user-avatar" src={user.picture} alt="" />}
-              <span className="user-name" title={user.email}>{user.login}</span>
-              <button className="user-signout" onClick={signOut}>Sign out</button>
-            </div>
-          )}
+          {user.login && <UserMenu user={user} />}
         </div>
       </header>
 
