@@ -47,13 +47,15 @@ type timings struct {
 	// perSandbox bounds the Forward streams of one sandbox on this
 	// instance, pooled ones included.
 	perSandbox int
-	// capWait is how long a dial waits for one of the sandbox's slots
-	// before its request is answered 503.
+	// capWait is how long a request waits for its turn at a connection of
+	// its pool, in the pool's queue and for its dial's slot of the
+	// sandbox's cap together, and a dial for its slot, before the request
+	// is answered 503. The rest of a dial is not bounded by it.
 	capWait time.Duration
-	// maxConnsPerHost and maxIdlePerHost bound the connections of one
-	// (pod, port) transport; idleTimeout closes a pooled one.
-	maxConnsPerHost, maxIdlePerHost int
-	idleTimeout                     time.Duration
+	// maxIdlePerHost bounds the idle connections of one (pod, port)
+	// transport; idleTimeout closes a pooled one.
+	maxIdlePerHost int
+	idleTimeout    time.Duration
 	// maxTransports bounds the transports kept; unusedAfter evicts one
 	// that served nothing for that long, checked every sweepEvery.
 	maxTransports int
@@ -70,14 +72,13 @@ type timings struct {
 
 func defaultTimings() timings {
 	return timings{
-		perSandbox:      32,
-		capWait:         30 * time.Second,
-		maxConnsPerHost: 32,
-		maxIdlePerHost:  8,
-		idleTimeout:     90 * time.Second,
-		maxTransports:   4096,
-		unusedAfter:     90 * time.Second,
-		sweepEvery:      30 * time.Second,
+		perSandbox:     32,
+		capWait:        30 * time.Second,
+		maxIdlePerHost: 8,
+		idleTimeout:    90 * time.Second,
+		maxTransports:  4096,
+		unusedAfter:    90 * time.Second,
+		sweepEvery:     30 * time.Second,
 		// The engine bounds an Ensure by the preparation budget (7 m 5 s);
 		// this is the outer bound of a wake nobody waits for.
 		wakeTimeout:  8 * time.Minute,
@@ -465,6 +466,9 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, lease model.Leas
 	up **upgradedConn) (stale bool) {
 	tr, done := h.transport(lease, tg.port)
 	defer done()
+	ctx, stop := h.waitForConn(r.Context())
+	defer stop()
+	r = r.WithContext(ctx)
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = "http"

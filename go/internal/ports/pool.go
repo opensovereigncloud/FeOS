@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -188,8 +189,11 @@ func (h *Handler) sweep() {
 }
 
 // newTransport is the pool of one (pod, port) on node: HTTP/1.1 over
-// Forward streams, at most maxConnsPerHost connections (more requests wait
-// for one), maxIdlePerHost of them kept idle.
+// Forward streams, at most as many connections as the sandbox has slots
+// (more requests wait for one, at most capWait: waitForConn),
+// maxIdlePerHost of them kept idle. The pool's own bound keeps a burst on
+// one port on the connections it has: a request it queues does not dial,
+// and so neither takes a slot nor closes pooled connections for one.
 func (h *Handler) newTransport(k tkey, node string) *http.Transport {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
@@ -200,9 +204,105 @@ func (h *Handler) newTransport(k tkey, node string) *http.Transport {
 		},
 		Protocols:           &protocols,
 		MaxIdleConnsPerHost: h.t.maxIdlePerHost,
-		MaxConnsPerHost:     h.t.maxConnsPerHost,
+		MaxConnsPerHost:     h.t.perSandbox,
 		IdleConnTimeout:     h.t.idleTimeout,
 		DisableCompression:  true,
+	}
+}
+
+// waitForConn bounds a request's wait for its turn at a connection of its
+// pool to capWait: the wait in the pool's queue, which the transport would
+// let last without end, and its dial's wait for a slot of the sandbox's
+// cap. Past it the request fails with errCapFull, a 503. The wait is timed
+// per attempt of the transport, from httptrace's GetConn to its GotConn or
+// to the moment the attempt's dial holds its slot (connWait.dialing): what
+// is left of a dial, the node's connection (which waits out the node's
+// rollout grace) and the guest's ready, ends with the dial's own result,
+// and a connection that has been got is never cut. It returns the
+// request's context and the function that ends it.
+func (h *Handler) waitForConn(ctx context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	cw := &connWait{wait: h.t.capWait, cancel: cancel}
+	ctx = context.WithValue(ctx, connWaitKey{}, cw)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GetConn: func(string) { cw.begin() },
+		GotConn: func(httptrace.GotConnInfo) { cw.end() },
+	})
+	return ctx, func() {
+		cw.end()
+		cancel(nil)
+	}
+}
+
+// connWait is one request's wait for a connection (waitForConn).
+type connWait struct {
+	wait   time.Duration
+	cancel context.CancelCauseFunc
+
+	mu sync.Mutex
+	// timer is the current attempt's; nil once the attempt has a
+	// connection or its dial a slot.
+	timer *time.Timer
+}
+
+// connWaitKey carries a request's *connWait in its context, and so in the
+// context of the transport's dial for it, which keeps the request's
+// values.
+type connWaitKey struct{}
+
+// connWaitOf is the wait of the request a dial's ctx is for; nil when
+// there is none.
+func connWaitOf(ctx context.Context) *connWait {
+	cw, _ := ctx.Value(connWaitKey{}).(*connWait)
+	return cw
+}
+
+// begin starts an attempt's wait.
+func (cw *connWait) begin() {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if cw.timer != nil {
+		cw.timer.Stop()
+	}
+	var t *time.Timer
+	t = time.AfterFunc(cw.wait, func() {
+		cw.mu.Lock()
+		defer cw.mu.Unlock()
+		if cw.timer == t {
+			cw.cancel(errCapFull)
+		}
+	})
+	cw.timer = t
+}
+
+// end ends the current attempt's wait.
+func (cw *connWait) end() {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	if cw.timer != nil {
+		cw.timer.Stop()
+		cw.timer = nil
+	}
+}
+
+// dialing is called by a dial as it begins. The function it returns, which
+// the dial calls once it holds its slot, ends the wait of the attempt the
+// dial began for; not a later attempt's, which a dial outliving its own
+// attempt must not leave unbounded. On a nil cw it does nothing.
+func (cw *connWait) dialing() (slotTaken func()) {
+	if cw == nil {
+		return func() {}
+	}
+	cw.mu.Lock()
+	t := cw.timer
+	cw.mu.Unlock()
+	return func() {
+		cw.mu.Lock()
+		defer cw.mu.Unlock()
+		if t != nil && cw.timer == t {
+			t.Stop()
+			cw.timer = nil
+		}
 	}
 }
 
@@ -213,8 +313,9 @@ type capSem struct {
 	refs  int
 }
 
-// errCapFull is a dial that found no slot of the sandbox's cap within
-// capWait.
+// errCapFull is a request that got neither a connection of its pool nor
+// a slot of the sandbox's cap for its dial within capWait, or a dial that
+// found no slot within capWait.
 var errCapFull = errors.New("too many forwarded connections into the sandbox on this instance")
 
 // takeSlot takes one of the sandbox's slots, waiting up to capWait (or
@@ -286,13 +387,17 @@ func (e *dialError) Unwrap() error { return e.err }
 // dial opens one forwarded connection: a slot of the sandbox's cap, then a
 // Forward stream on the node connection, open{port}, and the guest's
 // ready, so that "nothing listens on the port" arrives as a failed dial
-// and not as a stream that stays silent. The stream does not end with
-// ctx: an upgraded connection outlives the dial by far; Close ends it.
+// and not as a stream that stays silent. Once it holds the slot, its
+// request no longer waits on the cap: the rest takes as long as the node
+// and the guest take. The stream does not end with ctx: an upgraded
+// connection outlives the dial by far; Close ends it.
 func (h *Handler) dial(ctx context.Context, k tkey, node string) (net.Conn, error) {
+	slotTaken := connWaitOf(ctx).dialing()
 	release, err := h.takeSlot(ctx, k.id)
 	if err != nil {
 		return nil, err
 	}
+	slotTaken()
 	cc, err := h.conns.Conn(ctx, node)
 	if err != nil {
 		release()

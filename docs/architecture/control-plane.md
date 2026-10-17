@@ -979,9 +979,17 @@ start does not cancel it. The request goes through a reverse proxy whose
 transport dials `PortForwardService/Forward` on the sandbox's node
 connection; the token stops at the door, and the guest sees the Host the
 client sent, which for FeCode's previews is the preview host. Upgrades
-such as WebSockets ride through. Connections are pooled per pod and port,
-at most 32, for whose slots a request waits up to 30 s; a forward holds
-the sandbox awake. A failed dial is read by its code and feosd's text,
+such as WebSockets ride through. Connections are pooled per pod and port;
+a sandbox has at most 32 on the instance, pooled ones included, and a
+port's pool no more. A request waits up to 30 s for its turn at a
+connection, a pooled one or a slot for a new one, then gets 503 "too many
+connections into this sandbox on this instance, try again" with
+`Retry-After: 1`; a dial that waits for a slot closes the sandbox's idle
+pooled connections. The 30 s bounds that wait only: a dial that has its
+slot waits for the node (up to its rollout deadline when it announced a
+restart) and for the guest's ready as long as they take, and the request
+gets their answer. A forward holds the sandbox awake. A failed dial is
+read by its code and feosd's text,
 since both failures that matter come as `UNAVAILABLE`: "127.0.0.1:<port>:
 …", the guest's, means nothing listens on the port (502), "the guest of
 pod …" that the guest does not answer (503), anything else that the node

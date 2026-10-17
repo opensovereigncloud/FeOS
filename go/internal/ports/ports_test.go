@@ -287,6 +287,129 @@ func TestWaitingCap(t *testing.T) {
 	wg.Wait()
 }
 
+// The cap holds on one port as it does across ports: with every slot of
+// the sandbox busy on the port, the next request to that port waits for a
+// slot at most capWait and then gets 503, instead of waiting in the
+// transport for one of the port's connections without end.
+func TestWaitingCapOnePort(t *testing.T) {
+	w := newWorld(t, func(tm *timings) { tm.capWait = 1500 * time.Millisecond })
+	slots := defaultTimings().perSandbox
+	var once sync.Once
+	release := func() { once.Do(func() { close(w.guest.release) }) }
+	t.Cleanup(release)
+	var wg sync.WaitGroup
+	for range slots {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if code, _, body := w.do("GET", w.url(guestPort, "/hold"), nil, ""); code != 200 {
+				t.Errorf("%d %s", code, body)
+			}
+		}()
+	}
+	eventually(t, 10*time.Second, "every slot held on one port", func() bool {
+		return w.guest.inFlight.Load() == int64(slots)
+	})
+	start := time.Now()
+	type answer struct {
+		code        int
+		retry, body string
+	}
+	done := make(chan answer, 1)
+	go func() {
+		code, retry, body := w.do("GET", w.url(guestPort, "/x"), nil, "")
+		done <- answer{code, retry, body}
+	}()
+	select {
+	case a := <-done:
+		wantAnswer(t, "past the cap on one port", a.code, a.retry, a.body, 503, "1",
+			"too many connections into this sandbox on this instance, try again")
+		if d := time.Since(start); d < 1500*time.Millisecond {
+			t.Errorf("answered after %v, before the cap's wait", d)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request past the cap was not answered within 10 s")
+	}
+	if n := w.guest.inFlight.Load(); n != int64(slots) {
+		t.Errorf("%d requests in the guest, want %d", n, slots)
+	}
+	release()
+	wg.Wait()
+	w.noHoldsLeft()
+}
+
+// The cap's wait bounds the wait for the cap only. A dial that holds its
+// slot and then waits for the guest's ready, or for a node within its
+// rollout deadline, takes as long as they take; it is served when they
+// answer and gets its own answer when they fail, never the cap's 503.
+// Each case uses a port of its own, so that it dials.
+func TestCapWaitIsTheCapsOnly(t *testing.T) {
+	const capWait = time.Second
+	w := newWorld(t, func(tm *timings) { tm.capWait = capWait })
+	script := w.env.Node.Script()
+	for _, p := range []uint32{5174, 5175} {
+		script.SetPortAddr(p, w.guest.addr())
+	}
+
+	// A guest whose ready comes after the cap's wait.
+	forward := portforwardv1.PortForwardService_Forward_FullMethodName
+	script.SetHook(forward, func(ctx context.Context, _ string, _ any) error {
+		select {
+		case <-time.After(2 * capWait):
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	start := time.Now()
+	if code, _, body := w.do("GET", w.url(5174, "/"), nil, ""); code != 200 {
+		t.Errorf("a late ready: %d %s", code, body)
+	}
+	if d := time.Since(start); d < 2*capWait {
+		t.Errorf("a late ready answered after %v", d)
+	}
+	script.SetHook(forward, nil)
+
+	// A node away within its rollout deadline (the lease is the one read
+	// before it left).
+	w.env.Node.Partition(true)
+	eventually(t, 10*time.Second, "the node gone", func() bool { return !w.env.Port.Connected(toolstest.NodeName) })
+	w.eng.Stale(w.sb.ID, 2)
+
+	// It does not come back: the answer is the node's, at its deadline.
+	start = time.Now()
+	w.env.Port.SetStoppingUntil(toolstest.NodeName, time.Now().Add(3*capWait))
+	code, retry, body := w.do("GET", w.url(5175, "/"), nil, "")
+	wantAnswer(t, "a node that stays away", code, retry, body, 503, "5", "the sandbox's node is unavailable")
+	if d := time.Since(start); d < 3*capWait {
+		t.Errorf("a node that stays away answered after %v, before its deadline", d)
+	}
+
+	// It comes back: the request it held is served.
+	w.env.Port.SetStoppingUntil(toolstest.NodeName, time.Now().Add(time.Minute))
+	done := make(chan string, 1)
+	go func() {
+		code, _, body := w.do("GET", w.url(guestPort, "/"), nil, "")
+		done <- fmt.Sprintf("%d %s", code, body)
+	}()
+	time.Sleep(2 * capWait)
+	select {
+	case got := <-done:
+		t.Fatalf("answered while the node was away: %s", got)
+	default:
+	}
+	w.env.Node.Partition(false)
+	select {
+	case got := <-done:
+		if !strings.HasPrefix(got, "200 ") {
+			t.Errorf("the request held for the node: %s", got)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the request held for the node was not answered within 30 s of its return")
+	}
+	w.env.Port.SetStoppingUntil(toolstest.NodeName, time.Time{})
+	w.noHoldsLeft()
+}
+
 // The failures of the node and the guest, as the door answers them.
 func TestErrorMapping(t *testing.T) {
 	w := newWorld(t)

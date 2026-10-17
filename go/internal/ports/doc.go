@@ -27,14 +27,16 @@
 // Host the client sent, which for FeCode's previews is the preview host.
 //
 // Connections are pooled per pod, port and node: a page that loads a
-// hundred modules rides a few Forward streams, at most 32 per port, and
-// at most 32 per sandbox on this instance, for whose slots a dial waits
-// up to 30 s. A forwarded request, and an upgraded connection for as long
-// as it is open, holds the sandbox awake (a forward hold), and its end
-// counts as activity. At an instance's stop the upgraded connections are
-// closed once no request is left (CloseUpgraded); their clients reconnect
-// to another instance. So are those to a pod that stops running on its
-// node, as when a drain moves its sandbox: a forward does not keep a
-// sandbox on a draining node, and its client reconnects to where it runs
-// next.
+// hundred modules rides a few Forward streams, at most 32 per sandbox on
+// this instance, pooled ones included, and so at most 32 per port. A
+// request waits up to 30 s for its turn at a connection, a pooled one or a
+// slot for a new one, and then gets 503; a dial that has its slot waits
+// for the node and the guest as long as they take. A forwarded request,
+// and an upgraded connection for as long as it is open, holds the sandbox
+// awake (a forward hold), and its end counts as activity. At an instance's
+// stop the upgraded connections are closed once no request is left
+// (CloseUpgraded); their clients reconnect to another instance. So are
+// those to a pod that stops running on its node, as when a drain moves its
+// sandbox: a forward does not keep a sandbox on a draining node, and its
+// client reconnects to where it runs next.
 package ports
