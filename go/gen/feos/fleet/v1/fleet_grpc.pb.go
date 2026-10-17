@@ -24,6 +24,7 @@ const (
 	FleetService_ReportTelemetry_FullMethodName     = "/feos.fleet.v1.FleetService/ReportTelemetry"
 	FleetService_PublishEvents_FullMethodName       = "/feos.fleet.v1.FleetService/PublishEvents"
 	FleetService_IssuePodCredentials_FullMethodName = "/feos.fleet.v1.FleetService/IssuePodCredentials"
+	FleetService_JoinMesh_FullMethodName            = "/feos.fleet.v1.FleetService/JoinMesh"
 )
 
 // FleetServiceClient is the client API for FleetService service.
@@ -93,6 +94,17 @@ type FleetServiceClient interface {
 	// answer was lost, is answered again. Too many requests for one pod fail
 	// with RESOURCE_EXHAUSTED; feos-authn retries them with backoff.
 	IssuePodCredentials(ctx context.Context, in *IssuePodCredentialsRequest, opts ...grpc.CallOption) (*IssuePodCredentialsResponse, error)
+	// The node's place on the cluster's mesh (ADR 0017), asked for whenever
+	// the uplink comes up and whenever the node's key or endpoint changes:
+	// its WireGuard key and endpoint in, the cluster's ULA and the node's
+	// /64 of it out. The control plane gives a node its /64 at its first
+	// call, the next of the ULA, never one twice, and the same one on every
+	// call after it, until the node is removed; the other nodes get the key
+	// and the endpoint as a peer (feos.network.v1.MeshService). In a
+	// cluster whose network is routed, the answer is empty. A request
+	// without a key, from a node with a prefix of its network's, asks only
+	// whether the cluster is meshed: its answer has the ULA and no /64.
+	JoinMesh(ctx context.Context, in *JoinMeshRequest, opts ...grpc.CallOption) (*JoinMeshResponse, error)
 }
 
 type fleetServiceClient struct {
@@ -150,6 +162,16 @@ func (c *fleetServiceClient) IssuePodCredentials(ctx context.Context, in *IssueP
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(IssuePodCredentialsResponse)
 	err := c.cc.Invoke(ctx, FleetService_IssuePodCredentials_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fleetServiceClient) JoinMesh(ctx context.Context, in *JoinMeshRequest, opts ...grpc.CallOption) (*JoinMeshResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JoinMeshResponse)
+	err := c.cc.Invoke(ctx, FleetService_JoinMesh_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -223,6 +245,17 @@ type FleetServiceServer interface {
 	// answer was lost, is answered again. Too many requests for one pod fail
 	// with RESOURCE_EXHAUSTED; feos-authn retries them with backoff.
 	IssuePodCredentials(context.Context, *IssuePodCredentialsRequest) (*IssuePodCredentialsResponse, error)
+	// The node's place on the cluster's mesh (ADR 0017), asked for whenever
+	// the uplink comes up and whenever the node's key or endpoint changes:
+	// its WireGuard key and endpoint in, the cluster's ULA and the node's
+	// /64 of it out. The control plane gives a node its /64 at its first
+	// call, the next of the ULA, never one twice, and the same one on every
+	// call after it, until the node is removed; the other nodes get the key
+	// and the endpoint as a peer (feos.network.v1.MeshService). In a
+	// cluster whose network is routed, the answer is empty. A request
+	// without a key, from a node with a prefix of its network's, asks only
+	// whether the cluster is meshed: its answer has the ULA and no /64.
+	JoinMesh(context.Context, *JoinMeshRequest) (*JoinMeshResponse, error)
 	mustEmbedUnimplementedFleetServiceServer()
 }
 
@@ -247,6 +280,9 @@ func (UnimplementedFleetServiceServer) PublishEvents(grpc.BidiStreamingServer[Ev
 }
 func (UnimplementedFleetServiceServer) IssuePodCredentials(context.Context, *IssuePodCredentialsRequest) (*IssuePodCredentialsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method IssuePodCredentials not implemented")
+}
+func (UnimplementedFleetServiceServer) JoinMesh(context.Context, *JoinMeshRequest) (*JoinMeshResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method JoinMesh not implemented")
 }
 func (UnimplementedFleetServiceServer) mustEmbedUnimplementedFleetServiceServer() {}
 func (UnimplementedFleetServiceServer) testEmbeddedByValue()                      {}
@@ -348,6 +384,24 @@ func _FleetService_IssuePodCredentials_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FleetService_JoinMesh_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(JoinMeshRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FleetServiceServer).JoinMesh(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FleetService_JoinMesh_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FleetServiceServer).JoinMesh(ctx, req.(*JoinMeshRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // FleetService_ServiceDesc is the grpc.ServiceDesc for FleetService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -370,6 +424,10 @@ var FleetService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "IssuePodCredentials",
 			Handler:    _FleetService_IssuePodCredentials_Handler,
+		},
+		{
+			MethodName: "JoinMesh",
+			Handler:    _FleetService_JoinMesh_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -26,7 +26,7 @@ pub use telemetry::{inventory_hash, Diskd, Installed, Inventory};
 pub use token::{check_trust_domain, JoinToken};
 
 use chrono::Utc;
-use feos_proto::fleet_service::{JoinRequest, RenewCertificateRequest};
+use feos_proto::fleet_service::{JoinMeshRequest, JoinRequest, RenewCertificateRequest};
 use identity::{Identity, Instance, NodeDir};
 use log::{error, info, warn};
 use node::Nodes;
@@ -54,6 +54,7 @@ const FIRST_INTERVAL: Duration = Duration::from_secs(5);
 const REPORT_DEADLINE: Duration = Duration::from_secs(3);
 const JOIN_DEADLINE: Duration = Duration::from_secs(10);
 const RENEW_DEADLINE: Duration = Duration::from_secs(10);
+const JOIN_MESH_DEADLINE: Duration = Duration::from_secs(10);
 /// How often a node that waits for a join token looks at its file.
 const TOKEN_POLL: Duration = Duration::from_secs(5);
 const JOIN_BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
@@ -80,6 +81,9 @@ pub struct Config {
     /// The node's IPv6 prefix for pods, such as "2001:db8:1:2::/64", or
     /// empty.
     pub pod_prefix: String,
+    /// `--mesh-address`: where the other nodes reach the node's mesh; the
+    /// address from which it reaches the control plane when unset.
+    pub mesh_address: Option<std::net::IpAddr>,
     /// feosd's version.
     pub version: String,
 }
@@ -138,6 +142,7 @@ impl Config {
             node_dir: NODE_DIR.into(),
             node_name: None,
             pod_prefix: String::new(),
+            mesh_address: None,
             version: String::new(),
         })
     }
@@ -515,6 +520,9 @@ impl<I: Inventory> Runner<I> {
         let mut interval = FIRST_INTERVAL;
         let mut renew_at = identity.renew_after;
         let mut renew_wait = RENEW_BACKOFF.0;
+        // The last JoinMesh the control plane answered: asked again when
+        // the node's key or endpoint changes.
+        let mut joined: Option<JoinMeshRequest> = None;
         loop {
             if Utc::now() >= renew_at {
                 match self.renew(dir, &identity, &mut uplink).await {
@@ -585,6 +593,9 @@ impl<I: Inventory> Runner<I> {
                         self.nodes.set(&targets);
                     }
                     uplink.set_targets(self.uplink_targets(&identity.state.instances));
+                    if let Err(outcome) = self.join_mesh(&mut uplink, &mut joined).await {
+                        return outcome;
+                    }
                 }
                 Err(status) if status.code() == Code::PermissionDenied => {
                     return Outcome::Refused(status.message().to_string())
@@ -595,6 +606,94 @@ impl<I: Inventory> Runner<I> {
             let until_renewal = (renew_at - Utc::now()).to_std().unwrap_or_default();
             sleep(interval.min(until_renewal.max(Duration::from_secs(1)))).await;
         }
+    }
+
+    /// Asks for the node's place on the cluster's mesh (ADR 0017) when it
+    /// has not been answered for the node's key and endpoint, and hands the
+    /// answer to feosd. A node with a prefix of its network's sends no key:
+    /// it asks only whether the cluster is meshed.
+    async fn join_mesh(
+        &self,
+        uplink: &mut Uplink,
+        joined: &mut Option<JoinMeshRequest>,
+    ) -> Result<(), Outcome> {
+        let request = match self.collector.inventory().mesh_key() {
+            Some((public_key, port)) => match self.mesh_endpoint(port).await {
+                Ok(endpoint) => JoinMeshRequest {
+                    public_key: public_key.to_vec(),
+                    endpoint: endpoint.to_string(),
+                },
+                Err(e) => {
+                    warn!("Fleet: The node's endpoint on the mesh: {e}");
+                    return Ok(());
+                }
+            },
+            None => JoinMeshRequest::default(),
+        };
+        if joined.as_ref() == Some(&request) {
+            return Ok(());
+        }
+        let answer = uplink
+            .call("JoinMesh", JOIN_MESH_DEADLINE, |mut client| {
+                let request = request.clone();
+                async move { client.join_mesh(request).await }
+            })
+            .await;
+        match answer {
+            Ok(answer) => {
+                if !request.public_key.is_empty() {
+                    info!(
+                        "Fleet: On the mesh at {}: {} of {}",
+                        request.endpoint,
+                        or_none(&answer.pod_prefix),
+                        or_none(&answer.pod_network)
+                    );
+                }
+                match self
+                    .collector
+                    .inventory()
+                    .joined_mesh(answer.pod_network, answer.pod_prefix)
+                    .await
+                {
+                    Ok(()) => *joined = Some(request),
+                    Err(e) => error!("Fleet: The mesh's answer is not taken, asking again: {e}"),
+                }
+            }
+            Err(status) if status.code() == Code::PermissionDenied => {
+                return Err(Outcome::Refused(status.message().to_string()))
+            }
+            Err(status) if status.code() == Code::Unimplemented => {
+                warn!("Fleet: The control plane knows no mesh: an older ferund");
+                *joined = Some(request);
+            }
+            // Asked again with the next report; the uplink said why.
+            Err(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Where the other nodes reach the node's mesh: `--mesh-address`, or
+    /// the address from which the node reaches the control plane, which a
+    /// connected UDP socket tells without sending anything.
+    async fn mesh_endpoint(&self, port: u16) -> Result<std::net::SocketAddr, String> {
+        if let Some(address) = self.config.mesh_address {
+            return Ok(std::net::SocketAddr::new(address, port));
+        }
+        let control_plane = tokio::net::lookup_host(&self.config.address)
+            .await
+            .map_err(|e| format!("resolving {}: {e}", self.config.address))?
+            .next()
+            .ok_or_else(|| format!("{} resolves to nothing", self.config.address))?;
+        let unspecified: std::net::SocketAddr = match control_plane {
+            std::net::SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+            std::net::SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+        };
+        let socket = std::net::UdpSocket::bind(unspecified).map_err(|e| e.to_string())?;
+        socket
+            .connect(control_plane)
+            .map_err(|e| format!("no route to the control plane at {control_plane}: {e}"))?;
+        let local = socket.local_addr().map_err(|e| e.to_string())?;
+        Ok(std::net::SocketAddr::new(local.ip(), port))
     }
 
     /// A new certificate for the node's key, kept before it is used.
@@ -643,6 +742,13 @@ impl<I: Inventory> Runner<I> {
             ))
         })?;
         Ok(renewed)
+    }
+}
+
+fn or_none(value: &str) -> &str {
+    match value {
+        "" => "none",
+        value => value,
     }
 }
 

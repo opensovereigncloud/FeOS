@@ -226,6 +226,25 @@ fn validate_guest_network(network: &GuestNetworkConfig) -> Result<(), VmmError> 
     {
         return invalid(&format!("bad resolver {dns:?}"));
     }
+    // The guest checks a route's prefix and MTU; here, that its family is
+    // one the guest has an address of.
+    for route in &network.routes {
+        let destination = route
+            .destination
+            .split_once('/')
+            .and_then(|(address, _)| address.parse::<IpAddr>().ok());
+        let gateway = route.gateway.parse::<IpAddr>().ok();
+        match (destination, gateway) {
+            (Some(IpAddr::V4(_)), Some(IpAddr::V4(_))) if ipv4 => {}
+            (Some(IpAddr::V6(_)), Some(IpAddr::V6(_))) if ipv6 => {}
+            _ => {
+                return invalid(&format!(
+                    "bad route to {:?} via {:?}",
+                    route.destination, route.gateway
+                ))
+            }
+        }
+    }
     Ok(())
 }
 
@@ -318,6 +337,24 @@ mod tests {
         let mut bad_resolver = network(("", ""), ipv6);
         bad_resolver.dns.push("fdfd::53%eth0".to_string());
         assert!(validate_guest_network(&bad_resolver).is_err());
+        let route = |destination: &str, gateway: &str| feos_proto::microvm::GuestRoute {
+            destination: destination.to_string(),
+            gateway: gateway.to_string(),
+            mtu: 1420,
+        };
+        let mut ula = network(ipv4, ipv6);
+        ula.routes.push(route("fc00::/7", "fe80::1"));
+        assert!(validate_guest_network(&ula).is_ok());
+        for (family, bad) in [
+            (network(ipv4, ("", "")), route("fc00::/7", "fe80::1")),
+            (network(ipv4, ipv6), route("fc00::/7", "169.254.0.1")),
+            (network(ipv4, ipv6), route("fc00::", "fe80::1")),
+            (network(("", ""), ipv6), route("10.9.0.0/16", "169.254.0.1")),
+        ] {
+            let mut config = family;
+            config.routes.push(bad);
+            assert!(validate_guest_network(&config).is_err(), "{config:?}");
+        }
     }
 
     #[test]

@@ -312,6 +312,19 @@ message SetNetworkConfigRequest {
   string ipv6_cidr = 6;
   // IPv6 default gateway on the interface's link, e.g. "fe80::1".
   string ipv6_gateway = 7;
+  // Routes via gateways on the interface's link, such as "fc00::/7" via
+  // "fe80::1". A family's routes replace its default route: a family
+  // without any gets the default route via its gateway.
+  repeated NetworkRoute routes = 8;
+}
+
+message NetworkRoute {
+  // A prefix of either family, e.g. "fc00::/7".
+  string destination = 1;
+  // On the interface's link, of the destination's family, e.g. "fe80::1".
+  string gateway = 2;
+  // The route's MTU; 0 is the interface's.
+  uint32 mtu = 3;
 }
 
 message SetNetworkConfigResponse {
@@ -338,6 +351,7 @@ message GetNetworkConfigResponse {
   string hostname = 6;
   string ipv6_cidr = 7;
   string ipv6_gateway = 8;
+  repeated NetworkRoute routes = 9;
 }
 
 message FreezeFilesystemRequest {

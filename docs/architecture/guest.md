@@ -55,9 +55,18 @@ via it. IPv6 routes everything via `fe80::1`, which the link-local
 prefix holds. Any gateway outside its address's prefix, and for IPv6
 outside the link-local one, gets such a route of its own.
 
+A push may carry routes (`routes`: a prefix, a gateway on the link and an
+MTU, 0 for the interface's), which replace their family's default route:
+a pod whose IPv6 address is a ULA is pushed `fc00::/7` via `fe80::1`, with
+the mesh's MTU of 1420 on a mesh, and no default route over IPv6
+([ADR 0017](../adr/0017-pod-mesh.md)). A route of a family the push has no
+address of, a prefix with bits beyond its length, a gateway of another
+family and an MTU below the family's minimum (1280 for IPv6, 68 for IPv4)
+are refused.
+
 A push leaves `eth0` with exactly its addresses and routes: the routes
-the kernel makes for the addresses, the default routes and the routes to
-the gateways. Addresses and routes of an earlier push go, as after a
+the kernel makes for the addresses, the default routes or the pushed
+routes, and the routes to the gateways. Addresses and routes of an earlier push go, as after a
 resume on another node, and so do other routes through `eth0`; a family
 whose address the push leaves empty goes with its routes. What is there
 already stays, so the same push again changes nothing. Pushes take effect
@@ -65,8 +74,9 @@ one after the other.
 
 Names resolve as the upstream resolvers answer them. Where a name has
 addresses of both families, programs take IPv6, since the pod's IPv4
-address is link-local; IPv4 literals and programs that speak only IPv4
-leave over IPv4.
+address is link-local, unless the pod has no route to the name's IPv6
+addresses, as a pod with a ULA has none to global ones; IPv4 literals and
+programs that speak only IPv4 leave over IPv4.
 
 The pod's metadata is at `169.254.169.254`, port 80, a session token
 first ([node.md](node.md#metadata)). Firecracker answers it in the

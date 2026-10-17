@@ -14,14 +14,17 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
              [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
              [--diskd-socket PATH]
              [--control-plane HOST:PORT [--control-plane-name NAME]
-              [--trust-domain NAME] [--join-token-file PATH] [--node-dir PATH]]
+              [--trust-domain NAME] [--join-token-file PATH] [--node-dir PATH]
+              [--mesh-port PORT] [--mesh-address ADDRESS]]
        feosd --version
 
   --tcp ADDRESS            also serve the API on TCP, without authentication
   --self-upgrade           let UpgradeFeosBinary replace this binary
   --pod-prefix PREFIX      the IPv6 prefix the network routes to this node, such
                            as a /64; pods get their addresses from it. Without,
-                           pods with a network fail
+                           a node with a control plane takes a /64 of its
+                           cluster's mesh (ADR 0017), and one without fails
+                           pods with a network
   --pod-ipv4-range PREFIX  the IPv4 prefix pods get an address of each, for
                            leaving through masquerade; 169.254.16.0/20 by
                            default
@@ -44,8 +47,14 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
                            by default
   --join-token-file PATH   the join token, read while the node has not joined;
                            /etc/feos/join-token by default
-  --node-dir PATH          the node's key, certificate and trust bundle;
-                           /var/lib/feos/node by default";
+  --node-dir PATH          the node's key, certificate and trust bundle, and the
+                           mesh's key and peers in mesh/; /var/lib/feos/node by
+                           default
+  --mesh-port PORT         the UDP port of the mesh's WireGuard device; 51820 by
+                           default
+  --mesh-address ADDRESS   where the other nodes reach this node's mesh; the
+                           address from which it reaches the control plane by
+                           default";
 
 #[derive(Debug, Default, PartialEq)]
 struct Args {
@@ -73,6 +82,8 @@ impl Args {
         let mut trust_domain = None;
         let mut join_token_file = None;
         let mut node_dir = None;
+        let mut mesh_port = None;
+        let mut mesh_address = None;
         while let Some(arg) = args.next() {
             let mut value = |what: &str| {
                 args.next()
@@ -120,6 +131,23 @@ impl Args {
                 "--trust-domain" => trust_domain = Some(value("a name")?),
                 "--join-token-file" => join_token_file = Some(value("a path")?.into()),
                 "--node-dir" => node_dir = Some(value("a path")?.into()),
+                "--mesh-port" => {
+                    let port = value("a port")?;
+                    mesh_port = Some(
+                        port.parse::<u16>()
+                            .ok()
+                            .filter(|port| *port != 0)
+                            .with_context(|| format!("--mesh-port {port}: a port"))?,
+                    );
+                }
+                "--mesh-address" => {
+                    let address = value("an address")?;
+                    mesh_address = Some(
+                        address
+                            .parse::<std::net::IpAddr>()
+                            .with_context(|| format!("--mesh-address {address}"))?,
+                    );
+                }
                 "--self-upgrade" => parsed.self_upgrade = true,
                 "--task-service" => parsed.task_service = true,
                 "--restarted-after-upgrade" => parsed.restarted_after_upgrade = true,
@@ -143,10 +171,25 @@ impl Args {
             if let Some(dir) = node_dir {
                 config.node_dir = dir;
             }
+            // Without a prefix of its network's, the node is on its
+            // cluster's mesh (ADR 0017).
+            if parsed.network.pod_prefix.is_none() {
+                parsed.network.mesh = Some(network::MeshConfig {
+                    dir: config.node_dir.join("mesh"),
+                    port: mesh_port.unwrap_or(network::MESH_PORT),
+                });
+                config.mesh_address = mesh_address;
+            } else if mesh_port.is_some() || mesh_address.is_some() {
+                bail!(
+                    "--mesh-port and --mesh-address are for a node without --pod-prefix\n{USAGE}"
+                );
+            }
             parsed.fleet = Some(config);
         } else if let Some(trust_domain) = trust_domain {
             fleet_client::check_trust_domain(&trust_domain)
                 .map_err(|e| anyhow!("--trust-domain: {e}\n{USAGE}"))?;
+        } else if mesh_port.is_some() || mesh_address.is_some() {
+            bail!("--mesh-port and --mesh-address need --control-plane\n{USAGE}");
         }
         parsed
             .network
@@ -266,6 +309,31 @@ mod tests {
         );
         assert_eq!(fleet.node_dir, std::path::Path::new("/srv/feos/node"));
         for bad in [
+            &["--mesh-port", "51821"][..],
+            &[
+                "--control-plane",
+                "ferun.example.com:7443",
+                "--mesh-port",
+                "0",
+            ],
+            &[
+                "--control-plane",
+                "ferun.example.com:7443",
+                "--mesh-address",
+                "node-b",
+            ],
+            &[
+                "--control-plane",
+                "ferun.example.com:7443",
+                "--pod-prefix",
+                "2001:db8:1:2::/64",
+                "--mesh-port",
+                "51821",
+            ],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        for bad in [
             &["--control-plane"][..],
             &["--control-plane", "ferun.example.com"],
             &["--control-plane", "10.43.0.17:7443"],
@@ -286,6 +354,43 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_node_without_a_prefix_is_on_the_mesh() {
+        let args = parse(&["--control-plane", "ferun.example.com:7443"]).unwrap();
+        let mesh = args.network.mesh.unwrap();
+        assert_eq!(mesh.dir, std::path::Path::new("/var/lib/feos/node/mesh"));
+        assert_eq!(mesh.port, 51820);
+        assert_eq!(args.fleet.unwrap().mesh_address, None);
+        let args = parse(&[
+            "--control-plane",
+            "ferun.example.com:7443",
+            "--node-dir",
+            "/srv/feos/node",
+            "--mesh-port",
+            "51821",
+            "--mesh-address",
+            "10.0.0.11",
+        ])
+        .unwrap();
+        let mesh = args.network.mesh.unwrap();
+        assert_eq!(mesh.dir, std::path::Path::new("/srv/feos/node/mesh"));
+        assert_eq!(mesh.port, 51821);
+        assert_eq!(
+            args.fleet.unwrap().mesh_address,
+            Some("10.0.0.11".parse().unwrap())
+        );
+        // A prefix of its network's, or no control plane: no mesh.
+        let args = parse(&[
+            "--control-plane",
+            "ferun.example.com:7443",
+            "--pod-prefix",
+            "2001:db8:1:2::/64",
+        ])
+        .unwrap();
+        assert_eq!(args.network.mesh, None);
+        assert_eq!(parse(&[]).unwrap().network.mesh, None);
     }
 
     #[test]

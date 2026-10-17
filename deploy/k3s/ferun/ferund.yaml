@@ -63,6 +63,10 @@ spec:
               value: 30m
             - name: FERUN_SHUTDOWN_GRACE
               value: 2m
+            # The lab's network routes no prefix to the nodes: the pods are
+            # on a mesh of a ULA /48 that ferund draws once (ADR 0017).
+            - name: FERUN_POD_NETWORK
+              value: mesh
             # People sign in to the UI and the admin API with their FeCode ID
             # (id.fecode.dev); its group admins gets the admin surface.
             - name: FERUN_PUBLIC_URL

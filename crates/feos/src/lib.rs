@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use container_service::api::ContainerApiHandler;
 #[cfg(feature = "host")]
 use feos_proto::network_service::{
+    mesh_service_server::MeshServiceServer,
     security_group_service_server::SecurityGroupServiceServer,
     traffic_service_server::TrafficServiceServer,
 };
@@ -376,6 +377,7 @@ impl Services {
             .add_service(PodServiceServer::new(self.pods.clone()))
             .add_service(VolumeServiceServer::new(self.volumes.clone()))
             .add_service(SecurityGroupServiceServer::new(self.groups.clone()))
+            .add_service(MeshServiceServer::new(self.pods.clone()))
             .add_service(TrafficServiceServer::new(self.traffic.clone()));
         #[cfg(feature = "guest")]
         let router = self.guest.add_to(router);

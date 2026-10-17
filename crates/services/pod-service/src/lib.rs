@@ -13,6 +13,11 @@ mod spec;
 mod store;
 pub mod volumes;
 
+use feos_proto::network_service::mesh_service_server::MeshService;
+use feos_proto::network_service::{
+    GetMeshRequest, Mesh, PutMeshPeersRequest, PutMeshPeersResponse, UpdateMeshPeersRequest,
+    UpdateMeshPeersResponse,
+};
 use feos_proto::pod_service::pod_service_server::PodService;
 use feos_proto::pod_service::{
     CreatePodRequest, CreatePodResponse, DeletePodRequest, DeletePodResponse, GetPodRequest,
@@ -36,6 +41,30 @@ pub use volumes::Volumes;
 
 /// Where the pods are kept: a file each.
 pub const POD_DIR: &str = "/var/lib/feos/pods";
+
+/// The node's mesh (ADR 0017), part of the pods' network.
+#[tonic::async_trait]
+impl MeshService for Pods {
+    async fn put_mesh_peers(
+        &self,
+        request: Request<PutMeshPeersRequest>,
+    ) -> Result<Response<PutMeshPeersResponse>, Status> {
+        self.network().put_mesh_peers(request.into_inner())?;
+        Ok(Response::new(PutMeshPeersResponse {}))
+    }
+
+    async fn update_mesh_peers(
+        &self,
+        request: Request<UpdateMeshPeersRequest>,
+    ) -> Result<Response<UpdateMeshPeersResponse>, Status> {
+        self.network().update_mesh_peers(request.into_inner())?;
+        Ok(Response::new(UpdateMeshPeersResponse {}))
+    }
+
+    async fn get_mesh(&self, _: Request<GetMeshRequest>) -> Result<Response<Mesh>, Status> {
+        Ok(Response::new(self.network().mesh()))
+    }
+}
 
 #[tonic::async_trait]
 impl PodService for Pods {

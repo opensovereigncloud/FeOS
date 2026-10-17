@@ -9,8 +9,9 @@
 use feos_proto::fleet_service::fleet_service_server::{FleetService, FleetServiceServer};
 use feos_proto::fleet_service::{
     event, Certificate, ControlPlaneInstance, Event, EventAck, EventBatch,
-    IssuePodCredentialsRequest, IssuePodCredentialsResponse, JoinRequest, JoinResponse,
-    RenewCertificateRequest, RenewCertificateResponse, Telemetry, TelemetryResponse,
+    IssuePodCredentialsRequest, IssuePodCredentialsResponse, JoinMeshRequest, JoinMeshResponse,
+    JoinRequest, JoinResponse, RenewCertificateRequest, RenewCertificateResponse, Telemetry,
+    TelemetryResponse,
 };
 use feos_proto::pod_service::{PodEvent, PodInfo, PodState};
 use feos_proto::volume_service::volume_service_client::VolumeServiceClient;
@@ -171,6 +172,8 @@ struct Seen {
     volumes: Vec<(Vec<u8>, String)>,
     /// Refuse the node from now on.
     refuse: bool,
+    /// The JoinMesh calls, with the certificate they came with.
+    mesh_joins: Vec<(Vec<u8>, JoinMeshRequest)>,
 }
 
 struct ControlPlane {
@@ -346,6 +349,22 @@ impl FleetService for ControlPlane {
     ) -> Result<Response<IssuePodCredentialsResponse>, Status> {
         Err(Status::unimplemented("not in this test"))
     }
+
+    async fn join_mesh(
+        &self,
+        request: Request<JoinMeshRequest>,
+    ) -> Result<Response<JoinMeshResponse>, Status> {
+        let peer = self.peer(&request)?;
+        self.seen
+            .lock()
+            .unwrap()
+            .mesh_joins
+            .push((peer, request.into_inner()));
+        Ok(Response::new(JoinMeshResponse {
+            pod_network: MESH_NETWORK.into(),
+            pod_prefix: MESH_PREFIX.into(),
+        }))
+    }
 }
 
 /// Starts the test control plane; its token and its address.
@@ -466,6 +485,14 @@ impl VolumeService for Volumes {
     }
 }
 
+/// The cluster's ULA and the node's /64 of it, as the test control plane
+/// gives them.
+const MESH_NETWORK: &str = "fd5e:1b2c:93a0::/48";
+const MESH_PREFIX: &str = "fd5e:1b2c:93a0:7::/64";
+
+/// What the node was told of the mesh, the last answer.
+static JOINED: Mutex<Option<(String, String)>> = Mutex::new(None);
+
 struct Node;
 
 impl Inventory for Node {
@@ -490,6 +517,23 @@ impl Inventory for Node {
             object_store_id: "abc".into(),
             version: "0.6.0".into(),
         })
+    }
+
+    fn pod_prefix(&self) -> Option<String> {
+        JOINED
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, prefix)| prefix.clone())
+    }
+
+    fn mesh_key(&self) -> Option<([u8; 32], u16)> {
+        Some(([7; 32], 51821))
+    }
+
+    async fn joined_mesh(&self, pod_network: String, pod_prefix: String) -> Result<(), String> {
+        *JOINED.lock().unwrap() = Some((pod_network, pod_prefix));
+        Ok(())
     }
 }
 
@@ -580,7 +624,9 @@ async fn a_node_joins_reports_renews_and_serves_its_api() {
         report.inventory_hash,
         sha256_hex(format!("{POD} POD_STATE_RUNNING\n").as_bytes())
     );
-    assert_eq!(report.pod_prefix, "fd00:fe05:1::/64");
+    // The configured prefix, until the mesh gives the node one.
+    let first = seen.lock().unwrap().reports[0].1.clone();
+    assert_eq!(first.pod_prefix, "fd00:fe05:1::/64");
     assert!(report.object_store);
     assert_eq!(report.object_store_id, "abc");
     let versions = report.versions.unwrap();
@@ -590,6 +636,24 @@ async fn a_node_joins_reports_renews_and_serves_its_api() {
     assert!(report.memory_total_bytes > 0);
     let state = std::fs::read_to_string(node_dir.join("node.json")).unwrap();
     assert!(state.contains(&address), "{state}");
+
+    // The node joins the mesh once, with its key and the address from
+    // which it reaches the control plane, and takes the answer: its /64 is
+    // its prefix from then on.
+    wait_for(&seen, "a report with the mesh's /64", |seen| {
+        seen.reports
+            .iter()
+            .any(|(_, report)| report.pod_prefix == MESH_PREFIX)
+    })
+    .await;
+    assert_eq!(
+        *JOINED.lock().unwrap(),
+        Some((MESH_NETWORK.to_string(), MESH_PREFIX.to_string()))
+    );
+    let joins = seen.lock().unwrap().mesh_joins.clone();
+    assert_eq!(joins.len(), 1, "{joins:?}");
+    assert_eq!(joins[0].1.public_key, [7; 32]);
+    assert_eq!(joins[0].1.endpoint, "127.0.0.1:51821");
 
     // The node's API on a node connection, with the renewed certificate.
     wait_for(&seen, "ListVolumes on a node connection", |seen| {

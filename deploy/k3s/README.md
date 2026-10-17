@@ -39,10 +39,13 @@ The first time:
       --from-env-file=$HOME/.config/feos/diskd/s3.env --from-literal=DISKD_S3_PREFIX=k3s/
     kubectl label node <node> feos.fecode.dev/node=true
 
-Each node gets the pods' IPv6 prefix `fd00:fe05:<last octet of its address,
-hex>::/64`: the lab's network routes no IPv6 to the nodes, so pods leave
-over IPv4 alone. Pods are denied the nodes' and the cluster's networks
-(configmap `feos-node`).
+The lab's network routes no IPv6 to the nodes. With the control plane,
+ferund runs with `FERUN_POD_NETWORK=mesh`: each node gets a /64 of the
+cluster's ULA from it and reaches the other nodes' pods through the
+WireGuard device `feos-mesh`, UDP port 51820 between the nodes (ADR 0017).
+Without, each node takes `fd00:fe05:<last octet of its address, hex>::/64`,
+which no other node reaches. Either way pods leave over IPv4 alone. Pods
+are denied the nodes' and the cluster's networks (configmap `feos-node`).
 
 On a node, `feosctl` talks to feosd as usual, and the services' logs are
 in its journal (`journalctl -u feosd -u diskd`), and in `kubectl -n feos

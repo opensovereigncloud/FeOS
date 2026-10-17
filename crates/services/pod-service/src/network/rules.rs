@@ -6,7 +6,9 @@
 //!
 //! - `prerouting` drops what a pod sends from an address that is not
 //!   routed back out its TAP, of either family, and router advertisements
-//!   and redirects.
+//!   and redirects; on a mesh (ADR 0017), whatever comes from an address of
+//!   the cluster's ULA through another device than the one it is routed
+//!   to, the mesh's or a pod's TAP.
 //! - `input` takes neighbor discovery and DNS to the resolver from pods,
 //!   nothing else of theirs.
 //! - `forward` copies the first packets of the TCP connections pods open
@@ -34,7 +36,7 @@ use network_service::{
     AddressRange, Allow, Family as AddressFamily, Policy, Protocol, SetChange, DENY4, DENY6,
 };
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use traffic_service::{prefix, COPY_GROUP, COPY_SNAPLEN, DROP_GROUP};
 
 /// feosd's table, in the inet family.
@@ -70,6 +72,8 @@ pub struct Options {
     /// The pods' IPv4 addresses (`--pod-ipv4-range`), which are
     /// masqueraded where they leave the node.
     pub ipv4_range: (Ipv4Addr, u8),
+    /// The cluster's ULA, on a mesh.
+    pub mesh: Option<(Ipv6Addr, u8)>,
 }
 
 /// The pod's chains.
@@ -127,7 +131,7 @@ pub fn table(policy: &Policy, options: &Options) -> Table {
         Hook::Prerouting,
         -150,
         ChainPolicy::Accept,
-        prerouting(),
+        prerouting(options),
     ));
     chains.push(Chain::base(
         "input",
@@ -283,9 +287,9 @@ fn lookup_chain(name: &str, vmap: Rule) -> Chain {
     )
 }
 
-fn prerouting() -> Vec<Rule> {
+fn prerouting(options: &Options) -> Vec<Rule> {
     let spoofed = fib_saddr_iif_oif_missing;
-    vec![
+    let mut rules = vec![
         // A pod sends from its addresses alone, of either family: those
         // routed to its TAP.
         [from_pods(), spoofed(), log(prefix::SPOOFED)].concat(),
@@ -308,7 +312,16 @@ fn prerouting() -> Vec<Rule> {
             verdict(Verdict::Drop),
         ]
         .concat(),
-    ]
+    ];
+    // An address of the cluster's comes from its node: through the mesh,
+    // which takes a peer's packets from its /64 alone, or from the pod's
+    // TAP; not through the node's other devices.
+    if let Some((network, len)) = options.mesh {
+        let cluster = ipv6_prefix(IPV6_SADDR, CmpOp::Eq, network, len);
+        rules.push([cluster.clone(), spoofed(), log(prefix::SPOOFED)].concat());
+        rules.push([cluster, spoofed(), verdict(Verdict::Drop)].concat());
+    }
+    rules
 }
 
 fn input(options: &Options) -> Vec<Rule> {
@@ -409,6 +422,7 @@ mod tests {
         Options {
             dns: IpAddr::V4(v4("169.254.0.53")),
             ipv4_range: (v4("169.254.16.0"), 20),
+            mesh: None,
         }
     }
 
@@ -706,6 +720,22 @@ mod tests {
             assert_eq!(rule, &[from_pods(), icmp, verdict(Verdict::Drop)].concat());
         }
         assert_eq!(rules.len(), 5, "IPv4 of pods passes");
+
+        // On a mesh, the cluster's addresses come through the device they
+        // are routed to, whichever it is.
+        let mesh = Options {
+            mesh: Some((a("fd5e:1b2c:93a0::"), 48)),
+            ..options()
+        };
+        let table = super::table(&policy(), &mesh);
+        let rules = &chain(&table, "prerouting").rules;
+        assert_eq!(rules.len(), 7);
+        let cluster = ipv6_prefix(IPV6_SADDR, CmpOp::Eq, a("fd5e:1b2c:93a0::"), 48);
+        assert!(logs(&rules[5], DROP_GROUP, "spoofed"));
+        assert_eq!(
+            rules[6],
+            [cluster, fib_saddr_iif_oif_missing(), verdict(Verdict::Drop)].concat()
+        );
     }
 
     #[test]

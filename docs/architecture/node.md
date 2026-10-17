@@ -108,6 +108,7 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 | `/var/lib/feos/containers/` | the host's containers, a `container.json` each |
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
 | `/var/lib/feos/node/` | the node's identity for the control plane ([below](#the-control-plane)) |
+| `/var/lib/feos/node/mesh/` | the mesh's private key `key` and `mesh.pb`, what the control plane gave and sent the node (a `feos.network.v1.Mesh`) ([the mesh](#the-mesh)) |
 | `/run/feos/` | the API sockets, the task service's pid, the runtime state of containers |
 | `/usr/lib/feos/firecracker/<version>/` | Firecracker and its jailer, a version each, side by side |
 | `/usr/lib/feos/guest/<version>/` | the guest's `vmlinuz`, `initramfs` and blank data volume `data.img.zst`, a version each, side by side |
@@ -129,7 +130,9 @@ serves on.
 | `--control-plane-name NAME` | HOST | the DNS name the control plane's certificate is checked for, wherever `feosd` dials; needed when HOST is an address |
 | `--trust-domain NAME` | `feos.local` | the control plane's SPIFFE trust domain |
 | `--join-token-file PATH` | `/etc/feos/join-token` | the operator's join token, `feos-join-<secret>.<pin>`, read while the node has not joined |
-| `--node-dir PATH` | `/var/lib/feos/node` | the node's identity |
+| `--node-dir PATH` | `/var/lib/feos/node` | the node's identity, and the mesh's key and peers in `mesh/` |
+| `--mesh-port PORT` | 51820 | the UDP port of the mesh's WireGuard device, on a node without `--pod-prefix` |
+| `--mesh-address ADDRESS` | the address from which the node reaches the control plane | where the other nodes reach the node's mesh |
 
 - **The join.** A node without an identity makes an ECDSA P-256 key and
   keeps it, then sends the token's secret, its hostname as its name and a
@@ -156,7 +159,11 @@ serves on.
   `feosd`'s own (`started`, and `stopping` on SIGTERM and before an
   upgrade), numbered from 1 per start and kept until the control plane
   acknowledges them. The buffer is in memory, at most 16384 events, the
-  oldest dropped and counted; a buffer on disk is to follow.
+  oldest dropped and counted; a buffer on disk is to follow. After the
+  first report that is answered, `JoinMesh` ([the mesh](#the-mesh)), and
+  again whenever the node's key or endpoint changes or an answer was not
+  taken; a node with `--pod-prefix` sends no key and asks only whether
+  the cluster is meshed.
 - **A refused node.** `PERMISSION_DENIED` on the uplink means the node was
   removed or its certificate revoked: `feosd` closes its connections,
   moves its identity into `removed-<time>/` in the node's directory, and
@@ -269,7 +276,7 @@ resolver) and `traffic-service` (the records).
 
 | Option | Default | What it is |
 |---|---|---|
-| `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120; a /64 is best |
+| `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120; a /64 is best. Without, a node with `--control-plane` takes a /64 of its cluster's [mesh](#the-mesh) |
 | `--pod-ipv4-range PREFIX` | `169.254.16.0/20` | the pods' IPv4 addresses, a /32 each; /1 to /30, with neither the resolver's address nor `169.254.0.1` in it |
 | `--dns-address ADDRESS` | `169.254.0.53` | the pods' resolver, an IPv4 address that the node holds, the same on every node; never `169.254.0.1` |
 | `--dns-upstream ADDRESS` | Google's and Cloudflare's, IPv6 first | the upstreams of pods that name none (repeatable) |
@@ -277,11 +284,14 @@ resolver) and `traffic-service` (the records).
 
 `--pod-ipv4-range` and `--dns-address` move the pods' IPv4 addresses and
 the resolver where the node's own network uses link-local addresses.
-Without `--pod-prefix`, or when the network cannot be set up, `feosd`
-logs the error and runs on: creating a pod with a network fails with
-`FAILED_PRECONDITION` and the reason, and a kept pod with a network fails
-when it boots or resumes. Pods without a network and the rest of the API
-work as before.
+Without `--pod-prefix` or a mesh, or when the network cannot be set up,
+`feosd` logs the error and runs on: creating a pod with a network fails
+with `FAILED_PRECONDITION` and the reason, and a kept pod with a network
+fails when it boots or resumes. Pods without a network and the rest of
+the API work as before. On a mesh whose /64 the node does not have yet,
+the same holds until the control plane gives it one; the network comes up
+then, as at a start: kept pods get the addresses they lack, the resolver
+answers, the rules are written, and running pods get their TAP devices.
 
 ### Devices and routes
 
@@ -332,7 +342,13 @@ The guest is pushed its IPv6 address as a /128 with `fe80::1` as its
 gateway, its IPv4 address as a /32 with `169.254.0.1` as its gateway, on
 the link although outside the /32, and the resolver
 ([guest.md](guest.md)); its MAC address is `06:00` and the 8 hex digits
-of its ID. Deleting the pod deletes the TAP device, which takes the
+of its ID. A pod whose IPv6 address is a ULA has no default route over
+IPv6 ([ADR 0017](../adr/0017-pod-mesh.md)): it is pushed a route for
+`fc00::/7` via `fe80::1` instead, with the mesh's MTU of 1420 on a mesh,
+so that a name with addresses of both families is reached over IPv4 at
+once (RFC 6724, rule 1) rather than after an unreachable that the node
+sends at most once a second. A guest from before routes keeps its default
+route until the pod boots anew. Deleting the pod deletes the TAP device, which takes the
 routes and the proxy entry with it.
 
 ### Addresses
@@ -375,6 +391,46 @@ too (a guest that is not attached yet gets it when it attaches). One
 whose devices differ, such as the first version's on a bridge, keeps the
 old network until the pod is stopped and started, and `feosd` warns
 about it.
+
+### The mesh
+
+A node whose network routes it no prefix, one with `--control-plane` and
+without `--pod-prefix`, is on its cluster's mesh
+([ADR 0017](../adr/0017-pod-mesh.md), `network/mesh.rs`):
+
+- **The device** `feos-mesh`, a WireGuard link with an MTU of 1420, no
+  addresses and no router advertisements, made at `feosd`'s start. Its
+  private key is made once, 32 random bytes from `getrandom`, and kept in
+  `<node dir>/mesh/key` (0600); the kernel derives the public key from it.
+  It listens on `--mesh-port`. `feosd` sets it up over WireGuard's generic
+  netlink family (`feos_utils::wireguard`), without `wg`.
+- **The node's /64.** The fleet client calls `JoinMesh` with the public
+  key and the endpoint, `--mesh-address` or the address from which the
+  node reaches the control plane, at `--mesh-port`. The answer, the
+  cluster's ULA /48 and the node's /64 of it, is kept in `mesh.pb`; the
+  /64 is the node's pod prefix from then on, and the /48 is routed to
+  `feos-mesh`. The node's own /64 stays routed as unreachable but for its
+  pods' /128s, which are longer. Another /64 than the network was set up
+  with takes effect at the next start. A node with `--pod-prefix` in a
+  meshed cluster fails its pods with a network: the two exclude each
+  other.
+- **The peers** come from the control plane over the node connection,
+  `feos.network.v1.MeshService`: `PutMeshPeers` whole with a version,
+  `UpdateMeshPeers` from the version the node has to the next, refused
+  with `FAILED_PRECONDITION` from any other. They are kept in `mesh.pb`
+  and given to the device as they change: a peer that stays keeps its
+  session, one that goes is removed, one that is new or changed is set
+  with its endpoint and its /64 as its one allowed prefix. WireGuard sends
+  a packet to the peer whose /64 holds its destination and takes one from
+  a peer only with that peer's key and a source in its /64. `GetMesh`
+  shows the node's prefixes, key, port, version and peers.
+- **The rules.** The peers' endpoints are denied to pods, as the node's
+  own addresses are, and `prerouting` drops what comes from an address of
+  the cluster's /48 through another device than the one it is routed to.
+
+Without a control plane the mesh, its peers and its rules stay untouched;
+pods reach each other across nodes only where their security groups allow
+it, as anywhere.
 
 ### DNS
 
@@ -455,7 +511,7 @@ traffic is not theirs:
 
 | Chain | What it does |
 |---|---|
-| `prerouting` (filter, -150) | from a pod's TAP: drops packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), of either family, logged as `spoofed`, and router advertisements and redirects of both families |
+| `prerouting` (filter, -150) | from a pod's TAP: drops packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), of either family, logged as `spoofed`, and router advertisements and redirects of both families; on a mesh, the same for a source in the cluster's /48 through any device |
 | `input` | from pods takes neighbor solicitations and advertisements and DNS to the resolver's address over UDP and TCP, and drops the rest |
 | `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), of both families, before anything else; accepts what belongs to a connection; drops invalid packets from and to pods; then jumps to `from-pods` what comes from a TAP and to `to-pods` what goes to one |
 | `from-pods`, `to-pods` | go through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) to the pod's chains, and drop and log (`no-rule`) what a TAP the maps do not have sends or receives, such as one whose rules failed to be written |
@@ -473,7 +529,8 @@ would end the base chain: a packet between two pods passes the sender's
 `out-` chain and the receiver's `in-` chain. The maps go to them
 (`goto`), so their `return` leads back to `forward`. The sets are what
 `network-service` compiles, each of one family: `deny4` and `deny6` (the
-denied prefixes, the node's own addresses, the pods' IPv4 range,
+denied prefixes, the node's own addresses, the mesh's peers' endpoints,
+the pods' IPv4 range,
 link-local, loopback, multicast and unspecified addresses: pods reach
 each other over IPv6 alone), `internet4` and `internet6` (the default
 group's), `g-<group>` (a group's members, of IPv6) and `b-<hash>` (an

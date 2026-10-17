@@ -26,7 +26,7 @@ pub async fn connect() -> io::Result<Handle> {
     Ok(handle)
 }
 
-fn netlink_error(what: &str) -> impl Fn(rtnetlink::Error) -> io::Error + '_ {
+pub(super) fn netlink_error(what: &str) -> impl Fn(rtnetlink::Error) -> io::Error + '_ {
     move |e| io::Error::other(format!("{what}: {e}"))
 }
 
@@ -37,7 +37,7 @@ fn errno(e: &rtnetlink::Error) -> Option<i32> {
     }
 }
 
-async fn link(handle: &Handle, name: &str) -> io::Result<Option<LinkMessage>> {
+pub(super) async fn link(handle: &Handle, name: &str) -> io::Result<Option<LinkMessage>> {
     let mut links = handle.link().get().match_name(name.to_string()).execute();
     match links.try_next().await {
         Ok(link) => Ok(link),
@@ -46,7 +46,7 @@ async fn link(handle: &Handle, name: &str) -> io::Result<Option<LinkMessage>> {
     }
 }
 
-async fn index(handle: &Handle, name: &str) -> io::Result<u32> {
+pub(super) async fn index(handle: &Handle, name: &str) -> io::Result<u32> {
     link(handle, name)
         .await?
         .map(|link| link.header.index)
@@ -97,7 +97,7 @@ fn keep_router_advertisements() -> io::Result<()> {
 /// IPv6 on a device of feosd's own: no router advertisements, no
 /// autoconfiguration and no link-local address of the kernel's; feosd
 /// adds the addresses. Before the device goes up.
-fn own_ipv6(name: &str) -> io::Result<()> {
+pub(super) fn own_ipv6(name: &str) -> io::Result<()> {
     for (setting, value) in [
         ("accept_ra", "0"),
         ("autoconf", "0"),
@@ -108,13 +108,22 @@ fn own_ipv6(name: &str) -> io::Result<()> {
     Ok(())
 }
 
-async fn up(handle: &Handle, index: u32, name: &str) -> io::Result<()> {
+pub(super) async fn up(handle: &Handle, index: u32, name: &str) -> io::Result<()> {
     handle
         .link()
         .set(LinkUnspec::new_with_index(index).up().build())
         .execute()
         .await
         .map_err(|e| io::Error::other(format!("bring {name} up: {e}")))
+}
+
+pub(super) async fn set_mtu(handle: &Handle, index: u32, name: &str, mtu: u32) -> io::Result<()> {
+    handle
+        .link()
+        .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
+        .execute()
+        .await
+        .map_err(|e| io::Error::other(format!("set {name}'s MTU to {mtu}: {e}")))
 }
 
 /// Adds an address, an IPv6 one without duplicate address detection: the

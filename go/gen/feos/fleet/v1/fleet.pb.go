@@ -1609,6 +1609,118 @@ func (x *SshBinding) GetPrivateKey() string {
 	return ""
 }
 
+type JoinMeshRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The node's WireGuard public key, 32 bytes; none asks only whether the
+	// cluster is meshed.
+	PublicKey []byte `protobuf:"bytes,1,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+	// "host:port" where the other nodes reach the node's WireGuard device,
+	// e.g. "10.0.0.11:51820" or "[2001:db8::11]:51820".
+	Endpoint      string `protobuf:"bytes,2,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JoinMeshRequest) Reset() {
+	*x = JoinMeshRequest{}
+	mi := &file_feos_fleet_v1_fleet_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JoinMeshRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JoinMeshRequest) ProtoMessage() {}
+
+func (x *JoinMeshRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_fleet_v1_fleet_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JoinMeshRequest.ProtoReflect.Descriptor instead.
+func (*JoinMeshRequest) Descriptor() ([]byte, []int) {
+	return file_feos_fleet_v1_fleet_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *JoinMeshRequest) GetPublicKey() []byte {
+	if x != nil {
+		return x.PublicKey
+	}
+	return nil
+}
+
+func (x *JoinMeshRequest) GetEndpoint() string {
+	if x != nil {
+		return x.Endpoint
+	}
+	return ""
+}
+
+type JoinMeshResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The cluster's ULA, a /48, e.g. "fd5e:1b2c:93a0::/48"; empty in a
+	// cluster whose network is routed.
+	PodNetwork string `protobuf:"bytes,1,opt,name=pod_network,json=podNetwork,proto3" json:"pod_network,omitempty"`
+	// The node's /64 of it, e.g. "fd5e:1b2c:93a0:7::/64"; empty for a
+	// request without a key.
+	PodPrefix     string `protobuf:"bytes,2,opt,name=pod_prefix,json=podPrefix,proto3" json:"pod_prefix,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *JoinMeshResponse) Reset() {
+	*x = JoinMeshResponse{}
+	mi := &file_feos_fleet_v1_fleet_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *JoinMeshResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*JoinMeshResponse) ProtoMessage() {}
+
+func (x *JoinMeshResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_fleet_v1_fleet_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use JoinMeshResponse.ProtoReflect.Descriptor instead.
+func (*JoinMeshResponse) Descriptor() ([]byte, []int) {
+	return file_feos_fleet_v1_fleet_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *JoinMeshResponse) GetPodNetwork() string {
+	if x != nil {
+		return x.PodNetwork
+	}
+	return ""
+}
+
+func (x *JoinMeshResponse) GetPodPrefix() string {
+	if x != nil {
+		return x.PodPrefix
+	}
+	return ""
+}
+
 var File_feos_fleet_v1_fleet_proto protoreflect.FileDescriptor
 
 const file_feos_fleet_v1_fleet_proto_rawDesc = "" +
@@ -1732,13 +1844,23 @@ const file_feos_fleet_v1_fleet_proto_rawDesc = "" +
 	"\x04user\x18\x03 \x01(\tR\x04user\x12\x1b\n" +
 	"\thost_keys\x18\x04 \x03(\tR\bhostKeys\x12\x1f\n" +
 	"\vprivate_key\x18\x05 \x01(\tR\n" +
-	"privateKey2\xba\x03\n" +
+	"privateKey\"L\n" +
+	"\x0fJoinMeshRequest\x12\x1d\n" +
+	"\n" +
+	"public_key\x18\x01 \x01(\fR\tpublicKey\x12\x1a\n" +
+	"\bendpoint\x18\x02 \x01(\tR\bendpoint\"R\n" +
+	"\x10JoinMeshResponse\x12\x1f\n" +
+	"\vpod_network\x18\x01 \x01(\tR\n" +
+	"podNetwork\x12\x1d\n" +
+	"\n" +
+	"pod_prefix\x18\x02 \x01(\tR\tpodPrefix2\x87\x04\n" +
 	"\fFleetService\x12?\n" +
 	"\x04Join\x12\x1a.feos.fleet.v1.JoinRequest\x1a\x1b.feos.fleet.v1.JoinResponse\x12c\n" +
 	"\x10RenewCertificate\x12&.feos.fleet.v1.RenewCertificateRequest\x1a'.feos.fleet.v1.RenewCertificateResponse\x12M\n" +
 	"\x0fReportTelemetry\x12\x18.feos.fleet.v1.Telemetry\x1a .feos.fleet.v1.TelemetryResponse\x12G\n" +
 	"\rPublishEvents\x12\x19.feos.fleet.v1.EventBatch\x1a\x17.feos.fleet.v1.EventAck(\x010\x01\x12l\n" +
-	"\x13IssuePodCredentials\x12).feos.fleet.v1.IssuePodCredentialsRequest\x1a*.feos.fleet.v1.IssuePodCredentialsResponseb\x06proto3"
+	"\x13IssuePodCredentials\x12).feos.fleet.v1.IssuePodCredentialsRequest\x1a*.feos.fleet.v1.IssuePodCredentialsResponse\x12K\n" +
+	"\bJoinMesh\x12\x1e.feos.fleet.v1.JoinMeshRequest\x1a\x1f.feos.fleet.v1.JoinMeshResponseb\x06proto3"
 
 var (
 	file_feos_fleet_v1_fleet_proto_rawDescOnce sync.Once
@@ -1752,7 +1874,7 @@ func file_feos_fleet_v1_fleet_proto_rawDescGZIP() []byte {
 	return file_feos_fleet_v1_fleet_proto_rawDescData
 }
 
-var file_feos_fleet_v1_fleet_proto_msgTypes = make([]protoimpl.MessageInfo, 21)
+var file_feos_fleet_v1_fleet_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_feos_fleet_v1_fleet_proto_goTypes = []any{
 	(*JoinRequest)(nil),                 // 0: feos.fleet.v1.JoinRequest
 	(*JoinResponse)(nil),                // 1: feos.fleet.v1.JoinResponse
@@ -1775,24 +1897,26 @@ var file_feos_fleet_v1_fleet_proto_goTypes = []any{
 	(*KubeBinding)(nil),                 // 18: feos.fleet.v1.KubeBinding
 	(*ClientCertificate)(nil),           // 19: feos.fleet.v1.ClientCertificate
 	(*SshBinding)(nil),                  // 20: feos.fleet.v1.SshBinding
-	(*timestamppb.Timestamp)(nil),       // 21: google.protobuf.Timestamp
-	(*v1.PodEvent)(nil),                 // 22: feos.pod.v1.PodEvent
-	(*v11.TrafficRecord)(nil),           // 23: feos.network.v1.TrafficRecord
+	(*JoinMeshRequest)(nil),             // 21: feos.fleet.v1.JoinMeshRequest
+	(*JoinMeshResponse)(nil),            // 22: feos.fleet.v1.JoinMeshResponse
+	(*timestamppb.Timestamp)(nil),       // 23: google.protobuf.Timestamp
+	(*v1.PodEvent)(nil),                 // 24: feos.pod.v1.PodEvent
+	(*v11.TrafficRecord)(nil),           // 25: feos.network.v1.TrafficRecord
 }
 var file_feos_fleet_v1_fleet_proto_depIdxs = []int32{
 	5,  // 0: feos.fleet.v1.JoinResponse.certificate:type_name -> feos.fleet.v1.Certificate
 	2,  // 1: feos.fleet.v1.JoinResponse.instances:type_name -> feos.fleet.v1.ControlPlaneInstance
 	5,  // 2: feos.fleet.v1.RenewCertificateResponse.certificate:type_name -> feos.fleet.v1.Certificate
-	21, // 3: feos.fleet.v1.Certificate.not_before:type_name -> google.protobuf.Timestamp
-	21, // 4: feos.fleet.v1.Certificate.not_after:type_name -> google.protobuf.Timestamp
-	21, // 5: feos.fleet.v1.Certificate.renew_after:type_name -> google.protobuf.Timestamp
+	23, // 3: feos.fleet.v1.Certificate.not_before:type_name -> google.protobuf.Timestamp
+	23, // 4: feos.fleet.v1.Certificate.not_after:type_name -> google.protobuf.Timestamp
+	23, // 5: feos.fleet.v1.Certificate.renew_after:type_name -> google.protobuf.Timestamp
 	7,  // 6: feos.fleet.v1.Telemetry.versions:type_name -> feos.fleet.v1.Versions
 	2,  // 7: feos.fleet.v1.TelemetryResponse.instances:type_name -> feos.fleet.v1.ControlPlaneInstance
 	10, // 8: feos.fleet.v1.EventBatch.events:type_name -> feos.fleet.v1.Event
-	21, // 9: feos.fleet.v1.Event.time:type_name -> google.protobuf.Timestamp
-	22, // 10: feos.fleet.v1.Event.pod:type_name -> feos.pod.v1.PodEvent
+	23, // 9: feos.fleet.v1.Event.time:type_name -> google.protobuf.Timestamp
+	24, // 10: feos.fleet.v1.Event.pod:type_name -> feos.pod.v1.PodEvent
 	11, // 11: feos.fleet.v1.Event.audit:type_name -> feos.fleet.v1.AuditRecord
-	23, // 12: feos.fleet.v1.Event.traffic:type_name -> feos.network.v1.TrafficRecord
+	25, // 12: feos.fleet.v1.Event.traffic:type_name -> feos.network.v1.TrafficRecord
 	12, // 13: feos.fleet.v1.Event.node:type_name -> feos.fleet.v1.NodeEvent
 	5,  // 14: feos.fleet.v1.IssuePodCredentialsResponse.certificate:type_name -> feos.fleet.v1.Certificate
 	16, // 15: feos.fleet.v1.IssuePodCredentialsResponse.bindings:type_name -> feos.fleet.v1.SealedBindings
@@ -1804,13 +1928,15 @@ var file_feos_fleet_v1_fleet_proto_depIdxs = []int32{
 	6,  // 21: feos.fleet.v1.FleetService.ReportTelemetry:input_type -> feos.fleet.v1.Telemetry
 	9,  // 22: feos.fleet.v1.FleetService.PublishEvents:input_type -> feos.fleet.v1.EventBatch
 	14, // 23: feos.fleet.v1.FleetService.IssuePodCredentials:input_type -> feos.fleet.v1.IssuePodCredentialsRequest
-	1,  // 24: feos.fleet.v1.FleetService.Join:output_type -> feos.fleet.v1.JoinResponse
-	4,  // 25: feos.fleet.v1.FleetService.RenewCertificate:output_type -> feos.fleet.v1.RenewCertificateResponse
-	8,  // 26: feos.fleet.v1.FleetService.ReportTelemetry:output_type -> feos.fleet.v1.TelemetryResponse
-	13, // 27: feos.fleet.v1.FleetService.PublishEvents:output_type -> feos.fleet.v1.EventAck
-	15, // 28: feos.fleet.v1.FleetService.IssuePodCredentials:output_type -> feos.fleet.v1.IssuePodCredentialsResponse
-	24, // [24:29] is the sub-list for method output_type
-	19, // [19:24] is the sub-list for method input_type
+	21, // 24: feos.fleet.v1.FleetService.JoinMesh:input_type -> feos.fleet.v1.JoinMeshRequest
+	1,  // 25: feos.fleet.v1.FleetService.Join:output_type -> feos.fleet.v1.JoinResponse
+	4,  // 26: feos.fleet.v1.FleetService.RenewCertificate:output_type -> feos.fleet.v1.RenewCertificateResponse
+	8,  // 27: feos.fleet.v1.FleetService.ReportTelemetry:output_type -> feos.fleet.v1.TelemetryResponse
+	13, // 28: feos.fleet.v1.FleetService.PublishEvents:output_type -> feos.fleet.v1.EventAck
+	15, // 29: feos.fleet.v1.FleetService.IssuePodCredentials:output_type -> feos.fleet.v1.IssuePodCredentialsResponse
+	22, // 30: feos.fleet.v1.FleetService.JoinMesh:output_type -> feos.fleet.v1.JoinMeshResponse
+	25, // [25:31] is the sub-list for method output_type
+	19, // [19:25] is the sub-list for method input_type
 	19, // [19:19] is the sub-list for extension type_name
 	19, // [19:19] is the sub-list for extension extendee
 	0,  // [0:19] is the sub-list for field type_name
@@ -1837,7 +1963,7 @@ func file_feos_fleet_v1_fleet_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_feos_fleet_v1_fleet_proto_rawDesc), len(file_feos_fleet_v1_fleet_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   21,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

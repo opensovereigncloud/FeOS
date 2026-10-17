@@ -317,6 +317,7 @@ impl Pods {
         }
         pods.follow_vms();
         pods.follow_security_groups();
+        pods.follow_network();
         Ok(pods)
     }
 
@@ -1554,6 +1555,12 @@ impl Pods {
         }))
     }
 
+    /// The pods' network, which the mesh's API and the control plane's
+    /// client reach through the pods.
+    pub fn network(&self) -> &Network {
+        &self.inner.network
+    }
+
     pub fn list(&self) -> Vec<PodInfo> {
         let mut pods: Vec<PodInfo> = self.pods().values().map(Pod::shown).collect();
         pods.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
@@ -1921,15 +1928,21 @@ impl Pods {
         self.inner.network.apply(&pods).await
     }
 
-    /// Writes the pods' rules again whenever the security groups change,
-    /// and every so often.
+    /// Writes the pods' rules again whenever the security groups or the
+    /// mesh's peers change, and every so often.
     fn follow_security_groups(&self) {
         let pods = self.clone();
         let mut changes = self.inner.network.groups().subscribe();
+        let mut peers = self.inner.network.subscribe_mesh();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     changed = changes.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = peers.changed() => {
                         if changed.is_err() {
                             return;
                         }
@@ -1941,6 +1954,71 @@ impl Pods {
                 }
             }
         });
+    }
+
+    /// Puts the pods on the network once it comes up after feosd's start,
+    /// as on a mesh whose /64 the control plane gives the node later
+    /// (ADR 0017): as the start does for a network that is there, pods
+    /// get the addresses they lack, the resolver knows them and answers,
+    /// the rules are written, the records start, and running pods get
+    /// their TAP devices.
+    fn follow_network(&self) {
+        let mut ready = self.inner.network.ready();
+        if *ready.borrow() {
+            return;
+        }
+        let pods = self.clone();
+        tokio::spawn(async move {
+            if ready.wait_for(|ready| *ready).await.is_err() {
+                return;
+            }
+            pods.network_came_up().await;
+        });
+    }
+
+    async fn network_came_up(&self) {
+        let network = &self.inner.network;
+        let changed: Vec<PodInfo> = {
+            let mut pods = self.pods();
+            // A hibernated pod has no addresses on the node.
+            let mut kept: Vec<PodInfo> = pods
+                .values()
+                .map(|pod| pod.info.clone())
+                .filter(|info| info.state() != PodState::Hibernated)
+                .collect();
+            let changed = network.adopt(&mut kept);
+            kept.into_iter()
+                .filter(|info| changed.contains(&info.pod_id))
+                .inspect(|info| {
+                    if let Some(pod) = pods.get_mut(&info.pod_id) {
+                        pod.info = info.clone();
+                    }
+                })
+                .collect()
+        };
+        for info in &changed {
+            if let Err(e) = self.inner.store.save(info) {
+                warn!("Pods: Failed to keep {}: {e}", info.pod_id);
+            }
+        }
+        network.sync(&self.list());
+        network.serve_dns();
+        match self.apply_network().await {
+            Ok(()) => network.start_records(),
+            Err(e) => network.fail(format!("the pods' rules are not written: {e}")),
+        }
+        let running: Vec<String> = self
+            .list()
+            .into_iter()
+            .filter(|info| info.state() == PodState::Running)
+            .map(|info| info.pod_id)
+            .collect();
+        for pod_id in running {
+            if let Err(e) = self.reattach(&pod_id).await {
+                warn!("Pods: {pod_id} runs without its network: {}", e.message());
+            }
+        }
+        info!("Pods: The pods' network is up");
     }
 
     /// Waits until the VM service records the microVM in `state`: it

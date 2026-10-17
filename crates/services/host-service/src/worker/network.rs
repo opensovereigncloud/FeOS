@@ -2,16 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Network configuration as the host pushes it: a static IPv6 address, a
-//! static IPv4 address or both, their default routes, the resolvers and the
-//! hostname. A gateway may lie outside its address's prefix, as a pod's
-//! IPv4 gateway does outside its /32: it gets a route on the link. A guest
-//! runs no DHCP and takes no router advertisements; its host pushes the
-//! whole configuration after every boot and every resume. Netlink through
-//! rtnetlink, no ip(8).
+//! static IPv4 address or both, their default routes or the routes that
+//! replace them, the resolvers and the hostname. A gateway may lie outside
+//! its address's prefix, as a pod's IPv4 gateway does outside its /32: it
+//! gets a route on the link. A guest runs no DHCP and takes no router
+//! advertisements; its host pushes the whole configuration after every
+//! boot and every resume. Netlink through rtnetlink, no ip(8).
 
 use crate::error::HostError;
 use feos_proto::host_service::{
-    GetNetworkConfigResponse, ResolverFailure, SetNetworkConfigRequest, SetNetworkConfigResponse,
+    GetNetworkConfigResponse, NetworkRoute, ResolverFailure, SetNetworkConfigRequest,
+    SetNetworkConfigResponse,
 };
 use feos_utils::filesystem::CONTAINERS_DIR;
 use feos_utils::resolver;
@@ -22,7 +23,8 @@ use rtnetlink::packet_route::address::{
 };
 use rtnetlink::packet_route::link::{LinkFlags, LinkMessage};
 use rtnetlink::packet_route::route::{
-    RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteProtocol, RouteScope, RouteType,
+    RouteAddress, RouteAttribute, RouteHeader, RouteMessage, RouteMetric, RouteProtocol,
+    RouteScope, RouteType,
 };
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::{Handle, RouteMessageBuilder};
@@ -46,7 +48,7 @@ pub async fn handle_set_network_config(
     let _push = PUSH.lock().await;
     let result = set_network_config(&req).await;
     if result.is_ok() {
-        let addresses: Vec<String> = [
+        let mut addresses: Vec<String> = [
             (&req.ipv6_cidr, &req.ipv6_gateway),
             (&req.ipv4_cidr, &req.gateway),
         ]
@@ -54,6 +56,10 @@ pub async fn handle_set_network_config(
         .filter(|(cidr, _)| !cidr.is_empty())
         .map(|(cidr, gateway)| format!("{cidr} via {gateway}"))
         .collect();
+        addresses.extend(req.routes.iter().map(|route| match route.mtu {
+            0 => format!("{} via {}", route.destination, route.gateway),
+            mtu => format!("{} via {} mtu {mtu}", route.destination, route.gateway),
+        }));
         info!(
             "HostWorker: Network configured: {} {}",
             req.interface,
@@ -81,6 +87,7 @@ pub async fn handle_get_network_config(
             hostname: c.hostname,
             ipv6_cidr: c.ipv6_cidr,
             ipv6_gateway: c.ipv6_gateway,
+            routes: c.routes,
         },
         None => GetNetworkConfigResponse::default(),
     };
@@ -92,12 +99,26 @@ pub async fn handle_get_network_config(
 async fn set_network_config(
     req: &SetNetworkConfigRequest,
 ) -> Result<SetNetworkConfigResponse, HostError> {
-    let ipv4 = parse_static(AddressFamily::Inet, &req.ipv4_cidr, &req.gateway)?;
-    let ipv6 = parse_static(AddressFamily::Inet6, &req.ipv6_cidr, &req.ipv6_gateway)?;
+    let mut ipv4 = parse_static(AddressFamily::Inet, &req.ipv4_cidr, &req.gateway)?;
+    let mut ipv6 = parse_static(AddressFamily::Inet6, &req.ipv6_cidr, &req.ipv6_gateway)?;
     if ipv4.is_none() && ipv6.is_none() {
         return Err(HostError::InvalidArgument(
             "neither an IPv6 nor an IPv4 address".to_string(),
         ));
+    }
+    for route in &req.routes {
+        let route = parse_route(route)?;
+        let family = match route.destination {
+            IpAddr::V4(_) => ipv4.as_mut(),
+            IpAddr::V6(_) => ipv6.as_mut(),
+        };
+        let family = family.ok_or_else(|| {
+            HostError::InvalidArgument(format!(
+                "route to {}/{}: the push has no address of its family",
+                route.destination, route.len
+            ))
+        })?;
+        family.routes.push(route);
     }
     // Each one becomes a nameserver line of resolv.conf.
     if let Some(dns) = req.dns.iter().find(|dns| dns.parse::<IpAddr>().is_err()) {
@@ -127,31 +148,39 @@ async fn set_network_config(
     Ok(SetNetworkConfigResponse { resolver_failed })
 }
 
-/// One family's part of a push: the address, its prefix length and the
-/// default gateway.
+/// One family's part of a push: the address, its prefix length, the
+/// default gateway, and the routes that replace the default route.
 #[derive(Debug, PartialEq)]
 struct Static {
     address: IpAddr,
     prefix_len: u8,
     gateway: IpAddr,
+    routes: Vec<Via>,
 }
 
 impl Static {
     /// The routes the family gets on the interface, in order, beside those
-    /// the kernel makes for the address: the default route via the gateway
-    /// and, for a gateway outside the address's prefix, a route to the
-    /// gateway on the link first, without which the kernel takes no route
-    /// via it. An IPv6 gateway on the link-local prefix needs none.
+    /// the kernel makes for the address: the default route via the gateway,
+    /// or the pushed routes instead, and before them, for each gateway
+    /// outside the address's prefix, a route to it on the link, without
+    /// which the kernel takes no route via it. An IPv6 gateway on the
+    /// link-local prefix needs none.
     fn routes(&self) -> Vec<Route> {
-        let on_link = match self.gateway {
-            IpAddr::V6(gateway) if gateway.is_unicast_link_local() => true,
-            gateway => same_prefix(self.address, gateway, self.prefix_len),
+        let vias = match self.routes.is_empty() {
+            true => vec![Via::default_route(self.gateway)],
+            false => self.routes.clone(),
         };
         let mut routes = Vec::new();
-        if !on_link {
-            routes.push(Route::Link(self.gateway));
+        for gateway in vias.iter().map(|via| via.gateway) {
+            let on_link = match gateway {
+                IpAddr::V6(gateway) if gateway.is_unicast_link_local() => true,
+                gateway => same_prefix(self.address, gateway, self.prefix_len),
+            };
+            if !on_link && !routes.contains(&Route::Link(gateway)) {
+                routes.push(Route::Link(gateway));
+            }
         }
-        routes.push(Route::Default(self.gateway));
+        routes.extend(vias.into_iter().map(Route::Via));
         routes
     }
 }
@@ -221,7 +250,74 @@ fn parse_static(
         address,
         prefix_len,
         gateway,
+        routes: Vec::new(),
     }))
+}
+
+/// A pushed route: a prefix without bits beyond its length, a gateway of
+/// its family that a host can have, and an MTU that the family can carry,
+/// or 0 for the interface's.
+fn parse_route(route: &NetworkRoute) -> Result<Via, HostError> {
+    let bad = |what: &str| {
+        HostError::InvalidArgument(format!(
+            "route to {:?} via {:?}: {what}",
+            route.destination, route.gateway
+        ))
+    };
+    let (destination, len) = route
+        .destination
+        .split_once('/')
+        .and_then(|(address, len)| Some((address.parse::<IpAddr>().ok()?, len.parse::<u8>().ok()?)))
+        .ok_or_else(|| bad("not a prefix"))?;
+    let (bits, min_mtu) = match destination {
+        IpAddr::V4(_) => (32, 68),
+        IpAddr::V6(_) => (128, 1280),
+    };
+    if len > bits {
+        return Err(bad("not a prefix"));
+    }
+    if !beyond_is_zero(destination, len) {
+        return Err(bad("the prefix has bits beyond its length"));
+    }
+    let gateway = route
+        .gateway
+        .parse::<IpAddr>()
+        .ok()
+        .filter(|g| g.is_ipv4() == destination.is_ipv4())
+        .filter(|g| match g {
+            IpAddr::V4(g) => unicast_v4(*g),
+            IpAddr::V6(g) => !(g.is_unspecified() || g.is_loopback() || g.is_multicast()),
+        })
+        .ok_or_else(|| bad("not a gateway of the prefix's family"))?;
+    if route.mtu != 0 && !(min_mtu..=65535).contains(&route.mtu) {
+        return Err(bad(&format!("an MTU of {}", route.mtu)));
+    }
+    Ok(Via {
+        destination,
+        len,
+        gateway,
+        mtu: route.mtu,
+    })
+}
+
+/// Whether the bits of `address` after its first `len` are all zero.
+fn beyond_is_zero(address: IpAddr, len: u8) -> bool {
+    let (value, bits) = match address {
+        IpAddr::V4(a) => (u128::from(u32::from(a)), 32),
+        IpAddr::V6(a) => (u128::from(a), 128),
+    };
+    value
+        .checked_shl(u32::from(len) + (128 - bits))
+        .unwrap_or(0)
+        == 0
+}
+
+/// The unspecified address of `address`'s family.
+fn unspecified(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+    }
 }
 
 /// Whether an IPv4 address can be a host's on a link: not unspecified,
@@ -340,20 +436,41 @@ async fn configure_family(
     configure_routes(handle, index, family, &routes).await
 }
 
+/// A route via a gateway: a prefix, the default route's of length 0, and
+/// its MTU, 0 for the interface's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Via {
+    destination: IpAddr,
+    len: u8,
+    gateway: IpAddr,
+    mtu: u32,
+}
+
+impl Via {
+    fn default_route(gateway: IpAddr) -> Self {
+        Self {
+            destination: unspecified(gateway),
+            len: 0,
+            gateway,
+            mtu: 0,
+        }
+    }
+}
+
 /// A route that a push gives the interface.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Route {
     /// To the gateway alone, on the interface's link.
     Link(IpAddr),
-    /// The default route via the gateway.
-    Default(IpAddr),
+    /// A prefix, or the default route, via a gateway.
+    Via(Via),
 }
 
 impl Route {
     /// The message that adds the route through the interface. A link-local
     /// gateway needs the interface, too.
     fn message(self, index: u32) -> RouteMessage {
-        match self {
+        let mut message = match self {
             // IPv4 takes a route via a gateway only when the gateway's own
             // route is of the link's scope.
             Route::Link(IpAddr::V4(gateway)) => RouteMessageBuilder::<Ipv4Addr>::new()
@@ -365,15 +482,35 @@ impl Route {
                 .destination_prefix(gateway, 128)
                 .output_interface(index)
                 .build(),
-            Route::Default(IpAddr::V4(gateway)) => RouteMessageBuilder::<Ipv4Addr>::new()
-                .gateway(gateway)
-                .output_interface(index)
-                .build(),
-            Route::Default(IpAddr::V6(gateway)) => RouteMessageBuilder::<Ipv6Addr>::new()
-                .gateway(gateway)
-                .output_interface(index)
-                .build(),
+            Route::Via(via) => match (via.destination, via.gateway) {
+                (IpAddr::V4(destination), IpAddr::V4(gateway)) => {
+                    let builder = RouteMessageBuilder::<Ipv4Addr>::new();
+                    let builder = match via.len {
+                        0 => builder,
+                        len => builder.destination_prefix(destination, len),
+                    };
+                    builder.gateway(gateway).output_interface(index).build()
+                }
+                (IpAddr::V6(destination), IpAddr::V6(gateway)) => {
+                    let builder = RouteMessageBuilder::<Ipv6Addr>::new();
+                    let builder = match via.len {
+                        0 => builder,
+                        len => builder.destination_prefix(destination, len),
+                    };
+                    builder.gateway(gateway).output_interface(index).build()
+                }
+                // parse_route keeps the families together.
+                _ => RouteMessage::default(),
+            },
+        };
+        if let Route::Via(Via { mtu, .. }) = self
+            && mtu != 0
+        {
+            message
+                .attributes
+                .push(RouteAttribute::Metrics(vec![RouteMetric::Mtu(mtu)]));
         }
+        message
     }
 
     /// The route that a message of the kernel's is, if it is one of these.
@@ -393,10 +530,18 @@ impl Route {
         };
         let mut destination = None;
         let mut gateway = None;
+        let mut mtu = 0;
         for attribute in &message.attributes {
             match attribute {
                 RouteAttribute::Destination(d) => destination = ip(d),
                 RouteAttribute::Gateway(g) => gateway = ip(g),
+                RouteAttribute::Metrics(metrics) => {
+                    for metric in metrics {
+                        if let RouteMetric::Mtu(value) = metric {
+                            mtu = *value;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -405,7 +550,16 @@ impl Route {
             destination,
             gateway,
         ) {
-            (0, _, Some(gateway)) => Some(Route::Default(gateway)),
+            (0, _, Some(gateway)) => Some(Route::Via(Via {
+                mtu,
+                ..Via::default_route(gateway)
+            })),
+            (len, Some(destination), Some(gateway)) => Some(Route::Via(Via {
+                destination,
+                len,
+                gateway,
+                mtu,
+            })),
             // IPv6 routes have no scope.
             (len, Some(destination), None)
                 if len == host_len
@@ -422,7 +576,16 @@ impl std::fmt::Display for Route {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Route::Link(gateway) => write!(f, "route to {gateway} on the link"),
-            Route::Default(gateway) => write!(f, "default route via {gateway}"),
+            Route::Via(via) => {
+                match via.len {
+                    0 => write!(f, "default route via {}", via.gateway)?,
+                    len => write!(f, "route to {}/{len} via {}", via.destination, via.gateway)?,
+                }
+                match via.mtu {
+                    0 => Ok(()),
+                    mtu => write!(f, " with an MTU of {mtu}"),
+                }
+            }
         }
     }
 }
@@ -533,6 +696,10 @@ fn ignore_gone(result: Result<(), rtnetlink::Error>, what: &str) -> Result<(), H
 mod tests {
     use super::*;
 
+    fn default(gateway: IpAddr) -> Route {
+        Route::Via(Via::default_route(gateway))
+    }
+
     #[test]
     fn parses_ipv4() {
         assert_eq!(
@@ -541,6 +708,7 @@ mod tests {
                 address: Ipv4Addr::new(192, 168, 100, 10).into(),
                 prefix_len: 24,
                 gateway: Ipv4Addr::new(192, 168, 100, 1).into(),
+                routes: Vec::new(),
             })
         );
         // A pod's: a /32 with the node's address on the link as gateway.
@@ -550,6 +718,7 @@ mod tests {
                 address: Ipv4Addr::new(169, 254, 16, 2).into(),
                 prefix_len: 32,
                 gateway: Ipv4Addr::new(169, 254, 0, 1).into(),
+                routes: Vec::new(),
             })
         );
         assert_eq!(parse_static(AddressFamily::Inet, "", "").unwrap(), None);
@@ -585,6 +754,7 @@ mod tests {
                 address: "fd00:fe05:ffff::2".parse::<Ipv6Addr>().unwrap().into(),
                 prefix_len: 128,
                 gateway: "fe80::1".parse::<Ipv6Addr>().unwrap().into(),
+                routes: Vec::new(),
             })
         );
         assert!(parse_static(AddressFamily::Inet6, "2001:db8::2/64", "2001:db8::1").is_ok());
@@ -625,49 +795,114 @@ mod tests {
         // first.
         assert_eq!(
             routes(AddressFamily::Inet, "169.254.16.2/32", "169.254.0.1"),
-            [
-                Route::Link(ip("169.254.0.1")),
-                Route::Default(ip("169.254.0.1"))
-            ]
+            [Route::Link(ip("169.254.0.1")), default(ip("169.254.0.1"))]
         );
         assert_eq!(
             routes(AddressFamily::Inet, "192.168.100.10/24", "192.168.100.1"),
-            [Route::Default(ip("192.168.100.1"))]
+            [default(ip("192.168.100.1"))]
         );
         assert_eq!(
             routes(AddressFamily::Inet, "192.168.100.10/24", "192.168.101.1"),
             [
                 Route::Link(ip("192.168.101.1")),
-                Route::Default(ip("192.168.101.1"))
+                default(ip("192.168.101.1"))
             ]
         );
         assert_eq!(
             routes(AddressFamily::Inet, "10.0.0.2/0", "192.168.101.1"),
-            [Route::Default(ip("192.168.101.1"))]
+            [default(ip("192.168.101.1"))]
         );
         assert_eq!(
             routes(AddressFamily::Inet6, "fd00:fe05:1::2/128", "fe80::1"),
-            [Route::Default(ip("fe80::1"))]
+            [default(ip("fe80::1"))]
         );
         assert_eq!(
             routes(AddressFamily::Inet6, "2001:db8::2/64", "2001:db8::1"),
-            [Route::Default(ip("2001:db8::1"))]
+            [default(ip("2001:db8::1"))]
         );
         assert_eq!(
             routes(AddressFamily::Inet6, "2001:db8::2/128", "2001:db8::1"),
-            [
-                Route::Link(ip("2001:db8::1")),
-                Route::Default(ip("2001:db8::1"))
-            ]
+            [Route::Link(ip("2001:db8::1")), default(ip("2001:db8::1"))]
         );
+        // Pushed routes replace the default route, and a gateway outside
+        // the prefix gets its route on the link once.
+        let ula = |destination: &str, gateway: &str, mtu| NetworkRoute {
+            destination: destination.to_string(),
+            gateway: gateway.to_string(),
+            mtu,
+        };
+        let mut pod = parse_static(AddressFamily::Inet6, "fd00:fe05:1::2/128", "fe80::1")
+            .unwrap()
+            .unwrap();
+        pod.routes
+            .push(parse_route(&ula("fc00::/7", "fe80::1", 1420)).unwrap());
+        let mesh = Route::Via(Via {
+            destination: ip("fc00::"),
+            len: 7,
+            gateway: ip("fe80::1"),
+            mtu: 1420,
+        });
+        assert_eq!(pod.routes(), [mesh]);
+        let mut far = parse_static(AddressFamily::Inet6, "2001:db8::2/128", "2001:db8::1")
+            .unwrap()
+            .unwrap();
+        for destination in ["2001:db8:1::/48", "2001:db8:2::/48"] {
+            far.routes
+                .push(parse_route(&ula(destination, "2001:db8::1", 0)).unwrap());
+        }
+        assert_eq!(far.routes().len(), 3);
+        assert_eq!(far.routes()[0], Route::Link(ip("2001:db8::1")));
         // What the guest adds, it knows again.
         for route in [
             Route::Link(ip("169.254.0.1")),
-            Route::Default(ip("169.254.0.1")),
+            default(ip("169.254.0.1")),
             Route::Link(ip("2001:db8::1")),
-            Route::Default(ip("fe80::1")),
+            default(ip("fe80::1")),
+            mesh,
+            Route::Via(Via {
+                destination: ip("10.9.0.0"),
+                len: 16,
+                gateway: ip("169.254.0.1"),
+                mtu: 0,
+            }),
         ] {
             assert_eq!(Route::of(&route.message(2)), Some(route));
+        }
+        assert_eq!(
+            mesh.to_string(),
+            "route to fc00::/7 via fe80::1 with an MTU of 1420"
+        );
+    }
+
+    #[test]
+    fn routes_are_checked() {
+        let route = |destination: &str, gateway: &str, mtu| {
+            parse_route(&NetworkRoute {
+                destination: destination.to_string(),
+                gateway: gateway.to_string(),
+                mtu,
+            })
+        };
+        assert!(route("fc00::/7", "fe80::1", 1420).is_ok());
+        assert!(route("::/0", "fe80::1", 0).is_ok());
+        assert!(route("10.9.0.0/16", "169.254.0.1", 1400).is_ok());
+        for (destination, gateway, mtu) in [
+            ("fc00::1/7", "fe80::1", 0),
+            ("fc00::/129", "fe80::1", 0),
+            ("fc00::", "fe80::1", 0),
+            ("fc00::/7", "169.254.0.1", 0),
+            ("10.9.0.0/16", "fe80::1", 0),
+            ("10.9.0.0/33", "169.254.0.1", 0),
+            ("fc00::/7", "ff02::1", 0),
+            ("fc00::/7", "::", 0),
+            ("fc00::/7", "fe80::1", 1279),
+            ("fc00::/7", "fe80::1", 65536),
+            ("10.9.0.0/16", "169.254.0.1", 67),
+        ] {
+            assert!(
+                route(destination, gateway, mtu).is_err(),
+                "{destination} via {gateway} mtu {mtu}"
+            );
         }
     }
 
@@ -720,6 +955,15 @@ mod tests {
                 for attribute in &message.attributes {
                     if let RouteAttribute::Gateway(g) = attribute {
                         route.push_str(&format!(" via {}", ip(g)));
+                    }
+                }
+                for attribute in &message.attributes {
+                    if let RouteAttribute::Metrics(metrics) = attribute {
+                        for metric in metrics {
+                            if let RouteMetric::Mtu(mtu) = metric {
+                                route.push_str(&format!(" mtu {mtu}"));
+                            }
+                        }
                     }
                 }
                 if message.header.scope == RouteScope::Link {
@@ -869,6 +1113,36 @@ mod tests {
                     strings(&["default via 10.0.0.1", "default via fe80::1"])
                 )
             );
+
+            // A pod whose address is a ULA: a route for the ULAs in
+            // place of the default route.
+            let mut ula = ipv6("fd00::3/128").unwrap();
+            ula.routes.push(Via {
+                destination: "fc00::".parse().unwrap(),
+                len: 7,
+                gateway: "fe80::1".parse().unwrap(),
+                mtu: 1420,
+            });
+            configure_interface("eth0", ipv4("169.254.16.4/32", "169.254.0.1"), Some(ula))
+                .await
+                .unwrap();
+            let routes = strings(&[
+                "169.254.0.1/32 scope link",
+                "default via 169.254.0.1",
+                "fc00::/7 via fe80::1 mtu 1420",
+            ]);
+            assert_eq!(configured(&handle, index).await.1, routes);
+            let mut ula = ipv6("fd00::3/128").unwrap();
+            ula.routes.push(Via {
+                destination: "fc00::".parse().unwrap(),
+                len: 7,
+                gateway: "fe80::1".parse().unwrap(),
+                mtu: 1420,
+            });
+            configure_interface("eth0", ipv4("169.254.16.4/32", "169.254.0.1"), Some(ula))
+                .await
+                .unwrap();
+            assert_eq!(configured(&handle, index).await.1, routes, "the same again");
 
             configure_interface("eth0", None, ipv6("fd00::3/128"))
                 .await

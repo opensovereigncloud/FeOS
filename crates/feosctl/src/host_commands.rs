@@ -8,9 +8,9 @@ use clap::{ArgGroup, Args, Subcommand};
 use feos_proto::host_service::{
     host_service_client::HostServiceClient, FreezeFilesystemRequest, GetCpuInfoRequest,
     GetMemoryBreakdownRequest, GetNetworkConfigRequest, GetNetworkInfoRequest, GetTimeRequest,
-    GetVersionInfoRequest, HostnameRequest, MemoryBreakdown, MemoryRequest, PingRequest,
-    PreparePauseRequest, RebootRequest, SetNetworkConfigRequest, SetTimeRequest, ShutdownRequest,
-    StreamFeosLogsRequest, StreamKernelLogsRequest, ThawFilesystemRequest,
+    GetVersionInfoRequest, HostnameRequest, MemoryBreakdown, MemoryRequest, NetworkRoute,
+    PingRequest, PreparePauseRequest, RebootRequest, SetNetworkConfigRequest, SetTimeRequest,
+    ShutdownRequest, StreamFeosLogsRequest, StreamKernelLogsRequest, ThawFilesystemRequest,
     UpgradeFeosBinaryRequest,
 };
 use prost_types::Timestamp;
@@ -114,6 +114,18 @@ pub enum HostCommand {
         dns: Vec<String>,
         #[arg(long, default_value = "")]
         hostname: String,
+        #[arg(
+            long = "route",
+            help = "A prefix via its family's gateway, in place of the family's default \
+                    route, e.g. fc00::/7; repeat for more than one"
+        )]
+        routes: Vec<String>,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "The routes' MTU; 0 is the interface's"
+        )]
+        route_mtu: u32,
     },
     /// Show the last pushed network configuration
     GetNetwork,
@@ -171,15 +183,31 @@ pub async fn handle_host_command(args: HostArgs) -> Result<()> {
             ipv6_gateway,
             dns,
             hostname,
+            routes,
+            route_mtu,
         } => {
+            let gateway = gateway.unwrap_or_default();
+            let ipv6_gateway = ipv6_gateway.unwrap_or_default();
+            let routes = routes
+                .into_iter()
+                .map(|destination| NetworkRoute {
+                    gateway: match destination.contains(':') {
+                        true => ipv6_gateway.clone(),
+                        false => gateway.clone(),
+                    },
+                    destination,
+                    mtu: route_mtu,
+                })
+                .collect();
             let request = SetNetworkConfigRequest {
                 interface,
                 ipv4_cidr: ipv4.unwrap_or_default(),
-                gateway: gateway.unwrap_or_default(),
+                gateway,
                 dns,
                 hostname,
                 ipv6_cidr: ipv6.unwrap_or_default(),
-                ipv6_gateway: ipv6_gateway.unwrap_or_default(),
+                ipv6_gateway,
+                routes,
             };
             set_network(&mut client, request).await?
         }
@@ -541,6 +569,15 @@ async fn get_network(client: &mut HostServiceClient<Channel>) -> Result<()> {
     println!("IPv4 gateway: {}", response.gateway);
     println!("DNS:          {}", response.dns.join(", "));
     println!("Hostname:     {}", response.hostname);
+    for route in &response.routes {
+        match route.mtu {
+            0 => println!("Route:        {} via {}", route.destination, route.gateway),
+            mtu => println!(
+                "Route:        {} via {}, MTU {mtu}",
+                route.destination, route.gateway
+            ),
+        }
+    }
     Ok(())
 }
 

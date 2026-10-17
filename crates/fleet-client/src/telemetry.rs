@@ -30,6 +30,29 @@ pub trait Inventory: Send + Sync + 'static {
     /// diskd's object store and version, or None when diskd does not
     /// answer.
     fn diskd(&self) -> impl Future<Output = Option<Diskd>> + Send;
+    /// The node's prefix for pods, such as "fd5e:1b2c:93a0:7::/64", once
+    /// it has one; the configured one is reported until then.
+    fn pod_prefix(&self) -> Option<String> {
+        None
+    }
+    /// The node's WireGuard key and port, if it is on the cluster's mesh
+    /// (ADR 0017). A node without, which has a prefix of its network's,
+    /// asks only whether the cluster is meshed.
+    fn mesh_key(&self) -> Option<([u8; 32], u16)> {
+        None
+    }
+    /// Takes what the control plane answered to the node's JoinMesh: the
+    /// cluster's ULA and the node's /64 of it, both empty in a cluster
+    /// whose network is routed. An answer that is not taken is asked for
+    /// again.
+    fn joined_mesh(
+        &self,
+        pod_network: String,
+        pod_prefix: String,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        let _ = (pod_network, pod_prefix);
+        async { Ok(()) }
+    }
 }
 
 /// The versions installed side by side (ADR 0009), newest first.
@@ -84,8 +107,15 @@ impl<I: Inventory> Collector<I> {
         }
     }
 
+    pub(crate) fn inventory(&self) -> &I {
+        &self.inventory
+    }
+
     pub(crate) async fn collect(&mut self) -> Telemetry {
         let mut report = self.fixed.clone();
+        if let Some(prefix) = self.inventory.pod_prefix() {
+            report.pod_prefix = prefix;
+        }
         report.hostname = nix::unistd::gethostname()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();

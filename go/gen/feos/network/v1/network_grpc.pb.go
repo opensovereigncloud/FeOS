@@ -301,6 +301,210 @@ var SecurityGroupService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	MeshService_PutMeshPeers_FullMethodName    = "/feos.network.v1.MeshService/PutMeshPeers"
+	MeshService_UpdateMeshPeers_FullMethodName = "/feos.network.v1.MeshService/UpdateMeshPeers"
+	MeshService_GetMesh_FullMethodName         = "/feos.network.v1.MeshService/GetMesh"
+)
+
+// MeshServiceClient is the client API for MeshService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// The node's place on its cluster's mesh (ADR 0017): a WireGuard device
+// whose peers are the other nodes, each with its /64 of the cluster's ULA
+// as the one prefix allowed for it. The control plane sends every node the
+// others as its peers: whole, or as a delta from one version to the next.
+// feosd keeps them on disk.
+type MeshServiceClient interface {
+	// Puts the peers whole, at a version. It replaces the peers feosd has,
+	// whatever their version. Fails with FAILED_PRECONDITION on a node that
+	// is not on a mesh.
+	PutMeshPeers(ctx context.Context, in *PutMeshPeersRequest, opts ...grpc.CallOption) (*PutMeshPeersResponse, error)
+	// Adds, changes and removes peers, from one version to the next. Fails
+	// with FAILED_PRECONDITION unless feosd has the peers at from_version:
+	// the control plane then puts them whole.
+	UpdateMeshPeers(ctx context.Context, in *UpdateMeshPeersRequest, opts ...grpc.CallOption) (*UpdateMeshPeersResponse, error)
+	// The node's mesh: its prefixes, its key and port, and its peers.
+	GetMesh(ctx context.Context, in *GetMeshRequest, opts ...grpc.CallOption) (*Mesh, error)
+}
+
+type meshServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewMeshServiceClient(cc grpc.ClientConnInterface) MeshServiceClient {
+	return &meshServiceClient{cc}
+}
+
+func (c *meshServiceClient) PutMeshPeers(ctx context.Context, in *PutMeshPeersRequest, opts ...grpc.CallOption) (*PutMeshPeersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PutMeshPeersResponse)
+	err := c.cc.Invoke(ctx, MeshService_PutMeshPeers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *meshServiceClient) UpdateMeshPeers(ctx context.Context, in *UpdateMeshPeersRequest, opts ...grpc.CallOption) (*UpdateMeshPeersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateMeshPeersResponse)
+	err := c.cc.Invoke(ctx, MeshService_UpdateMeshPeers_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *meshServiceClient) GetMesh(ctx context.Context, in *GetMeshRequest, opts ...grpc.CallOption) (*Mesh, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Mesh)
+	err := c.cc.Invoke(ctx, MeshService_GetMesh_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// MeshServiceServer is the server API for MeshService service.
+// All implementations must embed UnimplementedMeshServiceServer
+// for forward compatibility.
+//
+// The node's place on its cluster's mesh (ADR 0017): a WireGuard device
+// whose peers are the other nodes, each with its /64 of the cluster's ULA
+// as the one prefix allowed for it. The control plane sends every node the
+// others as its peers: whole, or as a delta from one version to the next.
+// feosd keeps them on disk.
+type MeshServiceServer interface {
+	// Puts the peers whole, at a version. It replaces the peers feosd has,
+	// whatever their version. Fails with FAILED_PRECONDITION on a node that
+	// is not on a mesh.
+	PutMeshPeers(context.Context, *PutMeshPeersRequest) (*PutMeshPeersResponse, error)
+	// Adds, changes and removes peers, from one version to the next. Fails
+	// with FAILED_PRECONDITION unless feosd has the peers at from_version:
+	// the control plane then puts them whole.
+	UpdateMeshPeers(context.Context, *UpdateMeshPeersRequest) (*UpdateMeshPeersResponse, error)
+	// The node's mesh: its prefixes, its key and port, and its peers.
+	GetMesh(context.Context, *GetMeshRequest) (*Mesh, error)
+	mustEmbedUnimplementedMeshServiceServer()
+}
+
+// UnimplementedMeshServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedMeshServiceServer struct{}
+
+func (UnimplementedMeshServiceServer) PutMeshPeers(context.Context, *PutMeshPeersRequest) (*PutMeshPeersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PutMeshPeers not implemented")
+}
+func (UnimplementedMeshServiceServer) UpdateMeshPeers(context.Context, *UpdateMeshPeersRequest) (*UpdateMeshPeersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateMeshPeers not implemented")
+}
+func (UnimplementedMeshServiceServer) GetMesh(context.Context, *GetMeshRequest) (*Mesh, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMesh not implemented")
+}
+func (UnimplementedMeshServiceServer) mustEmbedUnimplementedMeshServiceServer() {}
+func (UnimplementedMeshServiceServer) testEmbeddedByValue()                     {}
+
+// UnsafeMeshServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to MeshServiceServer will
+// result in compilation errors.
+type UnsafeMeshServiceServer interface {
+	mustEmbedUnimplementedMeshServiceServer()
+}
+
+func RegisterMeshServiceServer(s grpc.ServiceRegistrar, srv MeshServiceServer) {
+	// If the following call panics, it indicates UnimplementedMeshServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&MeshService_ServiceDesc, srv)
+}
+
+func _MeshService_PutMeshPeers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PutMeshPeersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MeshServiceServer).PutMeshPeers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MeshService_PutMeshPeers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MeshServiceServer).PutMeshPeers(ctx, req.(*PutMeshPeersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MeshService_UpdateMeshPeers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateMeshPeersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MeshServiceServer).UpdateMeshPeers(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MeshService_UpdateMeshPeers_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MeshServiceServer).UpdateMeshPeers(ctx, req.(*UpdateMeshPeersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MeshService_GetMesh_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMeshRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MeshServiceServer).GetMesh(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MeshService_GetMesh_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MeshServiceServer).GetMesh(ctx, req.(*GetMeshRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// MeshService_ServiceDesc is the grpc.ServiceDesc for MeshService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var MeshService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "feos.network.v1.MeshService",
+	HandlerType: (*MeshServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PutMeshPeers",
+			Handler:    _MeshService_PutMeshPeers_Handler,
+		},
+		{
+			MethodName: "UpdateMeshPeers",
+			Handler:    _MeshService_UpdateMeshPeers_Handler,
+		},
+		{
+			MethodName: "GetMesh",
+			Handler:    _MeshService_GetMesh_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "feos/network/v1/network.proto",
+}
+
+const (
 	TrafficService_StreamTrafficRecords_FullMethodName = "/feos.network.v1.TrafficService/StreamTrafficRecords"
 )
 

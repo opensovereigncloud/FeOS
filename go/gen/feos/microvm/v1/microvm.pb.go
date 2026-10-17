@@ -867,7 +867,12 @@ type GuestNetworkConfig struct {
 	// guest with IPv4 only.
 	Ipv6Cidr string `protobuf:"bytes,6,opt,name=ipv6_cidr,json=ipv6Cidr,proto3" json:"ipv6_cidr,omitempty"`
 	// IPv6 default gateway, on the interface's link, e.g. "fe80::1".
-	Ipv6Gateway   string `protobuf:"bytes,7,opt,name=ipv6_gateway,json=ipv6Gateway,proto3" json:"ipv6_gateway,omitempty"`
+	Ipv6Gateway string `protobuf:"bytes,7,opt,name=ipv6_gateway,json=ipv6Gateway,proto3" json:"ipv6_gateway,omitempty"`
+	// Routes via gateways on the interface's link, such as "fc00::/7" via
+	// "fe80::1" for a pod whose IPv6 address is a ULA (ADR 0017). A family's
+	// routes replace its default route: a family without any gets the
+	// default route via its gateway. A guest of before routes ignores them.
+	Routes        []*GuestRoute `protobuf:"bytes,8,rep,name=routes,proto3" json:"routes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -951,6 +956,76 @@ func (x *GuestNetworkConfig) GetIpv6Gateway() string {
 	return ""
 }
 
+func (x *GuestNetworkConfig) GetRoutes() []*GuestRoute {
+	if x != nil {
+		return x.Routes
+	}
+	return nil
+}
+
+type GuestRoute struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A prefix of either family, e.g. "fc00::/7".
+	Destination string `protobuf:"bytes,1,opt,name=destination,proto3" json:"destination,omitempty"`
+	// On the interface's link, of the destination's family, e.g. "fe80::1".
+	Gateway string `protobuf:"bytes,2,opt,name=gateway,proto3" json:"gateway,omitempty"`
+	// The route's MTU, e.g. 1420 over a mesh; 0 is the interface's.
+	Mtu           uint32 `protobuf:"varint,3,opt,name=mtu,proto3" json:"mtu,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GuestRoute) Reset() {
+	*x = GuestRoute{}
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GuestRoute) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GuestRoute) ProtoMessage() {}
+
+func (x *GuestRoute) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GuestRoute.ProtoReflect.Descriptor instead.
+func (*GuestRoute) Descriptor() ([]byte, []int) {
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *GuestRoute) GetDestination() string {
+	if x != nil {
+		return x.Destination
+	}
+	return ""
+}
+
+func (x *GuestRoute) GetGateway() string {
+	if x != nil {
+		return x.Gateway
+	}
+	return ""
+}
+
+func (x *GuestRoute) GetMtu() uint32 {
+	if x != nil {
+		return x.Mtu
+	}
+	return 0
+}
+
 type CpuConfig struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VcpuCount     uint32                 `protobuf:"varint,1,opt,name=vcpu_count,json=vcpuCount,proto3" json:"vcpu_count,omitempty"`
@@ -960,7 +1035,7 @@ type CpuConfig struct {
 
 func (x *CpuConfig) Reset() {
 	*x = CpuConfig{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[13]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -972,7 +1047,7 @@ func (x *CpuConfig) String() string {
 func (*CpuConfig) ProtoMessage() {}
 
 func (x *CpuConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[13]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -985,7 +1060,7 @@ func (x *CpuConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CpuConfig.ProtoReflect.Descriptor instead.
 func (*CpuConfig) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{13}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *CpuConfig) GetVcpuCount() uint32 {
@@ -1007,7 +1082,7 @@ type MemoryConfig struct {
 
 func (x *MemoryConfig) Reset() {
 	*x = MemoryConfig{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[14]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1019,7 +1094,7 @@ func (x *MemoryConfig) String() string {
 func (*MemoryConfig) ProtoMessage() {}
 
 func (x *MemoryConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[14]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1032,7 +1107,7 @@ func (x *MemoryConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MemoryConfig.ProtoReflect.Descriptor instead.
 func (*MemoryConfig) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{14}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *MemoryConfig) GetSizeMib() uint64 {
@@ -1067,7 +1142,7 @@ type BalloonConfig struct {
 
 func (x *BalloonConfig) Reset() {
 	*x = BalloonConfig{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[15]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1079,7 +1154,7 @@ func (x *BalloonConfig) String() string {
 func (*BalloonConfig) ProtoMessage() {}
 
 func (x *BalloonConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[15]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1092,7 +1167,7 @@ func (x *BalloonConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BalloonConfig.ProtoReflect.Descriptor instead.
 func (*BalloonConfig) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{15}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *BalloonConfig) GetAmountMib() uint32 {
@@ -1135,7 +1210,7 @@ type NetConfig struct {
 
 func (x *NetConfig) Reset() {
 	*x = NetConfig{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[16]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1147,7 +1222,7 @@ func (x *NetConfig) String() string {
 func (*NetConfig) ProtoMessage() {}
 
 func (x *NetConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[16]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1160,7 +1235,7 @@ func (x *NetConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetConfig.ProtoReflect.Descriptor instead.
 func (*NetConfig) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{16}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *NetConfig) GetDeviceId() string {
@@ -1193,7 +1268,7 @@ type TapConfig struct {
 
 func (x *TapConfig) Reset() {
 	*x = TapConfig{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[17]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1205,7 +1280,7 @@ func (x *TapConfig) String() string {
 func (*TapConfig) ProtoMessage() {}
 
 func (x *TapConfig) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[17]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1218,7 +1293,7 @@ func (x *TapConfig) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TapConfig.ProtoReflect.Descriptor instead.
 func (*TapConfig) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{17}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *TapConfig) GetTapName() string {
@@ -1247,7 +1322,7 @@ type VmInfo struct {
 
 func (x *VmInfo) Reset() {
 	*x = VmInfo{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[18]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1259,7 +1334,7 @@ func (x *VmInfo) String() string {
 func (*VmInfo) ProtoMessage() {}
 
 func (x *VmInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[18]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1272,7 +1347,7 @@ func (x *VmInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VmInfo.ProtoReflect.Descriptor instead.
 func (*VmInfo) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{18}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *VmInfo) GetVmId() string {
@@ -1330,7 +1405,7 @@ type GuestInfo struct {
 
 func (x *GuestInfo) Reset() {
 	*x = GuestInfo{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[19]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1342,7 +1417,7 @@ func (x *GuestInfo) String() string {
 func (*GuestInfo) ProtoMessage() {}
 
 func (x *GuestInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[19]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1355,7 +1430,7 @@ func (x *GuestInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GuestInfo.ProtoReflect.Descriptor instead.
 func (*GuestInfo) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{19}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *GuestInfo) GetAttached() bool {
@@ -1404,7 +1479,7 @@ type GuestAttachedEvent struct {
 
 func (x *GuestAttachedEvent) Reset() {
 	*x = GuestAttachedEvent{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[20]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1416,7 +1491,7 @@ func (x *GuestAttachedEvent) String() string {
 func (*GuestAttachedEvent) ProtoMessage() {}
 
 func (x *GuestAttachedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[20]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1429,7 +1504,7 @@ func (x *GuestAttachedEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GuestAttachedEvent.ProtoReflect.Descriptor instead.
 func (*GuestAttachedEvent) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{20}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *GuestAttachedEvent) GetGuest() *GuestInfo {
@@ -1449,7 +1524,7 @@ type GuestDetachedEvent struct {
 
 func (x *GuestDetachedEvent) Reset() {
 	*x = GuestDetachedEvent{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[21]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1461,7 +1536,7 @@ func (x *GuestDetachedEvent) String() string {
 func (*GuestDetachedEvent) ProtoMessage() {}
 
 func (x *GuestDetachedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[21]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1474,7 +1549,7 @@ func (x *GuestDetachedEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GuestDetachedEvent.ProtoReflect.Descriptor instead.
 func (*GuestDetachedEvent) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{21}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{22}
 }
 
 type PingVmRequest struct {
@@ -1486,7 +1561,7 @@ type PingVmRequest struct {
 
 func (x *PingVmRequest) Reset() {
 	*x = PingVmRequest{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[22]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1498,7 +1573,7 @@ func (x *PingVmRequest) String() string {
 func (*PingVmRequest) ProtoMessage() {}
 
 func (x *PingVmRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[22]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1511,7 +1586,7 @@ func (x *PingVmRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingVmRequest.ProtoReflect.Descriptor instead.
 func (*PingVmRequest) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{22}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *PingVmRequest) GetVmId() string {
@@ -1533,7 +1608,7 @@ type PingVmResponse struct {
 
 func (x *PingVmResponse) Reset() {
 	*x = PingVmResponse{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[23]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1545,7 +1620,7 @@ func (x *PingVmResponse) String() string {
 func (*PingVmResponse) ProtoMessage() {}
 
 func (x *PingVmResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[23]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1558,7 +1633,7 @@ func (x *PingVmResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingVmResponse.ProtoReflect.Descriptor instead.
 func (*PingVmResponse) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{23}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *PingVmResponse) GetBuildVersion() string {
@@ -1598,7 +1673,7 @@ type DeleteVmRequest struct {
 
 func (x *DeleteVmRequest) Reset() {
 	*x = DeleteVmRequest{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[24]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1610,7 +1685,7 @@ func (x *DeleteVmRequest) String() string {
 func (*DeleteVmRequest) ProtoMessage() {}
 
 func (x *DeleteVmRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[24]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1623,7 +1698,7 @@ func (x *DeleteVmRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteVmRequest.ProtoReflect.Descriptor instead.
 func (*DeleteVmRequest) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{24}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *DeleteVmRequest) GetVmId() string {
@@ -1642,7 +1717,7 @@ type StartVmRequest struct {
 
 func (x *StartVmRequest) Reset() {
 	*x = StartVmRequest{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[25]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1654,7 +1729,7 @@ func (x *StartVmRequest) String() string {
 func (*StartVmRequest) ProtoMessage() {}
 
 func (x *StartVmRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[25]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1667,7 +1742,7 @@ func (x *StartVmRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartVmRequest.ProtoReflect.Descriptor instead.
 func (*StartVmRequest) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{25}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *StartVmRequest) GetVmId() string {
@@ -1686,7 +1761,7 @@ type ShutdownVmRequest struct {
 
 func (x *ShutdownVmRequest) Reset() {
 	*x = ShutdownVmRequest{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[26]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1698,7 +1773,7 @@ func (x *ShutdownVmRequest) String() string {
 func (*ShutdownVmRequest) ProtoMessage() {}
 
 func (x *ShutdownVmRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[26]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1711,7 +1786,7 @@ func (x *ShutdownVmRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownVmRequest.ProtoReflect.Descriptor instead.
 func (*ShutdownVmRequest) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{26}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ShutdownVmRequest) GetVmId() string {
@@ -1733,7 +1808,7 @@ type ResumeVmRequest struct {
 
 func (x *ResumeVmRequest) Reset() {
 	*x = ResumeVmRequest{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[27]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1745,7 +1820,7 @@ func (x *ResumeVmRequest) String() string {
 func (*ResumeVmRequest) ProtoMessage() {}
 
 func (x *ResumeVmRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[27]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1758,7 +1833,7 @@ func (x *ResumeVmRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeVmRequest.ProtoReflect.Descriptor instead.
 func (*ResumeVmRequest) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{27}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ResumeVmRequest) GetVmId() string {
@@ -1795,7 +1870,7 @@ type RemoteSnapshot struct {
 
 func (x *RemoteSnapshot) Reset() {
 	*x = RemoteSnapshot{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[28]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1807,7 +1882,7 @@ func (x *RemoteSnapshot) String() string {
 func (*RemoteSnapshot) ProtoMessage() {}
 
 func (x *RemoteSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[28]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1820,7 +1895,7 @@ func (x *RemoteSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoteSnapshot.ProtoReflect.Descriptor instead.
 func (*RemoteSnapshot) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{28}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *RemoteSnapshot) GetVmstatePath() string {
@@ -1865,7 +1940,7 @@ type SuspendVmRequest struct {
 
 func (x *SuspendVmRequest) Reset() {
 	*x = SuspendVmRequest{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[29]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1877,7 +1952,7 @@ func (x *SuspendVmRequest) String() string {
 func (*SuspendVmRequest) ProtoMessage() {}
 
 func (x *SuspendVmRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[29]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1890,7 +1965,7 @@ func (x *SuspendVmRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SuspendVmRequest.ProtoReflect.Descriptor instead.
 func (*SuspendVmRequest) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{29}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *SuspendVmRequest) GetVmId() string {
@@ -1917,7 +1992,7 @@ type SuspendVmResponse struct {
 
 func (x *SuspendVmResponse) Reset() {
 	*x = SuspendVmResponse{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[30]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1929,7 +2004,7 @@ func (x *SuspendVmResponse) String() string {
 func (*SuspendVmResponse) ProtoMessage() {}
 
 func (x *SuspendVmResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[30]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1942,7 +2017,7 @@ func (x *SuspendVmResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SuspendVmResponse.ProtoReflect.Descriptor instead.
 func (*SuspendVmResponse) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{30}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *SuspendVmResponse) GetMemoryBytes() uint64 {
@@ -1960,7 +2035,7 @@ type StartVmResponse struct {
 
 func (x *StartVmResponse) Reset() {
 	*x = StartVmResponse{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[31]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1972,7 +2047,7 @@ func (x *StartVmResponse) String() string {
 func (*StartVmResponse) ProtoMessage() {}
 
 func (x *StartVmResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[31]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1985,7 +2060,7 @@ func (x *StartVmResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartVmResponse.ProtoReflect.Descriptor instead.
 func (*StartVmResponse) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{31}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{32}
 }
 
 type DeleteVmResponse struct {
@@ -1996,7 +2071,7 @@ type DeleteVmResponse struct {
 
 func (x *DeleteVmResponse) Reset() {
 	*x = DeleteVmResponse{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[32]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2008,7 +2083,7 @@ func (x *DeleteVmResponse) String() string {
 func (*DeleteVmResponse) ProtoMessage() {}
 
 func (x *DeleteVmResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[32]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2021,7 +2096,7 @@ func (x *DeleteVmResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteVmResponse.ProtoReflect.Descriptor instead.
 func (*DeleteVmResponse) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{32}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{33}
 }
 
 type ShutdownVmResponse struct {
@@ -2032,7 +2107,7 @@ type ShutdownVmResponse struct {
 
 func (x *ShutdownVmResponse) Reset() {
 	*x = ShutdownVmResponse{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[33]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2044,7 +2119,7 @@ func (x *ShutdownVmResponse) String() string {
 func (*ShutdownVmResponse) ProtoMessage() {}
 
 func (x *ShutdownVmResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[33]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2057,7 +2132,7 @@ func (x *ShutdownVmResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShutdownVmResponse.ProtoReflect.Descriptor instead.
 func (*ShutdownVmResponse) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{33}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{34}
 }
 
 type ResumeVmResponse struct {
@@ -2068,7 +2143,7 @@ type ResumeVmResponse struct {
 
 func (x *ResumeVmResponse) Reset() {
 	*x = ResumeVmResponse{}
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[34]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2080,7 +2155,7 @@ func (x *ResumeVmResponse) String() string {
 func (*ResumeVmResponse) ProtoMessage() {}
 
 func (x *ResumeVmResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[34]
+	mi := &file_feos_microvm_v1_microvm_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2093,7 +2168,7 @@ func (x *ResumeVmResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeVmResponse.ProtoReflect.Descriptor instead.
 func (*ResumeVmResponse) Descriptor() ([]byte, []int) {
-	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{34}
+	return file_feos_microvm_v1_microvm_proto_rawDescGZIP(), []int{35}
 }
 
 var File_feos_microvm_v1_microvm_proto protoreflect.FileDescriptor
@@ -2146,7 +2221,7 @@ const file_feos_microvm_v1_microvm_proto_rawDesc = "" +
 	"\rmetadata_json\x18\n" +
 	" \x01(\tR\fmetadataJsonJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\x06\x10\aR\timage_refR\x05disksR\bignition\"$\n" +
 	"\x0eDataDiskConfig\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\"\xd7\x01\n" +
+	"\x04path\x18\x01 \x01(\tR\x04path\"\x8c\x02\n" +
 	"\x12GuestNetworkConfig\x12\x1c\n" +
 	"\tinterface\x18\x01 \x01(\tR\tinterface\x12\x1b\n" +
 	"\tipv4_cidr\x18\x02 \x01(\tR\bipv4Cidr\x12\x18\n" +
@@ -2154,7 +2229,13 @@ const file_feos_microvm_v1_microvm_proto_rawDesc = "" +
 	"\x03dns\x18\x04 \x03(\tR\x03dns\x12\x1a\n" +
 	"\bhostname\x18\x05 \x01(\tR\bhostname\x12\x1b\n" +
 	"\tipv6_cidr\x18\x06 \x01(\tR\bipv6Cidr\x12!\n" +
-	"\fipv6_gateway\x18\a \x01(\tR\vipv6Gateway\";\n" +
+	"\fipv6_gateway\x18\a \x01(\tR\vipv6Gateway\x123\n" +
+	"\x06routes\x18\b \x03(\v2\x1b.feos.microvm.v1.GuestRouteR\x06routes\"Z\n" +
+	"\n" +
+	"GuestRoute\x12 \n" +
+	"\vdestination\x18\x01 \x01(\tR\vdestination\x12\x18\n" +
+	"\agateway\x18\x02 \x01(\tR\agateway\x12\x10\n" +
+	"\x03mtu\x18\x03 \x01(\rR\x03mtu\";\n" +
 	"\tCpuConfig\x12\x1d\n" +
 	"\n" +
 	"vcpu_count\x18\x01 \x01(\rR\tvcpuCountJ\x04\b\x02\x10\x03R\tmax_vcpus\"t\n" +
@@ -2258,7 +2339,7 @@ func file_feos_microvm_v1_microvm_proto_rawDescGZIP() []byte {
 }
 
 var file_feos_microvm_v1_microvm_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_feos_microvm_v1_microvm_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+var file_feos_microvm_v1_microvm_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
 var file_feos_microvm_v1_microvm_proto_goTypes = []any{
 	(VmState)(0),                    // 0: feos.microvm.v1.VmState
 	(*StreamVmConsoleRequest)(nil),  // 1: feos.microvm.v1.StreamVmConsoleRequest
@@ -2274,74 +2355,76 @@ var file_feos_microvm_v1_microvm_proto_goTypes = []any{
 	(*VmConfig)(nil),                // 11: feos.microvm.v1.VmConfig
 	(*DataDiskConfig)(nil),          // 12: feos.microvm.v1.DataDiskConfig
 	(*GuestNetworkConfig)(nil),      // 13: feos.microvm.v1.GuestNetworkConfig
-	(*CpuConfig)(nil),               // 14: feos.microvm.v1.CpuConfig
-	(*MemoryConfig)(nil),            // 15: feos.microvm.v1.MemoryConfig
-	(*BalloonConfig)(nil),           // 16: feos.microvm.v1.BalloonConfig
-	(*NetConfig)(nil),               // 17: feos.microvm.v1.NetConfig
-	(*TapConfig)(nil),               // 18: feos.microvm.v1.TapConfig
-	(*VmInfo)(nil),                  // 19: feos.microvm.v1.VmInfo
-	(*GuestInfo)(nil),               // 20: feos.microvm.v1.GuestInfo
-	(*GuestAttachedEvent)(nil),      // 21: feos.microvm.v1.GuestAttachedEvent
-	(*GuestDetachedEvent)(nil),      // 22: feos.microvm.v1.GuestDetachedEvent
-	(*PingVmRequest)(nil),           // 23: feos.microvm.v1.PingVmRequest
-	(*PingVmResponse)(nil),          // 24: feos.microvm.v1.PingVmResponse
-	(*DeleteVmRequest)(nil),         // 25: feos.microvm.v1.DeleteVmRequest
-	(*StartVmRequest)(nil),          // 26: feos.microvm.v1.StartVmRequest
-	(*ShutdownVmRequest)(nil),       // 27: feos.microvm.v1.ShutdownVmRequest
-	(*ResumeVmRequest)(nil),         // 28: feos.microvm.v1.ResumeVmRequest
-	(*RemoteSnapshot)(nil),          // 29: feos.microvm.v1.RemoteSnapshot
-	(*SuspendVmRequest)(nil),        // 30: feos.microvm.v1.SuspendVmRequest
-	(*SuspendVmResponse)(nil),       // 31: feos.microvm.v1.SuspendVmResponse
-	(*StartVmResponse)(nil),         // 32: feos.microvm.v1.StartVmResponse
-	(*DeleteVmResponse)(nil),        // 33: feos.microvm.v1.DeleteVmResponse
-	(*ShutdownVmResponse)(nil),      // 34: feos.microvm.v1.ShutdownVmResponse
-	(*ResumeVmResponse)(nil),        // 35: feos.microvm.v1.ResumeVmResponse
-	(*anypb.Any)(nil),               // 36: google.protobuf.Any
+	(*GuestRoute)(nil),              // 14: feos.microvm.v1.GuestRoute
+	(*CpuConfig)(nil),               // 15: feos.microvm.v1.CpuConfig
+	(*MemoryConfig)(nil),            // 16: feos.microvm.v1.MemoryConfig
+	(*BalloonConfig)(nil),           // 17: feos.microvm.v1.BalloonConfig
+	(*NetConfig)(nil),               // 18: feos.microvm.v1.NetConfig
+	(*TapConfig)(nil),               // 19: feos.microvm.v1.TapConfig
+	(*VmInfo)(nil),                  // 20: feos.microvm.v1.VmInfo
+	(*GuestInfo)(nil),               // 21: feos.microvm.v1.GuestInfo
+	(*GuestAttachedEvent)(nil),      // 22: feos.microvm.v1.GuestAttachedEvent
+	(*GuestDetachedEvent)(nil),      // 23: feos.microvm.v1.GuestDetachedEvent
+	(*PingVmRequest)(nil),           // 24: feos.microvm.v1.PingVmRequest
+	(*PingVmResponse)(nil),          // 25: feos.microvm.v1.PingVmResponse
+	(*DeleteVmRequest)(nil),         // 26: feos.microvm.v1.DeleteVmRequest
+	(*StartVmRequest)(nil),          // 27: feos.microvm.v1.StartVmRequest
+	(*ShutdownVmRequest)(nil),       // 28: feos.microvm.v1.ShutdownVmRequest
+	(*ResumeVmRequest)(nil),         // 29: feos.microvm.v1.ResumeVmRequest
+	(*RemoteSnapshot)(nil),          // 30: feos.microvm.v1.RemoteSnapshot
+	(*SuspendVmRequest)(nil),        // 31: feos.microvm.v1.SuspendVmRequest
+	(*SuspendVmResponse)(nil),       // 32: feos.microvm.v1.SuspendVmResponse
+	(*StartVmResponse)(nil),         // 33: feos.microvm.v1.StartVmResponse
+	(*DeleteVmResponse)(nil),        // 34: feos.microvm.v1.DeleteVmResponse
+	(*ShutdownVmResponse)(nil),      // 35: feos.microvm.v1.ShutdownVmResponse
+	(*ResumeVmResponse)(nil),        // 36: feos.microvm.v1.ResumeVmResponse
+	(*anypb.Any)(nil),               // 37: google.protobuf.Any
 }
 var file_feos_microvm_v1_microvm_proto_depIdxs = []int32{
 	2,  // 0: feos.microvm.v1.StreamVmConsoleRequest.attach:type_name -> feos.microvm.v1.AttachConsoleMessage
 	3,  // 1: feos.microvm.v1.StreamVmConsoleRequest.data:type_name -> feos.microvm.v1.ConsoleData
 	0,  // 2: feos.microvm.v1.VmStateChangedEvent.new_state:type_name -> feos.microvm.v1.VmState
-	36, // 3: feos.microvm.v1.VmEvent.data:type_name -> google.protobuf.Any
+	37, // 3: feos.microvm.v1.VmEvent.data:type_name -> google.protobuf.Any
 	11, // 4: feos.microvm.v1.CreateVmRequest.config:type_name -> feos.microvm.v1.VmConfig
-	14, // 5: feos.microvm.v1.VmConfig.cpus:type_name -> feos.microvm.v1.CpuConfig
-	15, // 6: feos.microvm.v1.VmConfig.memory:type_name -> feos.microvm.v1.MemoryConfig
-	17, // 7: feos.microvm.v1.VmConfig.net:type_name -> feos.microvm.v1.NetConfig
+	15, // 5: feos.microvm.v1.VmConfig.cpus:type_name -> feos.microvm.v1.CpuConfig
+	16, // 6: feos.microvm.v1.VmConfig.memory:type_name -> feos.microvm.v1.MemoryConfig
+	18, // 7: feos.microvm.v1.VmConfig.net:type_name -> feos.microvm.v1.NetConfig
 	13, // 8: feos.microvm.v1.VmConfig.guest_network:type_name -> feos.microvm.v1.GuestNetworkConfig
 	12, // 9: feos.microvm.v1.VmConfig.data_disk:type_name -> feos.microvm.v1.DataDiskConfig
 	12, // 10: feos.microvm.v1.VmConfig.volumes:type_name -> feos.microvm.v1.DataDiskConfig
-	16, // 11: feos.microvm.v1.MemoryConfig.balloon:type_name -> feos.microvm.v1.BalloonConfig
-	18, // 12: feos.microvm.v1.NetConfig.tap:type_name -> feos.microvm.v1.TapConfig
-	0,  // 13: feos.microvm.v1.VmInfo.state:type_name -> feos.microvm.v1.VmState
-	11, // 14: feos.microvm.v1.VmInfo.config:type_name -> feos.microvm.v1.VmConfig
-	20, // 15: feos.microvm.v1.VmInfo.guest:type_name -> feos.microvm.v1.GuestInfo
-	20, // 16: feos.microvm.v1.GuestAttachedEvent.guest:type_name -> feos.microvm.v1.GuestInfo
-	29, // 17: feos.microvm.v1.ResumeVmRequest.remote:type_name -> feos.microvm.v1.RemoteSnapshot
-	8,  // 18: feos.microvm.v1.MicroVmService.CreateVm:input_type -> feos.microvm.v1.CreateVmRequest
-	26, // 19: feos.microvm.v1.MicroVmService.StartVm:input_type -> feos.microvm.v1.StartVmRequest
-	10, // 20: feos.microvm.v1.MicroVmService.GetVm:input_type -> feos.microvm.v1.GetVmRequest
-	6,  // 21: feos.microvm.v1.MicroVmService.StreamVmEvents:input_type -> feos.microvm.v1.StreamVmEventsRequest
-	25, // 22: feos.microvm.v1.MicroVmService.DeleteVm:input_type -> feos.microvm.v1.DeleteVmRequest
-	1,  // 23: feos.microvm.v1.MicroVmService.StreamVmConsole:input_type -> feos.microvm.v1.StreamVmConsoleRequest
-	23, // 24: feos.microvm.v1.MicroVmService.PingVm:input_type -> feos.microvm.v1.PingVmRequest
-	27, // 25: feos.microvm.v1.MicroVmService.ShutdownVm:input_type -> feos.microvm.v1.ShutdownVmRequest
-	28, // 26: feos.microvm.v1.MicroVmService.ResumeVm:input_type -> feos.microvm.v1.ResumeVmRequest
-	30, // 27: feos.microvm.v1.MicroVmService.SuspendVm:input_type -> feos.microvm.v1.SuspendVmRequest
-	9,  // 28: feos.microvm.v1.MicroVmService.CreateVm:output_type -> feos.microvm.v1.CreateVmResponse
-	32, // 29: feos.microvm.v1.MicroVmService.StartVm:output_type -> feos.microvm.v1.StartVmResponse
-	19, // 30: feos.microvm.v1.MicroVmService.GetVm:output_type -> feos.microvm.v1.VmInfo
-	7,  // 31: feos.microvm.v1.MicroVmService.StreamVmEvents:output_type -> feos.microvm.v1.VmEvent
-	33, // 32: feos.microvm.v1.MicroVmService.DeleteVm:output_type -> feos.microvm.v1.DeleteVmResponse
-	4,  // 33: feos.microvm.v1.MicroVmService.StreamVmConsole:output_type -> feos.microvm.v1.StreamVmConsoleResponse
-	24, // 34: feos.microvm.v1.MicroVmService.PingVm:output_type -> feos.microvm.v1.PingVmResponse
-	34, // 35: feos.microvm.v1.MicroVmService.ShutdownVm:output_type -> feos.microvm.v1.ShutdownVmResponse
-	35, // 36: feos.microvm.v1.MicroVmService.ResumeVm:output_type -> feos.microvm.v1.ResumeVmResponse
-	31, // 37: feos.microvm.v1.MicroVmService.SuspendVm:output_type -> feos.microvm.v1.SuspendVmResponse
-	28, // [28:38] is the sub-list for method output_type
-	18, // [18:28] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	14, // 11: feos.microvm.v1.GuestNetworkConfig.routes:type_name -> feos.microvm.v1.GuestRoute
+	17, // 12: feos.microvm.v1.MemoryConfig.balloon:type_name -> feos.microvm.v1.BalloonConfig
+	19, // 13: feos.microvm.v1.NetConfig.tap:type_name -> feos.microvm.v1.TapConfig
+	0,  // 14: feos.microvm.v1.VmInfo.state:type_name -> feos.microvm.v1.VmState
+	11, // 15: feos.microvm.v1.VmInfo.config:type_name -> feos.microvm.v1.VmConfig
+	21, // 16: feos.microvm.v1.VmInfo.guest:type_name -> feos.microvm.v1.GuestInfo
+	21, // 17: feos.microvm.v1.GuestAttachedEvent.guest:type_name -> feos.microvm.v1.GuestInfo
+	30, // 18: feos.microvm.v1.ResumeVmRequest.remote:type_name -> feos.microvm.v1.RemoteSnapshot
+	8,  // 19: feos.microvm.v1.MicroVmService.CreateVm:input_type -> feos.microvm.v1.CreateVmRequest
+	27, // 20: feos.microvm.v1.MicroVmService.StartVm:input_type -> feos.microvm.v1.StartVmRequest
+	10, // 21: feos.microvm.v1.MicroVmService.GetVm:input_type -> feos.microvm.v1.GetVmRequest
+	6,  // 22: feos.microvm.v1.MicroVmService.StreamVmEvents:input_type -> feos.microvm.v1.StreamVmEventsRequest
+	26, // 23: feos.microvm.v1.MicroVmService.DeleteVm:input_type -> feos.microvm.v1.DeleteVmRequest
+	1,  // 24: feos.microvm.v1.MicroVmService.StreamVmConsole:input_type -> feos.microvm.v1.StreamVmConsoleRequest
+	24, // 25: feos.microvm.v1.MicroVmService.PingVm:input_type -> feos.microvm.v1.PingVmRequest
+	28, // 26: feos.microvm.v1.MicroVmService.ShutdownVm:input_type -> feos.microvm.v1.ShutdownVmRequest
+	29, // 27: feos.microvm.v1.MicroVmService.ResumeVm:input_type -> feos.microvm.v1.ResumeVmRequest
+	31, // 28: feos.microvm.v1.MicroVmService.SuspendVm:input_type -> feos.microvm.v1.SuspendVmRequest
+	9,  // 29: feos.microvm.v1.MicroVmService.CreateVm:output_type -> feos.microvm.v1.CreateVmResponse
+	33, // 30: feos.microvm.v1.MicroVmService.StartVm:output_type -> feos.microvm.v1.StartVmResponse
+	20, // 31: feos.microvm.v1.MicroVmService.GetVm:output_type -> feos.microvm.v1.VmInfo
+	7,  // 32: feos.microvm.v1.MicroVmService.StreamVmEvents:output_type -> feos.microvm.v1.VmEvent
+	34, // 33: feos.microvm.v1.MicroVmService.DeleteVm:output_type -> feos.microvm.v1.DeleteVmResponse
+	4,  // 34: feos.microvm.v1.MicroVmService.StreamVmConsole:output_type -> feos.microvm.v1.StreamVmConsoleResponse
+	25, // 35: feos.microvm.v1.MicroVmService.PingVm:output_type -> feos.microvm.v1.PingVmResponse
+	35, // 36: feos.microvm.v1.MicroVmService.ShutdownVm:output_type -> feos.microvm.v1.ShutdownVmResponse
+	36, // 37: feos.microvm.v1.MicroVmService.ResumeVm:output_type -> feos.microvm.v1.ResumeVmResponse
+	32, // 38: feos.microvm.v1.MicroVmService.SuspendVm:output_type -> feos.microvm.v1.SuspendVmResponse
+	29, // [29:39] is the sub-list for method output_type
+	19, // [19:29] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_feos_microvm_v1_microvm_proto_init() }
@@ -2365,7 +2448,7 @@ func file_feos_microvm_v1_microvm_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_feos_microvm_v1_microvm_proto_rawDesc), len(file_feos_microvm_v1_microvm_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   35,
+			NumMessages:   36,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

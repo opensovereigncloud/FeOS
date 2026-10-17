@@ -5,7 +5,8 @@
 #
 # Pods have an IPv6 address on the network and an IPv4 address for
 # leaving this node through masquerade (ADR 0010). feosd needs the prefix
-# that the network routes to this node to give pods a network; without it,
+# that the network routes to this node to give pods a network, or, with a
+# control plane, a /64 of its cluster's mesh (ADR 0017); without either,
 # pods with a network fail:
 #
 #   --pod-prefix PREFIX       e.g. 2001:db8:7:1::/64. A /64 is best, a
@@ -55,6 +56,16 @@
 #                               removed the node.
 #   --node-dir PATH             the node's key, certificate and trust
 #                               bundle, /var/lib/feos/node by default.
+#
+# A node with a control plane and without --pod-prefix is on its cluster's
+# mesh: the control plane gives it a /64 of the cluster's ULA, and a
+# WireGuard device, feos-mesh, carries its pods' IPv6 to the other nodes'.
+# The nodes reach each other on UDP port 51820.
+#
+#   --mesh-port PORT            the device's UDP port, 51820 by default.
+#   --mesh-address ADDRESS      where the other nodes reach this node; the
+#                               address from which it reaches the control
+#                               plane by default.
 #
 #   FEOSD_ARGS="--control-plane 10.43.0.17:7443 --control-plane-name ferun.example.com --trust-domain run.example.com"
 FEOSD_ARGS=""

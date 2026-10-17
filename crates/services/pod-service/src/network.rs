@@ -7,33 +7,42 @@
 //! routed to its TAP device, a link of its own between the node and the
 //! pod, on which the node is `fe80::1` and answers ARP for `169.254.0.1`
 //! by proxy. Names go through feosd's resolver; the pods' security groups
-//! become nftables rules; and their traffic becomes records.
+//! become nftables rules; and their traffic becomes records. Where the
+//! network routes the node no prefix, the node's prefix is a /64 of the
+//! cluster's mesh (ADR 0017), which the control plane gives it, maybe after
+//! feosd started: the network comes up then.
 
 mod addresses;
 mod devices;
+mod mesh;
 mod rules;
 
+pub use mesh::PORT as MESH_PORT;
+pub use mesh::{Assignment, Config as MeshConfig, DEVICE as MESH_DEVICE, MTU as MESH_MTU};
 pub use rules::TABLE;
 
 use addresses::{Ipv4Addresses, Ipv6Addresses};
 use devices::PodLink;
 use dns_service::Resolver;
-use feos_proto::network_service::{traffic_record, TrafficRecord};
+use feos_proto::network_service::{
+    traffic_record, Mesh as MeshInfo, PutMeshPeersRequest, TrafficRecord, UpdateMeshPeersRequest,
+};
 use feos_proto::pod_service::{PodInfo, PodNetwork, PodSpec};
 use feos_utils::listen_fds;
 use feos_utils::nft::{self, Family, Table};
 use log::{error, info, warn};
+use mesh::Mesh;
 use network_service::{compile, delta, Delta, Policy, Prefix, SecurityGroups};
 use rtnetlink::Handle;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tonic::Status;
 use traffic_service::Collector;
 
@@ -75,8 +84,11 @@ const DNS_PORT: u16 = 53;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     /// The prefix the network routes to the node (`--pod-prefix`).
-    /// Without, pods with a network fail.
+    /// Without it or a mesh, pods with a network fail.
     pub pod_prefix: Option<(Ipv6Addr, u8)>,
+    /// The cluster's mesh, whose /64 is the node's prefix when it has no
+    /// `--pod-prefix`: with a control plane.
+    pub mesh: Option<MeshConfig>,
     /// The pods' IPv4 addresses, a /32 of it each (`--pod-ipv4-range`).
     pub pod_ipv4_range: (Ipv4Addr, u8),
     /// The resolver's address on every node (`--dns-address`).
@@ -91,6 +103,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pod_prefix: None,
+            mesh: None,
             pod_ipv4_range: POD_IPV4_RANGE,
             dns_address: dns_service::ADDRESS,
             dns_upstreams: DNS_UPSTREAMS
@@ -150,6 +163,10 @@ pub fn parse_pod_ipv4_range(s: &str) -> Result<(Ipv4Addr, u8), String> {
     }
 }
 
+/// The unique local addresses (RFC 4193), which no network routes to the
+/// internet.
+pub const ULA: (Ipv6Addr, u8) = (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7);
+
 /// A pod's place on the network, for its microVM.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Attachment {
@@ -159,6 +176,35 @@ pub struct Attachment {
     pub ipv4: Ipv4Addr,
     /// The resolver.
     pub dns: Ipv4Addr,
+    /// The routes that replace the pod's default route over IPv6: none
+    /// for a global address, one for the ULAs over `fe80::1` for a ULA
+    /// (ADR 0017).
+    pub routes: Vec<PodRoute>,
+}
+
+/// A route of a pod's, via a gateway on its link.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PodRoute {
+    pub destination: Prefix,
+    pub gateway: IpAddr,
+    /// 0 is the link's.
+    pub mtu: u32,
+}
+
+/// The routes of a pod with `address` instead of its default route over
+/// IPv6: a ULA has no route to the internet, so that a pod with one, given
+/// none, takes IPv4 there at once (RFC 6724, rule 1). `mtu` is that of the
+/// node's way to the other ULAs, 0 for the link's.
+pub fn routes(address: Ipv6Addr, mtu: u32) -> Vec<PodRoute> {
+    let (ula, len) = ULA;
+    if !Prefix::V6(ula, len).contains(&Prefix::V6(address, 128)) {
+        return Vec::new();
+    }
+    vec![PodRoute {
+        destination: Prefix::V6(ula, len),
+        gateway: IpAddr::V6(GATEWAY),
+        mtu,
+    }]
 }
 
 /// The pod's TAP device: `pod-` and the first 8 hex digits of its ID.
@@ -206,9 +252,23 @@ pub struct Network {
     config: Config,
     groups: SecurityGroups,
     records: broadcast::Sender<TrafficRecord>,
-    /// What the network is made of, or why it is not there: pods with a
-    /// network then fail.
-    parts: Result<Parts, String>,
+    /// The pods' directory, which keeps their addresses.
+    dir: PathBuf,
+    /// What the network is made of, once it is there: pods with a network
+    /// fail until then, for the reason in `unready`.
+    parts: OnceLock<Parts>,
+    unready: Mutex<String>,
+    /// Whether the network is there, for what waits for it.
+    ready: watch::Sender<bool>,
+    /// The resolver's sockets that were handed to feosd, until the network
+    /// comes up.
+    handed: Mutex<Handed>,
+    /// Sets the network up after the start, once.
+    setting_up: tokio::sync::Mutex<()>,
+    /// The cluster's mesh, if the node is on one.
+    mesh: Option<Mesh>,
+    /// Moves with every change of the mesh's peers.
+    mesh_changes: watch::Sender<u64>,
     /// Set when the rules could not be written at the start.
     broken: Mutex<Option<String>>,
     directory: Arc<Directory>,
@@ -220,6 +280,8 @@ pub struct Network {
 }
 
 struct Parts {
+    /// The node's prefix.
+    prefix: (Ipv6Addr, u8),
     ipv6: Ipv6Addresses,
     ipv4: Ipv4Addresses,
     resolver: Arc<Resolver>,
@@ -236,8 +298,11 @@ impl Network {
     /// routes the pod prefix as unreachable, and gives the resolver its
     /// address and sockets: those of `sockets` that are bound to its
     /// address, which systemd or `feos-host-init` hold across restarts of
-    /// `feosd` (ADR 0010), or new ones. A failure is logged, and fails the
-    /// pods with a network from then on: feosd goes on serving the others.
+    /// `feosd` (ADR 0010), or new ones. On a mesh, the device comes up
+    /// first, and the prefix is the /64 the control plane gave the node: a
+    /// node that has none yet sets the rest up when it gets one
+    /// ([`Network::join_mesh`]). A failure is logged, and fails the pods
+    /// with a network from then on: feosd goes on serving the others.
     pub async fn start(
         config: Config,
         sockets: Vec<(OwnedFd, String)>,
@@ -251,36 +316,67 @@ impl Network {
             warn!("Network: The resolver does not take the {reason}");
         }
         let mut handed = (udp, tcp);
-        let parts = match config.pod_prefix {
+        let mut prefix = config.pod_prefix;
+        let mut unready = "feosd has no --pod-prefix: pods with a network cannot run".to_string();
+        let mut mesh = None;
+        if let (Some(mesh_config), None) = (&config.mesh, config.pod_prefix) {
+            let opened = match devices::connect().await {
+                Ok(handle) => Mesh::open(mesh_config.clone(), &handle).await,
+                Err(e) => Err(e),
+            };
+            match opened {
+                Ok(opened) => {
+                    prefix = opened.assignment().map(|a| a.pod_prefix);
+                    unready = "the node waits for the control plane to give it its /64 of the \
+                               mesh: pods with a network cannot run yet"
+                        .to_string();
+                    mesh = Some(opened);
+                }
+                Err(e) => {
+                    error!("Network: The mesh is not set up, pods with a network fail: {e}");
+                    unready = format!("the mesh is not set up: {e}");
+                }
+            }
+        }
+        let parts = OnceLock::new();
+        match prefix {
             Some(prefix) => match set_up_again(&config, prefix, dir, &records, &mut handed).await {
-                Ok(parts) => {
-                    let (range, range_len) = config.pod_ipv4_range;
-                    info!(
-                        "Network: Pods get addresses of {}/{} and {range}/{range_len}, DNS at {}",
-                        prefix.0, prefix.1, config.dns_address
-                    );
-                    Ok(parts)
+                Ok(set_up) => {
+                    log_set_up(&config, prefix);
+                    let _ = parts.set(set_up);
                 }
                 Err(e) => {
                     error!(
                         "Network: The pods' network is not set up, pods with a network fail: {e}"
                     );
-                    Err(format!("the pods' network is not set up: {e}"))
+                    unready = format!("the pods' network is not set up: {e}");
                 }
             },
             None => {
                 if let Err(e) = remove_old_network(true, dir).await {
                     warn!("Network: Failed to remove the IPv4 network: {e}");
                 }
-                warn!("Network: No --pod-prefix: pods with a network fail");
-                Err("feosd has no --pod-prefix: pods with a network cannot run".to_string())
+                match &mesh {
+                    Some(_) => info!(
+                        "Network: Waiting for the control plane to give the node its /64 of the mesh"
+                    ),
+                    None => warn!("Network: No --pod-prefix: pods with a network fail"),
+                }
             }
-        };
+        }
+        let ready = watch::Sender::new(parts.get().is_some());
         Self {
             config,
             groups,
             records,
+            dir: dir.to_path_buf(),
             parts,
+            unready: Mutex::new(unready),
+            ready,
+            handed: Mutex::new(handed),
+            setting_up: tokio::sync::Mutex::new(()),
+            mesh,
+            mesh_changes: watch::Sender::new(0),
             broken: Mutex::new(None),
             directory: Arc::default(),
             applied: tokio::sync::Mutex::new(None),
@@ -299,8 +395,120 @@ impl Network {
             return Err(Status::failed_precondition(broken.clone()));
         }
         self.parts
+            .get()
+            .ok_or_else(|| Status::failed_precondition(lock(&self.unready).clone()))
+    }
+
+    /// Whether the network is there, and when it comes.
+    pub fn ready(&self) -> watch::Receiver<bool> {
+        self.ready.subscribe()
+    }
+
+    /// The node's prefix for pods, once it has one.
+    pub fn pod_prefix(&self) -> Option<(Ipv6Addr, u8)> {
+        self.parts.get().map(|parts| parts.prefix)
+    }
+
+    /// The node's WireGuard key and port, if it is on a mesh.
+    pub fn mesh_key(&self) -> Option<(feos_utils::wireguard::Key, u16)> {
+        self.mesh
             .as_ref()
-            .map_err(|e| Status::failed_precondition(e.clone()))
+            .map(|mesh| (mesh.public_key(), mesh.port()))
+    }
+
+    /// Takes what the control plane answered to the node's JoinMesh: the
+    /// cluster's ULA and the node's /64 of it, which become the node's
+    /// prefix and the route to the other nodes. The first /64 sets the
+    /// network up, if it is not yet; another one than the network has
+    /// takes effect at feosd's next start. A node with `--pod-prefix`
+    /// asks only whether the cluster is meshed, and refuses the prefix if
+    /// it is (ADR 0017).
+    pub async fn join_mesh(&self, pod_network: &str, pod_prefix: &str) -> Result<(), String> {
+        let Some(mesh) = &self.mesh else {
+            if !pod_network.is_empty() && self.config.pod_prefix.is_some() {
+                self.fail(format!(
+                    "the cluster's pods are on a mesh of {pod_network}, which refuses \
+                     feosd's --pod-prefix"
+                ));
+            }
+            return Ok(());
+        };
+        if pod_network.is_empty() {
+            let reason = "the control plane routes the cluster's pods, and feosd has no \
+                          --pod-prefix: pods with a network cannot run";
+            if *lock(&self.unready) != reason {
+                error!("Network: {reason}");
+                *lock(&self.unready) = reason.to_string();
+            }
+            return Ok(());
+        }
+        let assignment = Assignment::parse(pod_network, pod_prefix)?;
+        let handle = devices::connect().await.map_err(|e| e.to_string())?;
+        if mesh
+            .assign(assignment, &handle)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            info!("Network: The node has {pod_prefix} of the mesh's {pod_network}");
+        }
+        let _setting_up = self.setting_up.lock().await;
+        match self.parts.get() {
+            Some(parts) if parts.prefix == assignment.pod_prefix => {}
+            Some(parts) => error!(
+                "Network: The control plane gave the node {pod_prefix} in place of {}/{}: feosd \
+                 takes it at its next start",
+                parts.prefix.0, parts.prefix.1
+            ),
+            None => {
+                let mut handed = std::mem::take(&mut *lock(&self.handed));
+                let prefix = assignment.pod_prefix;
+                match set_up_again(&self.config, prefix, &self.dir, &self.records, &mut handed)
+                    .await
+                {
+                    Ok(parts) => {
+                        log_set_up(&self.config, prefix);
+                        let _ = self.parts.set(parts);
+                        self.ready.send_replace(true);
+                    }
+                    Err(e) => {
+                        *lock(&self.handed) = handed;
+                        let reason = format!("the pods' network is not set up: {e}");
+                        *lock(&self.unready) = reason.clone();
+                        return Err(reason);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The node's mesh, as `MeshService.GetMesh` shows it.
+    pub fn mesh(&self) -> MeshInfo {
+        self.mesh.as_ref().map(Mesh::info).unwrap_or_default()
+    }
+
+    pub fn put_mesh_peers(&self, request: PutMeshPeersRequest) -> Result<(), Status> {
+        self.on_mesh()?.put(request)?;
+        self.mesh_changes.send_modify(|n| *n = n.wrapping_add(1));
+        Ok(())
+    }
+
+    pub fn update_mesh_peers(&self, request: UpdateMeshPeersRequest) -> Result<(), Status> {
+        self.on_mesh()?.update(request)?;
+        self.mesh_changes.send_modify(|n| *n = n.wrapping_add(1));
+        Ok(())
+    }
+
+    /// A counter that moves with every change of the mesh's peers, whose
+    /// endpoints the rules deny pods.
+    pub fn subscribe_mesh(&self) -> watch::Receiver<u64> {
+        self.mesh_changes.subscribe()
+    }
+
+    fn on_mesh(&self) -> Result<&Mesh, Status> {
+        self.mesh
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("the node is not on a mesh"))
     }
 
     /// Marks the network as not working.
@@ -381,8 +589,8 @@ impl Network {
         }
         let (range, len) = self.config.pod_ipv4_range;
         let pods = [
-            self.config
-                .pod_prefix
+            self.pod_prefix()
+                .or(self.config.pod_prefix)
                 .map(|(prefix, len)| Prefix::V6(prefix, len)),
             Some(Prefix::V4(range, len)),
         ];
@@ -583,6 +791,7 @@ impl Network {
             ipv6,
             ipv4,
             dns: self.config.dns_address,
+            routes: routes(ipv6, self.mesh.as_ref().map_or(0, |_| MESH_MTU)),
         }))
     }
 
@@ -595,15 +804,15 @@ impl Network {
         if !has_network(info) {
             return Ok(());
         }
-        let ipv4 = match (&self.parts, info.ipv4_address.parse::<Ipv4Addr>()) {
-            (Ok(parts), Ok(address)) if parts.ipv4.contains(address) => {
+        let ipv4 = match (self.parts.get(), info.ipv4_address.parse::<Ipv4Addr>()) {
+            (Some(parts), Ok(address)) if parts.ipv4.contains(address) => {
                 parts.resolver.remove_client(address.into());
                 Some(address)
             }
             _ => None,
         };
-        let ipv6 = match (&self.parts, info.ipv6_address.parse::<Ipv6Addr>()) {
-            (Ok(parts), Ok(address)) if parts.ipv6.contains(address) => Some(address),
+        let ipv6 = match (self.parts.get(), info.ipv6_address.parse::<Ipv6Addr>()) {
+            (Some(parts), Ok(address)) if parts.ipv6.contains(address) => Some(address),
             _ => None,
         };
         let tap = tap_name(&info.pod_id);
@@ -631,7 +840,8 @@ impl Network {
         if !has_network(info) {
             return;
         }
-        if let (Ok(parts), Ok(address)) = (&self.parts, info.ipv4_address.parse::<Ipv4Addr>())
+        if let (Some(parts), Ok(address)) =
+            (self.parts.get(), info.ipv4_address.parse::<Ipv4Addr>())
             && let Err(e) = parts.ipv4.free(address, SystemTime::now())
         {
             warn!("Network: Failed to free {address}: {e}");
@@ -692,12 +902,14 @@ impl Network {
         Ok(())
     }
 
-    /// What no pod reaches: the denied prefixes, the node's own addresses,
-    /// and the pods' IPv4 range, which link-local addresses cover unless
-    /// `--pod-ipv4-range` moves it: pods reach each other over IPv6 alone.
+    /// What no pod reaches: the denied prefixes, the node's own addresses
+    /// and the mesh's peers', and the pods' IPv4 range, which link-local
+    /// addresses cover unless `--pod-ipv4-range` moves it: pods reach each
+    /// other over IPv6 alone, and other nodes' pods through the mesh.
     fn denied(&self, node: &[IpAddr]) -> Vec<Prefix> {
         let mut denied = self.config.deny_prefixes.clone();
-        denied.extend(node.iter().map(|address| match *address {
+        let peers = self.mesh.as_ref().map(Mesh::endpoints).unwrap_or_default();
+        denied.extend(node.iter().chain(&peers).map(|address| match *address {
             IpAddr::V4(v4) => Prefix::V4(v4, 32),
             IpAddr::V6(v6) => Prefix::V6(v6, 128),
         }));
@@ -710,6 +922,11 @@ impl Network {
         rules::Options {
             dns: IpAddr::V4(self.config.dns_address),
             ipv4_range: self.config.pod_ipv4_range,
+            mesh: self
+                .mesh
+                .as_ref()
+                .and_then(Mesh::assignment)
+                .map(|assignment| assignment.pod_network),
         }
     }
 
@@ -800,11 +1017,20 @@ async fn set_up(
     ));
     let (range, range_len) = config.pod_ipv4_range;
     Ok(Parts {
+        prefix: (prefix, len),
         ipv6: Ipv6Addresses::new(dir, prefix, len),
         ipv4: Ipv4Addresses::new(dir, range, range_len),
         resolver,
         sockets: Mutex::new(Some((udp, tcp))),
     })
+}
+
+fn log_set_up(config: &Config, (prefix, len): (Ipv6Addr, u8)) {
+    let (range, range_len) = config.pod_ipv4_range;
+    info!(
+        "Network: Pods get addresses of {prefix}/{len} and {range}/{range_len}, DNS at {}",
+        config.dns_address
+    );
 }
 
 /// [`set_up`], taken again a few times after a failure: netlink may answer
@@ -1040,7 +1266,14 @@ mod tests {
             config,
             groups,
             records: broadcast::channel(4).0,
-            parts: Err("not set up".to_string()),
+            dir: dir.path().to_path_buf(),
+            parts: OnceLock::new(),
+            unready: Mutex::new("not set up".to_string()),
+            ready: watch::Sender::new(false),
+            handed: Mutex::new((None, None)),
+            setting_up: tokio::sync::Mutex::new(()),
+            mesh: None,
+            mesh_changes: watch::Sender::new(0),
             broken: Mutex::new(None),
             directory: Arc::default(),
             applied: tokio::sync::Mutex::new(None),
@@ -1053,8 +1286,9 @@ mod tests {
     fn set_up_in(dir: &Path, config: Config) -> Network {
         let (prefix, len) = config.pod_prefix.expect("a pod prefix");
         let (range, range_len) = config.pod_ipv4_range;
-        let mut network = network(config);
-        network.parts = Ok(Parts {
+        let network = network(config);
+        let _ = network.parts.set(Parts {
+            prefix: (prefix, len),
             ipv6: Ipv6Addresses::new(dir, prefix, len),
             ipv4: Ipv4Addresses::new(dir, range, range_len),
             resolver: Resolver::new(dns_service::Config::default()),
@@ -1086,6 +1320,21 @@ mod tests {
             dns_upstreams: upstreams.iter().map(|u| u.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_ula_has_no_default_route() {
+        let ula = network_service::Prefix::V6("fc00::".parse().unwrap(), 7);
+        assert_eq!(
+            routes("fd5e:1b2c:93a0:7::2".parse().unwrap(), 1420),
+            [PodRoute {
+                destination: ula,
+                gateway: "fe80::1".parse().unwrap(),
+                mtu: 1420,
+            }]
+        );
+        assert!(routes("2001:db8:1:2::2".parse().unwrap(), 0).is_empty());
+        assert!(routes("fe80::2".parse().unwrap(), 0).is_empty());
     }
 
     #[test]

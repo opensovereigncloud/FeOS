@@ -14,3 +14,4 @@ pub mod resolver;
 pub mod share;
 pub mod version;
 pub mod vsock;
+pub mod wireguard;

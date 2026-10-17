@@ -35,6 +35,22 @@ impl Inventory for Node {
             version: stats.version,
         })
     }
+
+    fn pod_prefix(&self) -> Option<String> {
+        let (prefix, len) = self.pods.network().pod_prefix()?;
+        Some(format!("{prefix}/{len}"))
+    }
+
+    fn mesh_key(&self) -> Option<([u8; 32], u16)> {
+        self.pods.network().mesh_key()
+    }
+
+    async fn joined_mesh(&self, pod_network: String, pod_prefix: String) -> Result<(), String> {
+        self.pods
+            .network()
+            .join_mesh(&pod_network, &pod_prefix)
+            .await
+    }
 }
 
 /// Starts the node's side of the control plane, with the pods' events.

@@ -195,10 +195,11 @@ answers() {
   return 1
 }
 # The guest's global addresses on eth0 and its routes of both families but
-# the kernel's for multicast, sorted, without metrics and protocols.
+# the kernel's for multicast, sorted, without metrics, MTUs and protocols:
+# busybox's ip shows no MTU, which the guest's own tests check.
 guest_network() {
   cexec sh -c 'ip addr show dev eth0; ip -4 route show; ip -6 route show' |
-    sed -E 's/ (metric|proto|pref) [^ ]+//g; s/ +/ /g; s/^ //; s/ $//' |
+    sed -E 's/ (metric|proto|pref|mtu) [^ ]+//g; s/ +/ /g; s/^ //; s/ $//' |
     awk '/^inet6? .* scope global/ {print $1, $2; next} / dev eth0/ && !/^multicast /' | sort
 }
 # Checks the guest's addresses and routes after a push of $1 and $2: the
@@ -351,6 +352,26 @@ expect_network "${GUEST_IP_MOVED}" ""
 answers "${GUEST_IP_MOVED}" || fail "no answer on ${GUEST_IP_MOVED} with IPv4 alone"
 node ping -c1 -W1 "${GUEST_IP6_MOVED}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP6_MOVED}"
 log "a push of one family leaves the other unconfigured"
+
+# A pod whose IPv6 address is a ULA, as feosd pushes it (ADR 0017): a route
+# for the ULAs with the mesh's MTU in place of the default route over IPv6,
+# so that the guest answers the node and has no IPv6 route to the internet.
+ctl host set-network --interface eth0 --ipv4 "${GUEST_IP}/32" --gateway "${NODE_IP}" \
+  --ipv6 "${GUEST_IP6}/128" --ipv6-gateway fe80::1 --route fc00::/7 --route-mtu 1420 \
+  --dns "${DNS}" --hostname feos-test >/dev/null
+want=("fe80::/64 dev eth0" "inet ${GUEST_IP}/32" "${NODE_IP} dev eth0 scope link"
+  "default via ${NODE_IP} dev eth0" "inet6 ${GUEST_IP6}/128" "${GUEST_IP6} dev eth0"
+  "fc00::/7 via fe80::1 dev eth0")
+got="$(guest_network)"
+[ "${got}" = "$(printf '%s\n' "${want[@]}" | sort)" ] || fail "the network with a route for the ULAs: ${got}"
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} through the route for the ULAs"
+out="$(cexec wget -q -T 2 -O- 'http://[2001:db8::1]/' 2>&1 || true)"
+grep -qi "unreachable" <<<"${out}" || fail "a global IPv6 address is not unreachable at once: ${out}"
+grep -qx "Route: *fc00::/7 via fe80::1, MTU 1420" <<<"$(ctl host get-network)" \
+  || fail "get-network without the route: $(ctl host get-network)"
+push "${GUEST_IP}" "${GUEST_IP6}"
+expect_network "${GUEST_IP}" "${GUEST_IP6}"
+log "a route for the ULAs replaces the default route over IPv6"
 
 # A pod that runs from an earlier network, IPv6 alone with a resolver of
 # its own, is pushed this one by feosd: its running container resolves

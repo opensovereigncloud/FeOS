@@ -12,8 +12,8 @@ plane, and between `feosd` and `feos-guest`. They live in
 | `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, hibernate, restore, console, events | `feosd` |
 | `feos.volume.v1` | persistent volumes: create, delete, get, list; a pod's spec names them ([node.md](node.md#volumes)) | `feosd` |
 | `feos.disk.v1` | the pods' disks and memory over a chunk store and the object store, internal to the node ([disk.md](disk.md)) | `diskd` |
-| `feos.network.v1` | the pods' security groups (`SecurityGroupService`) and the records of their traffic (`TrafficService`) | `feosd` |
-| `feos.fleet.v1` | the control plane's API for nodes, on the uplink: join, the node's certificate, telemetry, events, pods' credentials ([control-plane.md](control-plane.md#nodes)) | `ferund` |
+| `feos.network.v1` | the pods' security groups (`SecurityGroupService`), the records of their traffic (`TrafficService`) and the node's mesh (`MeshService`) | `feosd` |
+| `feos.fleet.v1` | the control plane's API for nodes, on the uplink: join, the node's certificate, telemetry, events, pods' credentials, the node's place on the mesh ([control-plane.md](control-plane.md#nodes)) | `ferund` |
 | `feos.microvm.v1` | the pods' microVMs, internal to `feosd`, served on no listener | – |
 | `feos.container.v1` | containers: create, start, stop, delete, exec, logs, events | `feosd`, `feos-guest` |
 | `feos.image.v1` | OCI image pulls and the image store | `feosd`, `feos-guest` |
@@ -104,15 +104,26 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   with exceptions, of either family, or a group's members, of IPv6. An
   IPv4 block counts in rules out alone: nothing new comes in over IPv4. A
   change applies to the pods' rules within moments of the call.
+- `MeshService` (ADR 0017): `PutMeshPeers` replaces the node's peers on
+  the mesh whole, at a version; `UpdateMeshPeers` puts and removes peers
+  from `from_version` to `version`, and fails with `FAILED_PRECONDITION`
+  unless the node has them at `from_version`; both fail with
+  `FAILED_PRECONDITION` on a node that is not on a mesh or has no /64 of
+  it yet. A peer is a node's name, its WireGuard public key, its endpoint
+  and its /64. `GetMesh` shows the node's ULA, /64, key, port, version and
+  peers ([node.md](node.md#the-mesh)).
 - `TrafficService.StreamTrafficRecords` streams flows, drops, DNS queries
   and server names as `feosd` makes them, of one pod or of all; what a
   slow call misses is counted in the next record's `missed`.
 
 The guest's network configuration (`SetNetworkConfigRequest`,
 `GetNetworkConfigResponse`, `feos.microvm.v1.GuestNetworkConfig`) gained
-`ipv6_cidr` and `ipv6_gateway` by addition; `feosd` pushes both
-families: the IPv6 /128 via `fe80::1`, the IPv4 /32 via `169.254.0.1`,
-and its resolver ([guest.md](guest.md)).
+`ipv6_cidr` and `ipv6_gateway` by addition, and `routes` after them;
+`feosd` pushes both families: the IPv6 /128 via `fe80::1`, the IPv4 /32
+via `169.254.0.1`, and its resolver, and for a pod whose IPv6 address is a
+ULA a route for `fc00::/7` in place of the default route over IPv6
+([guest.md](guest.md)). An older guest ignores the routes and keeps its
+default route.
 
 ## Compatibility
 

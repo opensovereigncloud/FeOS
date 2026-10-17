@@ -6,8 +6,8 @@
 use crate::network::{self, Attachment};
 use crate::volumes;
 use feos_proto::microvm::{
-    BalloonConfig, CpuConfig, DataDiskConfig, GuestNetworkConfig, MemoryConfig, NetConfig,
-    TapConfig, VmConfig,
+    BalloonConfig, CpuConfig, DataDiskConfig, GuestNetworkConfig, GuestRoute, MemoryConfig,
+    NetConfig, TapConfig, VmConfig,
 };
 use feos_proto::pod_service::{PodSpec, Resources};
 use feos_utils::filesystem::volume as feos_volume;
@@ -253,6 +253,15 @@ pub fn vm_config(
             ipv6_gateway: network::GATEWAY.to_string(),
             dns: vec![attachment.dns.to_string()],
             hostname: pod_id.to_string(),
+            routes: attachment
+                .routes
+                .iter()
+                .map(|route| GuestRoute {
+                    destination: route.destination.to_string(),
+                    gateway: route.gateway.to_string(),
+                    mtu: route.mtu,
+                })
+                .collect(),
         });
         config.metadata_json = metadata_json(pod_id, spec, attachment);
     }
@@ -363,6 +372,7 @@ mod tests {
             ipv6: "fd00:fe05:1::9".parse().unwrap(),
             ipv4: "169.254.16.9".parse().unwrap(),
             dns: "169.254.0.53".parse().unwrap(),
+            routes: network::routes("fd00:fe05:1::9".parse().unwrap(), 1420),
         };
         let config = vm_config(id, &spec, Some(&attachment), None, &[]);
         assert_eq!(config.net[0].tap.as_ref().unwrap().tap_name, "pod-11111111");
@@ -377,6 +387,15 @@ mod tests {
         );
         assert_eq!(guest.dns, ["169.254.0.53"]);
         assert_eq!(guest.hostname, id);
+        // A ULA: no default route over IPv6.
+        assert_eq!(
+            guest.routes,
+            [GuestRoute {
+                destination: "fc00::/7".to_string(),
+                gateway: "fe80::1".to_string(),
+                mtu: 1420,
+            }]
+        );
         assert_eq!(config.memory.unwrap().size_mib, 512);
 
         let config = vm_config(id, &spec, None, None, &[]);
@@ -399,6 +418,7 @@ mod tests {
             ipv6: "fd00:fe05:1::9".parse().unwrap(),
             ipv4: "169.254.16.9".parse().unwrap(),
             dns: "169.254.0.53".parse().unwrap(),
+            routes: Vec::new(),
         };
         let config = vm_config(id, &spec, Some(&attachment), None, &[]);
         assert_eq!(

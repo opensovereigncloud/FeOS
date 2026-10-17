@@ -925,6 +925,400 @@ func (x *ListSecurityGroupsResponse) GetGroups() []*SecurityGroup {
 	return nil
 }
 
+type Mesh struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The cluster's ULA, a /48; empty on a node that is not on a mesh.
+	PodNetwork string `protobuf:"bytes,1,opt,name=pod_network,json=podNetwork,proto3" json:"pod_network,omitempty"`
+	// The node's /64 of it.
+	PodPrefix string `protobuf:"bytes,2,opt,name=pod_prefix,json=podPrefix,proto3" json:"pod_prefix,omitempty"`
+	// The node's WireGuard public key, 32 bytes.
+	PublicKey []byte `protobuf:"bytes,3,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+	// The UDP port the node's device listens on.
+	Port uint32 `protobuf:"varint,4,opt,name=port,proto3" json:"port,omitempty"`
+	// The peers' version, 0 before the control plane sent any.
+	Version       uint64      `protobuf:"varint,5,opt,name=version,proto3" json:"version,omitempty"`
+	Peers         []*MeshPeer `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Mesh) Reset() {
+	*x = Mesh{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Mesh) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Mesh) ProtoMessage() {}
+
+func (x *Mesh) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Mesh.ProtoReflect.Descriptor instead.
+func (*Mesh) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *Mesh) GetPodNetwork() string {
+	if x != nil {
+		return x.PodNetwork
+	}
+	return ""
+}
+
+func (x *Mesh) GetPodPrefix() string {
+	if x != nil {
+		return x.PodPrefix
+	}
+	return ""
+}
+
+func (x *Mesh) GetPublicKey() []byte {
+	if x != nil {
+		return x.PublicKey
+	}
+	return nil
+}
+
+func (x *Mesh) GetPort() uint32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *Mesh) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *Mesh) GetPeers() []*MeshPeer {
+	if x != nil {
+		return x.Peers
+	}
+	return nil
+}
+
+// Another node, as a peer of the mesh.
+type MeshPeer struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The node's name.
+	Node string `protobuf:"bytes,1,opt,name=node,proto3" json:"node,omitempty"`
+	// Its WireGuard public key, 32 bytes.
+	PublicKey []byte `protobuf:"bytes,2,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
+	// "host:port" of its device, e.g. "10.0.0.11:51820".
+	Endpoint string `protobuf:"bytes,3,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	// Its /64 of the cluster's ULA: the one prefix allowed for it.
+	PodPrefix     string `protobuf:"bytes,4,opt,name=pod_prefix,json=podPrefix,proto3" json:"pod_prefix,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MeshPeer) Reset() {
+	*x = MeshPeer{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MeshPeer) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MeshPeer) ProtoMessage() {}
+
+func (x *MeshPeer) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MeshPeer.ProtoReflect.Descriptor instead.
+func (*MeshPeer) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *MeshPeer) GetNode() string {
+	if x != nil {
+		return x.Node
+	}
+	return ""
+}
+
+func (x *MeshPeer) GetPublicKey() []byte {
+	if x != nil {
+		return x.PublicKey
+	}
+	return nil
+}
+
+func (x *MeshPeer) GetEndpoint() string {
+	if x != nil {
+		return x.Endpoint
+	}
+	return ""
+}
+
+func (x *MeshPeer) GetPodPrefix() string {
+	if x != nil {
+		return x.PodPrefix
+	}
+	return ""
+}
+
+type PutMeshPeersRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Version       uint64                 `protobuf:"varint,1,opt,name=version,proto3" json:"version,omitempty"`
+	Peers         []*MeshPeer            `protobuf:"bytes,2,rep,name=peers,proto3" json:"peers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PutMeshPeersRequest) Reset() {
+	*x = PutMeshPeersRequest{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PutMeshPeersRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PutMeshPeersRequest) ProtoMessage() {}
+
+func (x *PutMeshPeersRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PutMeshPeersRequest.ProtoReflect.Descriptor instead.
+func (*PutMeshPeersRequest) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *PutMeshPeersRequest) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *PutMeshPeersRequest) GetPeers() []*MeshPeer {
+	if x != nil {
+		return x.Peers
+	}
+	return nil
+}
+
+type PutMeshPeersResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PutMeshPeersResponse) Reset() {
+	*x = PutMeshPeersResponse{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PutMeshPeersResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PutMeshPeersResponse) ProtoMessage() {}
+
+func (x *PutMeshPeersResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PutMeshPeersResponse.ProtoReflect.Descriptor instead.
+func (*PutMeshPeersResponse) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{16}
+}
+
+type UpdateMeshPeersRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The version feosd must have.
+	FromVersion uint64 `protobuf:"varint,1,opt,name=from_version,json=fromVersion,proto3" json:"from_version,omitempty"`
+	// The version after this change.
+	Version uint64 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
+	// Peers that are new or changed, by node.
+	PutPeers []*MeshPeer `protobuf:"bytes,3,rep,name=put_peers,json=putPeers,proto3" json:"put_peers,omitempty"`
+	// The nodes that are peers no longer.
+	RemovePeers   []string `protobuf:"bytes,4,rep,name=remove_peers,json=removePeers,proto3" json:"remove_peers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateMeshPeersRequest) Reset() {
+	*x = UpdateMeshPeersRequest{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateMeshPeersRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateMeshPeersRequest) ProtoMessage() {}
+
+func (x *UpdateMeshPeersRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateMeshPeersRequest.ProtoReflect.Descriptor instead.
+func (*UpdateMeshPeersRequest) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *UpdateMeshPeersRequest) GetFromVersion() uint64 {
+	if x != nil {
+		return x.FromVersion
+	}
+	return 0
+}
+
+func (x *UpdateMeshPeersRequest) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *UpdateMeshPeersRequest) GetPutPeers() []*MeshPeer {
+	if x != nil {
+		return x.PutPeers
+	}
+	return nil
+}
+
+func (x *UpdateMeshPeersRequest) GetRemovePeers() []string {
+	if x != nil {
+		return x.RemovePeers
+	}
+	return nil
+}
+
+type UpdateMeshPeersResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateMeshPeersResponse) Reset() {
+	*x = UpdateMeshPeersResponse{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateMeshPeersResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateMeshPeersResponse) ProtoMessage() {}
+
+func (x *UpdateMeshPeersResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateMeshPeersResponse.ProtoReflect.Descriptor instead.
+func (*UpdateMeshPeersResponse) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{18}
+}
+
+type GetMeshRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetMeshRequest) Reset() {
+	*x = GetMeshRequest{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetMeshRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetMeshRequest) ProtoMessage() {}
+
+func (x *GetMeshRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetMeshRequest.ProtoReflect.Descriptor instead.
+func (*GetMeshRequest) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{19}
+}
+
 type StreamTrafficRecordsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Only this pod's records; all pods' when empty.
@@ -935,7 +1329,7 @@ type StreamTrafficRecordsRequest struct {
 
 func (x *StreamTrafficRecordsRequest) Reset() {
 	*x = StreamTrafficRecordsRequest{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[13]
+	mi := &file_feos_network_v1_network_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -947,7 +1341,7 @@ func (x *StreamTrafficRecordsRequest) String() string {
 func (*StreamTrafficRecordsRequest) ProtoMessage() {}
 
 func (x *StreamTrafficRecordsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[13]
+	mi := &file_feos_network_v1_network_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -960,7 +1354,7 @@ func (x *StreamTrafficRecordsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamTrafficRecordsRequest.ProtoReflect.Descriptor instead.
 func (*StreamTrafficRecordsRequest) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{13}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *StreamTrafficRecordsRequest) GetPodId() string {
@@ -991,7 +1385,7 @@ type TrafficRecord struct {
 
 func (x *TrafficRecord) Reset() {
 	*x = TrafficRecord{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[14]
+	mi := &file_feos_network_v1_network_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1003,7 +1397,7 @@ func (x *TrafficRecord) String() string {
 func (*TrafficRecord) ProtoMessage() {}
 
 func (x *TrafficRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[14]
+	mi := &file_feos_network_v1_network_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1016,7 +1410,7 @@ func (x *TrafficRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficRecord.ProtoReflect.Descriptor instead.
 func (*TrafficRecord) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{14}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *TrafficRecord) GetTime() *timestamppb.Timestamp {
@@ -1127,7 +1521,7 @@ type Tuple struct {
 
 func (x *Tuple) Reset() {
 	*x = Tuple{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[15]
+	mi := &file_feos_network_v1_network_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1139,7 +1533,7 @@ func (x *Tuple) String() string {
 func (*Tuple) ProtoMessage() {}
 
 func (x *Tuple) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[15]
+	mi := &file_feos_network_v1_network_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1152,7 +1546,7 @@ func (x *Tuple) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Tuple.ProtoReflect.Descriptor instead.
 func (*Tuple) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{15}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *Tuple) GetProtocol() uint32 {
@@ -1211,7 +1605,7 @@ type Flow struct {
 
 func (x *Flow) Reset() {
 	*x = Flow{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[16]
+	mi := &file_feos_network_v1_network_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1223,7 +1617,7 @@ func (x *Flow) String() string {
 func (*Flow) ProtoMessage() {}
 
 func (x *Flow) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[16]
+	mi := &file_feos_network_v1_network_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1236,7 +1630,7 @@ func (x *Flow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Flow.ProtoReflect.Descriptor instead.
 func (*Flow) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{16}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *Flow) GetTuple() *Tuple {
@@ -1314,7 +1708,7 @@ type Drop struct {
 
 func (x *Drop) Reset() {
 	*x = Drop{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[17]
+	mi := &file_feos_network_v1_network_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1326,7 +1720,7 @@ func (x *Drop) String() string {
 func (*Drop) ProtoMessage() {}
 
 func (x *Drop) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[17]
+	mi := &file_feos_network_v1_network_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1339,7 +1733,7 @@ func (x *Drop) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Drop.ProtoReflect.Descriptor instead.
 func (*Drop) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{17}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *Drop) GetTuple() *Tuple {
@@ -1378,7 +1772,7 @@ type DnsQuery struct {
 
 func (x *DnsQuery) Reset() {
 	*x = DnsQuery{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[18]
+	mi := &file_feos_network_v1_network_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1390,7 +1784,7 @@ func (x *DnsQuery) String() string {
 func (*DnsQuery) ProtoMessage() {}
 
 func (x *DnsQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[18]
+	mi := &file_feos_network_v1_network_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1403,7 +1797,7 @@ func (x *DnsQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DnsQuery.ProtoReflect.Descriptor instead.
 func (*DnsQuery) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{18}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *DnsQuery) GetName() string {
@@ -1446,7 +1840,7 @@ type ServerName struct {
 
 func (x *ServerName) Reset() {
 	*x = ServerName{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[19]
+	mi := &file_feos_network_v1_network_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1458,7 +1852,7 @@ func (x *ServerName) String() string {
 func (*ServerName) ProtoMessage() {}
 
 func (x *ServerName) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[19]
+	mi := &file_feos_network_v1_network_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1471,7 +1865,7 @@ func (x *ServerName) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerName.ProtoReflect.Descriptor instead.
 func (*ServerName) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{19}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ServerName) GetTuple() *Tuple {
@@ -1536,7 +1930,35 @@ const file_feos_network_v1_network_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"\x1b\n" +
 	"\x19ListSecurityGroupsRequest\"T\n" +
 	"\x1aListSecurityGroupsResponse\x126\n" +
-	"\x06groups\x18\x01 \x03(\v2\x1e.feos.network.v1.SecurityGroupR\x06groups\"4\n" +
+	"\x06groups\x18\x01 \x03(\v2\x1e.feos.network.v1.SecurityGroupR\x06groups\"\xc4\x01\n" +
+	"\x04Mesh\x12\x1f\n" +
+	"\vpod_network\x18\x01 \x01(\tR\n" +
+	"podNetwork\x12\x1d\n" +
+	"\n" +
+	"pod_prefix\x18\x02 \x01(\tR\tpodPrefix\x12\x1d\n" +
+	"\n" +
+	"public_key\x18\x03 \x01(\fR\tpublicKey\x12\x12\n" +
+	"\x04port\x18\x04 \x01(\rR\x04port\x12\x18\n" +
+	"\aversion\x18\x05 \x01(\x04R\aversion\x12/\n" +
+	"\x05peers\x18\x06 \x03(\v2\x19.feos.network.v1.MeshPeerR\x05peers\"x\n" +
+	"\bMeshPeer\x12\x12\n" +
+	"\x04node\x18\x01 \x01(\tR\x04node\x12\x1d\n" +
+	"\n" +
+	"public_key\x18\x02 \x01(\fR\tpublicKey\x12\x1a\n" +
+	"\bendpoint\x18\x03 \x01(\tR\bendpoint\x12\x1d\n" +
+	"\n" +
+	"pod_prefix\x18\x04 \x01(\tR\tpodPrefix\"`\n" +
+	"\x13PutMeshPeersRequest\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\x04R\aversion\x12/\n" +
+	"\x05peers\x18\x02 \x03(\v2\x19.feos.network.v1.MeshPeerR\x05peers\"\x16\n" +
+	"\x14PutMeshPeersResponse\"\xb0\x01\n" +
+	"\x16UpdateMeshPeersRequest\x12!\n" +
+	"\ffrom_version\x18\x01 \x01(\x04R\vfromVersion\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\x04R\aversion\x126\n" +
+	"\tput_peers\x18\x03 \x03(\v2\x19.feos.network.v1.MeshPeerR\bputPeers\x12!\n" +
+	"\fremove_peers\x18\x04 \x03(\tR\vremovePeers\"\x19\n" +
+	"\x17UpdateMeshPeersResponse\"\x10\n" +
+	"\x0eGetMeshRequest\"4\n" +
 	"\x1bStreamTrafficRecordsRequest\x12\x15\n" +
 	"\x06pod_id\x18\x01 \x01(\tR\x05podId\"\xc1\x02\n" +
 	"\rTrafficRecord\x12.\n" +
@@ -1606,7 +2028,11 @@ const file_feos_network_v1_network_proto_rawDesc = "" +
 	"\x13UpdateSecurityGroup\x12+.feos.network.v1.UpdateSecurityGroupRequest\x1a,.feos.network.v1.UpdateSecurityGroupResponse\x12p\n" +
 	"\x13DeleteSecurityGroup\x12+.feos.network.v1.DeleteSecurityGroupRequest\x1a,.feos.network.v1.DeleteSecurityGroupResponse\x12\\\n" +
 	"\x10GetSecurityGroup\x12(.feos.network.v1.GetSecurityGroupRequest\x1a\x1e.feos.network.v1.SecurityGroup\x12m\n" +
-	"\x12ListSecurityGroups\x12*.feos.network.v1.ListSecurityGroupsRequest\x1a+.feos.network.v1.ListSecurityGroupsResponse2x\n" +
+	"\x12ListSecurityGroups\x12*.feos.network.v1.ListSecurityGroupsRequest\x1a+.feos.network.v1.ListSecurityGroupsResponse2\x93\x02\n" +
+	"\vMeshService\x12[\n" +
+	"\fPutMeshPeers\x12$.feos.network.v1.PutMeshPeersRequest\x1a%.feos.network.v1.PutMeshPeersResponse\x12d\n" +
+	"\x0fUpdateMeshPeers\x12'.feos.network.v1.UpdateMeshPeersRequest\x1a(.feos.network.v1.UpdateMeshPeersResponse\x12A\n" +
+	"\aGetMesh\x12\x1f.feos.network.v1.GetMeshRequest\x1a\x15.feos.network.v1.Mesh2x\n" +
 	"\x0eTrafficService\x12f\n" +
 	"\x14StreamTrafficRecords\x12,.feos.network.v1.StreamTrafficRecordsRequest\x1a\x1e.feos.network.v1.TrafficRecord0\x01b\x06proto3"
 
@@ -1623,7 +2049,7 @@ func file_feos_network_v1_network_proto_rawDescGZIP() []byte {
 }
 
 var file_feos_network_v1_network_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_feos_network_v1_network_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_feos_network_v1_network_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_feos_network_v1_network_proto_goTypes = []any{
 	(Direction)(0),                      // 0: feos.network.v1.Direction
 	(Protocol)(0),                       // 1: feos.network.v1.Protocol
@@ -1642,14 +2068,21 @@ var file_feos_network_v1_network_proto_goTypes = []any{
 	(*GetSecurityGroupRequest)(nil),     // 14: feos.network.v1.GetSecurityGroupRequest
 	(*ListSecurityGroupsRequest)(nil),   // 15: feos.network.v1.ListSecurityGroupsRequest
 	(*ListSecurityGroupsResponse)(nil),  // 16: feos.network.v1.ListSecurityGroupsResponse
-	(*StreamTrafficRecordsRequest)(nil), // 17: feos.network.v1.StreamTrafficRecordsRequest
-	(*TrafficRecord)(nil),               // 18: feos.network.v1.TrafficRecord
-	(*Tuple)(nil),                       // 19: feos.network.v1.Tuple
-	(*Flow)(nil),                        // 20: feos.network.v1.Flow
-	(*Drop)(nil),                        // 21: feos.network.v1.Drop
-	(*DnsQuery)(nil),                    // 22: feos.network.v1.DnsQuery
-	(*ServerName)(nil),                  // 23: feos.network.v1.ServerName
-	(*timestamppb.Timestamp)(nil),       // 24: google.protobuf.Timestamp
+	(*Mesh)(nil),                        // 17: feos.network.v1.Mesh
+	(*MeshPeer)(nil),                    // 18: feos.network.v1.MeshPeer
+	(*PutMeshPeersRequest)(nil),         // 19: feos.network.v1.PutMeshPeersRequest
+	(*PutMeshPeersResponse)(nil),        // 20: feos.network.v1.PutMeshPeersResponse
+	(*UpdateMeshPeersRequest)(nil),      // 21: feos.network.v1.UpdateMeshPeersRequest
+	(*UpdateMeshPeersResponse)(nil),     // 22: feos.network.v1.UpdateMeshPeersResponse
+	(*GetMeshRequest)(nil),              // 23: feos.network.v1.GetMeshRequest
+	(*StreamTrafficRecordsRequest)(nil), // 24: feos.network.v1.StreamTrafficRecordsRequest
+	(*TrafficRecord)(nil),               // 25: feos.network.v1.TrafficRecord
+	(*Tuple)(nil),                       // 26: feos.network.v1.Tuple
+	(*Flow)(nil),                        // 27: feos.network.v1.Flow
+	(*Drop)(nil),                        // 28: feos.network.v1.Drop
+	(*DnsQuery)(nil),                    // 29: feos.network.v1.DnsQuery
+	(*ServerName)(nil),                  // 30: feos.network.v1.ServerName
+	(*timestamppb.Timestamp)(nil),       // 31: google.protobuf.Timestamp
 }
 var file_feos_network_v1_network_proto_depIdxs = []int32{
 	5,  // 0: feos.network.v1.SecurityGroup.rules:type_name -> feos.network.v1.Rule
@@ -1659,35 +2092,44 @@ var file_feos_network_v1_network_proto_depIdxs = []int32{
 	7,  // 4: feos.network.v1.Rule.block:type_name -> feos.network.v1.AddressBlock
 	4,  // 5: feos.network.v1.PutSecurityGroupRequest.group:type_name -> feos.network.v1.SecurityGroup
 	4,  // 6: feos.network.v1.ListSecurityGroupsResponse.groups:type_name -> feos.network.v1.SecurityGroup
-	24, // 7: feos.network.v1.TrafficRecord.time:type_name -> google.protobuf.Timestamp
-	20, // 8: feos.network.v1.TrafficRecord.flow:type_name -> feos.network.v1.Flow
-	21, // 9: feos.network.v1.TrafficRecord.drop:type_name -> feos.network.v1.Drop
-	22, // 10: feos.network.v1.TrafficRecord.dns:type_name -> feos.network.v1.DnsQuery
-	23, // 11: feos.network.v1.TrafficRecord.server_name:type_name -> feos.network.v1.ServerName
-	19, // 12: feos.network.v1.Flow.tuple:type_name -> feos.network.v1.Tuple
-	24, // 13: feos.network.v1.Flow.start:type_name -> google.protobuf.Timestamp
-	24, // 14: feos.network.v1.Flow.end:type_name -> google.protobuf.Timestamp
-	19, // 15: feos.network.v1.Drop.tuple:type_name -> feos.network.v1.Tuple
-	2,  // 16: feos.network.v1.Drop.reason:type_name -> feos.network.v1.DropReason
-	19, // 17: feos.network.v1.ServerName.tuple:type_name -> feos.network.v1.Tuple
-	3,  // 18: feos.network.v1.ServerName.source:type_name -> feos.network.v1.ServerNameSource
-	8,  // 19: feos.network.v1.SecurityGroupService.PutSecurityGroup:input_type -> feos.network.v1.PutSecurityGroupRequest
-	10, // 20: feos.network.v1.SecurityGroupService.UpdateSecurityGroup:input_type -> feos.network.v1.UpdateSecurityGroupRequest
-	12, // 21: feos.network.v1.SecurityGroupService.DeleteSecurityGroup:input_type -> feos.network.v1.DeleteSecurityGroupRequest
-	14, // 22: feos.network.v1.SecurityGroupService.GetSecurityGroup:input_type -> feos.network.v1.GetSecurityGroupRequest
-	15, // 23: feos.network.v1.SecurityGroupService.ListSecurityGroups:input_type -> feos.network.v1.ListSecurityGroupsRequest
-	17, // 24: feos.network.v1.TrafficService.StreamTrafficRecords:input_type -> feos.network.v1.StreamTrafficRecordsRequest
-	9,  // 25: feos.network.v1.SecurityGroupService.PutSecurityGroup:output_type -> feos.network.v1.PutSecurityGroupResponse
-	11, // 26: feos.network.v1.SecurityGroupService.UpdateSecurityGroup:output_type -> feos.network.v1.UpdateSecurityGroupResponse
-	13, // 27: feos.network.v1.SecurityGroupService.DeleteSecurityGroup:output_type -> feos.network.v1.DeleteSecurityGroupResponse
-	4,  // 28: feos.network.v1.SecurityGroupService.GetSecurityGroup:output_type -> feos.network.v1.SecurityGroup
-	16, // 29: feos.network.v1.SecurityGroupService.ListSecurityGroups:output_type -> feos.network.v1.ListSecurityGroupsResponse
-	18, // 30: feos.network.v1.TrafficService.StreamTrafficRecords:output_type -> feos.network.v1.TrafficRecord
-	25, // [25:31] is the sub-list for method output_type
-	19, // [19:25] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	18, // 7: feos.network.v1.Mesh.peers:type_name -> feos.network.v1.MeshPeer
+	18, // 8: feos.network.v1.PutMeshPeersRequest.peers:type_name -> feos.network.v1.MeshPeer
+	18, // 9: feos.network.v1.UpdateMeshPeersRequest.put_peers:type_name -> feos.network.v1.MeshPeer
+	31, // 10: feos.network.v1.TrafficRecord.time:type_name -> google.protobuf.Timestamp
+	27, // 11: feos.network.v1.TrafficRecord.flow:type_name -> feos.network.v1.Flow
+	28, // 12: feos.network.v1.TrafficRecord.drop:type_name -> feos.network.v1.Drop
+	29, // 13: feos.network.v1.TrafficRecord.dns:type_name -> feos.network.v1.DnsQuery
+	30, // 14: feos.network.v1.TrafficRecord.server_name:type_name -> feos.network.v1.ServerName
+	26, // 15: feos.network.v1.Flow.tuple:type_name -> feos.network.v1.Tuple
+	31, // 16: feos.network.v1.Flow.start:type_name -> google.protobuf.Timestamp
+	31, // 17: feos.network.v1.Flow.end:type_name -> google.protobuf.Timestamp
+	26, // 18: feos.network.v1.Drop.tuple:type_name -> feos.network.v1.Tuple
+	2,  // 19: feos.network.v1.Drop.reason:type_name -> feos.network.v1.DropReason
+	26, // 20: feos.network.v1.ServerName.tuple:type_name -> feos.network.v1.Tuple
+	3,  // 21: feos.network.v1.ServerName.source:type_name -> feos.network.v1.ServerNameSource
+	8,  // 22: feos.network.v1.SecurityGroupService.PutSecurityGroup:input_type -> feos.network.v1.PutSecurityGroupRequest
+	10, // 23: feos.network.v1.SecurityGroupService.UpdateSecurityGroup:input_type -> feos.network.v1.UpdateSecurityGroupRequest
+	12, // 24: feos.network.v1.SecurityGroupService.DeleteSecurityGroup:input_type -> feos.network.v1.DeleteSecurityGroupRequest
+	14, // 25: feos.network.v1.SecurityGroupService.GetSecurityGroup:input_type -> feos.network.v1.GetSecurityGroupRequest
+	15, // 26: feos.network.v1.SecurityGroupService.ListSecurityGroups:input_type -> feos.network.v1.ListSecurityGroupsRequest
+	19, // 27: feos.network.v1.MeshService.PutMeshPeers:input_type -> feos.network.v1.PutMeshPeersRequest
+	21, // 28: feos.network.v1.MeshService.UpdateMeshPeers:input_type -> feos.network.v1.UpdateMeshPeersRequest
+	23, // 29: feos.network.v1.MeshService.GetMesh:input_type -> feos.network.v1.GetMeshRequest
+	24, // 30: feos.network.v1.TrafficService.StreamTrafficRecords:input_type -> feos.network.v1.StreamTrafficRecordsRequest
+	9,  // 31: feos.network.v1.SecurityGroupService.PutSecurityGroup:output_type -> feos.network.v1.PutSecurityGroupResponse
+	11, // 32: feos.network.v1.SecurityGroupService.UpdateSecurityGroup:output_type -> feos.network.v1.UpdateSecurityGroupResponse
+	13, // 33: feos.network.v1.SecurityGroupService.DeleteSecurityGroup:output_type -> feos.network.v1.DeleteSecurityGroupResponse
+	4,  // 34: feos.network.v1.SecurityGroupService.GetSecurityGroup:output_type -> feos.network.v1.SecurityGroup
+	16, // 35: feos.network.v1.SecurityGroupService.ListSecurityGroups:output_type -> feos.network.v1.ListSecurityGroupsResponse
+	20, // 36: feos.network.v1.MeshService.PutMeshPeers:output_type -> feos.network.v1.PutMeshPeersResponse
+	22, // 37: feos.network.v1.MeshService.UpdateMeshPeers:output_type -> feos.network.v1.UpdateMeshPeersResponse
+	17, // 38: feos.network.v1.MeshService.GetMesh:output_type -> feos.network.v1.Mesh
+	25, // 39: feos.network.v1.TrafficService.StreamTrafficRecords:output_type -> feos.network.v1.TrafficRecord
+	31, // [31:40] is the sub-list for method output_type
+	22, // [22:31] is the sub-list for method input_type
+	22, // [22:22] is the sub-list for extension type_name
+	22, // [22:22] is the sub-list for extension extendee
+	0,  // [0:22] is the sub-list for field type_name
 }
 
 func init() { file_feos_network_v1_network_proto_init() }
@@ -1699,7 +2141,7 @@ func file_feos_network_v1_network_proto_init() {
 		(*Rule_Block)(nil),
 		(*Rule_Group)(nil),
 	}
-	file_feos_network_v1_network_proto_msgTypes[14].OneofWrappers = []any{
+	file_feos_network_v1_network_proto_msgTypes[21].OneofWrappers = []any{
 		(*TrafficRecord_Flow)(nil),
 		(*TrafficRecord_Drop)(nil),
 		(*TrafficRecord_Dns)(nil),
@@ -1711,9 +2153,9 @@ func file_feos_network_v1_network_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_feos_network_v1_network_proto_rawDesc), len(file_feos_network_v1_network_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   20,
+			NumMessages:   27,
 			NumExtensions: 0,
-			NumServices:   2,
+			NumServices:   3,
 		},
 		GoTypes:           file_feos_network_v1_network_proto_goTypes,
 		DependencyIndexes: file_feos_network_v1_network_proto_depIdxs,

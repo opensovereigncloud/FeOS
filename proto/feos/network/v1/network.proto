@@ -25,6 +25,24 @@ service SecurityGroupService {
   rpc ListSecurityGroups(ListSecurityGroupsRequest) returns (ListSecurityGroupsResponse);
 }
 
+// The node's place on its cluster's mesh (ADR 0017): a WireGuard device
+// whose peers are the other nodes, each with its /64 of the cluster's ULA
+// as the one prefix allowed for it. The control plane sends every node the
+// others as its peers: whole, or as a delta from one version to the next.
+// feosd keeps them on disk.
+service MeshService {
+  // Puts the peers whole, at a version. It replaces the peers feosd has,
+  // whatever their version. Fails with FAILED_PRECONDITION on a node that
+  // is not on a mesh.
+  rpc PutMeshPeers(PutMeshPeersRequest) returns (PutMeshPeersResponse);
+  // Adds, changes and removes peers, from one version to the next. Fails
+  // with FAILED_PRECONDITION unless feosd has the peers at from_version:
+  // the control plane then puts them whole.
+  rpc UpdateMeshPeers(UpdateMeshPeersRequest) returns (UpdateMeshPeersResponse);
+  // The node's mesh: its prefixes, its key and port, and its peers.
+  rpc GetMesh(GetMeshRequest) returns (Mesh);
+}
+
 // What the node's pods did on the network (ADR 0013): flows, drops, DNS
 // queries and server names, as feosd records them.
 service TrafficService {
@@ -123,6 +141,54 @@ message ListSecurityGroupsRequest {}
 message ListSecurityGroupsResponse {
   repeated SecurityGroup groups = 1;
 }
+
+message Mesh {
+  // The cluster's ULA, a /48; empty on a node that is not on a mesh.
+  string pod_network = 1;
+  // The node's /64 of it.
+  string pod_prefix = 2;
+  // The node's WireGuard public key, 32 bytes.
+  bytes public_key = 3;
+  // The UDP port the node's device listens on.
+  uint32 port = 4;
+  // The peers' version, 0 before the control plane sent any.
+  uint64 version = 5;
+  repeated MeshPeer peers = 6;
+}
+
+// Another node, as a peer of the mesh.
+message MeshPeer {
+  // The node's name.
+  string node = 1;
+  // Its WireGuard public key, 32 bytes.
+  bytes public_key = 2;
+  // "host:port" of its device, e.g. "10.0.0.11:51820".
+  string endpoint = 3;
+  // Its /64 of the cluster's ULA: the one prefix allowed for it.
+  string pod_prefix = 4;
+}
+
+message PutMeshPeersRequest {
+  uint64 version = 1;
+  repeated MeshPeer peers = 2;
+}
+
+message PutMeshPeersResponse {}
+
+message UpdateMeshPeersRequest {
+  // The version feosd must have.
+  uint64 from_version = 1;
+  // The version after this change.
+  uint64 version = 2;
+  // Peers that are new or changed, by node.
+  repeated MeshPeer put_peers = 3;
+  // The nodes that are peers no longer.
+  repeated string remove_peers = 4;
+}
+
+message UpdateMeshPeersResponse {}
+
+message GetMeshRequest {}
 
 message StreamTrafficRecordsRequest {
   // Only this pod's records; all pods' when empty.

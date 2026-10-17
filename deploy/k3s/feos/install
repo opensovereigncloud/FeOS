@@ -25,11 +25,13 @@ cache=/var/cache/feos-k3s/$version
 mkdir -p "/host$cache"
 cp /feos/debs/*.deb "/host$cache/"
 
-# The pods' IPv6 prefix: this lab's network routes none to the nodes, so a
-# ULA per node, from the last octet of its address. Its pods leave over
-# IPv4 alone (hack/packages/feosd/default).
+# The pods' IPv6 prefix: this lab's network routes none to the nodes. With
+# the control plane, each node gets a /64 of the cluster's ULA from it and
+# reaches the others' pods through the mesh (ADR 0017); without, a ULA per
+# node, from the last octet of its address, which no other node reaches.
+# Either way its pods leave over IPv4 alone.
 octet=${NODE_IP##*.}
-pod_prefix=$(printf 'fd00:fe05:%x::/64' "$octet")
+pod_prefix="--pod-prefix $(printf 'fd00:fe05:%x::/64' "$octet")"
 
 # What pods may not reach: the nodes' and the cluster's networks.
 deny=""
@@ -40,6 +42,7 @@ done
 control_plane=""
 if [ -n "${CONTROL_PLANE:-}" ]; then
 	control_plane="--control-plane $CONTROL_PLANE --control-plane-name $CONTROL_PLANE_NAME --trust-domain $TRUST_DOMAIN"
+	pod_prefix=""
 fi
 
 umask 077
@@ -65,7 +68,7 @@ put() {
 
 cat >/tmp/feosd <<EOF
 # Written by the feos DaemonSet (deploy/k3s/feos); edits are overwritten.
-FEOSD_ARGS="--pod-prefix $pod_prefix$deny $control_plane"
+FEOSD_ARGS="$pod_prefix$deny $control_plane"
 EOF
 put /etc/default/feosd /tmp/feosd
 

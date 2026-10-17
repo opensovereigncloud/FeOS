@@ -178,6 +178,20 @@ message GuestNetworkConfig {
   string ipv6_cidr = 6;
   // IPv6 default gateway, on the interface's link, e.g. "fe80::1".
   string ipv6_gateway = 7;
+  // Routes via gateways on the interface's link, such as "fc00::/7" via
+  // "fe80::1" for a pod whose IPv6 address is a ULA (ADR 0017). A family's
+  // routes replace its default route: a family without any gets the
+  // default route via its gateway. A guest of before routes ignores them.
+  repeated GuestRoute routes = 8;
+}
+
+message GuestRoute {
+  // A prefix of either family, e.g. "fc00::/7".
+  string destination = 1;
+  // On the interface's link, of the destination's family, e.g. "fe80::1".
+  string gateway = 2;
+  // The route's MTU, e.g. 1420 over a mesh; 0 is the interface's.
+  uint32 mtu = 3;
 }
 
 message CpuConfig {

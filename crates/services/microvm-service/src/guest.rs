@@ -19,7 +19,7 @@
 
 use crate::{vsock_path, VmEventWrapper};
 use feos_proto::host_service::{
-    host_service_client::HostServiceClient, PingRequest, PreparePauseRequest,
+    host_service_client::HostServiceClient, NetworkRoute, PingRequest, PreparePauseRequest,
     SetNetworkConfigRequest, SetTimeRequest,
 };
 use feos_proto::lifecycle_service::lifecycle_service_server::{
@@ -268,6 +268,15 @@ impl Guests {
                         hostname: network.hostname,
                         ipv6_cidr: network.ipv6_cidr,
                         ipv6_gateway: network.ipv6_gateway,
+                        routes: network
+                            .routes
+                            .into_iter()
+                            .map(|route| NetworkRoute {
+                                destination: route.destination,
+                                gateway: route.gateway,
+                                mtu: route.mtu,
+                            })
+                            .collect(),
                     })
                     .await
                     .map_err(|status| format!("SetNetworkConfig: {}", status.message()))?
