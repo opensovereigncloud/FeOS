@@ -72,8 +72,14 @@ The `.deb` packages of ADR 0009 build with nfpm, which `make packages`
 downloads, pinned by sha256 (`hack/packages/`):
 
     make packages        # target/packages/*.deb: feosd, feosctl, diskd, Firecracker, the guest
+    make ferund-package  # target/packages/ferund/: ferund's, with its UI (needs npm)
     make test-packages   # installs them on Debian 13 with systemd, in docker, and checks feosd
-    make publish-apt     # builds HEAD as a dev version and publishes it to apt.fecode.dev
+    make test-ferund-package  # installs ferund's on Debian 13, in docker, and checks its files
+    make publish-apt     # builds HEAD as a dev version, ferund's too, and publishes them to apt.fecode.dev
+
+ferund's package is the control plane's, not a node's: it lands in a
+directory of its own, so that a node image, which takes every `.deb` of
+`target/packages/`, never holds it.
 
 `make test-packages` boots a pod from the installed guest, restarts feosd
 under it, gives feosd an `fd00:` pod prefix and a denied prefix in

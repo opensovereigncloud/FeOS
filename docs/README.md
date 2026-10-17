@@ -4,7 +4,7 @@ FeOS Documentation
 | You want to know | Read |
 |---|---|
 | what FeOS is, what it is for, where it stands | [overview.md](overview.md) |
-| how the node, the guest and the API work | [architecture/](architecture/) |
+| how the node, the guest, the API and the control plane work | [architecture/](architecture/) |
 | why it is built this way | [adr/](adr/) |
 | how to build, test and contribute | [development.md](development.md) |
 | how to do a particular thing | [guides/](guides/) |

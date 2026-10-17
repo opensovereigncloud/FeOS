@@ -89,7 +89,9 @@ that pause, hibernate and scale to zero, and the front doors: a REST API,
 MCP for agents, and HTTP to the ports of pods. It reaches nodes only over
 the connections the nodes open to it, mTLS both ways: it calls the node's
 API on one, the node reports telemetry and events on the other
-(ADR 0015).
+(ADR 0015). It is written in Go, in `go/`, with its management UI in
+`web/`; [architecture/control-plane.md](architecture/control-plane.md)
+describes it.
 
 ### The contract
 
@@ -120,7 +122,7 @@ The guest's API is internal between `feosd` and `feos-guest`.
 - Confidential computing (TDX, SEV-SNP).
 - Point-in-time recovery: a snapshot is the latest state, not a history.
 
-## Where it stands (2026-10-15)
+## Where it stands (2026-10-16)
 
 | Part | State |
 |---|---|
@@ -128,9 +130,9 @@ The guest's API is internal between `feosd` and `feos-guest`.
 | `feosd` | runs pods (`feos.pod.v1`): a microVM in Firecracker's jailer and its containers, with snapshots, the balloon and the guest's uplink, and their persistent volumes (`feos.volume.v1`, ADR 0016), under systemd or `feos-host-init`; forwards a pod's container, image, tool and watch calls to its guest; gives every pod its network (ADR 0010): an IPv6 address of the node's prefix and a link-local IPv4 address on a routed TAP device, with proxy ARP for the IPv4 gateway and masquerade for leaving over IPv4, DNS from its own resolver; enforces security groups with nftables (ADR 0012) and records flows, drops, DNS queries and server names (ADR 0013), served as `feos.network.v1`. Credentials and proxies are not built; groups and records do not reach the control plane yet |
 | `feos-host-init` | sets the machine up as PID 1 and runs `feosd` |
 | `diskd` | the disk daemon (ADR 0011): ublk devices over sealed layers, a local cache and S3. Every pod has a disk from it, and hibernates into its object store: `HibernatePod` and `RestorePod`, here or on another node, with the pod's memory served lazily where the snapshot fits the node, and a boot on its disk where it does not (ADR 0008). Packaged beside `feosd`; no baked images, no sweep yet |
-| packages | `.deb` packages of `feosd`, `feosctl`, `diskd`, Firecracker and the guest, in a signed apt repository at apt.fecode.dev |
+| packages | `.deb` packages of `feosd`, `feosctl`, `diskd`, Firecracker and the guest, in a signed apt repository at apt.fecode.dev; `ferund`'s is published beside them |
 | control plane connections | `feosd --control-plane` (ADR 0015): joins with a one-time token, keeps its key and certificate and renews it, reports telemetry and its events (pods, start, stop) on the uplink, and serves its API on a node connection to every instance. The event buffer is in memory, not yet on disk; pods' credentials are not built |
-| control plane, node-side manager | in Go, still in the sandbox system's repository; the manager is being ported into `feosd`, the control plane becomes FeRun's `ferund` (ADR 0015) |
+| control plane | `ferund` (ADR 0015), in Go: tenants and their tokens, sandboxes on the nodes with placement, ops that survive their callers, pause, hibernation and restore elsewhere, drains, the agent's tools over REST and MCP, ports and file watches, Kubernetes and SSH bindings (off until feosd delivers them), the fleet of nodes with joins, certificates, telemetry and events, human sign-in with OIDC and the management UI; replicas over PostgreSQL with a leader. It runs on the lab's k3s with three nodes. Ports reach a pod once its feosd forwards `PortForwardService` to the guest |
 | CaaS | not started; its open questions are in ADR 0001 |
 
 ## Glossary
@@ -150,6 +152,8 @@ The guest's API is internal between `feosd` and `feos-guest`.
 ## Further reading
 
 - [docs/adr/](adr/): the decisions and why they were made.
+- [docs/architecture/](architecture/): how the node, the guest, the API
+  and the control plane work.
 - [docs/development.md](development.md): building, testing, the rules for
   code.
 - [hack/README.md](../hack/README.md): kernel, images and test

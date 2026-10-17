@@ -8,7 +8,8 @@ FeOS images, and [/docs/adr](/docs/adr) for the decisions behind it.
 ## Repository layout
 
 FeOS is a monorepo. Rust crates live under `crates/` in one Cargo workspace;
-other languages get their own top-level directory when they arrive.
+the control plane is Go, in `go/`, and its management UI JavaScript, in
+`web/`.
 
 ```
 crates/
@@ -49,6 +50,11 @@ crates/
     watch-service/      guest: inotify subscriptions on a container's files
     forward-service/    guest: port forwarding, kube and SSH credential offloading
 proto/feos/<api>/v1/    the gRPC APIs, package feos.<api>.v1
+go/                     the Go module github.com/ironcore-dev/feos/go: ferund
+                        and ferun-testnode (cmd/), their packages
+                        (internal/), the generated code of proto/ (gen/)
+web/                    ferund's management UI (React, Vite), built into
+                        go/internal/ui/dist
 fechat/                 FeChat, FeRun's reference client, at chat.fecode.dev
 deploy/k3s/             the lab's k3s deployment: FeOS on the nodes, FeRun,
                         FeChat
@@ -91,6 +97,14 @@ Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
 - **`diskctl`** (`crates/diskctl`): diskd's client, for development and
   the lab tests. diskd's API is internal to the node, so it is not part
   of `feosctl`.
+- **`ferund`** (`go/cmd/ferund`): FeRun, the control plane, in replicas
+  over one PostgreSQL; nodes connect to it
+  ([ADR 0015](adr/0015-control-plane.md),
+  [architecture/control-plane.md](architecture/control-plane.md)). It
+  embeds the management UI of `web/`. Static, `CGO_ENABLED=0`.
+- **`ferun-testnode`** (`go/cmd/ferun-testnode`): a node in memory that
+  speaks feosd's side of the wire, for developing ferund and its UI
+  without microVMs.
 
 `feosd` and `feos-guest` run the container runtime in a process of their
 own, `--task-service`, and start it again when it exits. See
@@ -150,6 +164,66 @@ Tests against the kernel need root and are ignored by default: those of
 `traffic-service`, which make their namespaces, and of the guest's network
 push. Their modules say how to run them, with `--ignored`. `make test-host`
 runs those of the node in the host kernel.
+
+## FeRun
+
+You need the Go of `go/go.mod`'s `toolchain` line (`go` downloads it),
+Node.js 22 and npm for the UI, and docker or a PostgreSQL 17 for the
+tests.
+
+    make go-lint         # gofmt and go vet
+    make go-test         # every Go test, against a throwaway PostgreSQL 17 in
+                         # docker, or the one FERUN_TEST_DATABASE_URL names
+    make go-test-unit    # the Go tests; those that need a database skip
+    make go-build        # static ferund and ferun-testnode: target/go/
+    make go-gen          # go/gen from proto/, after a change of a .proto
+    make web             # the UI into go/internal/ui/dist (npm ci, build)
+    make ferund-package  # ferund with the UI and its .deb: target/packages/ferund/
+    make test-ferund-package  # installs it on Debian 13, in docker, and checks
+                              # its user and its files' group
+
+    cd web && npm test   # the UI's tests (vitest)
+    cd web && npm run dev  # the UI on Vite's server, /api, /auth and /mcp
+                           # proxied to a ferund on localhost:8100
+
+A single package's tests, with the race detector:
+
+    export FERUN_TEST_DATABASE_URL='postgres://ferun:ferun@127.0.0.1:5432/postgres?sslmode=disable'
+    cd go && go test -race ./internal/sandbox/...
+
+The tests make a database of their own per test in that server and drop
+it afterwards. A ferund on one machine, with a test node:
+
+    ferund init-ca --root-dir /tmp/ferun/root --dir /tmp/ferun/ca \
+        --dns-domain feos.test
+    ferund serve --database-url "$DB" --ca-dir /tmp/ferun/ca \
+        --admin-users admin:admin --bootstrap-token "$TOKEN"
+    ferund join-token --database-url "$DB" --ca-dir /tmp/ferun/ca
+    ferun-testnode --join-token feos-join-... --addr 127.0.0.1:7443 \
+        --server-name ferun.feos.test
+
+Go code follows the rules of the Rust code where they apply, and these:
+
+- **The dependency set is fixed:** the standard library, pgx, gRPC,
+  protobuf, the MCP Go SDK, google/uuid, `golang.org/x/crypto` and
+  `golang.org/x/sync`. A new dependency is a decision, made in `go.mod`
+  and `go/internal/deps` together; `go mod tidy` and `go get` are not run
+  in passing. The UI's dependencies are React and, for building and
+  testing, Vite and Vitest.
+- **No panics** outside `main` and tests: errors are wrapped with `%w`
+  and returned. Logging is `log/slog`, structured and passed in; a log
+  line that a remote party can trigger is rate-limited.
+- **Every goroutine has an owner** and ends with its context;
+  `context.Context` is the first argument of everything that blocks.
+- **Times from the database:** every lease, TTL, grace and deadline is
+  decided on PostgreSQL's clock, `now()`.
+- **Nothing slow in a transaction**, no call to a node. A node's
+  mutating pod calls never run on the caller's context.
+- **Tests** use the standard `testing` package only; those that need
+  PostgreSQL call `dbtest.New(t)`. Packages with concurrency are tested
+  with `-race`.
+- **gofmt and `go vet`** are clean, and every Go file starts with the
+  SPDX header.
 
 ## Rules
 
