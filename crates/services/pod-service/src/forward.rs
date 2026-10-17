@@ -117,10 +117,27 @@ async fn forward(
     check_forwarded(request.uri().path())?;
     pods.check_reachable(pod_id)?;
     let channel = guest_channel(pod_id).await?;
-    channel
+    let response = channel
         .oneshot(request)
         .await
-        .map_err(|e| Status::unavailable(format!("the guest of pod {pod_id}: {e}")))
+        .map_err(|e| Status::unavailable(format!("the guest of pod {pod_id}: {e}")))?;
+    Ok(trailers_only(response))
+}
+
+/// A response whose headers carry its status, as the guest's to a call it
+/// failed before its first message, goes on without a body: as one HEADERS
+/// frame that ends the stream. When the guest failed a streaming call that
+/// way, it also reset the call's request (RST_STREAM NO_ERROR), after
+/// which the guest's body no longer says that it ended; feosd would send
+/// the headers and then an empty DATA frame that ends the stream, and a
+/// client that reads the status only from a frame that ends the stream, as
+/// grpc-go does, would see a stream that ended without one.
+fn trailers_only(response: Response<Body>) -> Response<Body> {
+    if !response.headers().contains_key("grpc-status") {
+        return response;
+    }
+    let (parts, _) = response.into_parts();
+    Response::from_parts(parts, Body::empty())
 }
 
 fn check_forwarded(path: &str) -> Result<(), Status> {
@@ -147,5 +164,21 @@ mod tests {
         assert!(check_forwarded("/feos.container.v1.ContainerServiceX/Exec").is_err());
         assert!(check_forwarded("/feos.kube.v1.KubeService/SetListeners").is_err());
         assert!(check_forwarded("/feos.ssh.v1.SshService/SetListeners").is_err());
+    }
+
+    #[test]
+    fn a_status_in_the_headers_ends_the_response() {
+        use tonic::codegen::Body as _;
+        // A body that does not say that it ended, as a reset guest's.
+        let open = || Body::new(String::from("open"));
+        let (parts, _) = Status::unavailable("127.0.0.1:1: refused")
+            .into_http::<Body>()
+            .into_parts();
+        let failed = trailers_only(Response::from_parts(parts, open()));
+        assert!(failed.body().is_end_stream());
+        assert_eq!(failed.headers()["grpc-status"], "14");
+
+        let answer = trailers_only(Response::new(open()));
+        assert!(!answer.body().is_end_stream());
     }
 }
