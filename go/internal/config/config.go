@@ -66,6 +66,12 @@ const (
 // EnvPrefix starts every environment variable of a flag.
 const EnvPrefix = "FERUN_"
 
+// The pod networks of a cluster (--pod-network), besides a ULA /48 itself.
+const (
+	PodNetworkRouted = ""
+	PodNetworkMesh   = "mesh"
+)
+
 // The placement policies.
 const (
 	PlacementBinpack = "binpack"
@@ -140,6 +146,11 @@ type Config struct {
 	// MCPAllowedOrigins are the Origins /mcp accepts; empty: every request
 	// with an Origin is refused.
 	MCPAllowedOrigins []string
+	// PodNetwork is the cluster's pod network (ADR 0017): PodNetworkRouted,
+	// every node with a prefix of its network's; PodNetworkMesh, a ULA /48
+	// drawn at random once and kept in the database; or such a /48 itself,
+	// "fdXX:XXXX:XXXX::/48".
+	PodNetwork string
 
 	DefaultImage     string
 	DefaultVCPUs     int
@@ -296,6 +307,8 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.StringVar(&c.BootstrapToken, "bootstrap-token", c.BootstrapToken, "becomes a token of tenant operator when no tenant exists")
 	fs.Var((*listValue)(&c.MCPAllowedOrigins), "mcp-allowed-origins",
 		"comma-separated Origin allowlist of /mcp; empty: every request with an Origin is refused")
+	fs.StringVar(&c.PodNetwork, "pod-network", c.PodNetwork,
+		"the pods' network: empty, routed (every node a prefix of its network's); mesh, a ULA /48 drawn once and kept in the database; or such a /48 (fdXX:XXXX:XXXX::/48)")
 	fs.StringVar(&c.DefaultImage, "default-image", c.DefaultImage, "image of a sandbox created without one")
 	fs.IntVar(&c.DefaultVCPUs, "default-vcpus", c.DefaultVCPUs, "vCPUs of a sandbox created without a size")
 	fs.IntVar(&c.DefaultMemoryMiB, "default-memory-mib", c.DefaultMemoryMiB, "memory (MiB) of a sandbox created without a size")
@@ -405,6 +418,11 @@ func (c *Config) Validate() error {
 	}
 	if c.SessionTTL <= 0 {
 		bad("--session-ttl must be positive")
+	}
+	if c.PodNetwork != PodNetworkRouted && c.PodNetwork != PodNetworkMesh {
+		if _, err := ParsePodNetwork(c.PodNetwork); err != nil {
+			bad("--pod-network: %v", err)
+		}
 	}
 	if c.DefaultImage == "" {
 		bad("--default-image must not be empty")
@@ -633,4 +651,24 @@ func ParseByteSize(s string) (int64, error) {
 		return 0, fmt.Errorf("byte size %q out of range", s)
 	}
 	return n << shift, nil
+}
+
+// ParsePodNetwork parses a cluster's ULA as --pod-network names it: a /48
+// of fd00::/8 without host bits (RFC 4193), such as "fd5e:1b2c:93a0::/48".
+func ParsePodNetwork(s string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%q is neither empty, mesh nor a ULA /48: %w", s, err)
+	}
+	switch {
+	case !p.Addr().Is6() || p.Addr().Is4In6() || p.Addr().Zone() != "":
+		return netip.Prefix{}, fmt.Errorf("%q is not an IPv6 prefix", s)
+	case p.Bits() != 48:
+		return netip.Prefix{}, fmt.Errorf("%q is not a /48", s)
+	case p.Masked() != p:
+		return netip.Prefix{}, fmt.Errorf("%q has host bits set", s)
+	case p.Addr().As16()[0] != 0xfd:
+		return netip.Prefix{}, fmt.Errorf("%q is not a ULA of fd00::/8", s)
+	}
+	return p, nil
 }

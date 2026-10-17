@@ -76,6 +76,7 @@ func testIssuer(t *testing.T) *pki.Issuer {
 type fakeLinks struct {
 	mu         sync.Mutex
 	connected  map[string]bool
+	conns      map[string]grpc.ClientConnInterface // a node's connection; none: UNAVAILABLE
 	rechecks   []string
 	recheckAll int
 	stopping   map[string]time.Time
@@ -83,7 +84,16 @@ type fakeLinks struct {
 }
 
 func newFakeLinks() *fakeLinks {
-	return &fakeLinks{connected: map[string]bool{}, stopping: map[string]time.Time{}}
+	return &fakeLinks{connected: map[string]bool{}, conns: map[string]grpc.ClientConnInterface{},
+		stopping: map[string]time.Time{}}
+}
+
+// setConn connects the node with conn as its connection.
+func (f *fakeLinks) setConn(node string, conn grpc.ClientConnInterface) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.connected[node] = true
+	f.conns[node] = conn
 }
 
 func (f *fakeLinks) setConnected(node string, on bool) {
@@ -92,7 +102,12 @@ func (f *fakeLinks) setConnected(node string, on bool) {
 	f.connected[node] = on
 }
 
-func (f *fakeLinks) Conn(context.Context, string) (grpc.ClientConnInterface, error) {
+func (f *fakeLinks) Conn(_ context.Context, node string) (grpc.ClientConnInterface, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.conns[node]; c != nil {
+		return c, nil
+	}
 	return nil, status.Error(codes.Unavailable, "no connections in this test")
 }
 func (f *fakeLinks) WaitConnected(context.Context, string) error {

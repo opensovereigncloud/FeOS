@@ -169,7 +169,9 @@ func (s *Service) OnPresented(node, serial, peerAddr string) {
 
 // OnNodeConn is nodelink.Config.OnNodeConn: a node got a current
 // connection on this instance after having none; its inventory is
-// reconciled (§8 "Reconcile requests").
+// reconciled (§8 "Reconcile requests"), and on the leader of a meshed
+// cluster the node gets its peers.
 func (s *Service) OnNodeConn(node string) {
 	s.requestReconcile(node)
+	s.wakeMeshPeers()
 }

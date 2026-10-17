@@ -86,9 +86,14 @@ func TestMigrateAndJoinToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
+	// Every embedded migration is applied.
+	files, err := os.ReadDir("../../internal/db/migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
 	var versions int
-	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != 2 {
-		t.Fatalf("migrations %d %v", versions, err)
+	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&versions); err != nil || versions != len(files) {
+		t.Fatalf("migrations %d of %d: %v", versions, len(files), err)
 	}
 
 	base := t.TempDir()

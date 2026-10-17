@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -25,7 +26,9 @@ const allKey = ""
 //   - "" on either (the listener reconnected, or a subscription
 //     overflowed: a notification may have been missed): every node's
 //     rollout deadline is reloaded, every connection re-checked, and every
-//     connected node's inventory reconciled.
+//     connected node's inventory reconciled;
+//   - a node's last connection gone: the leader forgets which of the
+//     mesh's peers it sent the node, which gets them whole next time.
 //
 // A stopping instance keeps its node connections and uplinks until §7 step
 // 5, and revocations, removals and forks must still close them meanwhile.
@@ -36,11 +39,25 @@ func (s *Service) Run(ctx context.Context) error {
 	defer unsubscribeNodes()
 	reconciles, unsubscribeReconciles := s.d.Subscribe(db.ChanReconcile)
 	defer unsubscribeReconciles()
+	var conns <-chan nodelink.ConnEvent
+	if s.links != nil {
+		var unsubscribeConns func()
+		conns, unsubscribeConns = s.links.Subscribe()
+		defer unsubscribeConns()
+	}
 	defer s.stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case ev, ok := <-conns:
+			switch {
+			case !ok:
+				conns = nil
+			case !ev.Connected:
+				// Its next connection gets its peers whole.
+				s.mesh.forget(ev.Node)
+			}
 		case node := <-nodes:
 			if node == "" || node == "*" {
 				s.refreshAll()

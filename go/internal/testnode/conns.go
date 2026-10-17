@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
+	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
 	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
@@ -259,6 +260,7 @@ func (n *Node) newNodeServer() *grpc.Server {
 	toolv1.RegisterToolServiceServer(srv, n.tools)
 	watchv1.RegisterWatchServiceServer(srv, n.watch)
 	portforwardv1.RegisterPortForwardServiceServer(srv, n.forward)
+	networkv1.RegisterMeshServiceServer(srv, n.mesh)
 	return srv
 }
 

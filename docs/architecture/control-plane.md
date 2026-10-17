@@ -7,6 +7,7 @@ its management UI, in `web/`. The decisions behind it:
 replication, and how nodes connect),
 [ADR 0014](../adr/0014-identity-and-credentials.md) (identity and
 credentials), [ADR 0013](../adr/0013-traffic-records.md) (traffic records),
+[ADR 0017](../adr/0017-pod-mesh.md) (the pods' mesh),
 [ADR 0009](../adr/0009-node-os-and-packages.md) (packages). The node's side
 of the wire is in [node.md](node.md#the-control-plane).
 
@@ -74,6 +75,7 @@ that.
 | `--session-ttl` | `12h` | the absolute lifetime of a UI session |
 | `--bootstrap-token` | none | becomes a token of the tenant `operator` while no tenant exists |
 | `--mcp-allowed-origins` | none | the Origins `/mcp` accepts; empty refuses every request with an Origin |
+| `--pod-network` | empty | the pods' network ([The pods' mesh](#the-pods-mesh)): empty, routed, every node with a prefix of its network's; `mesh`, a ULA /48 drawn at the first start and kept in the database; or such a /48, `fdXX:XXXX:XXXX::/48` |
 | `--default-image` | `ghcr.io/maltej/debian-ai:latest` | the image of a sandbox created without one |
 | `--default-vcpus`, `--default-memory-mib` | 2, 512 | the size of a sandbox created without one |
 | `--placement` | `binpack` | or `spread` |
@@ -117,8 +119,9 @@ of `proto/` is in `go/gen/feos/<api>/v1` (`make go-gen`), the rest in
 | `model` | value types and errors that several packages share |
 | `activity` | ferund's rows of the activity log, written in batches; the partitions of the log |
 | `pki` | the CA: issuer, certificates, signing requests, SPIFFE IDs, join tokens and pins, HPKE |
+| `mesh` | the pods' mesh: the ULA, a node's /64, endpoints, the peers' deltas |
 | `nodelink` | the nodes' port: TLS, ALPN, the node connections and their budgets, the uplink, join and refusal servers |
-| `fleet` | `feos.fleet.v1`: joins, renewals, telemetry, events, pods' credentials, the nodes' liveness |
+| `fleet` | `feos.fleet.v1`: joins, renewals, telemetry, events, pods' credentials, the mesh, the nodes' liveness; the mesh's peers to the nodes |
 | `leader` | the leader lease and the leader's loops, the instance's heartbeat |
 | `sandbox` | the sandbox engine: states, ops, placement, sync, reconcile, tombstones, policies, images |
 | `tools` | the agent's tools in a sandbox, and their REST routes |
@@ -154,9 +157,11 @@ replicate synchronously ([Operations](#operations)).
 - **Time.** Every lease, TTL, grace and deadline is decided on the
   database's clock (`now()`), never on a node's or an instance's.
 - **Migrations** are embedded (`internal/db/migrations/`: `0001_init.sql`,
-  the schema; `0002_auth.sql`, sign-in) and applied under an advisory lock,
-  recorded in `schema_migrations`. The same locked section creates the
-  cluster's MCP session key and, with `--bootstrap-token`, the tenant
+  the schema; `0002_auth.sql`, sign-in; `0005_mesh.sql`, the pods' mesh)
+  and applied under an advisory lock, recorded in `schema_migrations`. The
+  same locked section creates the cluster's MCP session key, reconciles
+  `--pod-network` with the database's ([The pods'
+  mesh](#the-pods-mesh)) and, with `--bootstrap-token`, creates the tenant
   `operator` and its token, when no tenant exists.
 - **Notifications.** One connection per instance listens on the channels
   below and fans them out in the process. A writer sends its notification
@@ -179,7 +184,8 @@ The tables: `instances`, `leases`, `cluster_secrets`; `tenants`,
 `tenant_tokens`; `nodes`, `node_telemetry` (the hot row, about a hundred
 updates a second at 512 nodes, never locked by placement), `node_certs`
 (every node certificate issued), `join_tokens`, `node_starts`,
-`event_gaps`; `sandboxes`, `sandbox_tokens`, `sandbox_holds`,
+`event_gaps`; `pod_network` (the mesh's ULA and its peers' version, one
+row while the cluster is meshed); `sandboxes`, `sandbox_tokens`, `sandbox_holds`,
 `pod_tombstones`, `bookings`, `placements` (the audit of placement
 decisions); `activity` and `traffic_records`, partitioned by day;
 `issued_certs` (pods' certificates); `watches`; `kube_bindings`,
@@ -208,6 +214,7 @@ hashes only, and shown once, at their creation.
 | node expiry | 5 s | marks a node down whose telemetry is older than `--node-ttl`; only while the leader has led for `--node-ttl` and the database has not failed for as long |
 | reconcile sweep | 60 s | reconciles every ready node the leader is connected to |
 | join-token expiry, fleet retention | 60 s, 1 h | expired join tokens; old feosd starts, event gaps, node and pod certificates |
+| mesh peers | 15 s | sends every node on the pods' mesh that the leader is connected to its peers ([The pods' mesh](#the-pods-mesh)) |
 | down sweep | 5 s | sandboxes of down and removed nodes become `unknown` |
 | lost grace | 30 s | `unknown` sandboxes of nodes down past `--lost-grace` become `hibernated` or `lost` |
 | idle pause | 1 s | pauses running sandboxes idle for `--idle-pause` |
@@ -462,6 +469,57 @@ row is never deleted: removal is a status. Its statuses: `joined`, `ready`
   outage of the control plane or a database failover, nodes have a full
   TTL to report again. Keep `--node-ttl` at least three telemetry
   intervals plus a failover.
+
+### The pods' mesh
+
+Where the network routes no prefix to the nodes, their pods' IPv6 goes
+over a WireGuard mesh between them
+([ADR 0017](../adr/0017-pod-mesh.md)); the node's side is in
+[node.md](node.md). The control plane gives every node its /64 and sends
+every node the others as its peers.
+
+- **The ULA.** `--pod-network mesh` draws a /48, `fd` and a Global ID of
+  40 random bits, when the database has none, and keeps it in
+  `pod_network`; `--pod-network fdXX:XXXX:XXXX::/48` keeps that one. Every
+  later start keeps the database's: an instance whose `--pod-network` is
+  empty while the database is meshed, or names another /48, does not
+  start ("the database's cluster is meshed on …"). A cluster does not
+  move between a routed network and a mesh, nor between meshes.
+- **`JoinMesh`**, on the uplink, takes the node's name from its
+  certificate, which must pass the checks of every uplink call; an unknown
+  or removed node gets `PERMISSION_DENIED`. In a routed cluster the answer
+  is empty, and a request without a key, from a node with a prefix of its
+  own, gets the ULA alone. Otherwise the key must be 32 bytes and the
+  endpoint an IP address and a port, an IPv6 address in brackets, neither
+  unspecified, multicast, IPv4-mapped nor with a zone
+  (`INVALID_ARGUMENT`). Under the node's row lock, a node without a
+  subnet ID gets the next of the sequence `mesh_subnets`, 1 to 65535,
+  which never hands one out twice (`RESOURCE_EXHAUSTED` once it ends), and
+  its /64 is the ULA with the ID in bits 48 to 63; the same node gets the
+  same one on every call. The key and the endpoint are stored beside it,
+  in `nodes`.
+- **The peers' version.** Every change of who the peers are counts up
+  `pod_network.peers_version` in its transaction and sends the hint
+  `mesh-peers` on `ferun_leader`: a node's first subnet, a new key or
+  endpoint, a peer's removal, and a pinned re-join, which takes the node
+  off the mesh until it asks again, for a new /64. A removed node keeps
+  its subnet ID, which is never given to another. Down nodes stay peers.
+- **Distribution.** The leader's loop `mesh-peers` reads the peers and
+  their version in one statement, every 15 s and when the hint or a
+  node's first connection to the leader wakes it, and calls
+  `feos.network.v1.MeshService` on the node connection of every connected
+  node that is a peer and has not taken this version: `PutMeshPeers` with
+  the others whole, after the node's connection came up and in a new term,
+  or `UpdateMeshPeers`, the peers added, changed and removed since the
+  version it took in this term; a delta refused with
+  `FAILED_PRECONDITION` is followed by the peers whole. At most 16 calls
+  run at once, each for at most 10 s, never in a transaction; a failure
+  is logged and the node is tried again on the next run. A feosd that
+  answers `UNIMPLEMENTED` is logged once and not asked again on its
+  connection. What the leader sent lives in its memory only: a node's last
+  connection to it gone, it is forgotten.
+- **The admin API** shows a node's /64 and endpoint as `meshPrefix` and
+  `meshEndpoint`.
 
 ## Sandboxes
 
@@ -922,13 +980,17 @@ feosd's do: in a task of their own, which further calls join and a resume
 abandons until the head is put; the script points `HibernateUpload` and
 `HibernateHead` hold one in its upload or right after its point of no
 return. With `ResumeWaitsForHibernation` it plays a feosd that does not
-report its hibernations, whose resume waits for one. `ferun-testnode`
-runs one for development:
+report its hibernations, whose resume waits for one. With `Mesh` it is on
+the pods' mesh: it asks `JoinMesh` with a random key and its endpoint on
+every new uplink and whenever its endpoint changes, and keeps the peers
+that `MeshService` gets in memory; without, `MeshService` answers
+`FAILED_PRECONDITION`. `ferun-testnode` runs one for development:
 
     ferun-testnode --join-token feos-join-<secret>.<pin> \
         --server-name ferun.example.com --addr 127.0.0.1:7443 \
         [--name NAME] [--trust-domain feos.local] [--state-dir DIR] \
-        [--object-store-dir DIR] [--pending-delay 2s]
+        [--object-store-dir DIR] [--pending-delay 2s] \
+        [--mesh [--mesh-endpoint ADDRESS:PORT]]
 
 ## Operations
 

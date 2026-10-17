@@ -18,10 +18,15 @@ func TestParse(t *testing.T) {
 		"FERUN_TESTNODE_MEMORY":        "8GiB",
 		"FERUN_TESTNODE_OBJECT_STORE":  "bucket",
 		"FERUN_TESTNODE_PENDING_DELAY": "1s",
+		"FERUN_TESTNODE_MESH":          "true",
 	}
-	cfg, level, err := parse([]string{"--name", "from-flag", "--disk", "512", "--log-level", "debug", "--abort-on-cancel"}, func(k string) string { return env[k] })
+	cfg, level, err := parse([]string{"--name", "from-flag", "--disk", "512", "--log-level", "debug", "--abort-on-cancel",
+		"--mesh-endpoint", "10.0.0.9:51820"}, func(k string) string { return env[k] })
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !cfg.Mesh || cfg.MeshEndpoint != "10.0.0.9:51820" {
+		t.Fatalf("mesh %v %q", cfg.Mesh, cfg.MeshEndpoint)
 	}
 	if cfg.Name != "from-flag" || cfg.ServerName != "ferun.example.test" || cfg.TrustDomain != "feos.local" ||
 		!slices.Equal(cfg.Addrs, []string{"10.0.0.1:7443", "10.0.0.2:7443"}) || cfg.MemoryBytes != 8<<30 || cfg.DiskBytes != 512 ||

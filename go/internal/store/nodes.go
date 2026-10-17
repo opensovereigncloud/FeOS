@@ -12,6 +12,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/model"
 )
 
 // Node is a row of nodes. A node is never deleted: removal is a status.
@@ -47,6 +49,13 @@ type Node struct {
 	JoinedAt             time.Time
 	ReconciledAt         time.Time
 	ReconcileRequestedAt time.Time
+
+	// The node on the pods' mesh (ADR 0017): its subnet ID (0: none yet),
+	// its /64, and its WireGuard key and endpoint (none before JoinMesh).
+	MeshSubnet    int
+	MeshPrefix    string
+	MeshPublicKey []byte
+	MeshEndpoint  string
 }
 
 // Forked reports whether the node's identity forked.
@@ -69,7 +78,7 @@ func nodeColumns(p string) string {
 		"slots", "mem_headroom_bytes", "cpu_overcommit", "hostname", "arch", "cpu_model", "cpu_cores",
 		"memory_total_bytes", "disk_total_bytes", "versions", "object_store", "object_store_id", "pod_prefix",
 		"start_id", "stopping_until", "current_serial", "identity_forked_at", "joined_at", "reconciled_at",
-		"reconcile_requested_at"}
+		"reconcile_requested_at", "mesh_subnet", "mesh_prefix", "mesh_public_key", "mesh_endpoint"}
 	if p != "" {
 		for i, c := range cols {
 			cols[i] = p + "." + c
@@ -86,11 +95,16 @@ func nodeScanTargets(n *Node) ([]any, func()) {
 	var downSince, removedAt, drainStarted, stoppingUntil, forkedAt, reconciledAt, requestedAt *time.Time
 	var startID *uuid.UUID
 	var overcommit float32
+	var subnet *int32
 	targets := []any{&n.Name, &n.Status, &n.StatusDescription, &downSince, &removedAt, &n.Draining, &drainStarted,
 		&n.Slots, &n.MemHeadroomBytes, &overcommit, &n.Hostname, &n.Arch, &n.CPUModel, &n.CPUCores,
 		&n.MemoryTotalBytes, &n.DiskTotalBytes, &n.Versions, &n.ObjectStore, &n.ObjectStoreID, &n.PodPrefix,
-		&startID, &stoppingUntil, &n.CurrentSerial, &forkedAt, &n.JoinedAt, &reconciledAt, &requestedAt}
+		&startID, &stoppingUntil, &n.CurrentSerial, &forkedAt, &n.JoinedAt, &reconciledAt, &requestedAt,
+		&subnet, &n.MeshPrefix, &n.MeshPublicKey, &n.MeshEndpoint}
 	return targets, func() {
+		if subnet != nil {
+			n.MeshSubnet = int(*subnet)
+		}
 		n.DownSince, n.RemovedAt, n.DrainStartedAt = timeOf(downSince), timeOf(removedAt), timeOf(drainStarted)
 		n.StoppingUntil, n.IdentityForkedAt = timeOf(stoppingUntil), timeOf(forkedAt)
 		n.ReconciledAt, n.ReconcileRequestedAt = timeOf(reconciledAt), timeOf(requestedAt)
@@ -139,22 +153,30 @@ func (s *Store) InsertNode(ctx context.Context, name string) (bool, error) {
 
 // RejoinNode resets a node for a join with a token pinned to its name: the
 // row (inserted if missing, then locked) becomes joined, not removed, not
-// forked, without a current serial or description (draining stays); every
-// earlier certificate of the node is revoked ("rejoined"); ferun_node is
-// sent, so that the old connections close everywhere.
+// forked, without a current serial or description (draining stays), and
+// off the pods' mesh, whose /64 it gets anew (ADR 0017); every earlier
+// certificate of the node is revoked ("rejoined"); ferun_node is sent, so
+// that the old connections close everywhere.
 func (s *Store) RejoinNode(ctx context.Context, name string) error {
 	if _, err := s.InsertNode(ctx, name); err != nil {
 		return err
 	}
-	if _, err := s.LockNode(ctx, name, ForUpdate); err != nil {
+	n, err := s.LockNode(ctx, name, ForUpdate)
+	if err != nil {
 		return err
 	}
 	if _, err := s.q.Exec(ctx, `UPDATE nodes SET status = 'joined', removed_at = NULL, identity_forked_at = NULL,
-		current_serial = '', status_description = '' WHERE name = $1`, name); err != nil {
+		current_serial = '', status_description = '', mesh_subnet = NULL, mesh_prefix = '', mesh_public_key = NULL,
+		mesh_endpoint = '' WHERE name = $1`, name); err != nil {
 		return err
 	}
 	if _, err := s.RevokeNodeCerts(ctx, name, RevokedRejoined, ""); err != nil {
 		return err
+	}
+	if n.MeshPeer() && n.Status != model.NodeRemoved {
+		if _, err := s.bumpMeshPeers(ctx); err != nil {
+			return err
+		}
 	}
 	return s.Notify(ctx, chanNode, name)
 }
@@ -315,9 +337,15 @@ func (s *Store) SetNodeDescription(ctx context.Context, name, description string
 }
 
 // RemoveNode marks a node removed (status, removed_at), revokes every
-// certificate of it ("removed") and sends ferun_node. The caller holds the
-// row FOR UPDATE and has checked the node's sandboxes.
+// certificate of it ("removed") and sends ferun_node. A node on the pods'
+// mesh stops being the others' peer; its /64 is never given out again.
+// The caller holds the row FOR UPDATE and has checked the node's
+// sandboxes.
 func (s *Store) RemoveNode(ctx context.Context, name string) (Node, error) {
+	before, err := s.LockNode(ctx, name, ForUpdate)
+	if err != nil {
+		return Node{}, err
+	}
 	n, err := scanNode(s.q.QueryRow(ctx, `UPDATE nodes SET status = 'removed', removed_at = coalesce(removed_at, now())
 		WHERE name = $1 RETURNING `+nodeCols, name))
 	if err != nil {
@@ -325,6 +353,11 @@ func (s *Store) RemoveNode(ctx context.Context, name string) (Node, error) {
 	}
 	if _, err := s.RevokeNodeCerts(ctx, name, RevokedRemoved, ""); err != nil {
 		return Node{}, err
+	}
+	if before.MeshPeer() && before.Status != model.NodeRemoved {
+		if _, err := s.bumpMeshPeers(ctx); err != nil {
+			return Node{}, err
+		}
 	}
 	return n, s.Notify(ctx, chanNode, name)
 }

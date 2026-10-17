@@ -20,7 +20,7 @@ func TestLoopsList(t *testing.T) {
 	h := newHarness(t)
 	want := map[string]time.Duration{
 		LoopNodeExpiry: 5 * time.Second, LoopReconcileSweep: time.Minute,
-		LoopJoinTokenExpiry: time.Minute, LoopRetention: time.Hour,
+		LoopJoinTokenExpiry: time.Minute, LoopRetention: time.Hour, LoopMeshPeers: 15 * time.Second,
 	}
 	loops := h.s.Loops()
 	if len(loops) != len(want) {

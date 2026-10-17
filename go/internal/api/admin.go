@@ -302,6 +302,11 @@ type nodeInfo struct {
 	ObjectStore   bool            `json:"objectStore"`
 	ObjectStoreID string          `json:"objectStoreId"`
 	PodPrefix     string          `json:"podPrefix"`
+	// MeshPrefix and MeshEndpoint: the node on the pods' mesh (ADR 0017),
+	// its /64 of the cluster's ULA and its WireGuard device's address;
+	// empty off the mesh.
+	MeshPrefix   string `json:"meshPrefix"`
+	MeshEndpoint string `json:"meshEndpoint"`
 	// Connected: to the instance that answers; Connections: its node
 	// connections there, current and draining.
 	Connected      bool   `json:"connected"`
@@ -350,7 +355,8 @@ func (s *server) nodeOf(v nodeView) nodeInfo {
 		SandboxesBooked: v.booked.Count, VcpusBooked: v.booked.VCPUs, MemoryBookedBytes: i64(v.booked.MemoryMiB << 20),
 
 		StartID: startID, Versions: versions, ObjectStore: n.ObjectStore, ObjectStoreID: n.ObjectStoreID,
-		PodPrefix: n.PodPrefix, CertSerial: n.CurrentSerial, CertNotAfter: rfc3339(v.certAfter),
+		PodPrefix: n.PodPrefix, MeshPrefix: n.MeshPrefix, MeshEndpoint: n.MeshEndpoint,
+		CertSerial: n.CurrentSerial, CertNotAfter: rfc3339(v.certAfter),
 		StoppingUntil: rfc3339(n.StoppingUntil), DrainStartedAt: rfc3339(n.DrainStartedAt),
 		IdentityForked: n.Forked(), RemovedAt: rfc3339(n.RemovedAt),
 	}

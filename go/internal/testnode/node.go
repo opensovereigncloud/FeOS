@@ -86,8 +86,17 @@ type Config struct {
 	MemoryBytes uint64
 	DiskBytes   uint64
 	// PodPrefix is the node's IPv6 prefix for pods; a /64 derived from Name
-	// when empty.
+	// when empty. On a mesh the node reports the /64 JoinMesh gave it
+	// instead, once it has one.
 	PodPrefix string
+	// Mesh puts the node on the pods' mesh (ADR 0017), as feosd without
+	// --pod-prefix: it asks JoinMesh on its uplink with a key of its own and
+	// MeshEndpoint, and serves MeshService. Without, MeshService answers
+	// FAILED_PRECONDITION.
+	Mesh bool
+	// MeshEndpoint is the node's endpoint on the mesh; 127.0.0.1 and a port
+	// derived from Name when empty.
+	MeshEndpoint string
 }
 
 // Node is a test node.
@@ -102,6 +111,7 @@ type Node struct {
 	tools     *toolService
 	container *containerService
 	forward   *forwardService
+	mesh      *meshService
 	podPrefix netip.Prefix
 	podsDir   string
 	tmpDir    string // removed when Run returns; "" with a StateDir
@@ -219,6 +229,9 @@ func New(cfg Config) (*Node, error) {
 	n.tools = &toolService{n: n}
 	n.container = &containerService{n: n}
 	n.forward = &forwardService{n: n}
+	if n.mesh, err = newMeshService(n); err != nil {
+		return nil, err
+	}
 	n.podCtx, n.podCancel = context.WithCancel(context.Background())
 	n.newStart()
 	return n, nil

@@ -287,6 +287,7 @@ func (n *Node) uplinkLoop(s *session) {
 	id, renewed := n.identityNow()
 	addrs, changed := n.targets()
 	p.sync(id, addrs)
+	n.mesh.newUplink()
 
 	b := newBackoff(n.backoffMin, n.backoffMax)
 	failed := 0
@@ -374,6 +375,13 @@ func (n *Node) uplinkLoop(s *session) {
 			failed = 0
 			b.reset()
 			n.setInstances(resp.GetInstances())
+			if err := n.mesh.join(ctx, u.client); err != nil && ctx.Err() == nil {
+				if refusal(err) {
+					n.refusedBy(u.addr, err)
+					return
+				}
+				n.rl.warn("mesh", "test node: JoinMesh failed; asking again after the next report", "err", err)
+			}
 			if s := resp.GetIntervalSeconds(); s > 0 {
 				interval = time.Duration(s) * time.Second
 			}
@@ -468,6 +476,9 @@ func (n *Node) telemetry() *fleetv1.Telemetry {
 			Diskd:       Version,
 		},
 		PodPrefix: n.podPrefix.String(),
+	}
+	if p := n.mesh.prefix(); p != "" {
+		t.PodPrefix = p
 	}
 	if store := n.cfg.ObjectStore; store != nil {
 		t.ObjectStore, t.ObjectStoreId = true, store.ID()

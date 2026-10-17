@@ -212,12 +212,20 @@ TABLE nodes
   COLUMN joined_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN reconciled_at timestamp with time zone
   COLUMN reconcile_requested_at timestamp with time zone
+  COLUMN mesh_subnet integer
+  COLUMN mesh_prefix text NOT NULL DEFAULT ''::text
+  COLUMN mesh_public_key bytea
+  COLUMN mesh_endpoint text NOT NULL DEFAULT ''::text
+  CONSTRAINT CHECK (((mesh_subnet >= 1) AND (mesh_subnet <= 65535)))
   CONSTRAINT CHECK ((cpu_overcommit >= (0)::double precision))
   CONSTRAINT CHECK ((mem_headroom_bytes >= 0))
   CONSTRAINT CHECK ((name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'::text))
+  CONSTRAINT CHECK ((octet_length(mesh_public_key) = 32))
   CONSTRAINT CHECK ((slots >= 0))
   CONSTRAINT CHECK ((status = ANY (ARRAY['joined'::text, 'ready'::text, 'down'::text, 'removed'::text])))
   CONSTRAINT PRIMARY KEY (name)
+  CONSTRAINT UNIQUE (mesh_subnet)
+  CREATE UNIQUE INDEX nodes_mesh_subnet_key ON public.nodes USING btree (mesh_subnet)
   CREATE UNIQUE INDEX nodes_pkey ON public.nodes USING btree (name)
 TABLE placements
   COLUMN id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
@@ -230,6 +238,16 @@ TABLE placements
   CONSTRAINT PRIMARY KEY (id)
   CREATE INDEX placements_pod ON public.placements USING btree (pod_id, at)
   CREATE UNIQUE INDEX placements_pkey ON public.placements USING btree (id)
+TABLE pod_network
+  COLUMN id boolean NOT NULL DEFAULT true
+  COLUMN ula cidr NOT NULL
+  COLUMN peers_version bigint NOT NULL DEFAULT 0
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK (((family((ula)::inet) = 6) AND (masklen((ula)::inet) = 48) AND ((ula)::inet << ('fd00::/8'::cidr)::inet)))
+  CONSTRAINT CHECK ((peers_version >= 0))
+  CONSTRAINT CHECK (id)
+  CONSTRAINT PRIMARY KEY (id)
+  CREATE UNIQUE INDEX pod_network_pkey ON public.pod_network USING btree (id)
 TABLE pod_tombstones
   COLUMN pod_id uuid NOT NULL
   COLUMN node text NOT NULL

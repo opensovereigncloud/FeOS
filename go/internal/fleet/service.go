@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,7 +90,10 @@ type Config struct {
 	// ActivityRetention is how long event_gaps rows are kept
 	// (--activity-retention).
 	ActivityRetention time.Duration
-	Log               *slog.Logger
+	// PodNetwork is the cluster's ULA when its pods are on a mesh (ADR
+	// 0017); the zero prefix when its network is routed.
+	PodNetwork netip.Prefix
+	Log        *slog.Logger
 }
 
 // Deps are the parts of the instance fleet works with.
@@ -184,6 +188,8 @@ type Service struct {
 	mu       sync.Mutex
 	notified map[string]time.Time // node → when this instance last sent ferun_reconcile for it
 
+	mesh meshSender // the leader's state of the peers it sent
+
 	unknownEvents atomic.Int64
 }
 
@@ -264,6 +270,10 @@ func (u *uplinkServer) PublishEvents(stream grpc.BidiStreamingServer[fleetv1.Eve
 
 func (u *uplinkServer) IssuePodCredentials(ctx context.Context, req *fleetv1.IssuePodCredentialsRequest) (*fleetv1.IssuePodCredentialsResponse, error) {
 	return u.s.issuePodCredentials(ctx, req)
+}
+
+func (u *uplinkServer) JoinMesh(ctx context.Context, req *fleetv1.JoinMeshRequest) (*fleetv1.JoinMeshResponse, error) {
+	return u.s.joinMesh(ctx, req)
 }
 
 type joinServer struct {

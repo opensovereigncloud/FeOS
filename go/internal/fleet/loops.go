@@ -52,14 +52,16 @@ const (
 const hintNodesDown = "down"
 
 // Loops returns fleet's leader loops: node expiry (5 s), the reconcile
-// sweep (60 s), the join tokens' expiry (60 s) and the retention of
-// node_starts, event_gaps, node_certs and issued_certs (1 h).
+// sweep (60 s), the join tokens' expiry (60 s), the retention of
+// node_starts, event_gaps, node_certs and issued_certs (1 h), and the
+// mesh's peers (15 s, and when a change wakes it).
 func (s *Service) Loops() []leader.Loop {
 	return []leader.Loop{
 		{Name: LoopNodeExpiry, Interval: 5 * time.Second, Run: s.expireNodes},
 		{Name: LoopReconcileSweep, Interval: time.Minute, Run: s.reconcileSweep},
 		{Name: LoopJoinTokenExpiry, Interval: time.Minute, Run: s.expireJoinTokens},
 		{Name: LoopRetention, Interval: time.Hour, Run: s.retention},
+		{Name: LoopMeshPeers, Interval: meshPeersInterval, Run: s.sendMeshPeers},
 	}
 }
 

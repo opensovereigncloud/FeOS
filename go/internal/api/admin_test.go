@@ -231,6 +231,10 @@ func TestNodes(t *testing.T) {
 		ObjectStore: true, ObjectStoreID: "os1", PodPrefix: "fd00::/64"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := e.st.Q().Exec(ctx, `UPDATE nodes SET mesh_subnet = 7, mesh_prefix = 'fd5e:1b2c:93a0:7::/64',
+		mesh_public_key = decode(repeat('ab', 32), 'hex'), mesh_endpoint = '10.0.0.11:51820' WHERE name = 'n1'`); err != nil {
+		t.Fatal(err)
+	}
 	overcommit := 1.5
 	if _, err := e.st.UpdateNodeSettings(ctx, "n1", store.NodeSettings{CPUOvercommit: &overcommit}); err != nil {
 		t.Fatal(err)
@@ -282,7 +286,8 @@ func TestNodes(t *testing.T) {
 		"cpuOvercommit": 1.5, "memAvailBytes": "4294967296", "diskAvailBytes": "53687091200", "load1": 0.5,
 		"sandboxesRunning": 2.0, "sandboxesPaused": 1.0, "inventoryHash": "hash", "downSinceNs": "0",
 		"sandboxesBooked": 1.0, "vcpusBooked": 2.0, "memoryBookedBytes": "536870912", "objectStore": true,
-		"objectStoreId": "os1", "podPrefix": "fd00::/64", "connected": true, "connections": 2.0, "certSerial": "abc123",
+		"objectStoreId": "os1", "podPrefix": "fd00::/64", "meshPrefix": "fd5e:1b2c:93a0:7::/64",
+		"meshEndpoint": "10.0.0.11:51820", "connected": true, "connections": 2.0, "certSerial": "abc123",
 		"certNotAfter": notAfter.Format(time.RFC3339), "identityForked": false, "removedAt": "", "stoppingUntil": "",
 		"drainStartedAt": "", "instanceId": "", "startId": "",
 	}
@@ -300,7 +305,7 @@ func TestNodes(t *testing.T) {
 		}
 	}
 	if n2["vcpusCapacity"] != 0.0 || n2["connected"] != false || n2["connections"] != 0.0 || n2["lastSeenAtNs"] != "0" ||
-		n2["status"] != "joined" {
+		n2["status"] != "joined" || n2["meshPrefix"] != "" || n2["meshEndpoint"] != "" {
 		t.Errorf("n2 %+v", n2)
 	}
 }

@@ -306,3 +306,31 @@ func TestHibernateTimeout(t *testing.T) {
 		t.Fatalf("an instance built in process with no hibernate timeout: %v", err)
 	}
 }
+
+// --pod-network: routed by default, mesh, or a ULA /48 of fd00::/8 without
+// host bits.
+func TestPodNetwork(t *testing.T) {
+	t.Parallel()
+	c, err := Parse([]string{"--database-url", testURL}, env(nil))
+	if err != nil || c.PodNetwork != PodNetworkRouted {
+		t.Fatalf("default %q, %v", c.PodNetwork, err)
+	}
+	for _, ok := range []string{"mesh", "fd5e:1b2c:93a0::/48", "fdff:ffff:ffff::/48"} {
+		c, err := Parse([]string{"--database-url", testURL}, env(map[string]string{"FERUN_POD_NETWORK": ok}))
+		if err != nil || c.PodNetwork != ok {
+			t.Errorf("%q: %q, %v", ok, c.PodNetwork, err)
+		}
+	}
+	for _, bad := range []string{
+		"Mesh", "routed", "fd5e:1b2c:93a0::/64", "fd5e:1b2c:93a0::1/48", "fc00:1:2::/48", "2001:db8:1::/48",
+		"10.0.0.0/8", "fd5e:1b2c:93a0::", "::ffff:10.0.0.0/120",
+	} {
+		if _, err := Parse([]string{"--database-url", testURL, "--pod-network", bad}, env(nil)); err == nil {
+			t.Errorf("%q was taken", bad)
+		}
+	}
+	p, err := ParsePodNetwork("fd5e:1b2c:93a0::/48")
+	if err != nil || p != netip.MustParsePrefix("fd5e:1b2c:93a0::/48") {
+		t.Fatalf("%v %v", p, err)
+	}
+}

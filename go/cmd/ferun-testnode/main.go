@@ -103,6 +103,8 @@ func parse(args []string, getenv func(string) string) (testnode.Config, slog.Lev
 	memory := fs.String("memory", "64GiB", "the memory the node reports")
 	disk := fs.String("disk", "1TiB", "the disk the node reports")
 	podPrefix := fs.String("pod-prefix", "", "the pods' IPv6 prefix; empty: derived from the name")
+	onMesh := fs.Bool("mesh", false, "put the node on the pods' mesh: ask JoinMesh with a key of its own, and serve MeshService")
+	meshEndpoint := fs.String("mesh-endpoint", "", "the node's endpoint on the mesh, address:port; empty: 127.0.0.1 and a port from the name")
 	logLevel := fs.String("log-level", "info", "debug, info, warn or error")
 
 	if err := fs.Parse(args); err != nil {
@@ -154,6 +156,8 @@ func parse(args []string, getenv func(string) string) (testnode.Config, slog.Lev
 		MemoryBytes:   memBytes,
 		DiskBytes:     diskBytes,
 		PodPrefix:     *podPrefix,
+		Mesh:          *onMesh,
+		MeshEndpoint:  *meshEndpoint,
 	}
 	switch {
 	case *objectStore != "" && *objectStoreDir != "":

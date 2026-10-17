@@ -39,6 +39,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -57,6 +58,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/fleet"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/mcpsrv"
+	"github.com/ironcore-dev/feos/go/internal/mesh"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/pki"
@@ -132,6 +134,9 @@ type Instance struct {
 	Bindings  *bindings.Service
 	streams   Streams
 	handler   http.Handler
+	// podNetwork is the cluster's ULA when it is meshed (ADR 0017), from
+	// the migration's bootstrap.
+	podNetwork netip.Prefix
 
 	httpLn  net.Listener
 	httpSrv *http.Server
@@ -259,7 +264,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	fl = fleet.New(fleet.Config{
 		InstanceID: i.id, TrustDomain: cfg.TrustDomain, NodeCertTTL: cfg.NodeCertTTL, PodCertTTL: cfg.PodCertTTL,
 		RolloutGrace: cfg.RolloutGrace, NodeTTL: cfg.NodeTTL, ConnDrainTimeout: cfg.ConnDrainTimeout,
-		ActivityRetention: cfg.ActivityRetention, Log: i.log,
+		ActivityRetention: cfg.ActivityRetention, PodNetwork: i.podNetwork, Log: i.log,
 	}, fleet.Deps{DB: i.DB, Store: i.Store, Issuer: i.Issuer, Links: i.Links, Hooks: i.Engine, Bindings: i.Bindings,
 		Activity: i.Activity, Elector: i.Elector})
 	i.Fleet = fl
@@ -312,9 +317,13 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	return i, nil
 }
 
-// bootstrap is the migration's bootstrap: with --bootstrap-token, the
-// tenant "operator" with that token, while no tenant exists.
+// bootstrap is the migration's bootstrap: the cluster's pod network, and
+// with --bootstrap-token the tenant "operator" with that token, while no
+// tenant exists.
 func (i *Instance) bootstrap(ctx context.Context, tx pgx.Tx) error {
+	if err := i.bootstrapPodNetwork(ctx, store.On(tx)); err != nil {
+		return err
+	}
 	if i.cfg.BootstrapToken == "" {
 		return nil
 	}
@@ -325,6 +334,47 @@ func (i *Instance) bootstrap(ctx context.Context, tx pgx.Tx) error {
 	if created {
 		i.log.Info("bootstrapped the tenant operator with the bootstrap token")
 	}
+	return nil
+}
+
+// bootstrapPodNetwork reconciles --pod-network with the database's
+// (ADR 0017): mesh draws the ULA unless the database has one, and keeps
+// it; a /48 is kept unless the database has another. A database that is
+// meshed does not become routed, nor another mesh, by a flag: the nodes'
+// addresses are of its ULA.
+func (i *Instance) bootstrapPodNetwork(ctx context.Context, st *store.Store) error {
+	i.podNetwork = netip.Prefix{}
+	have, meshed, err := st.PodNetwork(ctx)
+	if err != nil {
+		return fmt.Errorf("read the pod network: %w", err)
+	}
+	want := i.cfg.PodNetwork
+	switch {
+	case want == config.PodNetworkRouted && meshed:
+		return fmt.Errorf("the database's cluster is meshed on %s, and --pod-network is empty (routed): set it to mesh or %s",
+			have, have)
+	case want == config.PodNetworkRouted:
+		return nil
+	case meshed && want != config.PodNetworkMesh && want != have.String():
+		return fmt.Errorf("the database's cluster is meshed on %s, not on --pod-network %s", have, want)
+	case meshed:
+		i.podNetwork = have
+		return nil
+	}
+	var ula netip.Prefix
+	if want == config.PodNetworkMesh {
+		ula, err = mesh.Draw()
+	} else {
+		ula, err = config.ParsePodNetwork(want)
+	}
+	if err != nil {
+		return fmt.Errorf("--pod-network: %w", err)
+	}
+	if err := st.InsertPodNetwork(ctx, ula); err != nil {
+		return fmt.Errorf("keep the pod network: %w", err)
+	}
+	i.log.Info("the pods are on the mesh of a new ULA", "pod_network", ula.String())
+	i.podNetwork = ula
 	return nil
 }
 
