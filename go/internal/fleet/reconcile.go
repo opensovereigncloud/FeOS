@@ -75,6 +75,17 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
+// rolloutDeadline turns the rollout grace a node has left, as the
+// database measured it, into a deadline on this instance's clock for
+// nodelink: zero when none is left. So the database's clock decides when
+// the grace ends, whatever this instance's clock reads.
+func (s *Service) rolloutDeadline(left time.Duration) time.Time {
+	if left <= 0 {
+		return time.Time{}
+	}
+	return s.now().Add(left)
+}
+
 // refreshNode reloads a node's rollout deadline and re-checks its
 // connections, in the background, coalesced per node.
 func (s *Service) refreshNode(node string) {
@@ -83,11 +94,11 @@ func (s *Service) refreshNode(node string) {
 	}
 	s.coalesce(&s.refreshes, node, func(ctx context.Context) {
 		qctx, cancel := context.WithTimeout(ctx, rpcTimeout)
-		n, err := s.st.GetNode(qctx, node)
+		left, err := s.st.NodeStoppingFor(qctx, node)
 		cancel()
 		switch {
 		case err == nil:
-			s.links.SetStoppingUntil(node, n.StoppingUntil)
+			s.links.SetStoppingUntil(node, s.rolloutDeadline(left))
 		case !errors.Is(err, store.ErrNoRow):
 			s.rl.warn("refresh", "cannot reload a node's rollout deadline", "node", node, "err", err)
 		}
@@ -104,13 +115,13 @@ func (s *Service) refreshAll() {
 	}
 	s.coalesce(&s.refreshes, allKey, func(ctx context.Context) {
 		qctx, cancel := context.WithTimeout(ctx, rpcTimeout)
-		nodes, err := s.st.ListNodes(qctx)
+		left, err := s.st.NodesStoppingFor(qctx)
 		cancel()
 		if err != nil {
 			s.rl.warn("refresh", "cannot reload the nodes' rollout deadlines", "err", err)
 		}
-		for _, n := range nodes {
-			s.links.SetStoppingUntil(n.Name, n.StoppingUntil)
+		for node, d := range left {
+			s.links.SetStoppingUntil(node, s.rolloutDeadline(d))
 		}
 		s.links.RecheckAll(ctx)
 		for _, node := range s.links.Nodes() {

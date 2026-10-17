@@ -175,6 +175,9 @@ type Service struct {
 	// The inputs of node expiry's health gate; tests replace them.
 	leadingSince func() time.Time
 	lastFailure  func() time.Time
+	// now is this instance's clock, which turns a node's rollout grace
+	// into a deadline for nodelink (time.Now); tests skew it.
+	now func() time.Time
 	// expiryBatch is the most nodes one transaction of node expiry marks
 	// down (fencedBatch; tests make it smaller).
 	expiryBatch int
@@ -235,6 +238,7 @@ func New(cfg Config, deps Deps) *Service {
 		presents:     make(chan struct{}, maxPresentations),
 		leadingSince: func() time.Time { return time.Time{} },
 		lastFailure:  deps.DB.LastFailure,
+		now:          time.Now,
 		expiryBatch:  fencedBatch,
 		notified:     map[string]time.Time{},
 	}

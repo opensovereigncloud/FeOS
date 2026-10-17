@@ -493,7 +493,11 @@ func (s *Server) closeIfIdle(l *link) {
 func (s *Server) uplinkClosed(l *link) { s.closeLink(l, "connection closed") }
 
 // SetStoppingUntil holds a node's rollout deadline (§4): Conn and
-// WaitConnected wait for the node up to it. The zero time clears it.
+// WaitConnected wait for the node up to it. The zero time clears it. until
+// is on this instance's clock, compared with time.Now: fleet makes it from
+// the grace the node has left by the database's clock (time.Now().Add of
+// it), never from stopping_until itself, so that the instance's offset
+// from the database moves nothing.
 func (s *Server) SetStoppingUntil(node string, until time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -324,9 +324,13 @@ One TLS 1.3 listener, routed strictly by ALPN:
 - **Calls to a node.** `Conn` returns the current connection; without one
   it waits up to `--node-wait`, or up to the node's rollout deadline when
   it announced a restart, then fails with `UNAVAILABLE` "node <n> is not
-  connected to instance <i>". A lost connection is what tells an instance
-  to fail calls for the node fast; it changes nothing in the database. A
-  call into a pod's guest carries `feos-pod-id`.
+  connected to instance <i>". The rollout deadline is the grace the
+  database measures as left (`stopping_until - now()`) when the instance
+  reloads it, counted from then on the instance's monotonic clock: an
+  instance whose clock is off the database's waits as long as one whose
+  clock is not. A lost connection is what tells an instance to fail calls
+  for the node fast; it changes nothing in the database. A call into a
+  pod's guest carries `feos-pod-id`.
 - **Stream budgets**, per connection, of `--node-max-streams` N: long
   streams (exec, watch, port forward, console, traffic records, host
   streams) at most N/2, unary tool calls at most N/4; beyond them a call
@@ -480,10 +484,11 @@ row is never deleted: removal is a status. Its statuses: `joined`, `ready`
   the stream with `UNAVAILABLE` and acknowledges nothing. Pod events go to
   `activity`, audit records too (source `authn`), traffic records to
   `traffic_records`, node events (`started`, `stopping`) to `activity`; a
-  `stopping` sets the node's rollout deadline, `--rollout-grace` ahead,
-  during which calls wait for it. A record about a pod is attributed to
-  its sandbox only when the pod is or was on that node; otherwise it is
-  kept for the node's audit as foreign, and a partial index of the foreign
+  `stopping` sets the node's rollout deadline, `--rollout-grace` ahead
+  on the database clock, during which calls wait for it ([calls to a
+  node](#the-nodes-port)). A record about a pod is attributed to its
+  sandbox only when the pod is or was on that node; otherwise it is kept
+  for the node's audit as foreign, and a partial index of the foreign
   records serves the node's activity a page at a time.
 - **Pods' credentials.** `IssuePodCredentials` issues a pod's certificate
   when the sandbox is placed on the asking node and has a run there

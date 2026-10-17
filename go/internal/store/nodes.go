@@ -248,6 +248,37 @@ func (s *Store) SetNodeStopping(ctx context.Context, name string, grace time.Dur
 	return until, s.Notify(ctx, chanNode, name)
 }
 
+// stoppingFor is a node's rollout grace still ahead, in microseconds on
+// the database clock: 0 when there is none, or it passed.
+const stoppingFor = "(extract(epoch FROM greatest(coalesce(stopping_until, now()) - now(), interval '0')) * 1000000)::bigint"
+
+// NodeStoppingFor returns how much of node's rollout grace lies ahead, on
+// the database clock: 0 when it announced no restart, or the grace
+// passed. An instance waits for the node that long by its own monotonic
+// clock, so that its clock's offset from the database's never moves the
+// end of the grace. ErrNoRow if there is no such node.
+func (s *Store) NodeStoppingFor(ctx context.Context, name string) (time.Duration, error) {
+	var us int64
+	err := s.q.QueryRow(ctx, "SELECT "+stoppingFor+" FROM nodes WHERE name = $1", name).Scan(&us)
+	return time.Duration(us) * time.Microsecond, noRow(err, ErrNoRow)
+}
+
+// NodesStoppingFor returns NodeStoppingFor of every node, 0 included.
+func (s *Store) NodesStoppingFor(ctx context.Context) (map[string]time.Duration, error) {
+	rows, err := s.q.Query(ctx, "SELECT name, "+stoppingFor+" FROM nodes")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]time.Duration{}
+	var name string
+	var us int64
+	_, err = pgx.ForEachRow(rows, []any{&name, &us}, func() error {
+		out[name] = time.Duration(us) * time.Microsecond
+		return nil
+	})
+	return out, err
+}
+
 // StoppingUntil returns every node's stopping_until that lies ahead.
 func (s *Store) StoppingUntil(ctx context.Context) (map[string]time.Time, error) {
 	rows, err := s.q.Query(ctx, "SELECT name, stopping_until FROM nodes WHERE stopping_until > now()")

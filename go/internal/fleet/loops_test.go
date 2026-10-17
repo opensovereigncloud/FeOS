@@ -253,15 +253,22 @@ func TestRunFollowsNodeAndReconcileNotifications(t *testing.T) {
 	h.joined("n1")
 	h.joined("n2")
 	h.links.setConnected("n1", true)
+	// This instance's clock runs an hour ahead of the database's. The
+	// rollout deadline nodelink gets still lies the grace the node has
+	// left ahead of it: the database's clock decides when the grace ends.
+	h.s.now = func() time.Time { return time.Now().Add(time.Hour) }
+	graceLeft := func(at time.Time, want time.Duration) bool {
+		left := at.Sub(h.s.now())
+		return left > want-5*time.Second && left <= want
+	}
 	runService(t, h)
 
 	// ferun_node: the rollout deadline is reloaded and the connections
 	// re-checked.
 	h.exec("UPDATE nodes SET stopping_until = now() + interval '30 seconds' WHERE name = 'n1'")
-	until := h.node("n1").StoppingUntil
 	h.notifyUntil(db.ChanNode, "n1", "the re-check of n1", func() bool {
 		rechecks, _, stopping := h.links.snapshot()
-		return contains(rechecks, "n1") && stopping["n1"].Equal(until)
+		return contains(rechecks, "n1") && graceLeft(stopping["n1"], 30*time.Second)
 	})
 	h.exec("UPDATE nodes SET stopping_until = NULL WHERE name = 'n1'")
 	h.notifyUntil(db.ChanNode, "n1", "the cleared deadline", func() bool {
@@ -286,12 +293,11 @@ func TestRunFollowsNodeAndReconcileNotifications(t *testing.T) {
 	// reconciled.
 	h.allowReconcile("n1")
 	h.exec("UPDATE nodes SET stopping_until = now() + interval '20 seconds' WHERE name = 'n2'")
-	until2 := h.node("n2").StoppingUntil
 	h.exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
 		WHERE application_name = 'ferund-listener' AND datname = current_database()`)
 	waitFor(t, "RecheckAll", 10*time.Second, func() bool {
 		_, all, stopping := h.links.snapshot()
-		return all > 0 && stopping["n2"].Equal(until2)
+		return all > 0 && graceLeft(stopping["n2"], 20*time.Second)
 	})
 	h.expectReconcile("n1")
 	h.expectNoReconcile()
