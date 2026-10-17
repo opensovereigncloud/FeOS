@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 const SQUASHFS_MEDIA_TYPE: &str = "application/vnd.ironcore.image.squashfs.v1alpha1.squashfs";
 const INITRAMFS_MEDIA_TYPE: &str = "application/vnd.ironcore.image.initramfs.v1alpha1.initramfs";
@@ -157,7 +157,7 @@ pub async fn pull_image(image_ref: &str, dest: &Path) -> Result<Pulled, ImageSer
     }
 
     // Start every fetch except a leading tar layer, which streams.
-    let semaphore = Arc::new(Semaphore::new(PREFETCH));
+    let mut slots = Slots::new(PREFETCH);
     let mut fetches = Vec::with_capacity(kinds.len());
     for (index, (layer, kind)) in manifest.layers.iter().zip(&kinds).enumerate() {
         let path = match kind {
@@ -176,12 +176,9 @@ pub async fn pull_image(image_ref: &str, dest: &Path) -> Result<Pulled, ImageSer
             let client = client.clone();
             let reference = reference.clone();
             let layer = layer.clone();
-            let semaphore = semaphore.clone();
+            let slot = slots.next();
             tokio::spawn(async move {
-                let permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| ImageServiceError::Internal(e.to_string()))?;
+                let permit = slot.await?;
                 fetch_to_file(&client, &reference, &layer, &path).await?;
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 Ok::<(u64, OwnedSemaphorePermit), ImageServiceError>((size, permit))
@@ -223,6 +220,47 @@ pub async fn pull_image(image_ref: &str, dest: &Path) -> Result<Pulled, ImageSer
         config: config.into_bytes(),
         size_bytes,
     })
+}
+
+/// Hands out the [`PREFETCH`] slots in layer order. [`pull_image`] frees a
+/// slot once it applied the slot's layer, so in layer order too; fetches
+/// that raced for the slots could take them all for later layers, leaving
+/// none for the layer it waits for, and the pull would hang without a
+/// transfer for the stall guard to catch.
+struct Slots {
+    semaphore: Arc<Semaphore>,
+    turn: Option<oneshot::Receiver<()>>,
+}
+
+impl Slots {
+    fn new(slots: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(slots)),
+            turn: None,
+        }
+    }
+
+    /// The slot of the next layer, taken only after that of the layer
+    /// before (or once its fetch ended without one).
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<OwnedSemaphorePermit, ImageServiceError>> + Send + use<>
+    {
+        let semaphore = self.semaphore.clone();
+        let (taken, next) = oneshot::channel();
+        let before = self.turn.replace(next);
+        async move {
+            if let Some(before) = before {
+                let _ = before.await;
+            }
+            let permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|e| ImageServiceError::Internal(e.to_string()))?;
+            let _ = taken.send(());
+            Ok(permit)
+        }
+    }
 }
 
 async fn join(
@@ -490,6 +528,27 @@ mod tests {
         assert!(pulled.size_bytes > 0);
         assert!(dest.path().join("rootfs/bin/busybox").is_file());
         assert!(!dest.path().join("layer.1.blob").exists());
+    }
+
+    /// Slots go to the layers in order, whichever fetch asks first: a later
+    /// layer that asked first must not take the slot an earlier one needs.
+    #[tokio::test]
+    async fn slots_go_to_the_layers_in_order() {
+        let mut slots = Slots::new(2);
+        let (first, second, third) = (slots.next(), slots.next(), slots.next());
+        let third = tokio::spawn(third);
+        let second = tokio::spawn(second);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!second.is_finished() && !third.is_finished());
+
+        let first = first.await.unwrap();
+        let second = second.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!third.is_finished());
+
+        drop(first);
+        drop(third.await.unwrap().unwrap());
+        drop(second);
     }
 
     #[test]
