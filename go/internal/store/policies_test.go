@@ -42,6 +42,7 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 	elsewhere := mkSandbox(t, s, "acme")
 	onRemoved := mkSandbox(t, s, "acme")
 	onDownRemoved := mkSandbox(t, s, "acme")
+	neverSeen := mkSandbox(t, s, "acme")
 	place(t, s, running.ID, "n1", model.StateRunning)
 	place(t, s, paused.ID, "n1", model.StatePaused)
 	place(t, s, withOp.ID, "n1", model.StateResuming)
@@ -50,6 +51,11 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 	place(t, s, elsewhere.ID, "n2", model.StateRunning)
 	place(t, s, onRemoved.ID, "n3", model.StateRunning)
 	place(t, s, onDownRemoved.ID, "n4", model.StatePaused)
+	// Each of these had its pod seen on its node; neverSeen's first create
+	// is under way there.
+	exec(t, s, "UPDATE sandboxes SET materialised = true WHERE id <> $1", neverSeen.ID)
+	place(t, s, neverSeen.ID, "n1", model.StateCreating)
+	must(t, s.UpsertBooking(bg, store.Booking{PodID: neverSeen.ID, Node: "n1", VCPUs: 2, MemoryMiB: 512, Gated: true}))
 	exec(t, s, `UPDATE sandboxes SET checkpoint_head = 'head-4', checkpoint_epoch = 1,
 		checkpoint_at = '2026-01-01T00:00:00Z' WHERE id = $1`, onDownRemoved.ID)
 	exec(t, s, "UPDATE sandboxes SET checkpoint_head = 'head-1', checkpoint_epoch = 1, checkpoint_at = now() WHERE id = $1", paused.ID)
@@ -72,7 +78,7 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 		swept, err = tx.DownSweep(bg, 256)
 		return err
 	})
-	want := []uuid.UUID{running.ID, paused.ID, onRemoved.ID, onDownRemoved.ID}
+	want := []uuid.UUID{running.ID, paused.ID, onRemoved.ID, onDownRemoved.ID, neverSeen.ID}
 	slices.SortFunc(want, func(a, b uuid.UUID) int { return strings.Compare(a.String(), b.String()) })
 	if !slices.Equal(swept, want) {
 		t.Fatalf("swept %v, want %v", swept, want)
@@ -122,8 +128,9 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 	}
 	exec(t, s, "UPDATE nodes SET down_since = now() - interval '2 hours' WHERE name = 'n1'")
 	exec(t, s, "UPDATE sandboxes SET run_id = 'run-1' WHERE id = $1", running.ID)
+	exec(t, s, "UPDATE sandboxes SET pending_since = now() WHERE id = $1", neverSeen.ID)
 	lost, err = s.LostGrace(bg, time.Hour, 256)
-	if err != nil || len(lost) != 2 {
+	if err != nil || len(lost) != 3 {
 		t.Fatalf("lost grace on n1 %+v %v", lost, err)
 	}
 	for _, l := range lost {
@@ -136,9 +143,24 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 			if l.State != model.StateHibernated {
 				t.Fatalf("paused with a checkpoint → %+v", l)
 			}
+		case neverSeen.ID:
+			if l.State != model.StatePending || l.Node != "n1" {
+				t.Fatalf("never seen → %+v", l)
+			}
 		default:
 			t.Fatalf("unexpected %+v", l)
 		}
+	}
+	// A sandbox whose pod was never seen lost nothing: pending, without a
+	// node, created on its next use.
+	ns := get(t, s, neverSeen.ID)
+	if ns.ClientState != model.StatePending || ns.Node != "" || ns.LostFrom != "" || ns.Materialised ||
+		!ns.PendingSince.IsZero() || !strings.HasPrefix(ns.StatusDescription, "node n1 down since ") ||
+		!strings.HasSuffix(ns.StatusDescription, "; its pod was never seen there; created on the next use") {
+		t.Fatalf("never seen %+v", ns)
+	}
+	if _, err := s.GetBooking(bg, neverSeen.ID); !errors.Is(err, store.ErrNoRow) {
+		t.Fatal("lost grace kept the booking of a pending sandbox")
 	}
 	r = get(t, s, running.ID)
 	if r.Node != "n1" || r.LostFrom != "n1" || r.StatusDescription == "" {

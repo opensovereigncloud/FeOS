@@ -576,36 +576,48 @@ func (s *Store) DownSweep(ctx context.Context, limit int) ([]uuid.UUID, error) {
 type LostRow struct {
 	ID       uuid.UUID
 	Owner    string
-	Node     string
-	State    string // model.StateHibernated or model.StateLost
+	Node     string // the node that went down
+	State    string // model.StateHibernated, model.StateLost or model.StatePending
 	RunID    string // the run still open, for the caller to close
 	Previous string // the description before
 }
 
 // LostGrace resolves up to limit unknown sandboxes without an op on a node
-// that is down for longer than grace, or removed: with a checkpoint to
-// hibernated, else to lost; lost_from = node, node kept, gen + 1, "node
-// <n> down since <t>[; restored from the checkpoint of <checkpoint_at> on
-// the next use]". Their bookings and process holds are deleted (both
-// states end the pod's use of the node and its processes); no tombstone is
-// written. Rows locked by others are skipped. It returns the rows and
-// notifies them.
+// that is down for longer than grace, or removed, gen + 1, "node <n> down
+// since <t>…": with a checkpoint to hibernated ("; restored from the
+// checkpoint of <checkpoint_at> on the next use"), else, when a pod of
+// theirs was seen there (materialised), to lost; both keep the node and
+// set lost_from = node. One whose pod was never seen (a first create whose
+// outcome its node took down with it) has nothing to lose and becomes
+// pending without a node ("; its pod was never seen there; created on the
+// next use"), as a sync makes of a pod that is not found; a pod the node
+// still has when it returns belongs to no row there, and reconcile
+// tombstones it. pending_since is cleared. Their bookings and process
+// holds are deleted (these states end the pod's use of the node and its
+// processes); no tombstone is written. Rows locked by others are skipped.
+// It returns the rows and notifies them.
 func (s *Store) LostGrace(ctx context.Context, grace time.Duration, limit int) ([]LostRow, error) {
 	rows, err := s.q.Query(ctx, `WITH c AS (
 			SELECT s.id FROM sandboxes s JOIN nodes n ON n.name = s.node
 			WHERE s.client_state = 'unknown' AND s.op = ''
 				AND (n.status = 'removed' OR (n.status = 'down' AND n.down_since < now() - $1::interval))
 			ORDER BY s.id LIMIT $2 FOR UPDATE OF s SKIP LOCKED),
-		old AS (SELECT s.id, s.status_description FROM sandboxes s JOIN c ON c.id = s.id)
+		old AS (SELECT s.id, s.node, s.status_description,
+				s.checkpoint_head <> '' AS checkpoint, s.checkpoint_head <> '' OR s.materialised AS kept
+			FROM sandboxes s JOIN c ON c.id = s.id)
 		UPDATE sandboxes s SET
-			client_state = CASE WHEN s.checkpoint_head <> '' THEN 'hibernated' ELSE 'lost' END,
-			lost_from = s.node,
+			client_state = CASE WHEN old.checkpoint THEN 'hibernated' WHEN old.kept THEN 'lost' ELSE 'pending' END,
+			node = CASE WHEN old.kept THEN s.node END,
+			lost_from = CASE WHEN old.kept THEN s.node END,
+			pending_since = NULL,
 			status_description = 'node ' || n.name || ' down since ' || `+nodeDownSince+`
-				|| CASE WHEN s.checkpoint_head <> '' THEN '; restored from the checkpoint of '
-					|| `+rfc3339("coalesce(s.checkpoint_at, now())")+` || ' on the next use' ELSE '' END,
+				|| CASE WHEN old.checkpoint THEN '; restored from the checkpoint of '
+					|| `+rfc3339("coalesce(s.checkpoint_at, now())")+` || ' on the next use'
+				WHEN old.kept THEN ''
+				ELSE '; its pod was never seen there; created on the next use' END,
 			gen = s.gen + 1, updated_at = now()
 		FROM c, nodes n, old WHERE s.id = c.id AND old.id = s.id AND n.name = s.node
-		RETURNING s.id, s.owner, s.node, s.client_state, s.run_id, old.status_description`, interval(grace), limit)
+		RETURNING s.id, s.owner, old.node, s.client_state, s.run_id, old.status_description`, interval(grace), limit)
 	if err != nil {
 		return nil, err
 	}

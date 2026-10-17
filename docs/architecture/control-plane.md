@@ -222,7 +222,7 @@ audit is its activity row.
 | join-token expiry, fleet retention | 60 s, 1 h | expired join tokens; old feosd starts, event gaps, node and pod certificates |
 | mesh peers | 15 s | sends every node on the pods' mesh that the leader is connected to its peers ([The pods' mesh](#the-pods-mesh)) |
 | down sweep | 5 s | sandboxes of down and removed nodes become `unknown` |
-| lost grace | 30 s | `unknown` sandboxes of nodes down past `--lost-grace` become `hibernated` or `lost` |
+| lost grace | 30 s | `unknown` sandboxes of nodes down past `--lost-grace` become `hibernated`, `lost`, or `pending` when their pod was never seen |
 | idle pause | 1 s | pauses running sandboxes idle for `--idle-pause`, unless a failed pause backs off |
 | hibernate-after | 5 s | hibernates sandboxes paused for `--hibernate-after`, unless a failed hibernation backs off |
 | drain | 5 s | moves sandboxes off draining nodes |
@@ -552,7 +552,7 @@ that is not ours.
 
 | State | Booked | Means |
 |---|---|---|
-| `pending` | no | no pod yet, or a create failed before the pod existed |
+| `pending` | no | no pod yet, a create failed before the pod existed, or its node went down before its pod was ever seen |
 | `creating` | yes | a create, start, restore or repair runs, or the pod was seen pending |
 | `running` | yes | the pod runs |
 | `pausing` | yes | a suspend runs |
@@ -562,7 +562,7 @@ that is not ours.
 | `hibernated` | no | in the object store; brought back with a restore, on any node of the same store |
 | `stopped`, `failed` | no | the pod stopped or failed; the description says why |
 | `unknown` | as before | the truth is not known: the node is down, or an op was released; a sync or the lost grace resolves it |
-| `lost` | no | the pod is gone and there is no checkpoint, or it went down with its node; until deleted, unless its node returns with the pod |
+| `lost` | no | the pod that ran is gone and there is no checkpoint, or it went down with its node; until deleted, unless its node returns with the pod |
 
 **Bookings follow resource use.** Every write of a state books the pod's
 size on its node or frees it, as the table says. An op's admission books
@@ -798,20 +798,24 @@ that ID on that node. Tombstones of removed nodes are dropped.
 The down sweep marks the sandboxes of down and removed nodes `unknown`,
 leaving those with an op in flight to the op. After `--lost-grace` they
 become `hibernated` (with a checkpoint, restored elsewhere on the next
-use) or `lost`; no tombstone is written, since the pod may still run, and
-a returning node's pod is adopted. Idle pause, hibernate-after, drain and
-repair begin ops as their triggers. A drain hibernates what is paused,
-and pauses and hibernates what runs without execs; a forward does not
-keep a sandbox, since the port door closes its upgraded connections, a
-preview's WebSocket among them, once the sandbox leaves running, and
-their clients reconnect to where it runs next. A call for a sandbox on a
-draining node starts nothing there: it waits until the sandbox has
-moved. After `--drain-timeout`, minutes after the drain's start, the
-execs that still run are cancelled and the rest moves regardless. A
-sandbox that ran is restored on another node as soon as its hibernation
-is done, where the calls that waited go on; without room elsewhere it
-stays hibernated until its next use. A resume never abandons a drain's
-hibernation. A node without an object store cannot be drained.
+use), `lost` (their pod was seen there), or `pending` without a node when
+their pod was never seen there, as after a first create whose outcome
+the node took down with it: nothing ran, so nothing is lost, and the
+next use creates the sandbox. No tombstone is written, since the pod may
+still run: a returning node's pod is adopted, or tombstoned by reconcile
+when its sandbox is pending or placed elsewhere by then. Idle pause,
+hibernate-after, drain and repair begin ops as their triggers. A drain
+hibernates what is paused, and pauses and hibernates what runs without
+execs; a forward does not keep a sandbox, since the port door closes its
+upgraded connections, a preview's WebSocket among them, once the sandbox
+leaves running, and their clients reconnect to where it runs next. A call
+for a sandbox on a draining node starts nothing there: it waits until the
+sandbox has moved. After `--drain-timeout`, minutes after the drain's
+start, the execs that still run are cancelled and the rest moves
+regardless. A sandbox that ran is restored on another node as soon as its
+hibernation is done, where the calls that waited go on; without room
+elsewhere it stays hibernated until its next use. A resume never abandons
+a drain's hibernation. A node without an object store cannot be drained.
 
 An idle pause that leaves the pod running, and a hibernate-after that
 leaves it suspended, back their own policy off, so that a node that

@@ -129,9 +129,11 @@ func (e *Engine) downSweep(ctx context.Context) error {
 }
 
 // lostGrace resolves the unknown sandboxes of nodes down for longer than
-// the lost grace, or removed: hibernated with a checkpoint, else lost;
+// the lost grace, or removed: hibernated with a checkpoint, else lost, or
+// pending without a node when their pod was never seen (store.LostGrace);
 // their bookings and process holds go, their runs close. No tombstone: the
-// pod may still run there, and a returning node's pod is adopted.
+// pod may still run there, and a returning node's pod is adopted (one of a
+// pending sandbox is tombstoned by reconcile).
 func (e *Engine) lostGrace(ctx context.Context) error {
 	for {
 		var lost []store.LostRow

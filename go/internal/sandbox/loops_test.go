@@ -138,6 +138,52 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 	wantState(t, h.row(running.ID), model.StateLost)
 }
 
+// A first create whose node went down with its outcome leaves a sandbox
+// whose pod was never seen: lost grace makes it pending, not lost, and its
+// next use creates it elsewhere. The pod the node holds when it returns
+// belongs to no row there, and is tombstoned.
+func TestLostGraceNeverSeen(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.LostGrace = time.Minute })
+	n1 := h.addNode("n1")
+	e := h.eng()
+	sb := h.sandbox(512)
+	h.exec(`UPDATE sandboxes SET client_state = 'unknown', node = 'n1', image_ref = $2, gen = gen + 1,
+		status_description = 'create on node n1: outcome unknown (the node did not answer)' WHERE id = $1`, sb.ID, testImage)
+	row := h.row(sb.ID)
+	if row.Materialised {
+		t.Fatal("materialised")
+	}
+	// The create made the pod after all.
+	if _, err := h.pods("n1").CreatePod(bg, &podv1.CreatePodRequest{PodId: sb.ID.String(), Spec: podSpec(row)}); err != nil {
+		t.Fatal(err)
+	}
+	n1.Partition(true)
+	eventually(t, 10*time.Second, "n1 disconnected", func() bool { return !h.ins[0].srv.Connected("n1") })
+	h.exec("UPDATE nodes SET status = 'down', down_since = now() - interval '2 minutes' WHERE name = 'n1'")
+	if err := e.lostGrace(bg); err != nil {
+		t.Fatal(err)
+	}
+	r := h.row(sb.ID)
+	wantState(t, r, model.StatePending)
+	if r.Node != "" || r.LostFrom != "" || !strings.HasSuffix(r.StatusDescription, "; its pod was never seen there; created on the next use") {
+		t.Fatalf("after lost grace %+v", r)
+	}
+	h.activityNamed(sb.ID, "sandbox_state", "unknown → pending")
+	// Its next use creates it on another node.
+	h.addNode("n2")
+	if lease := h.ensure(sb.ID); lease.Node != "n2" {
+		t.Fatalf("created on %s", lease.Node)
+	}
+	// n1 returns with the pod: it is tombstoned and deleted.
+	n1.Partition(false)
+	eventually(t, 10*time.Second, "n1 back", func() bool { return h.ins[0].srv.Connected("n1") })
+	if err := e.ReconcileNode(bg, "n1"); err != nil {
+		t.Fatal(err)
+	}
+	h.noPod("n1", sb.ID)
+	wantState(t, h.row(sb.ID), model.StateRunning)
+}
+
 func TestIdlePauseLoop(t *testing.T) {
 	h := newHarness(t, func(c *Config) { c.IdlePause = 50 * time.Millisecond })
 	h.addNode("n1")
