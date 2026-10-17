@@ -32,6 +32,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -143,6 +144,8 @@ type Instance struct {
 
 	httpLn  net.Listener
 	httpSrv *http.Server
+	// front is the front doors' certificate (--tls-cert); nil: plain HTTP.
+	front *frontCert
 
 	// started is set when Run starts; Ready reads it from other
 	// goroutines.
@@ -168,9 +171,10 @@ type startTimes struct {
 	mono time.Time
 }
 
-// New builds an instance: it opens and migrates the database (and
-// bootstraps the operator tenant), loads the issuer, and binds the front
-// doors' and the nodes' listeners. Nothing serves before Run.
+// New builds an instance: it loads the front doors' certificate (with
+// --tls-cert) and the issuer, opens and migrates the database (and
+// bootstraps the operator tenant), and binds the front doors' and the
+// nodes' listeners. Nothing serves before Run.
 func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance, err error) {
 	if log == nil {
 		log = slog.Default()
@@ -191,6 +195,11 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.log = log.With("instance", i.id)
 
 	// What can fail without side effects first.
+	if cfg.TLSCert != "" {
+		if i.front, err = loadFrontCert(cfg.TLSCert, cfg.TLSKey, i.log); err != nil {
+			return nil, err
+		}
+	}
 	var key []byte
 	if cfg.SecretKeyFile != "" {
 		if key, err = readSecretKey(cfg.SecretKeyFile); err != nil {
@@ -312,6 +321,9 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 		Handler:           accessLog(i.handler, i.log),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ErrorLog:          slog.NewLogLogger(i.log.Handler(), slog.LevelDebug),
+	}
+	if i.front != nil {
+		i.httpSrv.TLSConfig = &tls.Config{GetCertificate: i.front.GetCertificate}
 	}
 	if i.streams.OnShutdown != nil {
 		i.httpSrv.RegisterOnShutdown(i.streams.OnShutdown)
@@ -580,6 +592,9 @@ func (i *Instance) run(ctx context.Context) error {
 	start(&lifeWG, "tools", life, i.Runner.Run, false)
 	start(&lifeWG, "mcp", life, i.mcp.Run, false)
 	start(&lifeWG, "server certificate", life, i.certs.Run, false)
+	if i.front != nil {
+		start(&lifeWG, "front doors' certificate", life, i.front.Run, false)
+	}
 	start(&lifeWG, "nodes' port", life, i.Links.Serve, true)
 	for n, f := range i.streams.Run {
 		start(&lifeWG, fmt.Sprintf("streams %d", n), life, f, false)
@@ -588,8 +603,8 @@ func (i *Instance) run(ctx context.Context) error {
 	go func() {
 		defer close(httpDone)
 		var err error
-		if i.cfg.TLSCert != "" {
-			err = i.httpSrv.ServeTLS(i.httpLn, i.cfg.TLSCert, i.cfg.TLSKey)
+		if i.front != nil {
+			err = i.httpSrv.ServeTLS(i.httpLn, "", "")
 		} else {
 			err = i.httpSrv.Serve(i.httpLn)
 		}

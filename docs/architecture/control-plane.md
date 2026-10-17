@@ -55,7 +55,7 @@ that.
 |---|---|---|
 | `--database-url` | required | the PostgreSQL DSN |
 | `--listen` | `:8100` | the front doors |
-| `--tls-cert`, `--tls-key` | none | TLS on `--listen`; without, plain HTTP behind the balancer |
+| `--tls-cert`, `--tls-key` | none | TLS on `--listen`; without, plain HTTP behind the balancer. Loaded at the start, which fails on a missing or bad file, and read again every minute: a pair renewed on disk is served from the next handshake on, and one that does not load keeps the pair before |
 | `--node-listen` | `:7443` | the nodes' port |
 | `--node-advertise-address` | none | `host:port` at which nodes reach this instance's nodes' port; listed to nodes. Empty: the instance is not listed, and nodes reach it only by the name they were configured with (one machine) |
 | `--instance-id` | `<hostname>-<8 random hex>` | the instance's ID; the default is new at every start. A fixed one (a StatefulSet's pod name) must be unique among the running instances: a start under an ID whose row was written within 15 s waits until the row is older, and is refused if it is written meanwhile ([Leader and instances](#leader-and-instances)) |
