@@ -969,6 +969,14 @@ and retries once. REST and MCP share the one entry point:
   and an SSE comment every 25 s keeps balancers from closing the
   response.
 
+Every deployed guest decodes at most 4 MiB a message (tonic's default),
+restored ones included, and the test node's services take as much. A
+write, an edit or a command whose request is larger than 4032 KiB (4 MiB
+less room for framing) is therefore refused before it runs: "the content
+is larger than 4032 KiB, the most one write carries into the sandbox"
+(the edits, the command), on REST a 413. A JSON body is read up to 32
+MiB, a write's body up to that limit.
+
 ### Ports
 
 `/fwd/{id}/{port}/…` and `/api/v1/sandboxes/{id}/ports/{port}/…` forward

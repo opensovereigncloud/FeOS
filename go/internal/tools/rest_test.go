@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -118,8 +119,10 @@ func TestRESTRoutes(t *testing.T) {
 		{"GET", base + "/dirs/?limit=-1", ``, 400, `{"error":"limit must not be negative, got -1"}` + "\n", ""},
 		{"GET", base + "/search?q=x&context=-2", ``, 400, `{"error":"context must not be negative, got -2"}` + "\n", ""},
 		{"GET", base + "/search?q=x&kind=name&limit=-3", ``, 400, `{"error":"limit must not be negative, got -3"}` + "\n", ""},
-		// A body past the cap is refused, not cut.
-		{"PUT", base + "/files/big", strings.Repeat("x", maxRequestBody+1), 413, `{"error":"request body larger than 32 MiB"}` + "\n", ""},
+		// A body past the cap is refused, not cut; a file write's cap is the
+		// guest's.
+		{"PUT", base + "/files/big", strings.Repeat("x", maxGuestRequest+1), 413,
+			`{"error":"write: the content is larger than 4032 KiB, the most one write carries into the sandbox"}` + "\n", ""},
 		{"POST", base + "/exec", `{"command":"` + strings.Repeat("x", maxRequestBody) + `"}`, 413, `{"error":"request body larger than 32 MiB"}` + "\n", ""},
 	} {
 		doREST(t, h, c)
@@ -387,6 +390,73 @@ func TestRESTWriteBytes(t *testing.T) {
 	if len(want) != 0 {
 		t.Errorf("no tool_start rows for %v", want)
 	}
+}
+
+// A write, an edit or a command larger than the guest takes is a 413 that
+// states the limit and never reaches the node; MCP's call of the tool
+// gets the same error. The largest write the limit lets through, the node,
+// whose services take what the guest's take, accepts.
+func TestRESTGuestLimit(t *testing.T) {
+	env := toolstest.New(t, toolstest.Options{})
+	r := newRunner(env)
+	sb := env.NewSandbox()
+	h := restMux(NewREST(r), sb)
+	base := "/api/v1/sandboxes/" + sb.ID.String()
+	var mu sync.Mutex
+	var sizes []int
+	env.Node.Script().SetTool(func(_ context.Context, _ uuid.UUID, _ string, req proto.Message) (proto.Message, bool, error) {
+		mu.Lock()
+		sizes = append(sizes, proto.Size(req))
+		mu.Unlock()
+		return nil, false, nil
+	})
+
+	path := "/workspace/big.bin"
+	// The content whose request is exactly maxGuestRequest bytes: 1 byte of
+	// tag and 4 of length besides the rest of the request.
+	n := maxGuestRequest - proto.Size(&toolv1.WriteRequest{Container: mainContainer, Path: path}) - 5
+	if s := proto.Size(&toolv1.WriteRequest{Container: mainContainer, Path: path, Content: make([]byte, n)}); s != maxGuestRequest {
+		t.Fatalf("a request of %d bytes", s)
+	}
+	doREST(t, h, restCase{"PUT", base + "/files" + path, strings.Repeat("\xff", n), 200,
+		`{"exitCode":0,"output":"wrote /workspace/big.bin\n"}` + "\n", ""})
+	mu.Lock()
+	if len(sizes) != 1 || sizes[0] != maxGuestRequest {
+		t.Errorf("the node received requests of %v bytes", sizes)
+	}
+	mu.Unlock()
+	acquired := env.Engine.Calls("Acquire", sb.ID)
+
+	big := strings.Repeat("x", 5<<20)
+	const (
+		writeText = `the content is larger than 4032 KiB, the most one write carries into the sandbox`
+		editText  = `the edits are larger than 4032 KiB, the most one edit carries into the sandbox`
+		cmdText   = `the command is larger than 4032 KiB, the most one call carries into the sandbox`
+	)
+	for _, c := range []restCase{
+		{"PUT", base + "/files" + path, strings.Repeat("\xff", n+1), 413, `{"error":"write: ` + writeText + `"}` + "\n", ""},
+		{"PUT", base + "/files" + path, big, 413, `{"error":"write: ` + writeText + `"}` + "\n", ""},
+		{"PATCH", base + "/files" + path, `{"edits":[{"old":"a","new":"` + big + `"}]}`, 413,
+			`{"error":"edit: ` + editText + `"}` + "\n", ""},
+		{"POST", base + "/exec", `{"command":"` + big + `"}`, 413, `{"error":"bash: ` + cmdText + `"}` + "\n", ""},
+		{"POST", base + "/processes", `{"command":"` + big + `","timeout":0}`, 413,
+			`{"error":"process_start: ` + cmdText + `"}` + "\n", ""},
+	} {
+		doREST(t, h, c)
+	}
+	args, _ := json.Marshal(WriteParams{Path: path, Content: big})
+	var tooLarge *TooLargeError
+	if _, err := r.Call(bg, sb, ToolWrite, args, nil); !errors.As(err, &tooLarge) || err.Error() != writeText {
+		t.Errorf("MCP's write: %v", err)
+	}
+	if n := env.Engine.Calls("Acquire", sb.ID); n != acquired {
+		t.Errorf("a refused call acquired the sandbox %d times", n-acquired)
+	}
+	mu.Lock()
+	if len(sizes) != 1 {
+		t.Errorf("the node received requests of %v bytes", sizes)
+	}
+	mu.Unlock()
 }
 
 // The routes over a real HTTP server, as FeCode's client reaches them: a

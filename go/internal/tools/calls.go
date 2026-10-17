@@ -13,6 +13,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"google.golang.org/protobuf/proto"
+
 	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
 )
 
@@ -140,8 +142,12 @@ func prepare(tool string, args json.RawMessage, defaultTimeout time.Duration) (*
 		for i, ed := range p.Edits {
 			edits[i] = &toolv1.EditOp{Old: ed.Old, New: ed.New}
 		}
+		req := &toolv1.EditRequest{Container: mainContainer, Path: p.Path, Edits: edits}
+		if proto.Size(req) > maxGuestRequest {
+			return nil, &TooLargeError{Tool: tool}
+		}
 		c.unary = func(ctx context.Context, tc toolv1.ToolServiceClient, o *output) (int, error) {
-			resp, err := tc.Edit(ctx, &toolv1.EditRequest{Container: mainContainer, Path: p.Path, Edits: edits})
+			resp, err := tc.Edit(ctx, req)
 			if err != nil {
 				return -1, err
 			}
@@ -274,6 +280,15 @@ func prepare(tool string, args json.RawMessage, defaultTimeout time.Duration) (*
 	default:
 		return nil, fmt.Errorf("unknown tool %q", tool)
 	}
+	if c.argv != nil {
+		n := 0
+		for _, a := range c.argv {
+			n += len(a)
+		}
+		if n > maxGuestRequest {
+			return nil, &TooLargeError{Tool: tool}
+		}
+	}
 	return c, nil
 }
 
@@ -283,6 +298,9 @@ func prepare(tool string, args json.RawMessage, defaultTimeout time.Duration) (*
 // UTF-8 text.
 func prepareWrite(path string, content []byte, defaultTimeout time.Duration) (*call, error) {
 	req := &toolv1.WriteRequest{Container: mainContainer, Path: path, Content: content}
+	if proto.Size(req) > maxGuestRequest {
+		return nil, &TooLargeError{Tool: ToolWrite}
+	}
 	return &call{tool: ToolWrite, timeout: defaultTimeout,
 		unary: func(ctx context.Context, tc toolv1.ToolServiceClient, o *output) (int, error) {
 			resp, err := tc.Write(ctx, req)
@@ -315,6 +333,31 @@ func writeArgs(path string, content []byte) json.RawMessage {
 		return nil
 	}
 	return b
+}
+
+// maxGuestRequest is the largest request a call sends into the guest. The
+// guest's services decode at most 4 MiB a message (tonic's default, which
+// every deployed guest has, restored ones included), and refuse a larger
+// one with a text that names their limit, not the call's; this leaves room
+// for the request's framing. A larger call is refused before it runs.
+const maxGuestRequest = 4<<20 - 64<<10
+
+// TooLargeError is a call whose request is larger than the guest takes
+// (maxGuestRequest): a write's content, an edit's edits, a command.
+// Nothing has run.
+type TooLargeError struct {
+	Tool string
+}
+
+func (e *TooLargeError) Error() string {
+	what, one := "the command is", "call"
+	switch e.Tool {
+	case ToolWrite:
+		what, one = "the content is", "write"
+	case ToolEdit:
+		what, one = "the edits are", "edit"
+	}
+	return fmt.Sprintf("%s larger than %d KiB, the most one %s carries into the sandbox", what, maxGuestRequest>>10, one)
 }
 
 // maxTimeoutSeconds bounds a timeout an argument names: the largest the

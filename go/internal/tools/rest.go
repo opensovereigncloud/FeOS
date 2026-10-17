@@ -6,6 +6,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -15,9 +16,11 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/auth"
 )
 
-// maxRequestBody caps what a tool route reads of a request. A file write
-// carries the whole file, so it is generous; it bounds a stuck or hostile
-// client. A larger body is refused, never cut.
+// maxRequestBody caps what a tool route reads of a JSON request, which
+// may be larger than the call it makes (escapes): it bounds a stuck or
+// hostile client, and the call's own bound is the guest's
+// (maxGuestRequest). A file write's body is the content and is read up to
+// that bound. A larger body is refused, never cut.
 const maxRequestBody = 32 << 20
 
 // retryAfter is the Retry-After of a tool route's 502 for a cause worth
@@ -34,8 +37,9 @@ const retryAfter = 5
 // failed, the sandbox not prepared or the node not answering, is a 502
 // {"error": "<tool>: <err>"}, with Retry-After: 5 when a retry is worth it
 // (Retryable); these routes never map errors to other statuses. A bad
-// request is a 400, a body larger than 32 MiB a 413. A client that hung up
-// gets nothing.
+// request is a 400. A body larger than 32 MiB is a 413, and so is a write,
+// an edit or a command larger than the guest takes (TooLargeError), with
+// its limit in the text. A client that hung up gets nothing.
 type REST struct {
 	r *Runner
 }
@@ -86,6 +90,11 @@ func (h *REST) answer(w http.ResponseWriter, r *http.Request, tool string,
 	res, err := call(r.Context(), sb)
 	if r.Context().Err() != nil {
 		// The client hung up; its call was cancelled with its request.
+		return
+	}
+	var tooLarge *TooLargeError
+	if errors.As(err, &tooLarge) {
+		apierr.Write(w, apierr.New(http.StatusRequestEntityTooLarge, "%s: %v", tool, err))
 		return
 	}
 	if err != nil {
@@ -153,7 +162,9 @@ func (h *REST) WriteFile(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, apierr.New(http.StatusBadRequest, "path is required"))
 		return
 	}
-	body, err := readBody(r)
+	body, err := readAtMost(r, maxGuestRequest, func() error {
+		return apierr.New(http.StatusRequestEntityTooLarge, "%s: %v", ToolWrite, &TooLargeError{Tool: ToolWrite})
+	})
 	if err != nil {
 		apierr.Write(w, err)
 		return
@@ -329,12 +340,20 @@ func decodeJSON(r *http.Request, v any) (map[string]json.RawMessage, error) {
 // readBody reads the request body, at most maxRequestBody bytes: a larger
 // one is a 413, not a body cut short.
 func readBody(r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
+	return readAtMost(r, maxRequestBody, func() error {
+		return apierr.New(http.StatusRequestEntityTooLarge, "request body larger than %d MiB", maxRequestBody>>20)
+	})
+}
+
+// readAtMost reads the request body, at most limit bytes: a larger one is
+// tooLarge's error, not a body cut short.
+func readAtMost(r *http.Request, limit int, tooLarge func() error) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(limit)+1))
 	if err != nil {
 		return nil, apierr.New(http.StatusBadRequest, "read body: %v", err)
 	}
-	if len(body) > maxRequestBody {
-		return nil, apierr.New(http.StatusRequestEntityTooLarge, "request body larger than %d MiB", maxRequestBody>>20)
+	if len(body) > limit {
+		return nil, tooLarge()
 	}
 	return body, nil
 }

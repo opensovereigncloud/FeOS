@@ -245,10 +245,15 @@ func (n *Node) clientTLS(id *identity, alpn string) *tls.Config {
 // newNodeServer is the gRPC server of one node connection: the node's
 // feos.* services with feosd's routing, with the enforcement policy that
 // accepts the control plane's pings every 10 s without streams (grpc-go's
-// default would answer them with GOAWAY "too_many_pings").
+// default would answer them with GOAWAY "too_many_pings"), and the
+// guest's receive limit: its ToolService and ContainerService decode at
+// most 4 MiB a message (tonic's default). A larger one fails here with
+// RESOURCE_EXHAUSTED, in the guest with OUT_OF_RANGE; ferund refuses such
+// a call before it makes it.
 func (n *Node) newNodeServer() *grpc.Server {
 	srv := grpc.NewServer(
 		grpc.Creds(insecure.NewCredentials()),
+		grpc.MaxRecvMsgSize(guestMaxRecvMsgSize),
 		grpc.MaxConcurrentStreams(n.cfg.MaxStreams),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{MinTime: 5 * time.Second, PermitWithoutStream: true}),
 		grpc.KeepaliveParams(keepalive.ServerParameters{Time: 30 * time.Second, Timeout: 10 * time.Second}),
@@ -263,6 +268,9 @@ func (n *Node) newNodeServer() *grpc.Server {
 	networkv1.RegisterMeshServiceServer(srv, n.mesh)
 	return srv
 }
+
+// guestMaxRecvMsgSize is the largest message the guest's services decode.
+const guestMaxRecvMsgSize = 4 << 20
 
 // nodeLink is one node connection: the node serves its gRPC server over
 // the TLS connection it dialled.
