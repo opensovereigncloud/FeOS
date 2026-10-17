@@ -11,6 +11,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
 )
@@ -125,18 +126,7 @@ func prepare(tool string, args json.RawMessage, defaultTimeout time.Duration) (*
 		if err := json.Unmarshal(args, &p); err != nil {
 			return nil, err
 		}
-		c.unary = func(ctx context.Context, tc toolv1.ToolServiceClient, o *output) (int, error) {
-			resp, err := tc.Write(ctx, &toolv1.WriteRequest{Container: mainContainer, Path: p.Path, Content: []byte(p.Content)})
-			if err != nil {
-				return -1, err
-			}
-			if resp.Error != "" {
-				o.emit(resp.Error + "\n")
-				return 1, nil
-			}
-			o.emit(fmt.Sprintf("wrote %s\n", p.Path))
-			return 0, nil
-		}
+		return prepareWrite(p.Path, []byte(p.Content), defaultTimeout)
 
 	case ToolEdit:
 		var p EditParams
@@ -285,6 +275,46 @@ func prepare(tool string, args json.RawMessage, defaultTimeout time.Duration) (*
 		return nil, fmt.Errorf("unknown tool %q", tool)
 	}
 	return c, nil
+}
+
+// prepareWrite makes the write of content into path. The content is bytes
+// whatever they hold: REST's file write calls it with the request's body,
+// which a JSON string, the tool's argument, could not carry unless it is
+// UTF-8 text.
+func prepareWrite(path string, content []byte, defaultTimeout time.Duration) (*call, error) {
+	req := &toolv1.WriteRequest{Container: mainContainer, Path: path, Content: content}
+	return &call{tool: ToolWrite, timeout: defaultTimeout,
+		unary: func(ctx context.Context, tc toolv1.ToolServiceClient, o *output) (int, error) {
+			resp, err := tc.Write(ctx, req)
+			if err != nil {
+				return -1, err
+			}
+			if resp.Error != "" {
+				o.emit(resp.Error + "\n")
+				return 1, nil
+			}
+			o.emit(fmt.Sprintf("wrote %s\n", path))
+			return 0, nil
+		}}, nil
+}
+
+// writeArgs are the arguments prepareWrite's call is recorded with in the
+// activity log: the write tool's own when the content is UTF-8 text, as
+// MCP's call of it has them; for other bytes, which no JSON string carries
+// unchanged, the path and the size.
+func writeArgs(path string, content []byte) json.RawMessage {
+	var v any = WriteParams{Path: path, Content: string(content)}
+	if !utf8.Valid(content) {
+		v = struct {
+			Path string `json:"path"`
+			Size int    `json:"size"`
+		}{path, len(content)}
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return b
 }
 
 // maxTimeoutSeconds bounds a timeout an argument names: the largest the

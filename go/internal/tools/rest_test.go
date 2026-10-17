@@ -4,11 +4,13 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -332,6 +334,58 @@ func TestRESTErrors(t *testing.T) {
 	doREST(t, restMux(NewREST(r), auth.Sandbox{}), restCase{"POST", base + "/exec", `{"command":"x"}`, 401, `{"error":"sandbox token required"}` + "\n", ""})
 	if env.Engine.Holds(sb.ID) != 0 {
 		t.Errorf("%d holds left", env.Engine.Holds(sb.ID))
+	}
+}
+
+// A file write carries its body byte for byte, whatever the bytes: 0x00
+// to 0xFF reach the node as sent. The activity log records the write as
+// MCP's call of the tool is recorded when the content is UTF-8 text, and
+// by its path and size when it is not.
+func TestRESTWriteBytes(t *testing.T) {
+	env := toolstest.New(t, toolstest.Options{})
+	sb := env.NewSandbox()
+	h := restMux(NewREST(newRunner(env)), sb)
+	base := "/api/v1/sandboxes/" + sb.ID.String()
+	var mu sync.Mutex
+	var got [][]byte
+	env.Node.Script().SetTool(func(_ context.Context, _ uuid.UUID, _ string, req proto.Message) (proto.Message, bool, error) {
+		if w, ok := req.(*toolv1.WriteRequest); ok {
+			mu.Lock()
+			got = append(got, w.GetContent())
+			mu.Unlock()
+		}
+		return nil, false, nil
+	})
+	all := make([]byte, 256)
+	for i := range all {
+		all[i] = byte(i)
+	}
+	doREST(t, h, restCase{"PUT", base + "/files/workspace/bytes.bin", string(all), 200,
+		`{"exitCode":0,"output":"wrote /workspace/bytes.bin\n"}` + "\n", ""})
+	doREST(t, h, restCase{"PUT", base + "/files/workspace/text.txt", "h\u00e9llo\n", 200,
+		`{"exitCode":0,"output":"wrote /workspace/text.txt\n"}` + "\n", ""})
+	mu.Lock()
+	if len(got) != 2 || !bytes.Equal(got[0], all) || string(got[1]) != "h\u00e9llo\n" {
+		t.Errorf("the node received %q", got)
+	}
+	mu.Unlock()
+
+	want := map[string]map[string]any{
+		"write: /workspace/bytes.bin": {"path": "/workspace/bytes.bin", "size": 256.0},
+		"write: /workspace/text.txt":  {"path": "/workspace/text.txt", "content": "h\u00e9llo\n"},
+	}
+	for _, row := range env.Activity(sb.ID, 4) {
+		if row.Kind != "tool_start" {
+			continue
+		}
+		var params map[string]any
+		if err := json.Unmarshal(row.Params, &params); err != nil || !maps.Equal(params, want[row.Name]) {
+			t.Errorf("%s: params %s", row.Name, row.Params)
+		}
+		delete(want, row.Name)
+	}
+	if len(want) != 0 {
+		t.Errorf("no tool_start rows for %v", want)
 	}
 }
 

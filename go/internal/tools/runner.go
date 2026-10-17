@@ -232,7 +232,23 @@ func (r *Runner) Call(ctx context.Context, sb auth.Sandbox, tool string, args js
 	if err != nil {
 		return Result{}, err
 	}
+	return r.callPrepared(ctx, sb, c, args, progress)
+}
 
+// writeFile is the write tool with its content as bytes (prepareWrite),
+// as Call runs it otherwise.
+func (r *Runner) writeFile(ctx context.Context, sb auth.Sandbox, path string, content []byte) (Result, error) {
+	c, err := prepareWrite(path, content, r.defaultTimeout)
+	if err != nil {
+		return Result{}, err
+	}
+	return r.callPrepared(ctx, sb, c, writeArgs(path, content), nil)
+}
+
+// callPrepared runs the call c, recorded in the activity log with args.
+func (r *Runner) callPrepared(ctx context.Context, sb auth.Sandbox, c *call, args json.RawMessage,
+	progress func(chunk string)) (Result, error) {
+	tool := c.tool
 	// The call is cancellable by ferun_cancel from here on, while Acquire
 	// waits for the sandbox too: a forced drain must not miss a call that
 	// is about to run on the node it drains.

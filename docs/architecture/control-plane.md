@@ -952,6 +952,9 @@ and retries once. REST and MCP share the one entry point:
   verdict, and 502 `{"error": "<tool>: <error>"}` otherwise, with
   `Retry-After: 5` when a retry is worth it (no capacity, a node or
   instance unavailable or stopping, a hibernation in flight, a budget).
+  `PUT …/files/{path}` writes its body byte for byte, whatever the bytes;
+  the activity log records the write with its content when that is UTF-8
+  text, as MCP's, and by its path and size otherwise.
 - **MCP** (`/mcp`) runs the go-sdk's Streamable HTTP handler stateless,
   so that any instance serves any request: the bearer is resolved on
   every request. Its answers are the door's own, which the SDK's clients

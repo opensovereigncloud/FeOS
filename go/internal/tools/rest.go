@@ -4,6 +4,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -63,17 +64,26 @@ type toolResult struct {
 // run makes the call of tool with params (one of the parameter structs)
 // and answers it.
 func (h *REST) run(w http.ResponseWriter, r *http.Request, tool string, params any) {
-	sb, ok := auth.SandboxFrom(r.Context())
-	if !ok {
-		apierr.Write(w, apierr.New(http.StatusUnauthorized, "sandbox token required"))
-		return
-	}
 	args, err := json.Marshal(params)
 	if err != nil {
 		apierr.Write(w, err)
 		return
 	}
-	res, err := h.r.Call(r.Context(), sb, tool, args, nil)
+	h.answer(w, r, tool, func(ctx context.Context, sb auth.Sandbox) (Result, error) {
+		return h.r.Call(ctx, sb, tool, args, nil)
+	})
+}
+
+// answer runs call, a call of tool, for the request's sandbox and answers
+// it.
+func (h *REST) answer(w http.ResponseWriter, r *http.Request, tool string,
+	call func(ctx context.Context, sb auth.Sandbox) (Result, error)) {
+	sb, ok := auth.SandboxFrom(r.Context())
+	if !ok {
+		apierr.Write(w, apierr.New(http.StatusUnauthorized, "sandbox token required"))
+		return
+	}
+	res, err := call(r.Context(), sb)
 	if r.Context().Err() != nil {
 		// The client hung up; its call was cancelled with its request.
 		return
@@ -134,7 +144,9 @@ func (h *REST) ReadFile(w http.ResponseWriter, r *http.Request) {
 }
 
 // WriteFile is PUT /api/v1/sandboxes/{id}/files/{path...}: write, with the
-// request body as the file's content.
+// request body as the file's content, byte for byte: it never becomes the
+// JSON string of the tool's arguments, which would turn bytes that are not
+// UTF-8 into U+FFFD.
 func (h *REST) WriteFile(w http.ResponseWriter, r *http.Request) {
 	path := toolPath(r)
 	if path == "/" {
@@ -146,7 +158,9 @@ func (h *REST) WriteFile(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, err)
 		return
 	}
-	h.run(w, r, ToolWrite, WriteParams{Path: path, Content: string(body)})
+	h.answer(w, r, ToolWrite, func(ctx context.Context, sb auth.Sandbox) (Result, error) {
+		return h.r.writeFile(ctx, sb, path, body)
+	})
 }
 
 // EditFile is PATCH /api/v1/sandboxes/{id}/files/{path...} {"edits":[{old,
