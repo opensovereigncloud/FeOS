@@ -429,6 +429,7 @@ async fn test_volume_hibernates_with_its_pod() -> Result<()> {
     let checkpoint = pods
         .hibernate_pod(HibernatePodRequest {
             pod_id: pod_id.clone(),
+            ..Default::default()
         })
         .await?
         .into_inner()
@@ -554,6 +555,7 @@ async fn test_volume_hibernates_with_its_pod() -> Result<()> {
     let again = pods
         .hibernate_pod(HibernatePodRequest {
             pod_id: pod_id.clone(),
+            ..Default::default()
         })
         .await?
         .into_inner()

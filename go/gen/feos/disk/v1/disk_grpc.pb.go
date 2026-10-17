@@ -69,6 +69,12 @@ type DiskServiceClient interface {
 	// and at most one layer of its own. With upload, the chain's chunks and
 	// then its layers go to S3; PutHead names them. A disk without a top,
 	// sealed already, returns the newest layer of its chain.
+	// A Seal whose caller goes away stops its upload where it is: the layer
+	// stays sealed on the node, its device row names it, and the chunks
+	// uploaded so far stay in S3 and are not uploaded again for 12 hours.
+	// The local seal runs to its end: until then CreateDisk, OpenDisk,
+	// StopDisk, RemoveDevice, Seal and PutHead of the disk wait for it. Seal
+	// without upload and then with it seals, and then uploads.
 	Seal(ctx context.Context, in *SealRequest, opts ...grpc.CallOption) (*Layer, error)
 	// Seals the frozen top of a running device into a layer on L0, for
 	// other pods to start from. Nothing about the pod changes. Fails with
@@ -87,7 +93,9 @@ type DiskServiceClient interface {
 	Push(ctx context.Context, in *LayerRef, opts ...grpc.CallOption) (*Empty, error)
 	// Downloads a layer's manifest, and with warm its chunks.
 	Pull(ctx context.Context, in *LayerRef, opts ...grpc.CallOption) (*Empty, error)
-	// Drops chunks from the cache that can be fetched again.
+	// Drops chunks from the cache that can be fetched again: never those of
+	// a disk's layer that is not uploaded, or of its own layer while no head
+	// names it.
 	Evict(ctx context.Context, in *EvictRequest, opts ...grpc.CallOption) (*EvictStats, error)
 	// Counters and latency histograms per device and memory handler.
 	Stats(ctx context.Context, in *StatsRequest, opts ...grpc.CallOption) (*StatsResponse, error)
@@ -370,6 +378,12 @@ type DiskServiceServer interface {
 	// and at most one layer of its own. With upload, the chain's chunks and
 	// then its layers go to S3; PutHead names them. A disk without a top,
 	// sealed already, returns the newest layer of its chain.
+	// A Seal whose caller goes away stops its upload where it is: the layer
+	// stays sealed on the node, its device row names it, and the chunks
+	// uploaded so far stay in S3 and are not uploaded again for 12 hours.
+	// The local seal runs to its end: until then CreateDisk, OpenDisk,
+	// StopDisk, RemoveDevice, Seal and PutHead of the disk wait for it. Seal
+	// without upload and then with it seals, and then uploads.
 	Seal(context.Context, *SealRequest) (*Layer, error)
 	// Seals the frozen top of a running device into a layer on L0, for
 	// other pods to start from. Nothing about the pod changes. Fails with
@@ -388,7 +402,9 @@ type DiskServiceServer interface {
 	Push(context.Context, *LayerRef) (*Empty, error)
 	// Downloads a layer's manifest, and with warm its chunks.
 	Pull(context.Context, *LayerRef) (*Empty, error)
-	// Drops chunks from the cache that can be fetched again.
+	// Drops chunks from the cache that can be fetched again: never those of
+	// a disk's layer that is not uploaded, or of its own layer while no head
+	// names it.
 	Evict(context.Context, *EvictRequest) (*EvictStats, error)
 	// Counters and latency histograms per device and memory handler.
 	Stats(context.Context, *StatsRequest) (*StatsResponse, error)

@@ -809,8 +809,10 @@ func (x *LayerRef) GetWarm() bool {
 type EvictRequest struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Target EvictRequest_Target    `protobuf:"varint,1,opt,name=target,proto3,enum=feos.disk.v1.EvictRequest_Target" json:"target,omitempty"`
-	// Also evict chunks of layers that were not pushed: they are nowhere
-	// else.
+	// Also evict what is kept otherwise: the chunks of the devices' chains,
+	// and of layers that were not pushed, which are nowhere else. Pinned
+	// chunks stay: those of a disk's layer that is not uploaded, and of its
+	// own layer while no head names it.
 	Force         bool `protobuf:"varint,2,opt,name=force,proto3" json:"force,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -254,6 +254,7 @@ pub async fn handle_pod_command(args: PodArgs) -> Result<()> {
             let response = client
                 .hibernate_pod(HibernatePodRequest {
                     pod_id: pod_id.clone(),
+                    ..Default::default()
                 })
                 .await?
                 .into_inner();

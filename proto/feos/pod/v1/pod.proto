@@ -44,17 +44,31 @@ service PodService {
   // microVM.
   rpc SuspendPod(SuspendPodRequest) returns (SuspendPodResponse);
   // Restores a suspended pod, with its containers as they were. A
-  // hibernated pod is restored from its checkpoint, as RestorePod does; a
-  // resume that came while the pod hibernated waits for it.
+  // hibernated pod is restored from its checkpoint, as RestorePod does.
+  // A resume that comes while the pod hibernates abandons the hibernation
+  // (PodInfo.hibernation.abandonable): the hibernation stops at its next
+  // step, its HibernatePod fails with ABORTED, and the pod resumes from its
+  // snapshot on the node. What the hibernation uploaded stays in object
+  // storage, named by no head, and serves the pod's next hibernation. A
+  // hibernation that may not be abandoned (HibernatePodRequest.no_abandon),
+  // one of a pod without memory, or one whose head is being put, the
+  // resume waits for, and restores the pod from its checkpoint.
   rpc ResumePod(ResumePodRequest) returns (ResumePodResponse);
   // Takes the pod off the node into object storage: suspends it if it
   // runs, seals its disk, its volumes and its memory, uploads them with
   // its spec, and frees what it held on the node: its microVM, its disk,
-  // its volumes' disks and its addresses. The pod is POD_STATE_HIBERNATED then, a record with its
-  // checkpoint, from which ResumePod and RestorePod bring it back, here or
-  // on another node. A stopped or failed pod hibernates its disk alone.
-  // A hibernation that fails leaves the pod suspended on the node. Needs
-  // diskd with an object store: without one, the pod stays as it is.
+  // its volumes' disks and its addresses. The pod is POD_STATE_HIBERNATED
+  // then, a record with its checkpoint, from which ResumePod and
+  // RestorePod bring it back, here or on another node. A stopped or
+  // failed pod hibernates its disk alone. The hibernation runs on its own:
+  // a call that is cancelled, or whose connection goes, leaves it running,
+  // and a HibernatePod that comes while it runs waits for it and gets its
+  // answer. Until its head is being put, a ResumePod abandons it, unless
+  // no_abandon: it fails with ABORTED then, and leaves the pod suspended on
+  // the node for the resume; so does a later HibernatePod with the
+  // request_id of an abandoned hibernation. A hibernation that fails leaves
+  // the pod suspended on the node. Needs diskd with an object store:
+  // without one, the pod stays as it is.
   rpc HibernatePod(HibernatePodRequest) returns (HibernatePodResponse);
   // Brings a hibernated pod back from a checkpoint: on this node, or on
   // one that does not have the pod, which takes its spec from the
@@ -194,6 +208,42 @@ message PodInfo {
   // pod that runs from one reads layers of it, so a sweep of the object
   // store keeps the heads of every pod's checkpoint.
   Checkpoint checkpoint = 9;
+  // The hibernation in flight (HibernatePod), until it ends; unset
+  // otherwise.
+  Hibernation hibernation = 10;
+}
+
+// A hibernation in flight.
+message Hibernation {
+  HibernationPhase phase = 1;
+  // A ResumePod abandons it now: no HibernatePod set no_abandon, the
+  // pod's memory goes with it, and its head is not being put yet.
+  bool abandonable = 2;
+  // The epoch of the checkpoint it writes; 0 until it is chosen.
+  uint64 epoch = 3;
+  // The request_id of each HibernatePod that started or joined it.
+  repeated string request_ids = 4;
+}
+
+enum HibernationPhase {
+  HIBERNATION_PHASE_UNSPECIFIED = 0;
+  // Waiting for the pod's lock, behind another call or a bring-up.
+  HIBERNATION_PHASE_WAITING = 1;
+  // The running pod is written to a snapshot.
+  HIBERNATION_PHASE_SUSPENDING = 2;
+  // Its disk is sealed on the node.
+  HIBERNATION_PHASE_SEALING = 3;
+  // Its disk's layers go to the object store.
+  HIBERNATION_PHASE_UPLOADING_DISK = 4;
+  // Its volumes are sealed and uploaded.
+  HIBERNATION_PHASE_VOLUMES = 5;
+  // Its memory, vmstate and spec go to the object store.
+  HIBERNATION_PHASE_UPLOADING_MEMORY = 6;
+  // Its volumes' heads and its head are being put: from here on the
+  // checkpoint is the pod.
+  HIBERNATION_PHASE_HEAD = 7;
+  // It leaves the node.
+  HIBERNATION_PHASE_LEAVING = 8;
 }
 
 // A pod in object storage, as HibernatePod wrote it.
@@ -301,6 +351,15 @@ message ResumePodResponse {}
 
 message HibernatePodRequest {
   string pod_id = 1;
+  // A ResumePod never abandons this hibernation: the control plane takes
+  // the pod off a node it empties. A HibernatePod that joins a hibernation
+  // in flight with it set makes that one so, too.
+  bool no_abandon = 2;
+  // Who asks; the control plane sends its op's id. A HibernatePod that
+  // starts or joins a hibernation adds it to Hibernation.request_ids. One
+  // whose request_id an abandoned hibernation of the pod had fails with
+  // ABORTED and starts nothing.
+  string request_id = 3;
 }
 
 message HibernatePodResponse {

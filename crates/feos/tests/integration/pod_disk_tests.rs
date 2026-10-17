@@ -302,6 +302,7 @@ async fn hibernate(pods: &mut PodServiceClient<Channel>, pod_id: &str) -> Result
     let response = pods
         .hibernate_pod(HibernatePodRequest {
             pod_id: pod_id.to_string(),
+            ..Default::default()
         })
         .await?
         .into_inner();

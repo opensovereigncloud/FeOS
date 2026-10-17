@@ -79,17 +79,31 @@ type PodServiceClient interface {
 	// microVM.
 	SuspendPod(ctx context.Context, in *SuspendPodRequest, opts ...grpc.CallOption) (*SuspendPodResponse, error)
 	// Restores a suspended pod, with its containers as they were. A
-	// hibernated pod is restored from its checkpoint, as RestorePod does; a
-	// resume that came while the pod hibernated waits for it.
+	// hibernated pod is restored from its checkpoint, as RestorePod does.
+	// A resume that comes while the pod hibernates abandons the hibernation
+	// (PodInfo.hibernation.abandonable): the hibernation stops at its next
+	// step, its HibernatePod fails with ABORTED, and the pod resumes from its
+	// snapshot on the node. What the hibernation uploaded stays in object
+	// storage, named by no head, and serves the pod's next hibernation. A
+	// hibernation that may not be abandoned (HibernatePodRequest.no_abandon),
+	// one of a pod without memory, or one whose head is being put, the
+	// resume waits for, and restores the pod from its checkpoint.
 	ResumePod(ctx context.Context, in *ResumePodRequest, opts ...grpc.CallOption) (*ResumePodResponse, error)
 	// Takes the pod off the node into object storage: suspends it if it
 	// runs, seals its disk, its volumes and its memory, uploads them with
 	// its spec, and frees what it held on the node: its microVM, its disk,
-	// its volumes' disks and its addresses. The pod is POD_STATE_HIBERNATED then, a record with its
-	// checkpoint, from which ResumePod and RestorePod bring it back, here or
-	// on another node. A stopped or failed pod hibernates its disk alone.
-	// A hibernation that fails leaves the pod suspended on the node. Needs
-	// diskd with an object store: without one, the pod stays as it is.
+	// its volumes' disks and its addresses. The pod is POD_STATE_HIBERNATED
+	// then, a record with its checkpoint, from which ResumePod and
+	// RestorePod bring it back, here or on another node. A stopped or
+	// failed pod hibernates its disk alone. The hibernation runs on its own:
+	// a call that is cancelled, or whose connection goes, leaves it running,
+	// and a HibernatePod that comes while it runs waits for it and gets its
+	// answer. Until its head is being put, a ResumePod abandons it, unless
+	// no_abandon: it fails with ABORTED then, and leaves the pod suspended on
+	// the node for the resume; so does a later HibernatePod with the
+	// request_id of an abandoned hibernation. A hibernation that fails leaves
+	// the pod suspended on the node. Needs diskd with an object store:
+	// without one, the pod stays as it is.
 	HibernatePod(ctx context.Context, in *HibernatePodRequest, opts ...grpc.CallOption) (*HibernatePodResponse, error)
 	// Brings a hibernated pod back from a checkpoint: on this node, or on
 	// one that does not have the pod, which takes its spec from the
@@ -295,17 +309,31 @@ type PodServiceServer interface {
 	// microVM.
 	SuspendPod(context.Context, *SuspendPodRequest) (*SuspendPodResponse, error)
 	// Restores a suspended pod, with its containers as they were. A
-	// hibernated pod is restored from its checkpoint, as RestorePod does; a
-	// resume that came while the pod hibernated waits for it.
+	// hibernated pod is restored from its checkpoint, as RestorePod does.
+	// A resume that comes while the pod hibernates abandons the hibernation
+	// (PodInfo.hibernation.abandonable): the hibernation stops at its next
+	// step, its HibernatePod fails with ABORTED, and the pod resumes from its
+	// snapshot on the node. What the hibernation uploaded stays in object
+	// storage, named by no head, and serves the pod's next hibernation. A
+	// hibernation that may not be abandoned (HibernatePodRequest.no_abandon),
+	// one of a pod without memory, or one whose head is being put, the
+	// resume waits for, and restores the pod from its checkpoint.
 	ResumePod(context.Context, *ResumePodRequest) (*ResumePodResponse, error)
 	// Takes the pod off the node into object storage: suspends it if it
 	// runs, seals its disk, its volumes and its memory, uploads them with
 	// its spec, and frees what it held on the node: its microVM, its disk,
-	// its volumes' disks and its addresses. The pod is POD_STATE_HIBERNATED then, a record with its
-	// checkpoint, from which ResumePod and RestorePod bring it back, here or
-	// on another node. A stopped or failed pod hibernates its disk alone.
-	// A hibernation that fails leaves the pod suspended on the node. Needs
-	// diskd with an object store: without one, the pod stays as it is.
+	// its volumes' disks and its addresses. The pod is POD_STATE_HIBERNATED
+	// then, a record with its checkpoint, from which ResumePod and
+	// RestorePod bring it back, here or on another node. A stopped or
+	// failed pod hibernates its disk alone. The hibernation runs on its own:
+	// a call that is cancelled, or whose connection goes, leaves it running,
+	// and a HibernatePod that comes while it runs waits for it and gets its
+	// answer. Until its head is being put, a ResumePod abandons it, unless
+	// no_abandon: it fails with ABORTED then, and leaves the pod suspended on
+	// the node for the resume; so does a later HibernatePod with the
+	// request_id of an abandoned hibernation. A hibernation that fails leaves
+	// the pod suspended on the node. Needs diskd with an object store:
+	// without one, the pod stays as it is.
 	HibernatePod(context.Context, *HibernatePodRequest) (*HibernatePodResponse, error)
 	// Brings a hibernated pod back from a checkpoint: on this node, or on
 	// one that does not have the pod, which takes its spec from the
