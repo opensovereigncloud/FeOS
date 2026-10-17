@@ -6,6 +6,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -443,7 +444,7 @@ func TestOpDeadlines(t *testing.T) {
 	}{
 		{OpCreate, 512, 7*time.Minute + 5*time.Second},
 		{OpStart, 65536, 7*time.Minute + 5*time.Second},
-		{OpResume, 1025, 2*time.Minute + 4*time.Second},
+		{OpResume, 1025, 7*time.Minute + 5*time.Second + 16*time.Second},
 		{OpRestore, 2048, 7*time.Minute + 5*time.Second + 16*time.Second},
 		{OpPause, 512, 2*time.Minute + 4*time.Second},
 		{OpHibernate, 65536, time.Hour + 64*16*time.Second},
@@ -453,6 +454,105 @@ func TestOpDeadlines(t *testing.T) {
 		if got := OpDeadline(c.kind, c.mem); got != c.want {
 			t.Errorf("%s of %d MiB: %v, want %v", c.kind, c.mem, got, c.want)
 		}
+	}
+	// A resume may wait for a hibernation and then restore the pod: it has
+	// the restore's deadline.
+	for _, mem := range []int{0, 512, 1024, 1025, 65536} {
+		if r, s := deadlineFor(OpResume, mem, time.Hour), deadlineFor(OpRestore, mem, time.Hour); r != s {
+			t.Errorf("resume of %d MiB: %v, restore %v", mem, r, s)
+		}
+	}
+}
+
+// TestHibernateNoAbandonPerTrigger: every HibernatePod carries the op's id
+// as its request id, and no_abandon for a drain's hibernate (drain,
+// drain_forced), Ensure's off a draining node, an explicit one, and a
+// takeover on a draining node; not for a hibernate-after's, Ensure's after
+// the node refused the resume for capacity, or a takeover on a node that
+// does not drain.
+func TestHibernateNoAbandonPerTrigger(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	sb := h.running(512)
+	calls := h.watchCalls("n1", podv1.PodService_HibernatePod_FullMethodName, false)
+	// paused brings the sandbox back to n1 and pauses it, for long.
+	paused := func() {
+		t.Helper()
+		h.exec("UPDATE nodes SET draining = false, slots = 50 WHERE name = 'n1'")
+		h.ensure(sb.ID)
+		h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+		h.exec("UPDATE sandboxes SET paused_at = now() - interval '1 hour' WHERE id = $1", sb.ID)
+	}
+	check := func(what string, n int, opID uuid.UUID, want bool) {
+		t.Helper()
+		reqs := calls.hibernateRequests()
+		if len(reqs) != n+1 {
+			t.Fatalf("%s: %d HibernatePods, want %d", what, len(reqs), n+1)
+		}
+		if r := reqs[n]; r.GetNoAbandon() != want || r.GetRequestId() != opID.String() {
+			t.Errorf("%s: no_abandon %v, request id %q; want %v, %s", what, r.GetNoAbandon(), r.GetRequestId(), want, opID)
+		}
+	}
+	ctx, cancel := context.WithTimeout(bg, 60*time.Second)
+	defer cancel()
+	wait := func(what string, hd *OpHandle) {
+		t.Helper()
+		if res, err := hd.Wait(ctx); err != nil || res.State != model.StateHibernated {
+			t.Fatalf("%s: %+v %v", what, res, err)
+		}
+	}
+
+	for _, c := range []struct {
+		trigger OpTrigger
+		want    bool
+	}{{TriggerHibernateAfter, false}, {TriggerDrain, true}, {TriggerDrainForced, true}, {TriggerExplicit, true}} {
+		paused()
+		n := calls.count()
+		hd, err := h.begin(sb.ID, OpIntent{Kind: OpHibernate, Trigger: c.trigger, Target: "n1"})
+		if err != nil {
+			t.Fatalf("%s: %v", c.trigger, err)
+		}
+		wait(string(c.trigger), hd)
+		check(string(c.trigger), n, hd.opID, c.want)
+	}
+
+	// Ensure's: the node drains, or has no slot for the resume. The restore
+	// that follows finds no node; only the hibernate's call matters here.
+	for _, c := range []struct {
+		what, sql string
+		want      bool
+	}{
+		{"ensure off a draining node", "UPDATE nodes SET draining = true WHERE name = 'n1'", true},
+		{"ensure after a refusal for capacity", "UPDATE nodes SET slots = 0 WHERE name = 'n1'", false},
+	} {
+		paused()
+		n := calls.count()
+		h.exec(c.sql)
+		if _, _, err := ensureFor(e, sb.ID, 30*time.Second); err == nil {
+			t.Fatalf("%s: restored", c.what)
+		}
+		var span string
+		h.scalar(&span, `SELECT span_id FROM activity WHERE sandbox_id = $1 AND kind = 'lifecycle_start'
+			AND detail->>'op' = 'hibernate' ORDER BY ts_ns DESC LIMIT 1`, sb.ID)
+		check(c.what, n, uuid.MustParse(strings.TrimPrefix(span, "op-")), c.want)
+	}
+
+	// A takeover: the op's trigger is not in the row; the node's draining
+	// decides.
+	h.deadInstance("gone")
+	for _, draining := range []bool{true, false} {
+		paused()
+		h.settle(sb.ID)
+		row := h.opOfDeadOwner(h.row(sb.ID), OpHibernate, "gone")
+		h.exec("UPDATE nodes SET draining = $1 WHERE name = 'n1'", draining)
+		n := calls.count()
+		hd, err := h.begin(sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerRepair, Target: "n1", takeover: row.OpID})
+		if err != nil || !hd.takeover {
+			t.Fatalf("takeover: %v", err)
+		}
+		wait("takeover", hd)
+		check(fmt.Sprintf("takeover (draining %v)", draining), n, hd.opID, draining)
 	}
 }
 

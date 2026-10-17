@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
@@ -26,16 +27,23 @@ import (
 // again: "<op> on node <n> failed: <description>". Its ops carry the
 // trigger ensure; they run on when Ensure stops waiting.
 //
-// A hibernate in flight (this instance's, another live instance's, or
-// one Ensure began itself) is waited for at most hibernateWait: a
-// hibernation uploads the pod's disk and memory to the object store and
-// takes minutes, longer than a caller should wait. One that has not ended
-// by then is ErrBusy, "sandbox <id> is hibernating; retry in a minute",
-// and goes on; a later Ensure restores the sandbox.
+// A hibernate in flight of a paused sandbox whose node says that a resume
+// abandons the hibernation now (feosd's PodInfo.hibernation: abandonable,
+// and the op's own call among its request ids) is preempted, whoever owns
+// it: a resume takes its place, and the sandbox resumes on its node from
+// its snapshot. A drain's hibernate, and Ensure's off a draining node,
+// are never abandoned. Any other hibernate in flight (this instance's,
+// another live instance's, or one Ensure began itself; also every one on
+// a feosd that does not report its hibernations) is waited for at most
+// hibernateWait: a hibernation uploads the pod's disk and memory to the
+// object store and takes minutes, longer than a caller should wait. One
+// that has not ended by then is ErrBusy, "sandbox <id> is hibernating;
+// retry in a minute", and goes on; a later Ensure restores the sandbox.
 func (e *Engine) Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error) {
 	ctx, cancel := context.WithTimeout(ctx, e.t.prepBudget)
 	defer cancel()
-	en := &ensurer{e: e, id: id, ops: map[string]OpResult{}, tombTried: map[store.TombstoneKey]bool{}}
+	en := &ensurer{e: e, id: id, ops: map[string]OpResult{}, tombTried: map[store.TombstoneKey]bool{},
+		preemptRefused: map[uuid.UUID]bool{}}
 	ch, unsubscribe := e.d.Subscribe(db.ChanSandbox)
 	defer unsubscribe()
 	en.changes = ch
@@ -63,10 +71,23 @@ type ensurer struct {
 	// hibernateSince is when this call first met a hibernate in flight;
 	// it waits for hibernates until hibernateWait after it.
 	hibernateSince time.Time
+	// preemptNext is when this call may next ask the node whether a resume
+	// abandons the hibernate in flight; preemptMaybe: the last answer may
+	// still change (no hibernation reported yet, the op's call not in it
+	// yet, no answer), so the waits for the hibernate end by then.
+	preemptNext  time.Time
+	preemptMaybe bool
+	// preemptRefused are the hibernates whose preempting resume this call
+	// had refused by its admission: not begun again.
+	preemptRefused map[uuid.UUID]bool
 }
 
 // errContinue makes the loop read the row again.
 var errContinue = errors.New("continue")
+
+// errNoPreempt: Ensure does not preempt the hibernate in flight, and waits
+// for it.
+var errNoPreempt = errors.New("no preempt")
 
 func (en *ensurer) run(ctx context.Context) (model.Lease, error) {
 	e := en.e
@@ -175,20 +196,33 @@ func (en *ensurer) step(ctx context.Context, row store.Sandbox) (model.Lease, er
 
 // opInFlight joins this instance's op when it is the row's, takes over
 // one whose owner is not live, or waits for the row to change; a hibernate
-// of a live owner only within the hibernate wait. An op of this
+// that a resume abandons now it preempts, whoever owns it, and waits for
+// another of a live owner only within the hibernate wait. An op of this
 // instance's that is not the row's (taken over by another instance, or of
 // an earlier incarnation) is not waited for.
 func (en *ensurer) opInFlight(ctx context.Context, row store.Sandbox) error {
 	e := en.e
 	if h := e.runner.Running(en.id); h != nil && h.opID == row.OpID {
+		if h.kind == OpHibernate {
+			if err := en.preempt(ctx, row); !errors.Is(err, errNoPreempt) {
+				return err
+			}
+		}
 		return en.await(ctx, h)
 	}
 	live, err := e.st.InstanceLive(ctx, row.OpOwner)
 	if err != nil {
 		return err
 	}
-	if live && OpKind(row.Op) == OpHibernate {
-		return en.waitHibernateRow(ctx)
+	if OpKind(row.Op) == OpHibernate {
+		// A dead owner's hibernate that a resume abandons is preempted
+		// rather than taken over.
+		if err := en.preempt(ctx, row); !errors.Is(err, errNoPreempt) {
+			return err
+		}
+		if live {
+			return en.waitHibernateRow(ctx)
+		}
 	}
 	if live {
 		en.waitNext = true
@@ -198,6 +232,63 @@ func (en *ensurer) opInFlight(ctx context.Context, row store.Sandbox) error {
 	// loop reads the row again (runOp).
 	return en.runOp(ctx, row, OpIntent{Kind: OpKind(row.Op), Trigger: TriggerEnsure, Target: row.OpTarget,
 		Incarnation: row.Incarnation, takeover: row.OpID})
+}
+
+// preempt begins a resume in the place of the row's hibernate when its
+// node says that a resume abandons the hibernation now: the hibernate is
+// a paused sandbox's on its node, the node is connected and not draining,
+// and GetPod reports the hibernation abandonable with the op's own call
+// among its request ids (a call still on its way, or a hibernation an
+// earlier call left, is not this op's: feosd would start the op's late
+// call anew behind the resume). It returns errNoPreempt when it begins
+// nothing, and the caller waits for the hibernate as before; it asks the
+// node at most once per preemptRecheck, and not again for a hibernate
+// whose resume this call had refused.
+func (en *ensurer) preempt(ctx context.Context, row store.Sandbox) error {
+	e := en.e
+	if OpKind(row.Op) != OpHibernate || row.OpFromState != model.StatePaused || row.ClientState != model.StateHibernating ||
+		row.OpTarget != row.Node || en.preemptRefused[row.OpID] {
+		en.preemptMaybe = false
+		return errNoPreempt
+	}
+	if time.Now().Before(en.preemptNext) {
+		return errNoPreempt
+	}
+	en.preemptNext = time.Now().Add(e.t.preemptRecheck)
+	n, err := e.st.GetNode(ctx, row.Node)
+	if err != nil || n.Draining || !e.conns.Connected(row.Node) {
+		en.preemptMaybe = false
+		return errNoPreempt
+	}
+	gctx, cancel := context.WithTimeout(ctx, e.t.preemptGet)
+	obs, err := e.getPod(gctx, row.Node, row.ID)
+	cancel()
+	if err != nil {
+		// The node may answer the next look.
+		en.preemptMaybe = true
+		return errNoPreempt
+	}
+	if !obs.ours(row.Incarnation) {
+		en.preemptMaybe = false
+		return errNoPreempt
+	}
+	hb := obs.info.GetHibernation()
+	ownCall := slices.Contains(hb.GetRequestIds(), row.OpID.String())
+	// No hibernation on the node yet, or not this op's call in it yet (the
+	// call is on its way), or a feosd that does not report hibernations:
+	// look again within preemptRecheck.
+	en.preemptMaybe = (hb == nil || !ownCall) && obs.state() != podv1.PodState_POD_STATE_HIBERNATED
+	if !hb.GetAbandonable() || !ownCall {
+		return errNoPreempt
+	}
+	err = en.runOp(ctx, row, OpIntent{Kind: OpResume, Trigger: TriggerEnsure, Target: row.Node,
+		Incarnation: row.Incarnation, preempt: row.OpID})
+	var a *admission
+	if errors.As(err, &a) {
+		en.preemptRefused[row.OpID] = true
+		return errNoPreempt
+	}
+	return err
 }
 
 // running returns the lease of a running sandbox, or moves it off a
@@ -574,14 +665,20 @@ func (en *ensurer) hibernating() error {
 // hibernate wait. The end of ctx's deadline counts as the wait's: Ensure
 // never waits longer than its budget, and its caller learns that the
 // sandbox is hibernating. A hibernate that has ended when the wait ends
-// has ended, as the row path's read after the wait finds.
+// has ended, as the row path's read after the wait finds. While the
+// node's answer to a preempt may still change, the wait ends after
+// preemptRecheck with errContinue, so that the loop looks again.
 func (en *ensurer) waitHibernateOp(ctx context.Context, h *OpHandle) error {
 	select {
 	case <-h.Done():
 		return nil
 	default:
 	}
-	t := time.NewTimer(time.Until(en.hibernateDeadline()))
+	deadline, capped := en.hibernateDeadline(), false
+	if next := time.Now().Add(en.e.t.preemptRecheck); en.preemptMaybe && next.Before(deadline) {
+		deadline, capped = next, true
+	}
+	t := time.NewTimer(time.Until(deadline))
 	defer t.Stop()
 	select {
 	case <-h.Done():
@@ -591,13 +688,17 @@ func (en *ensurer) waitHibernateOp(ctx context.Context, h *OpHandle) error {
 		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return ctx.Err()
 		}
+		capped = false
 	}
 	select {
 	case <-h.Done():
 		return nil
 	default:
-		return en.hibernating()
 	}
+	if capped {
+		return errContinue
+	}
+	return en.hibernating()
 }
 
 // waitHibernateRow waits for a hibernate of a live owner that this

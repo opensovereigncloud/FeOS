@@ -187,10 +187,13 @@ func (c *change) observe(node string, obs observation) {
 	}
 }
 
-// observeOurs applies the state of the row's own pod on node.
+// observeOurs applies the state of the row's own pod on node. A newer
+// checkpoint the pod reports is merged in any state: a pod restored from a
+// hibernation that a resume waited for runs on it.
 func (c *change) observeOurs(node string, info *podv1.PodInfo) {
 	a := &c.after
 	a.Node, a.Materialised, a.LostFrom = node, true, ""
+	c.mergeCheckpoint(info.GetCheckpoint(), node)
 	switch info.GetState() {
 	case podv1.PodState_POD_STATE_PENDING:
 		a.ClientState = model.StateCreating
@@ -214,7 +217,6 @@ func (c *change) observeOurs(node string, info *podv1.PodInfo) {
 		c.closeRun = "paused"
 	case podv1.PodState_POD_STATE_HIBERNATED:
 		a.ClientState = model.StateHibernated
-		c.mergeCheckpoint(info.GetCheckpoint(), node)
 		if c.before.ClientState != model.StateHibernated {
 			a.StatusDescription = ""
 		}
@@ -262,8 +264,9 @@ func (c *change) notFound(node, why string) {
 	a.PendingSince = time.Time{}
 }
 
-// mergeCheckpoint writes the checkpoint of a pod hibernated on node when
-// it is not older than the row's (never back to an older epoch).
+// mergeCheckpoint writes the checkpoint a pod on node reports when it is
+// not older than the row's (never back to an older epoch), and reports
+// whether it did.
 func (c *change) mergeCheckpoint(cp *podv1.Checkpoint, node string) bool {
 	if cp.GetHeadKey() == "" {
 		return false

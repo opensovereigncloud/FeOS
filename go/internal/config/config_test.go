@@ -261,7 +261,7 @@ func TestUsage(t *testing.T) {
 	for _, s := range []string{"--database-url (FERUN_DATABASE_URL)", "--oidc-client-secret-file (FERUN_OIDC_CLIENT_SECRET_FILE)",
 		`--shutdown-grace (FERUN_SHUTDOWN_GRACE, default "10m0s")`, "--node-advertise-address (FERUN_NODE_ADVERTISE_ADDRESS)",
 		`--hibernate-timeout (FERUN_HIBERNATE_TIMEOUT, default "1h0m0s")`,
-		"how long a hibernate may run (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB"} {
+		"how long ferund waits for a hibernate (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB, and the node's hibernation goes on after the wait"} {
 		if !strings.Contains(b.String(), s) {
 			t.Errorf("serve help lacks %q", s)
 		}
@@ -278,9 +278,9 @@ func TestUsage(t *testing.T) {
 	}
 }
 
-// --hibernate-timeout bounds a hibernate's node call: its variable is
-// FERUN_HIBERNATE_TIMEOUT, its default an hour, and the flag wins over the
-// variable.
+// --hibernate-timeout bounds how long ferund waits for a hibernate's node
+// call: its variable is FERUN_HIBERNATE_TIMEOUT, its default an hour, and
+// the flag wins over the variable.
 func TestHibernateTimeout(t *testing.T) {
 	t.Parallel()
 	if EnvName("hibernate-timeout") != "FERUN_HIBERNATE_TIMEOUT" {

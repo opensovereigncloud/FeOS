@@ -166,6 +166,11 @@ type Config struct {
 	ConnDrainTimeout time.Duration
 	// HibernateTimeout is how long a hibernate's node call may run; the
 	// hibernate op's deadline is this plus 16 seconds per GiB of memory.
+	// It is how long ferund waits: a feosd that reports its hibernations
+	// goes on with one after the call ends, the sandbox is paused until its
+	// end arrives as the pod's event, and a resume meanwhile abandons it
+	// unless it is a drain's or past its point of no return. An older
+	// feosd runs the hibernation in the call, which the deadline cuts.
 	HibernateTimeout time.Duration
 	// ShutdownGrace is how long a stopping instance waits for its requests
 	// and ops (§7). A container deployment sets its termination grace
@@ -311,7 +316,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.IntVar(&c.NodeMaxStreams, "node-max-streams", c.NodeMaxStreams, "HTTP/2 stream limit of a node connection; the stream budgets derive from it")
 	fs.DurationVar(&c.ConnDrainTimeout, "conn-drain-timeout", c.ConnDrainTimeout, "a draining node connection is closed after this at the latest")
 	fs.DurationVar(&c.HibernateTimeout, "hibernate-timeout", c.HibernateTimeout,
-		"how long a hibernate may run (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB")
+		"how long ferund waits for a hibernate (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB, and the node's hibernation goes on after the wait")
 	fs.DurationVar(&c.ShutdownGrace, "shutdown-grace", c.ShutdownGrace,
 		"how long a stopping instance waits for its requests and ops; set a container's termination grace to at least this plus 30s")
 	fs.DurationVar(&c.ActivityRetention, "activity-retention", c.ActivityRetention, "how long activity is kept")

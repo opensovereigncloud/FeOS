@@ -74,6 +74,11 @@ type OpIntent struct {
 	// take over: the begin takes it over or fails with ErrPrecondition,
 	// and never begins an op of its own.
 	takeover uuid.UUID
+	// preempt, when set, is the op id of a hibernate that a resume is to
+	// take the place of, because its node said that a resume abandons the
+	// hibernation now: the begin replaces that op with the resume or fails
+	// with ErrPrecondition, and never begins an op beside it.
+	preempt uuid.UUID
 }
 
 // OpResult is how an op ended: the sandbox's new state, node and
@@ -99,6 +104,14 @@ type OpHandle struct {
 	trigger  OpTrigger
 	target   string
 	takeover bool
+	// preempted is the op id of the hibernate a resume took the place of.
+	preempted uuid.UUID
+	// from is the owner of the op a takeover or a preempt took the place
+	// of, which the begin logs once it has committed.
+	from string
+	// noAbandon: a hibernate's HibernatePod says that a resume may not
+	// abandon the hibernation (a drain's, or one off a draining node).
+	noAbandon bool
 	// deadline is the op's deadline on this instance's clock.
 	deadline time.Time
 	started  time.Time
@@ -278,8 +291,9 @@ func (r *runner) start(ctx context.Context, id uuid.UUID, in OpIntent, wait bool
 // joinable returns this instance's op in flight for the sandbox when the
 // caller may join it instead of beginning one: an op of the incarnation
 // the caller read (the new row of a sandbox deleted and created again
-// never waits for its old row's op), and for a takeover the op it means to
-// take over.
+// never waits for its old row's op), for a takeover the op it means to
+// take over, and for a preempt any op but the hibernate it means to
+// preempt (a resume another caller began in its place is joined).
 func (r *runner) joinable(id uuid.UUID, in OpIntent) *OpHandle {
 	h := r.Running(id)
 	if h == nil {
@@ -289,6 +303,9 @@ func (r *runner) joinable(id uuid.UUID, in OpIntent) *OpHandle {
 		return nil
 	}
 	if in.takeover != uuid.Nil && h.opID != in.takeover {
+		return nil
+	}
+	if in.preempt != uuid.Nil && h.opID == in.preempt {
 		return nil
 	}
 	return h
@@ -420,7 +437,7 @@ func (r *runner) Stop(ctx context.Context) error {
 		return err
 	}
 	if len(ids) > 0 {
-		r.e.log.Info("released the ops of the stopping instance", "instance", r.e.id, "sandboxes", len(ids))
+		r.e.log.Info("released the ops of the stopping instance", "sandboxes", len(ids))
 	}
 	return nil
 }
@@ -521,7 +538,11 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 	case OpPause:
 		_, res.err = pc.SuspendPod(ctx, &podv1.SuspendPodRequest{PodId: id})
 	case OpHibernate:
-		resp, err := pc.HibernatePod(ctx, &podv1.HibernatePodRequest{PodId: id})
+		// The op's id names the call, so that a resume preempts only a
+		// hibernation its own call reached (Ensure), and feosd fails a late
+		// call of a hibernation it abandoned.
+		resp, err := pc.HibernatePod(ctx, &podv1.HibernatePodRequest{PodId: id, RequestId: h.opID.String(),
+			NoAbandon: h.noAbandon})
 		res.err = err
 		if err == nil {
 			res.checkpoint = resp.GetCheckpoint()

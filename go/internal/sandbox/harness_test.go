@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -506,4 +507,148 @@ func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
 	case <-time.After(15 * time.Second):
 		t.Fatalf("not within 15s: %s", what)
 	}
+}
+
+// calls watches the calls of one method of a node, or of one of its script
+// points: it counts them, keeps their requests, and with hold holds the
+// first until release, or until its ctx ends (a hibernation's upload
+// point's ends when a resume abandons it). Later calls pass.
+type calls struct {
+	arrived chan struct{}
+	out     chan struct{}
+	once    sync.Once
+
+	mu   sync.Mutex
+	reqs []any
+}
+
+// watchCalls hooks method on node with a calls; with hold it holds the
+// first call. The test's end releases it.
+func (h *harness) watchCalls(node, method string, hold bool) *calls {
+	c := &calls{arrived: make(chan struct{}), out: make(chan struct{})}
+	h.node(node).Script().SetHook(method, func(ctx context.Context, _ string, req any) error {
+		c.mu.Lock()
+		c.reqs = append(c.reqs, req)
+		first := len(c.reqs) == 1
+		c.mu.Unlock()
+		if !first {
+			return nil
+		}
+		close(c.arrived)
+		if hold {
+			select {
+			case <-c.out:
+			case <-ctx.Done():
+			}
+		}
+		return nil
+	})
+	h.t.Cleanup(c.release)
+	return c
+}
+
+func (c *calls) release() { c.once.Do(func() { close(c.out) }) }
+
+func (c *calls) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.reqs)
+}
+
+// hibernateRequests are the HibernatePodRequests among the calls.
+func (c *calls) hibernateRequests() []*podv1.HibernatePodRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []*podv1.HibernatePodRequest
+	for _, r := range c.reqs {
+		if hr, ok := r.(*podv1.HibernatePodRequest); ok {
+			out = append(out, hr)
+		}
+	}
+	return out
+}
+
+// pausedLong makes a running sandbox on node, paused an hour ago: a
+// hibernate-after's recheck passes.
+func (h *harness) pausedLong(node string) store.Sandbox {
+	h.t.Helper()
+	sb := h.running(512)
+	if sb.Node != node {
+		h.t.Fatalf("placed on %s, not %s", sb.Node, node)
+	}
+	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: node})
+	h.exec("UPDATE sandboxes SET paused_at = now() - interval '1 hour' WHERE id = $1", sb.ID)
+	return h.row(sb.ID)
+}
+
+// hibernatingAtUpload makes a paused sandbox on node and begins its
+// hibernate on the first instance, as hibernate-after does; the node holds
+// the hibernation at its upload, where a resume abandons it (upload
+// releases it).
+func (h *harness) hibernatingAtUpload(node string) (sb store.Sandbox, hd *OpHandle, upload *calls) {
+	h.t.Helper()
+	sb = h.pausedLong(node)
+	upload = h.watchCalls(node, testnode.HibernateUpload, true)
+	hd, err := h.begin(sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerHibernateAfter, Target: node})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	waitClosed(h.t, upload.arrived, "the hibernation's upload")
+	return h.row(sb.ID), hd, upload
+}
+
+// hibernation is the hibernation in flight that node reports of the pod;
+// nil without one.
+func (h *harness) hibernation(node string, id uuid.UUID) *podv1.Hibernation {
+	h.t.Helper()
+	info, err := h.pods(node).GetPod(bg, &podv1.GetPodRequest{PodId: id.String()})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return info.GetHibernation()
+}
+
+// wantHibernation checks the hibernation in flight that node reports of
+// the pod.
+func (h *harness) wantHibernation(node string, id uuid.UUID, phase podv1.HibernationPhase, abandonable bool, requestIDs ...string) {
+	h.t.Helper()
+	hb := h.hibernation(node, id)
+	if hb == nil || hb.GetPhase() != phase || hb.GetAbandonable() != abandonable {
+		h.t.Fatalf("hibernation %v, want phase %s, abandonable %v", hb, phase, abandonable)
+	}
+	for _, r := range requestIDs {
+		if !slices.Contains(hb.GetRequestIds(), r) {
+			h.t.Fatalf("hibernation %v lacks the request id %s", hb, r)
+		}
+	}
+}
+
+// runOrigin waits for the start of the sandbox's open run in the activity
+// log and returns its origin.
+func (h *harness) runOrigin(id uuid.UUID) string {
+	h.t.Helper()
+	run := h.row(id).RunID
+	if run == "" {
+		h.t.Fatalf("sandbox %s has no open run", id)
+	}
+	var origin string
+	eventually(h.t, 10*time.Second, "the run's start recorded", func() bool {
+		err := h.d.Pool.QueryRow(bg, `SELECT detail->>'origin' FROM activity WHERE kind = 'run_start' AND span_id = $1`,
+			run).Scan(&origin)
+		return err == nil
+	})
+	return origin
+}
+
+// activityNamed waits until the sandbox's activity has a row of kind named
+// name, and returns its detail.
+func (h *harness) activityNamed(id uuid.UUID, kind, name string) map[string]any {
+	h.t.Helper()
+	var detail map[string]any
+	eventually(h.t, 10*time.Second, fmt.Sprintf("activity %s %q", kind, name), func() bool {
+		err := h.d.Pool.QueryRow(bg, `SELECT detail FROM activity WHERE sandbox_id = $1 AND kind = $2 AND name = $3`,
+			id, kind, name).Scan(&detail)
+		return err == nil
+	})
+	return detail
 }

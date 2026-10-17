@@ -8,9 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
 // hibernatedOn makes a sandbox that is hibernated with its record on node.
@@ -195,6 +199,115 @@ func TestFencedOutCheckpointMerge(t *testing.T) {
 	}
 	if ts := h.tombstones(sb.ID); len(ts) != 0 {
 		t.Fatalf("a hibernate wrote tombstones %+v", ts)
+	}
+
+	// A hibernate that a resume preempted after its hibernation had reached
+	// its head: the row is the resume's, running on the node, and the
+	// checkpoint the pod was restored from is merged into it. On another
+	// node it is not.
+	h.exec("INSERT INTO nodes (name, status) VALUES ('far', 'ready')")
+	for _, c := range []struct {
+		node   string
+		merged bool
+	}{{"n1", true}, {"far", false}} {
+		sb := h.running(512)
+		h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
+		arrived, release := h.gate("n1", podv1.PodService_HibernatePod_FullMethodName)
+		hd, err := h.begin(sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerExplicit, Target: "n1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitClosed(t, arrived, "the hibernation's call")
+		h.exec(`UPDATE sandboxes SET op = '', op_id = NULL, op_owner = '', op_deadline = NULL, op_target = '',
+			op_from_state = '', client_state = 'running', node = $2, gen = gen + 1 WHERE id = $1`, sb.ID, c.node)
+		release()
+		if res, err := hd.Wait(ctx); err != nil || !res.fenced {
+			t.Fatalf("fenced finish on %s %+v %v", c.node, res, err)
+		}
+		row := h.row(sb.ID)
+		if merged := row.CheckpointHead != "" && row.CheckpointEpoch > 0 && row.CheckpointStore == h.objs.ID(); merged != c.merged {
+			t.Fatalf("row on %s after the fenced finish (merged %v): %+v", c.node, c.merged, row)
+		}
+	}
+}
+
+// TestEnsurePreemptsADeadOwnersHibernate: a dead owner's hibernate that a
+// resume abandons now is preempted rather than taken over: no HibernatePod
+// is sent again, the dead owner's call (still at the node) is answered
+// ABORTED, and the sandbox runs from its snapshot.
+func TestEnsurePreemptsADeadOwnersHibernate(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	sb := h.pausedLong("n1")
+	h.settle(sb.ID)
+	h.deadInstance("gone")
+	row := h.opOfDeadOwner(sb, OpHibernate, "gone")
+	upload := h.watchCalls("n1", testnode.HibernateUpload, true)
+	pc := h.pods("n1")
+	call := make(chan error, 1)
+	go func() {
+		_, err := pc.HibernatePod(bg, &podv1.HibernatePodRequest{PodId: sb.ID.String(), RequestId: row.OpID.String()})
+		call <- err
+	}()
+	waitClosed(t, upload.arrived, "the dead owner's upload")
+	calls := h.watchCalls("n1", podv1.PodService_HibernatePod_FullMethodName, false)
+	if lease := h.ensure(sb.ID); lease.Node != "n1" {
+		t.Fatalf("lease %+v", lease)
+	}
+	if calls.count() != 0 {
+		t.Fatalf("%d HibernatePods sent again", calls.count())
+	}
+	select {
+	case err := <-call:
+		if status.Code(err) != codes.Aborted || status.Convert(err).Message() != abandoned(sb.ID) {
+			t.Fatalf("the dead owner's call: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the dead owner's call was not answered")
+	}
+	h.activityNamed(sb.ID, "lifecycle_start", "resume on node n1 (abandons the hibernate of instance gone)")
+	after := h.row(sb.ID)
+	wantState(t, after, model.StateRunning)
+	if after.Op != "" || after.CheckpointHead != "" {
+		t.Fatalf("row %+v", after)
+	}
+	h.podState("n1", sb.ID, podv1.PodState_POD_STATE_RUNNING)
+}
+
+// TestPreemptRollback: a preempting resume that gets no connection to its
+// node after its begin sent nothing, and the hibernate it took the place
+// of goes on at the node: the row is unknown, on its node, booked; a Sync
+// resolves it (paused while the pod hibernates), and the hibernation's end
+// reaches the row.
+func TestPreemptRollback(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	sb, hd, upload := h.hibernatingAtUpload("n1")
+	h.failNextOp(nil)
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	_, err := h.eng().Ensure(ctx, sb.ID)
+	wantErr(t, err, model.ErrNodeUnavailable, "node n1 is not connected to instance i1")
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateUnknown)
+	if row.Node != "n1" ||
+		row.StatusDescription != "node n1 is not connected to instance i1; the hibernate the resume was to abandon goes on" {
+		t.Fatalf("row after the preempt's rollback %+v", row)
+	}
+	if b, ok := h.booking(sb.ID); !ok || b.Node != "n1" {
+		t.Fatal("the booking went")
+	}
+	h.wantHibernation("n1", sb.ID, podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK, true, hd.opID.String())
+	if err := h.eng().Sync(bg, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	wantState(t, h.row(sb.ID), model.StatePaused)
+	upload.release()
+	if res, err := hd.Wait(ctx); err != nil || !res.fenced {
+		t.Fatalf("the hibernate's end %+v %v", res, err)
+	}
+	if after := h.waitState(sb.ID, model.StateHibernated, 15*time.Second); after.CheckpointHead == "" {
+		t.Fatalf("hibernated without a checkpoint %+v", after)
 	}
 }
 

@@ -6,6 +6,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -414,5 +415,59 @@ func TestEnsureHibernateEndsAtTheBound(t *testing.T) {
 				t.Fatalf("round %d (the budget ended: %v): a hibernate that ended gave %v", i, budget, err)
 			}
 		}
+	}
+}
+
+// TestEnsurePreemptsHibernate: Ensure meeting a hibernate of this instance
+// whose node says that a resume abandons it now begins a resume in its
+// place: the sandbox runs again on its node, from its snapshot, well
+// within the hibernate wait; the hibernate ends fenced out ("abandoned")
+// and writes nothing.
+func TestEnsurePreemptsHibernate(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	sb, hd, upload := h.hibernatingAtUpload("n1")
+	h.wantHibernation("n1", sb.ID, podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK, true, hd.opID.String())
+	if reqs := upload.hibernateRequests(); len(reqs) != 1 || reqs[0].GetRequestId() != hd.opID.String() || reqs[0].GetNoAbandon() {
+		t.Fatalf("the hibernate's request %v", reqs)
+	}
+	lease, took, err := ensureFor(e, sb.ID, time.Minute)
+	if err != nil || lease.Node != "n1" {
+		t.Fatalf("ensure: %+v %v", lease, err)
+	}
+	if took > e.t.hibernateWait/3 {
+		t.Fatalf("the preempt took %v", took)
+	}
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	if res, err := hd.Wait(ctx); err != nil || !res.fenced {
+		t.Fatalf("the preempted hibernate's end %+v %v", res, err)
+	}
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateRunning)
+	if row.Op != "" || row.CheckpointHead != "" || row.CheckpointEpoch != 0 || row.Node != "n1" {
+		t.Fatalf("row after the preempt %+v", row)
+	}
+	if b, ok := h.booking(sb.ID); !ok || b.Node != "n1" || !b.Gated {
+		t.Fatalf("booking after the preempt %+v %v", b, ok)
+	}
+	if origin := h.runOrigin(sb.ID); origin != "snapshot" {
+		t.Fatalf("run origin %q", origin)
+	}
+	start := h.activityNamed(sb.ID, "lifecycle_start", "resume on node n1 (abandons the hibernate of instance i1)")
+	if start["abandons"] != hd.opID.String() || start["from"] != model.StatePaused || start["trigger"] != string(TriggerEnsure) {
+		t.Fatalf("the preempt's start %v", start)
+	}
+	end := h.activityNamed(sb.ID, "lifecycle_end", "hibernate on node n1: abandoned")
+	if errText, _ := end["error"].(string); !strings.Contains(errText, "its hibernation was abandoned") {
+		t.Fatalf("the hibernate's end %v", end)
+	}
+	info := h.podState("n1", sb.ID, podv1.PodState_POD_STATE_RUNNING)
+	if info.GetHibernation() != nil || info.GetCheckpoint().GetHeadKey() != "" {
+		t.Fatalf("pod after the preempt %v", info)
+	}
+	if upload.count() != 1 {
+		t.Fatalf("%d hibernations", upload.count())
 	}
 }

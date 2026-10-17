@@ -92,6 +92,10 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 			return model.ErrNotFound
 		}
 		if row.Op != "" {
+			if in.preempt != uuid.Nil {
+				h, events, err = r.preemptHibernate(ctx, tx, row, in, target)
+				return err
+			}
 			if in.takeover != uuid.Nil && row.OpID != in.takeover {
 				return errorf(model.ErrPrecondition, "sandbox %s: the op to take over ended", id)
 			}
@@ -101,11 +105,20 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 		if in.takeover != uuid.Nil {
 			return errorf(model.ErrPrecondition, "sandbox %s: the op to take over ended", id)
 		}
+		if in.preempt != uuid.Nil {
+			return preemptEnded(id)
+		}
 		if e.beginHook != nil {
 			e.beginHook(ctx, id, in.Kind)
 		}
 		if err := r.precheck(ctx, tx, row, in, target); err != nil {
 			return err
+		}
+		noAbandon := false
+		if in.Kind == OpHibernate {
+			if noAbandon, err = r.noAbandon(ctx, tx, in.Trigger, target); err != nil {
+				return err
+			}
 		}
 		if admits(in.Kind) {
 			if err := e.claim(ctx, tx, row, in.Kind, target); err != nil {
@@ -180,6 +193,7 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 		h = r.newHandle(written, in.Kind, in.Trigger, target, d)
 		h.read.state, h.read.node, h.read.lostFrom, h.read.materialised = row.ClientState, row.Node, row.LostFrom, row.Materialised
 		h.tombstones = tombs
+		h.noAbandon = noAbandon
 		events = append(events, h.startEvent(row))
 		return nil
 	})
@@ -187,6 +201,14 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 		return nil, err
 	}
 	e.record(events...)
+	// Logged once committed: InTx may run the closure again, and a
+	// transaction that does not commit took nothing over.
+	switch {
+	case h.preempted != uuid.Nil:
+		e.log.Info("preempted a hibernate", "sandbox", id, "node", h.target, "owner", h.from, "hibernate", h.preempted)
+	case h.takeover:
+		e.log.Info("took over an op", "sandbox", id, "op", string(h.kind), "target", h.target, "from", h.from)
+	}
 	return h, nil
 }
 
@@ -226,6 +248,19 @@ func (r *runner) takeover(ctx context.Context, tx *store.Store, row store.Sandbo
 		return nil, nil, err
 	}
 	kind := OpKind(row.Op)
+	// The trigger of the op taken over is not in the row: a hibernate
+	// taken over on a draining node is a drain's, which a resume never
+	// abandons. feosd keeps a hibernation unabandonable once any of its
+	// calls said so, so a takeover on a node that drains no more cannot
+	// make a drain's abandonable while it runs.
+	noAbandon := false
+	if kind == OpHibernate {
+		n, err := tx.GetNode(ctx, row.OpTarget)
+		if err != nil && !errors.Is(err, store.ErrNoRow) {
+			return nil, nil, err
+		}
+		noAbandon = err == nil && n.Draining
+	}
 	d := r.e.t.opDeadline(kind, row.MemoryMiB)
 	after := row
 	after.OpID, after.OpOwner, after.OpDeadline = uuid.New(), r.e.id, now.Add(d)
@@ -235,11 +270,80 @@ func (r *runner) takeover(ctx context.Context, tx *store.Store, row store.Sandbo
 	}
 	h := r.newHandle(written, kind, trigger, row.OpTarget, d)
 	h.takeover = true
+	h.from = row.OpOwner
+	h.noAbandon = noAbandon
 	h.read.state, h.read.node, h.read.lostFrom, h.read.materialised = row.OpFromState, row.Node, row.LostFrom, row.Materialised
 	ev := h.startEvent(row)
 	ev.Name = fmt.Sprintf("%s on node %s (taken over from instance %s)", kind, row.OpTarget, row.OpOwner)
-	r.e.log.Info("took over an op", "sandbox", row.ID, "op", row.Op, "target", row.OpTarget, "from", row.OpOwner)
 	return h, []activity.Event{ev}, nil
+}
+
+// preemptHibernate begins a resume in the place of the hibernate in flight
+// in row, whose node said that a resume abandons the hibernation now
+// (Ensure's preempt): one transaction replaces the row's op with the
+// resume, admitted and booked on the sandbox's node as any resume, owned by
+// this instance. The hibernate's owner is not looked at (this instance, a
+// live one or a dead one): its op is fenced out by its op id, and its
+// finish writes nothing but a newer checkpoint. A row whose hibernate
+// ended, or is not a paused sandbox's on its node, fails with
+// ErrPrecondition; a refused admission is the *refusal.
+func (r *runner) preemptHibernate(ctx context.Context, tx *store.Store, row store.Sandbox, in OpIntent,
+	target string) (*OpHandle, []activity.Event, error) {
+	e := r.e
+	if row.OpID != in.preempt || OpKind(row.Op) != OpHibernate || row.ClientState != model.StateHibernating ||
+		row.OpFromState != model.StatePaused || row.Node != target || row.OpTarget != target {
+		return nil, nil, preemptEnded(row.ID)
+	}
+	if err := e.claim(ctx, tx, row, OpResume, target); err != nil {
+		return nil, nil, err
+	}
+	if err := tx.UpsertBooking(ctx, store.Booking{PodID: row.ID, Node: target, VCPUs: row.VCPUs,
+		MemoryMiB: row.MemoryMiB, Gated: true}); err != nil {
+		return nil, nil, err
+	}
+	now, err := tx.Now(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	d := e.t.opDeadline(OpResume, row.MemoryMiB)
+	after := row
+	after.Op, after.OpID, after.OpOwner = string(OpResume), uuid.New(), e.id
+	after.OpDeadline, after.OpTarget, after.OpFromState = now.Add(d), target, model.StatePaused
+	after.ClientState = transitional(OpResume)
+	after.StatusDescription = ""
+	written, err := tx.UpdateSandbox(ctx, row, after)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := e.syncBooking(ctx, tx, row, written, false); err != nil {
+		return nil, nil, err
+	}
+	h := r.newHandle(written, OpResume, in.Trigger, target, d)
+	h.preempted, h.from = row.OpID, row.OpOwner
+	h.read.state, h.read.node, h.read.lostFrom, h.read.materialised = model.StatePaused, row.Node, row.LostFrom, row.Materialised
+	ev := h.startEvent(row)
+	ev.Name = fmt.Sprintf("%s on node %s (abandons the hibernate of instance %s)", OpResume, target, row.OpOwner)
+	ev.Detail["from"] = model.StatePaused
+	ev.Detail["abandons"] = row.OpID.String()
+	return h, []activity.Event{ev}, nil
+}
+
+// preemptEnded is the begin's answer when the hibernate a resume was to
+// preempt is no longer the row's op.
+func preemptEnded(id uuid.UUID) error {
+	return errorf(model.ErrPrecondition, "sandbox %s: the hibernate to preempt ended", id)
+}
+
+// noAbandon reports whether a fresh hibernate's call tells feosd that a
+// resume may not abandon the hibernation: a drain's (drain, drain_forced),
+// Ensure's off a draining node (read in the begin's transaction; not one
+// begun because the node had no room for a resume), and an explicit one.
+// A hibernate-after's is abandoned by the next resume.
+func (r *runner) noAbandon(ctx context.Context, tx *store.Store, trigger OpTrigger, target string) (bool, error) {
+	if trigger == TriggerExplicit {
+		return true, nil
+	}
+	return r.drainHibernate(ctx, tx, trigger, target)
 }
 
 // precheck is begin step 3: the op's preconditions on the locked row, then

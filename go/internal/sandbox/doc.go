@@ -13,18 +13,28 @@
 // finished in another transaction that applies what the node did. An op's
 // node calls never run on the caller's context: they keep running when the
 // caller gives up, until the op's deadline, because feosd cuts a mutating
-// pod call whose request is cancelled at an arbitrary point. An op whose
-// owner died or stops is taken over by another instance; a finish that
-// finds the op no longer its own writes nothing but a tombstone for a pod
-// it may have made, or a newer checkpoint.
+// pod call whose request is cancelled at an arbitrary point. HibernatePod
+// is the exception on a feosd that reports its hibernations
+// (PodInfo.hibernation): it runs the hibernation in a task of its own,
+// which outlives its call, so a hibernate op's deadline
+// (--hibernate-timeout) is how long ferund waits for it, and its end
+// arrives as the pod's event; an older feosd runs it in the call, which
+// the deadline cuts. An
+// op whose owner died or stops is taken over by another instance; a finish
+// that finds the op no longer its own writes nothing but a tombstone for a
+// pod it may have made, or a newer checkpoint.
 //
 // Around the ops:
 //   - Ensure brings a sandbox to running before a tool call, a forward or a
 //     resume: it places it (the old placement algorithm with the gates of
 //     §9), resolves and pins its image, and starts or joins the ops that
-//     its state needs. A hibernate in flight, which takes minutes, it waits
-//     for only briefly and then tells its caller to come back (ErrBusy).
-//     Acquire holds it awake while a call runs.
+//     its state needs. A hibernate in flight that a resume abandons now, by
+//     its node's word, it preempts: a resume op takes the hibernate's
+//     place, and the sandbox resumes from its snapshot on the node. A
+//     drain's hibernate is never abandoned. Another hibernate in flight,
+//     which takes minutes, it waits for only briefly and then tells its
+//     caller to come back (ErrBusy). Acquire holds it awake while a call
+//     runs.
 //   - Sync and ReconcileNode apply what a node reports to the rows: Sync
 //     one sandbox after a pod event, ReconcileNode a node's whole inventory
 //     against a snapshot of the rows taken before it was listed.

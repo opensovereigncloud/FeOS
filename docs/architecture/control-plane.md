@@ -90,7 +90,7 @@ that.
 | `--node-cert-ttl`, `--pod-cert-ttl` | `168h`, `1h` | the certificates' lifetimes; renewed at three quarters |
 | `--node-max-streams` | 1024 | the HTTP/2 stream limit nodes advertise on a node connection; the stream budgets derive from it |
 | `--conn-drain-timeout` | `20m` | a draining node connection is closed after this at the latest |
-| `--hibernate-timeout` | `1h` | how long a hibernation may run, plus 16 s per GiB of memory |
+| `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
 | `--shutdown-grace` | `10m` | how long a stopping instance waits for its requests and ops |
 | `--activity-retention`, `--traffic-retention` | `720h`, `168h` | how long activity and traffic records are kept |
 | `--log-level` | `info` | |
@@ -518,7 +518,7 @@ finished in another transaction that applies what the node did.
 |---|---|---|---|---|
 | create | pending | creating | CreatePod | 7 min 5 s |
 | start | stopped, failed | creating | StartPod | 7 min 5 s |
-| resume | paused | resuming | ResumePod | 2 min + 2 s/GiB |
+| resume | paused; hibernating, in the place of a hibernate that a resume abandons | resuming | ResumePod | 7 min 5 s + 8 s/GiB |
 | restore | hibernated | creating | RestorePod of the checkpoint | 7 min 5 s + 8 s/GiB |
 | pause | running | pausing | SuspendPod | 2 min + 4 s/GiB |
 | hibernate | paused; stopped, failed and running when draining | hibernating | HibernatePod | `--hibernate-timeout` + 16 s/GiB |
@@ -526,15 +526,30 @@ finished in another transaction that applies what the node did.
 
 GiB is the sandbox's memory, rounded up. A hibernation uploads the pod's
 disk and memory to the object store and takes minutes per GiB, hence its
-own timeout.
+own timeout. A feosd that reports its hibernations ([Follow-ups for
+feosd](#follow-ups-for-feosd), item 2) runs one in a task of its own,
+which a `HibernatePod` that comes meanwhile joins and which a cancelled
+call or a dropped connection never stops, so the timeout is how long
+ferund waits: past it the pod is still suspended, the sandbox `paused`
+("hibernation failed: …"), and the hibernation's end arrives as the
+pod's event, unless a resume abandons it first. A hibernate released by
+a stopping instance goes on the same way, and the next Ensure resumes
+the sandbox. An older feosd runs the hibernation in its call, which the
+deadline, or a stopping instance that drops it, cuts at an arbitrary
+point: there the timeout is how long a hibernation may run. A resume
+has a restore's deadline: a `ResumePod` that meets a hibernation it
+cannot abandon waits for it, then restores the pod from the new
+checkpoint inside the call.
 
 - **Detached.** An op's node calls never run on its caller's context:
   they keep the caller's values but not its cancellation, and end at the
   op's deadline. A client hanging up, an MCP cancellation or the end of a
-  leader term never cuts them, because today's feosd stops a mutating pod
-  call at an arbitrary point when its request is cancelled. Callers wait
-  on the op and may stop waiting; the op goes on. One op per sandbox runs
-  on an instance at a time.
+  leader term never cuts them, because feosd stops a mutating pod call
+  (other than `HibernatePod` on a feosd that reports its hibernations) at
+  an arbitrary point when its request is cancelled. Callers wait on the
+  op and may stop waiting; the op goes on. An instance runs one op per
+  sandbox at a time, except that a hibernate a resume preempted runs on,
+  fenced out, until its call answers.
 - **Before begin.** An op on the node the sandbox is on (start, resume,
   pause, hibernate, repair, a takeover) first waits for this instance's
   connection to that node, up to `--node-wait` or the node's rollout
@@ -549,32 +564,56 @@ own timeout.
   that the sandbox is still idle and holds nothing; a pause for a drain
   only that nothing executes or forwards; an explicit pause nothing. An
   admission locks the target node's row, rechecks the gates and books.
+- **Preempt.** A hibernate of a paused sandbox that a resume abandons now
+  is replaced by a resume, in one transaction under the row's lock: the
+  resume gets a new op ID, this instance as its owner and its own
+  deadline, and is admitted and booked as any resume. Its `ResumePod`
+  makes feosd abandon the hibernation, which stops at its next step and
+  answers `ABORTED`, and the pod resumes on its node from its snapshot;
+  what was uploaded stays in the object store, named by no head. Whoever
+  owned the hibernate, its op is fenced out by its ID: its finish writes
+  nothing but a newer checkpoint, and its activity ends "abandoned".
+  Every `HibernatePod` carries its op's ID as `request_id`, and feosd
+  reports a hibernation in flight in `PodInfo.hibernation`: its phase,
+  whether a resume abandons it now, and the request IDs of the calls in
+  it. Only Ensure preempts, and only a hibernation that its op's own call
+  has reached; feosd would otherwise start that call's hibernation anew
+  behind the resume, and answers `ABORTED` to a late call of a
+  hibernation it abandoned. A drain's hibernate, Ensure's off a draining
+  node and a takeover's on a draining node send `no_abandon`, which feosd
+  keeps for the hibernation's whole run: a resume waits for these, and
+  the admission refuses a resume on a draining node anyway. A preempting
+  resume that reaches no connection leaves `unknown`, "node <n> is not
+  connected to instance <i>; the hibernate the resume was to abandon goes
+  on", for a sync to resolve.
 - **Call and settle.** After the call, also after its error, the op reads
   the pod and waits while it is pending, on its event stream with a read
   every 5 s, until the deadline. `UNAVAILABLE` and `RESOURCE_EXHAUSTED`
   while waiting are transient. Call errors are never mapped to a state
   directly: the pod read after them decides.
 - **Finish** is retried until it commits. An op that is no longer the
-  row's (taken over, or the row deleted or re-created meanwhile) writes
-  only a tombstone for a pod it may have made, or a newer checkpoint. A
+  row's (taken over, preempted, or the row deleted or re-created
+  meanwhile) writes only a tombstone for a pod it may have made, or a
+  newer checkpoint into the row on its node, in any state. A
   rollback, when this run reached no connection and sent nothing, puts
   the row back as the begin found it; after a takeover, which cannot know
   what the first owner sent, it leaves `unknown`.
 
 | Observed on the target | Becomes |
 |---|---|
-| ours, running | `running`; a run opens; a failed pause lands here too |
+| ours, running | `running`; a run opens, restored from the checkpoint when a resume brought the pod back from a newer one; a failed pause lands here too |
 | ours, pending at the deadline | `creating`, "still starting on node <n> after <d>" |
-| ours, suspended | `paused`; a failed hibernation lands here too |
+| ours, suspended | `paused`; a failed hibernation lands here too, and one that a resume from elsewhere abandoned ("hibernation abandoned for a resume") |
 | ours, hibernated | `hibernated`, with the checkpoint (never an older one) |
 | ours, stopped or failed | `stopped` or `failed`, with the pod's reason |
 | not ours | a tombstone for that pod, then as not found |
 | not found | `hibernated` without a node when there is a checkpoint; `lost` when the pod existed; else `pending`, and a node where the create failed is avoided next time |
 | no answer until the deadline | `unknown`, "outcome unknown"; a sync resolves it |
 
-A repair that restarts a pod, and a start, resume or restore that came up
-with a cold boot, end the sandbox's process holds; a repair that found the
-pod healthy and made no call ends nothing.
+A newer checkpoint that our pod reports is taken in every state, here and
+by Sync, never an older one. A repair that restarts a pod, and a start,
+resume or restore that came up with a cold boot, end the sandbox's process
+holds; a repair that found the pod healthy and made no call ends nothing.
 
 **Stale ops.** The leader takes over the op of an instance that died or
 stops, when it is connected to the op's node; otherwise it releases the
@@ -592,13 +631,18 @@ paused one resumed on its node, or hibernated and restored elsewhere when
 its node has no room or drains; a hibernated one placed and restored; a
 stopped or failed one started; an `unknown` one synced. A running sandbox
 on a draining node is moved first. A `lost` one is synced once, in case
-its node came back with the pod, then "sandbox lost". A hibernation in
-flight is waited for at most 30 s; after that the caller gets "sandbox
-<id> is hibernating; retry in a minute", and a later call restores the
-sandbox. Ensure starts at most one op of each kind per node per call, and
-returns the error of an op that failed instead of trying again: "<op> on
-node <n> failed: <description>". Every error of Ensure reaches the client
-as `ensure sandbox: <error>`.
+its node came back with the pod, then "sandbox lost". A hibernate in
+flight that a resume abandons now is preempted ([Ops](#ops)), and the
+sandbox resumes on its node; while the node's answer may still change (no
+hibernation reported yet, the op's call not in it yet, no answer), Ensure
+asks again every second. Any other hibernation in flight (a drain's, one
+past its point of no return, every one on a feosd that does not report
+its hibernations) is waited for at most 30 s; after that the caller gets
+"sandbox <id> is hibernating; retry in a minute", and a later call
+restores the sandbox. Ensure starts at most one op of each kind per node
+per call, and returns the error of an op that failed instead of trying
+again: "<op> on node <n> failed: <description>". Every error of Ensure
+reaches the client as `ensure sandbox: <error>`.
 
 `Acquire` is Ensure and a **hold**: a row in `sandbox_holds` that keeps
 the sandbox from being paused while a call or a forward runs, leased for
@@ -672,8 +716,9 @@ use) or `lost`; no tombstone is written, since the pod may still run, and
 a returning node's pod is adopted. Idle pause, hibernate-after, drain and
 repair begin ops as their triggers; a drain hibernates what is paused,
 pauses and hibernates what runs without execs or forwards, and after
-`--drain-timeout` cancels the execs and moves the rest regardless. A
-node without an object store cannot be drained.
+`--drain-timeout` cancels the execs and moves the rest regardless; a
+resume never abandons its hibernations. A node without an object store
+cannot be drained.
 
 ### Delete
 
@@ -1026,8 +1071,12 @@ changes to feosd it relies on or improves with:
    acknowledged.
 2. **Mutating pod calls in a task of their own**, which the request awaits,
    so that a cancelled call or a dropped connection never cuts them: the
-   prerequisite of ADR 0015's "retry on `UNAVAILABLE`". Until then ferund
-   never cancels them and repairs stuck pods.
+   prerequisite of ADR 0015's "retry on `UNAVAILABLE`". Built for
+   `HibernatePod` ([ADR 0008](../adr/0008-suspend-and-restore.md)),
+   together with `PodInfo.hibernation` and the abandon by `ResumePod` that
+   the preempt relies on; a feosd without it reports no hibernation, and
+   Ensure waits for its hibernates as before. The other calls still run in
+   their request: ferund never cancels them and repairs stuck pods.
 3. **Port forwarding for pods** is built: feosd forwards
    `feos.portforward.v1.PortForwardService` to a pod's guest. The codes
    stay as they are, both "nothing listens" and "the guest is unreachable"

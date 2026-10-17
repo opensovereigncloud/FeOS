@@ -40,7 +40,9 @@ type Config struct {
 	PendingRepairAfter, UnreachableRepairAfter                   time.Duration
 	// HibernateTimeout is how long a hibernate's node call may run
 	// (--hibernate-timeout): the hibernate op's deadline is this plus 16
-	// seconds per GiB of memory.
+	// seconds per GiB of memory. It is how long ferund waits: a feosd that
+	// runs the hibernation in a task of its own goes on after the call
+	// ends, and its end arrives as the pod's event.
 	HibernateTimeout time.Duration
 	Log              *slog.Logger
 }
@@ -127,6 +129,12 @@ type timings struct {
 	// before it tells its caller to come back (ErrBusy): a hibernation
 	// uploads the pod's disk and memory and takes minutes.
 	hibernateWait time.Duration
+	// preemptRecheck is how often Ensure asks the node again whether a
+	// resume would abandon the hibernate it waits for, while the answer
+	// may still change (no hibernation on the node yet, the op's call not
+	// in it yet, the node did not answer); preemptGet bounds one such
+	// GetPod.
+	preemptRecheck, preemptGet time.Duration
 }
 
 // defaultTimings are the timings of an instance whose hibernates may run
@@ -156,6 +164,9 @@ func defaultTimings(hibernateTimeout time.Duration) timings {
 		touchEvery:    time.Second,
 		waitPoll:      db.DefaultPoll,
 		hibernateWait: 30 * time.Second,
+
+		preemptRecheck: time.Second,
+		preemptGet:     5 * time.Second,
 	}
 }
 
@@ -172,15 +183,17 @@ func OpDeadline(kind OpKind, memoryMiB int) time.Duration {
 }
 
 // deadlineFor is OpDeadline with the instance's hibernate timeout: a
-// hibernate's deadline is hibernateTimeout plus 16 seconds per GiB.
+// hibernate's deadline is hibernateTimeout plus 16 seconds per GiB. A
+// resume has the restore's: a ResumePod that meets a hibernation it cannot
+// abandon (past its point of no return, a drain's, a pod without memory)
+// waits for it and then restores the pod from the new checkpoint, inside
+// the call.
 func deadlineFor(kind OpKind, memoryMiB int, hibernateTimeout time.Duration) time.Duration {
 	g := gib(memoryMiB)
 	switch kind {
 	case OpCreate, OpStart:
 		return PreparationBudget
-	case OpResume:
-		return 2*time.Minute + 2*time.Second*g
-	case OpRestore, OpRepair:
+	case OpResume, OpRestore, OpRepair:
 		return PreparationBudget + 8*time.Second*g
 	case OpPause:
 		return 2*time.Minute + 4*time.Second*g

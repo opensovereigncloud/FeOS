@@ -79,8 +79,13 @@ func (r *runner) finishOnce(ctx context.Context, h *OpHandle, res callResult, ob
 		}
 		if gone || row.Incarnation != h.inc || row.OpID != h.opID {
 			result, ac, events, err = r.fencedOut(ctx, tx, h, row, gone, res, obs)
-			// The op's span ends without a state of its own.
-			events = append(events, h.endEvent(store.Sandbox{Owner: h.row.Owner, ClientState: "fenced out"}, res))
+			// The op's span ends without a state of its own; a hibernate
+			// whose node abandoned it for a resume says so.
+			label := "fenced out"
+			if h.kind == OpHibernate && grpcCode(res.err) == codes.Aborted {
+				label = "abandoned"
+			}
+			events = append(events, h.endEvent(store.Sandbox{Owner: h.row.Owner, ClientState: label}, res))
 			return err
 		}
 		c, err := e.newChange(ctx, tx, row)
@@ -108,7 +113,10 @@ func (r *runner) finishOnce(ctx context.Context, h *OpHandle, res callResult, ob
 // step 2): it writes a tombstone for a pod a create, start, resume,
 // restore or repair may have made for a row that is gone, of another
 // incarnation, or placed elsewhere; or merges a checkpoint newer than the
-// row's into a row hibernating or hibernated on the target. Nothing else.
+// row's into a row on the target, in any state. Nothing else: a hibernate
+// that a resume preempted leaves the resume's row as it is, unless its
+// hibernation reached its head first, whose checkpoint the pod then
+// restored from.
 func (r *runner) fencedOut(ctx context.Context, tx *store.Store, h *OpHandle, row store.Sandbox, gone bool,
 	res callResult, obs observation) (OpResult, afterCommit, []activity.Event, error) {
 	result := OpResult{fenced: true}
@@ -132,17 +140,22 @@ func (r *runner) fencedOut(ctx context.Context, tx *store.Store, h *OpHandle, ro
 	if gone || row.Incarnation != h.inc {
 		return result, ac, nil, nil
 	}
-	cp := res.checkpoint
-	if obs.ours(h.inc) && obs.state() == podv1.PodState_POD_STATE_HIBERNATED && obs.info.GetCheckpoint().GetHeadKey() != "" {
-		cp = obs.info.GetCheckpoint()
+	cps := []*podv1.Checkpoint{res.checkpoint}
+	if obs.ours(h.inc) {
+		cps = append(cps, obs.info.GetCheckpoint())
 	}
-	if cp.GetHeadKey() != "" && int64(min(cp.GetEpoch(), 1<<63-1)) > row.CheckpointEpoch && row.Node == h.target &&
-		(row.ClientState == model.StateHibernating || row.ClientState == model.StateHibernated) {
+	newer := false
+	for _, cp := range cps {
+		newer = newer || (cp.GetHeadKey() != "" && int64(min(cp.GetEpoch(), 1<<63-1)) > row.CheckpointEpoch)
+	}
+	if newer && row.Node == h.target {
 		c, err := r.e.newChange(ctx, tx, row)
 		if err != nil {
 			return OpResult{}, ac, nil, err
 		}
-		c.mergeCheckpoint(cp, h.target)
+		for _, cp := range cps {
+			c.mergeCheckpoint(cp, h.target)
+		}
 		written, err := tx.UpdateSandbox(ctx, row, c.after)
 		if err != nil {
 			return OpResult{}, ac, nil, err
@@ -180,7 +193,14 @@ func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle) (OpResult, after
 		}
 		a := &c.after
 		clearOp(a)
-		if !h.takeover {
+		switch {
+		case h.preempted != uuid.Nil:
+			// The hibernate it took the place of goes on at the node, its
+			// op fenced out: what the pod is decides.
+			a.ClientState = model.StateUnknown
+			a.StatusDescription = fmt.Sprintf("node %s is not connected to instance %s; the hibernate the resume was to abandon goes on",
+				h.target, e.id)
+		case !h.takeover:
 			a.ClientState, a.Node, a.LostFrom, a.Materialised = h.read.state, h.read.node, h.read.lostFrom, h.read.materialised
 			a.StatusDescription = fmt.Sprintf("node %s is not connected to instance %s; nothing was sent", h.target, e.id)
 			for _, k := range h.tombstones {
@@ -188,7 +208,7 @@ func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle) (OpResult, after
 					return err
 				}
 			}
-		} else {
+		default:
 			// The previous owner may have sent the call.
 			a.ClientState = model.StateUnknown
 			a.StatusDescription = fmt.Sprintf("node %s is not connected to instance %s; the outcome of %s is unknown",
@@ -246,10 +266,14 @@ func applyOutcome(c *change, h *OpHandle, res callResult, obs observation) {
 	}
 }
 
-// applyOurs applies the state of the op's own pod on its target.
+// applyOurs applies the state of the op's own pod on its target. The
+// pod's checkpoint is merged in every state: a resume that met a
+// hibernation past its point of no return restored the pod from the
+// hibernation's checkpoint.
 func applyOurs(c *change, h *OpHandle, res callResult, info *podv1.PodInfo) {
 	a := &c.after
 	a.Node, a.Materialised, a.LostFrom = h.target, true, ""
+	c.mergeCheckpoint(info.GetCheckpoint(), h.target)
 	// A repair restarts the pod and ends its processes, unless it found the
 	// pod healthy and made no call; a takeover cannot know what the first
 	// owner did.
@@ -270,6 +294,11 @@ func applyOurs(c *change, h *OpHandle, res callResult, info *podv1.PodInfo) {
 			a.StatusDescription = "pause failed: " + errText(res.err, "the pod still runs")
 		}
 		c.openRun = runOrigin(h.kind, res)
+		if h.kind == OpResume && newerCheckpoint(info.GetCheckpoint(), h.row) {
+			// The pod's checkpoint moved since the resume began: it was
+			// restored from a hibernation the resume waited for.
+			c.openRun = "checkpoint"
+		}
 		if coldBoot(h.kind, res) {
 			c.endsProcesses = true
 		}
@@ -289,6 +318,11 @@ func applyOurs(c *change, h *OpHandle, res callResult, info *podv1.PodInfo) {
 		a.StatusDescription = ""
 		if h.kind == OpHibernate {
 			a.StatusDescription = "hibernation failed: " + errText(res.err, "the pod stays suspended")
+			if grpcCode(res.err) == codes.Aborted {
+				// A ResumePod from elsewhere abandoned it, not a preempt
+				// of ferund's (that one's finish is fenced out).
+				a.StatusDescription = "hibernation abandoned for a resume"
+			}
 		}
 		c.closeRun = "paused"
 		if h.trigger == TriggerIdle {
@@ -297,11 +331,9 @@ func applyOurs(c *change, h *OpHandle, res callResult, info *podv1.PodInfo) {
 	case podv1.PodState_POD_STATE_HIBERNATED:
 		a.ClientState = model.StateHibernated
 		a.PendingSince = time.Time{}
-		cp := info.GetCheckpoint()
-		if cp.GetHeadKey() == "" {
-			cp = res.checkpoint
+		if info.GetCheckpoint().GetHeadKey() == "" {
+			c.mergeCheckpoint(res.checkpoint, h.target)
 		}
-		c.mergeCheckpoint(cp, h.target)
 		a.StatusDescription = ""
 		c.closeRun = "hibernated"
 	case podv1.PodState_POD_STATE_STOPPED:
@@ -318,6 +350,15 @@ func applyOurs(c *change, h *OpHandle, res callResult, info *podv1.PodInfo) {
 		a.ClientState = model.StateUnknown
 		a.StatusDescription = fmt.Sprintf("%s on node %s: the pod is in state %s", h.kind, h.target, info.GetState())
 	}
+}
+
+// newerCheckpoint reports whether cp is newer than the checkpoint of row.
+func newerCheckpoint(cp *podv1.Checkpoint, row store.Sandbox) bool {
+	if cp.GetHeadKey() == "" {
+		return false
+	}
+	epoch := int64(min(cp.GetEpoch(), uint64(1<<63-1)))
+	return epoch > row.CheckpointEpoch || (epoch == row.CheckpointEpoch && cp.GetHeadKey() != row.CheckpointHead)
 }
 
 // placementFailure reports whether a create's error, with no pod after

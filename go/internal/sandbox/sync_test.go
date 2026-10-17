@@ -297,3 +297,30 @@ func TestSyncRetriesOnceWhenTheRowChanged(t *testing.T) {
 	}
 	wantState(t, h.row(sb.ID), model.StateRunning)
 }
+
+// TestSyncMergesTheCheckpointOfARunningPod: a pod that runs on a checkpoint
+// newer than its row's (restored by a resume that waited for a hibernation
+// past its point of no return) gives the row that checkpoint.
+func TestSyncMergesTheCheckpointOfARunningPod(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	sb := h.hibernatedOn("n1")
+	h.ensure(sb.ID)
+	h.settle(sb.ID)
+	cp := h.row(sb.ID)
+	info := h.podState("n1", sb.ID, podv1.PodState_POD_STATE_RUNNING)
+	if info.GetCheckpoint().GetHeadKey() != cp.CheckpointHead || cp.CheckpointHead == "" {
+		t.Fatalf("the restored pod's checkpoint %v, the row's %q", info.GetCheckpoint(), cp.CheckpointHead)
+	}
+	h.exec(`UPDATE sandboxes SET checkpoint_head = 'older', checkpoint_epoch = checkpoint_epoch - 1, checkpoint_store = '',
+		gen = gen + 1 WHERE id = $1`, sb.ID)
+	if err := e.Sync(bg, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateRunning)
+	if row.CheckpointHead != cp.CheckpointHead || row.CheckpointEpoch != cp.CheckpointEpoch || row.CheckpointStore != h.objs.ID() {
+		t.Fatalf("row after the Sync %+v, want the checkpoint of %+v", row, cp)
+	}
+}

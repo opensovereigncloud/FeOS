@@ -13,6 +13,7 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
 func TestStopReleasesOps(t *testing.T) {
@@ -320,4 +321,90 @@ func TestEnsureMeetsAnotherInstancesHibernate(t *testing.T) {
 	if restores != 3 { // the create and two restores
 		t.Fatalf("%d placements of i1", restores)
 	}
+}
+
+// TestEnsurePreemptsAnotherInstancesHibernate: a hibernate of another live
+// instance that a resume abandons now is preempted too: i1's Ensure
+// resumes the sandbox on its node, and i2's hibernate ends fenced out and
+// writes nothing.
+func TestEnsurePreemptsAnotherInstancesHibernate(t *testing.T) {
+	h := newHarness(t)
+	i2 := h.addInstance("i2")
+	h.addNode("n1")
+	sb := h.pausedLong("n1")
+	upload := h.watchCalls("n1", testnode.HibernateUpload, true)
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	hd, err := i2.eng.runner.start(ctx, sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerHibernateAfter, Target: "n1",
+		Incarnation: sb.Incarnation}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitClosed(t, upload.arrived, "i2's upload")
+	lease, took, err := ensureFor(h.eng(), sb.ID, time.Minute)
+	if err != nil || lease.Node != "n1" {
+		t.Fatalf("ensure: %+v %v", lease, err)
+	}
+	if took > h.eng().t.hibernateWait/3 {
+		t.Fatalf("the preempt took %v", took)
+	}
+	h.activityNamed(sb.ID, "lifecycle_start", "resume on node n1 (abandons the hibernate of instance i2)")
+	if res, err := hd.Wait(ctx); err != nil || !res.fenced {
+		t.Fatalf("i2's hibernate's end %+v %v", res, err)
+	}
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateRunning)
+	if row.Op != "" || row.CheckpointHead != "" {
+		t.Fatalf("i2's fenced finish wrote: %+v", row)
+	}
+	h.podState("n1", sb.ID, podv1.PodState_POD_STATE_RUNNING)
+}
+
+// TestRolloutThenResumeAbandons: an instance stops while its hibernate's
+// upload runs; its op is released (unknown), and the hibernation goes on
+// at the node, whose dropped call no longer stops it. Ensure on another
+// instance syncs the sandbox (paused: the pod is suspended), resumes it,
+// and the node abandons the hibernation: the sandbox runs from its
+// snapshot, and no hibernation is left.
+func TestRolloutThenResumeAbandons(t *testing.T) {
+	h := newHarness(t)
+	i2 := h.addInstance("i2")
+	h.addNode("n1")
+	sb := h.pausedLong("n1")
+	upload := h.watchCalls("n1", testnode.HibernateUpload, true)
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	if _, err := i2.eng.runner.start(ctx, sb.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerHibernateAfter, Target: "n1",
+		Incarnation: sb.Incarnation}, false); err != nil {
+		t.Fatal(err)
+	}
+	waitClosed(t, upload.arrived, "i2's upload")
+	sctx, scancel := context.WithTimeout(bg, 200*time.Millisecond)
+	if err := i2.eng.Stop(sctx); err != nil {
+		t.Fatal(err)
+	}
+	scancel()
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateUnknown)
+	if row.StatusDescription != "op hibernate of stopping instance i2 was released" {
+		t.Fatalf("released row %+v", row)
+	}
+	i2.stop()
+	h.wantHibernation("n1", sb.ID, podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK, true)
+	if lease := h.ensure(sb.ID); lease.Node != "n1" {
+		t.Fatalf("lease %+v", lease)
+	}
+	row = h.row(sb.ID)
+	wantState(t, row, model.StateRunning)
+	if row.CheckpointHead != "" {
+		t.Fatalf("a checkpoint after an abandoned hibernation: %+v", row)
+	}
+	if origin := h.runOrigin(sb.ID); origin != "snapshot" {
+		t.Fatalf("run origin %q", origin)
+	}
+	info := h.podState("n1", sb.ID, podv1.PodState_POD_STATE_RUNNING)
+	if info.GetHibernation() != nil {
+		t.Fatalf("a hibernation left: %v", info.GetHibernation())
+	}
+	never(t, 300*time.Millisecond, "a second hibernation", func() bool { return upload.count() > 1 })
 }
