@@ -26,7 +26,7 @@ use libublk::ctrl_async::UblkCtrlAsync;
 use libublk::io::{UblkDev, UblkQueue};
 use libublk::ops::{self, TgtFd};
 use libublk::{BufDesc, UblkError, UblkFlags, UblkRuntime};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::stats::DevStats;
 
@@ -110,35 +110,54 @@ pub fn spawn(ctx: DeviceCtx, recover: bool) -> Result<StartedDevice, String> {
 pub fn stop(started: StartedDevice) -> Result<(), String> {
     started.shared.stop.store(true, Ordering::SeqCst);
     if let Ok(ctrl) = UblkCtrl::new_simple(started.dev_id) {
-        // Quiesce first (UBLK_F_QUIESCE): cancels pending uring_cmds so
-        // io tasks unwind on QueueIsDown, then teardown via kill_dev.
-        // Direct kill_dev+drop wedges ublk_ctrl_del_dev's iou worker on
-        // this kernel (dev-host observation) when FETCHes are armed.
-        // Quiesce can race VM teardown (block file still close-serving
-        // on the host side) → transient EBUSY. Retry a few times.
-        let mut ok = false;
-        for attempt in 0..5u32 {
-            match ctrl.quiesce_dev(3000) {
-                Ok(_) => {
-                    ok = true;
-                    break;
-                }
-                Err(e) => {
-                    if attempt == 4 {
-                        warn!(error = %e, dev = started.dev_id,
-                              "quiesce failed after retries; killing");
+        // Quiesce first where the driver can (UBLK_F_QUIESCE, Linux
+        // 6.15): it cancels the pending uring_cmds, so that the io tasks
+        // unwind on QueueIsDown before kill_dev. Quiesce can race VM
+        // teardown (block file still close-serving on the host side) →
+        // transient EBUSY. Retry a few times. A driver without it is not
+        // asked: the device is killed at once, as after a quiesce that
+        // failed. The wedge of ublk_ctrl_del_dev's iou worker that a
+        // kill with FETCHes armed met on 6.12 is avoided by serve()'s
+        // explicit del_dev and dev_thread's leaked runtime.
+        if driver_quiesces(&ctrl) {
+            for attempt in 0..5u32 {
+                match ctrl.quiesce_dev(3000) {
+                    Ok(_) => break,
+                    Err(e) => {
+                        if attempt == 4 {
+                            warn!(error = %e, dev = started.dev_id,
+                                  "quiesce failed after retries; killing");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(400));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(400));
                 }
             }
+        } else {
+            debug!(
+                dev = started.dev_id,
+                "the ublk driver cannot quiesce; killing"
+            );
         }
-        let _ = ok;
         let _ = ctrl.kill_dev();
     }
     started
         .join
         .join()
         .map_err(|_| "device thread panicked".to_string())
+}
+
+/// Whether the ublk driver can quiesce a device (UBLK_F_QUIESCE, Linux
+/// 6.15), as its features say, which libublk asked the driver for when it
+/// opened `ctrl` (UBLK_U_CMD_GET_FEATURES, Linux 6.5). Without them the
+/// device is taken for one that cannot: a driver before 6.5 cannot, and a
+/// query that failed is asked again by the next stop's handle.
+fn driver_quiesces(ctrl: &UblkCtrl) -> bool {
+    quiesces(ctrl.get_driver_features())
+}
+
+/// Whether the driver's `features`, if it told them, include the quiesce.
+fn quiesces(features: Option<u64>) -> bool {
+    features.is_some_and(|features| features & libublk::sys::UBLK_F_QUIESCE as u64 != 0)
 }
 
 fn dev_thread(ctx: DeviceCtx, recover: bool, ready: mpsc::Sender<Ready>) {
@@ -898,4 +917,19 @@ fn open_zero(state_dir: &Path) -> Result<fs::File, String> {
         f.set_len(MAX_IO_BYTES as u64).map_err(|e| e.to_string())?;
     }
     fs::File::open(&p).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stop_quiesces_as_its_handle_says() {
+        let quiesce = libublk::sys::UBLK_F_QUIESCE as u64;
+        let recovery = libublk::sys::UBLK_F_USER_RECOVERY as u64;
+        // A query that failed decides nothing for the next stop.
+        assert!(!quiesces(None), "a driver that did not tell");
+        assert!(quiesces(Some(recovery | quiesce)));
+        assert!(!quiesces(Some(recovery)), "a driver before 6.15");
+    }
 }
