@@ -77,7 +77,7 @@ export function JoinTokens() {
         )}
         <ErrBox error={err} />
 
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead>
             <tr>
               <th>ID</th><th>node</th><th>made by</th><th className="col-when">made</th><th>expires</th><th>use</th><th className="col-quick" />
@@ -117,7 +117,7 @@ export function JoinTokens() {
               );
             })}
           </tbody>
-        </table>
+        </table></div>
         {tokens && tokens.length === 0 && <p className="empty">No join tokens.</p>}
         {!tokens && !err && <p className="empty">Loading…</p>}
       </section>

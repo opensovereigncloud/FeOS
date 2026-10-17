@@ -25,6 +25,9 @@ export function nodeRows(nodes) {
     const status = n.status || 'unknown';
     const memTotal = Number(n.memoryTotalbytes || 0);
     const memAvail = Number(n.memAvailBytes || 0);
+    // In use: the total less what the host reports available, what the
+    // memory bar fills by and labels.
+    const memUsed = Math.max(0, memTotal - memAvail);
     return {
       key: n.node,
       node: n.node,
@@ -40,7 +43,8 @@ export function nodeRows(nodes) {
       lastSeenNs: Number(n.lastSeenAtNs || 0),
       memAvail,
       memTotal,
-      memPct: memTotal > 0 ? Math.round((100 * (memTotal - memAvail)) / memTotal) : 0,
+      memUsed,
+      memPct: memTotal > 0 ? Math.round((100 * memUsed) / memTotal) : 0,
       load1: Number(n.load1 || 0),
       diskAvail: Number(n.diskAvailBytes || 0),
       running: Number(n.sandboxesRunning || 0),
@@ -73,6 +77,24 @@ export function nodeRows(nodes) {
   });
   const order = (r) => (r.status === 'removed' ? 1 : 0);
   return rows.map((r, i) => [r, i]).sort((a, b) => order(a[0]) - order(b[0]) || a[1] - b[1]).map(([r]) => r);
+}
+
+// fmtBytesOf renders a part of a whole, "12.0 / 63.0 GiB", with the unit
+// once when both share it.
+export function fmtBytesOf(part, whole) {
+  const p = fmtBytes(part);
+  const w = fmtBytes(whole);
+  const unit = (s) => s.slice(s.lastIndexOf(' '));
+  return unit(p) === unit(w) ? `${p.slice(0, p.lastIndexOf(' '))} / ${w}` : `${p} / ${w}`;
+}
+
+// memBar is the memory bar's label and title: the memory in use against
+// the total, as the bar fills, and what is available in the title.
+export function memBar(row) {
+  return {
+    label: fmtBytesOf(row.memUsed, row.memTotal),
+    title: `${fmtBytes(row.memUsed)} in use of ${fmtBytes(row.memTotal)}, ${fmtBytes(row.memAvail)} available`,
+  };
 }
 
 // vcpuCapacityText renders a vCPU capacity: 0 is "∞" (not gated).

@@ -75,7 +75,7 @@ export function Tenants({ navigate, user }) {
         )}
         <ErrBox error={err} />
 
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead>
             <tr>
               <th>name</th>
@@ -137,7 +137,7 @@ export function Tenants({ navigate, user }) {
               );
             })}
           </tbody>
-        </table>
+        </table></div>
         {tenants && tenants.length === 0 && <p className="empty">No tenants yet.</p>}
         {!tenants && !err && <p className="empty">Loading…</p>}
 
@@ -188,7 +188,7 @@ function TenantTokens({ tenant, user, onChange }) {
               </button>)}
         </Secret>
       )}
-      <table className="tbl">
+      <div className="tblwrap"><table className="tbl">
         <thead>
           <tr><th>hash</th><th>label</th><th className="col-when">created</th><th className="col-when">last used</th><th /><th className="col-quick" /></tr>
         </thead>
@@ -217,7 +217,7 @@ function TenantTokens({ tenant, user, onChange }) {
             </tr>
           ))}
         </tbody>
-      </table>
+      </table></div>
       {tokens && tokens.length === 0 && <p className="empty">No tokens: nothing can act as this tenant.</p>}
       <form className="createpanel" onSubmit={async (e) => {
         e.preventDefault();

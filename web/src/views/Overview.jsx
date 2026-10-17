@@ -82,7 +82,7 @@ export function Overview({ tenant, navigate }) {
             <span className="spacer" />
             <button className="ghost mini" onClick={() => navigate(base)}>all →</button>
           </div>
-          <table className="tbl">
+          <div className="tblwrap"><table className="tbl">
             <tbody>
               {hotList.map((sb) => (
                 <tr key={sb.sandboxId} className="clickable" onClick={() => navigate(`${base}/${sb.sandboxId}`)}>
@@ -94,7 +94,7 @@ export function Overview({ tenant, navigate }) {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
           {sandboxes && sandboxes.length === 0 && (
             <p className="empty">
               No sandboxes yet.{' '}

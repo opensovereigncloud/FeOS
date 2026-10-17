@@ -367,7 +367,7 @@ function Tokens({ sandboxId }) {
       <ErrBox error={err} />
       {fresh && <TokenOnce token={fresh} context="the sandbox" onDismiss={() => setFresh('')} />}
 
-      <table className="tbl">
+      <div className="tblwrap"><table className="tbl">
         <thead>
           <tr><th>hash</th><th>label</th><th className="col-when">created</th><th className="col-when">last used</th><th className="col-quick" /></tr>
         </thead>
@@ -386,7 +386,7 @@ function Tokens({ sandboxId }) {
             </tr>
           ))}
         </tbody>
-      </table>
+      </table></div>
       {tokens && tokens.length === 0 && <p className="empty">No tokens.</p>}
 
       <form className="createpanel" onSubmit={async (e) => {

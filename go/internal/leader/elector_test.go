@@ -4,8 +4,12 @@
 package leader
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -492,6 +496,58 @@ func TestWoken(t *testing.T) {
 			if got[i] != tc.want[i] {
 				t.Fatalf("woken(%q) = %v, want %v", tc.hint, got, tc.want)
 			}
+		}
+	}
+}
+
+// lockedBuffer is a log sink the elector's goroutines write to.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// The elector's lines name the instance once: the logger it is given is
+// the instance's, which carries it already.
+func TestLogNamesInstanceOnce(t *testing.T) {
+	t.Parallel()
+	d := dbtest.New(t)
+	var out lockedBuffer
+	log := slog.New(slog.NewJSONHandler(&out, nil)).With("instance", "a")
+	e := NewElector(d, "a", log)
+	e.ttl, e.renewEvery, e.readEvery, e.margin = 3*time.Second, 300*time.Millisecond, 100*time.Millisecond, time.Second
+	stop := start(t, e)
+	waitFor(t, "a to lead", 5*time.Second, e.IsLeader)
+	if err := e.Resign(bg); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+
+	seen := map[string]bool{}
+	for line := range strings.Lines(out.String()) {
+		if n := strings.Count(line, `"instance":`); n != 1 {
+			t.Errorf("%d instance attributes in %s", n, line)
+		}
+		var rec struct{ Msg string }
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("%v: %s", err, line)
+		}
+		seen[rec.Msg] = true
+	}
+	for _, msg := range []string{"leading", "stepped down", "released the leader lease"} {
+		if !seen[msg] {
+			t.Errorf("no line %q in\n%s", msg, out.String())
 		}
 	}
 }

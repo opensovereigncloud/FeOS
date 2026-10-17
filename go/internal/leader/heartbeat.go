@@ -47,7 +47,8 @@ type Heartbeat struct {
 	removed bool
 }
 
-// NewHeartbeat returns the heartbeat of the instance info describes.
+// NewHeartbeat returns the heartbeat of the instance info describes. log
+// is the instance's, which names the instance already.
 func NewHeartbeat(d *db.DB, info InstanceInfo, log *slog.Logger) *Heartbeat {
 	if log == nil {
 		log = slog.Default()
@@ -68,7 +69,7 @@ func (h *Heartbeat) Run(ctx context.Context) error {
 		if done, err := h.beat(ctx); done {
 			return nil
 		} else if err != nil && ctx.Err() == nil {
-			h.log.Warn("cannot write the instance's heartbeat", "instance", h.info.ID, "err", err)
+			h.log.Warn("cannot write the instance's heartbeat", "err", err)
 		}
 		if !sleep(ctx, h.every) {
 			return nil

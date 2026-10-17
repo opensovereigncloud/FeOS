@@ -98,9 +98,12 @@ type Handler struct {
 	resolve func(ctx context.Context, bearer string) (auth.Sandbox, error)
 	db      *db.DB
 	st      *store.Store
-	log     *slog.Logger
-	rl      *rateLog
-	t       timings
+	// tenantOf names the tenant of a tenant token's hash; it is the
+	// store's lookup, nil without a database.
+	tenantOf func(ctx context.Context, hash string) (string, error)
+	log      *slog.Logger
+	rl       *rateLog
+	t        timings
 
 	// base is the parent of every Forward stream and of the wakes nobody
 	// waits for; Run's end cancels it.
@@ -128,7 +131,8 @@ type Handler struct {
 
 // New returns the port door. kp may be nil (no binding ever refuses a
 // port); d, when set, tells the door of sandboxes whose pooled connections
-// lost their pod (Run).
+// lost their pod (Run) and of tenants' tokens, which it refuses with 401
+// rather than as unknown.
 func New(s Sandboxes, conns nodelink.Conns, kp KubePorts,
 	resolve func(ctx context.Context, bearer string) (auth.Sandbox, error), d *db.DB, log *slog.Logger) *Handler {
 	if log == nil {
@@ -144,6 +148,7 @@ func New(s Sandboxes, conns nodelink.Conns, kp KubePorts,
 	}
 	if d != nil {
 		h.st = store.New(d)
+		h.tenantOf = h.st.ResolveTenantToken
 	}
 	h.base, h.cancelBase = context.WithCancel(context.Background())
 	return h
@@ -248,7 +253,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	sb, err := h.resolve(r.Context(), tok)
 	if errors.Is(err, model.ErrUnknownToken) {
-		reply{http.StatusNotFound, textNoSandbox, 0}.write(w)
+		h.notSandboxToken(r.Context(), tok).write(w)
 		return
 	}
 	if err != nil {
@@ -277,6 +282,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.forward(w, r, sb.ID, tg)
+}
+
+// notSandboxToken answers a bearer that is no sandbox's token. A tenant's
+// token is told what the door takes, 401 as without a token: its holder
+// sent the wrong one of its tokens, and the answer names no sandbox, so it
+// tells nothing about the one in the path. Any other token gets the answer
+// of an absent sandbox.
+func (h *Handler) notSandboxToken(ctx context.Context, tok string) reply {
+	if h.tenantOf == nil {
+		return reply{http.StatusNotFound, textNoSandbox, 0}
+	}
+	_, err := h.tenantOf(ctx, store.HashToken(tok))
+	switch {
+	case err == nil:
+		return reply{http.StatusUnauthorized, textNoToken, 0}
+	case errors.Is(err, model.ErrUnknownToken):
+		return reply{http.StatusNotFound, textNoSandbox, 0}
+	}
+	h.rl.warn("lookup", "forward: token lookup failed", "err", err)
+	return reply{http.StatusInternalServerError, textLookupFailed, 0}
 }
 
 func kubeText(port int) string {

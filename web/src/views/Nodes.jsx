@@ -6,7 +6,7 @@ import { api } from '../api.js';
 import { Icon } from '../Icon.jsx';
 import { Ago, ArmButton, ErrBox, LiveBadge, StateDot, useArm, useNow, usePoll } from '../components.jsx';
 import { fmtNs, nsToDate } from '../format.js';
-import { canDrain, fleetDefaults, fmtBytes, nodeRows, stopping, vcpuCapacityText } from './fleet.js';
+import { canDrain, fleetDefaults, fmtBytes, fmtBytesOf, memBar, nodeRows, stopping, vcpuCapacityText } from './fleet.js';
 
 // The nodes: one row per node that joined, with its telemetry, what
 // placement booked on it, its connection to this instance and its
@@ -74,92 +74,103 @@ export function Nodes({ navigate }) {
           </button>
         </div>
         <ErrBox error={err} />
-        <div className="tblwrap">
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th className="col-state">status</th>
-                <th>node</th>
-                <th title="connected to the instance that answered, and its node connections there">link</th>
-                <th>last seen</th>
-                <th className="col-bar">memory</th>
-                <th>load1</th>
-                <th>disk free</th>
-                <th>running / paused</th>
-                <th title="what placement booked on the node, against what it may book">booked</th>
-                <th>slots</th>
-                <th>certificate</th>
-                <th className="col-quick" />
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.key} className={'clickable ' + r.cls} onClick={() => open(r)}>
-                  <td className="col-state"><StateDot state={r.status} title={r.status} /></td>
-                  <td>
-                    <span className="mono strong">{r.node}</span> <span className="muted small">{r.status}</span>
-                    {r.hostname && r.hostname !== r.node && <div className="muted small mono">{r.hostname}</div>}
-                    {r.draining && <div className="warn small">draining: no new sandboxes</div>}
-                    {r.identityForked && <div className="bad small" title="two holders of the node's identity were seen">identity forked</div>}
-                    {stopping(r, now) && <div className="muted small">feosd restarting</div>}
-                    {r.description && <div className="muted small">{r.description}</div>}
-                  </td>
-                  <td className="small">
-                    {r.connected
-                      ? <span className="ok" title={`${r.connections} node connection${r.connections === 1 ? '' : 's'}`}>connected{r.connections > 1 ? ` ×${r.connections}` : ''}</span>
-                      : <span className="muted">—</span>}
-                  </td>
-                  <td className="muted nowrap" title={nsToDate(r.lastSeenNs)}>{r.lastSeenNs ? fmtNs(r.lastSeenNs) : '—'}</td>
-                  <td className="col-bar">
-                    <div className="membar" title={`${fmtBytes(r.memAvail)} available of ${fmtBytes(r.memTotal)}`}>
-                      <div className="membar-fill" style={{ width: r.memPct + '%' }} />
-                      <span className="membar-label mono">{fmtBytes(r.memAvail)} / {fmtBytes(r.memTotal)}</span>
-                    </div>
-                  </td>
-                  <td className="mono nowrap">{r.load1.toFixed(2)}</td>
-                  <td className="mono nowrap">{fmtBytes(r.diskAvail)}</td>
-                  <td className="mono nowrap">{r.running} / {r.paused}</td>
-                  <td className="mono small nowrap">
-                    <div title={r.vcpusCapacity ? `${r.cpus} cores × ${r.cpuOvercommit}` : 'CPU not gated'}>
-                      {r.vcpusBooked} / {vcpuCapacityText(r.vcpusCapacity)} vCPU
-                    </div>
-                    <div title={`total less ${fmtBytes(r.memHeadroom)} headroom`}>{fmtBytes(r.memBooked)} / {fmtBytes(r.memCapacity)}</div>
-                  </td>
-                  <td className="mono nowrap">{r.booked} / {r.slots}</td>
-                  <td className="small nowrap">
-                    {r.certSerial
-                      ? <><span className="mono muted" title={r.certSerial}>{r.certSerial.slice(0, 8)}</span>
-                        {r.status === 'removed'
-                          ? <div className="muted">revoked</div>
-                          : r.certNotAfter && <div>expires <Ago iso={r.certNotAfter} /></div>}</>
-                      : <span className="muted">—</span>}
-                  </td>
-                  <td className="col-quick" onClick={(e) => e.stopPropagation()}>
-                    {canDrain(r) && (
-                      <ArmButton armKey={'drain:' + r.node} armed={armed} arm={arm} disarm={disarm}
-                        className="mini" onConfirm={() => drainAct(r)}
-                        confirmLabel={r.draining ? 'really undrain?' : 'really drain?'}>
-                        {r.draining ? 'undrain' : 'drain'}
-                      </ArmButton>
-                    )}
-                    <button className="iconbtn mini" title="open the node" onClick={() => open(r)}>
-                      <Icon name="chevronRight" size={13} /></button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {nodes && rows.length === 0 && (
-            <p className="empty">
-              No node has joined yet. A node joins with a join token:{' '}
-              <a href="/join-tokens" onClick={(e) => { e.preventDefault(); navigate('/join-tokens'); }}>make one →</a>
-            </p>
-          )}
-          {!nodes && !err && <p className="empty">Loading…</p>}
-        </div>
+        <NodesTable rows={rows} now={now} armed={armed} arm={arm} disarm={disarm} onDrain={drainAct} onOpen={open} />
+        {nodes && rows.length === 0 && (
+          <p className="empty">
+            No node has joined yet. A node joins with a join token:{' '}
+            <a href="/join-tokens" onClick={(e) => { e.preventDefault(); navigate('/join-tokens'); }}>make one →</a>
+          </p>
+        )}
+        {!nodes && !err && <p className="empty">Loading…</p>}
         <NodesFootnote defaults={defaults} />
       </section>
     </div>
+  );
+}
+
+// NodesTable is the nodes' table: rows from nodeRows, now in ms for the
+// restart notes, the arm state of the drain buttons, and what a drain and
+// a click on a row do. It fits a 1280 px window and scrolls sideways in
+// a narrower one.
+export function NodesTable({ rows, now, armed, arm, disarm, onDrain, onOpen }) {
+  return (
+    <div className="tblwrap"><table className="tbl nodes-tbl">
+      <thead>
+        <tr>
+          <th className="col-state" title="status" />
+          <th>node</th>
+          <th title="the node's last telemetry; connected to the instance that answered, and its node connections there">seen</th>
+          <th className="col-bar" title="the host's memory in use, of its total">memory</th>
+          <th>load1</th>
+          <th>disk free</th>
+          <th>running / paused</th>
+          <th title="what placement booked on the node, against what it may book: vCPUs, memory, sandboxes against slots">booked</th>
+          <th>certificate</th>
+          <th className="col-quick" />
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => {
+          const mem = memBar(r);
+          return (
+            <tr key={r.key} className={'clickable ' + r.cls} onClick={() => onOpen(r)}>
+              <td className="col-state"><StateDot state={r.status} title={r.status} /></td>
+              <td className="col-node">
+                <span className="mono strong">{r.node}</span> <span className="muted small">{r.status}</span>
+                {r.hostname && r.hostname !== r.node && <div className="muted small mono">{r.hostname}</div>}
+                {r.draining && <div className="warn small">draining: no new sandboxes</div>}
+                {r.identityForked && <div className="bad small" title="two holders of the node's identity were seen">identity forked</div>}
+                {stopping(r, now) && <div className="muted small">feosd restarting</div>}
+                {r.description && <div className="muted small">{r.description}</div>}
+              </td>
+              <td className="small nowrap">
+                <div className="muted" title={nsToDate(r.lastSeenNs)}>{r.lastSeenNs ? fmtNs(r.lastSeenNs) : '—'}</div>
+                {r.connected
+                  ? <div className="ok" title={`connected to this instance, ${r.connections} node connection${r.connections === 1 ? '' : 's'}`}>connected{r.connections > 1 ? ` ×${r.connections}` : ''}</div>
+                  : r.status === 'down' || r.status === 'removed'
+                    ? <div className="muted">not connected</div>
+                    : <div className="muted" title="not connected to this instance; it may be to another">—</div>}
+              </td>
+              <td className="col-bar">
+                <div className="membar" title={mem.title}>
+                  <div className="membar-fill" style={{ width: r.memPct + '%' }} />
+                  <span className="membar-label mono">{mem.label}</span>
+                </div>
+              </td>
+              <td className="mono nowrap">{r.load1.toFixed(2)}</td>
+              <td className="mono nowrap">{fmtBytes(r.diskAvail)}</td>
+              <td className="mono nowrap">{r.running} / {r.paused}</td>
+              <td className="mono small nowrap">
+                <div title={r.vcpusCapacity ? `${r.cpus} cores × ${r.cpuOvercommit}` : 'CPU not gated'}>
+                  {r.vcpusBooked} / {vcpuCapacityText(r.vcpusCapacity)} vCPU
+                </div>
+                <div title={`total less ${fmtBytes(r.memHeadroom)} headroom`}>{fmtBytesOf(r.memBooked, r.memCapacity)}</div>
+                <div title="sandboxes booked, against the node's slots">{r.booked} / {r.slots} slots</div>
+              </td>
+              <td className="small nowrap">
+                {r.certSerial
+                  ? <><span className="mono muted" title={r.certSerial}>{r.certSerial.slice(0, 8)}</span>
+                    {r.status === 'removed'
+                      ? <div className="muted">revoked</div>
+                      : r.certNotAfter && <div>expires <Ago iso={r.certNotAfter} /></div>}</>
+                  : <span className="muted">—</span>}
+              </td>
+              <td className="col-quick" onClick={(e) => e.stopPropagation()}>
+                {canDrain(r) && (
+                  <ArmButton armKey={'drain:' + r.node} armed={armed} arm={arm} disarm={disarm}
+                    className="mini" onConfirm={() => onDrain(r)}
+                    confirmLabel={r.draining ? 'undrain?' : 'drain?'}>
+                    {r.draining ? 'undrain' : 'drain'}
+                  </ArmButton>
+                )}
+                <button className="iconbtn mini" title="open the node" onClick={() => onOpen(r)}>
+                  <Icon name="chevronRight" size={13} /></button>
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table></div>
   );
 }
 

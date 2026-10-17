@@ -9,8 +9,9 @@
 // token in "Authorization: Bearer" and nowhere else (no cookie, no query
 // parameter), the {id} of the path a claim the token must back, and
 // answers in plain text. A token of another sandbox and an unknown one get
-// the answer of an absent sandbox. A port of the sandbox's Kubernetes
-// bindings is never forwarded.
+// the answer of an absent sandbox; a tenant's token gets 401 "forwarding
+// needs a sandbox token", as no token does. A port of the sandbox's
+// Kubernetes bindings is never forwarded.
 //
 // What the door does is a lookup and a pipe. A request to a sandbox that
 // sleeps waits while the engine brings it up; the bringing up runs

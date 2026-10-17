@@ -95,7 +95,8 @@ type term struct {
 }
 
 // NewElector returns an Elector for instanceID. It registers the leader's
-// own loop, which deletes the rows of instances not seen for an hour.
+// own loop, which deletes the rows of instances not seen for an hour. log
+// is the instance's, which names the instance already.
 func NewElector(d *db.DB, instanceID string, log *slog.Logger) *Elector {
 	if log == nil {
 		log = slog.Default()
@@ -198,7 +199,7 @@ func (e *Elector) lead(ctx context.Context, epoch int64, sent time.Time) {
 	e.term, e.last = t, t
 	loops := slices.Clone(e.loops)
 	e.mu.Unlock()
-	e.log.Info("leading", "instance", e.id, "epoch", epoch)
+	e.log.Info("leading", "epoch", epoch)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -217,7 +218,7 @@ func (e *Elector) lead(ctx context.Context, epoch int64, sent time.Time) {
 	cancel()
 	wg.Wait()
 	close(t.done)
-	e.log.Info("stepped down", "instance", e.id, "epoch", epoch, "reason", reason)
+	e.log.Info("stepped down", "epoch", epoch, "reason", reason)
 }
 
 // renewLoop renews the lease every renewEvery until the term ends; it
@@ -438,7 +439,7 @@ func (e *Elector) release(ctx context.Context, epoch int64) error {
 		return fmt.Errorf("release the leader lease: %w", err)
 	}
 	if held {
-		e.log.Info("released the leader lease", "instance", e.id, "epoch", epoch)
+		e.log.Info("released the leader lease", "epoch", epoch)
 	}
 	return nil
 }

@@ -47,7 +47,7 @@ export function Access({ sandboxId }) {
       {!data.kube && <Disabled />}
       {data.kube && (data.kube.bindings || []).length === 0 && <p className="empty">No cluster bound.</p>}
       {data.kube && (data.kube.bindings || []).length > 0 && (
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead>
             <tr><th>name</th><th>server</th><th>credential</th><th>in the sandbox</th><th>use</th></tr>
           </thead>
@@ -69,14 +69,14 @@ export function Access({ sandboxId }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
 
       <h3 className="sect"><Icon name="terminal" size={13} /> SSH servers</h3>
       {!data.ssh && <Disabled />}
       {data.ssh && (data.ssh.bindings || []).length === 0 && <p className="empty">No server bound.</p>}
       {data.ssh && (data.ssh.bindings || []).length > 0 && (
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead>
             <tr><th>name</th><th>login</th><th>key</th><th>host keys</th><th>use</th></tr>
           </thead>
@@ -106,13 +106,13 @@ export function Access({ sandboxId }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
 
       <h3 className="sect"><Icon name="x" size={13} /> Refusals</h3>
       {denies.length === 0 && <p className="empty">Nothing refused.</p>}
       {denies.length > 0 && (
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead>
             <tr><th className="col-when">when</th><th>kind</th><th>binding</th><th>reason</th><th>detail</th></tr>
           </thead>
@@ -127,7 +127,7 @@ export function Access({ sandboxId }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
     </div>
   );

@@ -698,17 +698,27 @@ The routes, bodies, status codes and texts are the sandbox system's;
 | tenant | `/api/v1/sandboxes`, `/api/v1/sandboxes/{id}` (create, list, get, delete, pause, resume, tokens, access), `/api/v1/tools` | a tenant's token |
 | sandbox | `/api/v1/sandboxes/{id}/…`: exec, files, dirs, search, fetch, processes, watches, bindings | the sandbox's own token |
 | mcp | `/mcp` | the sandbox's token, with the door's own answers |
-| forward | `/fwd/…`, `/api/v1/sandboxes/{id}/ports/…` | the sandbox's token in `Authorization` alone |
+| forward | `/fwd/…`, `/api/v1/sandboxes/{id}/ports/…` | the sandbox's token in `Authorization` alone ([ports](#ports)) |
 | public | `/healthz`, `/readyz`, `/auth/…`, the UI | none |
 
 A tenant's token is not accepted on a sandbox route, not even for its own
-sandbox; whoever names what they may not see gets the answer of an absent
-thing, 404. Every unknown route under `/api/` is 404 `{"error": "no such
-route: METHOD PATH"}`, never 405. A sandbox ID must be a UUID. The admin
-API has tenants and their tokens (hashed, shown once), nodes (with their
-connections to the serving instance, certificates, drain, removal and
-capacity settings), join tokens, instances and the leader, and the
-activity of a sandbox or a node, with gaps and traffic records. Deleting
+sandbox (the forward class answers it 401 "forwarding needs a sandbox
+token", [ports](#ports)); whoever names what they may not see gets the
+answer of an absent thing, 404. Every unknown route under `/api/` is 404
+`{"error": "no such route: METHOD PATH"}`, never 405. A sandbox ID must be
+a UUID. The admin API has tenants and their tokens (hashed, shown once),
+nodes (with their connections to the serving instance, certificates,
+drain, removal and capacity settings), join tokens, instances and the leader, and the
+activity of a sandbox or a node, with gaps and traffic records. `GET
+/api/v1/admin/nodes` answers the nodes and `defaults`, the serving
+instance's settings that the UI explains the fleet with:
+`telemetryIntervalSeconds`, `nodeTtlSeconds`, `lostGraceSeconds` and
+`drainTimeoutSeconds` (its timings, in seconds), `defaultVcpus`,
+`defaultMemoryMib` and `defaultImage` (what a sandbox created without
+them gets), and `minVcpus`, `maxVcpus`, `minMemoryMib` and
+`maxMemoryMib` (the bounds a create accepts). An undrain clears the text
+the drain loop left in the node's status description ("draining: …",
+"drained", "cannot drain: …"); another writer's text stays. Deleting
 a tenant deletes its tokens at once, then its sandboxes in batches as a
 sandbox delete does; the leader finishes what a request did not.
 `/readyz` fails while the instance stops, and after its start until it is
@@ -730,7 +740,12 @@ everywhere; anyone else gets "no access" and no session. A request with
 the session cookie that changes something must carry `X-Requested-With:
 ferun` and, with an `Origin`, the public URL's; ferund sends no CORS
 headers. Basic credentials, when present, are checked first. Without
-OIDC and `--admin-users`, the admin routes answer 503.
+OIDC and `--admin-users`, the admin routes answer 503. An admin route's
+401 carries `WWW-Authenticate: Basic`, which makes a browser show its
+login dialog, only with `--admin-users` and only to a request without
+`X-Requested-With: ferun`: the UI sends that header on every request and
+shows its own sign-in screen on a 401, so a session that expired does
+not bring up the browser's dialog over it.
 
 ### Tools and MCP
 
@@ -768,7 +783,10 @@ and retries once. REST and MCP share the one entry point:
 
 `/fwd/{id}/{port}/…` and `/api/v1/sandboxes/{id}/ports/{port}/…` forward
 HTTP to a port inside the sandbox, with the sandbox's token in
-`Authorization: Bearer` and nowhere else. A sleeping sandbox is brought up
+`Authorization: Bearer` and nowhere else. Without it the door answers 401
+"forwarding needs a sandbox token", and so it answers a tenant's token,
+on both paths: the answer names no sandbox. An unknown token and another
+sandbox's get 404 "no such sandbox". A sleeping sandbox is brought up
 detached from the request, so that a browser that gives up on a cold
 start does not cancel it. The request goes through a reverse proxy whose
 transport dials `PortForwardService/Forward` on the sandbox's node
@@ -823,7 +841,13 @@ ferund embeds; only `dist/.keep` is committed, so the module builds
 without npm, and such a build answers the UI's routes with 404. It shows
 tenants and their tokens, sandboxes with their activity, network and
 access, nodes with their certificates and capacity, join tokens, and
-instances with the leader, and signs people in through `/auth/`.
+instances with the leader, and signs people in through `/auth/`. A table
+too wide for the window scrolls sideways in its own box; the nodes'
+table fits a 1280 px wide window, and its memory bar fills by, and is
+labelled with, the host's memory in use against its total. Its node
+connections are those to the instance that answered, which with several
+replicas need not be the one a node dialled; so it calls a node not
+connected only when the node is down or removed.
 
 ## The activity log
 
@@ -999,11 +1023,12 @@ changes to feosd it relies on or improves with:
    so that a cancelled call or a dropped connection never cuts them: the
    prerequisite of ADR 0015's "retry on `UNAVAILABLE`". Until then ferund
    never cancels them and repairs stuck pods.
-3. **Port forwarding for pods**: forward
+3. **Port forwarding for pods** is built: feosd forwards
    `feos.portforward.v1.PortForwardService` to a pod's guest. The codes
    stay as they are, both "nothing listens" and "the guest is unreachable"
    `UNAVAILABLE`; the texts tell them apart, and `forward.rs` documents
-   them as the contract ([Ports](#ports)). Until then ports answer 502.
+   them as the contract ([Ports](#ports)). Against a feosd from before,
+   which answers `UNIMPLEMENTED`, ports answer 502.
 4. **Idempotent `SuspendPod` and `ResumePod`**; ferund resolves their
    `FAILED_PRECONDITION` by reading the pod meanwhile.
 5. **Bindings for a running pod**: an RPC that sets a running pod's sealed

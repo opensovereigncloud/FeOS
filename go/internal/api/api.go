@@ -16,7 +16,8 @@
 //	public    /healthz, /readyz, /auth/…, the UI
 //
 // The two token classes stay apart: a tenant's token is not accepted on a
-// sandbox route, not even for a sandbox the tenant owns, and a sandbox's
+// sandbox route, not even for a sandbox the tenant owns (the forward class
+// answers it 401 "forwarding needs a sandbox token"), and a sandbox's
 // token is unknown on a tenant route. Whoever names something they may not
 // see gets the answer of an absent thing (404), never a 403. Every
 // unknown route under /api/ is a 404 {"error": "no such route: METHOD

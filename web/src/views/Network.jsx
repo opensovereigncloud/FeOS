@@ -58,7 +58,7 @@ export function Network({ sandboxId }) {
       </div>
 
       <Sect title="Flows" n={flows.length}>
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead><tr><th>started</th><th>connection</th><th>dir</th><th>sent / received</th><th>state</th></tr></thead>
           <tbody>
             {[...flows].reverse().map((f) => (
@@ -79,11 +79,11 @@ export function Network({ sandboxId }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       </Sect>
 
       <Sect title="DNS" n={dns.length}>
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead><tr><th>time</th><th>name</th><th>type</th><th>answer</th><th>addresses</th></tr></thead>
           <tbody>
             {[...dns].reverse().map((d) => (
@@ -98,11 +98,11 @@ export function Network({ sandboxId }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       </Sect>
 
       <Sect title="Server names" n={names.length}>
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead><tr><th>time</th><th>name</th><th>from</th><th>server</th></tr></thead>
           <tbody>
             {[...names].reverse().map((s) => (
@@ -116,11 +116,11 @@ export function Network({ sandboxId }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       </Sect>
 
       <Sect title="Drops" n={drops.length}>
-        <table className="tbl">
+        <div className="tblwrap"><table className="tbl">
           <thead><tr><th>time</th><th>packet</th><th>dir</th><th>reason</th></tr></thead>
           <tbody>
             {[...drops].reverse().map((d) => (
@@ -132,7 +132,7 @@ export function Network({ sandboxId }) {
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       </Sect>
     </div>
   );

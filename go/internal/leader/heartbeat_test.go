@@ -5,6 +5,8 @@ package leader
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -103,5 +105,31 @@ func TestOwnerLiveStale(t *testing.T) {
 	}
 	if live, err := OwnerLive(bg, d.Pool, "old"); err != nil || live {
 		t.Fatalf("a row past the TTL is live: %v %v", live, err)
+	}
+}
+
+// A failed beat's warning names the instance once: the logger the
+// heartbeat is given is the instance's, which carries it already.
+func TestHeartbeatWarningNamesInstanceOnce(t *testing.T) {
+	t.Parallel()
+	d := dbtest.New(t)
+	d.Close() // every beat fails while Run's context lives
+	var out lockedBuffer
+	h := NewHeartbeat(d, InstanceInfo{ID: "a"}, slog.New(slog.NewJSONHandler(&out, nil)).With("instance", "a"))
+	h.every = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan error, 1)
+	go func() { done <- h.Run(ctx) }()
+	waitFor(t, "a failed beat's warning", 5*time.Second, func() bool {
+		return strings.Contains(out.String(), "cannot write the instance's heartbeat")
+	})
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.Lines(out.String()) {
+		if n := strings.Count(line, `"instance":`); n != 1 {
+			t.Errorf("%d instance attributes in %s", n, line)
+		}
 	}
 }

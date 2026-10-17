@@ -190,7 +190,7 @@ input:focus { outline: none; border-color: var(--accent); }
 .tbl tr.down td { color: var(--muted); background: rgba(239,84,73,.05); }
 
 /* node fleet memory bar */
-.col-bar { min-width: 150px; }
+.col-bar { min-width: 128px; }
 .membar {
   position: relative; height: 15px; border-radius: 4px; overflow: hidden;
   background: rgba(128,128,128,.15); border: 1px solid rgba(128,128,128,.2);
@@ -203,6 +203,10 @@ input:focus { outline: none; border-color: var(--accent); }
   position: relative; display: block; text-align: center; line-height: 15px;
   font-size: 10px; color: var(--text);
 }
+/* the nodes' table: tighter cells, and the node's name, hostname and
+   notes wrap, so that its ten columns fit a 1280 px window */
+.nodes-tbl th, .nodes-tbl td { padding-left: 6px; padding-right: 6px; }
+.nodes-tbl .col-node { min-width: 140px; overflow-wrap: anywhere; }
 .tbl tr.clickable { cursor: pointer; }
 .tbl tr.clickable:hover td { background: rgba(91,157,248,.05); }
 .tbl tr.sel td { background: rgba(91,157,248,.09); }

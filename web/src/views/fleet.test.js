@@ -3,8 +3,8 @@
 
 import { describe, expect, it } from 'vitest';
 import {
-  canDrain, certState, createHints, fleetDefaults, fmtBytes, fmtSeconds, fmtSize, joinTokenState, nodeRows,
-  sandboxCounts, settingsForm, settingsPatch, stopping, tokenRows, vcpuCapacityText,
+  canDrain, certState, createHints, fleetDefaults, fmtBytes, fmtBytesOf, fmtSeconds, fmtSize, joinTokenState, memBar,
+  nodeRows, sandboxCounts, settingsForm, settingsPatch, stopping, tokenRows, vcpuCapacityText,
 } from './fleet.js';
 
 // The node view's rows, from GET /api/v1/admin/nodes as ferund renders
@@ -73,6 +73,29 @@ describe('nodeRows', () => {
     for (const k of ['memPct', 'load1', 'diskAvail', 'running', 'paused', 'vcpusCapacity', 'memCapacity', 'lastSeenNs']) {
       expect(Number.isNaN(n[k]), k).toBe(false);
     }
+  });
+});
+
+describe('the memory bar', () => {
+  it('labels the memory in use of the total, as it fills', () => {
+    const [r] = nodeRows([{ ...READY, memoryTotalbytes: String(64 * 2 ** 30), memAvailBytes: String(40.5 * 2 ** 30) }]);
+    expect(r.memUsed).toBe(23.5 * 2 ** 30);
+    expect(r.memPct).toBe(37);
+    expect(memBar(r)).toEqual({ label: '23.5 / 64.0 GiB', title: '23.5 GiB in use of 64.0 GiB, 40.5 GiB available' });
+  });
+
+  it('a node without telemetry shows nothing in use, never a negative', () => {
+    const [n] = nodeRows([{ node: 'new', status: 'joined' }]);
+    expect([n.memUsed, n.memPct]).toEqual([0, 0]);
+    expect(memBar(n).label).toBe('0 / 0 B');
+    const [odd] = nodeRows([{ node: 'odd', memoryTotalbytes: '100', memAvailBytes: '200' }]);
+    expect([odd.memUsed, odd.memPct]).toEqual([0, 0]);
+  });
+
+  it('names the unit once when both share it', () => {
+    expect(fmtBytesOf(12 * 2 ** 30, 63 * 2 ** 30)).toBe('12.0 / 63.0 GiB');
+    expect(fmtBytesOf(512 * 2 ** 20, 63 * 2 ** 30)).toBe('512 MiB / 63.0 GiB');
+    expect(fmtBytesOf(2 ** 40, 2 * 2 ** 40)).toBe('1.0 / 2.0 TiB');
   });
 });
 
