@@ -30,12 +30,19 @@ type Image struct {
 // marker, "(no output)" and "(exit code N)".
 //
 // A Call that fails returns the output gathered until then in Text.
+//
+// FirstLine is set by a read of text: Text is the file's lines from that
+// one on, and More says the file goes on past them. REST answers the text
+// as it is; MCP, whose client is an agent, numbers the lines and names the
+// offset to go on from.
 type Result struct {
 	Text      string
 	ExitCode  int
 	Truncated bool
 	Image     *Image
 	IsError   bool
+	FirstLine int
+	More      bool
 }
 
 // TruncatedMarker follows a cut output in an MCP answer.
@@ -66,6 +73,9 @@ type output struct {
 	auditCut bool
 	image    *Image
 	progress func(chunk string)
+	// The lines of a read (Result.FirstLine, Result.More).
+	firstLine int
+	more      bool
 }
 
 // emit takes one chunk of text output. The client's text takes chunks
@@ -101,10 +111,17 @@ func (o *output) emitImage(img *Image) {
 	o.image = img
 }
 
+// lines says the text emitted is a file's lines from line first on, and
+// whether the file goes on past them.
+func (o *output) lines(first int, more bool) {
+	o.firstLine, o.more = first, more
+}
+
 // result is the Result of what was emitted, for exit code code.
 func (o *output) result(tool string, code int) Result {
 	text := o.text.String()
-	r := Result{Text: text, ExitCode: code, Image: o.image, IsError: isToolError(tool, code)}
+	r := Result{Text: text, ExitCode: code, Image: o.image, IsError: isToolError(tool, code),
+		FirstLine: o.firstLine, More: o.more}
 	if len(text) > MaxToolOutput {
 		r.Text, r.Truncated = text[:MaxToolOutput], true
 	}

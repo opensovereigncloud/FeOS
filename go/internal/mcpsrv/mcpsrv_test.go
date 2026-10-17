@@ -290,6 +290,13 @@ func TestRendering(t *testing.T) {
 		{tools.Result{Text: "abc", Truncated: true}, fmt.Errorf("boom"), "abc\n... [truncated]\n\nerror: boom", true},
 		{tools.Result{Text: "partial"}, fmt.Errorf("node n1: gone"), "partial\nerror: node n1: gone", true},
 		{tools.Result{}, fmt.Errorf("x"), "error: x", true},
+		// A read of text: numbered as cat -n numbers, and where to go on.
+		{tools.Result{Text: "a\n\tb\n", FirstLine: 1}, nil, "     1\ta\n     2\t\tb\n", false},
+		{tools.Result{Text: "no newline", FirstLine: 1}, nil, "     1\tno newline", false},
+		{tools.Result{Text: "x\ny\n", FirstLine: 7, More: true}, nil,
+			"     7\tx\n     8\ty\n... [the file goes on: read with offset=9 for more]\n", false},
+		{tools.Result{Text: "ab\ncd", FirstLine: 1, Truncated: true}, nil,
+			"     1\tab\n     2\tcd\n... [truncated]\n... [the file goes on: read with offset=2 for more]\n", false},
 	} {
 		r := render(tc.res, tc.err)
 		if got := r.Content[0].(*mcp.TextContent).Text; got != tc.text || r.IsError != tc.isError {

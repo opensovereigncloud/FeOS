@@ -146,6 +146,37 @@ func TestRenderToolService(t *testing.T) {
 	}
 }
 
+// A read of text says where its lines start and whether the file goes on,
+// for MCP to number them; a read of nothing or of a picture says neither.
+func TestReadLines(t *testing.T) {
+	env := toolstest.New(t, toolstest.Options{})
+	r := newRunner(env)
+	sb := env.NewSandbox()
+	for _, tc := range []struct {
+		name, args string
+		resp       *toolv1.ReadResponse
+		first      int
+		more       bool
+	}{
+		{"whole", `{"path":"/a"}`, &toolv1.ReadResponse{Text: "a\nb\n"}, 1, false},
+		{"offset", `{"path":"/a","offset":40,"limit":2}`, &toolv1.ReadResponse{Text: "a\nb\n", Truncated: true}, 40, true},
+		{"past the end", `{"path":"/a","offset":99}`, &toolv1.ReadResponse{}, 0, false},
+		{"image", `{"path":"/a.png"}`, &toolv1.ReadResponse{Image: image(8), MediaType: "image/png", Width: 1, Height: 1}, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scriptTool(env, toolv1.ToolService_Read_FullMethodName, tc.resp)
+			res, err := r.Call(bg, sb, ToolRead, json.RawMessage(tc.args), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.FirstLine != tc.first || res.More != tc.more {
+				t.Errorf("first line %d, more %v; want %d, %v", res.FirstLine, res.More, tc.first, tc.more)
+			}
+		})
+	}
+	env.Node.Script().SetTool(nil)
+}
+
 // The ToolService requests carry the main container, the pod's ID and the
 // parameters as the guest takes them.
 func TestToolServiceRequests(t *testing.T) {

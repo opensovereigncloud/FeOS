@@ -50,23 +50,23 @@ type Spec struct {
 var baseline = []Spec{
 	{
 		Name:        ToolBash,
-		Description: "Execute a bash command and return its output with exit code. Output is truncated to 2000 lines / 50KB.",
-		InputSchema: json.RawMessage(`{"properties":{"command":{"description":"Shell command to execute","type":"string"},"timeout":{"description":"Timeout in seconds (optional, no default timeout)","type":"integer"}},"required":["command"],"type":"object"}`),
+		Description: "Execute a bash command and return its output with exit code: for building, testing, git, package managers and running programs. Do not read, search or change files with it — read, rg, fd, edit and write do that, and their answers are made for you. Output is truncated to 2000 lines / 50KB.",
+		InputSchema: json.RawMessage(`{"properties":{"command":{"description":"Shell command to execute","type":"string"},"timeout":{"description":"Timeout in seconds (default 120); give more for a long build or test run","type":"integer"}},"required":["command"],"type":"object"}`),
 	},
 	{
 		Name:        ToolRead,
-		Description: "Read the contents of a file. Supports text files and images (png, jpg, gif, webp — e.g. a screenshot): an image is returned as an image you can look at, up to 3.75 MB and 8000 px per side. Text output is truncated to 2000 lines or 50KB. Use offset (1-based)/limit for large files.",
+		Description: "Read a file. Use this instead of cat, head, tail or sed -n in bash. Text comes back numbered like cat -n: each line starts with its number and a tab, which are not part of the file — leave them out of an edit. Up to 2000 lines or 50KB per call; when the file goes on, the answer ends with the offset to continue from. Use offset (1-based)/limit to read a part of a large file. Images (png, jpg, gif, webp — e.g. a screenshot) are returned as an image you can look at, up to 3.75 MB and 8000 px per side.",
 		InputSchema: json.RawMessage(`{"properties":{"limit":{"description":"Maximum number of lines to read","type":"integer"},"offset":{"description":"Line number to start reading from (1-indexed)","type":"integer"},"path":{"description":"Path to the file to read (relative or absolute)","type":"string"}},"required":["path"],"type":"object"}`),
 	},
 	{
 		Name:        ToolWrite,
-		Description: "Write content to a file. Creates the file and parent directories, overwrites if it exists.",
+		Description: "Write a whole file: creates it and its parent directories, or replaces it if it exists. Use this instead of cat <<EOF, echo > or tee in bash. To change part of an existing file, use edit.",
 		InputSchema: json.RawMessage(`{"properties":{"content":{"description":"Content to write to the file","type":"string"},"path":{"description":"Path to the file to write (relative or absolute)","type":"string"}},"required":["path","content"],"type":"object"}`),
 	},
 	{
 		Name:        ToolEdit,
-		Description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file.",
-		InputSchema: json.RawMessage(`{"properties":{"edits":{"description":"Targeted exact-match replacements","items":{"properties":{"new":{"description":"Replacement text for this targeted edit","type":"string"},"old":{"description":"Exact text for this targeted edit; must be unique","type":"string"}},"required":["old","new"],"type":"object"},"type":"array"},"path":{"description":"Path to the file to edit (relative or absolute)","type":"string"}},"required":["path","edits"],"type":"object"}`),
+		Description: "Change an existing file by exact text replacement. Use this for every change to a file, never sed -i, perl -pi, python or a heredoc in bash. Each entry of edits replaces old with new; old must match the file exactly, whitespace and indentation included, and occur exactly once — take in a line or two around it to make it unique. List several places of one file in one call: they apply to the file as it was and must not overlap. For several files, call edit once per file; several calls in one answer are fine.",
+		InputSchema: json.RawMessage(`{"properties":{"edits":{"description":"Targeted exact-match replacements","items":{"properties":{"new":{"description":"Replacement text for this targeted edit","type":"string"},"old":{"description":"Exact text to replace, as it is in the file (without read's line numbers); must occur exactly once","type":"string"}},"required":["old","new"],"type":"object"},"type":"array"},"path":{"description":"Path to the file to edit (relative or absolute)","type":"string"}},"required":["path","edits"],"type":"object"}`),
 	},
 	{
 		Name:        ToolLs,
@@ -75,12 +75,12 @@ var baseline = []Spec{
 	},
 	{
 		Name:        ToolRg,
-		Description: "Search file contents with ripgrep syntax. Pattern is a regex (Rust regex, like rg). Returns matching lines with file paths and line numbers. Respects .gitignore, skips hidden and binary files. Truncated to 100 match lines (default) or 50KB.",
+		Description: "Search file contents with ripgrep syntax. Use this instead of grep or rg in bash. Pattern is a regex (Rust regex, like rg). Returns matching lines with file paths and line numbers. Respects .gitignore, skips hidden and binary files. Truncated to 100 match lines (default) or 50KB.",
 		InputSchema: json.RawMessage(`{"properties":{"context":{"description":"Lines of context around each match (rg -C)","type":"integer"},"glob":{"description":"Filter files, e.g. '*.py' (rg -g)","type":"string"},"ignoreCase":{"description":"Case-insensitive search (rg -i)","type":"boolean"},"limit":{"description":"Maximum number of match lines (default: 100)","type":"integer"},"literal":{"description":"Treat pattern as literal string (rg -F)","type":"boolean"},"path":{"description":"Directory or file to search (default: current directory)","type":"string"},"pattern":{"description":"Search pattern (regex, ripgrep syntax)","type":"string"}},"required":["pattern"],"type":"object"}`),
 	},
 	{
 		Name:        ToolFd,
-		Description: "Find files by name with fd syntax. Pattern is a regex matched against file names, smart-case (all-lowercase = insensitive); use glob=true for glob patterns like '*.go'. Returns matching file paths. Respects .gitignore, skips hidden files. Truncated to 1000 results (default).",
+		Description: "Find files by name with fd syntax. Use this instead of find or ls -R in bash. Pattern is a regex matched against file names, smart-case (all-lowercase = insensitive); use glob=true for glob patterns like '*.go'. Returns matching file paths. Respects .gitignore, skips hidden files. Truncated to 1000 results (default).",
 		InputSchema: json.RawMessage(`{"properties":{"glob":{"description":"Treat pattern as glob, e.g. '*.go' (fd --glob)","type":"boolean"},"limit":{"description":"Maximum number of results (default: 1000)","type":"integer"},"path":{"description":"Directory to search in (default: current directory)","type":"string"},"pattern":{"description":"Pattern to match file names (fd regex, smart case)","type":"string"}},"required":["pattern"],"type":"object"}`),
 	},
 	{

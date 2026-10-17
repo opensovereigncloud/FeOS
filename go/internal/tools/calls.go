@@ -120,6 +120,9 @@ func prepare(tool string, args json.RawMessage, defaultTimeout time.Duration) (*
 				return 0, nil
 			}
 			o.emit(resp.Text)
+			if resp.Text != "" {
+				o.lines(max(p.Offset, 1), resp.Truncated)
+			}
 			return 0, nil
 		}
 

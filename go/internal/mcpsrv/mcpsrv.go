@@ -374,8 +374,16 @@ func (s *Server) toolHandler(sb auth.Sandbox, tool string) mcp.ToolHandler {
 // render is the MCP result of a tool call.
 func render(res tools.Result, err error) *mcp.CallToolResult {
 	text := res.Text
+	if res.FirstLine > 0 {
+		text = numbered(text, res.FirstLine)
+	}
 	if res.Truncated {
 		text += tools.TruncatedMarker
+	}
+	if res.FirstLine > 0 && (res.More || res.Truncated) {
+		// The first line not shown whole: a cut may end inside one.
+		next := res.FirstLine + strings.Count(res.Text, "\n")
+		text += fmt.Sprintf("... [the file goes on: read with offset=%d for more]\n", next)
 	}
 	if err != nil {
 		if text != "" {
@@ -394,6 +402,23 @@ func render(res tools.Result, err error) *mcp.CallToolResult {
 		content = append(content, &mcp.ImageContent{Data: img.Data, MIMEType: img.MediaType})
 	}
 	return &mcp.CallToolResult{Content: content, IsError: res.IsError}
+}
+
+// numbered puts each line's number in front of it, as cat -n does: right
+// aligned in six columns, then a tab. An agent finds its place by them and
+// edits by the text after the tab.
+func numbered(text string, first int) string {
+	var b strings.Builder
+	b.Grow(len(text) + 8*(strings.Count(text, "\n")+1))
+	for n := first; text != ""; n++ {
+		line, rest, nl := strings.Cut(text, "\n")
+		fmt.Fprintf(&b, "%6d\t%s", n, line)
+		if nl {
+			b.WriteByte('\n')
+		}
+		text = rest
+	}
+	return b.String()
 }
 
 // heartbeats sends a call's progress notifications: on a timer, and on
