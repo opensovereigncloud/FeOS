@@ -10,10 +10,19 @@
 //! accounting and byte budget — lives in a single actor thread fed by an
 //! mpsc channel. Eviction is `unlink`; readers holding an fd are
 //! unaffected.
+//!
+//! The budget is one of reconstructible bytes. A chunk the node holds the
+//! only durable copy of is pinned instead: never evicted, and outside the
+//! budget. The caller names those ([`Cache::pin`], which replaces the set);
+//! a seal holds the chunks of its new layer from their admission on
+//! ([`Cache::hold`]), until the caller has pinned them, so that no admit in
+//! between can evict them.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 
@@ -25,10 +34,15 @@ use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheStats {
+    /// Chunks in the cache, pinned ones included.
     pub entries: u64,
     pub bytes: u64,
     pub evicted_entries: u64,
     pub evicted_bytes: u64,
+    /// Of `entries` and `bytes`: the pinned and held chunks, which the
+    /// budget does not count.
+    pub pinned_entries: u64,
+    pub pinned_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -57,6 +71,20 @@ enum Msg {
     Remove {
         hash: Hash,
     },
+    /// Replaces the pinned set.
+    Pin {
+        keep: HashSet<Hash>,
+    },
+    /// Adds chunks to a hold; answers once they are held.
+    Hold {
+        id: u64,
+        hashes: Vec<Hash>,
+        reply: mpsc::Sender<()>,
+    },
+    /// Ends a hold.
+    Release {
+        id: u64,
+    },
     Evict {
         target: EvictTarget,
         keep: std::collections::HashSet<Hash>,
@@ -83,6 +111,22 @@ pub struct Cache {
     tx: mpsc::Sender<Msg>,
     actor: Option<JoinHandle<CacheStats>>,
     refill: Option<Refill>,
+    next_hold: AtomicU64,
+}
+
+/// Chunks admitted under a hold ([`Cache::admit_batch`]) stay in the cache,
+/// outside the budget, until the hold is dropped. A seal holds the chunks
+/// of its new layer so, from their admission until the caller has pinned
+/// them ([`Cache::pin`]) or given the layer up.
+pub struct Hold {
+    id: u64,
+    tx: mpsc::Sender<Msg>,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Release { id: self.id });
+    }
 }
 
 impl Cache {
@@ -128,6 +172,7 @@ impl Cache {
             tx,
             actor: Some(actor),
             refill: None,
+            next_hold: AtomicU64::new(1),
         })
     }
 
@@ -185,7 +230,7 @@ impl Cache {
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = self.staging_dir().join(format!("{}.tmp", hash.to_hex()));
+        let tmp = staging_tmp(&self.staging_dir(), &hash.to_hex());
         fs::write(&tmp, bytes)?;
         fs::File::open(&tmp)?.sync_all()?;
         fs::rename(&tmp, &dst)?;
@@ -209,18 +254,42 @@ impl Cache {
     /// 256 MiB base at 64 KiB chunks on loop-XFS).
     /// Correct for the seal commit rule as long as the caller does not
     /// reference the chunks from a manifest before this returns.
-    pub fn admit_batch(&self, chunks: &[(Hash, Vec<u8>)]) -> Result<()> {
+    ///
+    /// With a hold, every chunk of the batch is held, those the cache had
+    /// already too: they are held before the files are looked at, so a
+    /// chunk is either evicted before, and written again here, or kept.
+    pub fn admit_batch(&self, chunks: &[(Hash, Vec<u8>)], hold: Option<&Hold>) -> Result<()> {
+        if let Some(hold) = hold {
+            let (rtx, rrx) = mpsc::channel();
+            self.tx
+                .send(Msg::Hold {
+                    id: hold.id,
+                    hashes: chunks.iter().map(|(h, _)| *h).collect(),
+                    reply: rtx,
+                })
+                .map_err(|_| Error::Head("budget actor gone".into()))?;
+            rrx.recv()
+                .map_err(|_| Error::Head("budget actor gone".into()))?;
+        }
         let mut wrote = false;
         for (hash, bytes) in chunks {
             let dst = self.chunk_path(hash);
             if dst.is_file() {
-                let _ = self.tx.send(Msg::Touch { hash: *hash });
+                let _ = self.tx.send(match hold {
+                    // Accounted as held, also if its own admit is still
+                    // on the way (a racing admitter's).
+                    Some(_) => Msg::Admit {
+                        hash: *hash,
+                        len: bytes.len() as u64,
+                    },
+                    None => Msg::Touch { hash: *hash },
+                });
                 continue;
             }
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let tmp = self.staging_dir().join(format!("{}.tmp", hash.to_hex()));
+            let tmp = staging_tmp(&self.staging_dir(), &hash.to_hex());
             fs::write(&tmp, bytes)?;
             fs::rename(&tmp, &dst)?;
             wrote = true;
@@ -246,6 +315,23 @@ impl Cache {
         let _ = self.tx.send(Msg::Remove { hash: *hash });
     }
 
+    /// Pins `keep`, in place of what was pinned: these chunks are never
+    /// evicted, and the budget does not count them. A chunk in `keep` that
+    /// is not in the cache is pinned when it comes. The chunks that lose
+    /// their pin are the most recently used ones then.
+    pub fn pin(&self, keep: HashSet<Hash>) {
+        let _ = self.tx.send(Msg::Pin { keep });
+    }
+
+    /// A new hold, for one seal's admits.
+    pub fn hold(&self) -> Hold {
+        Hold {
+            id: self.next_hold.fetch_add(1, Ordering::Relaxed),
+            tx: self.tx.clone(),
+        }
+    }
+
+    /// Evicts down to `target`. Pinned and held chunks are never evicted.
     pub fn evict(&self, target: EvictTarget) -> Result<EvictStats> {
         self.evict_skip(target, &std::collections::HashSet::new())
     }
@@ -288,37 +374,82 @@ impl Drop for Cache {
     }
 }
 
-fn actor_loop(
+/// The budget actor's state. `lru` and `bytes` are the evictable chunks,
+/// which the budget is about; `pinned` are the chunks in the cache that
+/// are pinned or held, outside both.
+struct Budget {
     cache_dir: PathBuf,
     budget: u64,
-    rx: mpsc::Receiver<Msg>,
-    mut lru: LinkedHashMap<Hash, u64>,
-    mut bytes: u64,
-) -> CacheStats {
-    let mut evicted_entries = 0u64;
-    let mut evicted_bytes = 0u64;
+    lru: LinkedHashMap<Hash, u64>,
+    bytes: u64,
+    pinned: HashMap<Hash, u64>,
+    pinned_bytes: u64,
+    /// What the last `Pin` pinned, in the cache or not.
+    pins: HashSet<Hash>,
+    /// The open holds, with the chunks each of them holds.
+    holds: HashMap<u64, HashSet<Hash>>,
+    evicted_entries: u64,
+    evicted_bytes: u64,
+}
 
-    fn drop_oldest(
-        cache_dir: &Path,
-        lru: &mut LinkedHashMap<Hash, u64>,
-        bytes: &mut u64,
-        keep: &std::collections::HashSet<Hash>,
-    ) -> Option<u64> {
-        // Skip over protected (protenured) entries without evicting them.
-        if keep.is_empty() {
-            let (h, len) = lru.pop_front()?;
-            let p = cache_dir.join(chunk::cache_rel_path(&h));
-            if let Err(e) = fs::remove_file(&p)
-                && e.kind() != io::ErrorKind::NotFound
-            {
-                debug!(hash = %h.to_hex(), error = %e, "evict unlink failed");
-            }
-            *bytes = bytes.saturating_sub(len);
-            return Some(len);
+impl Budget {
+    fn wanted(&self, h: &Hash) -> bool {
+        self.pins.contains(h) || self.holds.values().any(|held| held.contains(h))
+    }
+
+    /// A chunk that came into the cache: pinned, or the most recently used.
+    fn place(&mut self, hash: Hash, len: u64) {
+        if let Some(old) = self.lru.remove(&hash) {
+            self.bytes = self.bytes.saturating_sub(old);
         }
+        if let Some(old) = self.pinned.remove(&hash) {
+            self.pinned_bytes = self.pinned_bytes.saturating_sub(old);
+        }
+        if self.wanted(&hash) {
+            self.pinned.insert(hash, len);
+            self.pinned_bytes += len;
+        } else {
+            self.lru.insert(hash, len);
+            self.bytes += len;
+        }
+    }
+
+    /// Takes these chunks out of the LRU, if they are in it, and pins them.
+    fn pin_from_lru<'a>(&mut self, hashes: impl IntoIterator<Item = &'a Hash>) {
+        for h in hashes {
+            if let Some(len) = self.lru.remove(h) {
+                self.bytes = self.bytes.saturating_sub(len);
+                self.pinned.insert(*h, len);
+                self.pinned_bytes += len;
+            }
+        }
+    }
+
+    /// Puts the pinned chunks that are no longer wanted back into the
+    /// LRU, as its most recently used.
+    fn unpin_unwanted(&mut self) {
+        let unwanted: Vec<Hash> = self
+            .pinned
+            .keys()
+            .filter(|h| !self.wanted(h))
+            .copied()
+            .collect();
+        for h in unwanted {
+            if let Some(len) = self.pinned.remove(&h) {
+                self.pinned_bytes = self.pinned_bytes.saturating_sub(len);
+                self.lru.insert(h, len);
+                self.bytes += len;
+            }
+        }
+    }
+
+    /// Evicts the least recently used chunk that is not in `keep`, and
+    /// returns its length.
+    fn drop_oldest(&mut self, keep: &HashSet<Hash>) -> Option<u64> {
+        // Skip over protected (protenured) entries without evicting them.
         let mut skipped: Vec<(Hash, u64)> = Vec::new();
         let mut next: Option<(Hash, u64)> = None;
-        while let Some((h, len)) = lru.pop_front() {
+        while let Some((h, len)) = self.lru.pop_front() {
             if keep.contains(&h) {
                 skipped.push((h, len));
             } else {
@@ -326,50 +457,105 @@ fn actor_loop(
                 break;
             }
         }
-        lru.extend(skipped);
+        self.lru.extend(skipped);
         let (h, len) = next?;
-        let p = cache_dir.join(chunk::cache_rel_path(&h));
+        let p = self.cache_dir.join(chunk::cache_rel_path(&h));
         if let Err(e) = fs::remove_file(&p)
             && e.kind() != io::ErrorKind::NotFound
         {
             debug!(hash = %h.to_hex(), error = %e, "evict unlink failed");
         }
-        *bytes = bytes.saturating_sub(len);
+        self.bytes = self.bytes.saturating_sub(len);
         Some(len)
     }
+
+    /// Evicts until the evictable bytes are within `goal`, never a chunk
+    /// in `keep`, and returns what it freed.
+    fn evict_to(&mut self, goal: u64, keep: &HashSet<Hash>) -> EvictStats {
+        let before_e = self.evicted_entries;
+        let before_b = self.evicted_bytes;
+        while self.bytes > goal {
+            match self.drop_oldest(keep) {
+                Some(l) => {
+                    self.evicted_entries += 1;
+                    self.evicted_bytes += l;
+                }
+                None => break,
+            }
+        }
+        EvictStats {
+            removed_entries: self.evicted_entries - before_e,
+            freed_bytes: self.evicted_bytes - before_b,
+        }
+    }
+
+    fn stats(&self) -> CacheStats {
+        CacheStats {
+            entries: (self.lru.len() + self.pinned.len()) as u64,
+            bytes: self.bytes + self.pinned_bytes,
+            evicted_entries: self.evicted_entries,
+            evicted_bytes: self.evicted_bytes,
+            pinned_entries: self.pinned.len() as u64,
+            pinned_bytes: self.pinned_bytes,
+        }
+    }
+}
+
+fn actor_loop(
+    cache_dir: PathBuf,
+    budget: u64,
+    rx: mpsc::Receiver<Msg>,
+    lru: LinkedHashMap<Hash, u64>,
+    bytes: u64,
+) -> CacheStats {
+    let mut b = Budget {
+        cache_dir,
+        budget,
+        lru,
+        bytes,
+        pinned: HashMap::new(),
+        pinned_bytes: 0,
+        pins: HashSet::new(),
+        holds: HashMap::new(),
+        evicted_entries: 0,
+        evicted_bytes: 0,
+    };
+    let nothing = HashSet::new();
 
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Admit { hash, len } => {
-                if lru.contains_key(&hash) {
-                    lru.remove(&hash);
-                    bytes = bytes.saturating_sub(len);
-                }
-                lru.insert(hash, len);
-                bytes += len;
-                while bytes > budget {
-                    match drop_oldest(
-                        &cache_dir,
-                        &mut lru,
-                        &mut bytes,
-                        &std::collections::HashSet::new(),
-                    ) {
-                        Some(l) => {
-                            evicted_entries += 1;
-                            evicted_bytes += l;
-                        }
-                        None => break,
-                    }
-                }
+                b.place(hash, len);
+                b.evict_to(b.budget, &nothing);
             }
             Msg::Touch { hash } => {
-                if let Some(len) = lru.remove(&hash) {
-                    lru.insert(hash, len);
+                if let Some(len) = b.lru.remove(&hash) {
+                    b.lru.insert(hash, len);
                 }
             }
             Msg::Remove { hash } => {
-                if let Some(len) = lru.remove(&hash) {
-                    bytes = bytes.saturating_sub(len);
+                if let Some(len) = b.lru.remove(&hash) {
+                    b.bytes = b.bytes.saturating_sub(len);
+                }
+                if let Some(len) = b.pinned.remove(&hash) {
+                    b.pinned_bytes = b.pinned_bytes.saturating_sub(len);
+                }
+            }
+            Msg::Pin { keep } => {
+                b.pin_from_lru(&keep);
+                b.pins = keep;
+                b.unpin_unwanted();
+                b.evict_to(b.budget, &nothing);
+            }
+            Msg::Hold { id, hashes, reply } => {
+                b.pin_from_lru(&hashes);
+                b.holds.entry(id).or_default().extend(hashes);
+                let _ = reply.send(());
+            }
+            Msg::Release { id } => {
+                if b.holds.remove(&id).is_some() {
+                    b.unpin_unwanted();
+                    b.evict_to(b.budget, &nothing);
                 }
             }
             Msg::Evict {
@@ -379,41 +565,17 @@ fn actor_loop(
             } => {
                 let goal = match target {
                     EvictTarget::All => 0,
-                    EvictTarget::Budget => budget,
+                    EvictTarget::Budget => b.budget,
                 };
-                let before_e = evicted_entries;
-                let before_b = evicted_bytes;
-                while bytes > goal {
-                    match drop_oldest(&cache_dir, &mut lru, &mut bytes, &keep) {
-                        Some(l) => {
-                            evicted_entries += 1;
-                            evicted_bytes += l;
-                        }
-                        None => break,
-                    }
-                }
-                let _ = reply.send(EvictStats {
-                    removed_entries: evicted_entries - before_e,
-                    freed_bytes: evicted_bytes - before_b,
-                });
+                let _ = reply.send(b.evict_to(goal, &keep));
             }
             Msg::Stats { reply } => {
-                let _ = reply.send(CacheStats {
-                    entries: lru.len() as u64,
-                    bytes,
-                    evicted_entries,
-                    evicted_bytes,
-                });
+                let _ = reply.send(b.stats());
             }
             Msg::Shutdown => break,
         }
     }
-    CacheStats {
-        entries: lru.len() as u64,
-        bytes,
-        evicted_entries,
-        evicted_bytes,
-    }
+    b.stats()
 }
 
 /// Walk `cache/<hh>/<hash>` returning (hash, len, mtime-secs) sorted by
@@ -456,6 +618,20 @@ pub fn fsync_dir(p: &Path) -> io::Result<()> {
     fs::File::open(p)?.sync_all()
 }
 
+/// A staging file of its own for one write of `name` (a chunk's hash, a
+/// layer's manifest) in `staging`. Two seals that write the same chunk at
+/// once must not share one: the first rename would take it from under the
+/// second. The process id keeps a second process on the same state dir
+/// apart; [`Cache::open`] removes what an interrupted write left.
+pub fn staging_tmp(staging: &Path, name: &str) -> PathBuf {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    staging.join(format!(
+        "{name}.{}-{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 /// syncfs(2) on the filesystem containing `p`. Production mounts a
 /// dedicated XFS volume for diskd (ADR 0011), so flushing it flushes only
 /// diskd's own data.
@@ -466,4 +642,217 @@ pub fn syncfs(p: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEN: usize = 4096;
+
+    /// A chunk of its own for each `i`.
+    fn data(i: u32) -> Vec<u8> {
+        let mut v = vec![0x5a; LEN];
+        v[..4].copy_from_slice(&i.to_le_bytes());
+        v
+    }
+
+    fn admit(cache: &Cache, i: u32) -> Hash {
+        let d = data(i);
+        let h = chunk::hash(&d);
+        cache.admit(&h, &d).unwrap();
+        h
+    }
+
+    /// The actor's state once it has handled every message sent so far.
+    fn settled(cache: &Cache) -> CacheStats {
+        cache.stats().unwrap()
+    }
+
+    fn three_chunks(dir: &Path) -> Cache {
+        Cache::open(dir, 3 * LEN as u64).unwrap()
+    }
+
+    #[test]
+    fn pinned_chunks_survive_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = three_chunks(dir.path());
+        let first: Vec<Hash> = (0..3).map(|i| admit(&cache, i)).collect();
+        cache.pin(first[..2].iter().copied().collect());
+        let more: Vec<Hash> = (10..15).map(|i| admit(&cache, i)).collect();
+        let st = settled(&cache);
+        assert!(cache.contains(&first[0]) && cache.contains(&first[1]));
+        assert!(!cache.contains(&first[2]), "the unpinned one is evicted");
+        assert!(!cache.contains(&more[0]) && cache.contains(&more[4]));
+        assert_eq!(st.bytes, 5 * LEN as u64, "2 pinned + 3 in the budget");
+        assert_eq!(st.entries, 5);
+        assert_eq!(st.pinned_entries, 2);
+        assert_eq!(st.pinned_bytes, 2 * LEN as u64);
+    }
+
+    #[test]
+    fn pinned_admits_survive_unpinned_admits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = three_chunks(dir.path());
+        let hold = cache.hold();
+        let held: Vec<(Hash, Vec<u8>)> = (0..5)
+            .map(|i| {
+                let d = data(i);
+                (chunk::hash(&d), d)
+            })
+            .collect();
+        cache.admit_batch(&held, Some(&hold)).unwrap();
+        for i in 100..110 {
+            admit(&cache, i);
+        }
+        let st = settled(&cache);
+        for (h, _) in &held {
+            assert!(cache.contains(h), "a held chunk was evicted");
+        }
+        assert_eq!(st.pinned_entries, 5);
+        assert_eq!(st.bytes, 8 * LEN as u64);
+    }
+
+    #[test]
+    fn pin_replace_unpins() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = three_chunks(dir.path());
+        let a = admit(&cache, 0);
+        cache.pin([a].into_iter().collect());
+        for i in 1..4 {
+            admit(&cache, i);
+        }
+        assert!(cache.contains(&a));
+        cache.pin(HashSet::new());
+        assert_eq!(settled(&cache).pinned_entries, 0);
+        for i in 10..13 {
+            admit(&cache, i);
+        }
+        settled(&cache);
+        assert!(!cache.contains(&a), "an unpinned chunk is evicted again");
+
+        // A held chunk keeps its place while its hold lives, whatever is
+        // pinned, and is evictable once the hold is gone.
+        let hold = cache.hold();
+        let d = data(20);
+        let c = chunk::hash(&d);
+        cache.admit_batch(&[(c, d)], Some(&hold)).unwrap();
+        cache.pin(HashSet::new());
+        for i in 30..35 {
+            admit(&cache, i);
+        }
+        settled(&cache);
+        assert!(cache.contains(&c), "a held chunk lost its hold to a pin");
+        drop(hold);
+        assert_eq!(settled(&cache).pinned_entries, 0);
+        for i in 40..43 {
+            admit(&cache, i);
+        }
+        settled(&cache);
+        assert!(!cache.contains(&c), "a released chunk is evicted again");
+    }
+
+    #[test]
+    fn a_hold_takes_chunks_the_cache_had() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = three_chunks(dir.path());
+        let a = admit(&cache, 0);
+        let hold = cache.hold();
+        cache.admit_batch(&[(a, data(0))], Some(&hold)).unwrap();
+        for i in 1..6 {
+            admit(&cache, i);
+        }
+        let st = settled(&cache);
+        assert!(cache.contains(&a));
+        assert_eq!(st.pinned_entries, 1);
+    }
+
+    #[test]
+    fn evict_all_keeps_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path(), 1 << 30).unwrap();
+        let hs: Vec<Hash> = (0..4).map(|i| admit(&cache, i)).collect();
+        cache.pin(hs[..2].iter().copied().collect());
+        let freed = cache.evict(EvictTarget::All).unwrap();
+        assert_eq!(freed.removed_entries, 2);
+        assert_eq!(freed.freed_bytes, 2 * LEN as u64);
+        assert!(cache.contains(&hs[0]) && cache.contains(&hs[1]));
+        assert!(!cache.contains(&hs[2]) && !cache.contains(&hs[3]));
+        let st = settled(&cache);
+        assert_eq!(st.entries, 2);
+        assert_eq!(st.bytes, 2 * LEN as u64);
+        assert_eq!(st.pinned_bytes, 2 * LEN as u64);
+    }
+
+    #[test]
+    fn admit_of_a_pinned_hash_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path(), LEN as u64).unwrap();
+        let h = chunk::hash(&data(0));
+        cache.pin([h].into_iter().collect());
+        assert_eq!(settled(&cache).pinned_entries, 0, "not in the cache yet");
+        admit(&cache, 0);
+        for i in 1..4 {
+            admit(&cache, i);
+        }
+        let st = settled(&cache);
+        assert!(cache.contains(&h));
+        assert_eq!(st.pinned_entries, 1);
+        assert_eq!(st.bytes, 2 * LEN as u64, "the pinned one and the budget's");
+    }
+
+    #[test]
+    fn remove_of_a_pinned_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = three_chunks(dir.path());
+        let a = admit(&cache, 0);
+        cache.pin([a].into_iter().collect());
+        assert_eq!(settled(&cache).pinned_entries, 1);
+        // GC unlinks a chunk, then makes the cache forget it.
+        fs::remove_file(cache.chunk_path(&a)).unwrap();
+        cache.forget(&a);
+        let st = settled(&cache);
+        assert_eq!((st.entries, st.bytes, st.pinned_entries), (0, 0, 0));
+        // Still pinned: it is held again when it comes back.
+        admit(&cache, 0);
+        assert_eq!(settled(&cache).pinned_entries, 1);
+    }
+
+    /// Two seals of like disks at once admit the same new chunks: each
+    /// stages its own file, so that neither renames the other's away.
+    #[test]
+    fn racing_admitters_of_a_chunk_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path(), 1 << 30).unwrap();
+        for round in 0..50u32 {
+            let chunks: Vec<(Hash, Vec<u8>)> = (0..8)
+                .map(|i| {
+                    let d = data(round * 8 + i);
+                    (chunk::hash(&d), d)
+                })
+                .collect();
+            let start = std::sync::Barrier::new(4);
+            std::thread::scope(|s| {
+                for t in 0..4 {
+                    let (cache, chunks, start) = (&cache, &chunks, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        if t % 2 == 0 {
+                            cache.admit_batch(chunks, None).unwrap();
+                        } else {
+                            for (h, d) in chunks {
+                                cache.admit(h, d).unwrap();
+                            }
+                        }
+                    });
+                }
+            });
+            for (h, d) in &chunks {
+                assert_eq!(&fs::read(cache.chunk_path(h)).unwrap(), d);
+            }
+        }
+        assert_eq!(settled(&cache).entries, 50 * 8);
+        let staged = fs::read_dir(cache.staging_dir()).unwrap().count();
+        assert_eq!(staged, 0, "staging files left");
+    }
 }

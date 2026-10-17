@@ -64,9 +64,12 @@ top      a sparse file: what the pod wrote since
 - `Seal(pod, upload)`, on a stopped device, merges the top into the pod's
   layer S, points the device's row at it and then removes the top; with
   `upload`, it pushes the chain. A disk without a top is sealed already,
-  and the seal returns its newest layer. `Bake(pod)` seals the frozen top
-  of a running device into a layer on L0 and changes nothing about the
-  pod.
+  and the seal returns its newest layer: `Seal` without upload and then
+  with it seals, and then uploads. A seal whose caller goes away runs on
+  to its end on the node; its upload stops where it is, and what it
+  uploaded stays, listed in the disk's journal (below). `Bake(pod)` seals
+  the frozen top of a running device into a layer on L0 and changes
+  nothing about the pod.
 - `PutHead(pod, epoch, memory, volume_heads)` uploads the head of a
   checkpoint of a sealed, stopped disk: its chain, how much of it is
   shared, its size, the memory the caller sealed and put beside it, and
@@ -74,9 +77,40 @@ top      a sparse file: what the pod wrote since
   vmstate or volumes' heads are not in the bucket, and one that exists:
   heads are never overwritten. `GetHead(key)` reads one.
 - `RemoveDevice` forgets a stopped pod.
+- `CreateDisk`, `OpenDisk`, `StopDisk`, `RemoveDevice`, `Seal` and
+  `PutHead` hold the disk's lock until their work on the node ends, also
+  when their caller goes away; a call waits for it up to 10 minutes and
+  fails `UNAVAILABLE` "disk `<pod>` is busy" then. So an `OpenDisk` that
+  comes during a seal starts the device over the sealed layer, after the
+  seal. A push holds no lock.
 
 When diskd ends, its devices stay. The next diskd recovers every device in
 `diskd.state` before it serves: I/O that waited goes on.
+
+## The cache
+
+The cache holds raw chunks within its budget (`--budget-bytes`), and drops
+the least recently used ones beyond it: chunks it can fetch again. Those
+it cannot are pinned, outside the budget, and never evicted, not by
+`Evict` either: the chunks of every layer of a device's chain that is not
+uploaded, and of a disk's own layer while no head names it. A seal marks
+the disk unheaded (`unheaded/<disk>`) until `PutHead` or `RemoveDevice`
+of the disk, or an `OpenDisk` from a head, and holds its new layer's
+chunks from their admission on. A hibernation that was abandoned or
+failed leaves the disk so until its next head: the node has the only copy
+of what the pod wrote.
+
+A marker (`uploaded/chunks/<hh>/<chunk>`, `uploaded/<layer>`) says a chunk
+or a layer is in the bucket, and a push skips what has one.
+`unheaded/<disk>` is the journal of what was pushed for the disk while it
+is unheaded, and `unheaded-memory/<layer>` that of a memory layer no head
+names yet: the time it started at, then a chunk per line, or for a disk a
+layer (`L <layer>`), each listed before its marker is written. Only a seal
+starts a disk's journal; a push that still runs once it is gone marks
+nothing. Nothing in the bucket names what a journal lists, so a sweep
+deletes it once it is older than its grace; at the start of every push,
+the markers of a journal older than 12 hours go, and what they marked is
+uploaded again.
 
 ## Memory
 
@@ -194,6 +228,8 @@ pod is `RestorePod` with its own checkpoint:
 | `live/<pod>/top.img`, `live/<pod>/disk` | a pod's top, and the link to its device |
 | `snapshots/<pod>/head.json` | a pod's head after its last seal: chain, size |
 | `uploaded/` | which chunks and layers are in the object store |
+| `unheaded/<disk>` | a disk whose own layer no head names yet, and the journal of the chunks pushed for it |
+| `unheaded-memory/<layer>` | the journal of the chunks pushed for a memory layer no head names yet |
 | `zero.bin` | zeroes to serve reads from |
 
 The state directory belongs on a filesystem of its own, preferably XFS.
@@ -218,7 +254,10 @@ given do not reach, and nothing younger than a day; a live head keeps the
 heads of its volumes. The live heads are every pod's
 `checkpoint.head_key`, on every node: a pod reads from the checkpoint it
 came from until its next one; and every volume's, whose pod may be gone. `feosd` sweeps nothing; the
-control plane, which knows all pods, will.
+control plane, which knows all pods, will. A grace must be longer than
+12 hours and the longest hibernation together, or a sweep may delete a
+chunk whose marker a push still trusts ([the cache](#the-cache)):
+`no_grace` is for labs.
 
 ## Development
 

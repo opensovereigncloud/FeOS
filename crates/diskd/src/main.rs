@@ -7,9 +7,9 @@
 //! disks, the local chunk cache, and the S3 client. Control via gRPC on
 //! a unix socket.
 //!
-//! Startup: adopt the cache, then reattach every device found in
-//! `diskd.state` via ublk user recovery (crash drill: kill -9, restart,
-//! I/O resumes).
+//! Startup: adopt the cache, pin the chunks only the node has, then
+//! reattach every device found in `diskd.state` via ublk user recovery
+//! (crash drill: kill -9, restart, I/O resumes).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -107,15 +107,23 @@ async fn main() -> Result<(), String> {
     };
     let cache = Arc::new(cache);
 
-    let svc = svc::DiskSvc {
-        state_dir: args.state_dir.clone(),
+    let svc = svc::DiskSvc::new(
+        args.state_dir.clone(),
         cache,
         s3,
-        devices: Default::default(),
-        memories: Default::default(),
-        s3_concurrency: args.s3_concurrency,
-        mem_readahead: args.mem_readahead,
-    };
+        args.s3_concurrency,
+        args.mem_readahead,
+    );
+
+    // Pin what the node holds the only copy of before anything is admitted:
+    // the layers of its devices that are not uploaded, and the own layers of
+    // disks no head names yet.
+    {
+        let this = svc.clone();
+        tokio::task::spawn_blocking(move || this.refresh_pins())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     // Startup recovery: reattach every device found in the state file.
     let rows: Vec<(String, state::DeviceRow)> = match state::State::load(&args.state_dir) {

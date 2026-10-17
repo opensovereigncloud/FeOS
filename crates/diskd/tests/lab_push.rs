@@ -13,8 +13,20 @@
 //!
 //! Both run against hermetic daemon state dirs so marker state and the
 //! counters are exact.
+//!
+//! `lab_seal_upload_dropped`: a `Seal{upload}` whose caller goes away in
+//! the middle of the push (a hibernation abandoned for a resume) leaves
+//! the layer sealed, pinned and unheaded, its uploaded chunks marked and
+//! listed in the disk's journal; the next push skips them, and `PutHead`
+//! ends the pins. `lab_unheaded_expiry`: once the journal is older than 12
+//! hours, the next push uploads those chunks again. Both run a daemon of
+//! their own, under a bucket prefix of their own that they delete.
 
 mod common;
+
+use std::collections::HashSet;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 use common::Lab;
 
@@ -201,4 +213,398 @@ fn lab_push_parallel_and_skips_uploaded() {
         "lab_push PASS: {mibps1:.1} → {mibps16:.1} MiB/s ({:.1}×), repush PUTs={puts_repush}, layer2 PUTs={puts2}",
         mibps16 / mibps1
     );
+}
+
+// ── a push whose caller went away ──────────────────────────────────────
+
+/// What the pod writes: 48 MiB, 768 chunks, past the first 256 a push
+/// marks at a time.
+const WRITTEN: usize = 48 << 20;
+const WRITTEN_AT: u64 = 8 << 20;
+
+/// A daemon of the test's own, on its own state dir and bucket prefix.
+struct Resume {
+    lab: Lab,
+    daemon: std::process::Child,
+    s3: disk_store::s3::S3,
+    prefix: String,
+    rt: tokio::runtime::Runtime,
+    pod: String,
+}
+
+impl Resume {
+    fn start(tag: &str) -> Resume {
+        let l = Lab::new();
+        let prefix = format!("diskd-test/resume-{tag}-{}/", std::process::id());
+        let state = l.root.join(format!("target/diskd/state-resume-{tag}"));
+        // A few PUTs at a time, so that the drop lands in the middle.
+        let (lab, daemon) =
+            l.spawn_daemon(&state, &["--s3-prefix", &prefix, "--s3-concurrency", "4"]);
+        let s3 = disk_store::s3::S3::from_env(prefix.clone())
+            .expect("s3 env")
+            .expect("s3 configured (S3_BUCKET + creds)");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        Resume {
+            lab,
+            daemon,
+            s3,
+            prefix,
+            rt,
+            pod: format!("lab-resume-{tag}"),
+        }
+    }
+
+    fn state(&self) -> &Path {
+        &self.lab.state
+    }
+
+    fn journal(&self) -> PathBuf {
+        self.state().join("unheaded").join(&self.pod)
+    }
+
+    /// The journal: when it started, and the chunks it lists.
+    fn read_journal(&self) -> (u64, HashSet<String>) {
+        let (since, chunks, _) = self.read_journal_layers();
+        (since, chunks)
+    }
+
+    /// The journal: when it started, the chunks and the layers it lists.
+    fn read_journal_layers(&self) -> (u64, HashSet<String>, HashSet<String>) {
+        let text = std::fs::read_to_string(self.journal()).expect("the disk's journal");
+        let mut lines = text.lines();
+        let since = lines.next().unwrap().trim().parse().unwrap();
+        let (mut chunks, mut layers) = (HashSet::new(), HashSet::new());
+        for l in lines.map(str::trim) {
+            match l.strip_prefix("L ") {
+                Some(layer) => layers.insert(layer.to_string()),
+                None => chunks.insert(l.to_string()),
+            };
+        }
+        (since, chunks, layers)
+    }
+
+    /// Moves the journal's start `hours` back, and returns the time now.
+    fn age_journal(&self, hours: u64) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let text = std::fs::read_to_string(self.journal()).unwrap();
+        let rest = text.split_once('\n').map_or("", |(_, rest)| rest);
+        std::fs::write(self.journal(), format!("{}\n{rest}", now - hours * 60 * 60)).unwrap();
+        now
+    }
+
+    fn puts(&self) -> u64 {
+        jnum(&self.lab.ctl_json(&["stats"]).unwrap(), "s3_puts")
+    }
+
+    fn marked(&self, hex: &str) -> bool {
+        self.state()
+            .join("uploaded/chunks")
+            .join(&hex[0..2])
+            .join(hex)
+            .is_file()
+    }
+
+    fn cached(&self, hex: &str) -> bool {
+        self.state()
+            .join("cache")
+            .join(&hex[0..2])
+            .join(hex)
+            .is_file()
+    }
+
+    fn has_manifest(&self, layer: &str) -> bool {
+        let id = disk_store::manifest::LayerId::from_hex(layer).unwrap();
+        self.rt.block_on(self.s3.has_manifest(&id))
+    }
+
+    fn ok(&self, args: &[&str]) -> serde_json::Value {
+        self.lab
+            .ctl_json(args)
+            .unwrap_or_else(|e| panic!("diskctl {args:?}: {e}"))
+    }
+
+    /// A pod on a pushed L0 writes `WRITTEN` bytes; its disk is sealed
+    /// without upload, and then a `Seal{upload}` is dropped once the push
+    /// has marked its first chunks. Returns the sealed layer, its chunks
+    /// and what was written.
+    fn dropped_upload(&self, seed: u64) -> (String, HashSet<String>, Vec<u8>) {
+        let base = self.state().join("base.raw");
+        {
+            let f = std::fs::File::create(&base).unwrap();
+            f.set_len(64 << 20).unwrap();
+            f.write_all_at(&noise(seed ^ 0xba5e, 1 << 20), 0).unwrap();
+        }
+        let l0 = self.ok(&["import-base", &base.display().to_string()])["layer_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let o = self.lab.ctl(&["push", &l0]);
+        assert!(o.status.success(), "push l0: {o:?}");
+
+        let link = self.ok(&["create", &self.pod, &l0])["link_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let data = noise(seed, WRITTEN);
+        direct_write(&link, WRITTEN_AT, &data);
+        self.lab.stop(&self.pod);
+
+        let layer = self.ok(&["seal", &self.pod])["layer_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(self.journal().is_file(), "a sealed disk is unheaded");
+        let chunks: HashSet<String> = self
+            .lab
+            .load_layer_manifest(&layer)
+            .entries
+            .iter()
+            .filter(|e| e.kind == disk_store::manifest::EntryKind::Data)
+            .map(|e| disk_store::chunk::Hash::from(e.hash).to_hex().to_string())
+            .collect();
+        assert!(
+            chunks.len() >= WRITTEN / (64 << 10),
+            "the layer holds the writes"
+        );
+
+        let mut caller = std::process::Command::new(&self.lab.ctl)
+            .args(["--socket", &self.lab.socket.display().to_string()])
+            .args(["seal", &self.pod, "--upload"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("diskctl seal --upload");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            assert!(
+                caller.try_wait().unwrap().is_none(),
+                "the push ended before it could be dropped"
+            );
+            if self.journal().is_file() && !self.read_journal().1.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no chunk was journaled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // The caller goes away: its connection with it.
+        caller.kill().unwrap();
+        let _ = caller.wait();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let stopped = self.puts();
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        assert_eq!(self.puts(), stopped, "the dropped push goes on");
+        (layer, chunks, data)
+    }
+
+    /// Stops the daemon and deletes the test's prefix; the state dir, with
+    /// the daemon's log, stays for a test that failed.
+    fn stop(mut self, passed: bool) {
+        self.lab.cleanup(&self.pod);
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+        // Never a sweep of the bucket: the test's own prefix only.
+        assert!(self.prefix.starts_with("diskd-test/resume-"));
+        self.rt.block_on(async {
+            let _ = self.s3.delete_prefix().await;
+        });
+        if passed {
+            let _ = std::fs::remove_dir_all(&self.lab.state);
+        }
+    }
+}
+
+/// Bytes of their own for a seed (xorshift).
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut x = seed ^ ((std::process::id() as u64) << 32) | 1;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// A buffer of `len` bytes at a 4 KiB boundary, for O_DIRECT.
+fn aligned(len: usize) -> (Vec<u8>, usize) {
+    let buf = vec![0u8; len + 4096];
+    let at = (4096 - buf.as_ptr() as usize % 4096) % 4096;
+    (buf, at)
+}
+
+/// Writes through the device, not the host's page cache.
+fn direct_write(link: &str, at: u64, data: &[u8]) {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(link)
+        .unwrap();
+    let (mut buf, a) = aligned(1 << 20);
+    for (i, piece) in data.chunks(1 << 20).enumerate() {
+        buf[a..a + piece.len()].copy_from_slice(piece);
+        f.write_all_at(&buf[a..a + piece.len()], at + (i << 20) as u64)
+            .unwrap();
+    }
+    f.sync_all().unwrap();
+}
+
+fn direct_read(link: &str, at: u64, len: usize) -> Vec<u8> {
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(link)
+        .unwrap();
+    let (mut buf, a) = aligned(len);
+    f.read_exact_at(&mut buf[a..a + len], at).unwrap();
+    buf[a..a + len].to_vec()
+}
+
+#[test]
+#[ignore = "lab: needs root, ublk and S3 (make diskd-lab)"]
+fn lab_seal_upload_dropped() {
+    if !common::ensure_lab_s3() {
+        return;
+    }
+    let r = Resume::start("dropped");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (layer, chunks, data) = r.dropped_upload(1);
+
+        // Sealed on the node, not in the bucket.
+        assert!(!r.has_manifest(&layer), "a dropped push put the manifest");
+        assert!(!r.state().join("uploaded").join(&layer).exists());
+        let (_, journaled, layers) = r.read_journal_layers();
+        assert!(
+            journaled.is_subset(&chunks),
+            "the journal lists the layer's chunks"
+        );
+        assert!(layers.is_empty(), "the journal lists a layer not put");
+        for hex in &journaled {
+            assert!(r.marked(hex), "a journaled chunk has its marker");
+        }
+        println!(
+            "dropped after {} of {} chunks were journaled",
+            journaled.len(),
+            chunks.len()
+        );
+
+        // The disk opens over the sealed layer.
+        let link = r.ok(&["open", &r.pod])["link_path"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            direct_read(&link, WRITTEN_AT, WRITTEN) == data,
+            "the reopened disk lost writes"
+        );
+        r.lab.stop(&r.pod);
+
+        // Its chunks are the node's only copy: pinned.
+        r.ok(&["evict", "all", "--force"]);
+        for hex in &chunks {
+            assert!(r.cached(hex), "Evict dropped a chunk of an unheaded layer");
+        }
+
+        // The next push skips what the dropped one marked.
+        let before = r.puts();
+        let again = r.ok(&["seal", &r.pod, "--upload"])["layer_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(again, layer, "an untouched top seals into the same layer");
+        let puts = r.puts() - before;
+        println!("second push: {puts} PUTs for {} chunks", chunks.len());
+        assert!(
+            puts as usize <= chunks.len() - journaled.len() + 1,
+            "the second push uploaded journaled chunks again ({puts} PUTs)"
+        );
+        assert!(r.has_manifest(&layer));
+        assert!(r.state().join("uploaded").join(&layer).is_file());
+        let (_, _, layers) = r.read_journal_layers();
+        assert_eq!(
+            layers,
+            HashSet::from([layer.clone()]),
+            "the layer is listed"
+        );
+
+        // A head names the layer: no journal, no pins.
+        r.ok(&["put-head", &r.pod, "--epoch", "1"]);
+        assert!(!r.journal().exists(), "PutHead leaves the journal");
+        r.ok(&["evict", "all", "--force"]);
+        for hex in &chunks {
+            assert!(!r.cached(hex), "a headed layer's chunk stayed pinned");
+        }
+    }));
+    r.stop(result.is_ok());
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+#[test]
+#[ignore = "lab: needs root, ublk and S3 (make diskd-lab)"]
+fn lab_unheaded_expiry() {
+    if !common::ensure_lab_s3() {
+        return;
+    }
+    let r = Resume::start("expiry");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (layer, chunks, _) = r.dropped_upload(2);
+        let (_, journaled) = r.read_journal();
+        assert!(!journaled.is_empty());
+
+        // 13 hours on: the markers of the journal are not trusted.
+        let now = r.age_journal(13);
+        let before = r.puts();
+        r.ok(&["seal", &r.pod, "--upload"]);
+        let puts = r.puts() - before;
+        println!("push after expiry: {puts} PUTs for {} chunks", chunks.len());
+        assert_eq!(
+            puts as usize,
+            chunks.len() + 1,
+            "every chunk again, and the manifest"
+        );
+        assert!(r.has_manifest(&layer));
+        let (since, listed, layers) = r.read_journal_layers();
+        assert!(since + 60 >= now, "the journal starts again");
+        assert_eq!(listed, chunks, "and lists what the push uploaded");
+        assert_eq!(layers, HashSet::from([layer.clone()]));
+
+        // Within the 12 hours, the layer is trusted: a push puts nothing.
+        let before = r.puts();
+        r.ok(&["seal", &r.pod, "--upload"]);
+        assert_eq!(r.puts(), before, "a push within the trust put something");
+
+        // A push that put the whole layer, its manifest too, 13 hours ago:
+        // a sweep may delete the layer any time now, so it is put again,
+        // although its id did not change.
+        r.age_journal(13);
+        let before = r.puts();
+        r.ok(&["seal", &r.pod, "--upload"]);
+        let puts = r.puts() - before;
+        println!("push of a whole layer after expiry: {puts} PUTs");
+        assert_eq!(
+            puts as usize,
+            chunks.len() + 1,
+            "every chunk again, and the manifest"
+        );
+        assert!(r.state().join("uploaded").join(&layer).is_file());
+        let (_, listed, layers) = r.read_journal_layers();
+        assert_eq!(listed, chunks);
+        assert_eq!(layers, HashSet::from([layer.clone()]));
+    }));
+    r.stop(result.is_ok());
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
 }

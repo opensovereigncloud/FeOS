@@ -8,6 +8,13 @@
 //! denies disallowed types outright and never touches this map. Every
 //! blocking store/device call runs in `spawn_blocking`.
 //!
+//! Each call that changes a disk (its row, its top, its device) holds the
+//! disk's lock until its work on the node ends, also when its caller goes
+//! away: the guard moves into the blocking closure. So a seal and an open
+//! of one disk never run together. `diskd.state` has one writer at a time
+//! (`update_state`), the pins one refresh at a time, and the journals of
+//! unheaded disks one writer at a time.
+//!
 //! Beyond devices: `Bake` (live seal of a frozen top), flatten-on-seal as
 //! `Seal`'s default behaviour, `SealFile` (flat memory
 //! layers), `OpenDisk{head_key}` (restore from a foreign node's head),
@@ -17,16 +24,20 @@
 
 #![allow(clippy::disallowed_types)] // control plane only — see module docs
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use disk_store::chunk::Hash;
 use feos_proto::disk_service as pb;
 use feos_proto::disk_service::disk_service_server::DiskService;
 use futures::StreamExt as _;
+use tokio::sync::OwnedMutexGuard;
 use tonic::{Request, Response, Status};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::dev::{self, DeviceCtx, StartedDevice};
 use crate::state::{DeviceRow, State};
@@ -36,6 +47,9 @@ type DeviceTable = Arc<Mutex<HashMap<String, StartedDevice>>>;
 /// Live UFFD memory handlers, one per restored pod. Control plane
 /// only, exactly like `DeviceTable` — the fault path never looks here.
 type MemoryTable = Arc<Mutex<HashMap<String, StartedMemory>>>;
+/// A lock per disk that a call holds, made on first use and gone when no
+/// call holds or waits for it. Control plane only.
+type DiskLocks = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
 #[derive(Clone)]
 pub struct DiskSvc {
@@ -48,6 +62,53 @@ pub struct DiskSvc {
     pub s3_concurrency: usize,
     /// `--mem-readahead`: chunks the UFFD backend pulls ahead of a fault.
     pub mem_readahead: u32,
+    disk_locks: DiskLocks,
+    /// The one writer of `diskd.state` (`update_state`).
+    state_mu: Arc<Mutex<()>>,
+    /// One refresh of the pins at a time, so that an older set never
+    /// replaces a newer one (`refresh_pins`).
+    pins_mu: Arc<Mutex<()>>,
+    /// The journals of unheaded disks and memory layers: an append and
+    /// its markers, or an expiry, at a time.
+    journal_mu: Arc<tokio::sync::Mutex<()>>,
+    /// Runs in Seal's closure, under the disk's lock, before it seals.
+    #[cfg(test)]
+    seal_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// How long a call waits for the lock of its disk: a local seal of a
+/// large disk takes minutes.
+const DISK_LOCK_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// How long a push trusts the chunk markers in the journal of a disk or
+/// memory layer that no head names yet (`unheaded/`). A sweep deletes
+/// such chunks once they are older than its grace, which must be longer
+/// than this and the longest hibernation together (ADR 0011).
+const UNHEADED_TRUST_SECONDS: u64 = 12 * 60 * 60;
+
+/// Chunks a push marks uploaded at a time, after their batch is in the
+/// journal.
+const MARK_BATCH: usize = 256;
+
+/// The lock of a disk, held. Dropping it lets the next call of the disk
+/// go, and forgets the lock when nobody else holds or waits for it.
+pub(crate) struct DiskLock {
+    id: String,
+    locks: DiskLocks,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for DiskLock {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if let Ok(mut locks) = self.locks.lock()
+            && locks
+                .get(&self.id)
+                .is_some_and(|l| Arc::strong_count(l) == 1)
+        {
+            locks.remove(&self.id);
+        }
+    }
 }
 
 /// Nothing younger than this is swept (ADR 0011): between the first
@@ -82,6 +143,72 @@ pub(crate) fn set_sched_idle() {
 }
 
 impl DiskSvc {
+    pub fn new(
+        state_dir: PathBuf,
+        cache: Arc<disk_store::cache::Cache>,
+        s3: Option<Arc<disk_store::s3::S3>>,
+        s3_concurrency: usize,
+        mem_readahead: u32,
+    ) -> Self {
+        DiskSvc {
+            state_dir,
+            cache,
+            s3,
+            devices: Default::default(),
+            memories: Default::default(),
+            s3_concurrency,
+            mem_readahead,
+            disk_locks: Default::default(),
+            state_mu: Default::default(),
+            pins_mu: Default::default(),
+            journal_mu: Default::default(),
+            #[cfg(test)]
+            seal_hook: None,
+        }
+    }
+
+    /// Takes the lock of disk `id`, waiting at most `DISK_LOCK_WAIT`.
+    async fn lock_disk(&self, id: &str) -> Result<DiskLock, Status> {
+        self.lock_disk_within(id, DISK_LOCK_WAIT).await
+    }
+
+    async fn lock_disk_within(&self, id: &str, wait: Duration) -> Result<DiskLock, Status> {
+        let lock = self
+            .disk_locks
+            .lock()
+            .map_err(|_| internal("poisoned"))?
+            .entry(id.to_string())
+            .or_default()
+            .clone();
+        let mut locked = DiskLock {
+            id: id.to_string(),
+            locks: self.disk_locks.clone(),
+            guard: None,
+        };
+        let acquired = tokio::time::timeout(wait, lock.lock_owned()).await;
+        match acquired {
+            Ok(guard) => {
+                locked.guard = Some(guard);
+                Ok(locked)
+            }
+            Err(_) => Err(Status::unavailable(format!("disk {id} is busy"))),
+        }
+    }
+
+    /// Loads `diskd.state`, lets `f` change it and stores it, as its one
+    /// writer: two calls that change two disks' rows keep both changes.
+    fn update_state<R>(
+        &self,
+        f: impl FnOnce(&mut State) -> Result<R, String>,
+    ) -> Result<R, String> {
+        // The mutex guards no data: a panic under it leaves nothing torn.
+        let _writer = self.state_mu.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = State::load(&self.state_dir).map_err(|e| e.to_string())?;
+        let r = f(&mut st)?;
+        State::store(&self.state_dir, &st).map_err(|e| e.to_string())?;
+        Ok(r)
+    }
+
     pub fn link_path(&self, pod_id: &str) -> PathBuf {
         self.state_dir.join("live").join(pod_id).join("disk")
     }
@@ -123,27 +250,24 @@ impl DiskSvc {
             .join(format!("{id_hex}.manifest"))
     }
 
-    fn save_row(&self, pod_id: &str, row: DeviceRow) -> Result<(), String> {
-        let mut st = State::load(&self.state_dir).map_err(|e| e.to_string())?;
-        st.devices.insert(pod_id.to_string(), row);
-        State::store(&self.state_dir, &st).map_err(|e| e.to_string())
-    }
-
     /// Startup/drill recovery: reattach a previously-seen device.
     pub(crate) fn spawn_dev_recovery(
         &self,
         row: DeviceRow,
         pod_id: String,
     ) -> Result<pb::Device, String> {
-        self.spawn_dev(row, pod_id, true)
+        self.spawn_dev(row, pod_id, true, false)
     }
 
-    /// Everything device spawn needs (runs on a blocking thread).
+    /// Everything device spawn needs (runs on a blocking thread). A
+    /// `new_row` (CreateDisk, OpenDisk from a head) is stored as it is;
+    /// otherwise the row in the state gets the device.
     fn spawn_dev(
         &self,
         row: DeviceRow,
         pod_id: String,
         recover: bool,
+        new_row: bool,
     ) -> Result<pb::Device, String> {
         let chain = self.load_chain(&row.chain)?;
         let logical = row.logical_size;
@@ -181,13 +305,10 @@ impl DiskSvc {
             .map_err(|_| "poisoned")?
             .insert(pod_id.clone(), started);
 
-        self.save_row(
-            &pod_id,
-            DeviceRow {
-                dev_id: Some(dev_id),
-                ..row
-            },
-        )?;
+        self.update_state(|st| {
+            put_device_row(st, &pod_id, row, dev_id, new_row);
+            Ok(())
+        })?;
 
         Ok(pb::Device {
             pod_id,
@@ -290,8 +411,10 @@ impl DiskSvc {
     }
 
     /// Push a layer and all missing ancestors, oldest-first (a chain is
-    /// only usable whole on another node).
-    async fn push_chain(&self, id_hex: &str) -> Result<(), String> {
+    /// only usable whole on another node). With a `journal`, the chunks and
+    /// layers it uploads are listed there before they are marked uploaded.
+    async fn push_chain(&self, id_hex: &str, journal: Option<Journal<'_>>) -> Result<(), String> {
+        self.expire_journals_now().await;
         // collect the not-yet-uploaded chain segment, head -> old
         let mut pending: Vec<String> = Vec::new();
         let mut cur = id_hex.to_string();
@@ -324,14 +447,15 @@ impl DiskSvc {
         }
         let pending: Vec<String> = pending.into_iter().rev().collect();
         for id in &pending {
-            self.push_layer(id).await?;
+            self.push_layer(id, journal).await?;
         }
         Ok(())
     }
 
     /// Push one layer: chunks (marked-uploaded ones skipped) at bounded
-    /// concurrency, manifest last (crash-safe ordering, ADR 0011).
-    async fn push_layer(&self, id_hex: &str) -> Result<(), String> {
+    /// concurrency, manifest last (crash-safe ordering, ADR 0011). The
+    /// caller expires the journals first (`expire_journals_now`).
+    async fn push_layer(&self, id_hex: &str, journal: Option<Journal<'_>>) -> Result<(), String> {
         set_sched_idle();
         let s3 = self
             .s3
@@ -347,13 +471,14 @@ impl DiskSvc {
             .collect();
         let n_bytes = AtomicU64::new(0);
         let conc = self.s3_concurrency.max(1);
-        let results: Vec<Result<(), String>> = futures::stream::iter(hashes)
+        // Each chunk: Ok(Some) when it is in S3 now and needs its marker.
+        let mut results = futures::stream::iter(hashes)
             .map(|h| {
                 let s3 = s3.clone();
                 let n_bytes = &n_bytes;
                 async move {
                     if self.chunk_uploaded(&h) {
-                        return Ok(());
+                        return Ok(None);
                     }
                     let p = self.cache.chunk_path(&h);
                     if p.is_file() {
@@ -366,30 +491,80 @@ impl DiskSvc {
                         .map_err(|e| e.to_string())?;
                         s3.put_chunk(&h, &raw).await.map_err(|e| e.to_string())?;
                         n_bytes.fetch_add(raw.len() as u64, Ordering::Relaxed);
-                        self.mark_chunk_uploaded(&h);
                     } else if s3.has_chunk(&h).await {
                         // Evicted locally, present remotely (the memory-increment
                         // case): learn the marker without a re-upload.
-                        self.mark_chunk_uploaded(&h);
                     } else {
                         return Err(format!("chunk missing locally and in S3: {}", h.to_hex()));
                     }
-                    Ok(())
+                    Ok(Some(h))
                 }
             })
-            .buffer_unordered(conc)
-            .collect()
-            .await;
-        for r in results {
-            r?;
+            .buffer_unordered(conc);
+        // Every chunk is tried before an error counts; the markers go in
+        // batches, each after it is in the journal.
+        let mut first_err: Option<String> = None;
+        let mut batch: Vec<Hash> = Vec::with_capacity(MARK_BATCH);
+        while let Some(r) = results.next().await {
+            match r {
+                Ok(Some(h)) => {
+                    batch.push(h);
+                    if batch.len() >= MARK_BATCH {
+                        self.mark_pushed(std::mem::take(&mut batch), journal).await;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        self.mark_pushed(batch, journal).await;
+        if let Some(e) = first_err {
+            return Err(e);
         }
         s3.put_manifest(&lid, &m).await.map_err(|e| e.to_string())?;
-        let dir = self.state_dir.join("uploaded");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let n_bytes = n_bytes.load(Ordering::Relaxed);
-        std::fs::write(dir.join(id_hex), format!("{n_bytes}\n")).map_err(|e| e.to_string())?;
+        self.mark_layer_pushed(id_hex, n_bytes, journal).await?;
         info!(layer = %id_hex, bytes = n_bytes, "push: layer uploaded");
         Ok(())
+    }
+
+    /// Writes the marker of a layer whose manifest is in S3 now: what
+    /// `push_chain` trusts. With a disk's journal, the layer is listed in
+    /// it first, durably; once that journal is gone, no marker is written.
+    async fn mark_layer_pushed(
+        &self,
+        id_hex: &str,
+        n_bytes: u64,
+        journal: Option<Journal<'_>>,
+    ) -> Result<(), String> {
+        let marker = self.state_dir.join("uploaded").join(id_hex);
+        let write_marker = move || -> Result<(), String> {
+            if let Some(dir) = marker.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(&marker, format!("{n_bytes}\n")).map_err(|e| e.to_string())
+        };
+        let Some(Journal::Disk(journal)) = journal else {
+            return write_marker();
+        };
+        // As in mark_pushed: both, or neither, before an expiry looks.
+        let journals = self.journal_mu.clone().lock_owned().await;
+        let this = self.clone();
+        let journal = journal.to_path_buf();
+        let line = format!("{LAYER_LINE}{id_hex}\n");
+        tokio::task::spawn_blocking(move || {
+            let _journals = journals;
+            let listed = append_journal(&journal, &line, None, &this.journal_tmp())
+                .map_err(|e| format!("{}: {e}", journal.display()))?;
+            if listed {
+                write_marker()?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     /// Ensure the manifest of `id_hex` and its ancestors are local (one
@@ -464,7 +639,11 @@ impl DiskSvc {
                 }
                 std::fs::create_dir_all(self.state_dir.join("layers"))
                     .map_err(|e| e.to_string())?;
-                let tmp = self.state_dir.join(format!("layers/.{id}.tmp"));
+                // Two disks over this layer may fetch it at once.
+                let tmp = disk_store::cache::staging_tmp(
+                    &self.cache.staging_dir(),
+                    &format!("{id}.manifest"),
+                );
                 std::fs::write(&tmp, m.encode()).map_err(|e| e.to_string())?;
                 std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
                 for e in &m.entries {
@@ -480,6 +659,269 @@ impl DiskSvc {
                 None => return Ok(()),
             }
         }
+    }
+}
+
+// ---- unheaded disks, and pins ---------------------------------------------
+//
+// `unheaded/<disk>` exists while no head names the disk's own layer: from
+// the seal of a checkpoint that was not finished (abandoned, failed) until
+// PutHead of the disk, RemoveDevice, or an OpenDisk from a head of the
+// pod. Meanwhile that layer may be the only copy of what the pod wrote:
+// its chunks, and those of every layer of a device row that is not
+// uploaded, are pinned in the cache (`Cache::pin`).
+//
+// The file is a journal as well: its first line the unix time it started
+// at, then what a push uploaded for the disk, one per line, each listed
+// before it is marked uploaded: a chunk, or a layer (`L <layer>`). Nothing
+// in the bucket names those yet, and a sweep deletes them once they are
+// older than its grace; so their markers are trusted for
+// UNHEADED_TRUST_SECONDS only, then they are uploaded again. Only Seal
+// starts a disk's journal: a push that still runs once PutHead or
+// RemoveDevice has removed it marks nothing. A memory layer that no head
+// names yet has a journal of its chunks in `unheaded-memory/<layer>`,
+// which its first chunk starts.
+
+/// The journal a push lists what it uploads in.
+#[derive(Clone, Copy)]
+enum Journal<'a> {
+    /// `unheaded/<disk>`: chunks and layers.
+    Disk(&'a Path),
+    /// `unheaded-memory/<layer>`: chunks. SealFile puts the layer's
+    /// manifest every time, whatever its marker says.
+    Memory(&'a Path),
+}
+
+impl Journal<'_> {
+    fn path(&self) -> &Path {
+        match self {
+            Journal::Disk(path) | Journal::Memory(path) => path,
+        }
+    }
+
+    /// When a journal that is not there starts, if a push starts it.
+    fn start(&self, now: u64) -> Option<u64> {
+        match self {
+            Journal::Disk(_) => None,
+            Journal::Memory(_) => Some(now),
+        }
+    }
+}
+
+/// How a journal lists a layer.
+const LAYER_LINE: &str = "L ";
+
+impl DiskSvc {
+    fn unheaded_path(&self, disk: &str) -> PathBuf {
+        self.state_dir.join("unheaded").join(disk)
+    }
+
+    fn memory_journal_path(&self, layer: &str) -> PathBuf {
+        self.state_dir.join("unheaded-memory").join(layer)
+    }
+
+    fn journal_tmp(&self) -> PathBuf {
+        self.state_dir.join("staging").join("journal.tmp")
+    }
+
+    /// Marks the disk unheaded, unless it is: a journal that starts now.
+    /// Blocking context.
+    fn mark_unheaded(&self, disk: &str) -> Result<(), String> {
+        let _journals = self.journal_mu.blocking_lock();
+        let path = self.unheaded_path(disk);
+        if !path.is_file() {
+            write_journal(&path, unix_now(), &self.journal_tmp())
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Removes a journal: a head names its layer now, or its disk is gone.
+    /// Blocking context.
+    fn remove_journal(&self, path: &Path) -> Result<(), String> {
+        let _journals = self.journal_mu.blocking_lock();
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Marks chunks that are in S3 now uploaded. With a journal, they are
+    /// listed in it first, durably, and the expiry waits for both. Once a
+    /// disk's journal is gone, they are not marked: the disk is headed or
+    /// removed, and a later push uploads them again.
+    async fn mark_pushed(&self, hashes: Vec<Hash>, journal: Option<Journal<'_>>) {
+        if hashes.is_empty() {
+            return;
+        }
+        let Some(journal) = journal else {
+            for h in &hashes {
+                self.mark_chunk_uploaded(h);
+            }
+            return;
+        };
+        // Moved into the blocking task: a push dropped here still writes
+        // both, or neither, before an expiry can look.
+        let journals = self.journal_mu.clone().lock_owned().await;
+        let this = self.clone();
+        let start = journal.start(unix_now());
+        let journal = journal.path().to_path_buf();
+        let marked = tokio::task::spawn_blocking(move || {
+            let _journals = journals;
+            let mut lines = String::with_capacity(hashes.len() * 65);
+            for h in &hashes {
+                lines.push_str(h.to_hex().as_str());
+                lines.push('\n');
+            }
+            let listed = append_journal(&journal, &lines, start, &this.journal_tmp())
+                .map_err(|e| format!("{}: {e}", journal.display()))?;
+            if listed {
+                for h in &hashes {
+                    this.mark_chunk_uploaded(h);
+                }
+            } else {
+                debug!(journal = %journal.display(), "push: the disk is headed or gone; chunks left unmarked");
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        match marked {
+            Ok(Ok(())) => {}
+            // Unmarked chunks are uploaded again by the next push.
+            Ok(Err(e)) => warn!(error = %e, "push: chunks left unmarked"),
+            Err(e) => warn!(error = %e, "push: chunks left unmarked"),
+        }
+    }
+
+    async fn expire_journals_now(&self) {
+        let this = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if this.expire_journals(unix_now()) {
+                // A layer that is not uploaded is pinned.
+                this.refresh_pins();
+            }
+        })
+        .await;
+    }
+
+    /// Ends the trust in the journals that started more than
+    /// UNHEADED_TRUST_SECONDS before `now`: the chunks and layers they list
+    /// lose their markers, and a disk's journal starts again at `now`, empty
+    /// (the disk stays unheaded); a memory layer's, or that of a disk this
+    /// node no longer has, goes. Returns whether a layer lost its marker.
+    /// Blocking context.
+    fn expire_journals(&self, now: u64) -> bool {
+        let _journals = self.journal_mu.blocking_lock();
+        let rows = State::load(&self.state_dir).ok();
+        let mut layers_unmarked = false;
+        for (dir, of_disks) in [
+            (self.state_dir.join("unheaded"), true),
+            (self.state_dir.join("unheaded-memory"), false),
+        ] {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let path = e.path();
+                let Ok(f) = std::fs::File::open(&path) else {
+                    continue;
+                };
+                let mut lines = std::io::BufRead::lines(std::io::BufReader::new(f));
+                // A torn first line counts as old: expiring costs uploads.
+                let since = lines
+                    .next()
+                    .and_then(|l| l.ok())
+                    .and_then(|l| l.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                if now.saturating_sub(since) <= UNHEADED_TRUST_SECONDS {
+                    continue;
+                }
+                let mut chunks = 0u64;
+                let mut layers = 0u64;
+                for l in lines.map_while(Result::ok) {
+                    let l = l.trim();
+                    if let Some(layer) = l.strip_prefix(LAYER_LINE) {
+                        // The next push of a chain that names it puts it
+                        // again. A torn line names no layer.
+                        if disk_store::manifest::LayerId::from_hex(layer).is_ok() {
+                            let _ =
+                                std::fs::remove_file(self.state_dir.join("uploaded").join(layer));
+                            layers += 1;
+                        }
+                    } else if let Ok(h) = Hash::from_hex(l) {
+                        self.unmark_chunk(&h);
+                        chunks += 1;
+                    }
+                }
+                layers_unmarked |= layers > 0;
+                let disk = e.file_name().to_string_lossy().to_string();
+                let keep = of_disks
+                    && rows
+                        .as_ref()
+                        .is_none_or(|st| st.devices.contains_key(&disk));
+                let done = if keep {
+                    write_journal(&path, now, &self.journal_tmp())
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                if let Err(e) = done {
+                    warn!(journal = %path.display(), error = %e, "unheaded: journal not reset");
+                }
+                info!(journal = %path.display(), chunks, layers, "unheaded: markers expired");
+            }
+        }
+        layers_unmarked
+    }
+
+    /// The chunks to pin: those of every device row's layers that are not
+    /// uploaded, and of an unheaded disk's own layer. Rows only: a memory
+    /// or baked layer is in no row, and stays evictable.
+    fn pinned_row_chunks(&self) -> Result<HashSet<Hash>, String> {
+        let st = State::load(&self.state_dir).map_err(|e| e.to_string())?;
+        let mut layers: BTreeSet<&str> = BTreeSet::new();
+        for (disk, row) in &st.devices {
+            let unheaded = self.unheaded_path(disk).is_file();
+            for (i, id) in row.chain.iter().enumerate() {
+                let own = i >= row.shared_depth;
+                if (unheaded && own) || !self.state_dir.join("uploaded").join(id).is_file() {
+                    layers.insert(id);
+                }
+            }
+        }
+        let mut keep = HashSet::new();
+        for id in layers {
+            match self.load_layer(id) {
+                Ok(m) => keep.extend(
+                    m.entries
+                        .iter()
+                        .filter(|e| e.kind == disk_store::manifest::EntryKind::Data)
+                        .map(|e| Hash::from(e.hash)),
+                ),
+                // A row whose layer is gone cannot be read anyway.
+                Err(e) => warn!(layer = %id, error = %e, "pins: layer skipped"),
+            }
+        }
+        Ok(keep)
+    }
+
+    /// Pins what `pinned_row_chunks` names, in place of what was pinned.
+    /// After every change of the rows, the uploads or the unheaded disks,
+    /// and at startup. Blocking context.
+    pub(crate) fn refresh_pins(&self) {
+        let _one = self.pins_mu.lock().unwrap_or_else(|e| e.into_inner());
+        match self.pinned_row_chunks() {
+            Ok(keep) => {
+                debug!(chunks = keep.len(), "pins refreshed");
+                self.cache.pin(keep);
+            }
+            Err(e) => warn!(error = %e, "pins not refreshed"),
+        }
+    }
+
+    async fn refresh_pins_now(&self) {
+        let this = self.clone();
+        let _ = tokio::task::spawn_blocking(move || this.refresh_pins()).await;
     }
 }
 
@@ -563,6 +1005,7 @@ impl DiskService for DiskSvc {
         if req.pod_id.is_empty() || req.chain.is_empty() {
             return Err(Status::invalid_argument("pod_id and chain required"));
         }
+        let locked = self.lock_disk(&req.pod_id).await?;
         if self
             .devices
             .lock()
@@ -590,10 +1033,16 @@ impl DiskService for DiskSvc {
         };
         let this = self.clone();
         let pod_id = req.pod_id;
-        let dev = tokio::task::spawn_blocking(move || this.spawn_dev(row, pod_id, false))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
+        let dev = tokio::task::spawn_blocking(move || {
+            let _locked = locked;
+            let dev = this.spawn_dev(row, pod_id, false, true);
+            // A chain whose layers are not uploaded is pinned.
+            this.refresh_pins();
+            dev
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
         Ok(Response::new(dev))
     }
 
@@ -602,7 +1051,10 @@ impl DiskService for DiskSvc {
         request: Request<pb::OpenDiskRequest>,
     ) -> Result<Response<pb::Device>, Status> {
         let req = request.into_inner();
-        let (pod_id, row) = if req.head_key.is_empty() {
+        let (pod_id, row, locked) = if req.head_key.is_empty() {
+            // After a seal of the disk that still runs, also one whose
+            // caller went away: the device starts over its new layer.
+            let locked = self.lock_disk(&req.pod_id).await?;
             // Started already: its caller lost the answer, or never knew.
             let live = self
                 .devices
@@ -628,7 +1080,7 @@ impl DiskService for DiskSvc {
                 .get(&req.pod_id)
                 .cloned()
                 .ok_or_else(|| Status::not_found(req.pod_id.clone()))?;
-            (req.pod_id.clone(), row)
+            (req.pod_id.clone(), row, locked)
         } else {
             // Restore on a foreign node: pull the head and its manifests
             // from S3, create the row here, start over the chain with a
@@ -652,6 +1104,7 @@ impl DiskService for DiskSvc {
             let Some(chain_head) = head.chain.last() else {
                 return Err(Status::invalid_argument("head has an empty chain"));
             };
+            let locked = self.lock_disk(&head.pod_id).await?;
             if self
                 .devices
                 .lock()
@@ -684,13 +1137,26 @@ impl DiskService for DiskSvc {
                 has_top: true,
                 shared_depth: head.shared_depth(),
             };
-            (head.pod_id.clone(), row)
+            (head.pod_id.clone(), row, locked)
         };
         let this = self.clone();
-        let dev = tokio::task::spawn_blocking(move || this.spawn_dev(row, pod_id, false))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
+        let new_row = !req.head_key.is_empty();
+        let dev = tokio::task::spawn_blocking(move || {
+            let _locked = locked;
+            if new_row && let Err(e) = this.remove_journal(&this.unheaded_path(&pod_id)) {
+                // A head names the disk's layer: a journal of an earlier
+                // disk of the pod costs pins until its next head.
+                warn!(pod = %pod_id, error = %e, "open_disk: journal left");
+            }
+            let dev = this.spawn_dev(row, pod_id, false, new_row);
+            if new_row {
+                this.refresh_pins();
+            }
+            dev
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
         Ok(Response::new(dev))
     }
 
@@ -699,22 +1165,31 @@ impl DiskService for DiskSvc {
         request: Request<pb::StopDiskRequest>,
     ) -> Result<Response<pb::Empty>, Status> {
         let req = request.into_inner();
+        let locked = self.lock_disk(&req.pod_id).await?;
         let started = {
             let mut t = self.devices.lock().map_err(|_| internal("poisoned"))?;
             t.remove(&req.pod_id)
                 .ok_or_else(|| Status::not_found(req.pod_id.clone()))?
         };
-        tokio::task::spawn_blocking(move || dev::stop(started))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
-        let _ = std::fs::remove_file(self.link_path(&req.pod_id));
-        // Row stays (top kept); clear the dev id.
-        let mut st = State::load(&self.state_dir).map_err(internal)?;
-        if let Some(row) = st.devices.get_mut(&req.pod_id) {
-            row.dev_id = None;
-        }
-        State::store(&self.state_dir, &st).map_err(internal)?;
+        let this = self.clone();
+        let pod = req.pod_id.clone();
+        // The stop and the row go together: a caller that goes away
+        // meanwhile leaves no row that names a device that is gone.
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let _locked = locked;
+            dev::stop(started)?;
+            let _ = std::fs::remove_file(this.link_path(&pod));
+            // Row stays (top kept); clear the dev id.
+            this.update_state(|st| {
+                if let Some(row) = st.devices.get_mut(&pod) {
+                    row.dev_id = None;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
         info!(pod = %req.pod_id, "stop_disk");
         Ok(Response::new(pb::Empty {}))
     }
@@ -727,6 +1202,7 @@ impl DiskService for DiskSvc {
         if req.pod_id.is_empty() {
             return Err(Status::invalid_argument("pod_id required"));
         }
+        let locked = self.lock_disk(&req.pod_id).await?;
         if self
             .devices
             .lock()
@@ -740,16 +1216,23 @@ impl DiskService for DiskSvc {
         let this = self.clone();
         let pod = req.pod_id;
         tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let mut st = State::load(&this.state_dir).map_err(|e| e.to_string())?;
-            let removed = st.devices.remove(&pod).is_some();
-            if removed {
-                State::store(&this.state_dir, &st).map_err(|e| e.to_string())?;
-            }
+            let _locked = locked;
+            this.update_state(|st| {
+                st.devices.remove(&pod);
+                Ok(())
+            })?;
+            // The disk is gone: nothing of it needs pins or uploads any
+            // more. Its journal goes only now, so that a row the call
+            // could not remove keeps its mark.
+            let journal = this.remove_journal(&this.unheaded_path(&pod));
             let dir = this.state_dir.join("live").join(&pod);
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
-            }
-            Ok(())
+            let live = if dir.exists() {
+                std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+            } else {
+                Ok(())
+            };
+            this.refresh_pins();
+            journal.and(live)
         })
         .await
         .map_err(internal)?
@@ -762,6 +1245,7 @@ impl DiskService for DiskSvc {
         if req.pod_id.is_empty() {
             return Err(Status::invalid_argument("pod_id required"));
         }
+        let locked = self.lock_disk(&req.pod_id).await?;
         if self
             .devices
             .lock()
@@ -778,14 +1262,29 @@ impl DiskService for DiskSvc {
         let this = self.clone();
         let pod = req.pod_id.clone();
         let pod_log = pod.clone();
-        let res = tokio::task::spawn_blocking(
-            move || -> Result<disk_store::seal::SealOutcome, String> {
+        let res = tokio::task::spawn_blocking(move || {
+            // The disk's lock goes with the local seal, which runs to its
+            // end also when its caller goes away.
+            let _locked = locked;
+            #[cfg(test)]
+            if let Some(hook) = &this.seal_hook {
+                hook();
+            }
+            // The new layer's chunks, from their admission until the pins
+            // below name them.
+            let hold = this.cache.hold();
+            let sealed = (|| -> Result<disk_store::seal::SealOutcome, String> {
                 let st = State::load(&this.state_dir).map_err(|e| e.to_string())?;
                 let row = st
                     .devices
                     .get(&pod)
                     .ok_or_else(|| format!("no device row for {pod}"))?
                     .clone();
+                // No head names the layer this seal makes until PutHead:
+                // the node may hold its only copy (pinned, see
+                // pinned_row_chunks). A seal that fails leaves the mark;
+                // the next PutHead or RemoveDevice of the disk takes it.
+                this.mark_unheaded(&pod)?;
                 let chain = this.load_chain(&row.chain)?;
                 // Flatten-on-seal (ADR 0011): the chain has
                 // the fixed shape <shared…, S, top>. Exactly one private
@@ -819,15 +1318,15 @@ impl DiskService for DiskSvc {
                         stats: Default::default(),
                     });
                 }
-                let outcome = disk_store::seal::seal_top(
+                let outcome = disk_store::seal::seal_top_held(
                     &top,
                     &parents,
                     merged,
                     &this.cache,
+                    &hold,
                     &this.state_dir,
                     row.logical_size,
                     row.chunk_size,
-                    None,
                 )
                 .map_err(|e| e.to_string())?;
                 // Commit order: seal_top already committed chunks+manifest;
@@ -840,8 +1339,7 @@ impl DiskService for DiskSvc {
                 } else {
                     None
                 };
-                let mut st2 = State::load(&this.state_dir).map_err(|e| e.to_string())?;
-                let new_chain = {
+                let new_chain = this.update_state(|st2| {
                     let row2 = st2
                         .devices
                         .get_mut(&pod)
@@ -850,9 +1348,8 @@ impl DiskService for DiskSvc {
                     row2.chain.push(new_id.clone());
                     row2.dev_id = None;
                     row2.has_top = false;
-                    row2.chain.clone()
-                };
-                State::store(&this.state_dir, &st2).map_err(|e| e.to_string())?;
+                    Ok(row2.chain.clone())
+                })?;
                 std::fs::remove_file(&top).map_err(|e| e.to_string())?;
                 // head.json is committed after the row (proto contract);
                 // existing memory refs survive a disk-only seal.
@@ -879,15 +1376,24 @@ impl DiskService for DiskSvc {
                     let _ = std::fs::remove_file(this.layer_path(&old));
                 }
                 Ok(outcome)
-            },
-        )
+            })();
+            // The row names the new layer now, or the seal failed: its
+            // chunks are pinned, or go back to the budget, with the hold.
+            this.refresh_pins();
+            drop(hold);
+            sealed
+        })
         .await
         .map_err(internal)?
         .map_err(internal)?;
         if req.upload {
-            self.push_chain(&res.layer_id.hex())
+            // Dropped with the call: what is uploaded stays, listed in the
+            // disk's journal.
+            let journal = self.unheaded_path(&pod_log);
+            self.push_chain(&res.layer_id.hex(), Some(Journal::Disk(&journal)))
                 .await
                 .map_err(|e| Status::internal(format!("seal uploaded but push failed: {e}")))?;
+            self.refresh_pins_now().await;
         }
         info!(pod = %pod_log, layer = %res.layer_id, upload = req.upload, "seal");
         Ok(Response::new(pb::Layer {
@@ -964,9 +1470,10 @@ impl DiskService for DiskSvc {
             ));
         }
         if req.upload {
-            self.push_chain(&res.layer_id.hex())
+            self.push_chain(&res.layer_id.hex(), None)
                 .await
                 .map_err(|e| Status::internal(format!("bake sealed but push failed: {e}")))?;
+            self.refresh_pins_now().await;
         }
         info!(pod = %pod_log, layer = %res.layer_id, upload = req.upload, "bake");
         Ok(Response::new(pb::Layer {
@@ -1014,10 +1521,25 @@ impl DiskService for DiskSvc {
         .map_err(internal)?
         .map_err(internal)?;
         if req.upload {
+            let layer = res.layer_id.hex();
+            // A call that goes before the layer is up takes its manifest
+            // with it (a seal of the file makes it again), so that the
+            // layer does not stay behind unuploaded, its chunks kept from
+            // every Evict.
+            let mut unuploaded = UnuploadedLayer {
+                manifest: res.manifest_path.clone(),
+                uploaded: self.state_dir.join("uploaded").join(&layer),
+                armed: true,
+            };
+            self.expire_journals_now().await;
             // Flat layer — no ancestors.
-            self.push_layer(&res.layer_id.hex()).await.map_err(|e| {
-                Status::internal(format!("seal_file uploaded but push failed: {e}"))
-            })?;
+            let journal = self.memory_journal_path(&layer);
+            self.push_layer(&layer, Some(Journal::Memory(&journal)))
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("seal_file uploaded but push failed: {e}"))
+                })?;
+            unuploaded.armed = false;
         }
         info!(path = %req.path, layer = %res.layer_id, upload = req.upload, "seal_file");
         Ok(Response::new(pb::Layer {
@@ -1089,9 +1611,11 @@ impl DiskService for DiskSvc {
         if self.s3.is_none() {
             return Err(Status::failed_precondition("S3 not configured"));
         }
-        self.push_layer(&req.layer_id)
+        self.expire_journals_now().await;
+        self.push_layer(&req.layer_id, None)
             .await
             .map_err(Status::internal)?;
+        self.refresh_pins_now().await;
         Ok(Response::new(pb::Empty {}))
     }
 
@@ -1455,6 +1979,17 @@ impl DiskService for DiskSvc {
         rep.bytes_deleted += bytes;
         rep.deleted_keys.extend(dead_layers.iter().cloned());
         delete_all(dead_layers.clone()).await.map_err(internal)?;
+        if !req.dry_run && !dead_layers.is_empty() {
+            // A layer's marker is a claim about S3 too: a row that still
+            // names a deleted layer gets its chunks pinned.
+            for id in dead_layers
+                .iter()
+                .filter_map(|k| disk_store::sweep::layer_id_of_key(k))
+            {
+                let _ = std::fs::remove_file(self.state_dir.join("uploaded").join(id));
+            }
+            self.refresh_pins_now().await;
+        }
         if started.elapsed() >= budget {
             rep.budget_exhausted = true;
             return Ok(Response::new(rep));
@@ -1651,6 +2186,7 @@ impl DiskService for DiskSvc {
         if req.pod_id.is_empty() || req.epoch == 0 {
             return Err(Status::invalid_argument("pod_id and an epoch are required"));
         }
+        let locked = self.lock_disk(&req.pod_id).await?;
         if self
             .devices
             .lock()
@@ -1733,7 +2269,37 @@ impl DiskService for DiskSvc {
         }
         head.stamp();
         let buf = head.encode().map_err(internal)?;
-        s3.put_object(&key, buf).await.map_err(internal)?;
+        // The head, and then the journals and pins of what it names, in a
+        // task of their own with the disk's lock: a caller that goes away
+        // does not part them.
+        let this = self.clone();
+        let pod = req.pod_id.clone();
+        let memory = head.memory.as_ref().map(|m| m.layer.clone());
+        let put = tokio::spawn({
+            let key = key.clone();
+            async move {
+                s3.put_object(&key, buf).await.map_err(internal)?;
+                // The head is stored, and the call succeeds: a journal
+                // left behind costs pins and uploads only.
+                let cleaned = tokio::task::spawn_blocking(move || {
+                    let _locked = locked;
+                    let mut journals = vec![this.unheaded_path(&pod)];
+                    journals.extend(memory.map(|layer| this.memory_journal_path(&layer)));
+                    for journal in &journals {
+                        if let Err(e) = this.remove_journal(journal) {
+                            warn!(pod = %pod, error = %e, "put_head: journal left");
+                        }
+                    }
+                    this.refresh_pins();
+                })
+                .await;
+                if let Err(e) = cleaned {
+                    warn!(error = %e, "put_head: journals and pins left");
+                }
+                Ok::<(), Status>(())
+            }
+        });
+        put.await.map_err(internal)??;
         info!(
             pod = %req.pod_id,
             key = %key,
@@ -1806,4 +2372,535 @@ fn load_local_layers(
         }
     }
     Ok(layers)
+}
+
+/// Removes the local manifest of a layer whose SealFile ended before the
+/// layer was uploaded, unless it is uploaded after all.
+struct UnuploadedLayer {
+    manifest: PathBuf,
+    uploaded: PathBuf,
+    armed: bool,
+}
+
+impl Drop for UnuploadedLayer {
+    fn drop(&mut self) {
+        if self.armed && !self.uploaded.is_file() {
+            let _ = std::fs::remove_file(&self.manifest);
+        }
+    }
+}
+
+/// The row `spawn_dev` leaves for a device it started: a new row as it was
+/// handed in, else the row as the state has it now (another call may have
+/// changed it since it was read), with the device.
+fn put_device_row(st: &mut State, pod_id: &str, row: DeviceRow, dev_id: i32, new_row: bool) {
+    match st.devices.get_mut(pod_id) {
+        Some(current) if !new_row => current.dev_id = Some(dev_id),
+        _ => {
+            st.devices.insert(
+                pod_id.to_string(),
+                DeviceRow {
+                    dev_id: Some(dev_id),
+                    ..row
+                },
+            );
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// Writes a journal that starts at `since` and lists no chunk, in place of
+/// what `path` held, through `tmp`.
+fn write_journal(path: &Path, since: u64, tmp: &Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if let Some(dir) = tmp.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(tmp, format!("{since}\n"))?;
+    std::fs::File::open(tmp)?.sync_all()?;
+    std::fs::rename(tmp, path)
+}
+
+/// Appends `lines` to the journal at `path`, durably, and returns whether
+/// it did. A journal that is not there starts at `start`, or, without one,
+/// gets nothing.
+fn append_journal(
+    path: &Path,
+    lines: &str,
+    start: Option<u64>,
+    tmp: &Path,
+) -> std::io::Result<bool> {
+    if !path.is_file() {
+        let Some(since) = start else {
+            return Ok(false);
+        };
+        write_journal(path, since, tmp)?;
+    }
+    let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
+    f.write_all(lines.as_bytes())?;
+    f.sync_data()?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use disk_store::manifest::{Entry, Manifest};
+    use std::os::unix::fs::FileExt;
+
+    const CHUNK: u32 = 64 * 1024;
+    const SIZE: u64 = 1 << 20;
+
+    fn svc(dir: &Path) -> DiskSvc {
+        let cache = disk_store::cache::Cache::open(dir, 64 << 20).unwrap();
+        DiskSvc::new(dir.to_path_buf(), Arc::new(cache), None, 4, 0)
+    }
+
+    fn row(chain: &[&str]) -> DeviceRow {
+        DeviceRow {
+            dev_id: None,
+            chain: chain.iter().map(|s| s.to_string()).collect(),
+            logical_size: SIZE,
+            chunk_size: CHUNK,
+            has_top: true,
+            shared_depth: 1,
+        }
+    }
+
+    fn h(i: u8) -> Hash {
+        disk_store::chunk::hash(&[i; 16])
+    }
+
+    /// A layer with data at chunk k for each hash, stored in `layers/`.
+    fn layer(svc: &DiskSvc, parent: Option<&Manifest>, hashes: &[Hash]) -> Manifest {
+        let mut m = Manifest::new(CHUNK, SIZE, parent.map(|p| p.layer_id()));
+        for (k, h) in hashes.iter().enumerate() {
+            m.entries.push(Entry::data(
+                k as u64 * CHUNK as u64,
+                *h.as_bytes(),
+                CHUNK,
+                100,
+            ));
+        }
+        std::fs::create_dir_all(svc.state_dir.join("layers")).unwrap();
+        std::fs::write(svc.layer_path(&m.layer_id().hex()), m.encode()).unwrap();
+        m
+    }
+
+    fn uploaded(svc: &DiskSvc, m: &Manifest) {
+        svc.mark_uploaded(&m.layer_id().hex()).unwrap();
+    }
+
+    /// A disk "p" over an L0 with data, and a top with writes.
+    fn disk_with_writes(svc: &DiskSvc) -> String {
+        let base = svc.state_dir.join("base.img");
+        let f = std::fs::File::create(&base).unwrap();
+        f.set_len(SIZE).unwrap();
+        f.write_all_at(&[7u8; 4096], 0).unwrap();
+        let l0 = disk_store::seal::seal_top(
+            &base,
+            &[],
+            None,
+            &svc.cache,
+            &svc.state_dir,
+            SIZE,
+            CHUNK,
+            None,
+        )
+        .unwrap()
+        .layer_id
+        .hex();
+        let mut st = State::default();
+        st.devices.insert("p".into(), row(&[&l0]));
+        State::store(&svc.state_dir, &st).unwrap();
+        std::fs::create_dir_all(svc.state_dir.join("live/p")).unwrap();
+        let top = std::fs::File::create(svc.top_path("p")).unwrap();
+        top.set_len(SIZE).unwrap();
+        top.write_all_at(&[9u8; 8192], 3 * CHUNK as u64).unwrap();
+        l0
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seal_keeps_the_disk_locked_after_its_caller_went() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut svc = svc(dir.path());
+        let l0 = disk_with_writes(&svc);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        svc.seal_hook = Some(Arc::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        }));
+
+        let seal = tokio::spawn({
+            let svc = svc.clone();
+            async move {
+                svc.seal(Request::new(pb::SealRequest {
+                    pod_id: "p".into(),
+                    upload: false,
+                }))
+                .await
+            }
+        });
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the seal's closure runs")
+        })
+        .await
+        .unwrap();
+        // The caller goes away; the local seal goes on, the lock with it.
+        seal.abort();
+        assert!(seal.await.unwrap_err().is_cancelled());
+
+        let busy = svc
+            .lock_disk_within("p", Duration::from_millis(50))
+            .await
+            .err()
+            .expect("the disk is locked");
+        assert_eq!(busy.code(), tonic::Code::Unavailable);
+        assert_eq!(busy.message(), "disk p is busy");
+        let waiter = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.lock_disk("p").await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !waiter.is_finished(),
+            "a call of the disk waits for the seal"
+        );
+
+        release_tx.send(()).unwrap();
+        let locked = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the lock is free once the seal ended")
+            .unwrap()
+            .unwrap();
+        // What an OpenDisk finds then: the sealed layer, no top.
+        let st = State::load(&svc.state_dir).unwrap();
+        let sealed = &st.devices["p"];
+        assert_eq!(sealed.chain.len(), 2);
+        assert_eq!(sealed.chain[0], l0);
+        assert!(!sealed.has_top);
+        assert!(!svc.top_path("p").exists());
+        assert!(svc.unheaded_path("p").is_file(), "no head names S' yet");
+        drop(locked);
+
+        // A seal that comes later finds it sealed already.
+        svc.seal_hook = None;
+        let again = svc
+            .seal(Request::new(pb::SealRequest {
+                pod_id: "p".into(),
+                upload: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(again.layer_id, sealed.chain[1]);
+        assert!(svc.disk_locks.lock().unwrap().is_empty(), "unused locks go");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_new_layer_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = svc(dir.path());
+        disk_with_writes(&svc);
+        let layer = svc
+            .seal(Request::new(pb::SealRequest {
+                pod_id: "p".into(),
+                upload: false,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let st = svc.cache.stats().unwrap();
+        // L0 is not uploaded either: pinned as well.
+        assert_eq!(st.pinned_entries, st.entries);
+        let s = svc.load_layer(&layer.layer_id).unwrap();
+        let data = s
+            .entries
+            .iter()
+            .filter(|e| e.kind == disk_store::manifest::EntryKind::Data)
+            .count();
+        assert!(data > 0);
+        svc.cache
+            .evict_skip(disk_store::cache::EvictTarget::All, &HashSet::new())
+            .unwrap();
+        for e in &s.entries {
+            assert!(svc.cache.contains(&Hash::from(e.hash)), "S' survives Evict");
+        }
+    }
+
+    #[test]
+    fn update_state_keeps_every_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = svc(dir.path());
+        const WRITERS: usize = 8;
+        const ROUNDS: u64 = 25;
+        std::thread::scope(|s| {
+            for w in 0..WRITERS {
+                let svc = &svc;
+                s.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        svc.update_state(|st| {
+                            st.devices
+                                .entry(format!("d{w}"))
+                                .or_insert_with(|| DeviceRow {
+                                    logical_size: 0,
+                                    ..row(&["l0"])
+                                })
+                                .logical_size += 1;
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                });
+            }
+        });
+        let st = State::load(&svc.state_dir).unwrap();
+        assert_eq!(st.devices.len(), WRITERS);
+        for r in st.devices.values() {
+            assert_eq!(r.logical_size, ROUNDS, "a change was lost");
+        }
+    }
+
+    #[test]
+    fn spawn_dev_keeps_a_chain_stored_meanwhile() {
+        let mut st = State::default();
+        // spawn_dev was handed [l0]; a seal stored [l0, s] since.
+        st.devices.insert("p".into(), row(&["l0", "s"]));
+        put_device_row(&mut st, "p", row(&["l0"]), 7, false);
+        assert_eq!(st.devices["p"].chain, ["l0", "s"]);
+        assert_eq!(st.devices["p"].dev_id, Some(7));
+        // A new row (CreateDisk, OpenDisk from a head) is stored as handed.
+        put_device_row(&mut st, "p", row(&["l1"]), 8, true);
+        assert_eq!(st.devices["p"].chain, ["l1"]);
+        assert_eq!(st.devices["p"].dev_id, Some(8));
+        put_device_row(&mut st, "q", row(&["l0"]), 9, false);
+        assert_eq!(st.devices["q"].dev_id, Some(9));
+    }
+
+    #[test]
+    fn pinned_row_chunks_are_what_only_the_node_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = svc(dir.path());
+        let l0 = layer(&svc, None, &[h(1), h(2)]);
+        uploaded(&svc, &l0);
+        let l0_local = layer(&svc, None, &[h(3)]);
+        // x: unheaded, its own layer uploaded (an abandon after the push).
+        let sx = layer(&svc, Some(&l0), &[h(10), h(11)]);
+        uploaded(&svc, &sx);
+        // y: headed and uploaded.
+        let sy = layer(&svc, Some(&l0), &[h(20)]);
+        uploaded(&svc, &sy);
+        // z: headed, its layers not uploaded.
+        let sz = layer(&svc, Some(&l0_local), &[h(30)]);
+        let id = |m: &Manifest| m.layer_id().hex();
+        let mut st = State::default();
+        st.devices.insert("x".into(), row(&[&id(&l0), &id(&sx)]));
+        st.devices.insert("y".into(), row(&[&id(&l0), &id(&sy)]));
+        st.devices
+            .insert("z".into(), row(&[&id(&l0_local), &id(&sz)]));
+        // w: unheaded, but no layer of its own yet.
+        st.devices.insert("w".into(), row(&[&id(&l0)]));
+        State::store(&svc.state_dir, &st).unwrap();
+        for disk in ["x", "w"] {
+            write_journal(&svc.unheaded_path(disk), unix_now(), &svc.journal_tmp()).unwrap();
+        }
+        let pinned = svc.pinned_row_chunks().unwrap();
+        let want: HashSet<Hash> = [h(3), h(10), h(11), h(30)].into_iter().collect();
+        assert_eq!(pinned, want);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unheaded_journals_expire_after_12_hours() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = svc(dir.path());
+        let now = unix_now();
+        let hours = |n: u64| now - n * 60 * 60;
+        let mut st = State::default();
+        st.devices.insert("old".into(), row(&["l0"]));
+        st.devices.insert("young".into(), row(&["l0"]));
+        State::store(&svc.state_dir, &st).unwrap();
+        let old = svc.unheaded_path("old");
+        let young = svc.unheaded_path("young");
+        let gone = svc.unheaded_path("gone");
+        let memory = svc.memory_journal_path("m");
+        for (path, since) in [(&old, 13), (&young, 11), (&gone, 13), (&memory, 13)] {
+            write_journal(path, hours(since), &svc.journal_tmp()).unwrap();
+        }
+        // What pushes listed and marked: chunks, and the layers of disks.
+        let layer = |i: u8| h(i).to_hex().to_string();
+        let layer_marked = |i: u8| svc.state_dir.join("uploaded").join(layer(i)).is_file();
+        let disk = |path| Some(Journal::Disk(path));
+        svc.mark_pushed(vec![h(1), h(2)], disk(&old)).await;
+        svc.mark_layer_pushed(&layer(100), 0, disk(&old))
+            .await
+            .unwrap();
+        svc.mark_pushed(vec![h(3), h(4)], disk(&young)).await;
+        svc.mark_layer_pushed(&layer(101), 0, disk(&young))
+            .await
+            .unwrap();
+        svc.mark_pushed(vec![h(5)], disk(&gone)).await;
+        svc.mark_pushed(vec![h(6)], Some(Journal::Memory(&memory)))
+            .await;
+        for i in 1..=6 {
+            assert!(svc.chunk_uploaded(&h(i)), "marker {i}");
+        }
+        assert!(layer_marked(100) && layer_marked(101));
+        let young_before = std::fs::read_to_string(&young).unwrap();
+
+        let expired = tokio::task::spawn_blocking({
+            let svc = svc.clone();
+            move || svc.expire_journals(now)
+        })
+        .await
+        .unwrap();
+
+        assert!(expired, "a layer lost its marker");
+        for i in [1, 2, 5, 6] {
+            assert!(!svc.chunk_uploaded(&h(i)), "marker {i} expired");
+        }
+        for i in [3, 4] {
+            assert!(svc.chunk_uploaded(&h(i)), "marker {i} kept");
+        }
+        assert!(!layer_marked(100), "the old journal's layer is put again");
+        assert!(layer_marked(101), "the young journal's layer is trusted");
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), format!("{now}\n"));
+        assert_eq!(std::fs::read_to_string(&young).unwrap(), young_before);
+        assert!(!gone.exists(), "the journal of a disk the node lost goes");
+        assert!(!memory.exists(), "an expired memory journal goes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_seal_starts_a_disks_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = svc(dir.path());
+        let layer = h(100).to_hex().to_string();
+        let layer_marked = || svc.state_dir.join("uploaded").join(&layer).is_file();
+        let disk = svc.unheaded_path("p");
+
+        // Headed or removed meanwhile: a push that still runs marks
+        // nothing, and leaves the disk headed.
+        svc.mark_pushed(vec![h(1)], Some(Journal::Disk(&disk)))
+            .await;
+        svc.mark_layer_pushed(&layer, 0, Some(Journal::Disk(&disk)))
+            .await
+            .unwrap();
+        assert!(!disk.exists());
+        assert!(!svc.chunk_uploaded(&h(1)));
+        assert!(!layer_marked());
+
+        // Started by a seal: listed, then marked.
+        tokio::task::spawn_blocking({
+            let svc = svc.clone();
+            move || svc.mark_unheaded("p")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let since = std::fs::read_to_string(&disk).unwrap();
+        svc.mark_pushed(vec![h(1), h(2)], Some(Journal::Disk(&disk)))
+            .await;
+        svc.mark_layer_pushed(&layer, 0, Some(Journal::Disk(&disk)))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&disk).unwrap(),
+            format!("{since}{}\n{}\nL {layer}\n", h(1).to_hex(), h(2).to_hex())
+        );
+        assert!(svc.chunk_uploaded(&h(1)) && svc.chunk_uploaded(&h(2)));
+        assert!(layer_marked());
+
+        // A memory layer's first chunk starts its journal.
+        let memory = svc.memory_journal_path("m");
+        svc.mark_pushed(vec![h(3)], Some(Journal::Memory(&memory)))
+            .await;
+        let text = std::fs::read_to_string(&memory).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].parse::<u64>().is_ok(), "{text}");
+        assert_eq!(lines[1..], [h(3).to_hex().to_string()]);
+        assert!(svc.chunk_uploaded(&h(3)));
+    }
+
+    #[tokio::test]
+    async fn unused_disk_locks_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = svc(dir.path());
+        let locks = || svc.disk_locks.lock().unwrap().len();
+        let waiter = || {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.lock_disk("p").await.map(|_| ()) })
+        };
+
+        // A call that gave up waiting.
+        let held = svc.lock_disk("p").await.unwrap();
+        let busy = svc.lock_disk_within("p", Duration::from_millis(20)).await;
+        assert_eq!(busy.err().unwrap().code(), tonic::Code::Unavailable);
+        drop(held);
+        assert_eq!(locks(), 0, "after a call that gave up");
+
+        // A call whose caller went away while it waited.
+        let held = svc.lock_disk("p").await.unwrap();
+        let w = waiter();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        w.abort();
+        assert!(w.await.unwrap_err().is_cancelled());
+        drop(held);
+        assert_eq!(locks(), 0, "after a call that went away waiting");
+
+        // One that went away once the lock was its, before it ran again.
+        let held = svc.lock_disk("p").await.unwrap();
+        let w = waiter();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(held);
+        w.abort();
+        assert!(w.await.unwrap_err().is_cancelled());
+        assert_eq!(locks(), 0, "after a call that went away with the lock");
+
+        // One that waited and got it.
+        let held = svc.lock_disk("p").await.unwrap();
+        let w = waiter();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(held);
+        w.await.unwrap().unwrap();
+        assert_eq!(locks(), 0, "after a call that waited");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_device_keeps_the_mark_of_a_row_it_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = svc(dir.path());
+        let mut st = State::default();
+        st.devices.insert("p".into(), row(&["l0"]));
+        State::store(&svc.state_dir, &st).unwrap();
+        let journal = svc.unheaded_path("p");
+        write_journal(&journal, unix_now(), &svc.journal_tmp()).unwrap();
+        let remove =
+            || svc.remove_device(Request::new(pb::RemoveDeviceRequest { pod_id: "p".into() }));
+
+        // diskd.state cannot be written.
+        let tmp = svc.state_dir.join("diskd.state.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(remove().await.is_err());
+        assert!(State::load(&svc.state_dir)
+            .unwrap()
+            .devices
+            .contains_key("p"));
+        assert!(journal.is_file(), "the row it kept lost its mark");
+
+        std::fs::remove_dir(&tmp).unwrap();
+        remove().await.unwrap();
+        assert!(State::load(&svc.state_dir).unwrap().devices.is_empty());
+        assert!(!journal.exists());
+    }
 }

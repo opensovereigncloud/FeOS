@@ -58,15 +58,24 @@ flush reaches diskd and not only the host's page cache.
   the layer below". A seal finds the changes with `SEEK_DATA` and
   `SEEK_HOLE` and compares hashes, so the write path stays a plain write.
 - The node's cache holds raw chunks, so that reads need no decompression;
-  zstd is the format in the object store. The cache is a budget of
-  reconstructible bytes, enforced by diskd. The top is the only data that
-  cannot be fetched again, and is never evicted.
+  zstd is the format in the object store. The budget, enforced by diskd,
+  holds chunks that can be fetched again. The top cannot be, and is never
+  evicted. A layer of a disk that is not uploaded, and a disk's own layer
+  that no head names yet (`unheaded/<disk>`: sealed for a hibernation
+  that was abandoned or failed), are pinned outside the budget: the node
+  has their only durable copy.
 - Commit order: chunks, then the layer's manifest, then the pod's head
   (`head.json`: its chain and memory); upward to the object store in the
   same order. A crash leaves garbage, never a manifest without its
   chunks. A sweeper deletes what the object store holds that nothing
   reaches; the caller names what is live, and nothing younger than a
   grace is touched.
+- A marker says a chunk or a layer is in the object store, and a push
+  skips what has one. The markers that a push wrote for a disk or a
+  memory layer that no head names yet are trusted for 12 hours, then
+  what they mark is uploaded again: nothing in the store reaches it, so
+  a sweep deletes it once it is older than its grace. A sweep's grace
+  must therefore exceed 12 hours plus the longest hibernation.
 
 ### Memory goes the same way
 
@@ -128,11 +137,15 @@ meanwhile. `feosd` does not bake yet.
 `feosd` restarts, and its calls get lost. `OpenDisk` returns a device that
 runs already, and `Seal` of a disk without a top returns the layer it
 sealed; the seal points the device's row at the new layer before it
-removes the top, so that a crash in between loses nothing. The head of a
-checkpoint is diskd's to write, last (`PutHead`): from the device's row,
-only once every layer it names and the vmstate are in the bucket, and
-never over another head. `GetHead` reads one. `feosd` needs no head format
-of its own, and the object store stays diskd's alone.
+removes the top, so that a crash in between loses nothing. Each call
+that changes a disk holds the disk's lock until its work on the node
+ends, whether or not its caller is still there: a seal whose caller went
+away ends before the disk opens again, over the sealed layer. Its upload
+stops where it is; what was uploaded stays, and the next push skips it.
+The head of a checkpoint is diskd's to write, last (`PutHead`): from the
+device's row, only once every layer it names and the vmstate are in the
+bucket, and never over another head. `GetHead` reads one. `feosd` needs
+no head format of its own, and the object store stays diskd's alone.
 
 ### diskd beside feosd
 
@@ -190,6 +203,9 @@ builds in XFS, for the state directory's filesystem.
 
 - diskd is node-critical: while it is down, every pod's disk I/O waits.
   It needs a restart policy and a watchdog.
+- A node's cache can outgrow its budget by the pinned layers: the own
+  layers of pods whose hibernation was abandoned or failed, until their
+  next head. They are bytes the node held before the seal, as tops.
 - The host kernel needs ublk (Linux 6.1 for recovery) and userfaultfd.
   Requests are copied once on 6.12; ublk's zero-copy needs 6.15 or 6.16.
 - One thread per device. Hundreds of pods mean hundreds of mostly idle

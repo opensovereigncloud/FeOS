@@ -42,7 +42,7 @@ use std::time::Instant;
 
 use tracing::{debug, instrument};
 
-use crate::cache::{fsync_dir, Cache};
+use crate::cache::{fsync_dir, staging_tmp, Cache, Hold};
 use crate::chunk::{self, Hash};
 use crate::error::{Error, Result};
 use crate::manifest::{Entry, LayerId, Manifest};
@@ -183,16 +183,19 @@ fn overlay_extents(
 /// (batched syncfs — per-chunk fsync dominates seal time otherwise).
 const FLUSH_AT: u64 = 64 << 20;
 
-struct Pending {
+struct Pending<'a> {
     chunks: Vec<(Hash, Vec<u8>)>,
     bytes: u64,
+    /// Holds what it admits, see [`seal_top`].
+    hold: Option<&'a Hold>,
 }
 
-impl Pending {
-    fn new() -> Self {
+impl<'a> Pending<'a> {
+    fn new(hold: Option<&'a Hold>) -> Self {
         Pending {
             chunks: Vec::new(),
             bytes: 0,
+            hold,
         }
     }
     fn push(&mut self, cache: &Cache, h: Hash, buf: Vec<u8>) -> Result<()> {
@@ -205,7 +208,7 @@ impl Pending {
     }
     fn flush(&mut self, cache: &Cache) -> Result<()> {
         if !self.chunks.is_empty() {
-            cache.admit_batch(&self.chunks)?;
+            cache.admit_batch(&self.chunks, self.hold)?;
             self.chunks.clear();
             self.bytes = 0;
         }
@@ -224,9 +227,7 @@ fn commit_manifest(
     fs::create_dir_all(&layers_dir)?;
     let layer_id = manifest.layer_id();
     let dst = layers_dir.join(format!("{layer_id}.manifest"));
-    let tmp = state_dir
-        .join("staging")
-        .join(format!("{layer_id}.manifest.tmp"));
+    let tmp = staging_tmp(&state_dir.join("staging"), &format!("{layer_id}.manifest"));
     fs::create_dir_all(state_dir.join("staging"))?;
     fs::write(&tmp, manifest.encode())?;
     fs::File::open(&tmp)?.sync_all()?;
@@ -258,6 +259,61 @@ pub fn seal_top(
     chain: &[&Manifest],
     merge_with: Option<&Manifest>,
     cache: &Cache,
+    state_dir: &Path,
+    logical_size: u64,
+    chunk_size: u32,
+    hook: Option<&mut SealHook<'_>>,
+) -> Result<SealOutcome> {
+    seal_top_inner(
+        top,
+        chain,
+        merge_with,
+        cache,
+        None,
+        state_dir,
+        logical_size,
+        chunk_size,
+        hook,
+    )
+}
+
+/// [`seal_top`] that holds every chunk of the top the layer has data of,
+/// new or in the cache already, from its admission on ([`Cache::hold`]):
+/// the seal of a pod's own layer, which may stay the only copy of the
+/// pod's disk. The chunks merged from `merge_with` are that layer's and
+/// keep what they had.
+#[allow(clippy::too_many_arguments)]
+#[instrument(skip(top, chain, merge_with, cache, hold), fields(chunk_size))]
+pub fn seal_top_held(
+    top: &Path,
+    chain: &[&Manifest],
+    merge_with: Option<&Manifest>,
+    cache: &Cache,
+    hold: &Hold,
+    state_dir: &Path,
+    logical_size: u64,
+    chunk_size: u32,
+) -> Result<SealOutcome> {
+    seal_top_inner(
+        top,
+        chain,
+        merge_with,
+        cache,
+        Some(hold),
+        state_dir,
+        logical_size,
+        chunk_size,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_top_inner(
+    top: &Path,
+    chain: &[&Manifest],
+    merge_with: Option<&Manifest>,
+    cache: &Cache,
+    hold: Option<&Hold>,
     state_dir: &Path,
     logical_size: u64,
     chunk_size: u32,
@@ -318,7 +374,7 @@ pub fn seal_top(
     let parent_id = shared.last().map(|m| m.layer_id());
     let mut manifest = Manifest::new(chunk_size, logical_size, parent_id);
 
-    let mut pending = Pending::new();
+    let mut pending = Pending::new(hold);
 
     for &ci in &touched {
         let off = ci * cs;
@@ -381,6 +437,11 @@ pub fn seal_top(
                 if cache.contains(&h) {
                     stats.chunks_pool_hit += 1;
                     stats.bytes_dedup_pool += blen as u64;
+                    if hold.is_some() {
+                        // Held as a new chunk is: the layer needs it as
+                        // much (written again if it is evicted meanwhile).
+                        pending.push(cache, h, std::mem::take(&mut buf))?;
+                    }
                 } else {
                     stats.bytes_new += blen as u64;
                     pending.push(cache, h, std::mem::take(&mut buf))?;
@@ -451,7 +512,7 @@ pub fn seal_file(
         ..Default::default()
     };
     let mut manifest = Manifest::new(chunk_size, logical_size, None);
-    let mut pending = Pending::new();
+    let mut pending = Pending::new(None);
 
     for ci in 0..n_chunks {
         let off = ci * cs;

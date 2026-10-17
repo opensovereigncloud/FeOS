@@ -106,8 +106,11 @@ enum Cmd {
     Evict {
         #[arg(value_enum, default_value_t = EvictTarget::All)]
         target: EvictTarget,
-        /// Also evict chunks of layers that have not been pushed — they
-        /// exist nowhere else.
+        /// Also evict what is kept otherwise: the chunks of the devices'
+        /// chains, and of layers that have not been pushed — those exist
+        /// nowhere else. Pinned chunks stay: those of a device's layer
+        /// that has not been pushed, and of a disk's own layer while no
+        /// head names it.
         #[arg(long)]
         force: bool,
     },
