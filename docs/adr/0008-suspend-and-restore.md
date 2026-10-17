@@ -88,7 +88,8 @@ builds on.
   unless the control plane said it may not (a drain), the pod has no
   memory to resume, or its head is being put: the hibernation stops at
   its next step, between two of the disk daemon's calls or by dropping
-  the one that uploads, and the pod resumes on the node from its
+  the one that seals or uploads, which stops a seal on the node before
+  it commits its layer, and the pod resumes on the node from its
   snapshot, on its disk sealed or not. What was uploaded stays, and its
   chunks serve the next hibernation. The volumes' heads are put with the
   pod's, after the point of no return, so an abandon leaves no head. A

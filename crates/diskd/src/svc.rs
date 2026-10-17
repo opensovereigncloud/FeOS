@@ -11,7 +11,9 @@
 //! Each call that changes a disk (its row, its top, its device) holds the
 //! disk's lock until its work on the node ends, also when its caller goes
 //! away: the guard moves into the blocking closure. So a seal and an open
-//! of one disk never run together. `diskd.state` has one writer at a time
+//! of one disk never run together. A seal whose caller goes away before
+//! its new layer is committed stops at its next chunk, and leaves the
+//! disk as it was. `diskd.state` has one writer at a time
 //! (`update_state`), the pins one refresh at a time, and the journals of
 //! unheaded disks one writer at a time.
 //!
@@ -27,7 +29,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -71,9 +73,19 @@ pub struct DiskSvc {
     /// The journals of unheaded disks and memory layers: an append and
     /// its markers, or an expiry, at a time.
     journal_mu: Arc<tokio::sync::Mutex<()>>,
-    /// Runs in Seal's closure, under the disk's lock, before it seals.
+    /// Runs in Seal's closure, under the disk's lock, at each `SealPoint`.
     #[cfg(test)]
-    seal_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    seal_hook: Option<Arc<dyn Fn(SealPoint) + Send + Sync>>,
+}
+
+/// Where Seal's closure runs a test's hook.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SealPoint {
+    /// Under the disk's lock, before the seal.
+    Locked,
+    /// The new layer's manifest is committed; the row does not name it yet.
+    Committed,
 }
 
 /// How long a call waits for the lock of its disk: a local seal of a
@@ -1053,7 +1065,9 @@ impl DiskService for DiskSvc {
         let req = request.into_inner();
         let (pod_id, row, locked) = if req.head_key.is_empty() {
             // After a seal of the disk that still runs, also one whose
-            // caller went away: the device starts over its new layer.
+            // caller went away: the device starts over its new layer, or
+            // over its top as it was if the seal stopped before it
+            // committed the layer.
             let locked = self.lock_disk(&req.pod_id).await?;
             // Started already: its caller lost the answer, or never knew.
             let live = self
@@ -1262,13 +1276,17 @@ impl DiskService for DiskSvc {
         let this = self.clone();
         let pod = req.pod_id.clone();
         let pod_log = pod.clone();
+        // Set when the call is dropped: a caller that goes away before the
+        // new layer is committed cancels the local seal.
+        let gone = Arc::new(AtomicBool::new(false));
+        let _gone_with_the_call = SetOnDrop(gone.clone());
         let res = tokio::task::spawn_blocking(move || {
-            // The disk's lock goes with the local seal, which runs to its
-            // end also when its caller goes away.
+            // The disk's lock goes with the local seal: until it is
+            // committed, or stopped because its caller went away.
             let _locked = locked;
             #[cfg(test)]
             if let Some(hook) = &this.seal_hook {
-                hook();
+                hook(SealPoint::Locked);
             }
             // The new layer's chunks, from their admission until the pins
             // below name them.
@@ -1318,6 +1336,10 @@ impl DiskService for DiskSvc {
                         stats: Default::default(),
                     });
                 }
+                // A caller that goes away stops the seal up to the commit
+                // of its manifest. The row, the top and the chain are as
+                // they were then; the disk keeps its unheaded mark, as
+                // after a seal that failed.
                 let outcome = disk_store::seal::seal_top_held(
                     &top,
                     &parents,
@@ -1327,12 +1349,23 @@ impl DiskService for DiskSvc {
                     &this.state_dir,
                     row.logical_size,
                     row.chunk_size,
+                    &|| gone.load(Ordering::Relaxed),
                 )
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    if matches!(e, disk_store::Error::SealCancelled) {
+                        info!(pod = %pod, "seal cancelled, its caller gone: the disk is as it was");
+                    }
+                    e.to_string()
+                })?;
+                #[cfg(test)]
+                if let Some(hook) = &this.seal_hook {
+                    hook(SealPoint::Committed);
+                }
                 // Commit order: seal_top already committed chunks+manifest;
                 // now point the row at shared… + S', and then delete the
                 // top, which S' holds. A crash in between leaves a top
-                // over S' that reads as S' does.
+                // over S' that reads as S' does. From here on the seal
+                // ends whether or not its caller is there.
                 let new_id = outcome.layer_id.hex();
                 let old_private: Option<String> = if row.chain.len() > depth {
                     row.chain.last().cloned()
@@ -2390,6 +2423,16 @@ impl Drop for UnuploadedLayer {
     }
 }
 
+/// Sets its flag when it is dropped: with the future of a call, when the
+/// call ends or its caller goes away.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The row `spawn_dev` leaves for a device it started: a new row as it was
 /// handed in, else the row as the state has it now (another call may have
 /// changed it since it was read), with the device.
@@ -2528,40 +2571,77 @@ mod tests {
         l0
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_seal_keeps_the_disk_locked_after_its_caller_went() {
+    /// The layer a seal of `disk_with_writes` makes.
+    async fn layer_with_writes() -> String {
         let dir = tempfile::tempdir().unwrap();
-        let mut svc = svc(dir.path());
-        let l0 = disk_with_writes(&svc);
+        let svc = svc(dir.path());
+        disk_with_writes(&svc);
+        seal(&svc).await.unwrap().layer_id
+    }
+
+    async fn seal(svc: &DiskSvc) -> Result<pb::Layer, Status> {
+        svc.seal(Request::new(pb::SealRequest {
+            pod_id: "p".into(),
+            upload: false,
+        }))
+        .await
+        .map(Response::into_inner)
+    }
+
+    fn layer_files(svc: &DiskSvc) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(svc.state_dir.join("layers"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Starts a local seal of disk "p" whose closure stops at `point` until
+    /// the test sends on the returned channel; returns once it is there.
+    async fn seal_held_at(
+        svc: &mut DiskSvc,
+        point: SealPoint,
+    ) -> (
+        tokio::task::JoinHandle<Result<pb::Layer, Status>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let release_rx = Mutex::new(release_rx);
-        svc.seal_hook = Some(Arc::new(move || {
-            let _ = entered_tx.send(());
-            let _ = release_rx.lock().unwrap().recv();
-        }));
-
-        let seal = tokio::spawn({
-            let svc = svc.clone();
-            async move {
-                svc.seal(Request::new(pb::SealRequest {
-                    pod_id: "p".into(),
-                    upload: false,
-                }))
-                .await
+        svc.seal_hook = Some(Arc::new(move |at| {
+            if at == point {
+                let _ = entered_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
             }
+        }));
+        let sealing = tokio::spawn({
+            let svc = svc.clone();
+            async move { seal(&svc).await }
         });
         tokio::task::spawn_blocking(move || {
             entered_rx
                 .recv_timeout(Duration::from_secs(10))
-                .expect("the seal's closure runs")
+                .expect("the seal's closure gets there")
         })
         .await
         .unwrap();
-        // The caller goes away; the local seal goes on, the lock with it.
-        seal.abort();
-        assert!(seal.await.unwrap_err().is_cancelled());
+        (sealing, release_tx)
+    }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seal_whose_caller_went_leaves_the_disk_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut svc = svc(dir.path());
+        let l0 = disk_with_writes(&svc);
+        let top = std::fs::read(svc.top_path("p")).unwrap();
+        let layers = layer_files(&svc);
+        let (sealing, release) = seal_held_at(&mut svc, SealPoint::Locked).await;
+
+        // The caller goes away; the closure keeps the disk's lock until it
+        // stops.
+        sealing.abort();
+        assert!(sealing.await.unwrap_err().is_cancelled());
         let busy = svc
             .lock_disk_within("p", Duration::from_millis(50))
             .await
@@ -2579,33 +2659,69 @@ mod tests {
             "a call of the disk waits for the seal"
         );
 
-        release_tx.send(()).unwrap();
+        release.send(()).unwrap();
+        let locked = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the lock is free once the seal stopped")
+            .unwrap()
+            .unwrap();
+        // What an OpenDisk finds then: the disk as it was.
+        let st = State::load(&svc.state_dir).unwrap();
+        let row = &st.devices["p"];
+        assert_eq!(row.chain, [l0]);
+        assert!(row.has_top);
+        assert_eq!(std::fs::read(svc.top_path("p")).unwrap(), top);
+        assert_eq!(layer_files(&svc), layers, "a layer was committed");
+        assert!(svc.unheaded_path("p").is_file(), "as after a failed seal");
+        // L0 is not uploaded: still pinned.
+        let stats = svc.cache.stats().unwrap();
+        assert_eq!(stats.pinned_entries, stats.entries);
+        drop(locked);
+
+        // The next seal seals, as the first would have.
+        svc.seal_hook = None;
+        let sealed = seal(&svc).await.unwrap();
+        assert_eq!(sealed.layer_id, layer_with_writes().await);
+        let st = State::load(&svc.state_dir).unwrap();
+        assert_eq!(st.devices["p"].chain[1], sealed.layer_id);
+        assert!(!svc.top_path("p").exists());
+        assert!(svc.disk_locks.lock().unwrap().is_empty(), "unused locks go");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seal_whose_caller_went_once_it_committed_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut svc = svc(dir.path());
+        let l0 = disk_with_writes(&svc);
+        let (sealing, release) = seal_held_at(&mut svc, SealPoint::Committed).await;
+        sealing.abort();
+        assert!(sealing.await.unwrap_err().is_cancelled());
+        let waiter = tokio::spawn({
+            let svc = svc.clone();
+            async move { svc.lock_disk("p").await }
+        });
+        release.send(()).unwrap();
         let locked = tokio::time::timeout(Duration::from_secs(10), waiter)
             .await
             .expect("the lock is free once the seal ended")
             .unwrap()
             .unwrap();
         // What an OpenDisk finds then: the sealed layer, no top.
+        let want = layer_with_writes().await;
         let st = State::load(&svc.state_dir).unwrap();
         let sealed = &st.devices["p"];
-        assert_eq!(sealed.chain.len(), 2);
-        assert_eq!(sealed.chain[0], l0);
+        assert_eq!(sealed.chain, [l0, want.clone()]);
         assert!(!sealed.has_top);
         assert!(!svc.top_path("p").exists());
+        assert!(svc.layer_path(&want).is_file());
         assert!(svc.unheaded_path("p").is_file(), "no head names S' yet");
+        let stats = svc.cache.stats().unwrap();
+        assert_eq!(stats.pinned_entries, stats.entries, "S' is pinned");
         drop(locked);
 
         // A seal that comes later finds it sealed already.
         svc.seal_hook = None;
-        let again = svc
-            .seal(Request::new(pb::SealRequest {
-                pod_id: "p".into(),
-                upload: false,
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(again.layer_id, sealed.chain[1]);
+        assert_eq!(seal(&svc).await.unwrap().layer_id, want);
         assert!(svc.disk_locks.lock().unwrap().is_empty(), "unused locks go");
     }
 

@@ -44,7 +44,7 @@ use pod_service::disk::DISKD_SOCKET;
 use pod_service::network;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -670,6 +670,31 @@ async fn fill(pod_id: &str) -> Result<()> {
     written
 }
 
+/// How many chunks of 64 KiB diskd admits to its cache at a time when it
+/// seals new data: 64 MiB of them.
+const SEAL_WAVE: u64 = (64 << 20) >> 16;
+
+/// The entries in diskd's chunk cache.
+async fn cache_entries(disks: &mut DiskServiceClient<Channel>) -> Result<u64> {
+    let request = StatsRequest {
+        pod_id: "-".to_string(),
+    };
+    Ok(disks.stats(request).await?.into_inner().cache_entries)
+}
+
+/// The layers of the disk's row in diskd's state, its shared ones first.
+fn disk_chain(disk: &str) -> Result<Vec<String>> {
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(diskd_state().join("diskd.state"))?)?;
+    let chain = state["devices"][disk]["chain"]
+        .as_array()
+        .with_context(|| format!("diskd has no row of disk {disk}"))?;
+    Ok(chain
+        .iter()
+        .filter_map(|layer| layer.as_str().map(str::to_string))
+        .collect())
+}
+
 /// A pod of `spec()`, up.
 async fn up_pod(pods: &mut PodServiceClient<Channel>) -> Result<(String, PodGuard)> {
     let pod_id = new_pod_id();
@@ -892,6 +917,129 @@ async fn test_resume_abandons_the_memory_upload() -> Result<()> {
     assert_eq!(pod.state(), PodState::Running);
     guard.set_pid(pid(&pod)?);
     assert_eq!(guest_ping(&pod_id).await?.boot_id, before.boot_id);
+
+    delete(&mut pods, &pod_id, guard).await
+}
+
+#[tokio::test]
+async fn test_resume_abandons_the_local_seal() -> Result<()> {
+    if !can_hibernate()? {
+        return Ok(());
+    }
+    ensure_server().await;
+    let _store = OBJECT_STORE.read().await;
+    let (mut pods, _, _) = get_public_clients().await?;
+    let mut disks = diskd().await?;
+    let (pod_id, mut guard) = up_pod(&mut pods).await?;
+
+    // Data that no layer has, which the local seal takes a while for.
+    stop(&mut pods, &pod_id).await?;
+    let marker = format!("marker/{}", uuid::Uuid::new_v4());
+    plant(&pod_id, &["keep"], &marker).await?;
+    fill(&pod_id).await?;
+    let pod = start(&mut pods, &pod_id).await?;
+    guard.set_pid(pid(&pod)?);
+    let before = guest_ping(&pod_id).await?;
+    let unsealed = disk_chain(&pod_id)?;
+
+    info!("Hibernating pod {pod_id}, and resuming it while its disk is sealed on the node");
+    // diskd seals at once; feosd has its answer only once the test
+    // releases it, so that feosd is in the call when the resume comes,
+    // whether diskd ended the seal by then or not.
+    let id = pod_id.clone();
+    let local = diskd_gate().pass_holding_answer(
+        move |call| matches!(call, GateCall::Seal(seal) if seal.pod_id == id && !seal.upload),
+    );
+    let entries = cache_entries(&mut disks).await?;
+    let hibernation = spawn_hibernation(&pods, &pod_id, "s1", false);
+    timeout(STEP_TIMEOUT, local.arrived())
+        .await
+        .context("the local seal did not begin")?;
+    // The resume comes once diskd admitted a wave of the seal's chunks,
+    // with the seal under way, or once diskd ended the seal.
+    let admitted = timeout(STEP_TIMEOUT, async {
+        loop {
+            let admitted = cache_entries(&mut disks).await?.saturating_sub(entries);
+            if admitted >= SEAL_WAVE || local.answered() {
+                return anyhow::Ok(admitted);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("the local seal neither admitted chunks nor ended")??;
+    let shown = self::hibernation(&mut pods, &pod_id).await?;
+    assert_eq!(shown.phase(), HibernationPhase::Sealing);
+    assert!(shown.abandonable);
+    let resuming = Instant::now();
+    resume(&mut pods, &pod_id, ABANDON_TIMEOUT).await?;
+    let took = resuming.elapsed();
+    assert_abandoned(&hibernation.await?.unwrap_err(), &pod_id);
+    assert!(
+        timeout(ABANDON_TIMEOUT, local.dropped()).await?,
+        "feosd waited for the local seal"
+    );
+    let answered = local.answered();
+    drop(local);
+    // diskd stopped the seal before it committed the layer, or had
+    // committed it: the disk opened again over its top as it was, or over
+    // the sealed layer with a fresh top.
+    let chain = disk_chain(&pod_id)?;
+    if chain == unsealed {
+        ensure!(
+            !answered,
+            "diskd answered the seal, and the disk is not sealed"
+        );
+        info!(
+            "The resume took {took:?}: diskd stopped the local seal before its commit, \
+             {admitted} chunks into it"
+        );
+    } else {
+        ensure!(
+            chain.len() == unsealed.len() + 1 && chain.starts_with(&unsealed),
+            "the disk's chain {chain:?} after the abandon, {unsealed:?} before"
+        );
+        let how = if answered {
+            "had sealed the disk before the abandon"
+        } else {
+            "had committed the layer when the seal was dropped"
+        };
+        info!("The resume took {took:?}: diskd {how}");
+    }
+
+    // The pod runs on, with its memory and its disk.
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    assert_eq!(pod.hibernation, None);
+    assert_eq!(pod.checkpoint, None);
+    guard.set_pid(pid(&pod)?);
+    let after = guest_ping(&pod_id).await?;
+    assert_eq!(after.boot_id, before.boot_id, "the same boot");
+    assert!(after.tick > before.tick, "the guest forgot its pings");
+    assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
+
+    // The next hibernation seals what the disk has, and restores.
+    info!("Hibernating pod {pod_id} again, and restoring it");
+    let head_key = hibernate(&mut pods, &pod_id).await?;
+    let head = disks
+        .get_head(GetHeadRequest {
+            key: head_key.clone(),
+        })
+        .await?
+        .into_inner();
+    assert_eq!(head.chain.len(), 2, "the chain grew: {:?}", head.chain);
+    resume(&mut pods, &pod_id, STEP_TIMEOUT).await?;
+    let pod = get_pod(&mut pods, &pod_id).await?;
+    assert_eq!(pod.state(), PodState::Running);
+    assert_eq!(
+        pod.checkpoint
+            .as_ref()
+            .map(|checkpoint| &checkpoint.head_key),
+        Some(&head_key)
+    );
+    guard.set_pid(pid(&pod)?);
+    assert_eq!(guest_ping(&pod_id).await?.boot_id, before.boot_id);
+    assert_eq!(records(&pod_id).await?, marked(&["keep"], &marker));
 
     delete(&mut pods, &pod_id, guard).await
 }

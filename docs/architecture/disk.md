@@ -65,8 +65,10 @@ top      a sparse file: what the pod wrote since
   layer S, points the device's row at it and then removes the top; with
   `upload`, it pushes the chain. A disk without a top is sealed already,
   and the seal returns its newest layer: `Seal` without upload and then
-  with it seals, and then uploads. A seal whose caller goes away runs on
-  to its end on the node; its upload stops where it is, and what it
+  with it seals, and then uploads. A seal whose caller goes away before
+  it committed the new layer stops at its next chunk and leaves the disk
+  as it was, its row and top unchanged; once the layer is committed, the
+  seal ends on the node, and its upload stops where it is: what it
   uploaded stays, listed in the disk's journal (below). `Bake(pod)` seals
   the frozen top of a running device into a layer on L0 and changes
   nothing about the pod.
@@ -81,8 +83,9 @@ top      a sparse file: what the pod wrote since
   `PutHead` hold the disk's lock until their work on the node ends, also
   when their caller goes away; a call waits for it up to 10 minutes and
   fails `UNAVAILABLE` "disk `<pod>` is busy" then. So an `OpenDisk` that
-  comes during a seal starts the device over the sealed layer, after the
-  seal. A push holds no lock.
+  comes during a seal starts the device after it: over the sealed layer,
+  or over the top as it was when the seal's caller went away before the
+  layer was committed. A push holds no lock.
 
 When diskd ends, its devices stay. The next diskd recovers every device in
 `diskd.state` before it serves: I/O that waited goes on.
@@ -205,13 +208,15 @@ pod skips step 1 and the memory.
 A `ResumePod` that comes before step 5 abandons the hibernation, unless a
 `HibernatePod` of it said `no_abandon`, as the control plane's drains do,
 or the pod has no memory. The hibernation stops before its next step, or
-drops the call that uploads, whose push diskd stops where it is; the
-suspend and the seals without upload run to their end. Every
-`HibernatePod` of it fails with `ABORTED`, and so does a later one with
-one of its request ids. The resume then takes the pod's lock and resumes
-the pod from its snapshot, on its disk and volumes as the hibernation
-left them: `OpenDisk` starts a sealed one over its sealed layer, with a
-fresh top. Nothing names what was uploaded: the next hibernation's push
+drops the call to diskd it is in, a seal or an upload: diskd stops a
+seal on the node before it commits the new layer, and a push where it
+is; the suspend runs to its end. Every `HibernatePod` of it fails with
+`ABORTED`, and so does a later one with one of its request ids. The
+resume then takes the pod's lock and resumes the pod from its snapshot,
+on its disk and volumes as the hibernation left them: `OpenDisk` waits
+for a seal that diskd still stops or ends, and starts a sealed disk over
+its sealed layer, with a fresh top, and one whose seal stopped over its
+top. Nothing names what was uploaded: the next hibernation's push
 skips the chunks that have their markers ([the cache](#the-cache)), and
 a sweep deletes the rest. A resume that comes in step 5 or later, or to a
 hibernation it may not abandon, waits for it, and restores the pod from

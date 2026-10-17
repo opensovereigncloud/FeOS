@@ -69,12 +69,15 @@ type DiskServiceClient interface {
 	// and at most one layer of its own. With upload, the chain's chunks and
 	// then its layers go to S3; PutHead names them. A disk without a top,
 	// sealed already, returns the newest layer of its chain.
-	// A Seal whose caller goes away stops its upload where it is: the layer
-	// stays sealed on the node, its device row names it, and the chunks
-	// uploaded so far stay in S3 and are not uploaded again for 12 hours.
-	// The local seal runs to its end: until then CreateDisk, OpenDisk,
-	// StopDisk, RemoveDevice, Seal and PutHead of the disk wait for it. Seal
-	// without upload and then with it seals, and then uploads.
+	// A Seal whose caller goes away before the new layer is committed stops
+	// at its next chunk and leaves the disk as it was: the same device row,
+	// top and chain, and no new layer. Once the layer is committed, the seal
+	// on the node ends and the device row names the layer; a caller that
+	// goes away then stops the upload where it is, and the chunks uploaded
+	// so far stay in S3 and are not uploaded again for 12 hours. Until the
+	// seal on the node ends or stops, CreateDisk, OpenDisk, StopDisk,
+	// RemoveDevice, Seal and PutHead of the disk wait for it. Seal without
+	// upload and then with it seals, and then uploads.
 	Seal(ctx context.Context, in *SealRequest, opts ...grpc.CallOption) (*Layer, error)
 	// Seals the frozen top of a running device into a layer on L0, for
 	// other pods to start from. Nothing about the pod changes. Fails with
@@ -378,12 +381,15 @@ type DiskServiceServer interface {
 	// and at most one layer of its own. With upload, the chain's chunks and
 	// then its layers go to S3; PutHead names them. A disk without a top,
 	// sealed already, returns the newest layer of its chain.
-	// A Seal whose caller goes away stops its upload where it is: the layer
-	// stays sealed on the node, its device row names it, and the chunks
-	// uploaded so far stay in S3 and are not uploaded again for 12 hours.
-	// The local seal runs to its end: until then CreateDisk, OpenDisk,
-	// StopDisk, RemoveDevice, Seal and PutHead of the disk wait for it. Seal
-	// without upload and then with it seals, and then uploads.
+	// A Seal whose caller goes away before the new layer is committed stops
+	// at its next chunk and leaves the disk as it was: the same device row,
+	// top and chain, and no new layer. Once the layer is committed, the seal
+	// on the node ends and the device row names the layer; a caller that
+	// goes away then stops the upload where it is, and the chunks uploaded
+	// so far stay in S3 and are not uploaded again for 12 hours. Until the
+	// seal on the node ends or stops, CreateDisk, OpenDisk, StopDisk,
+	// RemoveDevice, Seal and PutHead of the disk wait for it. Seal without
+	// upload and then with it seals, and then uploads.
 	Seal(context.Context, *SealRequest) (*Layer, error)
 	// Seals the frozen top of a running device into a layer on L0, for
 	// other pods to start from. Nothing about the pod changes. Fails with

@@ -3,10 +3,10 @@
 
 //! A gate between the tests' feosd and diskd: feosd reaches diskd through
 //! it, on a socket of the tests' own, and it holds the calls a test names,
-//! so that the test can act while a hibernation is at a step of its
-//! choosing. Every other call it forwards as it is. A call that feosd drops
-//! drops the gate's own call to diskd, whose handler stops where it is, as
-//! when feosd calls diskd directly.
+//! or diskd's answers to them, so that the test can act while a
+//! hibernation is at a step of its choosing. Every other call it forwards
+//! as it is. A call that feosd drops drops the gate's own call to diskd,
+//! whose handler stops as when feosd calls diskd directly.
 
 use feos_proto::disk_service::disk_service_client::DiskServiceClient;
 use feos_proto::disk_service::disk_service_server::{DiskService, DiskServiceServer};
@@ -66,41 +66,68 @@ pub struct DiskdGate {
 /// What a test asked the gate to do with the first call that matches.
 struct Rule {
     matches: Box<dyn Fn(&GateCall) -> bool + Send + Sync>,
-    hold: bool,
+    mode: Mode,
     passage: Arc<Passage>,
+}
+
+/// How the gate takes a call that a rule took.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// Holds it before diskd, until the test releases it.
+    Hold,
+    /// Forwards it at once, and answers feosd as diskd answers.
+    Pass,
+    /// Forwards it at once, and holds diskd's answer until the test
+    /// releases it.
+    HoldAnswer,
 }
 
 /// What became of a call that a rule took.
 struct Passage {
     arrived: watch::Sender<bool>,
     released: watch::Sender<bool>,
-    /// Whether feosd dropped the call before diskd answered it; unset
+    /// Whether diskd answered the forwarded call.
+    answered: watch::Sender<bool>,
+    /// Whether feosd dropped the call before the gate answered it; unset
     /// while it is under way.
     ended: watch::Sender<Option<bool>>,
 }
 
 /// A call that a test named, held or forwarded. Dropping it releases the
-/// call, so that a test that fails leaves no hibernation hanging.
+/// call, so that a test that fails leaves no hibernation hanging, and
+/// takes its rule out of the gate if no call came for it.
 pub struct Held(Arc<Passage>);
 
 impl DiskdGate {
     /// Holds the first call that `matches` before it reaches diskd, until
     /// the test releases it.
     pub fn hold(&self, matches: impl Fn(&GateCall) -> bool + Send + Sync + 'static) -> Held {
-        self.add(matches, true)
+        self.add(matches, Mode::Hold)
     }
 
     /// Forwards the first call that `matches` at once and reports it: if
     /// feosd drops it, the forwarded call is dropped with it, and diskd's
     /// handler where it is.
     pub fn pass(&self, matches: impl Fn(&GateCall) -> bool + Send + Sync + 'static) -> Held {
-        self.add(matches, false)
+        self.add(matches, Mode::Pass)
     }
 
-    fn add(&self, matches: impl Fn(&GateCall) -> bool + Send + Sync + 'static, hold: bool) -> Held {
+    /// Forwards the first call that `matches` at once, and holds diskd's
+    /// answer until the test releases it: feosd is in the call until then,
+    /// whether or not diskd ended it. If feosd drops it, the forwarded call
+    /// is dropped with it, unless diskd answered.
+    pub fn pass_holding_answer(
+        &self,
+        matches: impl Fn(&GateCall) -> bool + Send + Sync + 'static,
+    ) -> Held {
+        self.add(matches, Mode::HoldAnswer)
+    }
+
+    fn add(&self, matches: impl Fn(&GateCall) -> bool + Send + Sync + 'static, mode: Mode) -> Held {
         let passage = Arc::new(Passage {
             arrived: watch::channel(false).0,
             released: watch::channel(false).0,
+            answered: watch::channel(false).0,
             ended: watch::channel(None).0,
         });
         self.rules
@@ -108,18 +135,18 @@ impl DiskdGate {
             .unwrap_or_else(PoisonError::into_inner)
             .push(Rule {
                 matches: Box::new(matches),
-                hold,
+                mode,
                 passage: passage.clone(),
             });
         Held(passage)
     }
 
     /// Takes the first rule that matches `call`.
-    fn take(&self, call: &GateCall) -> Option<(bool, Arc<Passage>)> {
+    fn take(&self, call: &GateCall) -> Option<(Mode, Arc<Passage>)> {
         let mut rules = self.rules.lock().unwrap_or_else(PoisonError::into_inner);
         let index = rules.iter().position(|rule| (rule.matches)(call))?;
         let rule = rules.remove(index);
-        Some((rule.hold, rule.passage))
+        Some((rule.mode, rule.passage))
     }
 }
 
@@ -134,13 +161,19 @@ impl Held {
             .await;
     }
 
-    /// Forwards a held call.
+    /// Forwards a held call, or diskd's held answer.
     pub fn release(&self) {
         self.0.released.send_replace(true);
     }
 
-    /// Whether feosd dropped the call before diskd answered it: returns
-    /// once one of the two happened.
+    /// Whether diskd answered the forwarded call, so far.
+    pub fn answered(&self) -> bool {
+        *self.0.answered.borrow()
+    }
+
+    /// Whether feosd dropped the call before the gate answered it, as
+    /// diskd did or, with its answer held, once released: returns once one
+    /// of the two happened.
     pub async fn dropped(&self) -> bool {
         let mut ended = self.0.ended.subscribe();
         let ended = ended.wait_for(Option::is_some).await.map(|ended| *ended);
@@ -151,10 +184,14 @@ impl Held {
 impl Drop for Held {
     fn drop(&mut self) {
         self.release();
+        GATE.rules
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|rule| !Arc::ptr_eq(&rule.passage, &self.0));
     }
 }
 
-/// Marks a call that a rule took as dropped, unless it was answered.
+/// Marks a call that a rule took as dropped, unless the gate answered it.
 struct Ending {
     passage: Arc<Passage>,
     answered: bool,
@@ -166,13 +203,13 @@ impl Drop for Ending {
     }
 }
 
-/// Takes a call through the gate: holds it if its rule says so, and
-/// forwards it.
+/// Takes a call through the gate: forwards it, and holds it or diskd's
+/// answer to it if its rule says so.
 async fn through<T>(
-    rule: Option<(bool, Arc<Passage>)>,
+    rule: Option<(Mode, Arc<Passage>)>,
     forward: impl Future<Output = Result<Response<T>, Status>>,
 ) -> Result<Response<T>, Status> {
-    let Some((hold, passage)) = rule else {
+    let Some((mode, passage)) = rule else {
         return forward
             .await
             .map(|response| Response::new(response.into_inner()));
@@ -182,16 +219,25 @@ async fn through<T>(
         answered: false,
     };
     passage.arrived.send_replace(true);
-    if hold {
-        let _ = passage
-            .released
-            .subscribe()
-            .wait_for(|released| *released)
-            .await;
+    if mode == Mode::Hold {
+        released(&passage).await;
     }
     let answer = forward.await;
+    passage.answered.send_replace(true);
+    if mode == Mode::HoldAnswer {
+        released(&passage).await;
+    }
     ending.answered = true;
     answer.map(|response| Response::new(response.into_inner()))
+}
+
+/// Returns once the test released the call.
+async fn released(passage: &Passage) {
+    let _ = passage
+        .released
+        .subscribe()
+        .wait_for(|released| *released)
+        .await;
 }
 
 /// The gate's service: diskd's API, forwarded to diskd.
@@ -212,8 +258,12 @@ macro_rules! forward {
                     let request = request.into_inner();
                     let call = ($call)(&request);
                     let rule = GATE.take(&call);
-                    if let Some((hold, _)) = &rule {
-                        let what = if *hold { "holds" } else { "passes" };
+                    if let Some((mode, _)) = &rule {
+                        let what = match mode {
+                            Mode::Hold => "holds",
+                            Mode::Pass => "passes",
+                            Mode::HoldAnswer => "passes, holding the answer to,",
+                        };
                         log::info!("The diskd gate {what} a call of {}", call.method());
                     }
                     let mut diskd = self.diskd.clone();

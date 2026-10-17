@@ -25,6 +25,11 @@ pub enum Error {
     #[error("seal aborted at step {0}")]
     SealAborted(&'static str),
 
+    /// The seal's caller went away before the layer was committed: the
+    /// seal stopped, and committed nothing.
+    #[error("seal cancelled: its caller went away")]
+    SealCancelled,
+
     #[error("head manifest: {0}")]
     Head(String),
 }

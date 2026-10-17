@@ -649,10 +649,12 @@ impl Pods {
 
     /// The hibernation, under the pod's lock, step by step. Until its heads
     /// are being put, a resume may abandon it: it stops then between two
-    /// steps, or drops the call to diskd that uploads, and leaves the pod
-    /// as the steps before it left it, suspended on the node with its disk
-    /// sealed or not. The steps that a dropped call would cut, a suspend
-    /// and a seal on the node, run to their end.
+    /// steps, or drops the call to diskd that seals or uploads, and leaves
+    /// the pod as the steps before it left it, suspended on the node with
+    /// its disk sealed or not. diskd stops a dropped seal on the node
+    /// before it commits the new layer, which leaves the disk as it was,
+    /// or finishes it once it has; the resume's OpenDisk waits for either.
+    /// The suspend, which a dropped call would cut, runs to its end.
     async fn hibernate_locked(&self, run: &mut Run<'_>) -> Answer {
         let pod_id = run.pod_id;
         let info = self.info(pod_id)?;
@@ -701,7 +703,7 @@ impl Pods {
         info!("Pods: {pod_id} hibernates, epoch {epoch}");
         run.check()?;
         self.set_phase(run, HibernationPhase::Sealing);
-        self.inner.disks.seal_local(pod_id).await?;
+        run.abandonable(self.inner.disks.seal_local(pod_id)).await?;
         run.check()?;
         self.set_phase(run, HibernationPhase::UploadingDisk);
         let disk = run.abandonable(self.inner.disks.seal(pod_id)).await?;
@@ -1252,7 +1254,7 @@ impl Pods {
     /// checkpoint, in the order of the pod's spec: its chain, whose head
     /// `head_volumes` puts. A volume that is checkpointed already, of a pod
     /// that has not booted since, keeps its head. A resume may abandon the
-    /// hibernation between two volumes, and during an upload.
+    /// hibernation between two volumes, and during a seal or an upload.
     async fn seal_volumes(
         &self,
         run: &mut Run<'_>,
@@ -1282,7 +1284,7 @@ impl Pods {
                 .open_volume(&volume, self.inner.volumes.dir())
                 .await?;
             self.inner.disks.stop(&disk).await?;
-            self.inner.disks.seal_local(&disk).await?;
+            run.abandonable(self.inner.disks.seal_local(&disk)).await?;
             run.check()?;
             run.abandonable(self.inner.disks.seal(&disk)).await?;
             parts.push(VolumePart::Sealed {
@@ -2132,7 +2134,7 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// A step that an abandon drops, a call to diskd that uploads.
+    /// A step that an abandon drops: a call to diskd that seals or uploads.
     async fn abandonable<T>(
         &mut self,
         step: impl Future<Output = Result<T, Status>>,
@@ -2264,8 +2266,9 @@ fn abandoned(pod_id: &str) -> Status {
 }
 
 /// Runs a step of a hibernation until a resume asks for the abandon: the
-/// step is dropped then, and with it its call to diskd, whose handler stops
-/// where it is.
+/// step is dropped then, and with it its call to diskd, whose handler
+/// stops: an upload where it is, a seal on the node before it commits its
+/// layer.
 async fn abandonable<T>(
     abandon: &mut watch::Receiver<bool>,
     pod_id: &str,

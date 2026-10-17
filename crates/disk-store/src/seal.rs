@@ -32,6 +32,12 @@
 //! chunks (GC candidates) or a complete layer — never a dangling
 //! manifest. The caller deletes the top only *after* this returns (and,
 //! if requested, after upload).
+//!
+//! A seal whose caller went away ([`seal_top_held`]'s `cancelled`) stops
+//! between two chunks, or at the latest before its manifest is
+//! committed, and commits nothing: the chunks it admitted are cache
+//! entries that no manifest names. Once the manifest is committed, the
+//! layer is sealed, and a cancel is not looked at any more.
 
 use std::collections::HashSet;
 use std::fs;
@@ -181,21 +187,39 @@ fn overlay_extents(
 
 /// New-chunk batching: chunks batch here and flush in ~64 MiB waves
 /// (batched syncfs — per-chunk fsync dominates seal time otherwise).
+#[cfg(not(test))]
 const FLUSH_AT: u64 = 64 << 20;
+/// Four chunks of 64 KiB in this crate's tests: a seal admits in waves.
+#[cfg(test)]
+const FLUSH_AT: u64 = 256 << 10;
+
+/// Whether a seal goes on: not once its caller went away.
+type Cancelled<'a> = Option<&'a dyn Fn() -> bool>;
+
+/// Fails a seal whose caller went away ([`seal_top_held`]).
+fn go_on(cancelled: Cancelled<'_>) -> Result<()> {
+    match cancelled {
+        Some(cancelled) if cancelled() => Err(Error::SealCancelled),
+        _ => Ok(()),
+    }
+}
 
 struct Pending<'a> {
     chunks: Vec<(Hash, Vec<u8>)>,
     bytes: u64,
     /// Holds what it admits, see [`seal_top`].
     hold: Option<&'a Hold>,
+    /// A seal that is cancelled admits no further wave.
+    cancelled: Cancelled<'a>,
 }
 
 impl<'a> Pending<'a> {
-    fn new(hold: Option<&'a Hold>) -> Self {
+    fn new(hold: Option<&'a Hold>, cancelled: Cancelled<'a>) -> Self {
         Pending {
             chunks: Vec::new(),
             bytes: 0,
             hold,
+            cancelled,
         }
     }
     fn push(&mut self, cache: &Cache, h: Hash, buf: Vec<u8>) -> Result<()> {
@@ -208,6 +232,7 @@ impl<'a> Pending<'a> {
     }
     fn flush(&mut self, cache: &Cache) -> Result<()> {
         if !self.chunks.is_empty() {
+            go_on(self.cancelled)?;
             cache.admit_batch(&self.chunks, self.hold)?;
             self.chunks.clear();
             self.bytes = 0;
@@ -270,6 +295,7 @@ pub fn seal_top(
         merge_with,
         cache,
         None,
+        None,
         state_dir,
         logical_size,
         chunk_size,
@@ -282,8 +308,19 @@ pub fn seal_top(
 /// the seal of a pod's own layer, which may stay the only copy of the
 /// pod's disk. The chunks merged from `merge_with` are that layer's and
 /// keep what they had.
+///
+/// `cancelled` says whether the seal's caller went away. It is asked
+/// before each chunk, before each wave of admissions and once more before
+/// the manifest is committed: once it says so, the seal fails with
+/// [`Error::SealCancelled`] and has committed nothing; the chunks it
+/// admitted are held until `hold` drops, and then are cache entries that
+/// no manifest names. After the manifest is committed it is not asked:
+/// the layer is sealed.
 #[allow(clippy::too_many_arguments)]
-#[instrument(skip(top, chain, merge_with, cache, hold), fields(chunk_size))]
+#[instrument(
+    skip(top, chain, merge_with, cache, hold, cancelled),
+    fields(chunk_size)
+)]
 pub fn seal_top_held(
     top: &Path,
     chain: &[&Manifest],
@@ -293,6 +330,7 @@ pub fn seal_top_held(
     state_dir: &Path,
     logical_size: u64,
     chunk_size: u32,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<SealOutcome> {
     seal_top_inner(
         top,
@@ -300,6 +338,7 @@ pub fn seal_top_held(
         merge_with,
         cache,
         Some(hold),
+        Some(cancelled),
         state_dir,
         logical_size,
         chunk_size,
@@ -314,6 +353,7 @@ fn seal_top_inner(
     merge_with: Option<&Manifest>,
     cache: &Cache,
     hold: Option<&Hold>,
+    cancelled: Cancelled<'_>,
     state_dir: &Path,
     logical_size: u64,
     chunk_size: u32,
@@ -374,9 +414,10 @@ fn seal_top_inner(
     let parent_id = shared.last().map(|m| m.layer_id());
     let mut manifest = Manifest::new(chunk_size, logical_size, parent_id);
 
-    let mut pending = Pending::new(hold);
+    let mut pending = Pending::new(hold, cancelled);
 
     for &ci in &touched {
+        go_on(cancelled)?;
         let off = ci * cs;
         let raw_len = chunk::chunk_len_at(off, logical_size, chunk_size) as usize;
         // Composition parent: the content directly below the top (full
@@ -473,6 +514,9 @@ fn seal_top_inner(
     }
     fsync_dir(&cache.dir())?;
 
+    // The last point a seal whose caller went away stops at: past it, the
+    // manifest is committed, and the layer sealed.
+    go_on(cancelled)?;
     let manifest_path = commit_manifest(state_dir, &manifest, &mut hook)?;
 
     stats.seal_seconds = start.elapsed().as_secs_f64();
@@ -512,7 +556,7 @@ pub fn seal_file(
         ..Default::default()
     };
     let mut manifest = Manifest::new(chunk_size, logical_size, None);
-    let mut pending = Pending::new(None);
+    let mut pending = Pending::new(None, None);
 
     for ci in 0..n_chunks {
         let off = ci * cs;
@@ -577,4 +621,149 @@ fn read_exact_into(f: &fs::File, off: u64, buf: &mut [u8]) -> Result<()> {
         filled += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHUNK: u32 = 64 * 1024;
+    const SIZE: u64 = 16 * CHUNK as u64;
+
+    /// A stopped disk: an L0 with data in its first chunk, and a top that
+    /// wrote into that chunk and filled `chunks` more, each differently.
+    struct Disk {
+        _dir: tempfile::TempDir,
+        state: PathBuf,
+        cache: Cache,
+        l0: Manifest,
+        top: PathBuf,
+    }
+
+    fn disk(chunks: u64) -> Disk {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir_all(&state).unwrap();
+        let cache = Cache::open(&state, 1 << 30).unwrap();
+        let base = dir.path().join("base.img");
+        let f = fs::File::create(&base).unwrap();
+        f.set_len(SIZE).unwrap();
+        f.write_all_at(&[7u8; 4096], 0).unwrap();
+        let l0 = seal_top(&base, &[], None, &cache, &state, SIZE, CHUNK, None)
+            .unwrap()
+            .manifest;
+        let top = dir.path().join("top.img");
+        let f = fs::File::create(&top).unwrap();
+        f.set_len(SIZE).unwrap();
+        f.write_all_at(&[9u8; 4096], 8192).unwrap();
+        for i in 1..=chunks {
+            f.write_all_at(&vec![i as u8; CHUNK as usize], i * CHUNK as u64)
+                .unwrap();
+        }
+        Disk {
+            _dir: dir,
+            state,
+            cache,
+            l0,
+            top,
+        }
+    }
+
+    fn seal(d: &Disk, hold: &Hold, cancelled: &dyn Fn() -> bool) -> Result<SealOutcome> {
+        seal_top_held(
+            &d.top,
+            &[&d.l0],
+            None,
+            &d.cache,
+            hold,
+            &d.state,
+            SIZE,
+            CHUNK,
+            cancelled,
+        )
+    }
+
+    /// The files in `<state>/<dir>`.
+    fn files(state: &Path, dir: &str) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(state.join(dir))
+            .map(|rd| {
+                rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// The layer the seal of `disk(chunks)` makes.
+    fn layer_of(chunks: u64) -> LayerId {
+        let d = disk(chunks);
+        let hold = d.cache.hold();
+        seal(&d, &hold, &|| false).unwrap().layer_id
+    }
+
+    #[test]
+    fn a_cancelled_seal_commits_nothing() {
+        let d = disk(10);
+        let layers = files(&d.state, "layers");
+        let before = d.cache.stats().unwrap();
+
+        // The caller goes away once the seal admitted its first wave.
+        let hold = d.cache.hold();
+        let admitted = || d.cache.stats().unwrap().entries > before.entries;
+        let cancelled = seal(&d, &hold, &admitted);
+        assert!(
+            matches!(cancelled, Err(Error::SealCancelled)),
+            "{cancelled:?}"
+        );
+        assert_eq!(
+            files(&d.state, "layers"),
+            layers,
+            "a manifest was committed"
+        );
+        assert!(
+            files(&d.state, "staging").is_empty(),
+            "{:?}",
+            files(&d.state, "staging")
+        );
+        let wave = FLUSH_AT / CHUNK as u64;
+        let held = d.cache.stats().unwrap();
+        assert_eq!(held.entries, before.entries + wave, "one wave admitted");
+        assert_eq!(held.pinned_entries, before.pinned_entries + wave);
+        // Once the hold drops, they are chunks like any other.
+        drop(hold);
+        let released = d.cache.stats().unwrap();
+        assert_eq!(released.entries, held.entries);
+        assert_eq!(released.pinned_entries, before.pinned_entries);
+
+        // The next seal makes the layer the first one would have made.
+        let hold = d.cache.hold();
+        let sealed = seal(&d, &hold, &|| false).unwrap();
+        assert_eq!(sealed.layer_id, layer_of(10));
+        assert_eq!(sealed.stats.chunks_new, 11);
+        assert!(sealed.manifest_path.is_file());
+    }
+
+    #[test]
+    fn a_seal_cancelled_before_it_began_admits_nothing() {
+        let d = disk(3);
+        let before = d.cache.stats().unwrap();
+        let hold = d.cache.hold();
+        let cancelled = seal(&d, &hold, &|| true);
+        assert!(matches!(cancelled, Err(Error::SealCancelled)));
+        assert_eq!(d.cache.stats().unwrap().entries, before.entries);
+        assert_eq!(files(&d.state, "layers").len(), 1, "L0's alone");
+    }
+
+    #[test]
+    fn a_cancel_once_the_manifest_is_committed_is_not_looked_at() {
+        let d = disk(3);
+        let want = layer_of(3);
+        let manifest = d.state.join("layers").join(format!("{want}.manifest"));
+        let hold = d.cache.hold();
+        let sealed = seal(&d, &hold, &|| manifest.exists()).unwrap();
+        assert_eq!(sealed.layer_id, want);
+        assert_eq!(sealed.manifest_path, manifest);
+        assert!(manifest.is_file());
+    }
 }

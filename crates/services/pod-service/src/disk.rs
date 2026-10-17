@@ -354,7 +354,9 @@ impl Disks {
     }
 
     /// Seals the stopped disk's writes into its own layer, on the node: a
-    /// pod's, or a volume's. The disk opens again over that layer.
+    /// pod's, or a volume's. The disk opens again over that layer. A call
+    /// that is dropped before diskd committed the layer leaves the disk as
+    /// it was, over its top.
     pub async fn seal_local(&self, pod_id: &str) -> Result<Layer, Status> {
         self.seal_with(pod_id, false).await
     }

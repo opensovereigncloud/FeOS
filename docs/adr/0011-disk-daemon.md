@@ -139,9 +139,11 @@ runs already, and `Seal` of a disk without a top returns the layer it
 sealed; the seal points the device's row at the new layer before it
 removes the top, so that a crash in between loses nothing. Each call
 that changes a disk holds the disk's lock until its work on the node
-ends, whether or not its caller is still there: a seal whose caller went
-away ends before the disk opens again, over the sealed layer. Its upload
-stops where it is; what was uploaded stays, and the next push skips it.
+ends, whether or not its caller is still there. A seal whose caller went
+away before it committed the new layer stops at its next chunk, and the
+disk opens again as it was; one that committed it ends first, and the
+disk opens again over the sealed layer. Its upload stops where it is;
+what was uploaded stays, and the next push skips it.
 The head of a checkpoint is diskd's to write, last (`PutHead`): from the
 device's row, only once every layer it names and the vmstate are in the
 bucket, and never over another head. `GetHead` reads one. `feosd` needs

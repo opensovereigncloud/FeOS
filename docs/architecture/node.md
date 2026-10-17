@@ -203,9 +203,9 @@ microVM has a balloon with free page reporting.
   ends. A **Resume** that comes while the pod hibernates abandons the
   hibernation until its heads are being put, unless a call said
   `no_abandon` (a drain) or the pod has no memory: the hibernation stops,
-  its calls fail with `ABORTED`, and the pod resumes from its snapshot on
-  the node. Otherwise the resume waits for the hibernation and restores
-  the pod.
+  in the middle of a seal or an upload of diskd's too, its calls fail
+  with `ABORTED`, and the pod resumes from its snapshot on the node.
+  Otherwise the resume waits for the hibernation and restores the pod.
 - **Delete** ends a bring-up and removes the microVM, the disk and the
   record. Its volumes stay, their disks stopped, attached to no pod.
 - A running pod whose microVM crashes is `FAILED`; one whose microVM stops
