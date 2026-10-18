@@ -137,6 +137,9 @@ func TestVolumes(t *testing.T) {
 	}
 	_, err = pc2.RestorePod(bgctx, &podv1.RestorePodRequest{PodId: b.String(), HeadKey: hib.GetCheckpoint().GetHeadKey()})
 	wantPrefix(t, err, codes.FailedPrecondition, "volume "+vol+" is on this node with data its checkpoint may not have")
+	// The refused restore left nothing on n2, as on feosd.
+	_, err = pc2.GetPod(bgctx, &podv1.GetPodRequest{PodId: b.String()})
+	wantPrefix(t, err, codes.NotFound, "")
 	if _, err := vc2.DeleteVolume(bgctx, &volumev1.DeleteVolumeRequest{VolumeId: vol}); err != nil {
 		t.Fatal(err)
 	}
