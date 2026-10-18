@@ -102,14 +102,17 @@ func parseStored(raw json.RawMessage) (*spec.Spec, error) {
 	return &sp, nil
 }
 
-// releaseSpec returns release number's parsed spec, for reading only
-// (cached: a release never changes); errNoRelease when there is none.
-func (s *Service) releaseSpec(ctx context.Context, envID uuid.UUID, number int) (*spec.Spec, error) {
-	k := releaseKey{envID, number}
+// releaseSpec returns release number of environment e's parsed spec, for
+// reading only (cached: a release never changes); errNoRelease when there
+// is none. The cache knows the environment by its ID and its creation:
+// an ID is free again once its environment is deleted, and the next
+// environment of that ID has releases of its own.
+func (s *Service) releaseSpec(ctx context.Context, e store.Environment, number int) (*spec.Spec, error) {
+	k := releaseKey{env: e.ID, created: e.CreatedAt.UnixMicro(), number: number}
 	if sp, ok := s.specs.get(k); ok {
 		return sp, nil
 	}
-	r, err := s.st.GetRelease(ctx, envID, number)
+	r, err := s.st.GetRelease(ctx, e.ID, number)
 	if errors.Is(err, store.ErrNoRow) {
 		return nil, errNoRelease()
 	}

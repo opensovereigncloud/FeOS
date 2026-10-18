@@ -46,7 +46,7 @@ func (s *Service) status(ctx context.Context, e store.Environment) (EnvStatus, e
 	if latest.State == model.ReleaseFailed && e.Realised > 0 {
 		target = e.Realised
 	}
-	targetSpec, err := s.releaseSpec(ctx, e.ID, target)
+	targetSpec, err := s.releaseSpec(ctx, e, target)
 	if err != nil {
 		return EnvStatus{}, err
 	}
@@ -54,7 +54,7 @@ func (s *Service) status(ctx context.Context, e store.Environment) (EnvStatus, e
 	if e.Realised > 0 {
 		routed = e.Realised
 	}
-	routeSpec, err := s.releaseSpec(ctx, e.ID, routed)
+	routeSpec, err := s.releaseSpec(ctx, e, routed)
 	if err != nil {
 		return EnvStatus{}, err
 	}

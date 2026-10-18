@@ -60,6 +60,8 @@ type fakeEngine struct {
 	mu       sync.Mutex
 	bad      map[string]string
 	resolved []string
+	// restartErr is Restart's answer.
+	restartErr error
 }
 
 func digestOf(image string) string {
@@ -74,7 +76,11 @@ func (f *fakeEngine) Ensure(context.Context, uuid.UUID) (model.Lease, error) {
 func (f *fakeEngine) Delete(context.Context, string, uuid.UUID) (store.Sandbox, bool, error) {
 	return store.Sandbox{}, false, nil
 }
-func (f *fakeEngine) Restart(context.Context, uuid.UUID, string) error { return nil }
+func (f *fakeEngine) Restart(context.Context, uuid.UUID, string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.restartErr
+}
 func (f *fakeEngine) ResolveImage(_ context.Context, image string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

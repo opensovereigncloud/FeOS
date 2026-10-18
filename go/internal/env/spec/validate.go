@@ -53,6 +53,13 @@ type ValidateContext interface {
 	// of it. A secret whose versions are all deleted is ok with Latest 0.
 	// Not asked in ModeSpec.
 	Secret(name string) (info SecretInfo, ok bool)
+	// Volume reports the data the environment's volume of addon name
+	// holds (its volume that is not being deleted); ok false when it has
+	// none. The controller keeps an addon's volume by the addon's name and
+	// mounts it whatever the latest release says, so an addon is validated
+	// against it rather than against the latest release's addon. Not asked
+	// in ModeSpec.
+	Volume(addon string) (data AddonData, ok bool)
 	// Blueprint returns the addon type typ; ok false when no blueprint of
 	// that type is registered.
 	Blueprint(typ string) (b Blueprint, ok bool)
@@ -84,6 +91,12 @@ type AttachedPort struct {
 	Port         int
 }
 
+// AddonData is what an addon's volume holds: data of addon type Type,
+// written last by Version ("": not recorded yet).
+type AddonData struct {
+	Type, Version string
+}
+
 // SecretInfo is a tenant secret of an environment.
 type SecretInfo struct {
 	// Latest is its newest version that is not deleted; 0: every version
@@ -99,9 +112,10 @@ type SecretInfo struct {
 // service adapts an internal/env/addons blueprint to it (addons imports
 // this package for Finding, so this package cannot import addons).
 type Blueprint interface {
-	// Validate checks addon name of this type against the same addon of
-	// the current release (prev nil: none, or another type): its version,
-	// plan and options. Paths are relative to the addon: "version",
+	// Validate checks addon name of this type against what it replaces
+	// (prev nil: nothing, or another type): the data its volume holds,
+	// else the same addon of the current release. Its version, plan and
+	// options. Paths are relative to the addon: "version",
 	// "options.roles[1]"; Validate prefixes them with "addons.<name>.".
 	Validate(name string, prev *Addon, next Addon) []Finding
 	// Ref checks a reference {"addon": name, "key": key, …fields} to the
@@ -627,18 +641,7 @@ func (v *validator) addon(name string, a Addon) {
 		v.errorf(p+".type", v.typesRemedy(), "no addon type %q", a.Type)
 		return
 	}
-	var prev *Addon
-	if v.prev != nil {
-		if pa, ok := v.prev.Addons[name]; ok {
-			if pa.Type == a.Type {
-				prev = &pa
-			} else {
-				v.warnf(p+".type", "keep the type, or accept that the addon starts empty",
-					"addon %s changes its type from %s to %s: its data is deleted", name, pa.Type, a.Type)
-			}
-		}
-	}
-	for _, f := range b.Validate(name, prev, a) {
+	for _, f := range b.Validate(name, v.prevAddon(name, a), a) {
 		if f.Path != "" {
 			f.Path = p + "." + f.Path
 		} else {
@@ -646,6 +649,58 @@ func (v *validator) addon(name string, a Addon) {
 		}
 		v.out = append(v.out, f)
 	}
+}
+
+// prevAddon is what addon name of type a.Type is validated against: the
+// data its volume holds when the environment has one (its type, the
+// version that wrote it, the latest release's plan and options when that
+// release has the addon of that type), else the latest release's addon;
+// nil when there is neither, or either is of another type, which deletes
+// the data (a warning says so).
+func (v *validator) prevAddon(name string, a Addon) *Addon {
+	var latest *Addon
+	if v.prev != nil {
+		if pa, ok := v.prev.Addons[name]; ok {
+			latest = &pa
+		}
+	}
+	p := "addons." + name
+	if data, ok := v.volume(name); ok {
+		if data.Type != a.Type {
+			v.warnf(p+".type", "keep the type, or accept that the addon starts empty",
+				"addon %s's volume holds %s data, not %s: its data is deleted", name, data.Type, a.Type)
+			return nil
+		}
+		prev := Addon{Type: data.Type, Version: data.Version, Plan: a.Plan}
+		if latest != nil && latest.Type == data.Type {
+			prev.Plan, prev.Options = latest.Plan, latest.Options
+			if prev.Version == "" {
+				prev.Version = latest.Version
+			}
+		}
+		return &prev
+	}
+	if latest == nil {
+		return nil
+	}
+	if latest.Type != a.Type {
+		v.warnf(p+".type", "keep the type, or accept that the addon starts empty",
+			"addon %s changes its type from %s to %s: its data is deleted", name, latest.Type, a.Type)
+		return nil
+	}
+	return latest
+}
+
+// volume is the data of addon name's volume, outside ModeSpec.
+func (v *validator) volume(name string) (AddonData, bool) {
+	if v.mode == ModeSpec {
+		return AddonData{}, false
+	}
+	data, ok := v.vc.Volume(name)
+	if !ok || data.Type == "" {
+		return AddonData{}, false
+	}
+	return data, true
 }
 
 func (v *validator) typesRemedy() string {

@@ -38,6 +38,9 @@ type validateCtx struct {
 	sandboxes map[string]spec.SandboxInfo
 	secrets   map[string]spec.SecretInfo
 	images    map[string]imageAnswer
+	// volumes are what the environment's addon volumes that are not being
+	// deleted hold, by addon name.
+	volumes   map[string]spec.AddonData
 	blueprint func(typ string) (addons.Blueprint, bool)
 }
 
@@ -56,6 +59,11 @@ func (v *validateCtx) Sandbox(id string) (spec.SandboxInfo, bool) {
 func (v *validateCtx) Secret(name string) (spec.SecretInfo, bool) {
 	sec, ok := v.secrets[name]
 	return sec, ok
+}
+
+func (v *validateCtx) Volume(addon string) (spec.AddonData, bool) {
+	d, ok := v.volumes[addon]
+	return d, ok
 }
 
 func (v *validateCtx) Blueprint(typ string) (spec.Blueprint, bool) {
@@ -141,12 +149,12 @@ func (s *Service) resolveImages(ctx context.Context, images []string) map[string
 // of its normalisation: the tenant's sandboxes its attached services run
 // in (with the ports other environments' attached services use there),
 // the environment's secrets (secrets, when not nil, stands in for them:
-// a clone's), the addon types and the images. env is nil for a spec
-// without an environment.
+// a clone's), what its addon volumes hold, the addon types and the
+// images. env is nil for a spec without an environment.
 func (s *Service) loadContext(ctx context.Context, tenant string, env *store.Environment, sp spec.Spec, mode spec.Mode,
 	secrets map[string]spec.SecretInfo) (*validateCtx, spec.Pins, error) {
 	vc := &validateCtx{mode: mode, sandboxes: map[string]spec.SandboxInfo{}, secrets: secrets,
-		blueprint: s.d.Blueprint}
+		volumes: map[string]spec.AddonData{}, blueprint: s.d.Blueprint}
 	pins := spec.Pins{Images: map[string]string{}, Secrets: map[string]int{}, Plans: map[string]string{}}
 
 	vc.images = s.resolveImages(ctx, imagesOf(sp))
@@ -206,6 +214,19 @@ func (s *Service) loadContext(ctx context.Context, tenant string, env *store.Env
 					info.AttachedPorts = append(info.AttachedPorts, spec.AttachedPort{Env: o.EnvName, Service: name, Port: p.Port})
 				}
 				vc.sandboxes[sb] = info
+			}
+		}
+	}
+
+	if env != nil && len(sp.Addons) > 0 {
+		vols, err := s.st.ListEnvVolumes(ctx, env.ID)
+		if err != nil {
+			return nil, pins, fmt.Errorf("volumes: %w", err)
+		}
+		for _, vol := range vols {
+			name, ok := strings.CutPrefix(vol.Object, spec.KindAddon+"/")
+			if ok && !vol.Deleting && vol.AddonType != "" {
+				vc.volumes[name] = spec.AddonData{Type: vol.AddonType, Version: vol.DataVersion}
 			}
 		}
 	}
@@ -272,7 +293,7 @@ func (s *Service) plan(ctx context.Context, tenant string, env store.Environment
 		p.base = *base
 	}
 	if env.Release > 0 {
-		cur, err := s.releaseSpec(ctx, env.ID, env.Release)
+		cur, err := s.releaseSpec(ctx, env, env.Release)
 		if err != nil {
 			return planned{}, err
 		}
@@ -294,7 +315,7 @@ func (s *Service) plan(ctx context.Context, tenant string, env store.Environment
 	if p.base != p.current {
 		baseSpec = nil
 		if p.base > 0 {
-			if baseSpec, err = s.releaseSpec(ctx, env.ID, p.base); err != nil {
+			if baseSpec, err = s.releaseSpec(ctx, env, p.base); err != nil {
 				return planned{}, err
 			}
 		}
@@ -321,7 +342,7 @@ type applyArgs struct {
 
 // errReplan is an apply whose plan is stale: the environment got a new
 // release between the plan and the transaction, which the request's base
-// already names.
+// already names, or a secret version the plan pins was deleted.
 var errReplan = errors.New("the current release changed since the plan")
 
 // apply plans raw (ModeApply: an image that cannot be resolved is an
@@ -360,6 +381,9 @@ func (s *Service) applyOnce(ctx context.Context, tenant, ref string, a applyArgs
 	if err != nil {
 		return ApplyAnswer{}, fmt.Errorf("the normalised spec: %w", err)
 	}
+	if s.afterPlan != nil {
+		s.afterPlan()
+	}
 	var ans ApplyAnswer
 	err = s.st.InTx(ctx, func(tx *store.Store) error {
 		if err := lockTenant(ctx, tx, tenant); err != nil {
@@ -380,6 +404,11 @@ func (s *Service) applyOnce(ctx context.Context, tenant, ref string, a applyArgs
 				return errReplan
 			}
 			return &BaseMismatchError{Base: a.base, Current: e.Release}
+		}
+		// The plan read the secrets before the lock: a DeleteSecret, which
+		// takes the same lock, may have deleted a version it pins since.
+		if err := checkPins(ctx, tx, e.ID, p.norm.Secrets); err != nil {
+			return err
 		}
 		if e.Release > 0 && spec.EqualNormalised(p.norm, *p.currentSpec) {
 			cur, err := tx.GetRelease(ctx, e.ID, e.Release)
@@ -430,6 +459,25 @@ func (s *Service) applyOnce(ctx context.Context, tenant, ref string, a applyArgs
 		return ApplyAnswer{}, err
 	}
 	return ans, nil
+}
+
+// checkPins answers errReplan when a secret version a normalised spec
+// pins is no longer there or deleted: inside the apply's transaction,
+// after the environment's lock.
+func checkPins(ctx context.Context, tx *store.Store, envID uuid.UUID, pins map[string]spec.SecretRef) error {
+	if len(pins) == 0 {
+		return nil
+	}
+	versions, err := tx.TenantSecretVersions(ctx, envID)
+	if err != nil {
+		return fmt.Errorf("secrets: %w", err)
+	}
+	for name, ref := range pins {
+		if !slices.Contains(versions[name].Versions, ref.Version) {
+			return errReplan
+		}
+	}
+	return nil
 }
 
 // checkReleaseMeta refuses an author, a message or annotations that a

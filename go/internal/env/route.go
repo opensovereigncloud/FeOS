@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/url"
@@ -26,6 +27,7 @@ import (
 const (
 	textRouteToken = "route token required"
 	textDotDot     = "the path has a .. segment"
+	textDot        = "the path has a . segment"
 	textNoDoor     = "not available on this instance"
 )
 
@@ -62,24 +64,58 @@ func routePath(r *http.Request) (path, raw string, err error) {
 	return path, raw, err
 }
 
-// hasDotDot reports a ".." segment in a path, its escaped form, or
-// either unescaped once more.
-func hasDotDot(path, raw string) bool {
-	for _, p := range []string{path, raw} {
-		for range 2 {
-			for seg := range strings.SplitSeq(p, "/") {
-				if seg == ".." {
-					return true
-				}
+// dotSegment is ".." or "." when a segment of a path's escaped form is
+// that, as it is or decoded once or twice, else "". Each decode is
+// lenient, as an upstream that decodes again may be: a valid %XX becomes
+// its byte and any other "%" stays, so a "%" that the first decode made
+// ("/q/100%25") is a character, not a reason to refuse, and still hides
+// no "%2e%2e" beside it.
+func dotSegment(raw string) string {
+	p := raw
+	for i := range 3 {
+		for seg := range strings.SplitSeq(p, "/") {
+			if seg == "." || seg == ".." {
+				return seg
 			}
-			dec, err := url.PathUnescape(p)
-			if err != nil {
-				return true
-			}
-			p = dec
+		}
+		if i < 2 {
+			p = lenientUnescape(p)
 		}
 	}
-	return false
+	return ""
+}
+
+// lenientUnescape decodes each valid %XX of s and leaves any other "%"
+// as it is.
+func lenientUnescape(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c >= 'a':
+		return c - 'a' + 10
+	case c >= 'A':
+		return c - 'A' + 10
+	}
+	return c - '0'
 }
 
 // matchRoute returns the route whose path is the longest segment-aware
@@ -143,9 +179,13 @@ func rawOf(path, raw string) string {
 // none is), and the request forwarded through the port door to a ready
 // instance of the route's service, round-robin, or, when none is ready,
 // to a paused or hibernated one (the forward wakes it: scale from zero);
-// none at all is 503 with Retry-After 5. An attached service's requests
-// go to its sandbox. The path is stripped of the route's path when the
-// route says so; the query is kept. Its answers are plain text.
+// none at all is 503 with Retry-After 5. The port is the one the chosen
+// instance's own release gives the route's port name (the matched
+// release's when that release has none). An attached service's requests
+// go to its sandbox, only while that is the environment owner's and the
+// incarnation its process was started in (else 503). The path is
+// stripped of the route's path when the route says so; the query is
+// kept. Its answers are plain text.
 func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tok := bearer(r)
@@ -187,8 +227,12 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the path is not escaped correctly", http.StatusBadRequest)
 		return
 	}
-	if hasDotDot(path, raw) {
+	switch dotSegment(raw) {
+	case "..":
 		http.Error(w, textDotDot, http.StatusBadRequest)
+		return
+	case ".":
+		http.Error(w, textDot, http.StatusBadRequest)
 		return
 	}
 	number := e.Realised
@@ -197,7 +241,7 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	var sp *spec.Spec
 	if number > 0 {
-		if sp, err = s.releaseSpec(ctx, e.ID, number); err != nil {
+		if sp, err = s.releaseSpec(ctx, e, number); err != nil {
 			s.routeFailed(w, r, err)
 			return
 		}
@@ -213,11 +257,7 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	svc := sp.Services[route.Service]
-	port, ok := spec.PortNumber(svc.Ports, route.Port)
-	if !ok {
-		http.Error(w, "route "+route.Path+" names no port of "+route.Service, http.StatusBadGateway)
-		return
-	}
+	port, portOK := spec.PortNumber(svc.Ports, route.Port)
 	upPath, upRaw := path, rawOf(path, raw)
 	if route.Strip {
 		if upPath, upRaw, err = stripSegments(raw, n); err != nil {
@@ -230,51 +270,110 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if svc.Runtime == spec.RuntimeAttached {
-		id, ok := parseUUID(svc.Sandbox)
-		if !ok {
-			http.Error(w, "service "+route.Service+" names no sandbox", http.StatusBadGateway)
+		if !portOK {
+			http.Error(w, "route "+route.Path+" names no port of "+route.Service, http.StatusBadGateway)
+			return
+		}
+		id, refusal, err := s.attachedSandbox(ctx, e, route.Service)
+		if err != nil {
+			s.routeFailed(w, r, err)
+			return
+		}
+		if refusal != "" {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, refusal, http.StatusServiceUnavailable)
 			return
 		}
 		s.d.Ports.ForwardTo(w, r, id, port, upPath, upRaw)
 		return
 	}
-	id, err := s.pickInstance(ctx, e.ID, route.Service)
+	inst, err := s.pickInstance(ctx, e.ID, route.Service)
 	if err != nil {
 		s.routeFailed(w, r, err)
 		return
 	}
-	if id == uuid.Nil {
+	if inst.id == uuid.Nil {
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, "no ready instance of "+route.Service, http.StatusServiceUnavailable)
 		return
 	}
-	s.d.Ports.ForwardTo(w, r, id, port, upPath, upRaw)
+	// The instance listens on the port of its own release, which a
+	// rolling release may have changed.
+	if inst.release != number && inst.release > 0 {
+		own, err := s.releaseSpec(ctx, e, inst.release)
+		if err != nil && !isNotFound(err) {
+			s.routeFailed(w, r, err)
+			return
+		}
+		if own != nil {
+			if p, ok := spec.PortNumber(own.Services[route.Service].Ports, route.Port); ok {
+				port, portOK = p, true
+			}
+		}
+	}
+	if !portOK {
+		http.Error(w, "route "+route.Path+" names no port of "+route.Service, http.StatusBadGateway)
+		return
+	}
+	s.d.Ports.ForwardTo(w, r, inst.id, port, upPath, upRaw)
+}
+
+// attachedSandbox is the sandbox an attached service's requests go to:
+// the one its controller row names, while that sandbox exists, is the
+// environment owner's, is no instance row and is the incarnation the
+// process was started in (when it was). Otherwise refusal says why not:
+// a sandbox ID is free again once its sandbox is deleted, and another
+// tenant may take it, which the spec validated at apply never sees.
+func (s *Service) attachedSandbox(ctx context.Context, e store.Environment, service string) (uuid.UUID, string, error) {
+	a, err := s.st.GetAttached(ctx, e.ID, service)
+	if errors.Is(err, store.ErrNoRow) {
+		return uuid.Nil, "no ready instance of " + service, nil
+	}
+	if err != nil {
+		return uuid.Nil, "", fmt.Errorf("attached service %s: %w", service, err)
+	}
+	sb, err := s.st.GetSandbox(ctx, a.SandboxID)
+	if err != nil && !errors.Is(err, model.ErrNotFound) {
+		return uuid.Nil, "", fmt.Errorf("sandbox %s: %w", a.SandboxID, err)
+	}
+	if err != nil || sb.Owner != e.Owner || sb.IsInstance() ||
+		(a.SandboxIncarnation != uuid.Nil && a.SandboxIncarnation != sb.Incarnation) {
+		return uuid.Nil, fmt.Sprintf("sandbox %s of service %s is gone or not this tenant's", a.SandboxID, service), nil
+	}
+	return sb.ID, "", nil
+}
+
+// picked is the instance a request goes to: its sandbox and its release.
+type picked struct {
+	id      uuid.UUID
+	release int
 }
 
 // pickInstance chooses the instance of an image service a request goes
 // to: a ready one whose sandbox runs, round-robin; else a paused or
-// hibernated one, which the forward wakes; uuid.Nil when there is none.
-func (s *Service) pickInstance(ctx context.Context, envID uuid.UUID, service string) (uuid.UUID, error) {
+// hibernated one, which the forward wakes; a zero id when there is none.
+func (s *Service) pickInstance(ctx context.Context, envID uuid.UUID, service string) (picked, error) {
 	rows, err := s.st.ListEnvInstanceRows(ctx, envID)
 	if err != nil {
-		return uuid.Nil, err
+		return picked{}, err
 	}
-	var ready, asleep []uuid.UUID
+	var ready, asleep []picked
 	for _, row := range rows {
 		i, sb := row.Instance, row.Sandbox
 		if i.Kind != spec.KindService || i.Object != service || i.Phase == model.PhaseRetiring {
 			continue
 		}
+		p := picked{id: sb.ID, release: i.Release}
 		switch {
 		case i.Phase == model.PhaseReady && sb.ClientState == model.StateRunning && sb.Op == "":
-			ready = append(ready, sb.ID)
+			ready = append(ready, p)
 		case i.Phase == model.PhaseReady && sb.ClientState == model.StateRunning:
 			// Busy with an op (a pause on its way): only when nothing
 			// else answers.
-			asleep = append(asleep, sb.ID)
+			asleep = append(asleep, p)
 		case sb.ClientState == model.StatePaused || sb.ClientState == model.StateHibernated ||
 			sb.ClientState == model.StatePausing || sb.ClientState == model.StateHibernating:
-			asleep = append(asleep, sb.ID)
+			asleep = append(asleep, p)
 		}
 	}
 	if len(ready) > 0 {
@@ -283,7 +382,7 @@ func (s *Service) pickInstance(ctx context.Context, envID uuid.UUID, service str
 	if len(asleep) > 0 {
 		return asleep[0], nil
 	}
-	return uuid.Nil, nil
+	return picked{}, nil
 }
 
 // routeFailed answers a route door request that failed inside ferund.

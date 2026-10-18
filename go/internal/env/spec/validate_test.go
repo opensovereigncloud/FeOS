@@ -6,6 +6,7 @@ package spec
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -60,6 +61,8 @@ type fakeVC struct {
 	// badImages fail to resolve with their error text.
 	badImages map[string]string
 	types     bool
+	// volumes are the environment's volumes by addon name.
+	volumes map[string]AddonData
 }
 
 func (f fakeVC) Mode() Mode { return f.mode }
@@ -70,6 +73,10 @@ func (f fakeVC) Sandbox(id string) (SandboxInfo, bool) {
 func (f fakeVC) Secret(name string) (SecretInfo, bool) {
 	s, ok := f.secrets[name]
 	return s, ok
+}
+func (f fakeVC) Volume(addon string) (AddonData, bool) {
+	d, ok := f.volumes[addon]
+	return d, ok
 }
 func (f fakeVC) Blueprint(typ string) (Blueprint, bool) {
 	switch typ {
@@ -493,5 +500,75 @@ func TestValidateContextDependent(t *testing.T) {
 	})
 	if len(fs) != 1 || fs[0].Remedy != "use one of: nats, postgres" {
 		t.Fatalf("%s", dump(fs))
+	}
+}
+
+// An addon is validated against the data its environment's volume holds
+// when it has one (the controller keeps a volume by the addon's name, and
+// mounts it whatever the latest release says), else against the latest
+// release's addon.
+func TestValidateAgainstVolume(t *testing.T) {
+	prev := mustParse(t, expensa)
+	pg16 := Addon{Type: "postgres", Version: "16"}
+	pg17 := Addon{Type: "postgres", Version: "17"}
+	withDB := func(a Addon) func(s *Spec) {
+		return func(s *Spec) {
+			s.Services["approval-service"] = Service{Image: "ghcr.io/acme/approval:1.2", Ports: []Port{{Name: "http", Port: 8080}}}
+			s.Addons["db"] = a
+		}
+	}
+	for _, c := range []struct {
+		name   string
+		latest *Addon
+		volume *AddonData
+		next   Addon
+		mode   Mode
+		want   []expect
+	}{
+		// The latest release removed db, but the controller has not yet
+		// deleted its volume: re-added, the volume's data decides.
+		{name: "removed then re-added", volume: &AddonData{Type: "postgres", Version: "16"}, next: pg17,
+			want: []expect{e("addons.db.version", "a major version change")}},
+		{name: "re-added as it was", volume: &AddonData{Type: "postgres", Version: "16"}, next: pg16},
+		// postgres to nats and back before the controller acted: the
+		// volume still holds postgres 16's data, nothing is deleted.
+		{name: "type round trip", latest: &Addon{Type: "nats", Version: "2"}, volume: &AddonData{Type: "postgres", Version: "16"},
+			next: pg16},
+		{name: "type round trip, other version", latest: &Addon{Type: "nats", Version: "2"},
+			volume: &AddonData{Type: "postgres", Version: "16"}, next: pg17,
+			want: []expect{e("addons.db.version", "a major version change")}},
+		// The volume holds another type's data: it is deleted, whatever the
+		// latest release says, and its version is no constraint.
+		{name: "volume of another type", latest: &pg17, volume: &AddonData{Type: "nats", Version: "2"}, next: pg16,
+			want: []expect{w("addons.db.type", "holds nats data, not postgres: its data is deleted")}},
+		// The version that ran ready on the volume decides, not the latest
+		// release's (a failed upgrade never wrote the data).
+		{name: "upgrade that never ran", latest: &Addon{Type: "postgres", Version: "17"},
+			volume: &AddonData{Type: "postgres", Version: "16"}, next: pg16},
+		// No version recorded yet: the latest release's.
+		{name: "no data version", latest: &pg17, volume: &AddonData{Type: "postgres"}, next: pg16,
+			want: []expect{e("addons.db.version", "a major version change")}},
+		// No volume: the latest release's addon, as before.
+		{name: "no volume", latest: &pg17, next: pg16, want: []expect{e("addons.db.version", "a major version change")}},
+		{name: "no volume, type change", latest: &Addon{Type: "nats", Version: "2"}, next: pg16,
+			want: []expect{w("addons.db.type", "changes its type from nats to postgres: its data is deleted")}},
+		// Without an environment there is no volume.
+		{name: "env-less", volume: &AddonData{Type: "postgres", Version: "16"}, next: pg17, mode: ModeSpec},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			vc := defaultVC(ModePlan)
+			if c.mode != "" {
+				vc.mode = c.mode
+			}
+			p := prev
+			p.Addons = maps.Clone(prev.Addons)
+			if c.latest != nil {
+				p.Addons["db"] = *c.latest
+			}
+			if c.volume != nil {
+				vc.volumes = map[string]AddonData{"db": *c.volume}
+			}
+			checkFindings(t, validateMutated(t, vc, &p, withDB(c.next)), c.want)
+		})
 	}
 }

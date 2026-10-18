@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/env/ctl"
@@ -195,13 +196,13 @@ func (s *Service) Release(ctx context.Context, tenant, env string, number int) (
 	if err != nil {
 		return ReleaseDetail{}, fmt.Errorf("release %d: %w", number, err)
 	}
-	sp, err := s.releaseSpec(ctx, e.ID, number)
+	sp, err := s.releaseSpec(ctx, e, number)
 	if err != nil {
 		return ReleaseDetail{}, err
 	}
 	var prev *spec.Spec
 	if number > 1 {
-		if prev, err = s.releaseSpec(ctx, e.ID, number-1); err != nil && !isNotFound(err) {
+		if prev, err = s.releaseSpec(ctx, e, number-1); err != nil && !isNotFound(err) {
 			return ReleaseDetail{}, err
 		}
 	}
@@ -559,9 +560,31 @@ func (s *Service) Incident(ctx context.Context, tenant, env string, id int64) (I
 	return incidentOf(r), nil
 }
 
+// The codes of the controller's refusals of expected states (409).
+const (
+	// CodeBusy: the object has an operation in flight (a restart while
+	// an Ensure, a pause or the probe's own restart runs); Retry-After.
+	CodeBusy = "busy"
+	// CodeNotRunning: the instance does not run (pending, stopped,
+	// failed, its sandbox gone), so it has no log to read. A paused one
+	// answers "paused" without a code.
+	CodeNotRunning = "not_running"
+	// CodeNotReady: a job cannot run yet (its template does not render:
+	// an addon without an address).
+	CodeNotReady = "not_ready"
+)
+
 // ctlError maps the controller's answers: ErrNoObject 404, ErrPaused
-// 409 "paused", ErrNoContainerLogs 501.
+// 409 "paused", ErrNoContainerLogs 501, and its refusals of expected
+// states 409 with a code (CodeBusy with Retry-After, CodeNotRunning,
+// CodeNotReady) or plain (an environment or tenant being deleted), never
+// 500. Some of those refusals carry no sentinel of the controller's, and
+// are known by their texts.
 func ctlError(err error, kind, name string) error {
+	msg := ""
+	if err != nil {
+		msg = err.Error()
+	}
 	switch {
 	case err == nil:
 		return nil
@@ -571,6 +594,24 @@ func ctlError(err error, kind, name string) error {
 		return apierr.New(http.StatusConflict, "paused")
 	case errors.Is(err, ctl.ErrNoContainerLogs):
 		return apierr.New(http.StatusNotImplemented, "%s", ctl.ErrNoContainerLogs.Error())
+	case errors.Is(err, model.ErrBusy):
+		return apierr.WithCode(http.StatusConflict, CodeBusy, "%s %s is busy with another operation; try again shortly",
+			kind, name).RetryAfter(apierr.RetryAfterOf(err, 5))
+	case errors.Is(err, model.ErrNotFound):
+		return apierr.WithCode(http.StatusConflict, CodeNotRunning, "%s %s is not running: its sandbox is gone", kind, name)
+	case errors.Is(err, store.ErrNoRow):
+		// An instance or process row the controller read went before it
+		// locked it (retired, replaced).
+		return apierr.WithCode(http.StatusConflict, CodeBusy, "%s %s changed meanwhile; try again", kind, name).
+			RetryAfter(5)
+	case strings.HasSuffix(msg, ": no log to read"):
+		return apierr.WithCode(http.StatusConflict, CodeNotRunning, "%s", msg)
+	case strings.HasPrefix(msg, "job "+name+" cannot run yet: "):
+		return apierr.WithCode(http.StatusConflict, CodeNotReady, "%s", msg)
+	case msg == "the environment is being deleted" || msg == "the tenant is being deleted":
+		return apierr.New(http.StatusConflict, "%s", msg)
+	case strings.HasPrefix(msg, "process logs need the tools' runner"):
+		return apierr.New(http.StatusServiceUnavailable, "%s", msg)
 	}
 	return err
 }
@@ -578,7 +619,8 @@ func ctlError(err error, kind, name string) error {
 // Logs is GET /api/v1/environments/{env}/objects/{kind}/{name}/logs: the
 // last lines lines (default 200, at most 10000) of replica replica's log
 // (ctl.Controller.LogTail); 501 when the node serves no container logs,
-// 409 "paused" for a paused instance (never woken).
+// 409 "paused" for a paused instance (never woken), 409 CodeNotRunning
+// for one that does not run.
 func (s *Service) Logs(ctx context.Context, tenant, env, kind, name string, lines, replica int) (LogsAnswer, error) {
 	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
 	if err != nil {
@@ -608,7 +650,8 @@ func (s *Service) Logs(ctx context.Context, tenant, env, kind, name string, line
 
 // RestartService is POST /api/v1/environments/{env}/services/{name}/restart
 // (202): an attached service's process, an image service's replicas one
-// at a time.
+// at a time; 409 CodeBusy (Retry-After) while the first has an op in
+// flight.
 func (s *Service) RestartService(ctx context.Context, tenant, env, name string) error {
 	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
 	if err != nil {
@@ -621,7 +664,7 @@ func (s *Service) RestartService(ctx context.Context, tenant, env, name string) 
 }
 
 // RunJob is POST /api/v1/environments/{env}/jobs/{name}/run (202): a new
-// run, attempt 1.
+// run, attempt 1; 409 CodeNotReady while its template cannot render.
 func (s *Service) RunJob(ctx context.Context, tenant, env, name string) error {
 	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
 	if err != nil {

@@ -6,6 +6,7 @@ package env
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -105,7 +106,7 @@ func TestClone(t *testing.T) {
 	if v, err := h.sealer.Open(sec.Sealed, envdeps.SecretAAD(e2.ID, "token", 1)); err != nil || string(v) != "fresh" {
 		t.Fatalf("set secret %q %v", v, err)
 	}
-	sp2, _ := h.svc.releaseSpec(ctx, e2.ID, 1)
+	sp2, _ := h.svc.releaseSpec(ctx, e2, 1)
 	if *sp2.Services["api"].Replicas != 1 {
 		t.Fatalf("given spec %+v", sp2.Services["api"])
 	}
@@ -383,9 +384,15 @@ func TestRouteDoor(t *testing.T) {
 	if f := h.ports.last(t); f.path != "/a/b/c d" || f.rawPath != "/a%2Fb/c%20d" {
 		t.Fatalf("escaped %+v", f)
 	}
-	// A route to an attached service goes to its sandbox.
+	// A route to an attached service goes to its sandbox, once the
+	// controller has its row.
 	h.apply("stage", strings.Replace(previewSpec(sb), `"root": {"path": "/", "service": "web", "port": "http"}`,
 		`"root": {"path": "/", "service": "web", "port": "http"}, "dev": {"path": "/dev", "service": "dev", "port": "http"}`, 1), 1)
+	w = routeRequest(mux, "POST", "/api/v1/environments/stage/http/dev/src/main.ts", tok.Token)
+	wantPlain(t, w, 503, "no ready instance of dev\n")
+	if _, err := h.st.InsertAttached(ctx, store.EnvAttached{EnvID: e.ID, Service: "dev", SandboxID: sb}); err != nil {
+		t.Fatal(err)
+	}
 	routeRequest(mux, "POST", "/api/v1/environments/stage/http/dev/src/main.ts", tok.Token)
 	if f := h.ports.last(t); f.sandbox != sb || f.port != 5173 || f.path != "/dev/src/main.ts" {
 		t.Fatalf("attached %+v", f)
@@ -406,6 +413,17 @@ func TestRouteDoor(t *testing.T) {
 	w = httptest.NewRecorder()
 	h.svc.ServeRoute(w, r)
 	wantPlain(t, w, 400, "the path has a .. segment\n")
+	r = httptest.NewRequest("GET", "/api/v1/environments/stage/http/api/%2e/admin", nil)
+	r.Header.Set("Authorization", "Bearer "+tok.Token)
+	r.SetPathValue("env", "stage")
+	w = httptest.NewRecorder()
+	h.svc.ServeRoute(w, r)
+	wantPlain(t, w, 400, "the path has a . segment\n")
+	// A percent sign is a character like any other.
+	routeRequest(mux, "GET", "/api/v1/environments/stage/http/api/q/100%25", tok.Token)
+	if f := h.ports.last(t); f.path != "/q/100%" || f.rawPath != "" {
+		t.Fatalf("percent %+v", f)
+	}
 
 	// The token was used; revoked, it opens nothing.
 	rt, _ := h.st.ResolveRouteToken(ctx, store.HashToken(tok.Token))
@@ -463,15 +481,152 @@ func TestRoutePaths(t *testing.T) {
 			t.Errorf("strip %s %d: %q %q %v", c.raw, c.n, p, rp, err)
 		}
 	}
-	for _, c := range []struct {
-		path, raw string
-		bad       bool
-	}{
-		{"/a/../b", "/a/../b", true}, {"/a/../b", "/a/%2e%2e/b", true}, {"/a/%2e%2e/b", "/a/%252e%252e/b", true},
-		{"/a/..b/c", "/a/..b/c", false}, {"/a/b", "/a/b", false},
+	// Only a segment that is, or decodes once or twice to, . or .. is
+	// refused; a % that starts no escape after a decode is a character.
+	for _, c := range []struct{ raw, want string }{
+		{"/a/../b", ".."}, {"/a/%2e%2e/b", ".."}, {"/a/%252e%252e/b", ".."}, {"/a%2F..%2Fb", ".."},
+		{"/%252e%252e/x%25", ".."}, {"/%252e%2e/x", ".."}, {"/a/%2e/b", "."}, {"/a/%252E", "."},
+		{"/a/..b/c", ""}, {"/a/b", ""}, {"/q/100%25", ""}, {"/search/50%25off", ""}, {"/a%2541", ""},
+		{"/a/%25252e%25252e/b", ""}, {"/%2e%2e%zz", ""}, {"/files/a%25zz/..x", ""},
 	} {
-		if got := hasDotDot(c.path, c.raw); got != c.bad {
-			t.Errorf("dotdot %s %s: %v", c.path, c.raw, got)
+		if got := dotSegment(c.raw); got != c.want {
+			t.Errorf("dot segment of %s: %q, want %q", c.raw, got, c.want)
 		}
+	}
+}
+
+// The route door forwards to an attached service's sandbox only while it
+// is the environment owner's, not an instance row, and the incarnation
+// the process was started in: a sandbox ID is free again once deleted,
+// and another tenant may take it.
+func TestRouteDoorAttachedOwner(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	mux := doorMux(h.svc)
+	sb := h.sandbox(tenantA, true)
+	h.create("preview", nil)
+	e := h.env("preview")
+	tok, err := h.svc.CreateRouteToken(ctx, tenantA, "preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.putSecret("preview", "token", "x")
+	h.apply("preview", strings.Replace(previewSpec(sb), `"root": {"path": "/", "service": "web", "port": "http"}`,
+		`"root": {"path": "/", "service": "web", "port": "http"}, "dev": {"path": "/dev", "service": "dev", "port": "http"}`, 1), 0)
+	first, err := h.st.GetSandbox(ctx, sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.st.InsertAttached(ctx, store.EnvAttached{EnvID: e.ID, Service: "dev", SandboxID: sb,
+		SandboxIncarnation: first.Incarnation, ProcessID: "p1", Phase: model.PhaseReady}); err != nil {
+		t.Fatal(err)
+	}
+	const path = "/api/v1/environments/preview/http/dev/"
+	if w := routeRequest(mux, "GET", path, tok.Token); w.Code != 200 || h.ports.last(t).sandbox != sb {
+		t.Fatalf("own sandbox: %d %s", w.Code, w.Body)
+	}
+	calls := func() int {
+		h.ports.mu.Lock()
+		defer h.ports.mu.Unlock()
+		return len(h.ports.calls)
+	}
+	refused := func(why string) {
+		t.Helper()
+		before := calls()
+		w := routeRequest(mux, "GET", path, tok.Token)
+		wantPlain(t, w, 503, "sandbox "+sb.String()+" of service dev is gone or not this tenant's\n")
+		if calls() != before {
+			t.Fatalf("%s: forwarded %+v", why, h.ports.last(t))
+		}
+	}
+	recreate := func(n store.NewSandbox) {
+		t.Helper()
+		h.exec("DELETE FROM sandboxes WHERE id = $1", sb)
+		if n.Owner != "" {
+			n.ID, n.Image, n.VCPUs, n.MemoryMiB = sb, "img", 1, 512
+			if _, _, err := h.st.CreateSandbox(ctx, n); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Gone.
+	recreate(store.NewSandbox{})
+	refused("gone")
+	// Another tenant's sandbox of the same ID, attachable.
+	recreate(store.NewSandbox{Owner: tenantB, PodTemplate: &model.PodTemplate{Command: []string{"sleep", "infinity"},
+		SecurityGroups: []string{model.SandboxGroupID(sb)}}})
+	refused("another tenant's")
+	// An instance row of the same ID.
+	zero := 0
+	recreate(store.NewSandbox{Owner: tenantA, EnvironmentID: e.ID, IdleAfterS: &zero,
+		PodTemplate: &model.PodTemplate{SecurityGroups: []string{model.EnvGroupID(e.ID)}}})
+	refused("an instance row")
+	// The owner's own sandbox again, but a new incarnation: not the one
+	// the process was started in.
+	recreate(store.NewSandbox{Owner: tenantA, PodTemplate: &model.PodTemplate{Command: []string{"sleep", "infinity"},
+		SecurityGroups: []string{model.SandboxGroupID(sb)}}})
+	refused("another incarnation")
+	// Once the supervisor starts it there (or before it records one), it
+	// is routed to.
+	a, err := h.st.GetAttached(ctx, e.ID, "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := a
+	after.SandboxIncarnation, after.ProcessID = uuid.Nil, ""
+	if _, err := h.st.UpdateAttached(ctx, a, after); err != nil {
+		t.Fatal(err)
+	}
+	if w := routeRequest(mux, "GET", path, tok.Token); w.Code != 200 || h.ports.last(t).sandbox != sb {
+		t.Fatalf("recreated own sandbox: %d %s", w.Code, w.Body)
+	}
+}
+
+// The port of a request comes from the release of the instance it goes
+// to: while a release that changes the port rolls, its ready instances
+// get the new one, the old release's the old one.
+func TestRouteDoorRollingPort(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	mux := doorMux(h.svc)
+	h.create("stage", nil)
+	e := h.env("stage")
+	tok, err := h.svc.CreateRouteToken(ctx, tenantA, "stage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	specOf := func(name string, port int) string {
+		return fmt.Sprintf(`{"services": {"api": {"image": "ghcr.io/acme/api:1", "env": {"PORT": "%d"},
+		  "ports": [{"name": "%s", "port": %d}]}}, "routes": {"api": {"path": "/", "service": "api", "port": "%s"}}}`,
+			port, name, port, name)
+	}
+	h.apply("stage", specOf("http", 8080), 0)
+	h.exec("UPDATE environments SET realised = 1 WHERE id = $1", e.ID)
+	h.apply("stage", specOf("http", 9090), 1)
+	port := func() int {
+		t.Helper()
+		if w := routeRequest(mux, "GET", "/api/v1/environments/stage/http/x", tok.Token); w.Code != 200 {
+			t.Fatalf("%d %s", w.Code, w.Body)
+		}
+		return h.ports.last(t).port
+	}
+	old := h.instance(e.ID, spec.KindService, "api", 0, 1, model.PhaseReady, model.StateRunning, "n1", "fd6b::11")
+	if p := port(); p != 8080 {
+		t.Fatalf("release 1's instance on %d", p)
+	}
+	h.exec("UPDATE env_instances SET phase = 'retiring' WHERE sandbox_id = $1", old)
+	h.instance(e.ID, spec.KindService, "api", 0, 2, model.PhaseReady, model.StateRunning, "n1", "fd6b::12")
+	if p := port(); p != 9090 {
+		t.Fatalf("release 2's instance on %d", p)
+	}
+	// A release that has no such port falls back to the matched one's.
+	h.apply("stage", specOf("web", 7070), 2)
+	h.exec("UPDATE env_instances SET phase = 'retiring' WHERE env_id = $1", e.ID)
+	h.instance(e.ID, spec.KindService, "api", 0, 3, model.PhaseReady, model.StateRunning, "n1", "fd6b::13")
+	if p := port(); p != 8080 {
+		t.Fatalf("release 3's instance on %d", p)
 	}
 }
