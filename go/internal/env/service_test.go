@@ -627,8 +627,10 @@ func TestLogsRestartRunJob(t *testing.T) {
 			"service x is busy with another operation; try again shortly"},
 		{fmt.Errorf("sandbox s: %w", model.ErrNotFound), http.StatusConflict, "service x is not running: its sandbox is gone"},
 		{fmt.Errorf("lock: %w", store.ErrNoRow), http.StatusConflict, "service x changed meanwhile; try again"},
-		{errors.New("the instance is pending: no log to read"), http.StatusConflict, "the instance is pending: no log to read"},
-		{errors.New("job x cannot run yet: addon pg has no address yet"), http.StatusConflict, "job x cannot run yet"},
+		{fmt.Errorf("the instance is pending: no log to read (%w)", ctl.ErrNotRunning), http.StatusConflict,
+			"the instance is pending: no log to read"},
+		{fmt.Errorf("job x cannot run yet: addon pg has no address yet (%w)", ctl.ErrNotReady), http.StatusConflict,
+			"job x cannot run yet"},
 		{errors.New("the environment is being deleted"), http.StatusConflict, "the environment is being deleted"},
 		{errors.New("the tenant is being deleted"), http.StatusConflict, "the tenant is being deleted"},
 		{errors.New("process logs need the tools' runner, which this instance lacks"), http.StatusServiceUnavailable,
@@ -913,12 +915,12 @@ func TestControllerRefusals(t *testing.T) {
 	}
 	h.exec("DELETE FROM sandboxes WHERE id = $1", sb)
 	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "dev", 0, 0)
-	wantStatus(t, err, http.StatusConflict, "service dev is not running: its sandbox is gone")
+	wantStatus(t, err, http.StatusConflict, "sandbox "+sb.String()+" is gone or not this tenant's: no log to read")
 
-	// The first replica has an op in flight.
-	h.eng.mu.Lock()
-	h.eng.restartErr = fmt.Errorf("an op ensure of instance i2 is in flight: %w", model.ErrBusy)
-	h.eng.mu.Unlock()
+	// The replicas have an op in flight: the controller refuses before it
+	// touches them.
+	h.exec(`UPDATE sandboxes SET op = 'repair', op_id = gen_random_uuid(), op_owner = 'i2'
+		WHERE environment_id = $1`, e.ID)
 	err = h.svc.RestartService(ctx, tenantA, "stage", "api")
 	wantStatus(t, err, http.StatusConflict, "service api is busy with another operation; try again shortly")
 	var ae *apierr.Error

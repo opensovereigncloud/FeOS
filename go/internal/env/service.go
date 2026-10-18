@@ -604,9 +604,9 @@ func ctlError(err error, kind, name string) error {
 		// locked it (retired, replaced).
 		return apierr.WithCode(http.StatusConflict, CodeBusy, "%s %s changed meanwhile; try again", kind, name).
 			RetryAfter(5)
-	case strings.HasSuffix(msg, ": no log to read"):
+	case errors.Is(err, ctl.ErrNotRunning):
 		return apierr.WithCode(http.StatusConflict, CodeNotRunning, "%s", msg)
-	case strings.HasPrefix(msg, "job "+name+" cannot run yet: "):
+	case errors.Is(err, ctl.ErrNotReady):
 		return apierr.WithCode(http.StatusConflict, CodeNotReady, "%s", msg)
 	case msg == "the environment is being deleted" || msg == "the tenant is being deleted":
 		return apierr.New(http.StatusConflict, "%s", msg)
