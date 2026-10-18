@@ -50,7 +50,6 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
-	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -127,10 +126,6 @@ type Deps struct {
 	Runner     envdeps.Runner
 	Ports      envdeps.Ports
 	Sealer     envdeps.Sealer
-	// ResolveSecret is not used: the controller resolves secrets itself
-	// (Controller.ResolveSecret), which the environment service's resolver
-	// delegates to. It stays so that callers that set it keep compiling.
-	ResolveSecret sandbox.SecretResolver
 	// Blueprint looks up an addon type.
 	Blueprint func(typ string) (addons.Blueprint, bool)
 	Log       *slog.Logger

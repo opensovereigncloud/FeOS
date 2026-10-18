@@ -102,7 +102,7 @@ func New(deps Deps) (*Service, error) {
 	c, err := ctl.New(ctl.Deps{
 		InstanceID: deps.InstanceID, DB: deps.DB, Store: st, Elector: deps.Elector, Conns: deps.Conns,
 		Engine: deps.Engine, Runner: deps.Runner, Ports: deps.Ports, Sealer: deps.Sealer,
-		ResolveSecret: s.ResolveSecret, Blueprint: deps.Blueprint, Log: deps.Log,
+		Blueprint: deps.Blueprint, Log: deps.Log,
 	})
 	if err != nil {
 		return nil, err
@@ -142,26 +142,14 @@ func (s *Service) Controller() *ctl.Controller { return s.ctl }
 // (--secret-key-file): without, the secrets routes answer 503.
 func (s *Service) SecretsEnabled() bool { return s.d.Sealer != nil }
 
-// secretResolver is the controller's secret resolution (§13.2):
-// (*ctl.Controller).ResolveSecret.
-type secretResolver interface {
-	ResolveSecret(ctx context.Context, envID uuid.UUID, name string, version int) (string, error)
-}
-
 // ResolveSecret is the engine's secret resolver (sandbox.SecretResolver):
 // the value of version version of the secret name of environment envID, a
 // tenant's or a system secret, unsealed with its AAD (envdeps.SecretAAD).
 // A deleted version still resolves (a release pins it until a later one
 // is realised). The controller resolves it, which also generates the
-// addons' credentials; a controller that cannot is an error.
+// addons' credentials.
 func (s *Service) ResolveSecret(ctx context.Context, envID uuid.UUID, name string, version int) (string, error) {
-	if r, ok := any(s.ctl).(secretResolver); ok {
-		return r.ResolveSecret(ctx, envID, name, version)
-	}
-	if s.d.Sealer == nil {
-		return "", errors.New(textNoSecrets)
-	}
-	return "", errors.New("this ferund's environment controller does not resolve secrets")
+	return s.ctl.ResolveSecret(ctx, envID, name, version)
 }
 
 // PrepareHook is the engine's prepare hook (sandbox.PrepareHook): the

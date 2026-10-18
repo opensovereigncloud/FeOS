@@ -87,7 +87,7 @@ type Port struct {
 type Resources struct {
 	// VCPUs is 1..32; 0: 1.
 	VCPUs int `json:"vcpus,omitempty"`
-	// MemoryMib is 128..65536; 0: 512.
+	// MemoryMib is 256..65536 (a pod's floor); 0: 512.
 	MemoryMib int `json:"memoryMib,omitempty"`
 }
 
@@ -442,7 +442,7 @@ const (
 	MinVCPUs         = 1
 	MaxVCPUs         = 32
 	DefaultVCPUs     = 1
-	MinMemoryMib     = 128
+	MinMemoryMib     = 256
 	MaxMemoryMib     = 65536
 	DefaultMemoryMib = 512
 	MaxRetries       = 5

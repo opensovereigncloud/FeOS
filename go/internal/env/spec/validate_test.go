@@ -257,7 +257,7 @@ func TestValidateRules(t *testing.T) {
 			approval(s)
 			svc(s, "expense-service", func(v *Service) {
 				v.Replicas = intp(0)
-				v.Resources = &Resources{VCPUs: 32, MemoryMib: 128}
+				v.Resources = &Resources{VCPUs: 32, MemoryMib: 256}
 			})
 		}, nil},
 		{"idle", ModePlan, func(s *Spec) {
