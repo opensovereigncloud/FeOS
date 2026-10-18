@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ironcore-dev/feos/go/internal/seal"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -412,7 +413,7 @@ func TestKubeSecretsSealedAtRest(t *testing.T) {
 	}
 	_, rows := r.kubeRows()
 	for _, row := range rows {
-		if row.Sealed[0] != sealVersion || len(row.Sealed) < 1+12+16 {
+		if row.Sealed[0] != seal.Version || len(row.Sealed) < 1+12+16 {
 			t.Fatalf("blob shape: % x", row.Sealed[:4])
 		}
 	}

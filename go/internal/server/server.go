@@ -67,6 +67,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/pki"
 	"github.com/ironcore-dev/feos/go/internal/ports"
 	"github.com/ironcore-dev/feos/go/internal/sandbox"
+	"github.com/ironcore-dev/feos/go/internal/seal"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/tools"
 	"github.com/ironcore-dev/feos/go/internal/ui"
@@ -297,7 +298,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	if streams != nil {
 		i.streams = streams(i)
 	}
-	if i.Env, err = i.newEnvironments(); err != nil {
+	if i.Env, err = i.newEnvironments(key); err != nil {
 		return nil, fmt.Errorf("environments: %w", err)
 	}
 
@@ -349,17 +350,25 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 // unsealing of a pod template's secrets and the preparation of a node for
 // an instance's pod. The runner's detached calls and the door's exports
 // are taken where the instance's runner and door have them; without, the
-// service says what does not work. The secrets are sealed under
-// --secret-key-file's key (internal/seal); without it they are refused.
-func (i *Instance) newEnvironments() (*env.Service, error) {
+// service says what does not work. The secrets are sealed under key,
+// --secret-key-file's (internal/seal); without it they are refused.
+func (i *Instance) newEnvironments(key []byte) (*env.Service, error) {
 	runner, _ := any(i.Runner).(env.Runner)
 	var fwd env.Ports
 	if i.streams.Forwarder != nil {
 		fwd, _ = any(i.streams.Forwarder).(env.Ports)
 	}
+	var sealer env.Sealer
+	if key != nil {
+		sl, err := seal.New(key)
+		if err != nil {
+			return nil, fmt.Errorf("--secret-key-file: %w", err)
+		}
+		sealer = sl
+	}
 	s, err := env.New(env.Deps{
 		InstanceID: i.id, DB: i.DB, Store: i.Store, Elector: i.Elector, Conns: i.Links, Engine: i.Engine,
-		Runner: runner, Ports: fwd, Sealer: nil, Log: i.log,
+		Runner: runner, Ports: fwd, Sealer: sealer, Log: i.log,
 	})
 	if err != nil {
 		return nil, err

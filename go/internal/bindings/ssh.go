@@ -356,7 +356,7 @@ func (s *Service) sealSSH(id uuid.UUID, b sshStored) (store.SSHBinding, error) {
 	if err != nil {
 		return store.SSHBinding{}, err
 	}
-	sealed, err := sealBlob(s.aead, pt, sealAAD(tableSSH, id, b.Name, b.authType))
+	sealed, err := s.sealer.Seal(pt, sealAAD(tableSSH, id, b.Name, b.authType))
 	if err != nil {
 		return store.SSHBinding{}, fmt.Errorf("seal binding %s: %w", b.Name, err)
 	}
@@ -366,7 +366,7 @@ func (s *Service) sealSSH(id uuid.UUID, b sshStored) (store.SSHBinding, error) {
 }
 
 func (s *Service) openSSHKey(id uuid.UUID, r store.SSHBinding) (string, error) {
-	pt, err := openBlob(s.aead, r.Sealed, sealAAD(tableSSH, id, r.Name, r.AuthType))
+	pt, err := s.sealer.Open(r.Sealed, sealAAD(tableSSH, id, r.Name, r.AuthType))
 	if err != nil {
 		return "", err
 	}

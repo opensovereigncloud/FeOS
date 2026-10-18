@@ -370,6 +370,48 @@ func (h *Handler) takeSlot(ctx context.Context, id uuid.UUID) (func(), error) {
 	}
 }
 
+// trySlot takes one of the sandbox's slots when one is free, without
+// waiting, and returns its release; false when every slot is taken. Idle
+// pooled connections hold slots they do not use: when every slot is
+// taken, they are closed and the slot is tried once more.
+func (h *Handler) trySlot(id uuid.UUID) (func(), bool) {
+	if release, ok := h.takeFreeSlot(id); ok {
+		return release, true
+	}
+	h.closeIdleOf(id)
+	return h.takeFreeSlot(id)
+}
+
+// takeFreeSlot takes one of the sandbox's slots when one is free.
+func (h *Handler) takeFreeSlot(id uuid.UUID) (func(), bool) {
+	h.mu.Lock()
+	c := h.caps[id]
+	if c == nil {
+		c = &capSem{slots: make(chan struct{}, h.t.perSandbox)}
+		h.caps[id] = c
+	}
+	c.refs++
+	h.mu.Unlock()
+	unref := func() {
+		h.mu.Lock()
+		c.refs--
+		if c.refs == 0 && h.caps[id] == c {
+			delete(h.caps, id)
+		}
+		h.mu.Unlock()
+	}
+	select {
+	case c.slots <- struct{}{}:
+		return func() {
+			<-c.slots
+			unref()
+		}, true
+	default:
+		unref()
+		return nil, false
+	}
+}
+
 // capReclaimEvery is how often a dial that waits for a slot closes the
 // sandbox's idle pooled connections.
 const capReclaimEvery = 50 * time.Millisecond
@@ -398,6 +440,14 @@ func (h *Handler) dial(ctx context.Context, k tkey, node string) (net.Conn, erro
 		return nil, err
 	}
 	slotTaken()
+	return h.openStream(ctx, k, node, release)
+}
+
+// openStream is the rest of a dial once it holds its slot, which release
+// gives back (at once when the stream cannot be opened, else when the
+// connection closes): the Forward stream, open{port}, and the guest's
+// ready, until which ctx ends the stream.
+func (h *Handler) openStream(ctx context.Context, k tkey, node string, release func()) (net.Conn, error) {
 	cc, err := h.conns.Conn(ctx, node)
 	if err != nil {
 		release()
