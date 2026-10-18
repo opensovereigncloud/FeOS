@@ -38,18 +38,18 @@ func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 		p := c.planJob(v, name, j)
 		if !p.ok() {
 			s.jobsDone = false
-			s.wait("job %s: %s", name, p.why())
+			s.wait(objectName(spec.KindJob, name), "job %s: %s", name, p.why())
 			continue
 		}
 		if !s.addonsReady {
 			s.jobsDone = false
-			s.wait("job %s waits for the addons", name)
+			s.wait(objectName(spec.KindJob, name), "job %s waits for the addons", name)
 			continue
 		}
 		done, err := c.st.JobSucceeded(ctx, v.env.ID, name, p.hash)
 		if err != nil {
 			s.jobsDone = false
-			s.wait("job %s: %v", name, err)
+			s.wait(objectName(spec.KindJob, name), "job %s: %v", name, err)
 			continue
 		}
 		if done {
@@ -58,7 +58,7 @@ func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 		s.jobsDone = false
 		runs, err := c.st.ListJobRuns(ctx, v.env.ID, name, 100)
 		if err != nil {
-			s.wait("job %s: %v", name, err)
+			s.wait(objectName(spec.KindJob, name), "job %s: %v", name, err)
 			continue
 		}
 		var last *store.EnvJobRun
@@ -72,14 +72,14 @@ func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 		case last == nil:
 			c.startRun(ctx, s, p, 1)
 		case last.Phase == model.RunRunning:
-			s.wait("job %s runs (attempt %d)", name, last.Attempt)
+			s.wait(objectName(spec.KindJob, name), "job %s runs (attempt %d)", name, last.Attempt)
 		case last.Phase == model.RunFailed && last.Attempt <= j.Retries:
 			c.startRun(ctx, s, p, last.Attempt+1)
 		case last.Phase == model.RunFailed:
 			summary := fmt.Sprintf("job %s failed its last attempt (%d of %d)%s", name, last.Attempt, j.Retries+1, runOutcome(*last))
 			ev := evidence{Exits: []store.EnvExit{{At: last.FinishedAt, Code: last.ExitCode}}, LogTail: last.LogTail}
 			if err := c.failRelease(ctx, v, summary, objectName(spec.KindJob, name), model.ConditionJobFailed, ev); err != nil {
-				s.wait("job %s: %v", name, err)
+				s.wait(objectName(spec.KindJob, name), "job %s: %v", name, err)
 				continue
 			}
 			s.failed = true
@@ -105,10 +105,10 @@ func (c *Controller) startRun(ctx context.Context, s *stepState, p *podPlan, att
 	run := &store.EnvJobRun{EnvID: v.env.ID, Job: p.name, TemplateHash: p.hash, Release: v.targetNum, Attempt: attempt,
 		Phase: model.RunRunning}
 	if _, err := c.insertInstance(ctx, v, insert{plan: p, release: v.targetNum, run: run}); err != nil {
-		s.wait("job %s: %v", p.name, err)
+		s.wait(objectName(spec.KindJob, p.name), "job %s: %v", p.name, err)
 		return
 	}
-	s.wait("job %s starts (attempt %d)", p.name, attempt)
+	s.wait(objectName(spec.KindJob, p.name), "job %s starts (attempt %d)", p.name, attempt)
 }
 
 // stepRuns keeps the running runs of the environment going, release and
@@ -119,7 +119,7 @@ func (c *Controller) stepRuns(ctx context.Context, s *stepState) {
 	v := s.v
 	runs, err := c.st.EnvCtlRunningJobRuns(ctx, v.env.ID)
 	if err != nil {
-		s.wait("job runs: %v", err)
+		s.wait("", "job runs: %v", err)
 		return
 	}
 	rows := map[uuid.UUID]store.EnvInstanceRow{}

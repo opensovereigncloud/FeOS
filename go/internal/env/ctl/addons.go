@@ -48,7 +48,7 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 	}
 	bp, ok := c.d.Blueprint(a.Type)
 	if !ok {
-		s.wait("addon %s: no addon type %q", name, a.Type)
+		s.wait(obj, "addon %s: no addon type %q", name, a.Type)
 		return false
 	}
 	if old, ok := v.volumes[volumeObject(name)]; ok && old.AddonType != "" && old.AddonType != a.Type {
@@ -60,24 +60,24 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 		if errors.Is(err, errNoSealer) {
 			s.reason = errNoSealer.Error()
 		}
-		s.wait("addon %s: its credentials: %v", name, err)
+		s.wait(obj, "addon %s: its credentials: %v", name, err)
 		return false
 	}
 	inst, err := bp.Render(addon, addons.Context{Env: v.env.Name, Name: name})
 	if err != nil {
-		s.wait("addon %s: %v", name, err)
+		s.wait(obj, "addon %s: %v", name, err)
 		return false
 	}
 	var vol *store.EnvVolume
 	if inst.Mount != "" {
 		got, err := c.addonVolume(ctx, v, bp, addon)
 		if err != nil {
-			s.wait("addon %s: its volume: %v", name, err)
+			s.wait(obj, "addon %s: its volume: %v", name, err)
 			return false
 		}
 		if got.Deleting {
 			c.awaitVolume(ctx, v, name, got)
-			s.wait("addon %s: its old volume is being deleted", name)
+			s.wait(obj, "addon %s: its old volume is being deleted", name)
 			return false
 		}
 		vol = &got
@@ -85,7 +85,7 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 	p := c.planAddon(v, name, a, vol, cur.Sandbox.Address)
 	s.addons[name] = p
 	if !p.ok() {
-		s.wait("addon %s: %s", name, p.why())
+		s.wait(obj, "addon %s: %s", name, p.why())
 		return false
 	}
 	if !hasCur || cur.Instance.TemplateHash != p.hash {
@@ -112,7 +112,7 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 			c.incident(ctx, v.env.ID, obj, v.targetNum, model.ConditionVolumeUnavailable,
 				fmt.Sprintf("addon %s is lost with node %s, which has its volume", name, sb.LostFrom), evidence{})
 		}
-		s.wait("addon %s is lost", name)
+		s.wait(obj, "addon %s is lost", name)
 		return false
 	}
 	if vol != nil && vol.Provisioned && steady(sb) && (vol.Node != sb.Node || sb.PinNode != sb.Node) {
@@ -120,7 +120,7 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 		c.moveVolume(ctx, v, *vol, sb)
 	}
 	if cur.Instance.Phase != model.PhaseReady {
-		s.wait("addon %s is %s", name, cur.Instance.Phase)
+		s.wait(obj, "addon %s is %s", name, cur.Instance.Phase)
 		return false
 	}
 	c.closeIncidents(ctx, v, obj, model.ConditionVolumeUnavailable)
@@ -130,7 +130,7 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 	}
 	if cur.Instance.ProvisionedHash != p.stepsHash {
 		c.provision(ctx, v, p, cur)
-		s.wait("addon %s is being provisioned", name)
+		s.wait(obj, "addon %s is being provisioned", name)
 		return false
 	}
 	return true
@@ -199,7 +199,7 @@ func (c *Controller) refuseAddon(ctx context.Context, s *stepState, p *addonPlan
 	if hasCur {
 		c.heal(ctx, cur, false)
 	}
-	s.wait("%s", reason)
+	s.wait(p.object(), "%s", reason)
 	if rolling(v) {
 		if err := c.failRelease(ctx, v, reason, p.object(), model.ConditionRolloutFailed,
 			evidence{Diff: c.releaseDiff(ctx, v)}); err == nil {
@@ -236,7 +236,7 @@ func (c *Controller) replaceVolume(ctx context.Context, s *stepState, name, typ 
 			return err
 		})
 		if err != nil {
-			s.wait("addon %s: %v", name, err)
+			s.wait(objectName(spec.KindAddon, name), "addon %s: %v", name, err)
 			return
 		}
 		c.log.Info("an addon's type changed: its volume and credentials are deleted", "environment", v.env.ID, "addon", name,
@@ -248,7 +248,7 @@ func (c *Controller) replaceVolume(ctx context.Context, s *stepState, name, typ 
 		}
 	}
 	c.awaitVolume(ctx, v, name, vol)
-	s.wait("addon %s: its %s volume is being deleted", name, vol.AddonType)
+	s.wait(objectName(spec.KindAddon, name), "addon %s: its %s volume is being deleted", name, vol.AddonType)
 }
 
 // awaitVolume deletes an addon's volume marked deleting once its addon
@@ -322,7 +322,7 @@ func (c *Controller) newAddon(ctx context.Context, s *stepState, p *addonPlan, v
 	v := s.v
 	for _, r := range v.rowsOf(spec.KindAddon, p.name) {
 		if r.Instance.Phase == model.PhaseRetiring {
-			s.wait("addon %s: its old instance is being deleted", p.name)
+			s.wait(p.object(), "addon %s: its old instance is being deleted", p.name)
 			return
 		}
 	}
@@ -330,7 +330,7 @@ func (c *Controller) newAddon(ctx context.Context, s *stepState, p *addonPlan, v
 	if vol != nil {
 		if vol.Holder != uuid.Nil {
 			if held, err := c.stillHolds(ctx, vol.Holder); err != nil || held {
-				s.wait("addon %s: its old pod still holds its volume", p.name)
+				s.wait(p.object(), "addon %s: its old pod still holds its volume", p.name)
 				return
 			}
 		}
@@ -342,17 +342,17 @@ func (c *Controller) newAddon(ctx context.Context, s *stepState, p *addonPlan, v
 					c.incident(ctx, v.env.ID, p.object(), v.targetNum, model.ConditionVolumeUnavailable,
 						fmt.Sprintf("addon %s's volume is on node %s, which was removed", p.name, vol.Node), evidence{})
 				}
-				s.wait("addon %s: its volume's node %s was removed", p.name, vol.Node)
+				s.wait(p.object(), "addon %s: its volume's node %s was removed", p.name, vol.Node)
 				return
 			}
 			pin = vol.Node
 		}
 	}
 	if _, err := c.insertInstance(ctx, v, insert{plan: &p.podPlan, release: v.targetNum, pin: pin}); err != nil {
-		s.wait("addon %s: %v", p.name, err)
+		s.wait(p.object(), "addon %s: %v", p.name, err)
 		return
 	}
-	s.wait("addon %s is starting", p.name)
+	s.wait(p.object(), "addon %s is starting", p.name)
 }
 
 // stillHolds reports whether a row, or a tombstone of its pod, is left:
@@ -379,14 +379,14 @@ func (c *Controller) recreateAddon(ctx context.Context, s *stepState, p *addonPl
 	sb := cur.Sandbox
 	if c.heal(ctx, cur, false) {
 		c.ensure(ctx, sb.ID)
-		s.wait("addon %s is lost; it is recreated once it runs again", p.name)
+		s.wait(p.object(), "addon %s is lost; it is recreated once it runs again", p.name)
 		return
 	}
 	if !steady(sb) || !c.nodeReady(ctx, sb.Node) {
 		if sb.Op == "" && sb.ClientState != model.StateRunning {
 			c.ensure(ctx, sb.ID)
 		}
-		s.wait("addon %s: waits for its instance to run before it is recreated", p.name)
+		s.wait(p.object(), "addon %s: waits for its instance to run before it is recreated", p.name)
 		return
 	}
 	err := c.fenced(ctx, func(tx *store.Store) error {
@@ -419,14 +419,14 @@ func (c *Controller) recreateAddon(ctx context.Context, s *stepState, p *addonPl
 		return err
 	})
 	if err != nil {
-		s.wait("addon %s: %v", p.name, err)
+		s.wait(p.object(), "addon %s: %v", p.name, err)
 		return
 	}
 	c.log.Info("addon recreated", "environment", v.env.ID, "addon", p.name, "old", sb.ID, "node", sb.Node)
 	if err := c.deleteInstance(ctx, sb); err != nil && ctx.Err() == nil {
 		c.rl.warn("recreate", "cannot delete an addon's old instance", "sandbox", sb.ID, "err", err)
 	}
-	s.wait("addon %s is being recreated", p.name)
+	s.wait(p.object(), "addon %s is being recreated", p.name)
 }
 
 // moveVolume records that an addon's volume is on the node its instance

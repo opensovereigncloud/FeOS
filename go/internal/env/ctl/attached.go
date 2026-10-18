@@ -64,12 +64,12 @@ func (c *Controller) stepOneAttached(ctx context.Context, s *stepState, name str
 	v := s.v
 	p := c.planAttached(v, name, svc)
 	if !p.ok() {
-		s.wait("attached service %s: %s", name, p.why())
+		s.wait(objectName(spec.KindService, name), "attached service %s: %s", name, p.why())
 		return false
 	}
 	sb, err := c.st.GetSandbox(ctx, p.sandbox)
 	if err != nil && !errors.Is(err, model.ErrNotFound) {
-		s.wait("attached service %s: %v", name, err)
+		s.wait(objectName(spec.KindService, name), "attached service %s: %v", name, err)
 		return false
 	}
 	found := err == nil
@@ -80,17 +80,17 @@ func (c *Controller) stepOneAttached(ctx context.Context, s *stepState, name str
 	}
 	if c.d.Runner == nil {
 		c.attachedDetail(ctx, v.env.ID, name, "attached services need the tools' runner, which this instance lacks")
-		s.wait("attached service %s: no tools' runner", name)
+		s.wait(objectName(spec.KindService, name), "attached service %s: no tools' runner", name)
 		return false
 	}
 	if a.SandboxID != p.sandbox {
 		c.moveAttached(ctx, v, a, p, sb, found)
-		s.wait("attached service %s moves to sandbox %s", name, p.sandbox)
+		s.wait(objectName(spec.KindService, name), "attached service %s moves to sandbox %s", name, p.sandbox)
 		return false
 	}
 	if !found || !attachedUsable(v.env, a, sb) {
 		c.attachedGone(ctx, v.env.ID, a)
-		s.wait("attached service %s: %s", name, goneDetail(p.sandbox))
+		s.wait(objectName(spec.KindService, name), "attached service %s: %s", name, goneDetail(p.sandbox))
 		return false
 	}
 	needsStart := a.ProcessID == "" || a.TemplateHash != p.hash
@@ -98,7 +98,7 @@ func (c *Controller) stepOneAttached(ctx context.Context, s *stepState, name str
 		c.wakeAttached(ctx, v.env.ID, name, sb.ID)
 	}
 	if a.Phase != model.PhaseReady || a.TemplateHash != p.hash || a.ProcessID == "" {
-		s.wait("attached service %s is %s", name, a.Phase)
+		s.wait(objectName(spec.KindService, name), "attached service %s is %s", name, a.Phase)
 		return false
 	}
 	return true
@@ -179,10 +179,10 @@ func (c *Controller) recordAttached(ctx context.Context, s *stepState, p *attach
 		return tx.Notify(ctx, db.ChanLeader, HintGroups)
 	})
 	if err != nil && !errors.Is(err, store.ErrExists) {
-		s.wait("attached service %s: %v", p.name, err)
+		s.wait(objectName(spec.KindService, p.name), "attached service %s: %v", p.name, err)
 		return
 	}
-	s.wait("attached service %s is recorded", p.name)
+	s.wait(objectName(spec.KindService, p.name), "attached service %s is recorded", p.name)
 }
 
 // moveAttached moves an attached service to another sandbox: its process

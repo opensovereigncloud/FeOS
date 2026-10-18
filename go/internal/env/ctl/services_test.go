@@ -459,3 +459,65 @@ func TestRestartNotDoneIsNoExit(t *testing.T) {
 		}
 	}
 }
+
+// A rolling release that waits for an addon that never provisions fails
+// at its deadline (rollout_failed, naming the addon, with what it waited
+// for and the instance's detail, credentials redacted), and the old
+// instance serves on. The deadline is the longest of the services'
+// budgets (5s here) and the floor (10s here, 10 minutes by default).
+func TestReleaseDeadline(t *testing.T) {
+	h := newHarness(t, options{timings: func(t *timings) { t.releaseDeadline = 10 * time.Second }})
+	n1 := h.addNode("n1")
+	var code atomic.Int32
+	code.Store(1)
+	failingProvisioning(n1, &code)
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	old := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	r2 := h.apply(env.ID, fmt.Sprintf(`{"addons":{"postgres":{"type":"postgres","version":"17","plan":"dev",
+		"options":{"databases":["app"]}}},"services":{"web":{"image":%q,"command":["/app"],
+		"env":{"DB":{"addon":"postgres","key":"url"}},"ports":[{"name":"http","port":8080}],"rollout":{"timeout":"5s"}}}}`,
+		testImage))
+	rel := h.waitRelease(env.ID, r2, model.ReleaseFailed, 60*time.Second)
+	if !strings.HasPrefix(rel.Reason, "release 2 did not roll out within 10s: addon postgres") {
+		t.Errorf("reason %q", rel.Reason)
+	}
+	inc := h.incident(env.ID, "addon/postgres", model.ConditionRolloutFailed, 10*time.Second)
+	var ev evidence
+	if err := json.Unmarshal(inc.Evidence, &ev); err != nil || inc.Release != r2 {
+		t.Fatalf("incident %+v %v", inc, err)
+	}
+	pw, _ := h.c.ResolveSecret(bg, env.ID, "addon.postgres.password", 1)
+	all := strings.Join(ev.Pending, "\n")
+	if !strings.Contains(all, "addon/postgres replica 0: provisioning step provision exited 1") ||
+		!strings.Contains(all, "service web waits for the addons") || pw == "" || strings.Contains(all, pw) {
+		t.Errorf("pending %q", ev.Pending)
+	}
+	if rows := h.rowsOf(env.ID, spec.KindService, "web"); len(rows) != 1 || rows[0].Sandbox.ID != old.Sandbox.ID || !ready(rows[0]) {
+		t.Errorf("web after the failed release %+v", rows)
+	}
+}
+
+// A scale-up counts as a rollout: replicas that cannot place fail the
+// release at the service's budget, and the replicas it kept serve on.
+func TestScaleUpBudget(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1", func(c *testnode.Config) { c.MemoryBytes = 8 << 30 })
+	env := h.newEnv("stage")
+	big := func(replicas int) string {
+		return serviceSpec(replicas, "1", `,"resources":{"memoryMib":6144},"rollout":{"timeout":"3s"}`)
+	}
+	r1 := h.apply(env.ID, big(1))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	kept := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	r2 := h.apply(env.ID, big(2))
+	rel := h.waitRelease(env.ID, r2, model.ReleaseFailed, 30*time.Second)
+	if rel.Reason != "service web did not roll out within 3s" {
+		t.Errorf("reason %q", rel.Reason)
+	}
+	eventually(t, 30*time.Second, "the kept replica alone", func() bool {
+		rows := h.rows(env.ID)
+		return len(rows) == 1 && rows[0].Sandbox.ID == kept.Sandbox.ID && ready(rows[0])
+	})
+}

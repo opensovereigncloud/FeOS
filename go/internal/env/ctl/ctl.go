@@ -186,6 +186,9 @@ type timings struct {
 	// restartReady bounds how long RestartService waits for a restarted
 	// replica to be ready before it restarts the next.
 	restartReady time.Duration
+	// releaseDeadline is the least time a release may roll before it fails
+	// (§13.5: longer when its services' budgets or jobs need more).
+	releaseDeadline time.Duration
 }
 
 func defaultTimings() timings {
@@ -203,6 +206,7 @@ func defaultTimings() timings {
 		nodeCall:        10 * time.Second,
 		attachedReady:   time.Minute,
 		restartReady:    5 * time.Minute,
+		releaseDeadline: 10 * time.Minute,
 	}
 }
 
