@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/url"
@@ -178,9 +179,13 @@ func rawOf(path, raw string) string {
 // none is), and the request forwarded through the port door to a ready
 // instance of the route's service, round-robin, or, when none is ready,
 // to a paused or hibernated one (the forward wakes it: scale from zero);
-// none at all is 503 with Retry-After 5. An attached service's requests
-// go to its sandbox. The path is stripped of the route's path when the
-// route says so; the query is kept. Its answers are plain text.
+// none at all is 503 with Retry-After 5. The port is the one the chosen
+// instance's own release gives the route's port name (the matched
+// release's when that release has none). An attached service's requests
+// go to its sandbox, only while that is the environment owner's and the
+// incarnation its process was started in (else 503). The path is
+// stripped of the route's path when the route says so; the query is
+// kept. Its answers are plain text.
 func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tok := bearer(r)
@@ -252,11 +257,7 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	svc := sp.Services[route.Service]
-	port, ok := spec.PortNumber(svc.Ports, route.Port)
-	if !ok {
-		http.Error(w, "route "+route.Path+" names no port of "+route.Service, http.StatusBadGateway)
-		return
-	}
+	port, portOK := spec.PortNumber(svc.Ports, route.Port)
 	upPath, upRaw := path, rawOf(path, raw)
 	if route.Strip {
 		if upPath, upRaw, err = stripSegments(raw, n); err != nil {
@@ -269,51 +270,110 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if svc.Runtime == spec.RuntimeAttached {
-		id, ok := parseUUID(svc.Sandbox)
-		if !ok {
-			http.Error(w, "service "+route.Service+" names no sandbox", http.StatusBadGateway)
+		if !portOK {
+			http.Error(w, "route "+route.Path+" names no port of "+route.Service, http.StatusBadGateway)
+			return
+		}
+		id, refusal, err := s.attachedSandbox(ctx, e, route.Service)
+		if err != nil {
+			s.routeFailed(w, r, err)
+			return
+		}
+		if refusal != "" {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, refusal, http.StatusServiceUnavailable)
 			return
 		}
 		s.d.Ports.ForwardTo(w, r, id, port, upPath, upRaw)
 		return
 	}
-	id, err := s.pickInstance(ctx, e.ID, route.Service)
+	inst, err := s.pickInstance(ctx, e.ID, route.Service)
 	if err != nil {
 		s.routeFailed(w, r, err)
 		return
 	}
-	if id == uuid.Nil {
+	if inst.id == uuid.Nil {
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, "no ready instance of "+route.Service, http.StatusServiceUnavailable)
 		return
 	}
-	s.d.Ports.ForwardTo(w, r, id, port, upPath, upRaw)
+	// The instance listens on the port of its own release, which a
+	// rolling release may have changed.
+	if inst.release != number && inst.release > 0 {
+		own, err := s.releaseSpec(ctx, e, inst.release)
+		if err != nil && !isNotFound(err) {
+			s.routeFailed(w, r, err)
+			return
+		}
+		if own != nil {
+			if p, ok := spec.PortNumber(own.Services[route.Service].Ports, route.Port); ok {
+				port, portOK = p, true
+			}
+		}
+	}
+	if !portOK {
+		http.Error(w, "route "+route.Path+" names no port of "+route.Service, http.StatusBadGateway)
+		return
+	}
+	s.d.Ports.ForwardTo(w, r, inst.id, port, upPath, upRaw)
+}
+
+// attachedSandbox is the sandbox an attached service's requests go to:
+// the one its controller row names, while that sandbox exists, is the
+// environment owner's, is no instance row and is the incarnation the
+// process was started in (when it was). Otherwise refusal says why not:
+// a sandbox ID is free again once its sandbox is deleted, and another
+// tenant may take it, which the spec validated at apply never sees.
+func (s *Service) attachedSandbox(ctx context.Context, e store.Environment, service string) (uuid.UUID, string, error) {
+	a, err := s.st.GetAttached(ctx, e.ID, service)
+	if errors.Is(err, store.ErrNoRow) {
+		return uuid.Nil, "no ready instance of " + service, nil
+	}
+	if err != nil {
+		return uuid.Nil, "", fmt.Errorf("attached service %s: %w", service, err)
+	}
+	sb, err := s.st.GetSandbox(ctx, a.SandboxID)
+	if err != nil && !errors.Is(err, model.ErrNotFound) {
+		return uuid.Nil, "", fmt.Errorf("sandbox %s: %w", a.SandboxID, err)
+	}
+	if err != nil || sb.Owner != e.Owner || sb.IsInstance() ||
+		(a.SandboxIncarnation != uuid.Nil && a.SandboxIncarnation != sb.Incarnation) {
+		return uuid.Nil, fmt.Sprintf("sandbox %s of service %s is gone or not this tenant's", a.SandboxID, service), nil
+	}
+	return sb.ID, "", nil
+}
+
+// picked is the instance a request goes to: its sandbox and its release.
+type picked struct {
+	id      uuid.UUID
+	release int
 }
 
 // pickInstance chooses the instance of an image service a request goes
 // to: a ready one whose sandbox runs, round-robin; else a paused or
-// hibernated one, which the forward wakes; uuid.Nil when there is none.
-func (s *Service) pickInstance(ctx context.Context, envID uuid.UUID, service string) (uuid.UUID, error) {
+// hibernated one, which the forward wakes; a zero id when there is none.
+func (s *Service) pickInstance(ctx context.Context, envID uuid.UUID, service string) (picked, error) {
 	rows, err := s.st.ListEnvInstanceRows(ctx, envID)
 	if err != nil {
-		return uuid.Nil, err
+		return picked{}, err
 	}
-	var ready, asleep []uuid.UUID
+	var ready, asleep []picked
 	for _, row := range rows {
 		i, sb := row.Instance, row.Sandbox
 		if i.Kind != spec.KindService || i.Object != service || i.Phase == model.PhaseRetiring {
 			continue
 		}
+		p := picked{id: sb.ID, release: i.Release}
 		switch {
 		case i.Phase == model.PhaseReady && sb.ClientState == model.StateRunning && sb.Op == "":
-			ready = append(ready, sb.ID)
+			ready = append(ready, p)
 		case i.Phase == model.PhaseReady && sb.ClientState == model.StateRunning:
 			// Busy with an op (a pause on its way): only when nothing
 			// else answers.
-			asleep = append(asleep, sb.ID)
+			asleep = append(asleep, p)
 		case sb.ClientState == model.StatePaused || sb.ClientState == model.StateHibernated ||
 			sb.ClientState == model.StatePausing || sb.ClientState == model.StateHibernating:
-			asleep = append(asleep, sb.ID)
+			asleep = append(asleep, p)
 		}
 	}
 	if len(ready) > 0 {
@@ -322,7 +382,7 @@ func (s *Service) pickInstance(ctx context.Context, envID uuid.UUID, service str
 	if len(asleep) > 0 {
 		return asleep[0], nil
 	}
-	return uuid.Nil, nil
+	return picked{}, nil
 }
 
 // routeFailed answers a route door request that failed inside ferund.
