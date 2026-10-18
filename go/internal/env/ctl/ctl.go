@@ -38,6 +38,7 @@ package ctl
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -89,7 +90,28 @@ var (
 	// logs (an older feosd answers Unimplemented): 501 "this node does not
 	// serve container logs yet".
 	ErrNoContainerLogs = errors.New("this node does not serve container logs yet")
+	// ErrNotRunning: what the call needs does not run, an expected state
+	// (409, never 500): an instance pending, stopped or failed has no log
+	// to read; an attached service's sandbox that is not running, gone or
+	// not the tenant's has no process to read or restart. The error's text
+	// says which. It wraps model.ErrNotRunning.
+	ErrNotRunning = fmt.Errorf("not running: %w", model.ErrNotRunning)
 )
+
+// stateError is an answer for an expected state: its text as the caller
+// shows it, its kind (ErrNotRunning, …) for errors.Is.
+type stateError struct {
+	msg  string
+	kind error
+}
+
+func (e *stateError) Error() string { return e.msg }
+func (e *stateError) Unwrap() error { return e.kind }
+
+// notRunning is an ErrNotRunning with its own text.
+func notRunning(format string, args ...any) error {
+	return &stateError{msg: fmt.Sprintf(format, args...), kind: ErrNotRunning}
+}
 
 // The sources of LogTail's lines.
 const (

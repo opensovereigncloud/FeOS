@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -51,8 +52,14 @@ func hostProcesses(n *testnode.Node, root string) {
 // API gives it) and brings it up.
 func (h *harness) attachable() store.Sandbox {
 	h.t.Helper()
-	id := uuid.New()
-	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: testTenant, Image: testImage, ImageRef: testImage,
+	return h.attachableAs(testTenant, uuid.New())
+}
+
+// attachableAs makes an attachable sandbox of owner with the ID id and
+// brings it up.
+func (h *harness) attachableAs(owner string, id uuid.UUID) store.Sandbox {
+	h.t.Helper()
+	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: owner, Image: testImage, ImageRef: testImage,
 		VCPUs: 1, MemoryMiB: 512, PodTemplate: &model.PodTemplate{Command: []string{"sleep", "infinity"},
 			SecurityGroups: []string{model.SandboxGroupID(id)}}}); err != nil {
 		h.t.Fatal(err)
@@ -256,4 +263,108 @@ func TestAttachedWakesPausedSandbox(t *testing.T) {
 		s, _ := h.st.GetSandbox(bg, sb.ID)
 		return s.ClientState != model.StatePaused
 	})
+}
+
+// startLog counts the process starts the node ran, per pod.
+type startLog struct {
+	mu     sync.Mutex
+	starts map[uuid.UUID]int
+}
+
+func (l *startLog) count(pod uuid.UUID) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.starts[pod]
+}
+
+// hostProcessesCounting is hostProcesses that also counts the starts.
+func hostProcessesCounting(n *testnode.Node, root string) *startLog {
+	l := &startLog{starts: map[uuid.UUID]int{}}
+	n.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+		argv := req.Command
+		if len(argv) > 2 && argv[0] == "python3" {
+			start := strings.Contains(argv[2], "no such working directory")
+			argv[2] = strings.ReplaceAll(argv[2], processRoot, root)
+			if start {
+				l.mu.Lock()
+				l.starts[pod]++
+				l.mu.Unlock()
+				if len(argv) > 6 && argv[6] != "" {
+					argv[6] = filepath.Join(n.PodDir(pod), argv[6])
+				}
+			}
+		}
+		return 0, false, nil
+	})
+	return l
+}
+
+// An attached service's sandbox deleted and its ID taken by another
+// tenant's attachable sandbox: the service fails ("gone or not this
+// tenant's"); nothing starts in the new sandbox, no hosts block is written
+// there, it joins no group of the environment and its own group reaches
+// none; its logs and restarts answer ErrNotRunning.
+func TestAttachedSandboxReusedByAnotherTenant(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	starts := hostProcessesCounting(n1, t.TempDir())
+	sb := h.attachable()
+	env := h.newEnv("dev")
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"api":{"image":%q},
+		"web":{"runtime":"attached","sandbox":%q,"command":["sleep","60"]}}}`, testImage, sb.ID))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	a, err := h.st.GetAttached(bg, env.ID, "web")
+	if err != nil || a.ProcessID == "" || a.SandboxIncarnation != sb.Incarnation {
+		t.Fatalf("attached %+v %v", a, err)
+	}
+
+	// The tenant deletes its sandbox; another tenant takes its ID.
+	if _, _, err := h.eng.Delete(bg, testTenant, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "the sandbox's pod gone", func() bool { return h.pod("n1", sb.ID) == nil })
+	if _, _, err := h.st.CreateTenant(bg, "t2"); err != nil {
+		t.Fatal(err)
+	}
+	before := starts.count(sb.ID)
+	other := h.attachableAs("t2", sb.ID)
+	eventually(t, 30*time.Second, "the service failed", func() bool {
+		b, err := h.st.GetAttached(bg, env.ID, "web")
+		return err == nil && b.Phase == model.PhaseFailed && b.ProcessID == "" &&
+			b.Detail == fmt.Sprintf("sandbox %s is gone or not this tenant's", sb.ID)
+	})
+	never(t, 3*time.Second, "something happened in the other tenant's sandbox", func() bool {
+		hosts, _ := os.ReadFile(filepath.Join(n1.PodDir(sb.ID), "etc", "hosts"))
+		return starts.count(sb.ID) != before || strings.Contains(string(hosts), "ferun environment")
+	})
+	if b, _ := h.st.GetAttached(bg, env.ID, "web"); b.SandboxIncarnation != sb.Incarnation {
+		t.Errorf("the recorded incarnation changed: %+v", b)
+	}
+	// Groups: the other sandbox is no member of the environment's group,
+	// and its own group reaches no group of the environment.
+	if g, _, err := h.c.buildGroup(bg, model.EnvGroupID(env.ID)); err != nil || slices.Contains(g.Members, other.Address) {
+		t.Fatalf("the env group %v %v", g, err)
+	}
+	if g := h.group("n1", model.SandboxGroupID(sb.ID)); g == nil || slices.ContainsFunc(g.Rules, func(r *networkv1.Rule) bool {
+		return r.GetGroup() == model.EnvGroupID(env.ID)
+	}) {
+		t.Fatalf("the other sandbox's group %v", g)
+	}
+	eventually(t, 30*time.Second, "the node's env group without the other sandbox", func() bool {
+		h.c.notify(bg, HintGroups)
+		g := h.group("n1", model.EnvGroupID(env.ID))
+		return g != nil && !slices.Contains(g.Members, other.Address) && len(g.Members) == 1
+	})
+	if _, _, err := h.c.LogTail(bg, env.ID, spec.KindService, "web", 0, 5); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("logs of the gone sandbox: %v", err)
+	}
+	if err := h.c.RestartService(bg, env.ID, "web"); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("a restart in the gone sandbox: %v", err)
+	}
+	if starts.count(sb.ID) != before {
+		t.Error("a process started in the other tenant's sandbox")
+	}
 }

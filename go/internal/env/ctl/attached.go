@@ -37,62 +37,142 @@ func (c *Controller) stepAttached(ctx context.Context, s *stepState) {
 		if runtimeOf(svc) != spec.RuntimeAttached {
 			continue
 		}
-		p := c.planAttached(v, name, svc)
-		if !p.ok() {
-			s.wait("attached service %s: %s", name, p.why())
+		if c.stepOneAttached(ctx, s, name, svc) || !rolling(v) || v.latest.StartedAt.IsZero() {
 			continue
 		}
-		a, ok := v.attached[name]
-		if !ok {
-			c.recordAttached(ctx, s, p)
+		budget := duration("", spec.DefaultRolloutTimeout)
+		if !v.now.After(v.latest.StartedAt.Add(budget)) {
 			continue
 		}
-		if c.d.Runner == nil {
-			c.attachedDetail(ctx, v.env.ID, name, "attached services need the tools' runner, which this instance lacks")
-			s.wait("attached service %s: no tools' runner", name)
-			continue
+		reason := fmt.Sprintf("attached service %s did not become ready within %s", name, budget)
+		if a, err := c.st.GetAttached(ctx, v.env.ID, name); err == nil && a.Detail != "" {
+			reason += ": " + a.Detail
 		}
-		if a.SandboxID != p.sandbox {
-			c.moveAttached(ctx, v, a, p)
-			s.wait("attached service %s moves to sandbox %s", name, p.sandbox)
-			continue
-		}
-		sb, err := c.st.GetSandbox(ctx, p.sandbox)
-		if err != nil || sb.IsInstance() || sb.Owner != v.env.Owner {
-			c.attachedDetail(ctx, v.env.ID, name, fmt.Sprintf("sandbox %s does not exist", p.sandbox))
-			s.wait("attached service %s: sandbox %s does not exist", name, p.sandbox)
-			continue
-		}
-		needsStart := a.ProcessID == "" || a.TemplateHash != p.hash ||
-			(a.SandboxIncarnation != uuid.Nil && a.SandboxIncarnation != sb.Incarnation)
-		if needsStart && !steady(sb) && sb.Op == "" && (a.NextRestartAt.IsZero() || !v.now.Before(a.NextRestartAt)) {
-			c.wakeAttached(ctx, v.env.ID, name, sb.ID)
-		}
-		if a.Phase != model.PhaseReady || a.TemplateHash != p.hash || a.ProcessID == "" {
-			s.wait("attached service %s is %s", name, a.Phase)
-			if rolling(v) && !v.latest.StartedAt.IsZero() {
-				budget := duration("", spec.DefaultRolloutTimeout)
-				if v.now.After(v.latest.StartedAt.Add(budget)) {
-					reason := fmt.Sprintf("attached service %s did not become ready within %s", name, budget)
-					if a.Detail != "" {
-						reason += ": " + a.Detail
-					}
-					if err := c.failRelease(ctx, v, reason, objectName(spec.KindService, name), model.ConditionRolloutFailed,
-						evidence{Diff: c.releaseDiff(ctx, v)}); err == nil {
-						s.failed = true
-						return
-					}
-				}
-			}
+		if err := c.failRelease(ctx, v, reason, objectName(spec.KindService, name), model.ConditionRolloutFailed,
+			evidence{Diff: c.releaseDiff(ctx, v)}); err == nil {
+			s.failed = true
+			return
 		}
 	}
 }
 
-// recordAttached records an attached service of T.
-func (c *Controller) recordAttached(ctx context.Context, s *stepState, p *attachedPlan) {
+// stepOneAttached keeps one attached service of T and reports whether it
+// is ready: recorded (with its sandbox's incarnation), moved to the
+// sandbox T names, its sandbox woken for a (re)start. A sandbox it may
+// not use (attachedUsable) fails it, and nothing is done in that sandbox.
+func (c *Controller) stepOneAttached(ctx context.Context, s *stepState, name string, svc spec.Service) bool {
+	v := s.v
+	p := c.planAttached(v, name, svc)
+	if !p.ok() {
+		s.wait("attached service %s: %s", name, p.why())
+		return false
+	}
+	sb, err := c.st.GetSandbox(ctx, p.sandbox)
+	if err != nil && !errors.Is(err, model.ErrNotFound) {
+		s.wait("attached service %s: %v", name, err)
+		return false
+	}
+	found := err == nil
+	a, ok := v.attached[name]
+	if !ok {
+		c.recordAttached(ctx, s, p, sb, found)
+		return false
+	}
+	if c.d.Runner == nil {
+		c.attachedDetail(ctx, v.env.ID, name, "attached services need the tools' runner, which this instance lacks")
+		s.wait("attached service %s: no tools' runner", name)
+		return false
+	}
+	if a.SandboxID != p.sandbox {
+		c.moveAttached(ctx, v, a, p, sb, found)
+		s.wait("attached service %s moves to sandbox %s", name, p.sandbox)
+		return false
+	}
+	if !found || !attachedUsable(v.env, a, sb) {
+		c.attachedGone(ctx, v.env.ID, a)
+		s.wait("attached service %s: %s", name, goneDetail(p.sandbox))
+		return false
+	}
+	needsStart := a.ProcessID == "" || a.TemplateHash != p.hash
+	if needsStart && !steady(sb) && sb.Op == "" && (a.NextRestartAt.IsZero() || !v.now.Before(a.NextRestartAt)) {
+		c.wakeAttached(ctx, v.env.ID, name, sb.ID)
+	}
+	if a.Phase != model.PhaseReady || a.TemplateHash != p.hash || a.ProcessID == "" {
+		s.wait("attached service %s is %s", name, a.Phase)
+		return false
+	}
+	return true
+}
+
+// goneDetail is the detail of an attached service whose sandbox it may
+// not use (§13.5).
+func goneDetail(id uuid.UUID) string {
+	return fmt.Sprintf("sandbox %s is gone or not this tenant's", id)
+}
+
+// attachedUsable reports whether an attached service of env may use the
+// sandbox row sb, the one it names (§13.5): a sandbox of env's owner, not
+// an instance row, and the incarnation the service recorded (any, while
+// it recorded none). A sandbox ID deleted and created again, by another
+// tenant or the same, is another sandbox: the service is never started,
+// checked, named or made a member there. store.EnvCtlMembers and
+// EnvCtlWithAttached apply the same condition.
+func attachedUsable(env store.Environment, a store.EnvAttached, sb store.Sandbox) bool {
+	return sb.ID == a.SandboxID && sb.Owner == env.Owner && !sb.IsInstance() &&
+		(a.SandboxIncarnation == uuid.Nil || a.SandboxIncarnation == sb.Incarnation)
+}
+
+// usableSandbox reads an attached service's sandbox, and reports whether
+// the service may use it.
+func (c *Controller) usableSandbox(ctx context.Context, env store.Environment, a store.EnvAttached) (store.Sandbox, bool) {
+	sb, err := c.st.GetSandbox(ctx, a.SandboxID)
+	return sb, err == nil && attachedUsable(env, a, sb)
+}
+
+// attachedGone fails an attached service whose sandbox it may not use:
+// phase failed, the detail saying so, no process (its process ran in a
+// sandbox that is gone); the incarnation it recorded stays, so that the
+// sandbox now under its ID is never taken for it.
+func (c *Controller) attachedGone(ctx context.Context, envID uuid.UUID, a store.EnvAttached) {
+	detail := goneDetail(a.SandboxID)
+	if a.Phase == model.PhaseFailed && a.Detail == detail && a.ProcessID == "" {
+		return
+	}
 	err := c.fenced(ctx, func(tx *store.Store) error {
-		if _, err := tx.InsertAttached(ctx, store.EnvAttached{EnvID: s.v.env.ID, Service: p.name, SandboxID: p.sandbox,
-			Phase: model.PhaseStarting}); err != nil {
+		cur, err := tx.LockAttached(ctx, envID, a.Service, store.ForUpdate)
+		if err != nil || cur.SandboxID != a.SandboxID {
+			return err
+		}
+		after := cur
+		after.Phase, after.Detail, after.ProcessID, after.ReadySince = model.PhaseFailed, detail, "", time.Time{}
+		after.ProbeFailures, after.NextRestartAt, after.HostsWritten = 0, time.Time{}, ""
+		if after == cur {
+			return nil
+		}
+		if _, err := tx.UpdateAttached(ctx, cur, after); err != nil {
+			return err
+		}
+		c.log.Warn("an attached service's sandbox is gone or not its tenant's", "environment", envID,
+			"service", a.Service, "sandbox", a.SandboxID)
+		return tx.Notify(ctx, db.ChanLeader, HintGroups)
+	})
+	if err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
+		c.rl.warn("attached", "cannot fail an attached service", "service", a.Service, "err", err)
+	}
+	c.forget("a/" + attachedKey(envID, a.Service))
+}
+
+// recordAttached records an attached service of T, with the incarnation
+// of its sandbox when it may use it (found and the owner's), else failed.
+func (c *Controller) recordAttached(ctx context.Context, s *stepState, p *attachedPlan, sb store.Sandbox, found bool) {
+	a := store.EnvAttached{EnvID: s.v.env.ID, Service: p.name, SandboxID: p.sandbox, Phase: model.PhaseStarting}
+	if found && attachedUsable(s.v.env, a, sb) {
+		a.SandboxIncarnation = sb.Incarnation
+	} else {
+		a.Phase, a.Detail = model.PhaseFailed, goneDetail(p.sandbox)
+	}
+	err := c.fenced(ctx, func(tx *store.Store) error {
+		if _, err := tx.InsertAttached(ctx, a); err != nil {
 			return err
 		}
 		// The sandbox joins the environment's group.
@@ -106,16 +186,21 @@ func (c *Controller) recordAttached(ctx context.Context, s *stepState, p *attach
 }
 
 // moveAttached moves an attached service to another sandbox: its process
-// in the old one stops (when that runs), the row starts over.
-func (c *Controller) moveAttached(ctx context.Context, v *view, a store.EnvAttached, p *attachedPlan) {
+// in the old one stops (when that runs), the row starts over, with the
+// new sandbox's incarnation when the service may use it.
+func (c *Controller) moveAttached(ctx context.Context, v *view, a store.EnvAttached, p *attachedPlan, sb store.Sandbox, found bool) {
 	c.stopAttached(ctx, v, a)
+	inc := uuid.Nil
+	if found && attachedUsable(v.env, store.EnvAttached{SandboxID: p.sandbox}, sb) {
+		inc = sb.Incarnation
+	}
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockAttached(ctx, v.env.ID, a.Service, store.ForUpdate)
 		if err != nil {
 			return err
 		}
 		after := cur
-		after.SandboxID, after.SandboxIncarnation, after.ProcessID, after.TemplateHash = p.sandbox, uuid.Nil, "", ""
+		after.SandboxID, after.SandboxIncarnation, after.ProcessID, after.TemplateHash = p.sandbox, inc, "", ""
 		after.Phase, after.ReadySince, after.Restarts, after.LastExit = model.PhaseStarting, time.Time{}, 0, nil
 		after.ProbeFailures, after.NextRestartAt, after.HostsWritten, after.Detail = 0, time.Time{}, "", ""
 		if _, err := tx.UpdateAttached(ctx, cur, after); err != nil {
@@ -131,10 +216,11 @@ func (c *Controller) moveAttached(ctx context.Context, v *view, a store.EnvAttac
 // stopAttached stops an attached service's process and takes its name
 // out of the sandbox's hosts block, when the sandbox runs (a paused one is
 // not woken: its process does not survive a cold restore, and a resumed
-// one is found by the supervisor no more).
+// one is found by the supervisor no more) and the service may use it (a
+// sandbox gone, or now another one under its ID, is left alone).
 func (c *Controller) stopAttached(ctx context.Context, v *view, a store.EnvAttached) {
-	sb, err := c.st.GetSandbox(ctx, a.SandboxID)
-	if err != nil || !steady(sb) || c.d.Runner == nil || !c.connected(sb.Node) {
+	sb, ok := c.usableSandbox(ctx, v.env, a)
+	if !ok || !steady(sb) || c.d.Runner == nil || !c.connected(sb.Node) {
 		return
 	}
 	l := lease(sb)
@@ -213,6 +299,16 @@ func (c *Controller) wakeAttached(ctx context.Context, envID uuid.UUID, service 
 		return
 	}
 	c.pool.run(ctx, "attached/"+attachedKey(envID, service), func(ctx context.Context) {
+		// Never wake a sandbox the service may not use.
+		env, err := c.st.GetEnvironment(ctx, envID)
+		if err != nil {
+			return
+		}
+		if a, err := c.st.GetAttached(ctx, envID, service); err != nil || a.SandboxID != sandboxID {
+			return
+		} else if _, ok := c.usableSandbox(ctx, env, a); !ok {
+			return
+		}
 		l, release, err := c.d.Engine.Acquire(ctx, sandboxID, model.HoldExec)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -263,13 +359,14 @@ func (c *Controller) backoff(n int) time.Duration {
 }
 
 // superviseAttached is one look of the supervisor at an attached service
-// in its running sandbox, with the sandbox's lease (§4.6): a new
-// incarnation of the sandbox resets the service; a changed template stops
-// the old process; a process that is gone counts as an exit, restarted
-// after the backoff; a working directory that does not exist yet keeps it
-// starting; a running process is checked (readiness) and the sandbox's
-// hosts block written. wait: wait for another look in flight instead of
-// leaving it to that one.
+// in its running sandbox, with the sandbox's lease (§4.6), when the
+// service may use the sandbox (attachedUsable: a sandbox of another
+// incarnation is another sandbox, never the service's; the reconcile step
+// fails the service): a changed template stops the old process; a process
+// that is gone counts as an exit, restarted after the backoff; a working
+// directory that does not exist yet keeps it starting; a running process
+// is checked (readiness) and the sandbox's hosts block written. wait:
+// wait for another look in flight instead of leaving it to that one.
 func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attachedPlan, sb store.Sandbox, l model.Lease, wait bool) {
 	if c.d.Runner == nil {
 		return
@@ -282,17 +379,11 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 	}
 	defer mu.Unlock()
 	a, err := c.st.GetAttached(ctx, v.env.ID, p.name)
-	if err != nil || a.SandboxID != sb.ID {
+	if err != nil || !attachedUsable(v.env, a, sb) || l.SandboxID != sb.ID || l.Incarnation != sb.Incarnation {
 		return
 	}
 	after := a
 	now := c.dbNow(ctx)
-	if a.SandboxIncarnation != uuid.Nil && a.SandboxIncarnation != sb.Incarnation {
-		// A new incarnation of the sandbox: its process is gone, and so is
-		// what the old one counted.
-		after.Restarts, after.NextRestartAt, after.ProbeFailures, after.HostsWritten = 0, time.Time{}, 0, ""
-		after.ProcessID, after.Phase, after.ReadySince, after.SandboxIncarnation = "", model.PhaseStarting, time.Time{}, uuid.Nil
-	}
 	if after.ProcessID != "" && after.TemplateHash != p.hash {
 		if err := c.d.Runner.StopProcessDetached(ctx, l, after.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) {
 			after.Detail = "stop the old process: " + err.Error()

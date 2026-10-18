@@ -6,7 +6,6 @@ package ctl
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"time"
 
@@ -90,7 +89,7 @@ func (c *Controller) instanceLog(ctx context.Context, sb store.Sandbox, lines in
 		sb.ClientState == model.StatePausing || sb.ClientState == model.StateHibernating:
 		return nil, ErrPaused
 	case sb.ClientState != model.StateRunning || sb.Node == "":
-		return nil, fmt.Errorf("the instance is %s: no log to read", sb.ClientState)
+		return nil, notRunning("the instance is %s: no log to read", sb.ClientState)
 	}
 	return c.containerLog(ctx, lease(sb), lines)
 }
@@ -121,19 +120,20 @@ func (c *Controller) jobLog(ctx context.Context, v *view, name string, lines int
 // processLog is an attached service's process log.
 func (c *Controller) processLog(ctx context.Context, v *view, name string, lines int) ([]string, string, error) {
 	a, ok := v.attached[name]
-	if !ok || a.ProcessID == "" {
+	if !ok {
 		return []string{}, SourceProcess, nil
 	}
-	sb, err := c.st.GetSandbox(ctx, a.SandboxID)
-	if err != nil {
-		return nil, "", err
-	}
+	sb, ok := c.usableSandbox(ctx, v.env, a)
 	switch {
+	case !ok:
+		return nil, "", notRunning("%s: no log to read", goneDetail(a.SandboxID))
+	case a.ProcessID == "":
+		return []string{}, SourceProcess, nil
 	case sb.ClientState == model.StatePaused || sb.ClientState == model.StateHibernated ||
 		sb.ClientState == model.StatePausing || sb.ClientState == model.StateHibernating:
 		return nil, "", ErrPaused
 	case !steady(sb):
-		return nil, "", fmt.Errorf("sandbox %s is %s: no log to read", sb.ID, sb.ClientState)
+		return nil, "", notRunning("sandbox %s is %s: no log to read", sb.ID, sb.ClientState)
 	case c.d.Runner == nil:
 		return nil, "", errors.New("process logs need the tools' runner, which this instance lacks")
 	}
@@ -250,7 +250,11 @@ func (c *Controller) restartAttached(ctx context.Context, v *view, name string) 
 	if !ok {
 		return nil
 	}
-	if sb, err := c.st.GetSandbox(ctx, a.SandboxID); err == nil && steady(sb) && a.ProcessID != "" && c.d.Runner != nil {
+	sb, usable := c.usableSandbox(ctx, v.env, a)
+	if !usable {
+		return notRunning("%s: no process to restart", goneDetail(a.SandboxID))
+	}
+	if steady(sb) && a.ProcessID != "" && c.d.Runner != nil {
 		if err := c.d.Runner.StopProcessDetached(ctx, lease(sb), a.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) {
 			return err
 		}

@@ -14,14 +14,25 @@ import (
 // The environment controller's queries (internal/env/ctl) beyond the
 // basic reads and writes of the env_*.go files.
 
+// attachedUsable is the condition under which an attached service a of
+// environment e may use the sandbox s it names (§13.5): s is a sandbox of
+// e's owner, not an instance row, and the incarnation a recorded (any,
+// while it recorded none). A sandbox ID that was deleted and created
+// again, by another tenant or the same, is not the one the service was
+// attached to.
+const attachedUsable = `s.owner = e.owner AND s.environment_id IS NULL
+	AND (a.sandbox_incarnation IS NULL OR a.sandbox_incarnation = s.incarnation)`
+
 // EnvCtlMembers returns the members of an environment's security group:
 // the addresses of its instance rows (any state, until the row is gone)
-// and of the sandboxes its attached services run in, without the empty
-// ones, distinct and sorted. The caller keeps the IPv6 ones.
+// and of the sandboxes its attached services may use (attachedUsable),
+// without the empty ones, distinct and sorted. The caller keeps the IPv6
+// ones.
 func (s *Store) EnvCtlMembers(ctx context.Context, envID uuid.UUID) ([]string, error) {
 	rows, err := s.q.Query(ctx, `SELECT address FROM sandboxes WHERE environment_id = $1 AND address <> ''
-		UNION SELECT s.address FROM env_attached a JOIN sandboxes s ON s.id = a.sandbox_id
-			WHERE a.env_id = $1 AND s.address <> ''
+		UNION SELECT s.address FROM env_attached a JOIN environments e ON e.id = a.env_id
+			JOIN sandboxes s ON s.id = a.sandbox_id
+			WHERE a.env_id = $1 AND s.address <> '' AND `+attachedUsable+`
 		ORDER BY 1`, envID)
 	if err != nil {
 		return nil, err
@@ -115,9 +126,11 @@ func (s *Store) EnvCtlRunningJobRuns(ctx context.Context, envID uuid.UUID) ([]En
 }
 
 // EnvCtlWithAttached returns the IDs of the environments whose attached
-// services run in the sandbox, sorted.
+// services run in the sandbox and may use it (attachedUsable), sorted.
 func (s *Store) EnvCtlWithAttached(ctx context.Context, sandboxID uuid.UUID) ([]uuid.UUID, error) {
-	rows, err := s.q.Query(ctx, `SELECT DISTINCT env_id FROM env_attached WHERE sandbox_id = $1 ORDER BY env_id`, sandboxID)
+	rows, err := s.q.Query(ctx, `SELECT DISTINCT a.env_id FROM env_attached a JOIN environments e ON e.id = a.env_id
+			JOIN sandboxes s ON s.id = a.sandbox_id
+		WHERE a.sandbox_id = $1 AND `+attachedUsable+` ORDER BY a.env_id`, sandboxID)
 	if err != nil {
 		return nil, err
 	}

@@ -225,7 +225,7 @@ func (c *Controller) probe(ctx context.Context) error {
 				continue
 			}
 			sb, err := c.st.GetSandbox(ctx, a.SandboxID)
-			if err != nil || !steady(sb) || !c.connected(sb.Node) {
+			if err != nil || !attachedUsable(v.env, a, sb) || !steady(sb) || !c.connected(sb.Node) {
 				continue
 			}
 			if !run(func() {
