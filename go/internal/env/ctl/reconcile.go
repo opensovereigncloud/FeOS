@@ -525,7 +525,7 @@ func (c *Controller) stepRemoved(ctx context.Context, s *stepState) {
 			// Gone from its node once no pod holds it: env-volumes would
 			// see to it within its interval.
 			if len(v.rowsOf(spec.KindAddon, name)) == 0 {
-				if err := c.deleteVolume(ctx, vol); err != nil && ctx.Err() == nil {
+				if _, err := c.deleteVolume(ctx, vol); err != nil && ctx.Err() == nil {
 					c.rl.warn("remove", "cannot delete a removed addon's volume", "environment", v.env.ID, "addon", name, "err", err)
 				}
 			}

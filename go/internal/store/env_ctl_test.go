@@ -162,6 +162,20 @@ func TestEnvCtlQueries(t *testing.T) {
 	if n, _ := s.EnvCtlMarkVolumesDeleting(bg, env.ID); n != 0 {
 		t.Fatalf("marked again %d", n)
 	}
+	// A touched volume goes to the end of the deleting ones.
+	if _, err := s.InsertEnvVolume(bg, store.EnvVolume{EnvID: env.ID, Object: "addon/kv", VolumeID: uuid.New(), SizeMiB: 256,
+		Deleting: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnvCtlTouchVolume(bg, env.ID, "addon/pg"); err != nil {
+		t.Fatal(err)
+	}
+	if vols, err := s.DeletingEnvVolumes(bg, 10); err != nil || len(vols) != 2 || vols[0].Object != "addon/kv" {
+		t.Fatalf("deleting volumes %+v %v", vols, err)
+	}
+	if err := s.EnvCtlTouchVolume(bg, env.ID, "addon/none"); err != store.ErrNoRow {
+		t.Fatalf("touch a volume that is not there: %v", err)
+	}
 
 	// Which environments and sandboxes exist.
 	gone := uuid.New()

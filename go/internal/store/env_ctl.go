@@ -94,6 +94,20 @@ func (s *Store) EnvCtlMarkVolumesDeleting(ctx context.Context, envID uuid.UUID) 
 	return ct.RowsAffected(), err
 }
 
+// EnvCtlTouchVolume sets a volume's updated_at to now(), so that one that
+// waits goes to the end of DeletingEnvVolumes's order; ErrNoRow when it is
+// gone.
+func (s *Store) EnvCtlTouchVolume(ctx context.Context, envID uuid.UUID, object string) error {
+	ct, err := s.q.Exec(ctx, `UPDATE env_volumes SET updated_at = now() WHERE env_id = $1 AND object = $2`, envID, object)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNoRow
+	}
+	return nil
+}
+
 // EnvCtlStarved returns the instance rows of the environment that have
 // been pending without capacity (a description beginning "no capacity")
 // for at least after, by the database's clock: their ids and

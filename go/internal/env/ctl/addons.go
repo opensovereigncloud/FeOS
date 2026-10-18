@@ -163,6 +163,16 @@ func (c *Controller) newAddon(ctx context.Context, s *stepState, p *addonPlan, v
 			}
 		}
 		if vol.Provisioned {
+			// Its data is on its node: a node that was removed never has it
+			// again, and a row pinned there would never place.
+			if gone, err := c.nodeGone(ctx, vol.Node); err != nil || gone {
+				if gone && !v.isOpen(p.object(), model.ConditionVolumeUnavailable) {
+					c.incident(ctx, v.env.ID, p.object(), v.targetNum, model.ConditionVolumeUnavailable,
+						fmt.Sprintf("addon %s's volume is on node %s, which was removed", p.name, vol.Node), evidence{})
+				}
+				s.wait("addon %s: its volume's node %s was removed", p.name, vol.Node)
+				return
+			}
 			pin = vol.Node
 		}
 	}

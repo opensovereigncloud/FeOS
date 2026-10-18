@@ -5,6 +5,7 @@ package ctl
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"sync"
@@ -17,9 +18,11 @@ import (
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
+	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -301,4 +304,59 @@ func TestAddonMovesWithDrain(t *testing.T) {
 	}
 	_ = n1
 	h.waitRows(env.ID, spec.KindAddon, "cache", 1, 30*time.Second, "ready on n2", ready)
+}
+
+// removeNode removes a node as the admin API does with force: its row
+// stays, marked removed, its certificates revoked, its connections closed.
+func (h *harness) removeNode(name string) {
+	h.t.Helper()
+	if err := h.st.InTx(bg, func(tx *store.Store) error {
+		if _, err := tx.LockNode(bg, name, store.ForUpdate); err != nil {
+			return err
+		}
+		if _, err := tx.RemoveNode(bg, name); err != nil {
+			return err
+		}
+		return tx.Notify(bg, db.ChanLeader, "*")
+	}); err != nil {
+		h.t.Fatal(err)
+	}
+	eventually(h.t, 30*time.Second, "node "+name+" disconnected", func() bool { return !h.srv.Connected(name) })
+}
+
+// A removed node never serves its volumes again: an addon whose row went
+// is not pinned there again (volume_unavailable), and a deleting tenant's
+// environment and the tenant are deleted although their volume was on it.
+func TestVolumeOfRemovedNode(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	h.removeNode("n1")
+	if _, _, err := h.eng.Delete(bg, "", first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.incident(env.ID, "addon/cache", model.ConditionVolumeUnavailable, 30*time.Second)
+	never(t, 3*time.Second, "an addon row pinned to the removed node", func() bool {
+		return len(h.rowsOf(env.ID, spec.KindAddon, "cache")) != 0
+	})
+
+	if _, err := h.st.MarkTenantDeleting(bg, testTenant); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 60*time.Second, "the environment gone", func() bool {
+		_, err := h.st.GetEnvironment(bg, env.ID)
+		return errors.Is(err, store.ErrNoRow)
+	})
+	var n int
+	if err := h.d.Pool.QueryRow(bg, `SELECT count(*) FROM env_volumes`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("%d volume rows stay, %v", n, err)
+	}
+	// Nothing of the environment holds the tenant's deletion (the engine's
+	// loop deletes it within its own interval).
+	if deleted, err := h.st.DeleteTenantIfEmpty(bg, testTenant); err != nil || !deleted {
+		t.Errorf("the tenant was not deleted: %v", err)
+	}
 }
