@@ -104,6 +104,7 @@ func (c *Controller) step(ctx context.Context, envID uuid.UUID) error {
 	c.stepRemoved(ctx, s)
 	c.stepRetiring(ctx, s)
 	c.stepStarved(ctx, s)
+	c.logPending(v, s.pending)
 	switch {
 	case s.failed || !rolling(v):
 	case len(s.pending) == 0:
@@ -112,6 +113,22 @@ func (c *Controller) step(ctx context.Context, envID uuid.UUID) error {
 		return c.setReason(ctx, v, s.reason)
 	}
 	return nil
+}
+
+// logPending logs what a rolling release waits for, when that changed.
+func (c *Controller) logPending(v *view, pending []string) {
+	if !rolling(v) {
+		return
+	}
+	text := strings.Join(pending, "; ")
+	key := "pending/" + v.env.ID.String()
+	c.mu.Lock()
+	last, ok := c.lastPending[key]
+	c.lastPending[key] = text
+	c.mu.Unlock()
+	if !ok || last != text {
+		c.log.Debug("the release waits", "environment", v.env.ID, "release", v.latest.Number, "for", text)
+	}
 }
 
 // startRollout moves R from pending to rolling.

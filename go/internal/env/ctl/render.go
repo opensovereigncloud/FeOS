@@ -52,8 +52,15 @@ func (p *podPlan) why() string {
 	return p.wait
 }
 
-// finish hashes the template and labels it.
+// minPodMemoryMiB is the least memory a sandbox row has
+// (sandboxes.memory_mib's CHECK, --default-memory-mib's floor): a spec's
+// or a plan's smaller size (128 MiB, valkey's and nats's dev plans) gets
+// a pod of this size.
+const minPodMemoryMiB = 256
+
+// finish sizes the pod, hashes the template and labels it.
 func (p *podPlan) finish(envID uuid.UUID) {
+	p.memoryMB = max(p.memoryMB, minPodMemoryMiB)
 	p.template.Labels = nil
 	p.hash = p.template.Hash(p.image, p.vcpus, p.memoryMB)
 	p.template.Labels = map[string]string{

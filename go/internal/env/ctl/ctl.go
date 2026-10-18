@@ -223,6 +223,9 @@ type Controller struct {
 	// provisionFailed holds when an addon instance's provisioning failed
 	// last, for provisionRetry.
 	provisionFailed map[uuid.UUID]time.Time
+	// lastPending is what each rolling release waited for at its last
+	// step, for logPending.
+	lastPending map[string]string
 }
 
 // New returns the controller of an instance.
@@ -243,7 +246,7 @@ func New(deps Deps) (*Controller, error) {
 	log := deps.Log.With("component", "env-ctl")
 	c := &Controller{d: deps, st: st, log: log, rl: newRateLog(log), t: defaultTimings(),
 		specs: newSpecCache(), seen: map[string]*seenState{}, locks: map[string]*sync.Mutex{},
-		provisionFailed: map[uuid.UUID]time.Time{}}
+		provisionFailed: map[uuid.UUID]time.Time{}, lastPending: map[string]string{}}
 	c.pool = newPool(poolWorkers, log)
 	c.bg, c.cancelBg = context.WithCancel(context.Background())
 	return c, nil
