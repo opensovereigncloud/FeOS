@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -20,8 +21,10 @@ import (
 	"github.com/google/uuid"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
+	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/ports"
 	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
@@ -520,4 +523,139 @@ func TestScaleUpBudget(t *testing.T) {
 		rows := h.rows(env.ID)
 		return len(rows) == 1 && rows[0].Sandbox.ID == kept.Sandbox.ID && ready(rows[0])
 	})
+}
+
+// busyPorts is a port door whose probes find every probe slot taken while
+// busy is set.
+type busyPorts struct {
+	envdeps.Ports
+	busy atomic.Bool
+}
+
+func (p *busyPorts) Probe(ctx context.Context, l model.Lease, port int, path string) (int, error) {
+	if p.busy.Load() {
+		return 0, ports.ErrProbeBusy
+	}
+	return p.Ports.Probe(ctx, l, port, path)
+}
+
+func (p *busyPorts) DialPod(ctx context.Context, l model.Lease, port int) (net.Conn, error) {
+	if p.busy.Load() {
+		return nil, ports.ErrProbeBusy
+	}
+	return p.Ports.DialPod(ctx, l, port)
+}
+
+// A check that finds every probe slot of its sandbox taken has no verdict
+// (§13.3): a ready instance stays ready, its failures and detail as they
+// were, even with a failure threshold of 1.
+func TestProbeBusyIsInconclusive(t *testing.T) {
+	door := &busyPorts{}
+	h := newHarness(t, options{ports: func(p envdeps.Ports) envdeps.Ports {
+		door.Ports = p
+		return door
+	}})
+	n1 := h.addNode("n1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", `,"readiness":{"http":{"port":"http","path":"/"},"period":"1s","failureThreshold":1}`))
+	row := h.waitRows(env.ID, spec.KindService, "web", 1, 30*time.Second, "running", running)[0]
+	n1.Script().SetPodPortAddr(row.Sandbox.ID, 8080, strings.TrimPrefix(srv.URL, "http://"))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	door.busy.Store(true)
+	never(t, 4*time.Second, "a busy probe counted", func() bool {
+		inst, err := h.st.GetEnvInstance(bg, row.Sandbox.ID)
+		return err != nil || inst.Phase != model.PhaseReady || inst.ProbeFailures != 0 || inst.Detail != ""
+	})
+}
+
+// An addon whose address changes (restored on another node) gives its
+// dependents a new template: they roll as for a change of T, surge 1,
+// without a new release.
+func TestAddonAddressRollsDependents(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	addon := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	// n1 takes no other pod: the service goes to n2.
+	h.exec(`UPDATE nodes SET slots = 1 WHERE name = 'n1'`)
+	h.addNode("n2")
+	r2 := h.apply(env.ID, fmt.Sprintf(`{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev"}},
+		"services":{"web":{"image":%q,"env":{"CACHE":{"addon":"cache","key":"url"}}}}}`, testImage))
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 60*time.Second)
+	web := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	if web.Sandbox.Node != "n2" {
+		t.Fatalf("web on %s", web.Sandbox.Node)
+	}
+
+	var mu sync.Mutex
+	maxLive, gap := 0, false
+	stop, watched := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(watched)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			rows, err := h.st.ListEnvInstanceRows(bg, env.ID)
+			if err != nil {
+				continue
+			}
+			live, readyWeb, retiring := 0, 0, false
+			for _, r := range rows {
+				if r.Instance.Object != "web" {
+					continue
+				}
+				if r.Instance.Phase == model.PhaseRetiring {
+					retiring = true
+					continue
+				}
+				live++
+				if r.Instance.Phase == model.PhaseReady {
+					readyWeb++
+				}
+			}
+			mu.Lock()
+			maxLive = max(maxLive, live)
+			gap = gap || (retiring && readyWeb == 0)
+			mu.Unlock()
+		}
+	}()
+	h.exec("UPDATE nodes SET draining = true, drain_started_at = now() WHERE name = 'n1'")
+	var moved store.EnvInstanceRow
+	eventually(t, 90*time.Second, "the addon on n2 with a new address", func() bool {
+		h.c.notify(bg, "drain")
+		rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+		if len(rows) != 1 || rows[0].Sandbox.Node != "n2" || !running(rows[0]) || rows[0].Sandbox.Address == "" {
+			return false
+		}
+		moved = rows[0]
+		return true
+	})
+	if moved.Sandbox.ID != addon.Sandbox.ID || moved.Sandbox.Address == addon.Sandbox.Address {
+		t.Fatalf("the addon after the drain %+v, before %+v", moved.Sandbox, addon.Sandbox)
+	}
+	eventually(t, 60*time.Second, "web rolled to the new address", func() bool {
+		rows := h.rowsOf(env.ID, spec.KindService, "web")
+		if len(rows) != 1 || rows[0].Sandbox.ID == web.Sandbox.ID || !ready(rows[0]) {
+			return false
+		}
+		p := h.pod("n2", rows[0].Sandbox.ID)
+		return p != nil && strings.Contains(p.Spec.Containers[0].Env["CACHE"], "["+moved.Sandbox.Address+"]")
+	})
+	close(stop)
+	<-watched
+	mu.Lock()
+	if maxLive > 2 || gap {
+		t.Errorf("at most %d web instances at once (want 2), a gap without a ready one %v", maxLive, gap)
+	}
+	mu.Unlock()
+	if e, _ := h.st.GetEnvironment(bg, env.ID); e.Release != r2 || e.Realised != r2 {
+		t.Errorf("environment %+v", e)
+	}
 }
