@@ -6,6 +6,7 @@ package env
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -622,6 +623,16 @@ func TestLogsRestartRunJob(t *testing.T) {
 		{ctl.ErrNoObject, http.StatusNotFound, "no such object: service/x"},
 		{ctl.ErrPaused, http.StatusConflict, "paused"},
 		{ctl.ErrNoContainerLogs, http.StatusNotImplemented, "this node does not serve container logs yet"},
+		{fmt.Errorf("an op ensure of instance i2 is in flight: %w", model.ErrBusy), http.StatusConflict,
+			"service x is busy with another operation; try again shortly"},
+		{fmt.Errorf("sandbox s: %w", model.ErrNotFound), http.StatusConflict, "service x is not running: its sandbox is gone"},
+		{fmt.Errorf("lock: %w", store.ErrNoRow), http.StatusConflict, "service x changed meanwhile; try again"},
+		{errors.New("the instance is pending: no log to read"), http.StatusConflict, "the instance is pending: no log to read"},
+		{errors.New("job x cannot run yet: addon pg has no address yet"), http.StatusConflict, "job x cannot run yet"},
+		{errors.New("the environment is being deleted"), http.StatusConflict, "the environment is being deleted"},
+		{errors.New("the tenant is being deleted"), http.StatusConflict, "the tenant is being deleted"},
+		{errors.New("process logs need the tools' runner, which this instance lacks"), http.StatusServiceUnavailable,
+			"process logs need the tools' runner"},
 		{errors.New("boom"), http.StatusInternalServerError, "boom"},
 	} {
 		wantStatus(t, ctlError(c.err, spec.KindService, "x"), c.status, c.msg)
@@ -859,5 +870,59 @@ func TestApplyRacesDeleteSecret(t *testing.T) {
 	}
 	if e := h.env("stage"); e.Release != 1 {
 		t.Fatalf("release %d was made", e.Release)
+	}
+}
+
+// The controller's refusals of expected states answer 409 with a code,
+// never 500: a restart while an op is in flight (Retry-After), a job that
+// cannot run yet, the log of an instance that does not run.
+func TestControllerRefusals(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	e := h.env("stage")
+	h.putSecret("stage", "token", "x")
+	sb := h.sandbox(tenantA, true)
+	h.apply("stage", previewSpec(sb), 0)
+	code := func(err error) string {
+		var ae *apierr.Error
+		if !errors.As(err, &ae) {
+			return ""
+		}
+		return ae.Code
+	}
+
+	// The migrate job's addon has no address yet.
+	err := h.svc.RunJob(ctx, tenantA, "stage", "migrate")
+	wantStatus(t, err, http.StatusConflict, "job migrate cannot run yet: ")
+	if code(err) != "not_ready" {
+		t.Fatalf("code %q", code(err))
+	}
+
+	// A pending instance has no log.
+	h.instance(e.ID, spec.KindService, "api", 0, 1, model.PhaseStarting, model.StatePending, "", "")
+	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "api", 0, 0)
+	wantStatus(t, err, http.StatusConflict, "the instance is pending: no log to read")
+	if code(err) != "not_running" {
+		t.Fatalf("code %q", code(err))
+	}
+	// Nor has an attached service whose sandbox is gone.
+	if _, err := h.st.InsertAttached(ctx, store.EnvAttached{EnvID: e.ID, Service: "dev", SandboxID: sb, ProcessID: "p1"}); err != nil {
+		t.Fatal(err)
+	}
+	h.exec("DELETE FROM sandboxes WHERE id = $1", sb)
+	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "dev", 0, 0)
+	wantStatus(t, err, http.StatusConflict, "service dev is not running: its sandbox is gone")
+
+	// The first replica has an op in flight.
+	h.eng.mu.Lock()
+	h.eng.restartErr = fmt.Errorf("an op ensure of instance i2 is in flight: %w", model.ErrBusy)
+	h.eng.mu.Unlock()
+	err = h.svc.RestartService(ctx, tenantA, "stage", "api")
+	wantStatus(t, err, http.StatusConflict, "service api is busy with another operation; try again shortly")
+	var ae *apierr.Error
+	if !errors.As(err, &ae) || ae.Code != "busy" || ae.Header.Get("Retry-After") != "5" {
+		t.Fatalf("busy %+v", ae)
 	}
 }
