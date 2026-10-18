@@ -15,7 +15,8 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
-// The placement gates of §9, in the order they are evaluated.
+// The placement gates of §9 and the pin of ADR 0018, numbered as they
+// came; the lists below evaluate them in their order.
 const (
 	gateStatus     = 1  // status ready
 	gateDraining   = 2  // not draining
@@ -30,16 +31,18 @@ const (
 	gateMemory     = 11 // booked memory within the total less the headroom
 	gateFreeMemory = 12 // live memory less the headroom
 	gateDisk       = 13 // live disk within the disk budget
+	gatePin        = 14 // create, start: the node the row is pinned to
 )
 
 // The gates of each check: a placement's snapshot, the claim of a create
 // or restore under the node's lock, the admission on a pinned node (start,
 // resume), and a booking that reality makes (syncBooking).
 var (
-	placementGates = []int{gateStatus, gateDraining, gateForked, gateConnected, gateTombstone, gateAvoid, gateTAP,
+	placementGates = []int{gateStatus, gatePin, gateDraining, gateForked, gateConnected, gateTombstone, gateAvoid, gateTAP,
 		gateStore, gateSlots, gateCPU, gateMemory, gateFreeMemory, gateDisk}
-	claimGates    = []int{gateStatus, gateDraining, gateForked, gateConnected, gateTombstone, gateTAP, gateStore, gateSlots, gateCPU, gateMemory}
-	admitGates    = []int{gateStatus, gateDraining, gateForked, gateConnected, gateSlots, gateCPU, gateMemory}
+	claimGates = []int{gateStatus, gatePin, gateDraining, gateForked, gateConnected, gateTombstone, gateTAP, gateStore,
+		gateSlots, gateCPU, gateMemory}
+	admitGates    = []int{gateStatus, gatePin, gateDraining, gateForked, gateConnected, gateSlots, gateCPU, gateMemory}
 	capacityGates = []int{gateSlots, gateCPU, gateMemory}
 )
 
@@ -55,6 +58,7 @@ type gateInput struct {
 
 	pod             uuid.UUID
 	vcpus, memMiB   int64
+	pin             string // the only node a create or start may go to; "": any
 	avoid           []string
 	restore         bool
 	checkpointStore string
@@ -99,6 +103,10 @@ func (in *gateInput) gate(g int) string {
 	case gateTombstone:
 		if in.tombstoned {
 			return "deleting an earlier pod of this ID"
+		}
+	case gatePin:
+		if in.pin != "" && n.Name != in.pin {
+			return "pinned to node " + in.pin + ": its volume is there"
 		}
 	case gateAvoid:
 		if slices.Contains(in.avoid, n.Name) {
@@ -245,13 +253,24 @@ func (e *Engine) place(ctx context.Context, sb store.Sandbox, kind OpKind) (plac
 	return p, nil
 }
 
-// gateInput is the pod's side of the gates for a sandbox's op on node.
+// gateInput is the pod's side of the gates for a sandbox's op on node. A
+// pinned row's create and start go only to its pin_node (an addon's
+// volume is there); its restore goes anywhere, since the checkpoint
+// carries the volume. A pinned row avoids no node: a create that failed
+// on its only node must not lock it out of it.
 func (e *Engine) gateInput(sb store.Sandbox, kind OpKind, n store.Node) gateInput {
-	return gateInput{
+	in := gateInput{
 		node: n, connected: e.conns.Connected(n.Name), pod: sb.ID,
 		vcpus: int64(sb.VCPUs), memMiB: int64(sb.MemoryMiB), avoid: sb.AvoidNodes,
 		restore: kind == OpRestore, checkpointStore: sb.CheckpointStore, diskBudget: e.cfg.DiskBudget,
 	}
+	if sb.PinNode != "" {
+		in.avoid = nil
+		if kind == OpCreate || kind == OpStart {
+			in.pin = sb.PinNode
+		}
+	}
+	return in
 }
 
 // claim rechecks the gates of an op's begin on the target node, whose row

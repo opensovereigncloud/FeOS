@@ -501,6 +501,10 @@ var sandboxWritable = []sandboxColumn{
 	plainColumn("policy_failed", false, func(s *Sandbox) string { return s.PolicyFailed }),
 	plainColumn("policy_failures", false, func(s *Sandbox) int { return s.PolicyFailures }),
 	timeColumn("policy_not_before", false, func(s *Sandbox) time.Time { return s.PolicyNotBefore }),
+	plainColumn("pin_node", false, func(s *Sandbox) string { return s.PinNode }),
+	{name: "idle_after_s", equal: func(a, b *Sandbox) bool { return sameIntPtr(a.IdleAfterS, b.IdleAfterS) },
+		value: func(s *Sandbox) any { return s.IdleAfterS }},
+	plainColumn("address", false, func(s *Sandbox) string { return s.Address }),
 }
 
 // sandboxFixed lists the columns UpdateSandbox refuses to change.
@@ -731,13 +735,14 @@ func (s *Store) LostGrace(ctx context.Context, grace time.Duration, limit int) (
 				AND (n.status = 'removed' OR (n.status = 'down' AND n.down_since < now() - $1::interval))
 			ORDER BY s.id LIMIT $2 FOR UPDATE OF s SKIP LOCKED),
 		old AS (SELECT s.id, s.node, s.status_description,
-				s.checkpoint_head <> '' AS checkpoint, s.checkpoint_head <> '' OR s.materialised AS kept
+				s.checkpoint_head <> '' AS checkpoint, s.checkpoint_head <> '' OR s.materialised AS kept,
+				s.address <> '' AND `+groupMember+` AS member
 			FROM sandboxes s JOIN c ON c.id = s.id)
 		UPDATE sandboxes s SET
 			client_state = CASE WHEN old.checkpoint THEN 'hibernated' WHEN old.kept THEN 'lost' ELSE 'pending' END,
 			node = CASE WHEN old.kept THEN s.node END,
 			lost_from = CASE WHEN old.kept THEN s.node END,
-			pending_since = NULL,
+			pending_since = NULL, address = '',
 			status_description = 'node ' || n.name || ' down since ' || `+nodeDownSince+`
 				|| CASE WHEN old.checkpoint THEN '; restored from the checkpoint of '
 					|| `+rfc3339("coalesce(s.checkpoint_at, now())")+` || ' on the next use'
@@ -745,17 +750,25 @@ func (s *Store) LostGrace(ctx context.Context, grace time.Duration, limit int) (
 				ELSE '; its pod was never seen there; created on the next use' END,
 			gen = s.gen + 1, updated_at = now()
 		FROM c, nodes n, old WHERE s.id = c.id AND old.id = s.id AND n.name = s.node
-		RETURNING s.id, s.owner, old.node, s.client_state, s.run_id, old.status_description`, interval(grace), limit)
+		RETURNING s.id, s.owner, old.node, s.client_state, s.run_id, old.status_description, old.member`, interval(grace), limit)
 	if err != nil {
 		return nil, err
 	}
+	members := false
 	lost, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (LostRow, error) {
 		var l LostRow
-		err := r.Scan(&l.ID, &l.Owner, &l.Node, &l.State, &l.RunID, &l.Previous)
+		var member bool
+		err := r.Scan(&l.ID, &l.Owner, &l.Node, &l.State, &l.RunID, &l.Previous, &member)
+		members = members || member
 		return l, err
 	})
 	if err != nil || len(lost) == 0 {
 		return lost, err
+	}
+	if members {
+		if err := s.Notify(ctx, db.ChanLeader, HintEnvGroups); err != nil {
+			return nil, err
+		}
 	}
 	ids := make([]uuid.UUID, len(lost))
 	for i, l := range lost {
@@ -787,13 +800,25 @@ func policyDue(policy string) string {
 	return "(s.policy_failed <> '" + policy + "' OR s.policy_not_before IS NULL OR s.policy_not_before <= now())"
 }
 
+// idleAfter is the idle pause's interval of a sandbox row s as SQL, with
+// $n the instance's --idle-pause (an interval): its idle_after_s, else
+// $n. idleOn is the condition under which s idles at all: not 0 (never).
+func idleAfter(n int) string {
+	return fmt.Sprintf("coalesce(make_interval(secs => s.idle_after_s), $%d::interval)", n)
+}
+
+func idleOn(n int) string {
+	return fmt.Sprintf("coalesce(s.idle_after_s > 0, $%d::interval > interval '0')", n)
+}
+
 // IdleSandboxes returns up to limit running sandboxes without an op on one
-// of nodes whose last_active_at is older than idle, that have no live
-// hold of any kind and that no failed idle pause backs off, the least
-// recently active first.
+// of nodes whose last_active_at is older than their idle interval (their
+// idle_after_s, or idle for a row without one; 0 never idles), that have
+// no live hold of any kind and that no failed idle pause backs off, the
+// least recently active first.
 func (s *Store) IdleSandboxes(ctx context.Context, idle time.Duration, nodes []string, limit int) ([]Sandbox, error) {
 	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
-		WHERE s.client_state = 'running' AND s.op = '' AND s.last_active_at < now() - $1::interval
+		WHERE s.client_state = 'running' AND s.op = '' AND `+idleOn(1)+` AND s.last_active_at < now() - `+idleAfter(1)+`
 			AND s.node = ANY($2) AND `+policyDue(PolicyIdle)+`
 			AND NOT EXISTS (SELECT 1 FROM sandbox_holds h WHERE h.sandbox_id = s.id AND h.lease_until > now())
 		ORDER BY s.last_active_at LIMIT $3`, interval(idle), nonNil(nodes), limit))

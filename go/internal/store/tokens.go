@@ -144,14 +144,15 @@ func (s *Store) DeleteSandboxToken(ctx context.Context, sandboxID uuid.UUID, has
 }
 
 // ResolveSandboxToken returns the sandbox and owner of a token hash,
-// ignoring a tenant being deleted; model.ErrUnknownToken when there is
-// none.
+// ignoring a tenant being deleted and an environment's instance row (the
+// sandbox doors treat it as absent; it has no token of its own);
+// model.ErrUnknownToken when there is none.
 func (s *Store) ResolveSandboxToken(ctx context.Context, hash string) (uuid.UUID, string, error) {
 	var id uuid.UUID
 	var owner string
 	err := s.q.QueryRow(ctx, `SELECT t.sandbox_id, s.owner FROM sandbox_tokens t
 		JOIN sandboxes s ON s.id = t.sandbox_id JOIN tenants n ON n.id = s.owner
-		WHERE t.hash = $1 AND n.deleting_at IS NULL`, hash).Scan(&id, &owner)
+		WHERE t.hash = $1 AND n.deleting_at IS NULL AND s.environment_id IS NULL`, hash).Scan(&id, &owner)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, "", model.ErrUnknownToken
 	}

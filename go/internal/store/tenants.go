@@ -117,11 +117,13 @@ func (s *Store) MarkTenantDeleting(ctx context.Context, id string) (bool, error)
 	return true, err
 }
 
-// DeleteTenantIfEmpty removes the tenant when it has no sandboxes left. It
-// reports whether it did.
+// DeleteTenantIfEmpty removes the tenant when it has no sandboxes and no
+// environments left (the environments' controller deletes those of a
+// deleting tenant). It reports whether it did.
 func (s *Store) DeleteTenantIfEmpty(ctx context.Context, id string) (bool, error) {
 	tag, err := s.q.Exec(ctx, `DELETE FROM tenants WHERE id = $1
-		AND NOT EXISTS (SELECT 1 FROM sandboxes WHERE owner = $1)`, id)
+		AND NOT EXISTS (SELECT 1 FROM sandboxes WHERE owner = $1)
+		AND NOT EXISTS (SELECT 1 FROM environments WHERE owner = $1)`, id)
 	return tag.RowsAffected() > 0, err
 }
 
