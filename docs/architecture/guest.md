@@ -170,7 +170,10 @@ reaps.
   from the end), or all of it with `tail`, then with `follow` what the
   container appends, until the container is deleted or the caller ends
   the call. A line goes out without its newline, one over 64 KiB in
-  parts; the source of a line is not known.
+  parts; the source of a line is not known. A tail counts each part as
+  a line, and cuts a line that reaches further back than the parts asked
+  for, so that its last parts are 64 KiB each; a follow sends a last line
+  that stays unfinished for a second as it is.
 
 ## Power
 
