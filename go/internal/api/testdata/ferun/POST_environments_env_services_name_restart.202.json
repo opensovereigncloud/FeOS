@@ -1,0 +1,9 @@
+{
+  "method": "POST",
+  "path": "/api/v1/environments/expensa-stage/services/expense-service/restart",
+  "query": {},
+  "status": 202,
+  "request": null,
+  "response": null,
+  "note": "no body; image: one replica at a time; attached: its process, never the sandbox"
+}

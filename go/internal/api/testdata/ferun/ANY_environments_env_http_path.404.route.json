@@ -1,0 +1,13 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-prod/http/admin",
+  "query": {},
+  "status": 404,
+  "request": null,
+  "response": "no route for /admin\n",
+  "headers": {
+    "Authorization": "Bearer <route token>"
+  },
+  "responseContentType": "text/plain; charset=utf-8",
+  "note": "an environment whose routes have no '/' route"
+}

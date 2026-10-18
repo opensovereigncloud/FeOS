@@ -1,0 +1,30 @@
+{
+  "method": "POST",
+  "path": "/api/v1/environments/expensa-stage/clone",
+  "query": {},
+  "status": 422,
+  "request": {
+    "name": "expensa-demo",
+    "release": 6,
+    "data": true
+  },
+  "response": {
+    "error": "the spec has 2 errors, the first: data: copying data is not available",
+    "code": "invalid_spec",
+    "findings": [
+      {
+        "severity": "error",
+        "path": "data",
+        "problem": "copying data is not available",
+        "remedy": "clone without data; the addons start empty"
+      },
+      {
+        "severity": "error",
+        "path": "services.approval-service.env.APPROVAL_INTERNAL_TOKEN",
+        "problem": "the new environment has no secret internal-token",
+        "remedy": "pass secrets: {\"internal-token\": {\"copy\": true}} or a value"
+      }
+    ]
+  },
+  "note": "without spec: the source release's spec (attached services dropped with an info finding each); a secret the new environment would not have is reported once, at its first reference"
+}

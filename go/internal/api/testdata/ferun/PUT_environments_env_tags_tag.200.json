@@ -1,0 +1,16 @@
+{
+  "method": "PUT",
+  "path": "/api/v1/environments/expensa-stage/tags/v1.4",
+  "query": {},
+  "status": 200,
+  "request": {
+    "release": 7,
+    "author": "fecode:0193a000-aaaa-7bbb-8ccc-000000000002"
+  },
+  "response": {
+    "tag": "v1.4",
+    "release": 7,
+    "movedBy": "fecode:0193a000-aaaa-7bbb-8ccc-000000000002",
+    "movedAt": "2026-10-18T14:09:30Z"
+  }
+}
