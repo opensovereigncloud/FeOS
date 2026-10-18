@@ -42,6 +42,43 @@ func TestEnvCtlQueries(t *testing.T) {
 	if envs, err := s.EnvCtlWithAttached(bg, sbx.ID); err != nil || !slices.Equal(envs, []uuid.UUID{env.ID}) {
 		t.Fatalf("attached to %v %v", envs, err)
 	}
+	// A sandbox the attached service may not use is neither a member nor
+	// attached: another tenant's, an instance row, or another incarnation
+	// than the one the service recorded.
+	mkTenant(t, s, "evil")
+	foreign := mkSandbox(t, s, "evil")
+	exec(t, s, `UPDATE sandboxes SET address = 'fd00::7' WHERE id = $1`, foreign.ID)
+	if _, err := s.InsertAttached(bg, store.EnvAttached{EnvID: env.ID, Service: "api", SandboxID: foreign.ID}); err != nil {
+		t.Fatal(err)
+	}
+	exec(t, s, `UPDATE sandboxes SET address = 'fd00::8' WHERE id = $1`, b.ID)
+	if _, err := s.InsertAttached(bg, store.EnvAttached{EnvID: other.ID, Service: "inst", SandboxID: b.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := s.EnvCtlMembers(bg, env.ID); err != nil || !slices.Equal(m, []string{"fd00::2", "fd00::8", "fd00::9"}) {
+		t.Fatalf("members with a foreign sandbox attached %v %v", m, err)
+	}
+	if m, err := s.EnvCtlMembers(bg, other.ID); err != nil || len(m) != 0 {
+		t.Fatalf("members with an instance row attached %v %v", m, err)
+	}
+	if envs, err := s.EnvCtlWithAttached(bg, foreign.ID); err != nil || len(envs) != 0 {
+		t.Fatalf("a foreign sandbox attached to %v %v", envs, err)
+	}
+	if envs, err := s.EnvCtlWithAttached(bg, b.ID); err != nil || len(envs) != 0 {
+		t.Fatalf("an instance row attached to %v %v", envs, err)
+	}
+	exec(t, s, `UPDATE env_attached SET sandbox_incarnation = $2 WHERE env_id = $1 AND service = 'web'`, env.ID, uuid.New())
+	if m, err := s.EnvCtlMembers(bg, env.ID); err != nil || !slices.Equal(m, []string{"fd00::2", "fd00::8"}) {
+		t.Fatalf("members with another incarnation recorded %v %v", m, err)
+	}
+	if envs, err := s.EnvCtlWithAttached(bg, sbx.ID); err != nil || len(envs) != 0 {
+		t.Fatalf("another incarnation attached to %v %v", envs, err)
+	}
+	exec(t, s, `UPDATE env_attached SET sandbox_incarnation = $2 WHERE env_id = $1 AND service = 'web'`, env.ID, sbx.Incarnation)
+	if envs, err := s.EnvCtlWithAttached(bg, sbx.ID); err != nil || !slices.Equal(envs, []uuid.UUID{env.ID}) {
+		t.Fatalf("its incarnation attached to %v %v", envs, err)
+	}
+	exec(t, s, `DELETE FROM env_attached WHERE service IN ('api', 'inst')`)
 	if rows, err := s.EnvCtlSandboxes(bg, env.ID); err != nil || len(rows) != 2 {
 		t.Fatalf("instance rows %v %v", rows, err)
 	}
@@ -124,6 +161,28 @@ func TestEnvCtlQueries(t *testing.T) {
 	}
 	if n, _ := s.EnvCtlMarkVolumesDeleting(bg, env.ID); n != 0 {
 		t.Fatalf("marked again %d", n)
+	}
+	// A touched volume goes to the end of the deleting ones.
+	if _, err := s.InsertEnvVolume(bg, store.EnvVolume{EnvID: env.ID, Object: "addon/kv", VolumeID: uuid.New(), SizeMiB: 256,
+		Deleting: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnvCtlTouchVolume(bg, env.ID, "addon/pg"); err != nil {
+		t.Fatal(err)
+	}
+	if vols, err := s.DeletingEnvVolumes(bg, 10); err != nil || len(vols) != 2 || vols[0].Object != "addon/kv" {
+		t.Fatalf("deleting volumes %+v %v", vols, err)
+	}
+	if err := s.EnvCtlTouchVolume(bg, env.ID, "addon/none"); err != store.ErrNoRow {
+		t.Fatalf("touch a volume that is not there: %v", err)
+	}
+	kv, _ := s.GetEnvVolume(bg, env.ID, "addon/kv")
+	byID, err := s.EnvCtlVolumesByID(bg, []uuid.UUID{kv.VolumeID, uuid.New()})
+	if err != nil || len(byID) != 1 || byID[kv.VolumeID].Object != "addon/kv" {
+		t.Fatalf("volumes by id %+v %v", byID, err)
+	}
+	if byID, err := s.EnvCtlVolumesByID(bg, nil); err != nil || len(byID) != 0 {
+		t.Fatalf("volumes by no id %+v %v", byID, err)
 	}
 
 	// Which environments and sandboxes exist.

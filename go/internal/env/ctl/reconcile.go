@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -67,7 +68,7 @@ type stepState struct {
 	// jobsDone: the release jobs of T succeeded (or T is not rolling).
 	jobsDone bool
 	// pending lists what the rolling release still waits for.
-	pending []string
+	pending []pending
 	// reason is shown on a rolling release that cannot go on ("secrets
 	// need --secret-key-file"); "" for none.
 	reason string
@@ -75,8 +76,25 @@ type stepState struct {
 	failed bool
 }
 
-func (s *stepState) wait(format string, args ...any) {
-	s.pending = append(s.pending, fmt.Sprintf(format, args...))
+// pending is one thing a rolling release waits for: the object ("" for
+// none) and what of it.
+type pending struct {
+	object, text string
+}
+
+// wait records that the release waits for object (format and args say
+// what of it).
+func (s *stepState) wait(object, format string, args ...any) {
+	s.pending = append(s.pending, pending{object: object, text: fmt.Sprintf(format, args...)})
+}
+
+// texts are what the pending say.
+func (s *stepState) texts() []string {
+	out := make([]string, len(s.pending))
+	for i, p := range s.pending {
+		out[i] = p.text
+	}
+	return out
 }
 
 // rolling reports whether T is R and R is pending or rolling: its jobs
@@ -104,14 +122,82 @@ func (c *Controller) step(ctx context.Context, envID uuid.UUID) error {
 	c.stepRemoved(ctx, s)
 	c.stepRetiring(ctx, s)
 	c.stepStarved(ctx, s)
-	c.logPending(v, s.pending)
+	c.logPending(v, s.texts())
 	switch {
 	case s.failed || !rolling(v):
 	case len(s.pending) == 0:
 		return c.realise(ctx, v)
+	case s.reason == "" && c.pastDeadline(v):
+		return c.failLate(ctx, s)
 	case s.reason != v.latest.Reason:
 		return c.setReason(ctx, v, s.reason)
 	}
+	return nil
+}
+
+// deadline is how long R may roll (§13.5): the longest of T's image
+// services' rollout budgets, of T's release jobs' attempts (timeout ×
+// (retries+1)), and the floor (10 minutes).
+func (c *Controller) deadline(v *view) time.Duration {
+	d := c.t.releaseDeadline
+	for _, svc := range v.target.Services {
+		if runtimeOf(svc) == spec.RuntimeImage {
+			d = max(d, rolloutOf(svc))
+		}
+	}
+	for _, j := range v.target.Jobs {
+		if jobOn(j) == spec.JobOnRelease {
+			d = max(d, jobTimeout(j)*time.Duration(max(j.Retries, 0)+1))
+		}
+	}
+	return d
+}
+
+// pastDeadline reports whether R has rolled longer than its deadline.
+func (c *Controller) pastDeadline(v *view) bool {
+	return !v.latest.StartedAt.IsZero() && v.now.After(v.latest.StartedAt.Add(c.deadline(v)))
+}
+
+// failLate fails a rolling R past its deadline (rollout_failed), naming
+// the first object it still waits for; the evidence has what it waits
+// for and the details of those objects' instances, credentials redacted.
+// A release that waits for addons or jobs, or for a scale-up without
+// capacity, would otherwise roll forever.
+func (c *Controller) failLate(ctx context.Context, s *stepState) error {
+	v := s.v
+	first := s.pending[0]
+	for _, p := range s.pending {
+		if p.object != "" {
+			first = p
+			break
+		}
+	}
+	var secrets []string
+	for _, name := range slices.Sorted(maps.Keys(v.target.Addons)) {
+		secrets = append(secrets, c.addonSecrets(ctx, v, name)...)
+	}
+	waits := map[string]bool{}
+	var ev evidence
+	for _, p := range s.pending {
+		ev.Pending = append(ev.Pending, redact(p.text, secrets))
+		waits[p.object] = true
+	}
+	for _, r := range v.rows {
+		if obj := objectName(r.Instance.Kind, r.Instance.Object); waits[obj] && r.Instance.Detail != "" {
+			ev.Pending = append(ev.Pending, redact(fmt.Sprintf("%s replica %d: %s", obj, r.Instance.Replica, r.Instance.Detail), secrets))
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(v.attached)) {
+		if a := v.attached[name]; waits[objectName(spec.KindService, name)] && a.Detail != "" {
+			ev.Pending = append(ev.Pending, redact(fmt.Sprintf("service/%s: %s", name, a.Detail), secrets))
+		}
+	}
+	ev.Diff = c.releaseDiff(ctx, v)
+	reason := redact(fmt.Sprintf("release %d did not roll out within %s: %s", v.latest.Number, c.deadline(v), first.text), secrets)
+	if err := c.failRelease(ctx, v, reason, first.object, model.ConditionRolloutFailed, ev); err != nil {
+		return err
+	}
+	s.failed = true
 	return nil
 }
 
@@ -172,7 +258,8 @@ func (c *Controller) setReason(ctx context.Context, v *view, reason string) erro
 
 // realise marks R realised (§4.3 step 7): the environment's realised
 // release, older realised and pending ones superseded, the open
-// rollout_failed and job_failed incidents of older releases closed.
+// rollout_failed, job_failed and crash_loop incidents of older releases
+// closed (every instance of R is ready).
 func (c *Controller) realise(ctx context.Context, v *view) error {
 	n := v.latest.Number
 	return c.fenced(ctx, func(tx *store.Store) error {
@@ -211,7 +298,8 @@ func (c *Controller) realise(ctx context.Context, v *view) error {
 			model.ReleaseRolling); err != nil {
 			return err
 		}
-		if _, err := tx.EnvCtlCloseIncidents(ctx, env.ID, n, model.ConditionRolloutFailed, model.ConditionJobFailed); err != nil {
+		if _, err := tx.EnvCtlCloseIncidents(ctx, env.ID, n, model.ConditionRolloutFailed, model.ConditionJobFailed,
+			model.ConditionCrashLoop); err != nil {
 			return err
 		}
 		c.log.Info("release realised", "environment", env.ID, "release", n)
@@ -253,7 +341,7 @@ func (c *Controller) failRelease(ctx context.Context, v *view, reason, object, c
 func (c *Controller) releaseDiff(ctx context.Context, v *view) []spec.DiffEntry {
 	var prev *spec.Spec
 	if v.env.Realised > 0 {
-		prev, _ = c.releaseSpec(ctx, v.env.ID, v.env.Realised)
+		prev, _ = c.releaseSpec(ctx, v.env, v.env.Realised)
 	}
 	return spec.Diff(prev, v.latestSpec)
 }
@@ -437,7 +525,8 @@ func (c *Controller) stepRetiring(ctx context.Context, s *stepState) {
 		if r.Instance.Phase != model.PhaseRetiring {
 			continue
 		}
-		s.wait("%s replica %d is retiring", objectName(r.Instance.Kind, r.Instance.Object), r.Instance.Replica)
+		obj := objectName(r.Instance.Kind, r.Instance.Object)
+		s.wait(obj, "%s replica %d is retiring", obj, r.Instance.Replica)
 		if !r.Instance.RetireAt.IsZero() && s.v.now.Before(r.Instance.RetireAt) {
 			continue
 		}
@@ -500,7 +589,7 @@ func (c *Controller) stepRemoved(ctx context.Context, s *stepState) {
 			if _, ok := v.latestSpec.Addons[inst.Object]; ok {
 				continue
 			}
-			s.wait("addon %s is being removed", inst.Object)
+			s.wait(objectName(spec.KindAddon, inst.Object), "addon %s is being removed", inst.Object)
 			if err := c.deleteInstance(ctx, r.Sandbox); err != nil && ctx.Err() == nil {
 				c.rl.warn("remove", "cannot delete a removed addon's instance", "sandbox", r.Sandbox.ID, "err", err)
 			}
@@ -510,7 +599,8 @@ func (c *Controller) stepRemoved(ctx context.Context, s *stepState) {
 		c.rl.warn("remove", "cannot retire removed instances", "environment", v.env.ID, "err", err)
 	}
 	for _, r := range retire {
-		s.wait("%s is being removed", objectName(r.Instance.Kind, r.Instance.Object))
+		obj := objectName(r.Instance.Kind, r.Instance.Object)
+		s.wait(obj, "%s is being removed", obj)
 	}
 	// The removed addons' volumes and credentials.
 	for _, object := range slices.Sorted(maps.Keys(v.volumes)) {
@@ -525,7 +615,7 @@ func (c *Controller) stepRemoved(ctx context.Context, s *stepState) {
 			// Gone from its node once no pod holds it: env-volumes would
 			// see to it within its interval.
 			if len(v.rowsOf(spec.KindAddon, name)) == 0 {
-				if err := c.deleteVolume(ctx, vol); err != nil && ctx.Err() == nil {
+				if _, err := c.deleteVolume(ctx, vol); err != nil && ctx.Err() == nil {
 					c.rl.warn("remove", "cannot delete a removed addon's volume", "environment", v.env.ID, "addon", name, "err", err)
 				}
 			}
@@ -554,9 +644,48 @@ func (c *Controller) stepRemoved(ctx context.Context, s *stepState) {
 		if svc, ok := v.target.Services[name]; ok && runtimeOf(svc) == spec.RuntimeAttached {
 			continue
 		}
-		s.wait("attached service %s is being removed", name)
+		s.wait(objectName(spec.KindService, name), "attached service %s is being removed", name)
 		c.removeAttached(ctx, v, v.attached[name])
 	}
+	c.closeRemovedIncidents(ctx, v)
+}
+
+// closeRemovedIncidents closes the open crash_loop, volume_unavailable and
+// addon_unhealthy incidents of objects that neither T nor R has: nothing
+// closes them otherwise (no_capacity closes in stepStarved, rollout_failed
+// and job_failed on a realisation).
+func (c *Controller) closeRemovedIncidents(ctx context.Context, v *view) {
+	done := map[[2]string]bool{}
+	for _, i := range v.open {
+		switch i.Condition {
+		case model.ConditionCrashLoop, model.ConditionVolumeUnavailable, model.ConditionAddonUnhealthy:
+		default:
+			continue
+		}
+		k := [2]string{i.Object, i.Condition}
+		if done[k] || hasObject(v.target, i.Object) || hasObject(v.latestSpec, i.Object) {
+			continue
+		}
+		done[k] = true
+		c.closeIncidents(ctx, v, i.Object, i.Condition)
+	}
+}
+
+// hasObject reports whether a spec has an object ("<kind>/<name>").
+func hasObject(s *spec.Spec, object string) bool {
+	kind, name, _ := strings.Cut(object, "/")
+	switch kind {
+	case spec.KindService:
+		_, ok := s.Services[name]
+		return ok
+	case spec.KindAddon:
+		_, ok := s.Addons[name]
+		return ok
+	case spec.KindJob:
+		_, ok := s.Jobs[name]
+		return ok
+	}
+	return false
 }
 
 // purgeCredentials deletes the system secrets of addons that neither T

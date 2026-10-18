@@ -502,6 +502,9 @@ func (p *podService) bringUpPod(ctx context.Context, id string, pd *pod) {
 	} else {
 		pd.guestDown, pd.exited = false, nil
 		pd.info.State, pd.info.Reason = podv1.PodState_POD_STATE_RUNNING, ""
+		// A boot is a new microVM process, as on feosd.
+		p.nextPID++
+		pd.pid = p.nextPID
 		p.n.volumes.booted(id)
 	}
 	p.announceLocked(pd.info, false)
@@ -1196,15 +1199,18 @@ func (p *podService) restore(ctx context.Context, id, headKey string, cold bool)
 		p.mu.Unlock()
 		return nil, notFound(id)
 	}
+	// The volumes first, as feosd's restore takes them over before it
+	// places the pod: a refused restore leaves a hibernated pod without
+	// addresses.
+	if err := p.n.volumes.takeOver(id, c.volumes); err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
 	if hasNetwork(pd.info.Spec) {
 		if err := p.allocateLocked(pd.info); err != nil {
 			p.mu.Unlock()
 			return nil, err
 		}
-	}
-	if err := p.n.volumes.takeOver(id, c.volumes); err != nil {
-		p.mu.Unlock()
-		return nil, err
 	}
 	pd.info.Checkpoint = &podv1.Checkpoint{HeadKey: key, Epoch: c.epoch, Memory: c.memory}
 	p.mu.Unlock()
@@ -1223,7 +1229,12 @@ func (p *podService) restore(ctx context.Context, id, headKey string, cold bool)
 			p.setState(id, podv1.PodState_POD_STATE_FAILED, err.Error())
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
-		p.change(id, func(pd *pod) { pd.guestDown, pd.snapshot = false, false })
+		p.change(id, func(pd *pod) {
+			pd.guestDown, pd.snapshot = false, false
+			// A restore runs in a new microVM process.
+			p.nextPID++
+			pd.pid = p.nextPID
+		})
 		p.n.volumes.booted(id)
 		p.setState(id, podv1.PodState_POD_STATE_RUNNING, "")
 		out, err := p.get(id)
@@ -1244,7 +1255,9 @@ func (p *podService) restore(ctx context.Context, id, headKey string, cold bool)
 }
 
 // adopt records a pod the node does not have, hibernated, from its
-// checkpoint, which holds its spec.
+// checkpoint, which holds its spec, once its volumes are restorable here
+// (feosd's adopt_checkpoint checks them first: a restore that cannot take
+// its volumes leaves nothing on the node).
 func (p *podService) adopt(id, headKey string) error {
 	if headKey == "" {
 		return status.Errorf(codes.NotFound, "no pod %s: name its checkpoint's head to restore it here", id)
@@ -1265,6 +1278,9 @@ func (p *podService) adopt(id, headKey string) error {
 	defer p.mu.Unlock()
 	if p.pods[id] != nil {
 		return nil // another restore was faster
+	}
+	if err := p.n.volumes.restorable(id, c.volumes); err != nil {
+		return err
 	}
 	info := &podv1.PodInfo{
 		PodId:      id,

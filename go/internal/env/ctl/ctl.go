@@ -38,6 +38,7 @@ package ctl
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -89,7 +90,31 @@ var (
 	// logs (an older feosd answers Unimplemented): 501 "this node does not
 	// serve container logs yet".
 	ErrNoContainerLogs = errors.New("this node does not serve container logs yet")
+	// ErrNotRunning: what the call needs does not run, an expected state
+	// (409, never 500): an instance pending, stopped or failed has no log
+	// to read; an attached service's sandbox that is not running, gone or
+	// not the tenant's has no process to read or restart. The error's text
+	// says which. It wraps model.ErrNotRunning.
+	ErrNotRunning = fmt.Errorf("not running: %w", model.ErrNotRunning)
+	// ErrNotReady: the object cannot run yet, an expected state (409): a
+	// job whose template does not render ("job X cannot run yet: …").
+	ErrNotReady = errors.New("not ready")
 )
+
+// stateError is an answer for an expected state: its text as the caller
+// shows it, its kind (ErrNotRunning, …) for errors.Is.
+type stateError struct {
+	msg  string
+	kind error
+}
+
+func (e *stateError) Error() string { return e.msg }
+func (e *stateError) Unwrap() error { return e.kind }
+
+// notRunning is an ErrNotRunning with its own text.
+func notRunning(format string, args ...any) error {
+	return &stateError{msg: fmt.Sprintf(format, args...), kind: ErrNotRunning}
+}
 
 // The sources of LogTail's lines.
 const (
@@ -164,6 +189,9 @@ type timings struct {
 	// restartReady bounds how long RestartService waits for a restarted
 	// replica to be ready before it restarts the next.
 	restartReady time.Duration
+	// releaseDeadline is the least time a release may roll before it fails
+	// (§13.5: longer when its services' budgets or jobs need more).
+	releaseDeadline time.Duration
 }
 
 func defaultTimings() timings {
@@ -181,6 +209,7 @@ func defaultTimings() timings {
 		nodeCall:        10 * time.Second,
 		attachedReady:   time.Minute,
 		restartReady:    5 * time.Minute,
+		releaseDeadline: 10 * time.Minute,
 	}
 }
 
@@ -220,6 +249,11 @@ type Controller struct {
 	// lastPending is what each rolling release waited for at its last
 	// step, for logPending.
 	lastPending map[string]string
+	// exitRun is the microVM's pid at each instance's last recorded exit:
+	// a restart boots a new microVM, so the same pid with the container
+	// still exited is the same run, whose restart did not happen (a leader
+	// change forgets it: at most one exit too many).
+	exitRun map[uuid.UUID]int64
 }
 
 // New returns the controller of an instance.
@@ -240,7 +274,7 @@ func New(deps Deps) (*Controller, error) {
 	log := deps.Log.With("component", "env-ctl")
 	c := &Controller{d: deps, st: st, log: log, rl: newRateLog(log), t: defaultTimings(),
 		specs: newSpecCache(), seen: map[string]*seenState{}, locks: map[string]*sync.Mutex{},
-		provisionFailed: map[uuid.UUID]time.Time{}, lastPending: map[string]string{}}
+		provisionFailed: map[uuid.UUID]time.Time{}, lastPending: map[string]string{}, exitRun: map[uuid.UUID]int64{}}
 	c.pool = newPool(poolWorkers, log)
 	c.bg, c.cancelBg = context.WithCancel(context.Background())
 	return c, nil

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
+	"github.com/ironcore-dev/feos/go/internal/tools"
 )
 
 // processRoot is where the process scripts keep their records in a
@@ -51,8 +53,14 @@ func hostProcesses(n *testnode.Node, root string) {
 // API gives it) and brings it up.
 func (h *harness) attachable() store.Sandbox {
 	h.t.Helper()
-	id := uuid.New()
-	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: testTenant, Image: testImage, ImageRef: testImage,
+	return h.attachableAs(testTenant, uuid.New())
+}
+
+// attachableAs makes an attachable sandbox of owner with the ID id and
+// brings it up.
+func (h *harness) attachableAs(owner string, id uuid.UUID) store.Sandbox {
+	h.t.Helper()
+	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: owner, Image: testImage, ImageRef: testImage,
 		VCPUs: 1, MemoryMiB: 512, PodTemplate: &model.PodTemplate{Command: []string{"sleep", "infinity"},
 			SecurityGroups: []string{model.SandboxGroupID(id)}}}); err != nil {
 		h.t.Fatal(err)
@@ -255,5 +263,209 @@ func TestAttachedWakesPausedSandbox(t *testing.T) {
 	never(t, 3*time.Second, "the probes woke the sandbox", func() bool {
 		s, _ := h.st.GetSandbox(bg, sb.ID)
 		return s.ClientState != model.StatePaused
+	})
+}
+
+// startLog counts the process starts the node ran, per pod.
+type startLog struct {
+	mu     sync.Mutex
+	starts map[uuid.UUID]int
+}
+
+func (l *startLog) count(pod uuid.UUID) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.starts[pod]
+}
+
+// hostProcessesCounting is hostProcesses that also counts the starts.
+func hostProcessesCounting(n *testnode.Node, root string) *startLog {
+	l := &startLog{starts: map[uuid.UUID]int{}}
+	n.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+		argv := req.Command
+		if len(argv) > 2 && argv[0] == "python3" {
+			start := strings.Contains(argv[2], "no such working directory")
+			argv[2] = strings.ReplaceAll(argv[2], processRoot, root)
+			if start {
+				l.mu.Lock()
+				l.starts[pod]++
+				l.mu.Unlock()
+				if len(argv) > 6 && argv[6] != "" {
+					argv[6] = filepath.Join(n.PodDir(pod), argv[6])
+				}
+			}
+		}
+		return 0, false, nil
+	})
+	return l
+}
+
+// An attached service's sandbox deleted and its ID taken by another
+// tenant's attachable sandbox: the service fails ("gone or not this
+// tenant's"); nothing starts in the new sandbox, no hosts block is written
+// there, it joins no group of the environment and its own group reaches
+// none; its logs and restarts answer ErrNotRunning.
+func TestAttachedSandboxReusedByAnotherTenant(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	starts := hostProcessesCounting(n1, t.TempDir())
+	sb := h.attachable()
+	env := h.newEnv("dev")
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"api":{"image":%q},
+		"web":{"runtime":"attached","sandbox":%q,"command":["sleep","60"]}}}`, testImage, sb.ID))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	a, err := h.st.GetAttached(bg, env.ID, "web")
+	if err != nil || a.ProcessID == "" || a.SandboxIncarnation != sb.Incarnation {
+		t.Fatalf("attached %+v %v", a, err)
+	}
+
+	// The tenant deletes its sandbox; another tenant takes its ID.
+	if _, _, err := h.eng.Delete(bg, testTenant, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "the sandbox's pod gone", func() bool { return h.pod("n1", sb.ID) == nil })
+	if _, _, err := h.st.CreateTenant(bg, "t2"); err != nil {
+		t.Fatal(err)
+	}
+	before := starts.count(sb.ID)
+	other := h.attachableAs("t2", sb.ID)
+	eventually(t, 30*time.Second, "the service failed", func() bool {
+		b, err := h.st.GetAttached(bg, env.ID, "web")
+		return err == nil && b.Phase == model.PhaseFailed && b.ProcessID == "" &&
+			b.Detail == fmt.Sprintf("sandbox %s is gone or not this tenant's", sb.ID)
+	})
+	never(t, 3*time.Second, "something happened in the other tenant's sandbox", func() bool {
+		hosts, _ := os.ReadFile(filepath.Join(n1.PodDir(sb.ID), "etc", "hosts"))
+		return starts.count(sb.ID) != before || strings.Contains(string(hosts), "ferun environment")
+	})
+	if b, _ := h.st.GetAttached(bg, env.ID, "web"); b.SandboxIncarnation != sb.Incarnation {
+		t.Errorf("the recorded incarnation changed: %+v", b)
+	}
+	// Groups: the other sandbox is no member of the environment's group,
+	// and its own group reaches no group of the environment.
+	if g, _, err := h.c.buildGroup(bg, model.EnvGroupID(env.ID)); err != nil || slices.Contains(g.Members, other.Address) {
+		t.Fatalf("the env group %v %v", g, err)
+	}
+	if g := h.group("n1", model.SandboxGroupID(sb.ID)); g == nil || slices.ContainsFunc(g.Rules, func(r *networkv1.Rule) bool {
+		return r.GetGroup() == model.EnvGroupID(env.ID)
+	}) {
+		t.Fatalf("the other sandbox's group %v", g)
+	}
+	eventually(t, 30*time.Second, "the node's env group without the other sandbox", func() bool {
+		h.c.notify(bg, HintGroups)
+		g := h.group("n1", model.EnvGroupID(env.ID))
+		return g != nil && !slices.Contains(g.Members, other.Address) && len(g.Members) == 1
+	})
+	if _, _, err := h.c.LogTail(bg, env.ID, spec.KindService, "web", 0, 5); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("logs of the gone sandbox: %v", err)
+	}
+	if err := h.c.RestartService(bg, env.ID, "web"); !errors.Is(err, ErrNotRunning) {
+		t.Errorf("a restart in the gone sandbox: %v", err)
+	}
+	if starts.count(sb.ID) != before {
+		t.Error("a process started in the other tenant's sandbox")
+	}
+}
+
+// runningNamed are the IDs of the sandbox's running processes named name.
+func (h *harness) runningNamed(sb store.Sandbox, name string) []string {
+	h.t.Helper()
+	ps, err := h.runner.ProcessesDetached(bg, lease(sb))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var out []string
+	for _, p := range ps {
+		if p.Running && p.Name == name {
+			out = append(out, p.ID)
+		}
+	}
+	return out
+}
+
+// An attached service's processes the row does not record never run on:
+// one with its name is stopped before a new one starts (a look whose
+// write was lost), one a look started but could not record is stopped at
+// once; a restart in a paused sandbox is refused (ErrPaused) instead of
+// leaving the process to survive the resume beside a new one.
+func TestAttachedStrayProcesses(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	hostProcesses(n1, t.TempDir())
+	sb := h.attachable()
+	env := h.newEnv("dev")
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"web":{"runtime":"attached","sandbox":%q,"command":["sleep","60"]}}}`, sb.ID))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	a, err := h.st.GetAttached(bg, env.ID, "web")
+	if err != nil || a.ProcessID == "" {
+		t.Fatalf("attached %+v %v", a, err)
+	}
+
+	// A row that lost its process's ID: the next start stops the process.
+	h.exec(`UPDATE env_attached SET process_id = '' WHERE env_id = $1 AND service = 'web'`, env.ID)
+	var b store.EnvAttached
+	eventually(t, 30*time.Second, "a new process", func() bool {
+		b, err = h.st.GetAttached(bg, env.ID, "web")
+		return err == nil && b.ProcessID != "" && b.ProcessID != a.ProcessID && b.Phase == model.PhaseReady
+	})
+	if got := h.runningNamed(sb, "ferun-env-dev-web"); !slices.Equal(got, []string{b.ProcessID}) {
+		t.Fatalf("running %v, the row records %s", got, b.ProcessID)
+	}
+
+	// A process a look started but could not record (the row moved).
+	orphan, err := h.runner.StartProcessDetached(bg, lease(sb), tools.ProcessStart{Argv: []string{"sleep", "60"}, Name: "orphan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := b
+	before.SandboxID = uuid.New()
+	after := before
+	after.ProcessID = orphan
+	h.c.writeAttached(bg, before, after, lease(sb))
+	if got := h.runningNamed(sb, "orphan"); len(got) != 0 {
+		t.Fatalf("the unrecorded process runs: %v", got)
+	}
+	if c, _ := h.st.GetAttached(bg, env.ID, "web"); c.ProcessID != b.ProcessID {
+		t.Fatalf("the row changed: %+v", c)
+	}
+
+	// A restart in a paused sandbox is refused and wakes nothing.
+	if err := h.eng.Pause(bg, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "paused", func() bool {
+		s, _ := h.st.GetSandbox(bg, sb.ID)
+		return s.ClientState == model.StatePaused && s.Op == ""
+	})
+	if err := h.c.RestartService(bg, env.ID, "web"); !errors.Is(err, ErrPaused) {
+		t.Fatalf("a restart in a paused sandbox: %v", err)
+	}
+	never(t, 3*time.Second, "the refused restart changed something", func() bool {
+		s, _ := h.st.GetSandbox(bg, sb.ID)
+		c, _ := h.st.GetAttached(bg, env.ID, "web")
+		return s.ClientState != model.StatePaused || c.ProcessID != b.ProcessID
+	})
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	if _, err := h.eng.Ensure(ctx, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.runningNamed(sb, "ferun-env-dev-web"); !slices.Equal(got, []string{b.ProcessID}) {
+		t.Fatalf("after the resume: running %v, the row records %s", got, b.ProcessID)
+	}
+	// Running again, the restart goes through: one new process.
+	if err := h.c.RestartService(bg, env.ID, "web"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "the restarted process", func() bool {
+		c, err := h.st.GetAttached(bg, env.ID, "web")
+		return err == nil && c.ProcessID != "" && c.ProcessID != b.ProcessID &&
+			slices.Equal(h.runningNamed(sb, "ferun-env-dev-web"), []string{c.ProcessID})
 	})
 }

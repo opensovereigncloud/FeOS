@@ -322,8 +322,15 @@ func TestApplyCheck(t *testing.T) {
 		t.Fatalf("threshold failures: %s", phase)
 	}
 	applyCheck(true, "", chk, now.Add(time.Second), &phase, &since, &failures, &detail)
-	if phase != model.PhaseReady || !since.Equal(now.Add(time.Second)) {
-		t.Fatalf("back: %s", phase)
+	if phase != model.PhaseReady || !since.Equal(now.Add(time.Second)) || detail != "" {
+		t.Fatalf("back: %s %q", phase, detail)
+	}
+	// A ready instance passing its checks keeps a detail the checks did
+	// not write (a failed provisioning's).
+	detail = "provisioning step provision exited 1"
+	applyCheck(true, "", chk, now.Add(2*time.Second), &phase, &since, &failures, &detail)
+	if phase != model.PhaseReady || detail != "provisioning step provision exited 1" {
+		t.Fatalf("a passing check of a ready instance: %s %q", phase, detail)
 	}
 }
 

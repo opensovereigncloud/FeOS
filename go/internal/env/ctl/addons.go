@@ -33,13 +33,26 @@ func (c *Controller) stepAddons(ctx context.Context, s *stepState) {
 }
 
 // stepAddon brings one addon up and reports whether it is ready and
-// provisioned.
+// provisioned. Before any (re)create onto an existing volume, the volume's
+// data decides (§13.5): a volume of another addon type is deleted first
+// (removal plus add: the data the warning said is deleted is), and a
+// version the blueprint refuses to run on the volume's data is never
+// started. While R failed, an addon whose row runs R's template stays as
+// R has it (fallbackAddon).
 func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a spec.Addon) bool {
 	v := s.v
 	obj := objectName(spec.KindAddon, name)
+	cur, hasCur := v.addonRow(name)
+	if hasCur && !v.targetIsLatest {
+		a = c.fallbackAddon(v, name, a, cur)
+	}
 	bp, ok := c.d.Blueprint(a.Type)
 	if !ok {
-		s.wait("addon %s: no addon type %q", name, a.Type)
+		s.wait(obj, "addon %s: no addon type %q", name, a.Type)
+		return false
+	}
+	if old, ok := v.volumes[volumeObject(name)]; ok && old.AddonType != "" && old.AddonType != a.Type {
+		c.replaceVolume(ctx, s, name, a.Type, old)
 		return false
 	}
 	addon := specAddon(bp, name, a)
@@ -47,40 +60,46 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 		if errors.Is(err, errNoSealer) {
 			s.reason = errNoSealer.Error()
 		}
-		s.wait("addon %s: its credentials: %v", name, err)
+		s.wait(obj, "addon %s: its credentials: %v", name, err)
 		return false
 	}
 	inst, err := bp.Render(addon, addons.Context{Env: v.env.Name, Name: name})
 	if err != nil {
-		s.wait("addon %s: %v", name, err)
+		s.wait(obj, "addon %s: %v", name, err)
 		return false
 	}
 	var vol *store.EnvVolume
 	if inst.Mount != "" {
 		got, err := c.addonVolume(ctx, v, bp, addon)
 		if err != nil {
-			s.wait("addon %s: its volume: %v", name, err)
+			s.wait(obj, "addon %s: its volume: %v", name, err)
 			return false
 		}
 		if got.Deleting {
-			s.wait("addon %s: its old volume is being deleted", name)
+			c.awaitVolume(ctx, v, name, got)
+			s.wait(obj, "addon %s: its old volume is being deleted", name)
 			return false
 		}
 		vol = &got
 	}
-	cur, hasCur := v.addonRow(name)
 	p := c.planAddon(v, name, a, vol, cur.Sandbox.Address)
 	s.addons[name] = p
 	if !p.ok() {
-		s.wait("addon %s: %s", name, p.why())
+		s.wait(obj, "addon %s: %s", name, p.why())
 		return false
 	}
-	if !hasCur {
-		c.newAddon(ctx, s, p, vol)
-		return false
-	}
-	if cur.Instance.TemplateHash != p.hash {
-		c.recreateAddon(ctx, s, p, cur, vol)
+	if !hasCur || cur.Instance.TemplateHash != p.hash {
+		if vol != nil {
+			if problem := c.dataRefusal(ctx, v, p, *vol, cur, hasCur); problem != "" {
+				c.refuseAddon(ctx, s, p, cur, hasCur, problem)
+				return false
+			}
+		}
+		if !hasCur {
+			c.newAddon(ctx, s, p, vol)
+		} else {
+			c.recreateAddon(ctx, s, p, cur, vol)
+		}
 		return false
 	}
 	c.keep(ctx, v, cur, 0)
@@ -93,7 +112,7 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 			c.incident(ctx, v.env.ID, obj, v.targetNum, model.ConditionVolumeUnavailable,
 				fmt.Sprintf("addon %s is lost with node %s, which has its volume", name, sb.LostFrom), evidence{})
 		}
-		s.wait("addon %s is lost", name)
+		s.wait(obj, "addon %s is lost", name)
 		return false
 	}
 	if vol != nil && vol.Provisioned && steady(sb) && (vol.Node != sb.Node || sb.PinNode != sb.Node) {
@@ -101,20 +120,173 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 		c.moveVolume(ctx, v, *vol, sb)
 	}
 	if cur.Instance.Phase != model.PhaseReady {
-		s.wait("addon %s is %s", name, cur.Instance.Phase)
+		s.wait(obj, "addon %s is %s", name, cur.Instance.Phase)
 		return false
 	}
 	c.closeIncidents(ctx, v, obj, model.ConditionVolumeUnavailable)
+	c.closeIncidents(ctx, v, obj, model.ConditionAddonUnhealthy)
+	if vol != nil && vol.DataVersion != p.addon.Version {
+		c.setDataVersion(ctx, v, *vol, p.addon.Version)
+	}
 	if cur.Instance.ProvisionedHash != p.stepsHash {
 		c.provision(ctx, v, p, cur)
-		s.wait("addon %s is being provisioned", name)
+		s.wait(obj, "addon %s is being provisioned", name)
 		return false
 	}
 	return true
 }
 
+// fallbackAddon is the addon a step keeps while R failed (T is the
+// realised release, §13.5): T's when the current row runs T's template;
+// R's when it runs R's (R recreated it before it failed), so that it is
+// kept, healed and provisioned as R has it, never recreated back (to an
+// older version than its data, or for a second downtime); else T's.
+func (c *Controller) fallbackAddon(v *view, name string, a spec.Addon, cur store.EnvInstanceRow) spec.Addon {
+	ra, ok := v.latestSpec.Addons[name]
+	if !ok {
+		return a
+	}
+	var vol *store.EnvVolume
+	if got, ok := v.volumes[volumeObject(name)]; ok {
+		vol = &got
+	}
+	if tp := c.planAddon(v, name, a, vol, cur.Sandbox.Address); tp.ok() && tp.hash == cur.Instance.TemplateHash {
+		return a
+	}
+	if rp := c.planAddon(v, name, ra, vol, cur.Sandbox.Address); rp.ok() && rp.hash == cur.Instance.TemplateHash {
+		return ra
+	}
+	return a
+}
+
+// dataRefusal is the problem of the first error finding of the
+// blueprint's Validate of the addon p against the data on its volume (the
+// version that wrote it, the plan and options the current row runs): ""
+// when the addon may run on it.
+func (c *Controller) dataRefusal(ctx context.Context, v *view, p *addonPlan, vol store.EnvVolume, cur store.EnvInstanceRow,
+	hasCur bool) string {
+	if vol.DataVersion == "" {
+		return ""
+	}
+	prev := p.addon
+	prev.Version = vol.DataVersion
+	if vol.AddonType != "" {
+		prev.Type = vol.AddonType
+	}
+	if hasCur {
+		if sp, err := c.releaseSpec(ctx, v.env, cur.Instance.Release); err == nil {
+			if ra, ok := sp.Addons[p.name]; ok && ra.Type == prev.Type {
+				ran := specAddon(p.bp, p.name, ra)
+				prev.Plan, prev.Options = ran.Plan, ran.Options
+			}
+		}
+	}
+	for _, f := range p.bp.Validate(&prev, p.addon) {
+		if f.Severity == spec.SeverityError {
+			return f.Problem
+		}
+	}
+	return ""
+}
+
+// refuseAddon leaves an addon as it runs when its target cannot run on
+// its volume's data: the current row stays (healed); a rolling R fails
+// (rollout_failed), else addon_unhealthy opens, the finding the reason.
+func (c *Controller) refuseAddon(ctx context.Context, s *stepState, p *addonPlan, cur store.EnvInstanceRow, hasCur bool,
+	problem string) {
+	v := s.v
+	reason := fmt.Sprintf("addon %s: %s", p.name, problem)
+	if hasCur {
+		c.heal(ctx, cur, false)
+	}
+	s.wait(p.object(), "%s", reason)
+	if rolling(v) {
+		if err := c.failRelease(ctx, v, reason, p.object(), model.ConditionRolloutFailed,
+			evidence{Diff: c.releaseDiff(ctx, v)}); err == nil {
+			s.failed = true
+		}
+		return
+	}
+	if !v.isOpen(p.object(), model.ConditionAddonUnhealthy) {
+		c.incident(ctx, v.env.ID, p.object(), v.targetNum, model.ConditionAddonUnhealthy, reason, evidence{})
+	}
+}
+
+// replaceVolume deletes the volume of an addon whose type changed, as a
+// removal would (§13.5): the volume is marked deleting and the old
+// credentials go in one transaction, the old instance goes, and the
+// volume once no pod holds it; the addon of the new type gets a new one.
+func (c *Controller) replaceVolume(ctx context.Context, s *stepState, name, typ string, vol store.EnvVolume) {
+	v := s.v
+	if !vol.Deleting {
+		err := c.fenced(ctx, func(tx *store.Store) error {
+			cur, err := tx.LockEnvVolume(ctx, v.env.ID, vol.Object, store.ForUpdate)
+			if err != nil {
+				return err
+			}
+			if cur.VolumeID != vol.VolumeID || cur.Deleting {
+				return nil
+			}
+			after := cur
+			after.Deleting = true
+			if _, err := tx.UpdateEnvVolume(ctx, cur, after); err != nil {
+				return err
+			}
+			_, err = tx.PurgeSecrets(ctx, v.env.ID, "addon."+name+".")
+			return err
+		})
+		if err != nil {
+			s.wait(objectName(spec.KindAddon, name), "addon %s: %v", name, err)
+			return
+		}
+		c.log.Info("an addon's type changed: its volume and credentials are deleted", "environment", v.env.ID, "addon", name,
+			"from", vol.AddonType, "to", typ, "volume", vol.VolumeID)
+	}
+	for _, r := range v.rowsOf(spec.KindAddon, name) {
+		if err := c.deleteInstance(ctx, r.Sandbox); err != nil && ctx.Err() == nil {
+			c.rl.warn("remove", "cannot delete an addon's old instance", "sandbox", r.Sandbox.ID, "err", err)
+		}
+	}
+	c.awaitVolume(ctx, v, name, vol)
+	s.wait(objectName(spec.KindAddon, name), "addon %s: its %s volume is being deleted", name, vol.AddonType)
+}
+
+// awaitVolume deletes an addon's volume marked deleting once its addon
+// has no row left (env-volumes would within its interval).
+func (c *Controller) awaitVolume(ctx context.Context, v *view, name string, vol store.EnvVolume) {
+	if len(v.rowsOf(spec.KindAddon, name)) > 0 {
+		return
+	}
+	if _, err := c.deleteVolume(ctx, vol); err != nil && ctx.Err() == nil {
+		c.rl.warn("volume", "cannot delete an addon's old volume", "environment", v.env.ID, "addon", name, "err", err)
+	}
+}
+
+// setDataVersion records the version an addon instance ran ready with on
+// its volume: the data's version from now on.
+func (c *Controller) setDataVersion(ctx context.Context, v *view, vol store.EnvVolume, version string) {
+	err := c.fenced(ctx, func(tx *store.Store) error {
+		cur, err := tx.LockEnvVolume(ctx, v.env.ID, vol.Object, store.ForUpdate)
+		if err != nil || cur.VolumeID != vol.VolumeID {
+			return err
+		}
+		after := cur
+		after.DataVersion = version
+		_, err = tx.UpdateEnvVolume(ctx, cur, after)
+		return err
+	})
+	if err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
+		c.rl.warn("volume", "cannot record a volume's data version", "environment", v.env.ID, "object", vol.Object, "err", err)
+		return
+	}
+	if err == nil {
+		c.log.Info("addon volume's data version", "environment", v.env.ID, "object", vol.Object, "version", version)
+	}
+}
+
 // addonVolume reads the addon's volume row, recording it with the plan's
-// size at its first creation (never resized).
+// size at its first creation (never resized), the addon's type (fixed)
+// and its version as the data's.
 func (c *Controller) addonVolume(ctx context.Context, v *view, bp addons.Blueprint, a addons.Addon) (store.EnvVolume, error) {
 	object := volumeObject(a.Name)
 	if vol, ok := v.volumes[object]; ok {
@@ -128,7 +300,7 @@ func (c *Controller) addonVolume(ctx context.Context, v *view, bp addons.Bluepri
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		var err error
 		out, err = tx.InsertEnvVolume(ctx, store.EnvVolume{EnvID: v.env.ID, Object: object, VolumeID: uuid.New(),
-			SizeMiB: plan.VolumeMib})
+			SizeMiB: plan.VolumeMib, AddonType: a.Type, DataVersion: a.Version})
 		return err
 	})
 	if errors.Is(err, store.ErrExists) {
@@ -150,7 +322,7 @@ func (c *Controller) newAddon(ctx context.Context, s *stepState, p *addonPlan, v
 	v := s.v
 	for _, r := range v.rowsOf(spec.KindAddon, p.name) {
 		if r.Instance.Phase == model.PhaseRetiring {
-			s.wait("addon %s: its old instance is being deleted", p.name)
+			s.wait(p.object(), "addon %s: its old instance is being deleted", p.name)
 			return
 		}
 	}
@@ -158,19 +330,29 @@ func (c *Controller) newAddon(ctx context.Context, s *stepState, p *addonPlan, v
 	if vol != nil {
 		if vol.Holder != uuid.Nil {
 			if held, err := c.stillHolds(ctx, vol.Holder); err != nil || held {
-				s.wait("addon %s: its old pod still holds its volume", p.name)
+				s.wait(p.object(), "addon %s: its old pod still holds its volume", p.name)
 				return
 			}
 		}
 		if vol.Provisioned {
+			// Its data is on its node: a node that was removed never has it
+			// again, and a row pinned there would never place.
+			if gone, err := c.nodeGone(ctx, vol.Node); err != nil || gone {
+				if gone && !v.isOpen(p.object(), model.ConditionVolumeUnavailable) {
+					c.incident(ctx, v.env.ID, p.object(), v.targetNum, model.ConditionVolumeUnavailable,
+						fmt.Sprintf("addon %s's volume is on node %s, which was removed", p.name, vol.Node), evidence{})
+				}
+				s.wait(p.object(), "addon %s: its volume's node %s was removed", p.name, vol.Node)
+				return
+			}
 			pin = vol.Node
 		}
 	}
 	if _, err := c.insertInstance(ctx, v, insert{plan: &p.podPlan, release: v.targetNum, pin: pin}); err != nil {
-		s.wait("addon %s: %v", p.name, err)
+		s.wait(p.object(), "addon %s: %v", p.name, err)
 		return
 	}
-	s.wait("addon %s is starting", p.name)
+	s.wait(p.object(), "addon %s is starting", p.name)
 }
 
 // stillHolds reports whether a row, or a tombstone of its pod, is left:
@@ -197,14 +379,14 @@ func (c *Controller) recreateAddon(ctx context.Context, s *stepState, p *addonPl
 	sb := cur.Sandbox
 	if c.heal(ctx, cur, false) {
 		c.ensure(ctx, sb.ID)
-		s.wait("addon %s is lost; it is recreated once it runs again", p.name)
+		s.wait(p.object(), "addon %s is lost; it is recreated once it runs again", p.name)
 		return
 	}
 	if !steady(sb) || !c.nodeReady(ctx, sb.Node) {
 		if sb.Op == "" && sb.ClientState != model.StateRunning {
 			c.ensure(ctx, sb.ID)
 		}
-		s.wait("addon %s: waits for its instance to run before it is recreated", p.name)
+		s.wait(p.object(), "addon %s: waits for its instance to run before it is recreated", p.name)
 		return
 	}
 	err := c.fenced(ctx, func(tx *store.Store) error {
@@ -237,14 +419,14 @@ func (c *Controller) recreateAddon(ctx context.Context, s *stepState, p *addonPl
 		return err
 	})
 	if err != nil {
-		s.wait("addon %s: %v", p.name, err)
+		s.wait(p.object(), "addon %s: %v", p.name, err)
 		return
 	}
 	c.log.Info("addon recreated", "environment", v.env.ID, "addon", p.name, "old", sb.ID, "node", sb.Node)
 	if err := c.deleteInstance(ctx, sb); err != nil && ctx.Err() == nil {
 		c.rl.warn("recreate", "cannot delete an addon's old instance", "sandbox", sb.ID, "err", err)
 	}
-	s.wait("addon %s is being recreated", p.name)
+	s.wait(p.object(), "addon %s is being recreated", p.name)
 }
 
 // moveVolume records that an addon's volume is on the node its instance

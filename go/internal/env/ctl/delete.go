@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -23,32 +24,133 @@ const volumesBatch = 64
 // volumesLoop is env-volumes: the volumes marked deleting go from their
 // nodes once no pod holds them (FAILED_PRECONDITION: later; NOT_FOUND:
 // done), then their rows. A volume never created on a node, or of a node
-// that is gone, only loses its row.
+// that is gone or removed, only loses its row. A volume that has to wait
+// goes to the end of the queue, so that those that wait long never hold
+// the batch. Then the copies left on nodes go (sweepVolumes).
 func (c *Controller) volumesLoop(ctx context.Context) error {
 	vols, err := c.st.DeletingEnvVolumes(ctx, volumesBatch)
 	if err != nil {
 		return err
 	}
-	var errs []error
+	errs := []error{c.sweepVolumes(ctx)}
 	for _, vol := range vols {
-		if err := c.deleteVolume(ctx, vol); err != nil && ctx.Err() == nil {
+		gone, err := c.deleteVolume(ctx, vol)
+		if err != nil && ctx.Err() == nil {
 			errs = append(errs, fmt.Errorf("volume %s of %s: %w", vol.VolumeID, vol.Object, err))
+		}
+		if !gone && ctx.Err() == nil {
+			if err := c.fenced(ctx, func(tx *store.Store) error {
+				return tx.EnvCtlTouchVolume(ctx, vol.EnvID, vol.Object)
+			}); err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
+				errs = append(errs, fmt.Errorf("volume %s of %s: %w", vol.VolumeID, vol.Object, err))
+			}
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// deleteVolume deletes one volume marked deleting.
-func (c *Controller) deleteVolume(ctx context.Context, vol store.EnvVolume) error {
-	if vol.Provisioned && vol.Node != "" {
-		_, err := c.st.GetNode(ctx, vol.Node)
+// sweepVolumes deletes, on each connected node, the records of
+// environments' volumes that no pod holds and that are not the volume as
+// its row has it: a volume whose row is gone (its addon or environment
+// was deleted while the record stayed elsewhere), or a copy on another
+// node than the row's (a restore elsewhere took the volume over, and the
+// node it left keeps a checkpointed record of it). DeleteVolume refuses a
+// volume a pod holds by then (FAILED_PRECONDITION: a later pass), so that
+// a restore or create that takes it meanwhile keeps it. A row not yet
+// provisioned keeps every record of its volume: its create may be in
+// flight.
+func (c *Controller) sweepVolumes(ctx context.Context) error {
+	if c.d.Conns == nil {
+		return nil
+	}
+	var errs []error
+	for _, node := range c.d.Conns.Nodes() {
+		if err := c.sweepNodeVolumes(ctx, node); err != nil && ctx.Err() == nil {
+			errs = append(errs, fmt.Errorf("node %s: %w", node, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// sweepNodeVolumes is sweepVolumes for one node.
+func (c *Controller) sweepNodeVolumes(ctx context.Context, node string) error {
+	lctx, cancel := context.WithTimeout(ctx, c.t.nodeCall)
+	defer cancel()
+	cc, err := c.conn(lctx, node)
+	if err != nil {
+		return err
+	}
+	vc := volumev1.NewVolumeServiceClient(cc)
+	list, err := vc.ListVolumes(lctx, &volumev1.ListVolumesRequest{})
+	if err != nil {
+		return err
+	}
+	var ids []uuid.UUID
+	for _, v := range list.GetVolumes() {
+		if v.GetLabels()[model.LabelEnvironment] == "" || v.GetPodId() != "" {
+			continue
+		}
+		if id, err := uuid.Parse(v.GetVolumeId()); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows, err := c.st.EnvCtlVolumesByID(ctx, ids)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, id := range ids {
+		vol, ok := rows[id]
+		why := "its row is gone"
 		switch {
-		case errors.Is(err, store.ErrNoRow):
-			// The node is gone, and its disks with it.
+		case !ok:
+		case vol.Provisioned && vol.Node != "" && vol.Node != node:
+			why = "the volume is on node " + vol.Node
+		default:
+			continue
+		}
+		dctx, dcancel := context.WithTimeout(ctx, c.t.nodeCall)
+		_, err := vc.DeleteVolume(dctx, &volumev1.DeleteVolumeRequest{VolumeId: id.String()})
+		dcancel()
+		switch status.Code(err) {
+		case codes.OK:
+			c.log.Info("a volume's record left on a node deleted", "node", node, "volume", id, "why", why)
+		case codes.NotFound, codes.FailedPrecondition:
+		default:
+			errs = append(errs, fmt.Errorf("delete volume %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// nodeGone reports whether a node will never serve its disks again: its
+// row is gone, or it was removed (a removed node is never deleted and
+// never connects again, and its disks are gone with it, as the engine's
+// DropRemovedNodeTombstones assumes).
+func (c *Controller) nodeGone(ctx context.Context, node string) (bool, error) {
+	n, err := c.st.GetNode(ctx, node)
+	switch {
+	case errors.Is(err, store.ErrNoRow):
+		return true, nil
+	case err != nil:
+		return false, err
+	}
+	return n.Status == model.NodeRemoved, nil
+}
+
+// deleteVolume deletes one volume marked deleting, and reports whether its
+// row went.
+func (c *Controller) deleteVolume(ctx context.Context, vol store.EnvVolume) (bool, error) {
+	if vol.Provisioned && vol.Node != "" {
+		gone, err := c.nodeGone(ctx, vol.Node)
+		switch {
 		case err != nil:
-			return err
+			return false, err
+		case gone:
+			c.log.Info("a volume's node is gone: its row goes without a node call", "environment", vol.EnvID,
+				"object", vol.Object, "volume", vol.VolumeID, "node", vol.Node)
 		case !c.connected(vol.Node):
-			return nil
+			return false, nil
 		default:
 			cctx, cancel := context.WithTimeout(ctx, c.t.nodeCall)
 			cc, err := c.conn(cctx, vol.Node)
@@ -59,9 +161,9 @@ func (c *Controller) deleteVolume(ctx context.Context, vol store.EnvVolume) erro
 			switch status.Code(err) {
 			case codes.OK, codes.NotFound:
 			case codes.FailedPrecondition:
-				return nil // a pod still holds it
+				return false, nil // a pod still holds it
 			default:
-				return err
+				return false, err
 			}
 		}
 	}
@@ -69,10 +171,11 @@ func (c *Controller) deleteVolume(ctx context.Context, vol store.EnvVolume) erro
 		_, err := tx.DeleteEnvVolume(ctx, vol.EnvID, vol.Object)
 		return err
 	})
-	if err == nil {
-		c.log.Info("volume deleted", "environment", vol.EnvID, "object", vol.Object, "volume", vol.VolumeID, "node", vol.Node)
+	if err != nil {
+		return false, err
 	}
-	return err
+	c.log.Info("volume deleted", "environment", vol.EnvID, "object", vol.Object, "volume", vol.VolumeID, "node", vol.Node)
+	return true, nil
 }
 
 // deleteBatch is how many deleting environments one env-delete pass
@@ -180,7 +283,7 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 		// The pods are going: their volumes may go too (env-volumes
 		// would, within its interval).
 		for _, vol := range vols {
-			if err := c.deleteVolume(ctx, vol); err != nil {
+			if _, err := c.deleteVolume(ctx, vol); err != nil {
 				return err
 			}
 		}

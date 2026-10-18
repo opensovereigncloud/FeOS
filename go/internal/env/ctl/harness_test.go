@@ -114,6 +114,8 @@ type options struct {
 	timings func(*timings)
 	// engine changes the engine's configuration.
 	engine func(*sandbox.Config)
+	// ports wraps the port door the controller probes through.
+	ports func(envdeps.Ports) envdeps.Ports
 }
 
 // testTimings are the controller's timings for the tests.
@@ -183,8 +185,12 @@ func newHarness(t *testing.T, o options) *harness {
 		}
 		h.sealer = sl
 	}
+	var door envdeps.Ports = h.door
+	if o.ports != nil {
+		door = o.ports(h.door)
+	}
 	h.c, err = New(Deps{InstanceID: id, DB: d, Elector: h.el, Conns: h.srv, Engine: testEngine{h.eng}, Runner: h.runner,
-		Ports: h.door, Sealer: h.sealer, Log: log})
+		Ports: door, Sealer: h.sealer, Log: log})
 	if err != nil {
 		t.Fatal(err)
 	}

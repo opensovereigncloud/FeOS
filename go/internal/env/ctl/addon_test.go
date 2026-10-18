@@ -5,9 +5,12 @@ package ctl
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,9 +20,11 @@ import (
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
+	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -299,6 +304,306 @@ func TestAddonMovesWithDrain(t *testing.T) {
 	if nv := n2.Volumes(); len(nv) != 1 || nv[0].PodId != first.Sandbox.ID.String() {
 		t.Errorf("n2's volumes %v", nv)
 	}
-	_ = n1
 	h.waitRows(env.ID, spec.KindAddon, "cache", 1, 30*time.Second, "ready on n2", ready)
+	// The record the volume left on n1 goes once n1's stale pod is gone.
+	eventually(t, 60*time.Second, "n1's record of the volume gone", func() bool {
+		h.c.notify(bg, LoopVolumes)
+		return len(n1.Volumes()) == 0
+	})
+	// The environment deleted, no record of its volume is left anywhere.
+	h.exec(`UPDATE environments SET deleting = true WHERE id = $1`, env.ID)
+	eventually(t, 60*time.Second, "the environment and its volume gone", func() bool {
+		h.c.notify(bg, LoopVolumes)
+		_, err := h.st.GetEnvironment(bg, env.ID)
+		return errors.Is(err, store.ErrNoRow) && len(n1.Volumes()) == 0 && len(n2.Volumes()) == 0
+	})
+}
+
+// removeNode removes a node as the admin API does with force: its row
+// stays, marked removed, its certificates revoked, its connections closed.
+func (h *harness) removeNode(name string) {
+	h.t.Helper()
+	if err := h.st.InTx(bg, func(tx *store.Store) error {
+		if _, err := tx.LockNode(bg, name, store.ForUpdate); err != nil {
+			return err
+		}
+		if _, err := tx.RemoveNode(bg, name); err != nil {
+			return err
+		}
+		return tx.Notify(bg, db.ChanLeader, "*")
+	}); err != nil {
+		h.t.Fatal(err)
+	}
+	eventually(h.t, 30*time.Second, "node "+name+" disconnected", func() bool { return !h.srv.Connected(name) })
+}
+
+// A removed node never serves its volumes again: an addon whose row went
+// is not pinned there again (volume_unavailable), and a deleting tenant's
+// environment and the tenant are deleted although their volume was on it.
+func TestVolumeOfRemovedNode(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	h.removeNode("n1")
+	if _, _, err := h.eng.Delete(bg, "", first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.incident(env.ID, "addon/cache", model.ConditionVolumeUnavailable, 30*time.Second)
+	never(t, 3*time.Second, "an addon row pinned to the removed node", func() bool {
+		return len(h.rowsOf(env.ID, spec.KindAddon, "cache")) != 0
+	})
+
+	if _, err := h.st.MarkTenantDeleting(bg, testTenant); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 60*time.Second, "the environment gone", func() bool {
+		_, err := h.st.GetEnvironment(bg, env.ID)
+		return errors.Is(err, store.ErrNoRow)
+	})
+	var n int
+	if err := h.d.Pool.QueryRow(bg, `SELECT count(*) FROM env_volumes`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("%d volume rows stay, %v", n, err)
+	}
+	// Nothing of the environment holds the tenant's deletion (the engine's
+	// loop deletes it within its own interval).
+	if deleted, err := h.st.DeleteTenantIfEmpty(bg, testTenant); err != nil || !deleted {
+		t.Errorf("the tenant was not deleted: %v", err)
+	}
+}
+
+// cacheServiceSpec is a valkey addon of version and a service web of
+// version (which a new template rolls).
+func cacheServiceSpec(valkey, web string) string {
+	return fmt.Sprintf(`{"addons":{"cache":{"type":"valkey","version":%q,"plan":"dev"}},
+		"services":{"web":{"image":%q,"command":["/app"],"env":{"VERSION":%q}}}}`, valkey, testImage, web)
+}
+
+// A release that upgraded an addon and then failed (a service's new
+// instance crashed) keeps the addon as it recreated it: T falls back to
+// the realised release, whose older version is never started again on
+// the data the newer one wrote, and the addon is not recreated a second
+// time; the volume records the version that ran on it.
+func TestFailedReleaseKeepsAddon(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, cacheServiceSpec("7.2", "1"))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	old := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	web := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	if vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache"); err != nil || vol.AddonType != "valkey" || vol.DataVersion != "7.2" {
+		t.Fatalf("volume %+v %v", vol, err)
+	}
+
+	r2 := h.apply(env.ID, cacheServiceSpec("8", "2"))
+	upgraded := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 60*time.Second, "upgraded", func(r store.EnvInstanceRow) bool {
+		return r.Sandbox.ID != old.Sandbox.ID && ready(r)
+	})[0]
+	if upgraded.Sandbox.Image != "valkey/valkey:8-alpine" {
+		t.Fatalf("the upgraded addon's image %s", upgraded.Sandbox.Image)
+	}
+	eventually(t, 30*time.Second, "the volume's data version 8", func() bool {
+		vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+		return err == nil && vol.DataVersion == "8"
+	})
+	// The new web instance crashes: R fails.
+	for i := 1; i <= 3; i++ {
+		var id uuid.UUID
+		eventually(t, 60*time.Second, "the new web instance running", func() bool {
+			for _, r := range h.rowsOf(env.ID, spec.KindService, "web") {
+				if r.Sandbox.ID == web.Sandbox.ID || !running(r) || r.Instance.Phase == model.PhaseExited {
+					continue
+				}
+				if p := h.pod("n1", r.Sandbox.ID); p != nil && len(p.Containers) == 1 &&
+					p.Containers[0].State.String() == "CONTAINER_STATE_RUNNING" {
+					id = r.Sandbox.ID
+					return true
+				}
+			}
+			return false
+		})
+		if err := n1.Script().ExitContainer(id, "main", 2); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, 10*time.Second, "the new instance's exit", func() bool {
+			inst, err := h.st.GetEnvInstance(bg, id)
+			return err == nil && len(inst.Exits) == i
+		})
+	}
+	h.waitRelease(env.ID, r2, model.ReleaseFailed, 30*time.Second)
+	never(t, 5*time.Second, "the addon was recreated back", func() bool {
+		rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+		return len(rows) != 1 || rows[0].Sandbox.ID != upgraded.Sandbox.ID ||
+			rows[0].Instance.TemplateHash != upgraded.Instance.TemplateHash
+	})
+	vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+	if err != nil || vol.Holder != upgraded.Sandbox.ID || vol.DataVersion != "8" {
+		t.Fatalf("volume %+v %v", vol, err)
+	}
+	for _, i := range h.incidents(env.ID, true) {
+		if i.Condition == model.ConditionAddonUnhealthy {
+			t.Errorf("the kept addon is unhealthy: %+v", i)
+		}
+	}
+	h.waitRows(env.ID, spec.KindService, "web", 1, 30*time.Second, "the old web serving", func(r store.EnvInstanceRow) bool {
+		return r.Sandbox.ID == web.Sandbox.ID && ready(r)
+	})
+}
+
+// An addon whose type changes loses its volume and its credentials, as a
+// removal would, and gets new ones: postgres → valkey → postgres never
+// mounts one's data under the other.
+func TestAddonTypeChange(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	pg := func(version string) string {
+		return fmt.Sprintf(`{"addons":{"db":{"type":"postgres","version":%q,"plan":"dev","options":{"databases":["app"]}}}}`, version)
+	}
+	volume := func(typ, version string) store.EnvVolume {
+		t.Helper()
+		var vol store.EnvVolume
+		eventually(t, 30*time.Second, "the volume of "+typ, func() bool {
+			var err error
+			vol, err = h.st.GetEnvVolume(bg, env.ID, "addon/db")
+			nv := n1.Volumes()
+			return err == nil && vol.AddonType == typ && vol.DataVersion == version && len(nv) == 1 &&
+				nv[0].VolumeId == vol.VolumeID.String()
+		})
+		return vol
+	}
+	password := func() string {
+		t.Helper()
+		v, err := h.c.ResolveSecret(bg, env.ID, "addon.db.password", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	r1 := h.apply(env.ID, pg("16"))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	v1, p1 := volume("postgres", "16"), password()
+
+	r2 := h.apply(env.ID, `{"addons":{"db":{"type":"valkey","version":"8","plan":"dev"}}}`)
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 60*time.Second)
+	v2, p2 := volume("valkey", "8"), password()
+	if v2.VolumeID == v1.VolumeID || p2 == p1 {
+		t.Fatalf("valkey has postgres's volume or password: %+v", v2)
+	}
+	row := h.waitRows(env.ID, spec.KindAddon, "db", 1, 10*time.Second, "ready", ready)[0]
+	if row.Sandbox.PodTemplate.Volumes[0].VolumeID != v2.VolumeID {
+		t.Fatalf("the valkey row's template %+v", row.Sandbox.PodTemplate)
+	}
+
+	r3 := h.apply(env.ID, pg("17"))
+	h.waitRelease(env.ID, r3, model.ReleaseRealised, 60*time.Second)
+	if v3 := volume("postgres", "17"); v3.VolumeID == v2.VolumeID || v3.VolumeID == v1.VolumeID {
+		t.Fatalf("postgres 17 mounts an old volume: %+v", v3)
+	}
+}
+
+// An addon's target that its volume's data refuses (a major version the
+// blueprint cannot run on it) is never started: a rolling release fails
+// with the finding and the running instance stays; outside a rollout,
+// addon_unhealthy opens and no instance starts on the data.
+func TestAddonRefusedOnItsData(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	pg := func(version string) string {
+		return fmt.Sprintf(`{"addons":{"db":{"type":"postgres","version":%q,"plan":"dev","options":{"databases":["app"]}}}}`, version)
+	}
+	r1 := h.apply(env.ID, pg("16"))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "db", 1, 10*time.Second, "ready", ready)[0]
+
+	// The service's validation refuses this; a removal and a re-add that
+	// the controller never saw apart would bring the same.
+	r2 := h.apply(env.ID, pg("17"))
+	rel := h.waitRelease(env.ID, r2, model.ReleaseFailed, 30*time.Second)
+	if !strings.Contains(rel.Reason, "addon db: changing postgres from 16 to 17 needs a data migration") {
+		t.Errorf("reason %q", rel.Reason)
+	}
+	inc := h.incident(env.ID, "addon/db", model.ConditionRolloutFailed, 10*time.Second)
+	if inc.Release != r2 {
+		t.Errorf("incident %+v", inc)
+	}
+	never(t, 3*time.Second, "the addon was recreated", func() bool {
+		rows := h.rowsOf(env.ID, spec.KindAddon, "db")
+		return len(rows) != 1 || rows[0].Sandbox.ID != first.Sandbox.ID
+	})
+
+	// Data written by 17 (as if it had run), the instance gone: T, the
+	// realised 16, never starts on it.
+	h.exec(`UPDATE env_volumes SET data_version = '17' WHERE env_id = $1`, env.ID)
+	if _, _, err := h.eng.Delete(bg, "", first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	unhealthy := h.incident(env.ID, "addon/db", model.ConditionAddonUnhealthy, 30*time.Second)
+	if !strings.Contains(unhealthy.Summary, "changing postgres from 17 to 16") {
+		t.Errorf("incident %+v", unhealthy)
+	}
+	never(t, 3*time.Second, "an instance started on the newer data", func() bool {
+		return len(h.rowsOf(env.ID, spec.KindAddon, "db")) != 0
+	})
+}
+
+// failingProvisioning makes the node's provisioning steps ("sh") exit
+// with code's value, echoing the step's credential (and its URL escaping)
+// on stderr as a failed psql statement may; 0 hands them to the node (exit
+// 0). It returns how many provisioning steps ran.
+func failingProvisioning(n *testnode.Node, code *atomic.Int32) *atomic.Int32 {
+	var runs atomic.Int32
+	n.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+		if len(req.Command) == 0 || req.Command[0] != "sh" {
+			return 0, false, nil
+		}
+		runs.Add(1)
+		c := code.Load()
+		if c == 0 {
+			return 0, false, nil
+		}
+		pw := req.Env["PGPASSWORD"]
+		_ = out.Stderr([]byte(fmt.Sprintf("psql: error: password authentication failed for %s (%s)\n", pw, escapeUserinfo(pw))))
+		return c, true, nil
+	})
+	return &runs
+}
+
+// A provisioning step that fails keeps the addon unprovisioned and the
+// release rolling, with the step's output as the instance's detail and
+// the credentials redacted from it; the step runs again after the retry
+// wait, and once it succeeds the release is realised.
+func TestAddonProvisioningFails(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	var code atomic.Int32
+	code.Store(1)
+	runs := failingProvisioning(n1, &code)
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, postgresSpec)
+	row := h.waitRows(env.ID, spec.KindAddon, "postgres", 1, 60*time.Second, "failing its provisioning", func(r store.EnvInstanceRow) bool {
+		return strings.Contains(r.Instance.Detail, "provisioning step provision exited 1")
+	})[0]
+	pw, err := h.c.ResolveSecret(bg, env.ID, "addon.postgres.password", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := row.Instance.Detail; !strings.Contains(d, redactedMark) || strings.Contains(d, pw) ||
+		strings.Contains(d, escapeUserinfo(pw)) || row.Instance.ProvisionedHash != "" {
+		t.Fatalf("instance %+v", row.Instance)
+	}
+	eventually(t, 10*time.Second, "the step run again", func() bool { return runs.Load() >= 2 })
+	if rel := h.release(env.ID, r1); rel.State != model.ReleaseRolling {
+		t.Fatalf("release %s while its addon is not provisioned", rel.State)
+	}
+	code.Store(0)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	row = h.waitRows(env.ID, spec.KindAddon, "postgres", 1, 10*time.Second, "ready", ready)[0]
+	if row.Instance.ProvisionedHash == "" || row.Instance.Detail != "" {
+		t.Fatalf("instance after the provisioning %+v", row.Instance)
+	}
 }

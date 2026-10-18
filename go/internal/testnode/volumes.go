@@ -233,13 +233,17 @@ func volumeHeadKey(volumeID string, epoch uint64) string {
 	return "snapshots/volume-" + volumeID + "/" + strconv.FormatUint(epoch, 10) + "/head.json"
 }
 
-// takeOver takes the volumes of a pod's checkpoint over, as a restore
-// does: each must be one the node does not have, the pod's own, or
-// checkpointed and held by no pod (check_restorable); afterwards each is
-// the pod's, checkpointed until it boots.
-func (s *volumeService) takeOver(pod string, volumes []*volumev1.Volume) error {
+// restorable checks that the volumes of a pod's checkpoint can be taken
+// over on the node, and changes nothing (check_restorable, which feosd's
+// adopt_checkpoint runs before it records the pod): each must be one the
+// node does not have, the pod's own, or checkpointed and held by no pod.
+func (s *volumeService) restorable(pod string, volumes []*volumev1.Volume) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.restorableLocked(pod, volumes)
+}
+
+func (s *volumeService) restorableLocked(pod string, volumes []*volumev1.Volume) error {
 	for _, v := range volumes {
 		had := s.volumes[v.VolumeId]
 		if had == nil {
@@ -253,6 +257,18 @@ func (s *volumeService) takeOver(pod string, volumes []*volumev1.Volume) error {
 		default:
 			return status.Errorf(codes.FailedPrecondition, "volume %s is attached to pod %s", v.VolumeId, had.PodId)
 		}
+	}
+	return nil
+}
+
+// takeOver takes the volumes of a pod's checkpoint over, as a restore
+// does: each must be restorable; afterwards each is the pod's,
+// checkpointed until it boots.
+func (s *volumeService) takeOver(pod string, volumes []*volumev1.Volume) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.restorableLocked(pod, volumes); err != nil {
+		return err
 	}
 	for _, v := range volumes {
 		c := cloneVolume(v)

@@ -68,14 +68,14 @@ func (c *Controller) stepService(ctx context.Context, s *stepState, name string,
 		c.heal(ctx, r, idles)
 	}
 	if !p.ok() {
-		s.wait("service %s: %s", name, p.why())
+		s.wait(objectName(spec.KindService, name), "service %s: %s", name, p.why())
 		return
 	}
 	if rolling(v) && (!s.addonsReady || !s.jobsDone) {
 		for _, r := range cur {
 			c.heal(ctx, r, idles)
 		}
-		s.wait("service %s waits for the addons and the release jobs", name)
+		s.wait(objectName(spec.KindService, name), "service %s waits for the addons and the release jobs", name)
 		return
 	}
 	var lost []store.EnvInstanceRow
@@ -110,30 +110,31 @@ func (c *Controller) stepService(ctx context.Context, s *stepState, name string,
 	case len(old) == 0 && len(cur) < desired:
 		for _, replica := range freeReplicas(cur, desired-len(cur)) {
 			if _, err := c.insertInstance(ctx, v, insert{plan: p, replica: replica, release: v.targetNum}); err != nil {
-				s.wait("service %s: %v", name, err)
+				s.wait(objectName(spec.KindService, name), "service %s: %v", name, err)
 				return
 			}
 		}
 	case len(old) == 0 && len(cur) > desired:
 		if err := c.retire(ctx, v, true, cur[desired:]...); err != nil {
-			s.wait("service %s: %v", name, err)
+			s.wait(objectName(spec.KindService, name), "service %s: %v", name, err)
 		}
 	case len(old) > 0 && ready < len(cur):
 		// A new one is coming up: wait for it.
 	case len(old) > 0 && len(cur) < desired && len(cur)+len(old) <= desired:
 		replica := freeReplicas(cur, 1)
 		if _, err := c.insertInstance(ctx, v, insert{plan: p, replica: replica[0], release: v.targetNum}); err != nil {
-			s.wait("service %s: %v", name, err)
+			s.wait(objectName(spec.KindService, name), "service %s: %v", name, err)
 			return
 		}
 	case len(old) > 0:
 		// Every new one is ready: an old one goes, the highest first.
 		if err := c.retire(ctx, v, true, old[len(old)-1]); err != nil {
-			s.wait("service %s: %v", name, err)
+			s.wait(objectName(spec.KindService, name), "service %s: %v", name, err)
 		}
 	}
 	if len(old) > 0 || len(cur) != desired || ready != len(cur) || len(retiring) > 0 {
-		s.wait("service %s: %d of %d ready, %d old, %d retiring", name, ready, desired, len(old), len(retiring))
+		s.wait(objectName(spec.KindService, name), "service %s: %d of %d ready, %d old, %d retiring", name, ready, desired,
+			len(old), len(retiring))
 	}
 }
 
@@ -158,18 +159,28 @@ func freeReplicas(rows []store.EnvInstanceRow, n int) []int {
 func (c *Controller) rolloutFailed(ctx context.Context, s *stepState, name string, svc spec.Service, p *podPlan,
 	cur, old []store.EnvInstanceRow) bool {
 	v := s.v
-	// The service rolls when it has old instances, or is new to R.
-	rollingService := len(old) > 0 || !c.inRealised(ctx, v, name)
+	// The service rolls when it has old instances, is new to R, or scales
+	// to another count (a scale-up adds under the same budget).
+	realised, inRealised := c.realisedService(ctx, v, name)
+	rollingService := len(old) > 0 || !inRealised || replicasOf(realised) != replicasOf(svc)
 	if !rollingService {
 		return false
 	}
+	// R's new instances: those inserted since it began (a scale-up keeps
+	// the others, with whatever exits they had before).
+	var fresh []store.EnvInstanceRow
+	for _, r := range cur {
+		if !r.Instance.CreatedAt.Before(v.latest.StartedAt) {
+			fresh = append(fresh, r)
+		}
+	}
 	var reason string
 	var culprit *store.EnvInstanceRow
-	for i, r := range cur {
+	for i, r := range fresh {
 		if len(r.Instance.Exits) >= c.t.crashExits {
 			reason = fmt.Sprintf("service %s: a new instance (replica %d) exited %d times", name, r.Instance.Replica,
 				len(r.Instance.Exits))
-			culprit = &cur[i]
+			culprit = &fresh[i]
 			break
 		}
 	}
@@ -185,8 +196,8 @@ func (c *Controller) rolloutFailed(ctx context.Context, s *stepState, name strin
 			return false
 		}
 		reason = fmt.Sprintf("service %s did not roll out within %s", name, budget)
-		if len(cur) > 0 {
-			culprit = &cur[0]
+		if len(fresh) > 0 {
+			culprit = &fresh[0]
 		}
 	}
 	if reason == "" {
@@ -200,25 +211,27 @@ func (c *Controller) rolloutFailed(ctx context.Context, s *stepState, name strin
 		}
 	}
 	if err := c.failRelease(ctx, v, reason, objectName(spec.KindService, name), model.ConditionRolloutFailed, ev); err != nil {
-		s.wait("service %s: %v", name, err)
+		s.wait(objectName(spec.KindService, name), "service %s: %v", name, err)
 		return false
 	}
 	s.failed = true
-	if err := c.retire(ctx, v, true, cur...); err != nil && ctx.Err() == nil {
+	if err := c.retire(ctx, v, true, fresh...); err != nil && ctx.Err() == nil {
 		c.rl.warn("rollout", "cannot retire a failed rollout's instances", "environment", v.env.ID, "service", name, "err", err)
 	}
 	return true
 }
 
-// inRealised reports whether the realised release has the image service.
-func (c *Controller) inRealised(ctx context.Context, v *view, name string) bool {
+// realisedService is the image service as the realised release has it,
+// and whether it has it (true when the realised release cannot be read:
+// the budget is not guessed).
+func (c *Controller) realisedService(ctx context.Context, v *view, name string) (spec.Service, bool) {
 	if v.env.Realised == 0 {
-		return false
+		return spec.Service{}, false
 	}
-	sp, err := c.releaseSpec(ctx, v.env.ID, v.env.Realised)
+	sp, err := c.releaseSpec(ctx, v.env, v.env.Realised)
 	if err != nil {
-		return true
+		return v.target.Services[name], true
 	}
 	svc, ok := sp.Services[name]
-	return ok && runtimeOf(svc) == spec.RuntimeImage
+	return svc, ok && runtimeOf(svc) == spec.RuntimeImage
 }

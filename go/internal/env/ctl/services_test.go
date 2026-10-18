@@ -6,7 +6,9 @@ package ctl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -19,8 +21,12 @@ import (
 	"github.com/google/uuid"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/ports"
+	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -328,4 +334,375 @@ func TestReadinessPhases(t *testing.T) {
 	})
 	code.Store(0)
 	h.waitRelease(env.ID, r3, model.ReleaseRealised, 30*time.Second)
+}
+
+// crash makes an instance's container exit n times (each once the
+// container runs again), its restarts counting from restarts.
+func crash(t *testing.T, h *harness, n *testnode.Node, envID, id uuid.UUID, restarts, times int) {
+	t.Helper()
+	for i := 1; i <= times; i++ {
+		eventually(t, 30*time.Second, "the container running", func() bool {
+			p := h.pod("n1", id)
+			inst, err := h.st.GetEnvInstance(bg, id)
+			return p != nil && len(p.Containers) == 1 && p.Containers[0].State.String() == "CONTAINER_STATE_RUNNING" &&
+				err == nil && inst.Phase != model.PhaseExited
+		})
+		if err := n.Script().ExitContainer(id, "main", 1); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, 10*time.Second, fmt.Sprintf("exit %d recorded", i), func() bool {
+			inst, _ := h.st.GetEnvInstance(bg, id)
+			return inst.Restarts == restarts+i && inst.Phase == model.PhaseExited
+		})
+	}
+}
+
+// A crash loop's incident closes once the object has been ready for the
+// crash window, and a later crash loop of the same release opens a new
+// one.
+func TestCrashLoopCloses(t *testing.T) {
+	h := newHarness(t, options{timings: func(t *timings) { t.crashWindow = 12 * time.Second }})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	id := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0].Sandbox.ID
+	crash(t, h, n1, env.ID, id, 0, 3)
+	first := h.incident(env.ID, "service/web", model.ConditionCrashLoop, 10*time.Second)
+	eventually(t, 60*time.Second, "the crash loop closed", func() bool {
+		for _, i := range h.incidents(env.ID, false) {
+			if i.ID == first.ID {
+				return !i.ClosedAt.IsZero()
+			}
+		}
+		return false
+	})
+	inst, _ := h.st.GetEnvInstance(bg, id)
+	if inst.Restarts != 0 {
+		t.Errorf("restarts %d after the crash window", inst.Restarts)
+	}
+	crash(t, h, n1, env.ID, id, 0, 3)
+	second := h.incident(env.ID, "service/web", model.ConditionCrashLoop, 10*time.Second)
+	if second.ID == first.ID || second.Release != r1 {
+		t.Fatalf("the second crash loop %+v, the first %+v", second, first)
+	}
+}
+
+// Incidents that nothing else closes: crash_loop, volume_unavailable and
+// addon_unhealthy of objects that neither T nor R has close; a crash
+// loop of an older release closes once a later release is realised.
+func TestIncidentsClose(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	open := func(object, condition string) int64 {
+		i, _, err := h.st.OpenIncident(bg, store.EnvIncident{EnvID: env.ID, Object: object, Release: r1, Condition: condition,
+			Summary: "test", Evidence: []byte("{}")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return i.ID
+	}
+	gone := []int64{open("addon/cache", model.ConditionVolumeUnavailable), open("service/old", model.ConditionCrashLoop),
+		open("addon/cache", model.ConditionAddonUnhealthy)}
+	stays := open("service/web", model.ConditionCrashLoop)
+	closed := func(id int64) bool {
+		for _, i := range h.incidents(env.ID, false) {
+			if i.ID == id {
+				return !i.ClosedAt.IsZero()
+			}
+		}
+		return false
+	}
+	eventually(t, 30*time.Second, "the removed objects' incidents closed", func() bool {
+		h.c.notify(bg, HintReconcile)
+		return closed(gone[0]) && closed(gone[1]) && closed(gone[2])
+	})
+	if closed(stays) {
+		t.Fatal("the crash loop of an object T has closed")
+	}
+	r2 := h.apply(env.ID, serviceSpec(1, "2", ""))
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 30*time.Second)
+	if !closed(stays) {
+		t.Error("the crash loop of release 1 stays open after release 2 was realised")
+	}
+}
+
+// A restart that did not happen (its repair's prepare hook failed: the
+// pod runs on with the same exited container) is tried again without
+// counting another exit: one real exit stays one exit, and no crash loop
+// opens.
+func TestRestartNotDoneIsNoExit(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	id := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0].Sandbox.ID
+	var fail atomic.Int32
+	fail.Store(2)
+	h.eng.SetPrepareHook(func(ctx context.Context, node string, sb store.Sandbox, kind sandbox.OpKind) error {
+		if kind == sandbox.OpRepair && sb.ID == id && fail.Load() > 0 {
+			fail.Add(-1)
+			return errors.New("the node's groups cannot be put right now")
+		}
+		return h.c.PrepareHook(ctx, node, sb, kind)
+	})
+	crash(t, h, n1, env.ID, id, 0, 1)
+	eventually(t, 30*time.Second, "two restarts not done", func() bool { return fail.Load() == 0 })
+	h.waitRows(env.ID, spec.KindService, "web", 1, 30*time.Second, "ready after the third restart", ready)
+	inst, err := h.st.GetEnvInstance(bg, id)
+	if err != nil || inst.Restarts != 1 || len(inst.Exits) != 1 {
+		t.Fatalf("instance %+v %v", inst, err)
+	}
+	for _, i := range h.incidents(env.ID, false) {
+		if i.Condition == model.ConditionCrashLoop {
+			t.Errorf("a crash loop opened: %+v", i)
+		}
+	}
+}
+
+// A rolling release that waits for an addon that never provisions fails
+// at its deadline (rollout_failed, naming the addon, with what it waited
+// for and the instance's detail, credentials redacted), and the old
+// instance serves on. The deadline is the longest of the services'
+// budgets (5s here) and the floor (10s here, 10 minutes by default).
+func TestReleaseDeadline(t *testing.T) {
+	h := newHarness(t, options{timings: func(t *timings) { t.releaseDeadline = 10 * time.Second }})
+	n1 := h.addNode("n1")
+	var code atomic.Int32
+	code.Store(1)
+	failingProvisioning(n1, &code)
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	old := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	r2 := h.apply(env.ID, fmt.Sprintf(`{"addons":{"postgres":{"type":"postgres","version":"17","plan":"dev",
+		"options":{"databases":["app"]}}},"services":{"web":{"image":%q,"command":["/app"],
+		"env":{"DB":{"addon":"postgres","key":"url"}},"ports":[{"name":"http","port":8080}],"rollout":{"timeout":"5s"}}}}`,
+		testImage))
+	rel := h.waitRelease(env.ID, r2, model.ReleaseFailed, 60*time.Second)
+	if !strings.HasPrefix(rel.Reason, "release 2 did not roll out within 10s: addon postgres") {
+		t.Errorf("reason %q", rel.Reason)
+	}
+	inc := h.incident(env.ID, "addon/postgres", model.ConditionRolloutFailed, 10*time.Second)
+	var ev evidence
+	if err := json.Unmarshal(inc.Evidence, &ev); err != nil || inc.Release != r2 {
+		t.Fatalf("incident %+v %v", inc, err)
+	}
+	pw, _ := h.c.ResolveSecret(bg, env.ID, "addon.postgres.password", 1)
+	all := strings.Join(ev.Pending, "\n")
+	if !strings.Contains(all, "addon/postgres replica 0: provisioning step provision exited 1") ||
+		!strings.Contains(all, "service web waits for the addons") || pw == "" || strings.Contains(all, pw) {
+		t.Errorf("pending %q", ev.Pending)
+	}
+	if rows := h.rowsOf(env.ID, spec.KindService, "web"); len(rows) != 1 || rows[0].Sandbox.ID != old.Sandbox.ID || !ready(rows[0]) {
+		t.Errorf("web after the failed release %+v", rows)
+	}
+}
+
+// A scale-up counts as a rollout: replicas that cannot place fail the
+// release at the service's budget, and the replicas it kept serve on.
+func TestScaleUpBudget(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1", func(c *testnode.Config) { c.MemoryBytes = 8 << 30 })
+	env := h.newEnv("stage")
+	big := func(replicas int) string {
+		return serviceSpec(replicas, "1", `,"resources":{"memoryMib":6144},"rollout":{"timeout":"3s"}`)
+	}
+	r1 := h.apply(env.ID, big(1))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	kept := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	r2 := h.apply(env.ID, big(2))
+	rel := h.waitRelease(env.ID, r2, model.ReleaseFailed, 30*time.Second)
+	if rel.Reason != "service web did not roll out within 3s" {
+		t.Errorf("reason %q", rel.Reason)
+	}
+	eventually(t, 30*time.Second, "the kept replica alone", func() bool {
+		rows := h.rows(env.ID)
+		return len(rows) == 1 && rows[0].Sandbox.ID == kept.Sandbox.ID && ready(rows[0])
+	})
+}
+
+// busyPorts is a port door whose probes find every probe slot taken while
+// busy is set.
+type busyPorts struct {
+	envdeps.Ports
+	busy atomic.Bool
+}
+
+func (p *busyPorts) Probe(ctx context.Context, l model.Lease, port int, path string) (int, error) {
+	if p.busy.Load() {
+		return 0, ports.ErrProbeBusy
+	}
+	return p.Ports.Probe(ctx, l, port, path)
+}
+
+func (p *busyPorts) DialPod(ctx context.Context, l model.Lease, port int) (net.Conn, error) {
+	if p.busy.Load() {
+		return nil, ports.ErrProbeBusy
+	}
+	return p.Ports.DialPod(ctx, l, port)
+}
+
+// A check that finds every probe slot of its sandbox taken has no verdict
+// (§13.3): a ready instance stays ready, its failures and detail as they
+// were, even with a failure threshold of 1.
+func TestProbeBusyIsInconclusive(t *testing.T) {
+	door := &busyPorts{}
+	h := newHarness(t, options{ports: func(p envdeps.Ports) envdeps.Ports {
+		door.Ports = p
+		return door
+	}})
+	n1 := h.addNode("n1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer srv.Close()
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", `,"readiness":{"http":{"port":"http","path":"/"},"period":"1s","failureThreshold":1}`))
+	row := h.waitRows(env.ID, spec.KindService, "web", 1, 30*time.Second, "running", running)[0]
+	n1.Script().SetPodPortAddr(row.Sandbox.ID, 8080, strings.TrimPrefix(srv.URL, "http://"))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	door.busy.Store(true)
+	never(t, 4*time.Second, "a busy probe counted", func() bool {
+		inst, err := h.st.GetEnvInstance(bg, row.Sandbox.ID)
+		return err != nil || inst.Phase != model.PhaseReady || inst.ProbeFailures != 0 || inst.Detail != ""
+	})
+}
+
+// An addon whose address changes (restored on another node) gives its
+// dependents a new template: they roll as for a change of T, surge 1,
+// without a new release.
+func TestAddonAddressRollsDependents(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	addon := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	// n1 takes no other pod: the service goes to n2.
+	h.exec(`UPDATE nodes SET slots = 1 WHERE name = 'n1'`)
+	h.addNode("n2")
+	r2 := h.apply(env.ID, fmt.Sprintf(`{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev"}},
+		"services":{"web":{"image":%q,"env":{"CACHE":{"addon":"cache","key":"url"}}}}}`, testImage))
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 60*time.Second)
+	web := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	if web.Sandbox.Node != "n2" {
+		t.Fatalf("web on %s", web.Sandbox.Node)
+	}
+
+	var mu sync.Mutex
+	maxLive, gap := 0, false
+	stop, watched := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(watched)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+			rows, err := h.st.ListEnvInstanceRows(bg, env.ID)
+			if err != nil {
+				continue
+			}
+			live, readyWeb, retiring := 0, 0, false
+			for _, r := range rows {
+				if r.Instance.Object != "web" {
+					continue
+				}
+				if r.Instance.Phase == model.PhaseRetiring {
+					retiring = true
+					continue
+				}
+				live++
+				if r.Instance.Phase == model.PhaseReady {
+					readyWeb++
+				}
+			}
+			mu.Lock()
+			maxLive = max(maxLive, live)
+			gap = gap || (retiring && readyWeb == 0)
+			mu.Unlock()
+		}
+	}()
+	h.exec("UPDATE nodes SET draining = true, drain_started_at = now() WHERE name = 'n1'")
+	var moved store.EnvInstanceRow
+	eventually(t, 90*time.Second, "the addon on n2 with a new address", func() bool {
+		h.c.notify(bg, "drain")
+		rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+		if len(rows) != 1 || rows[0].Sandbox.Node != "n2" || !running(rows[0]) || rows[0].Sandbox.Address == "" {
+			return false
+		}
+		moved = rows[0]
+		return true
+	})
+	if moved.Sandbox.ID != addon.Sandbox.ID || moved.Sandbox.Address == addon.Sandbox.Address {
+		t.Fatalf("the addon after the drain %+v, before %+v", moved.Sandbox, addon.Sandbox)
+	}
+	eventually(t, 60*time.Second, "web rolled to the new address", func() bool {
+		rows := h.rowsOf(env.ID, spec.KindService, "web")
+		if len(rows) != 1 || rows[0].Sandbox.ID == web.Sandbox.ID || !ready(rows[0]) {
+			return false
+		}
+		p := h.pod("n2", rows[0].Sandbox.ID)
+		return p != nil && strings.Contains(p.Spec.Containers[0].Env["CACHE"], "["+moved.Sandbox.Address+"]")
+	})
+	close(stop)
+	<-watched
+	mu.Lock()
+	if maxLive > 2 || gap {
+		t.Errorf("at most %d web instances at once (want 2), a gap without a ready one %v", maxLive, gap)
+	}
+	mu.Unlock()
+	if e, _ := h.st.GetEnvironment(bg, env.ID); e.Release != r2 || e.Realised != r2 {
+		t.Errorf("environment %+v", e)
+	}
+}
+
+// A restart while the replica has an op in flight is refused with
+// model.ErrBusy and takes no traffic away (the instance stays ready).
+func TestRefusalsOfExpectedStates(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	id := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0].Sandbox.ID
+	block := make(chan struct{})
+	n1.Script().SetHook(podv1.PodService_SuspendPod_FullMethodName, func(ctx context.Context, _ string, _ any) error {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	defer close(block)
+	go func() { _ = h.eng.Pause(bg, id) }()
+	eventually(t, 10*time.Second, "a pause in flight", func() bool {
+		sb, err := h.st.GetSandbox(bg, id)
+		return err == nil && sb.Op != ""
+	})
+	if err := h.c.RestartService(bg, env.ID, "web"); !errors.Is(err, model.ErrBusy) {
+		t.Fatalf("a restart while an op is in flight: %v", err)
+	}
+	if inst, err := h.st.GetEnvInstance(bg, id); err != nil || inst.Phase != model.PhaseReady || inst.Detail != "" {
+		t.Fatalf("the refused restart changed the instance: %+v %v", inst, err)
+	}
+}
+
+// A manual job whose template cannot render yet is refused with
+// ErrNotReady, its text as before.
+func TestRunJobNotReady(t *testing.T) {
+	// Without a sealer an addon never gets an address.
+	h := newHarness(t, options{noSealer: true})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	h.apply(env.ID, fmt.Sprintf(`{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev"}},
+		"jobs":{"once":{"image":%q,"on":"manual","env":{"CACHE":{"addon":"cache","key":"url"}}}}}`, testImage))
+	err := h.c.RunJob(bg, env.ID, "once")
+	if !errors.Is(err, ErrNotReady) || err.Error() != "job once cannot run yet: waits for the address of addon cache" {
+		t.Fatalf("a job that cannot run yet: %v", err)
+	}
 }

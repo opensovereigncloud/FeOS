@@ -15,12 +15,16 @@ import (
 
 // evidence is what an incident keeps of what the controller saw (§4.9):
 // the container's last exits, the end of its log, a failed rollout's diff
-// against the realised release, why an instance could not be placed.
+// against the realised release, why an instance could not be placed, what
+// a release past its deadline waited for.
 type evidence struct {
 	Exits     []store.EnvExit  `json:"exits,omitempty"`
 	LogTail   []string         `json:"logTail,omitempty"`
 	Diff      []spec.DiffEntry `json:"diff,omitempty"`
 	Placement string           `json:"placement,omitempty"`
+	// Pending is what a release past its deadline still waited for, and
+	// the details of those objects' instances.
+	Pending []string `json:"pending,omitempty"`
 }
 
 func (e evidence) json() json.RawMessage {

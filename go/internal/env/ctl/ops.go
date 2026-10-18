@@ -90,7 +90,7 @@ func (c *Controller) instanceLog(ctx context.Context, sb store.Sandbox, lines in
 		sb.ClientState == model.StatePausing || sb.ClientState == model.StateHibernating:
 		return nil, ErrPaused
 	case sb.ClientState != model.StateRunning || sb.Node == "":
-		return nil, fmt.Errorf("the instance is %s: no log to read", sb.ClientState)
+		return nil, notRunning("the instance is %s: no log to read", sb.ClientState)
 	}
 	return c.containerLog(ctx, lease(sb), lines)
 }
@@ -121,19 +121,20 @@ func (c *Controller) jobLog(ctx context.Context, v *view, name string, lines int
 // processLog is an attached service's process log.
 func (c *Controller) processLog(ctx context.Context, v *view, name string, lines int) ([]string, string, error) {
 	a, ok := v.attached[name]
-	if !ok || a.ProcessID == "" {
+	if !ok {
 		return []string{}, SourceProcess, nil
 	}
-	sb, err := c.st.GetSandbox(ctx, a.SandboxID)
-	if err != nil {
-		return nil, "", err
-	}
+	sb, ok := c.usableSandbox(ctx, v.env, a)
 	switch {
+	case !ok:
+		return nil, "", notRunning("%s: no log to read", goneDetail(a.SandboxID))
+	case a.ProcessID == "":
+		return []string{}, SourceProcess, nil
 	case sb.ClientState == model.StatePaused || sb.ClientState == model.StateHibernated ||
 		sb.ClientState == model.StatePausing || sb.ClientState == model.StateHibernating:
 		return nil, "", ErrPaused
 	case !steady(sb):
-		return nil, "", fmt.Errorf("sandbox %s is %s: no log to read", sb.ID, sb.ClientState)
+		return nil, "", notRunning("sandbox %s is %s: no log to read", sb.ID, sb.ClientState)
 	case c.d.Runner == nil:
 		return nil, "", errors.New("process logs need the tools' runner, which this instance lacks")
 	}
@@ -147,7 +148,8 @@ func (c *Controller) processLog(ctx context.Context, v *view, name string, lines
 // RestartService restarts a service of the environment's target release:
 // an attached service's process is stopped and started again (never its
 // sandbox's pod); an image service's replicas are restarted one at a
-// time. It returns once the restart is under way; ErrNoObject.
+// time. It returns once the restart is under way; ErrNoObject, ErrPaused
+// and ErrNotRunning (attached), model.ErrBusy (an op in flight).
 func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name string) error {
 	v, err := c.load(ctx, envID)
 	if errors.Is(err, store.ErrNoRow) || (err == nil && v == nil) {
@@ -200,13 +202,27 @@ func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name s
 
 // restartReplica restarts one replica's pod: its phase is starting again
 // (no traffic until it is ready), then Engine.Restart. A row that is not
-// running is left to the controller (Ensure brings it up anew).
+// running is left to the controller (Ensure brings it up anew); one with
+// an op in flight is model.ErrBusy, and its instance stays as it was (a
+// restart the engine refuses puts it back), so that a refused restart
+// takes no traffic away.
 func (c *Controller) restartReplica(ctx context.Context, id uuid.UUID) error {
-	err := c.st.InTx(ctx, func(tx *store.Store) error {
+	sb, err := c.st.GetSandbox(ctx, id)
+	switch {
+	case err != nil:
+		return err
+	case sb.Op != "":
+		return fmt.Errorf("an op %s of instance %s is in flight: %w", sb.Op, sb.OpOwner, model.ErrBusy)
+	case sb.ClientState != model.StateRunning:
+		return nil
+	}
+	var before store.EnvInstance
+	err = c.st.InTx(ctx, func(tx *store.Store) error {
 		inst, err := tx.LockEnvInstance(ctx, id, store.ForUpdate)
 		if err != nil {
 			return err
 		}
+		before = inst
 		after := inst
 		after.Phase, after.ReadySince, after.ProbeFailures, after.Detail = model.PhaseStarting, time.Time{}, 0, "restarting"
 		_, err = tx.UpdateEnvInstance(ctx, inst, after)
@@ -216,10 +232,32 @@ func (c *Controller) restartReplica(ctx context.Context, id uuid.UUID) error {
 		return err
 	}
 	err = c.d.Engine.Restart(ctx, id, "restart requested")
-	if errors.Is(err, model.ErrPrecondition) {
+	switch {
+	case errors.Is(err, model.ErrPrecondition):
 		return nil
+	case errors.Is(err, model.ErrBusy):
+		c.unrestart(ctx, before)
 	}
 	return err
+}
+
+// unrestart puts an instance back as it was before a restart the engine
+// refused, unless something wrote it meanwhile.
+func (c *Controller) unrestart(ctx context.Context, before store.EnvInstance) {
+	err := c.st.InTx(ctx, func(tx *store.Store) error {
+		cur, err := tx.LockEnvInstance(ctx, before.SandboxID, store.ForUpdate)
+		if err != nil || cur.Phase != model.PhaseStarting || cur.Detail != "restarting" {
+			return err
+		}
+		after := cur
+		after.Phase, after.ReadySince, after.ProbeFailures, after.Detail = before.Phase, before.ReadySince, before.ProbeFailures,
+			before.Detail
+		_, err = tx.UpdateEnvInstance(ctx, cur, after)
+		return err
+	})
+	if err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
+		c.rl.warn("restart", "cannot put back an instance whose restart was refused", "sandbox", before.SandboxID, "err", err)
+	}
 }
 
 // waitReady waits until an instance is ready again (true), or gone, or
@@ -243,23 +281,46 @@ func (c *Controller) waitReady(ctx context.Context, id uuid.UUID) bool {
 	return false
 }
 
-// restartAttached stops an attached service's process (when its sandbox
-// runs) and has the supervisor start it again at once.
+// restartAttached stops an attached service's process and has the
+// supervisor start it again at once. A sandbox that may keep the process
+// without running it (paused, hibernated, or with an op in flight) is
+// ErrPaused: the process would survive a warm resume beside the new one
+// (§13.5); one that cannot keep it (stopped, failed, …) needs no stop.
 func (c *Controller) restartAttached(ctx context.Context, v *view, name string) error {
 	a, ok := v.attached[name]
 	if !ok {
 		return nil
 	}
-	if sb, err := c.st.GetSandbox(ctx, a.SandboxID); err == nil && steady(sb) && a.ProcessID != "" && c.d.Runner != nil {
-		if err := c.d.Runner.StopProcessDetached(ctx, lease(sb), a.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) {
+	sb, usable := c.usableSandbox(ctx, v.env, a)
+	if !usable {
+		return notRunning("%s: no process to restart", goneDetail(a.SandboxID))
+	}
+	if keepsProcesses(sb) && !steady(sb) {
+		return ErrPaused
+	}
+	l := lease(sb)
+	stop := func(id string) error {
+		if !steady(sb) || id == "" || c.d.Runner == nil {
+			return nil
+		}
+		if err := c.d.Runner.StopProcessDetached(ctx, l, id); err != nil && !errors.Is(err, tools.ErrNoProcess) {
 			return err
 		}
+		return nil
 	}
-	return c.st.InTx(ctx, func(tx *store.Store) error {
+	if err := stop(a.ProcessID); err != nil {
+		return err
+	}
+	var cleared string
+	err := c.st.InTx(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockAttached(ctx, v.env.ID, name, store.ForUpdate)
 		if err != nil {
 			return err
 		}
+		if cur.SandboxID != a.SandboxID {
+			return nil // moved meanwhile: the move stopped it
+		}
+		cleared = cur.ProcessID
 		after := cur
 		after.ProcessID, after.Phase, after.ReadySince, after.ProbeFailures = "", model.PhaseStarting, time.Time{}, 0
 		after.NextRestartAt, after.Detail = time.Time{}, "restarting"
@@ -268,4 +329,22 @@ func (c *Controller) restartAttached(ctx context.Context, v *view, name string) 
 		}
 		return tx.Notify(ctx, db.ChanLeader, HintReconcile)
 	})
+	if err != nil || cleared == a.ProcessID {
+		return err
+	}
+	// The supervisor recorded another process meanwhile: stopped too, now
+	// that the row forgot it.
+	return stop(cleared)
+}
+
+// keepsProcesses reports whether a sandbox in its state keeps its
+// processes (or may, an op in flight): running, or suspended in a way a
+// warm resume or restore brings back.
+func keepsProcesses(sb store.Sandbox) bool {
+	switch sb.ClientState {
+	case model.StateRunning, model.StatePausing, model.StatePaused, model.StateResuming, model.StateHibernating,
+		model.StateHibernated:
+		return true
+	}
+	return sb.Op != ""
 }

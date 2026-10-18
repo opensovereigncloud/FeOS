@@ -7,9 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
@@ -66,6 +69,11 @@ func (c *Controller) prune(live map[string]bool) {
 	for id := range c.provisionFailed {
 		if !live[id.String()] {
 			delete(c.provisionFailed, id)
+		}
+	}
+	for id := range c.exitRun {
+		if !live[id.String()] {
+			delete(c.exitRun, id)
 		}
 	}
 	for k := range c.lastPending {
@@ -151,13 +159,18 @@ func (c *Controller) runCheck(ctx context.Context, l model.Lease, chk check, see
 
 // applyCheck moves a phase by a check's outcome (§4.4): starting →
 // ready on the first success; ready → unready after threshold failures in
-// a row; unready → ready on a success.
+// a row; unready → ready on a success. A success clears the detail the
+// checks (or the start) wrote, never one of a ready instance that passes
+// its checks (a failed provisioning's, which stays until it succeeds).
 func applyCheck(ok bool, why string, chk check, now time.Time, phase *string, readySince *time.Time, failures *int, detail *string) {
 	if ok {
+		if *phase != model.PhaseReady || *failures > 0 {
+			*detail = ""
+		}
 		if *phase != model.PhaseReady {
 			*phase, *readySince = model.PhaseReady, now
 		}
-		*failures, *detail = 0, ""
+		*failures = 0
 		return
 	}
 	*failures++
@@ -225,7 +238,7 @@ func (c *Controller) probe(ctx context.Context) error {
 				continue
 			}
 			sb, err := c.st.GetSandbox(ctx, a.SandboxID)
-			if err != nil || !steady(sb) || !c.connected(sb.Node) {
+			if err != nil || !attachedUsable(v.env, a, sb) || !steady(sb) || !c.connected(sb.Node) {
 				continue
 			}
 			if !run(func() {
@@ -287,8 +300,15 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 			c.finishJob(ctx, v, r, code, "")
 			return
 		}
+		pid := info.GetMicrovm().GetPid()
+		if inst.Phase == model.PhaseExited && inst.NextRestartAt.IsZero() && pid != 0 && c.exitRunOf(sb.ID) == pid {
+			// The restart did not happen (its repair was skipped, "repair
+			// not done"): the same run of the container, not another exit.
+			c.restartAgain(ctx, v, r)
+			return
+		}
 		if inst.Phase != model.PhaseExited || inst.NextRestartAt.IsZero() {
-			c.instanceExited(ctx, v, r, code)
+			c.instanceExited(ctx, v, r, code, pid)
 			return
 		}
 		if !v.now.Before(inst.NextRestartAt) {
@@ -332,19 +352,61 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 		after.Restarts = 0
 	}
 	c.writeInstance(ctx, inst, after)
+	// A crash loop is over once every instance of the object has been
+	// ready for the crash window (the crash-looping one, or those that
+	// replaced it).
+	if obj := objectName(inst.Kind, inst.Object); v.isOpen(obj, model.ConditionCrashLoop) &&
+		c.objectSteady(v, inst.Kind, inst.Object, after) {
+		c.closeIncidents(ctx, v, obj, model.ConditionCrashLoop)
+	}
 }
 
-// addonSecrets are an addon's credential values, for redaction.
-func (c *Controller) addonSecrets(ctx context.Context, v *view, addon string) []string {
-	a, ok := v.target.Addons[addon]
-	if !ok {
-		a = v.latestSpec.Addons[addon]
+// objectSteady reports whether every instance of an object (but those
+// retiring) has been ready for the crash window, with after as one of
+// them is now.
+func (c *Controller) objectSteady(v *view, kind, object string, after store.EnvInstance) bool {
+	n := 0
+	for _, r := range v.rowsOf(kind, object) {
+		i := r.Instance
+		if i.SandboxID == after.SandboxID {
+			i = after
+		}
+		if i.Phase == model.PhaseRetiring {
+			continue
+		}
+		if i.Phase != model.PhaseReady || i.ReadySince.IsZero() || v.now.Sub(i.ReadySince) < c.t.crashWindow {
+			return false
+		}
+		n++
 	}
-	bp, ok := c.d.Blueprint(a.Type)
-	if !ok {
+	return n > 0
+}
+
+// addonSecrets are an addon's credential values as T and R have it (an
+// addon kept as R has it while R failed has R's), for redaction.
+func (c *Controller) addonSecrets(ctx context.Context, v *view, addon string) []string {
+	var keys []string
+	var bp addons.Blueprint
+	for _, sp := range []*spec.Spec{v.target, v.latestSpec} {
+		a, ok := sp.Addons[addon]
+		if !ok {
+			continue
+		}
+		b, ok := c.d.Blueprint(a.Type)
+		if !ok || (bp != nil && b.Type() != bp.Type()) {
+			continue
+		}
+		bp = b
+		for _, k := range b.Credentials(specAddon(b, addon, a)) {
+			if !slices.Contains(keys, k) {
+				keys = append(keys, k)
+			}
+		}
+	}
+	if len(keys) == 0 {
 		return nil
 	}
-	return c.credentialValues(ctx, v.env.ID, addon, bp.Credentials(specAddon(bp, addon, a)))
+	return c.credentialValues(ctx, v.env.ID, addon, keys)
 }
 
 // writeInstance writes what a probe changed of an instance onto the row
@@ -379,10 +441,33 @@ func (c *Controller) writeInstance(ctx context.Context, before, after store.EnvI
 	}
 }
 
+// exitRunOf is the microVM pid at the instance's last recorded exit (0:
+// none known).
+func (c *Controller) exitRunOf(id uuid.UUID) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exitRun[id]
+}
+
+// restartAgain makes the restart of an exited instance due again after
+// its backoff, when the last one did not happen: its exit is not counted
+// again, its restarts do not grow.
+func (c *Controller) restartAgain(ctx context.Context, v *view, r store.EnvInstanceRow) {
+	wait := c.backoff(max(r.Instance.Restarts, 1))
+	after := r.Instance
+	after.NextRestartAt = v.now.Add(wait)
+	after.Detail = "the restart did not happen; trying again in " + wait.String()
+	if why := r.Sandbox.StatusDescription; why != "" {
+		after.Detail = fmt.Sprintf("the restart did not happen (%s); trying again in %s", why, wait)
+	}
+	c.writeInstance(ctx, r.Instance, after)
+}
+
 // instanceExited records an exit of a service's or an addon's container
 // (§4.4): restarts counted, the exit kept (the last five), the restart
-// due after the backoff; 3 exits within 10 minutes open crash_loop.
-func (c *Controller) instanceExited(ctx context.Context, v *view, r store.EnvInstanceRow, code *int) {
+// due after the backoff; 3 exits within 10 minutes open crash_loop. pid is
+// the microVM's (0: unknown), remembered with the exit.
+func (c *Controller) instanceExited(ctx context.Context, v *view, r store.EnvInstanceRow, code *int, pid int64) {
 	tail, _ := c.containerLog(ctx, lease(r.Sandbox), logTailLines)
 	if r.Instance.Kind == spec.KindAddon {
 		secrets := c.addonSecrets(ctx, v, r.Instance.Object)
@@ -391,7 +476,9 @@ func (c *Controller) instanceExited(ctx context.Context, v *view, r store.EnvIns
 		}
 	}
 	obj := objectName(r.Instance.Kind, r.Instance.Object)
+	recorded := false
 	err := c.fenced(ctx, func(tx *store.Store) error {
+		recorded = false
 		inst, err := tx.LockEnvInstance(ctx, r.Sandbox.ID, store.ForUpdate)
 		if err != nil {
 			return err
@@ -399,6 +486,7 @@ func (c *Controller) instanceExited(ctx context.Context, v *view, r store.EnvIns
 		if inst.Phase == model.PhaseRetiring || (inst.Phase == model.PhaseExited && !inst.NextRestartAt.IsZero()) {
 			return nil
 		}
+		recorded = true
 		now, err := tx.Now(ctx)
 		if err != nil {
 			return err
@@ -437,10 +525,18 @@ func (c *Controller) instanceExited(ctx context.Context, v *view, r store.EnvIns
 		}
 		return tx.Notify(ctx, db.ChanLeader, HintReconcile)
 	})
-	if err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
-		c.rl.warn("probe", "cannot record an exit", "sandbox", r.Sandbox.ID, "err", err)
+	if err != nil {
+		if ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
+			c.rl.warn("probe", "cannot record an exit", "sandbox", r.Sandbox.ID, "err", err)
+		}
 		return
 	}
+	if !recorded {
+		return
+	}
+	c.mu.Lock()
+	c.exitRun[r.Sandbox.ID] = pid
+	c.mu.Unlock()
 	c.log.Info("instance exited", "environment", v.env.ID, "object", obj, "replica", r.Instance.Replica, "code", code)
 }
 
