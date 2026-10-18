@@ -242,6 +242,11 @@ type Controller struct {
 	// lastPending is what each rolling release waited for at its last
 	// step, for logPending.
 	lastPending map[string]string
+	// exitRun is the microVM's pid at each instance's last recorded exit:
+	// a restart boots a new microVM, so the same pid with the container
+	// still exited is the same run, whose restart did not happen (a leader
+	// change forgets it: at most one exit too many).
+	exitRun map[uuid.UUID]int64
 }
 
 // New returns the controller of an instance.
@@ -262,7 +267,7 @@ func New(deps Deps) (*Controller, error) {
 	log := deps.Log.With("component", "env-ctl")
 	c := &Controller{d: deps, st: st, log: log, rl: newRateLog(log), t: defaultTimings(),
 		specs: newSpecCache(), seen: map[string]*seenState{}, locks: map[string]*sync.Mutex{},
-		provisionFailed: map[uuid.UUID]time.Time{}, lastPending: map[string]string{}}
+		provisionFailed: map[uuid.UUID]time.Time{}, lastPending: map[string]string{}, exitRun: map[uuid.UUID]int64{}}
 	c.pool = newPool(poolWorkers, log)
 	c.bg, c.cancelBg = context.WithCancel(context.Background())
 	return c, nil

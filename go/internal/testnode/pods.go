@@ -502,6 +502,9 @@ func (p *podService) bringUpPod(ctx context.Context, id string, pd *pod) {
 	} else {
 		pd.guestDown, pd.exited = false, nil
 		pd.info.State, pd.info.Reason = podv1.PodState_POD_STATE_RUNNING, ""
+		// A boot is a new microVM process, as on feosd.
+		p.nextPID++
+		pd.pid = p.nextPID
 		p.n.volumes.booted(id)
 	}
 	p.announceLocked(pd.info, false)
@@ -1226,7 +1229,12 @@ func (p *podService) restore(ctx context.Context, id, headKey string, cold bool)
 			p.setState(id, podv1.PodState_POD_STATE_FAILED, err.Error())
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
-		p.change(id, func(pd *pod) { pd.guestDown, pd.snapshot = false, false })
+		p.change(id, func(pd *pod) {
+			pd.guestDown, pd.snapshot = false, false
+			// A restore runs in a new microVM process.
+			p.nextPID++
+			pd.pid = p.nextPID
+		})
 		p.n.volumes.booted(id)
 		p.setState(id, podv1.PodState_POD_STATE_RUNNING, "")
 		out, err := p.get(id)

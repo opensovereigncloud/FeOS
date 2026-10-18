@@ -6,6 +6,7 @@ package ctl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,7 @@ import (
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -421,5 +423,39 @@ func TestIncidentsClose(t *testing.T) {
 	h.waitRelease(env.ID, r2, model.ReleaseRealised, 30*time.Second)
 	if !closed(stays) {
 		t.Error("the crash loop of release 1 stays open after release 2 was realised")
+	}
+}
+
+// A restart that did not happen (its repair's prepare hook failed: the
+// pod runs on with the same exited container) is tried again without
+// counting another exit: one real exit stays one exit, and no crash loop
+// opens.
+func TestRestartNotDoneIsNoExit(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	id := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0].Sandbox.ID
+	var fail atomic.Int32
+	fail.Store(2)
+	h.eng.SetPrepareHook(func(ctx context.Context, node string, sb store.Sandbox, kind sandbox.OpKind) error {
+		if kind == sandbox.OpRepair && sb.ID == id && fail.Load() > 0 {
+			fail.Add(-1)
+			return errors.New("the node's groups cannot be put right now")
+		}
+		return h.c.PrepareHook(ctx, node, sb, kind)
+	})
+	crash(t, h, n1, env.ID, id, 0, 1)
+	eventually(t, 30*time.Second, "two restarts not done", func() bool { return fail.Load() == 0 })
+	h.waitRows(env.ID, spec.KindService, "web", 1, 30*time.Second, "ready after the third restart", ready)
+	inst, err := h.st.GetEnvInstance(bg, id)
+	if err != nil || inst.Restarts != 1 || len(inst.Exits) != 1 {
+		t.Fatalf("instance %+v %v", inst, err)
+	}
+	for _, i := range h.incidents(env.ID, false) {
+		if i.Condition == model.ConditionCrashLoop {
+			t.Errorf("a crash loop opened: %+v", i)
+		}
 	}
 }
