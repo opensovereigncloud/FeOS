@@ -8,6 +8,7 @@ use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, exec_stream_frame, ContainerConfig,
     ContainerState, CreateContainerRequest, DeleteContainerRequest, ExecRequest,
     GetContainerRequest, ListContainersRequest, StartContainerRequest, StopContainerRequest,
+    StreamContainerLogsRequest, VolumeMount,
 };
 
 #[derive(Args, Debug)]
@@ -64,6 +65,20 @@ pub enum ContainerCommand {
             value_parser = parse_key_val
         )]
         env: Vec<(String, String)>,
+
+        #[arg(
+            long = "volume",
+            help = "Mount a volume the guest mounted: NAME:PATH, or NAME:PATH:ro",
+            value_parser = parse_volume_mount
+        )]
+        volumes: Vec<VolumeMount>,
+
+        #[arg(
+            last = true,
+            conflicts_with = "cmd",
+            help = "The command and its arguments as they are, after -- (in place of --cmd)"
+        )]
+        args: Vec<String>,
     },
     /// Start a created container
     Start {
@@ -82,6 +97,25 @@ pub enum ContainerCommand {
     },
     /// List all containers
     List,
+    /// Print a container's log: stdout and stderr, as the container wrote them
+    Logs {
+        #[arg(required = true, help = "Container identifier")]
+        id: String,
+
+        #[arg(
+            long,
+            short = 'n',
+            help = "Only the last lines (at most 10000); 0: none of the log so far"
+        )]
+        tail: Option<u32>,
+
+        #[arg(
+            long,
+            short = 'f',
+            help = "Go on printing what it writes, until it is deleted"
+        )]
+        follow: bool,
+    },
     /// Delete a container; a running one is killed first
     Delete {
         #[arg(required = true, help = "Container identifier")]
@@ -107,6 +141,21 @@ pub enum ContainerCommand {
     },
 }
 
+fn parse_volume_mount(s: &str) -> Result<VolumeMount, String> {
+    let (volume, rest) = s
+        .split_once(':')
+        .ok_or_else(|| format!("invalid volume mount {s}: NAME:PATH[:ro]"))?;
+    let (path, read_only) = match rest.strip_suffix(":ro") {
+        Some(path) => (path, true),
+        None => (rest, false),
+    };
+    Ok(VolumeMount {
+        volume: volume.to_string(),
+        path: path.to_string(),
+        read_only,
+    })
+}
+
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -125,11 +174,25 @@ pub async fn handle_container_command(args: ContainerArgs) -> Result<()> {
             adopt,
             cmd,
             env,
-        } => create_container(&mut client, image_ref, id, adopt, cmd, env).await?,
+            volumes,
+            args,
+        } => {
+            let command = if args.is_empty() { cmd } else { args };
+            create_container(&mut client, image_ref, id, adopt, command, env, volumes).await?
+        }
         ContainerCommand::Start { id } => start_container(&mut client, id).await?,
         ContainerCommand::Stop { id } => stop_container(&mut client, id).await?,
         ContainerCommand::Info { id } => get_container_info(&mut client, id).await?,
         ContainerCommand::List => list_containers(&mut client).await?,
+        ContainerCommand::Logs { id, tail, follow } => {
+            let request = StreamContainerLogsRequest {
+                container_id: id,
+                follow,
+                tail: tail.is_none(),
+                tail_lines: tail.unwrap_or(0),
+            };
+            print_logs(&mut client, request).await?
+        }
         ContainerCommand::Delete { id } => delete_container(&mut client, id).await?,
         ContainerCommand::Exec {
             id,
@@ -158,6 +221,7 @@ async fn create_container(
     adopt: bool,
     cmd: Vec<String>,
     env: Vec<(String, String)>,
+    volume_mounts: Vec<VolumeMount>,
 ) -> Result<()> {
     println!("Requesting container creation with image: {image_ref}...");
 
@@ -165,7 +229,7 @@ async fn create_container(
         image_ref,
         command: cmd,
         env: env.into_iter().collect(),
-        ..Default::default()
+        volume_mounts,
     };
 
     let request = CreateContainerRequest {
@@ -274,6 +338,22 @@ async fn delete_container(client: &mut ContainerServiceClient<Conn>, id: String)
     };
     client.delete_container(request).await?;
     println!("Successfully deleted container: {id}");
+    Ok(())
+}
+
+/// Prints the log's lines as they come.
+async fn print_logs(
+    client: &mut ContainerServiceClient<Conn>,
+    request: StreamContainerLogsRequest,
+) -> Result<()> {
+    use std::io::Write;
+    let mut entries = client.stream_container_logs(request).await?.into_inner();
+    let mut stdout = std::io::stdout();
+    while let Some(entry) = entries.message().await? {
+        stdout.write_all(&entry.line)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+    }
     Ok(())
 }
 

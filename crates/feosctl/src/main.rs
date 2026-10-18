@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 mod container_commands;
 mod forward_commands;
+mod guest_commands;
 mod host_commands;
 mod image_commands;
 mod pod_commands;
@@ -41,6 +42,7 @@ enum Service {
     Forward(forward_commands::ForwardArgs),
     Kube(forward_commands::KubeArgs),
     Ssh(forward_commands::SshArgs),
+    Guest(guest_commands::GuestArgs),
     /// The node's traffic records: flows, drops, DNS and server names
     Traffic(traffic_commands::TrafficArgs),
 }
@@ -68,6 +70,7 @@ async fn main() -> Result<()> {
         Service::Forward(args) => forward_commands::handle_forward_command(args).await?,
         Service::Kube(args) => forward_commands::handle_kube_command(args).await?,
         Service::Ssh(args) => forward_commands::handle_ssh_command(args).await?,
+        Service::Guest(args) => guest_commands::handle_guest_command(args).await?,
         Service::Traffic(args) => traffic_commands::handle_traffic_command(args).await?,
     }
 
