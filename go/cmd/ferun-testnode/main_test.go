@@ -28,6 +28,27 @@ func TestParse(t *testing.T) {
 	if !cfg.Mesh || cfg.MeshEndpoint != "10.0.0.9:51820" {
 		t.Fatalf("mesh %v %q", cfg.Mesh, cfg.MeshEndpoint)
 	}
+	if cfg.FakeExec || !cfg.CheckSecurityGroups {
+		t.Fatalf("fake exec %v, security groups checked %v", cfg.FakeExec, cfg.CheckSecurityGroups)
+	}
+	cfg, _, err = parse([]string{"--fake-exec", "--check-security-groups=false"}, func(k string) string { return env[k] })
+	if err != nil || !cfg.FakeExec || cfg.CheckSecurityGroups {
+		t.Fatalf("fake exec %v, security groups checked %v, %v", cfg.FakeExec, cfg.CheckSecurityGroups, err)
+	}
+	cfg, _, err = parse(nil, func(k string) string {
+		if k == "FERUN_TESTNODE_FAKE_EXEC" {
+			return "true"
+		}
+		return env[k]
+	})
+	if err != nil || !cfg.FakeExec {
+		t.Fatalf("FERUN_TESTNODE_FAKE_EXEC: %v, %v", cfg.FakeExec, err)
+	}
+	cfg, level, err = parse([]string{"--name", "from-flag", "--disk", "512", "--log-level", "debug", "--abort-on-cancel",
+		"--mesh-endpoint", "10.0.0.9:51820"}, func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
 	if cfg.Name != "from-flag" || cfg.ServerName != "ferun.example.test" || cfg.TrustDomain != "feos.local" ||
 		!slices.Equal(cfg.Addrs, []string{"10.0.0.1:7443", "10.0.0.2:7443"}) || cfg.MemoryBytes != 8<<30 || cfg.DiskBytes != 512 ||
 		cfg.ObjectStore == nil || cfg.PendingDelay != time.Second || !cfg.AbortOnCancel || cfg.MaxStreams != 1024 || cfg.CPUCores != 16 ||

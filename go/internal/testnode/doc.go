@@ -29,4 +29,14 @@
 // while the node runs, before a call or at a point inside its work
 // (HibernateUpload, HibernateHead); Restart, Crash and Partition play what
 // happens to a real node.
+//
+// For an environment's pods (ADR 0018) it serves VolumeService and
+// SecurityGroupService over records in memory with feosd's rules (a pod
+// claims its volumes at its create; with Config.CheckSecurityGroups a pod
+// whose groups the node lacks fails at its bring-up), reports a
+// container's exit with its code (Script.ExitContainer) and serves a
+// container's log (Script.AppendLog, StreamContainerLogs with
+// tail_lines). An Exec into an environment's pod exits 0 without running
+// anything unless the script answers it (Script.SetPodExec), so that an
+// addon's probe and provisioning pass.
 package testnode

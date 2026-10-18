@@ -97,6 +97,17 @@ type Config struct {
 	// MeshEndpoint is the node's endpoint on the mesh; 127.0.0.1 and a port
 	// derived from Name when empty.
 	MeshEndpoint string
+	// CheckSecurityGroups makes a pod that names a security group the node
+	// does not have fail at its bring-up (POD_STATE_FAILED "the node does
+	// not have the security groups …"), and its memory restore, as feosd
+	// does. Without it the groups a pod names are not checked, as the test
+	// node did before it served SecurityGroupService.
+	CheckSecurityGroups bool
+	// FakeExec makes every Exec that the script does not answer exit 0
+	// without running anything (ferun-testnode --fake-exec): for a control
+	// plane whose addons' probes and provisioning run commands the host
+	// does not have.
+	FakeExec bool
 }
 
 // Node is a test node.
@@ -112,6 +123,8 @@ type Node struct {
 	container *containerService
 	forward   *forwardService
 	mesh      *meshService
+	volumes   *volumeService
+	groups    *groupService
 	podPrefix netip.Prefix
 	podsDir   string
 	tmpDir    string // removed when Run returns; "" with a StateDir
@@ -229,6 +242,8 @@ func New(cfg Config) (*Node, error) {
 	n.tools = &toolService{n: n}
 	n.container = &containerService{n: n}
 	n.forward = &forwardService{n: n}
+	n.volumes = newVolumeService(n)
+	n.groups = newGroupService(n)
 	if n.mesh, err = newMeshService(n); err != nil {
 		return nil, err
 	}

@@ -62,17 +62,21 @@ type Script struct {
 	unreachable  map[uuid.UUID]bool
 	unrestorable string
 	portAddrs    map[uint32]string
+	podPortAddrs map[uuid.UUID]map[uint32]string
+	podExec      map[uuid.UUID]ExecFunc
 	kubePorts    map[uuid.UUID]map[uint32]bool
 }
 
 func newScript(n *Node) *Script {
 	return &Script{
-		n:           n,
-		hooks:       map[string]Hook{},
-		delays:      map[string]time.Duration{},
-		unreachable: map[uuid.UUID]bool{},
-		portAddrs:   map[uint32]string{},
-		kubePorts:   map[uuid.UUID]map[uint32]bool{},
+		n:            n,
+		hooks:        map[string]Hook{},
+		delays:       map[string]time.Duration{},
+		unreachable:  map[uuid.UUID]bool{},
+		portAddrs:    map[uint32]string{},
+		podPortAddrs: map[uuid.UUID]map[uint32]string{},
+		podExec:      map[uuid.UUID]ExecFunc{},
+		kubePorts:    map[uuid.UUID]map[uint32]bool{},
 	}
 }
 
@@ -128,6 +132,21 @@ func (s *Script) SetExec(f ExecFunc) {
 	s.exec = f
 }
 
+// SetPodExec scripts the Execs into one pod, before the function of
+// SetExec; nil removes it. Without a function that answers, an Exec into
+// an environment's pod (its spec has the label ferun.environment) exits 0
+// without running anything, so that an addon's probe and provisioning
+// (pg_isready, psql) pass; any other runs its real command.
+func (s *Script) SetPodExec(pod uuid.UUID, f ExecFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f == nil {
+		delete(s.podExec, pod)
+		return
+	}
+	s.podExec[pod] = f
+}
+
 // SetTool scripts the ToolService; nil runs the node's tools again.
 func (s *Script) SetTool(f ToolFunc) {
 	s.mu.Lock()
@@ -175,6 +194,40 @@ func (s *Script) SetPortAddr(port uint32, addr string) {
 		return
 	}
 	s.portAddrs[port] = addr
+}
+
+// SetPodPortAddr makes a port forward to port of the pod dial addr, in
+// place of SetPortAddr's address or 127.0.0.1:<port>; "" removes it.
+func (s *Script) SetPodPortAddr(pod uuid.UUID, port uint32, addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if addr == "" {
+		delete(s.podPortAddrs[pod], port)
+		return
+	}
+	if s.podPortAddrs[pod] == nil {
+		s.podPortAddrs[pod] = map[uint32]string{}
+	}
+	s.podPortAddrs[pod][port] = addr
+}
+
+// ExitContainer makes the process of a container of a running pod exit
+// with code, as a crashed or finished workload does: GetPod reports the
+// container CONTAINER_STATE_EXITED with the code (none when code is
+// negative: a node that reported no exit status) while the pod stays
+// POD_STATE_RUNNING, until the pod boots again (a StopPod and a StartPod).
+func (s *Script) ExitContainer(pod uuid.UUID, container string, code int) error {
+	e := containerExit{}
+	if code >= 0 {
+		e = containerExit{code: int32(code), hasCode: true}
+	}
+	return s.n.pods.exitContainer(pod, container, e)
+}
+
+// AppendLog adds a line to the log of a container of a pod, which
+// StreamContainerLogs serves.
+func (s *Script) AppendLog(pod uuid.UUID, container, line string) error {
+	return s.n.pods.appendLog(pod, container, line)
 }
 
 // SetKubePorts sets the pod's Kubernetes listener ports, which its guest
@@ -260,9 +313,18 @@ func (s *Script) unrestorableReason() string {
 	return s.unrestorable
 }
 
-func (s *Script) portAddr(port uint32) string {
+func (s *Script) podExecFunc(pod uuid.UUID) ExecFunc {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.podExec[pod]
+}
+
+func (s *Script) portAddr(pod uuid.UUID, port uint32) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a, ok := s.podPortAddrs[pod][port]; ok {
+		return a
+	}
 	if a, ok := s.portAddrs[port]; ok {
 		return a
 	}

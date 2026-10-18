@@ -105,6 +105,8 @@ func parse(args []string, getenv func(string) string) (testnode.Config, slog.Lev
 	podPrefix := fs.String("pod-prefix", "", "the pods' IPv6 prefix; empty: derived from the name")
 	onMesh := fs.Bool("mesh", false, "put the node on the pods' mesh: ask JoinMesh with a key of its own, and serve MeshService")
 	meshEndpoint := fs.String("mesh-endpoint", "", "the node's endpoint on the mesh, address:port; empty: 127.0.0.1 and a port from the name")
+	fakeExec := fs.Bool("fake-exec", false, "every exec into a pod exits 0 without running anything (an environment's addon probes and provisioning)")
+	checkGroups := fs.Bool("check-security-groups", true, "a pod that names a security group the node does not have fails, as on feosd")
 	logLevel := fs.String("log-level", "info", "debug, info, warn or error")
 
 	if err := fs.Parse(args); err != nil {
@@ -158,6 +160,9 @@ func parse(args []string, getenv func(string) string) (testnode.Config, slog.Lev
 		PodPrefix:     *podPrefix,
 		Mesh:          *onMesh,
 		MeshEndpoint:  *meshEndpoint,
+
+		FakeExec:            *fakeExec,
+		CheckSecurityGroups: *checkGroups,
 	}
 	switch {
 	case *objectStore != "" && *objectStoreDir != "":

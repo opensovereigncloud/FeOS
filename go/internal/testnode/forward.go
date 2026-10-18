@@ -56,7 +56,7 @@ func (f *forwardService) Forward(stream grpc.BidiStreamingServer[portforwardv1.F
 	// Dial before answering: "nothing listens there" reaches the caller as
 	// a failed call, in the guest's words.
 	d := net.Dialer{Timeout: 10 * time.Second}
-	conn, err := d.DialContext(ctx, "tcp", f.n.script.portAddr(port))
+	conn, err := d.DialContext(ctx, "tcp", f.n.script.portAddr(g.uid, port))
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "127.0.0.1:%d: %v", port, err)
 	}
