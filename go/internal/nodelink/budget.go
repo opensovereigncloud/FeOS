@@ -14,7 +14,9 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
 )
 
 // PodIDMetadata is the gRPC metadata key that routes a call to a pod's
@@ -41,7 +43,9 @@ const (
 	callLong                      // a long stream: within the stream budget
 )
 
-// lifecycleMethods are the unary PodService calls that ops make; the drain
+// lifecycleMethods are the unary PodService calls that ops make, and the
+// VolumeService and SecurityGroupService calls that prepare a node for
+// them (the environments' prepare hook and loops, ADR 0018); the drain
 // timeout never cuts them.
 var lifecycleMethods = map[string]bool{
 	podv1.PodService_CreatePod_FullMethodName:    true,
@@ -52,6 +56,17 @@ var lifecycleMethods = map[string]bool{
 	podv1.PodService_HibernatePod_FullMethodName: true,
 	podv1.PodService_RestorePod_FullMethodName:   true,
 	podv1.PodService_DeletePod_FullMethodName:    true,
+
+	volumev1.VolumeService_CreateVolume_FullMethodName: true,
+	volumev1.VolumeService_DeleteVolume_FullMethodName: true,
+	volumev1.VolumeService_GetVolume_FullMethodName:    true,
+	volumev1.VolumeService_ListVolumes_FullMethodName:  true,
+
+	networkv1.SecurityGroupService_PutSecurityGroup_FullMethodName:    true,
+	networkv1.SecurityGroupService_UpdateSecurityGroup_FullMethodName: true,
+	networkv1.SecurityGroupService_DeleteSecurityGroup_FullMethodName: true,
+	networkv1.SecurityGroupService_GetSecurityGroup_FullMethodName:    true,
+	networkv1.SecurityGroupService_ListSecurityGroups_FullMethodName:  true,
 }
 
 const toolServicePrefix = "/feos.tool.v1.ToolService/"
