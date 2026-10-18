@@ -78,6 +78,9 @@ type Service struct {
 	next atomic.Uint64
 	// touches throttles the route tokens' last_used_at writes.
 	touches throttle
+	// afterPlan, when set (tests), runs in an apply between its plan and
+	// its transaction.
+	afterPlan func()
 }
 
 // New returns the environments service of an instance, with its

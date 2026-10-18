@@ -342,7 +342,7 @@ type applyArgs struct {
 
 // errReplan is an apply whose plan is stale: the environment got a new
 // release between the plan and the transaction, which the request's base
-// already names.
+// already names, or a secret version the plan pins was deleted.
 var errReplan = errors.New("the current release changed since the plan")
 
 // apply plans raw (ModeApply: an image that cannot be resolved is an
@@ -381,6 +381,9 @@ func (s *Service) applyOnce(ctx context.Context, tenant, ref string, a applyArgs
 	if err != nil {
 		return ApplyAnswer{}, fmt.Errorf("the normalised spec: %w", err)
 	}
+	if s.afterPlan != nil {
+		s.afterPlan()
+	}
 	var ans ApplyAnswer
 	err = s.st.InTx(ctx, func(tx *store.Store) error {
 		if err := lockTenant(ctx, tx, tenant); err != nil {
@@ -401,6 +404,11 @@ func (s *Service) applyOnce(ctx context.Context, tenant, ref string, a applyArgs
 				return errReplan
 			}
 			return &BaseMismatchError{Base: a.base, Current: e.Release}
+		}
+		// The plan read the secrets before the lock: a DeleteSecret, which
+		// takes the same lock, may have deleted a version it pins since.
+		if err := checkPins(ctx, tx, e.ID, p.norm.Secrets); err != nil {
+			return err
 		}
 		if e.Release > 0 && spec.EqualNormalised(p.norm, *p.currentSpec) {
 			cur, err := tx.GetRelease(ctx, e.ID, e.Release)
@@ -451,6 +459,25 @@ func (s *Service) applyOnce(ctx context.Context, tenant, ref string, a applyArgs
 		return ApplyAnswer{}, err
 	}
 	return ans, nil
+}
+
+// checkPins answers errReplan when a secret version a normalised spec
+// pins is no longer there or deleted: inside the apply's transaction,
+// after the environment's lock.
+func checkPins(ctx context.Context, tx *store.Store, envID uuid.UUID, pins map[string]spec.SecretRef) error {
+	if len(pins) == 0 {
+		return nil
+	}
+	versions, err := tx.TenantSecretVersions(ctx, envID)
+	if err != nil {
+		return fmt.Errorf("secrets: %w", err)
+	}
+	for name, ref := range pins {
+		if !slices.Contains(versions[name].Versions, ref.Version) {
+			return errReplan
+		}
+	}
+	return nil
 }
 
 // checkReleaseMeta refuses an author, a message or annotations that a

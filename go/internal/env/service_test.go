@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -830,5 +831,33 @@ func TestAddonAgainstVolume(t *testing.T) {
 	var ise *InvalidSpecError
 	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "addons.db.version", "cannot go back from 8 to 7.2") {
 		t.Fatalf("revert over 8's data: %v", describe(err))
+	}
+}
+
+// A secret deleted between an apply's plan and its transaction is never
+// pinned by the new release: the apply plans again and refuses it.
+func TestApplyRacesDeleteSecret(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	h.putSecret("stage", "x", "v1")
+	h.apply("stage", `{"services": {"web": {"image": "ghcr.io/acme/web:1"}}}`, 0)
+	var once sync.Once
+	h.svc.afterPlan = func() {
+		once.Do(func() {
+			if err := h.svc.DeleteSecret(ctx, tenantA, "stage", "x"); err != nil {
+				t.Errorf("delete secret: %v", err)
+			}
+		})
+	}
+	_, err := h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Base: 1,
+		Spec: json.RawMessage(`{"services": {"web": {"image": "ghcr.io/acme/web:1", "env": {"X": {"secret": "x"}}}}}`)})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "services.web.env.X", "secret x was deleted") {
+		t.Fatalf("apply: %v", describe(err))
+	}
+	if e := h.env("stage"); e.Release != 1 {
+		t.Fatalf("release %d was made", e.Release)
 	}
 }
