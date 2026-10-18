@@ -154,14 +154,18 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 	}); err != nil {
 		return err
 	}
-	// The env group goes from every node this instance reaches; a node
-	// out of reach keeps it until env-groups finds it of an environment
-	// that is gone.
+	// The env group goes from every node this instance reaches, once no
+	// pod there names it any more (FAILED_PRECONDITION: a later pass); a
+	// node out of reach keeps it until env-groups finds it of an
+	// environment that is gone.
+	groupsGone := true
 	if c.d.Conns != nil {
 		for _, node := range c.d.Conns.Nodes() {
-			if err := c.deleteGroup(ctx, node, model.EnvGroupID(e.ID)); err != nil {
+			gone, err := c.deleteGroup(ctx, node, model.EnvGroupID(e.ID))
+			if err != nil {
 				return err
 			}
+			groupsGone = groupsGone && gone
 		}
 	}
 	left, err := c.st.EnvCtlSandboxes(ctx, e.ID)
@@ -184,7 +188,7 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 			return err
 		}
 	}
-	if len(left) > 0 || len(vols) > 0 {
+	if len(left) > 0 || len(vols) > 0 || !groupsGone {
 		return nil
 	}
 	return c.fenced(ctx, func(tx *store.Store) error {

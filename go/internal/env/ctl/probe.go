@@ -52,6 +52,34 @@ func (c *Controller) seenDue(key, token string, chk check) (seenState, bool) {
 	return *s, true
 }
 
+// prune drops what the controller remembers of instances, attached
+// services and environments that a probe pass no longer saw.
+func (c *Controller) prune(live map[string]bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.seen {
+		if !live[k] {
+			delete(c.seen, k)
+		}
+	}
+	for id := range c.provisionFailed {
+		if !live[id.String()] {
+			delete(c.provisionFailed, id)
+		}
+	}
+	for k := range c.lastPending {
+		if !live[k] {
+			delete(c.lastPending, k)
+		}
+	}
+	for k, m := range c.locks {
+		if !live["a/"+k] && m.TryLock() {
+			delete(c.locks, k)
+			m.Unlock()
+		}
+	}
+}
+
 // forget drops what the probe loop remembers of key.
 func (c *Controller) forget(key string) {
 	c.mu.Lock()
@@ -136,7 +164,14 @@ func (c *Controller) probe(ctx context.Context) error {
 	}
 	sem := make(chan struct{}, probeConcurrency)
 	var wg sync.WaitGroup
-	defer wg.Wait()
+	// What the pass looked at: the memory of everything else goes.
+	live := map[string]bool{}
+	defer func() {
+		wg.Wait()
+		if ctx.Err() == nil {
+			c.prune(live)
+		}
+	}()
 	run := func(f func()) bool {
 		select {
 		case sem <- struct{}{}:
@@ -162,6 +197,7 @@ func (c *Controller) probe(ctx context.Context) error {
 			continue
 		}
 		for _, r := range v.rows {
+			live[r.Sandbox.ID.String()] = true
 			if r.Instance.Phase == model.PhaseRetiring || !steady(r.Sandbox) || !c.connected(r.Sandbox.Node) {
 				continue
 			}
@@ -169,7 +205,9 @@ func (c *Controller) probe(ctx context.Context) error {
 				return nil
 			}
 		}
+		live["pending/"+e.ID.String()] = true
 		for name, a := range v.attached {
+			live["a/"+attachedKey(e.ID, name)] = true
 			svc, ok := v.target.Services[name]
 			if !ok || runtimeOf(svc) != spec.RuntimeAttached {
 				continue

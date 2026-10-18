@@ -375,31 +375,35 @@ func (c *Controller) syncNodeGroups(ctx context.Context, node string, cache map[
 	}
 	for _, u := range envs {
 		if !envOK[u] {
-			errs = append(errs, c.deleteGroup(ctx, node, model.EnvGroupID(u)))
+			_, err := c.deleteGroup(ctx, node, model.EnvGroupID(u))
+			errs = append(errs, err)
 		}
 	}
 	for _, u := range sbxs {
 		if !sbxOK[u] {
-			errs = append(errs, c.deleteGroup(ctx, node, model.SandboxGroupID(u)))
+			_, err := c.deleteGroup(ctx, node, model.SandboxGroupID(u))
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// deleteGroup deletes a group from a node: NOT_FOUND is done, and so is
-// FAILED_PRECONDITION for now (a pod still names it; the next pass tries
-// again).
-func (c *Controller) deleteGroup(ctx context.Context, node, id string) error {
+// deleteGroup deletes a group from a node and reports whether it is gone
+// (NOT_FOUND too); FAILED_PRECONDITION (a pod on the node still names it)
+// is not gone yet, and no error: a later pass tries again.
+func (c *Controller) deleteGroup(ctx context.Context, node, id string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.t.nodeCall)
 	defer cancel()
 	cc, err := c.conn(ctx, node)
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, err = networkv1.NewSecurityGroupServiceClient(cc).DeleteSecurityGroup(ctx, &networkv1.DeleteSecurityGroupRequest{Id: id})
 	switch status.Code(err) {
-	case codes.OK, codes.NotFound, codes.FailedPrecondition:
-		return nil
+	case codes.OK, codes.NotFound:
+		return true, nil
+	case codes.FailedPrecondition:
+		return false, nil
 	}
-	return err
+	return false, err
 }
