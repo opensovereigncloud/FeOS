@@ -370,33 +370,25 @@ func (h *Handler) takeSlot(ctx context.Context, id uuid.UUID) (func(), error) {
 	}
 }
 
-// trySlot takes one of the sandbox's slots when one is free, without
-// waiting, and returns its release; false when every slot is taken. Idle
-// pooled connections hold slots they do not use: when every slot is
-// taken, they are closed and the slot is tried once more.
-func (h *Handler) trySlot(id uuid.UUID) (func(), bool) {
-	if release, ok := h.takeFreeSlot(id); ok {
-		return release, true
-	}
-	h.closeIdleOf(id)
-	return h.takeFreeSlot(id)
-}
-
-// takeFreeSlot takes one of the sandbox's slots when one is free.
-func (h *Handler) takeFreeSlot(id uuid.UUID) (func(), bool) {
+// tryProbeSlot takes one of the sandbox's probe slots when one is free,
+// without waiting, and returns its release; false when every one is
+// taken. The probe slots are apart from the stream cap: a check neither
+// takes nor waits for a slot of the cap, nor closes pooled connections
+// for one.
+func (h *Handler) tryProbeSlot(id uuid.UUID) (func(), bool) {
 	h.mu.Lock()
-	c := h.caps[id]
+	c := h.probes[id]
 	if c == nil {
-		c = &capSem{slots: make(chan struct{}, h.t.perSandbox)}
-		h.caps[id] = c
+		c = &capSem{slots: make(chan struct{}, h.t.probeSlots)}
+		h.probes[id] = c
 	}
 	c.refs++
 	h.mu.Unlock()
 	unref := func() {
 		h.mu.Lock()
 		c.refs--
-		if c.refs == 0 && h.caps[id] == c {
-			delete(h.caps, id)
+		if c.refs == 0 && h.probes[id] == c {
+			delete(h.probes, id)
 		}
 		h.mu.Unlock()
 	}

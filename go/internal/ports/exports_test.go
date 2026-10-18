@@ -100,13 +100,30 @@ func TestProbeAndDialPod(t *testing.T) {
 	}
 }
 
-// A check never waits for the sandbox's stream cap, and has its own
-// timeout.
+// slotsInUse is how many slots of the world's sandbox's stream cap and of
+// its probe slots are taken.
+func (w *world) slotsInUse() (streams, probes int) {
+	w.h.mu.Lock()
+	defer w.h.mu.Unlock()
+	if c := w.h.caps[w.sb.ID]; c != nil {
+		streams = len(c.slots)
+	}
+	if c := w.h.probes[w.sb.ID]; c != nil {
+		probes = len(c.slots)
+	}
+	return streams, probes
+}
+
+// A check takes a probe slot, never a slot of the sandbox's stream cap: a
+// cap that forwarded traffic fills does not fail it. It never waits for a
+// probe slot either: past them it fails at once (ErrProbeBusy). And it
+// has its own timeout.
 func TestProbeCapAndTimeout(t *testing.T) {
 	w := newWorld(t, func(tm *timings) {
 		tm.perSandbox = 1
 		tm.capWait = time.Minute
 		tm.probeTimeout = 300 * time.Millisecond
+		tm.probeSlots = 1
 	})
 	lease := w.lease()
 	var wg sync.WaitGroup
@@ -116,21 +133,120 @@ func TestProbeCapAndTimeout(t *testing.T) {
 		w.do("GET", w.url(guestPort, "/hold"), nil, "")
 	}()
 	eventually(t, 10*time.Second, "the request in the guest", func() bool { return w.guest.inFlight.Load() == 1 })
+	// The forwarded request holds the only slot of the cap; the probe
+	// passes beside it.
+	if code, err := w.h.Probe(context.Background(), lease, guestPort, "/"); err != nil || code != http.StatusOK {
+		t.Fatalf("a probe beside a full stream cap: %d %v", code, err)
+	}
+	if streams, probes := w.slotsInUse(); streams != 1 || probes != 0 {
+		t.Fatalf("after the probe: %d stream slots, %d probe slots taken, want 1 and 0", streams, probes)
+	}
+
+	// The probe slot taken by an open DialPod: the next check fails at
+	// once, and passes once it is closed.
+	conn, err := w.h.DialPod(context.Background(), lease, guestPort)
+	if err != nil {
+		t.Fatal(err)
+	}
 	start := time.Now()
-	_, err := w.h.Probe(context.Background(), lease, guestPort, "/")
-	if !errors.Is(err, errProbeCap) || time.Since(start) > time.Second {
-		t.Fatalf("a probe past the cap: %v after %v", err, time.Since(start))
+	_, err = w.h.Probe(context.Background(), lease, guestPort, "/")
+	if !errors.Is(err, ErrProbeBusy) || time.Since(start) > time.Second {
+		t.Fatalf("a probe past the probe slots: %v after %v", err, time.Since(start))
+	}
+	if _, err := w.h.DialPod(context.Background(), lease, guestPort); !errors.Is(err, ErrProbeBusy) {
+		t.Fatalf("a dial past the probe slots: %v", err)
+	}
+	conn.Close()
+	if code, err := w.h.Probe(context.Background(), lease, guestPort, "/"); err != nil || code != http.StatusOK {
+		t.Fatalf("a probe once the slot is free: %d %v", code, err)
 	}
 	close(w.guest.release)
 	wg.Wait()
 	w.noHoldsLeft()
 
-	// A guest slower than the probe's timeout fails it.
+	// A guest slower than the probe's timeout fails it, and gives its slot
+	// back.
 	w.guest.delay.Store(int64(2 * time.Second))
 	start = time.Now()
 	_, err = w.h.Probe(context.Background(), lease, guestPort, "/slow")
 	if err == nil || !strings.Contains(err.Error(), "did not answer within 300ms") || time.Since(start) > 1500*time.Millisecond {
 		t.Fatalf("a slow probe: %v after %v", err, time.Since(start))
+	}
+	if _, probes := w.slotsInUse(); probes != 0 {
+		t.Fatalf("%d probe slots taken after a timed out probe", probes)
+	}
+}
+
+// With every slot of the sandbox's stream cap held by open forwarded
+// streams, a probe and a dial still pass: they take probe slots, give
+// them back, and leave the cap and the forwarding pools as they were.
+func TestProbePastAFullStreamCap(t *testing.T) {
+	w := newWorld(t)
+	lease := w.lease()
+	slots := defaultTimings().perSandbox
+	var once sync.Once
+	release := func() { once.Do(func() { close(w.guest.release) }) }
+	t.Cleanup(release)
+	var wg sync.WaitGroup
+	for range slots {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if code, _, body := w.do("GET", w.url(guestPort, "/hold"), nil, ""); code != 200 {
+				t.Errorf("%d %s", code, body)
+			}
+		}()
+	}
+	eventually(t, 10*time.Second, "every slot held by a forwarded stream", func() bool {
+		return w.guest.inFlight.Load() == int64(slots)
+	})
+	if streams, _ := w.slotsInUse(); streams != slots {
+		t.Fatalf("%d stream slots taken, want %d", streams, slots)
+	}
+	forwards := w.forwards.Load()
+	start := time.Now()
+	for range 3 {
+		if code, err := w.h.Probe(context.Background(), lease, guestPort, "/readyz"); err != nil || code != http.StatusOK {
+			t.Fatalf("a probe past a full stream cap: %d %v", code, err)
+		}
+	}
+	conn, err := w.h.DialPod(context.Background(), lease, guestPort)
+	if err != nil {
+		t.Fatalf("a dial past a full stream cap: %v", err)
+	}
+	if streams, probes := w.slotsInUse(); streams != slots || probes != 1 {
+		t.Fatalf("with a dial open: %d stream slots, %d probe slots taken, want %d and 1", streams, probes, slots)
+	}
+	conn.Close()
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("the checks took %v", d)
+	}
+	if n := w.forwards.Load() - forwards; n != 4 {
+		t.Errorf("%d Forward streams for 4 checks", n)
+	}
+	if streams, probes := w.slotsInUse(); streams != slots || probes != 0 {
+		t.Fatalf("after the checks: %d stream slots, %d probe slots taken, want %d and 0", streams, probes, slots)
+	}
+	if n := w.guest.inFlight.Load(); n != int64(slots) {
+		t.Errorf("%d forwarded requests in the guest, want %d", n, slots)
+	}
+	release()
+	wg.Wait()
+	w.noHoldsLeft()
+	// The forwarded requests' connections went back to their pool, which
+	// a request reuses; the checks' never entered it.
+	opened := w.guest.opened.Load()
+	if code, _, body := w.do("GET", w.url(guestPort, "/after"), nil, ""); code != 200 {
+		t.Fatalf("a forward after the checks: %d %s", code, body)
+	}
+	if n := w.guest.opened.Load() - opened; n != 0 {
+		t.Errorf("a forward after the checks opened %d connections, want a pooled one", n)
+	}
+	w.h.mu.Lock()
+	left := len(w.h.probes)
+	w.h.mu.Unlock()
+	if left != 0 {
+		t.Errorf("%d sandboxes with probe slots left", left)
 	}
 }
 

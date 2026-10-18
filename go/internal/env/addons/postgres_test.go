@@ -320,7 +320,9 @@ func TestPostgresURLParses(t *testing.T) {
 }
 
 // The script of the spike's verified run (.claude/caas/spike-addons.md
-// §1): databases expensa, reports; roles expense_svc, approval_svc.
+// §1): databases expensa, reports; roles expense_svc, approval_svc. It is
+// kept as the report has it; provisioning runs it with the owner checks
+// added (withOwnerChecks).
 const postgresSpikeScript = `exec psql -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 5432 -U postgres -d postgres -v d0=expensa -v d1=reports -v r0=expense_svc -v r1=approval_svc <<'SQL'
 \getenv p0 FERUN_ROLE_PASSWORD_expense_svc
 \getenv p1 FERUN_ROLE_PASSWORD_approval_svc
@@ -341,6 +343,32 @@ CREATE SCHEMA IF NOT EXISTS :"r1" AUTHORIZATION :"r1";
 SQL
 `
 
+// postgresOwnerCheck is the line provisioning has run since the review of
+// S1 (finding C4) before the CREATE SCHEMA IF NOT EXISTS of each role
+// (r<J>) in each database: it fails the step when a schema of the role's
+// name exists there and another role owns it.
+const postgresOwnerCheck = `SELECT format('DO %L', format('BEGIN RAISE EXCEPTION USING MESSAGE = %L; END', ` +
+	`format('schema %I in database %I belongs to role %I, not to role %I', nspname, current_database(), ` +
+	`pg_get_userbyid(nspowner), nspname))) FROM pg_namespace WHERE nspname = :'r<J>' ` +
+	`AND nspowner <> (SELECT oid FROM pg_roles WHERE rolname = :'r<J>') \gexec`
+
+// withOwnerChecks is a script of the spike's form with the owner check
+// inserted before each CREATE SCHEMA line and nothing else changed. The
+// spike's report stays as it was verified and written, so the spike case
+// compares against its script plus the checks; TestPostgresDocker runs
+// the checks against the real images.
+func withOwnerChecks(script string) string {
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(script, "\n") {
+		if rest, ok := strings.CutPrefix(line, `CREATE SCHEMA IF NOT EXISTS :"r`); ok {
+			j, _, _ := strings.Cut(rest, `"`)
+			b.WriteString(strings.ReplaceAll(postgresOwnerCheck, "<J>", j) + "\n")
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
 func TestPostgresProvision(t *testing.T) {
 	pgoptions := model.Literal("-c client_min_messages=warning -c log_min_error_statement=panic")
 	cases := []struct {
@@ -352,7 +380,7 @@ func TestPostgresProvision(t *testing.T) {
 		{
 			name:   "spike",
 			addon:  `{"type":"postgres","version":"17","options":{"databases":["expensa","reports"],"roles":["expense_svc","approval_svc"]}}`,
-			script: postgresSpikeScript,
+			script: withOwnerChecks(postgresSpikeScript),
 			env: map[string]model.TemplateValue{
 				"PGPASSWORD":                       model.CredentialValue("password"),
 				"PGOPTIONS":                        pgoptions,
@@ -379,12 +407,16 @@ SELECT format('CREATE ROLE %I', :'r0') WHERE NOT EXISTS (SELECT FROM pg_roles WH
 ALTER ROLE :"r0" WITH LOGIN PASSWORD :'p0';
 GRANT CONNECT, CREATE ON DATABASE :"d0" TO :"r0";
 \connect :"d0"
+SELECT format('DO %L', format('BEGIN RAISE EXCEPTION USING MESSAGE = %L; END', format('schema %I in database %I belongs to role %I, not to role %I', nspname, current_database(), pg_get_userbyid(nspowner), nspname))) FROM pg_namespace WHERE nspname = :'r0' AND nspowner <> (SELECT oid FROM pg_roles WHERE rolname = :'r0') \gexec
 CREATE SCHEMA IF NOT EXISTS :"r0" AUTHORIZATION :"r0";
 SQL
 `,
 			env: map[string]model.TemplateValue{"PGPASSWORD": model.CredentialValue("password"), "PGOPTIONS": pgoptions,
 				"FERUN_ROLE_PASSWORD_app": model.CredentialValue("role.app.password")},
 		},
+	}
+	if n := strings.Count(withOwnerChecks(postgresSpikeScript), "\\gexec\n") - strings.Count(postgresSpikeScript, "\\gexec\n"); n != 4 {
+		t.Fatalf("%d owner checks added to the spike's script, want 4 (2 databases, 2 roles)", n)
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
