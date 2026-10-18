@@ -7,6 +7,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -14,6 +18,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/ctl"
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
+	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
@@ -66,6 +71,13 @@ type Service struct {
 	st  *store.Store
 	ctl *ctl.Controller
 	log *slog.Logger
+
+	// specs caches the parsed specs of releases, which never change.
+	specs specCache
+	// next picks the route door's ready instance round-robin.
+	next atomic.Uint64
+	// touches throttles the route tokens' last_used_at writes.
+	touches throttle
 }
 
 // New returns the environments service of an instance, with its
@@ -85,7 +97,8 @@ func New(deps Deps) (*Service, error) {
 		st = store.New(deps.DB)
 	}
 	log := deps.Log.With("component", "env")
-	s := &Service{d: deps, st: st, log: log}
+	s := &Service{d: deps, st: st, log: log, specs: specCache{m: map[releaseKey]*spec.Spec{}},
+		touches: throttle{last: map[string]time.Time{}}}
 	c, err := ctl.New(ctl.Deps{
 		InstanceID: deps.InstanceID, DB: deps.DB, Store: st, Elector: deps.Elector, Conns: deps.Conns,
 		Engine: deps.Engine, Runner: deps.Runner, Ports: deps.Ports, Sealer: deps.Sealer,
@@ -129,13 +142,26 @@ func (s *Service) Controller() *ctl.Controller { return s.ctl }
 // (--secret-key-file): without, the secrets routes answer 503.
 func (s *Service) SecretsEnabled() bool { return s.d.Sealer != nil }
 
-// ResolveSecret is the engine's secret resolver (sandbox.SecretResolver)
-// and the controller's: the value of version version of the secret name
-// of environment envID, a tenant's or a system secret, unsealed with its
-// AAD (envdeps.SecretAAD). A deleted version still resolves (a release
-// pins it until a later one is realised).
+// secretResolver is the controller's secret resolution (§13.2):
+// (*ctl.Controller).ResolveSecret.
+type secretResolver interface {
+	ResolveSecret(ctx context.Context, envID uuid.UUID, name string, version int) (string, error)
+}
+
+// ResolveSecret is the engine's secret resolver (sandbox.SecretResolver):
+// the value of version version of the secret name of environment envID, a
+// tenant's or a system secret, unsealed with its AAD (envdeps.SecretAAD).
+// A deleted version still resolves (a release pins it until a later one
+// is realised). The controller resolves it, which also generates the
+// addons' credentials; a controller that cannot is an error.
 func (s *Service) ResolveSecret(ctx context.Context, envID uuid.UUID, name string, version int) (string, error) {
-	return "", errNotImplemented("resolving a secret")
+	if r, ok := any(s.ctl).(secretResolver); ok {
+		return r.ResolveSecret(ctx, envID, name, version)
+	}
+	if s.d.Sealer == nil {
+		return "", errors.New(textNoSecrets)
+	}
+	return "", errors.New("this ferund's environment controller does not resolve secrets")
 }
 
 // PrepareHook is the engine's prepare hook (sandbox.PrepareHook): the
@@ -149,3 +175,108 @@ var (
 	_ sandbox.SecretResolver = (*Service)(nil).ResolveSecret
 	_ sandbox.PrepareHook    = (*Service)(nil).PrepareHook
 )
+
+// specBlueprint adapts an addon blueprint to what spec.Validate asks of
+// it: findings relative to the addon (spec.Validate prefixes them with
+// "addons.<name>."), and a reference checked by the outputs it would
+// render (with no address yet: the addon's name stands in).
+type specBlueprint struct{ b addons.Blueprint }
+
+func toAddon(name string, a spec.Addon) addons.Addon {
+	return addons.Addon{Name: name, Type: a.Type, Version: a.Version, Plan: a.Plan, Options: a.Options}
+}
+
+func (a specBlueprint) Validate(name string, prev *spec.Addon, next spec.Addon) []spec.Finding {
+	var p *addons.Addon
+	if prev != nil {
+		pa := toAddon(name, *prev)
+		p = &pa
+	}
+	return a.b.Validate(p, toAddon(name, next))
+}
+
+func (a specBlueprint) Ref(name string, ad spec.Addon, key string, fields map[string]string) error {
+	_, err := a.b.Outputs(toAddon(name, ad), addons.Context{Name: name}, addons.Ref{Key: key, Fields: fields})
+	return err
+}
+
+var _ spec.Blueprint = specBlueprint{}
+
+// addonEffect tells what an update of an addon's options does (a diff's
+// effect, spec.AddonEffect): a rendered pod that differs recreates it,
+// provisioning steps that differ only reprovision.
+func (s *Service) addonEffect(name string, prev, next spec.Addon) string {
+	b, ok := s.d.Blueprint(next.Type)
+	if !ok {
+		return ""
+	}
+	pa, na := toAddon(name, prev), toAddon(name, next)
+	c := addons.Context{Name: name}
+	pi, errP := b.Render(pa, c)
+	ni, errN := b.Render(na, c)
+	switch {
+	case errP != nil || errN != nil:
+		return ""
+	case !reflect.DeepEqual(pi, ni):
+		return spec.EffectRecreates
+	case !reflect.DeepEqual(b.Provision(pa, c), b.Provision(na, c)):
+		return spec.EffectReprovisions
+	}
+	return spec.EffectInPlace
+}
+
+// releaseKey names a release.
+type releaseKey struct {
+	env    uuid.UUID
+	number int
+}
+
+// specCache holds parsed release specs, for reading only: a release
+// never changes. It forgets everything when full.
+type specCache struct {
+	mu sync.Mutex
+	m  map[releaseKey]*spec.Spec
+}
+
+// specCacheSize bounds the specs a service keeps parsed.
+const specCacheSize = 512
+
+func (c *specCache) get(k releaseKey) (*spec.Spec, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sp, ok := c.m[k]
+	return sp, ok
+}
+
+func (c *specCache) put(k releaseKey, sp *spec.Spec) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.m) >= specCacheSize {
+		clear(c.m)
+	}
+	c.m[k] = sp
+}
+
+// throttle lets a key through at most once a minute.
+type throttle struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func (t *throttle) due(key string) bool {
+	now := time.Now()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if last, ok := t.last[key]; ok && now.Sub(last) < time.Minute {
+		return false
+	}
+	if len(t.last) >= 4096 {
+		for k, v := range t.last {
+			if now.Sub(v) >= time.Minute {
+				delete(t.last, k)
+			}
+		}
+	}
+	t.last[key] = now
+	return true
+}

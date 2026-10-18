@@ -57,6 +57,9 @@ type envOptions struct {
 	ready func(context.Context) error
 	// db shares another env's database (a second instance).
 	db *db.DB
+	// environments builds the environments service on the test's
+	// database; nil: a fakeEnvs.
+	environments func(d *db.DB, st *store.Store) Environments
 }
 
 // env is a test's API over a fresh database.
@@ -68,6 +71,8 @@ type env struct {
 	srv   *server
 	fake  *fakeEngine
 	conns *fakeConns
+	// envs is the fake environments service, when no other is given.
+	envs *fakeEnvs
 	// tenantToken is a token of testTenant.
 	tenantToken string
 }
@@ -111,6 +116,12 @@ func newEnv(t *testing.T, o envOptions) *env {
 	deps := Deps{
 		DB: d, Store: st, Engine: eng, Conns: e.conns, Fleet: o.fleet, Tools: tools.NewREST(runner),
 		Specs: tools.Specs, MCP: o.mcp, Ports: o.ports, Watches: o.watches, Bindings: o.bindings, Ready: o.ready,
+	}
+	if o.environments != nil {
+		deps.Environments = o.environments(d, st)
+	} else {
+		e.envs = &fakeEnvs{}
+		deps.Environments = e.envs
 	}
 	e.srv = newServer(cfg, deps)
 	e.h = e.srv.mux

@@ -1,0 +1,22 @@
+{
+  "method": "POST",
+  "path": "/api/v1/environments/expensa-stage/releases/2/revert",
+  "query": {},
+  "status": 422,
+  "request": {
+    "base": 7,
+    "author": "fecode:0193a000-aaaa-7bbb-8ccc-000000000002"
+  },
+  "response": {
+    "error": "the spec has an error: secrets.internal-token: version 1 of secret internal-token was deleted",
+    "code": "invalid_spec",
+    "findings": [
+      {
+        "severity": "error",
+        "path": "secrets.internal-token",
+        "problem": "version 1 of secret internal-token was deleted",
+        "remedy": "apply a spec that pins an existing version instead of reverting"
+      }
+    ]
+  }
+}

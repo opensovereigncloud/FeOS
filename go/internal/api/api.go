@@ -8,11 +8,15 @@
 //
 //	admin     /api/v1/admin/…            an admin's UI session, or Basic (--admin-users)
 //	tenant    /api/v1/sandboxes[/{id}]   a tenant's token: create, list, delete,
-//	          /api/v1/tools              pause, resume, tokens, access
+//	          /api/v1/tools              pause, resume, tokens, access; the
+//	          /api/v1/environments[/…]   environments (ADR 0018) but their door
 //	sandbox   /api/v1/sandboxes/{id}/…   the sandbox's own token: everything that
 //	                                     acts inside the sandbox
 //	mcp       /mcp                       the MCP door's own class (internal/mcpsrv)
 //	forward   /fwd/…, …/ports/…          the port door's own class (internal/ports)
+//	route     /api/v1/environments/{env}/http/…
+//	                                     the route door's own class: a route token
+//	                                     of the environment (internal/env)
 //	public    /healthz, /readyz, /auth/…, the UI
 //
 // The two token classes stay apart: a tenant's token is not accepted on a
@@ -297,6 +301,10 @@ const (
 	classSandbox class = "sandbox"
 	classMCP     class = "mcp"
 	classForward class = "forward"
+	// classRoute is the route door's (ANY /api/v1/environments/{env}/http/
+	// {path...}): a route token of the environment, plain-text answers, a
+	// tenant's token refused; the environments service checks it.
+	classRoute class = "route"
 )
 
 // route is one line of the route table.
@@ -394,6 +402,9 @@ func (s *server) routes() []route {
 		tenant("POST /api/v1/kube/preflight", serve(b.KubePreflight))
 		tenant("POST /api/v1/ssh/preflight", serve(b.SSHPreflight))
 	}
+
+	// The environments (ADR 0018): the tenant's, and their route door.
+	s.envRoutes(add)
 
 	// The doors with classes of their own: their answers are plain text
 	// (forward) or the MCP door's, not this API's JSON.

@@ -1,0 +1,39 @@
+{
+  "method": "DELETE",
+  "path": "/api/v1/environments/expensa-stage/objects/route/api-approval",
+  "query": {
+    "base": [
+      "7"
+    ],
+    "author": [
+      "fecode:0193a000-aaaa-7bbb-8ccc-000000000001"
+    ]
+  },
+  "status": 201,
+  "request": null,
+  "response": {
+    "number": 8,
+    "state": "pending",
+    "origin": "object",
+    "originRef": "route/api-approval",
+    "author": "fecode:0193a000-aaaa-7bbb-8ccc-000000000001",
+    "message": "",
+    "annotations": {},
+    "base": 7,
+    "reason": "",
+    "createdAt": "2026-10-18T14:09:30Z",
+    "startedAt": "",
+    "finishedAt": "",
+    "tags": [],
+    "diff": [
+      {
+        "kind": "route",
+        "name": "api-approval",
+        "change": "remove",
+        "fields": [],
+        "effect": "in place"
+      }
+    ],
+    "findings": []
+  }
+}

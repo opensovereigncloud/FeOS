@@ -1,0 +1,58 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments",
+  "query": {
+    "label": [
+      "fecode.project=0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01"
+    ]
+  },
+  "status": 200,
+  "request": null,
+  "response": {
+    "environments": [
+      {
+        "id": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b01",
+        "name": "expensa-stage",
+        "labels": {
+          "fecode.class": "stage",
+          "fecode.env": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b01",
+          "fecode.project": "0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01"
+        },
+        "release": 7,
+        "realised": 6,
+        "state": "rolling",
+        "openIncidents": 1,
+        "createdAt": "2026-10-01T09:12:44Z"
+      },
+      {
+        "id": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b02",
+        "name": "expensa-prod",
+        "labels": {
+          "fecode.class": "production",
+          "fecode.env": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b02",
+          "fecode.project": "0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01"
+        },
+        "release": 4,
+        "realised": 4,
+        "state": "realised",
+        "openIncidents": 0,
+        "createdAt": "2026-10-01T09:14:02Z"
+      },
+      {
+        "id": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b03",
+        "name": "expensa-login-3f9a",
+        "labels": {
+          "fecode.class": "preview",
+          "fecode.env": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b03",
+          "fecode.project": "0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01"
+        },
+        "release": 3,
+        "realised": 3,
+        "state": "realised",
+        "openIncidents": 0,
+        "createdAt": "2026-10-18T10:41:07Z"
+      }
+    ]
+  },
+  "note": "sorted by name; ?label=k=v repeats, all must match"
+}

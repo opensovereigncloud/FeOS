@@ -1,0 +1,54 @@
+{
+  "method": "POST",
+  "path": "/api/v1/environments/expensa-stage/releases",
+  "query": {},
+  "status": 422,
+  "request": {
+    "spec": {
+      "services": {
+        "expense-service": {
+          "image": "ghcr.io/acme/expense:1.4",
+          "env": {
+            "EXPENSA_DATABASE_URL": {
+              "addon": "mysql",
+              "key": "url"
+            }
+          },
+          "ports": [
+            {
+              "name": "http",
+              "port": 8080
+            }
+          ],
+          "idle": "15m"
+        }
+      }
+    },
+    "base": 6,
+    "author": "fecode:0193a000-aaaa-7bbb-8ccc-000000000001",
+    "message": "stage follows main at revision 12",
+    "annotations": {
+      "fecode.dev/kind": "stage",
+      "fecode.dev/revision": "0193c111-2222-7333-8444-000000000012",
+      "fecode.dev/values": "2087034914b19da9e7ae7f06bbe87841f24b94d1d99a55afe95a70f5653565a4"
+    }
+  },
+  "response": {
+    "error": "the spec has 2 errors, the first: services.expense-service.env.EXPENSA_DATABASE_URL: no addon mysql",
+    "code": "invalid_spec",
+    "findings": [
+      {
+        "severity": "error",
+        "path": "services.expense-service.env.EXPENSA_DATABASE_URL",
+        "problem": "no addon mysql",
+        "remedy": "declare the addon under addons, or reference one that is declared"
+      },
+      {
+        "severity": "error",
+        "path": "services.expense-service.idle",
+        "problem": "nothing would wake it: no route targets expense-service",
+        "remedy": "add a route to it, or remove idle"
+      }
+    ]
+  }
+}

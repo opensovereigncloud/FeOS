@@ -144,8 +144,9 @@ func TestWriteError(t *testing.T) {
 		}
 	}
 	var ae *apierr.Error
-	if err := errNotImplemented("x"); !errors.As(err, &ae) || ae.Status != http.StatusNotImplemented {
-		t.Fatalf("not implemented is %v", err)
+	if err := errNoObject("service", "x"); !errors.As(err, &ae) || ae.Status != http.StatusNotFound ||
+		ae.Msg != "no such object: service/x" {
+		t.Fatalf("no object is %v", err)
 	}
 	e := &InvalidSpecError{Findings: []spec.Finding{{Severity: spec.SeverityError, Problem: "a"},
 		{Severity: spec.SeverityError, Path: "p", Problem: "b"}}}

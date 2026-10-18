@@ -1,0 +1,40 @@
+{
+  "method": "POST",
+  "path": "/api/v1/environments/plan",
+  "query": {},
+  "status": 200,
+  "request": {
+    "spec": {
+      "services": {
+        "web": {
+          "runtime": "attached",
+          "sandbox": "0193b0aa-1111-7222-8333-444455556601",
+          "replicas": 2,
+          "ports": [
+            {
+              "name": "http",
+              "port": 5173
+            }
+          ]
+        }
+      }
+    }
+  },
+  "response": {
+    "valid": false,
+    "findings": [
+      {
+        "severity": "error",
+        "path": "services.web.command",
+        "problem": "an attached service needs a command",
+        "remedy": "set command to the process to run in the sandbox"
+      },
+      {
+        "severity": "error",
+        "path": "services.web.replicas",
+        "problem": "an attached service runs once",
+        "remedy": "remove replicas, or run the service as an image"
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/objects/service/nope/logs",
+  "query": {},
+  "status": 404,
+  "request": null,
+  "response": {
+    "error": "no such object: service/nope"
+  }
+}

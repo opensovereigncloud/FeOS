@@ -5,55 +5,139 @@ package env
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
+	"regexp"
+	"slices"
+	"strconv"
+
+	"github.com/ironcore-dev/feos/go/internal/apierr"
+	"github.com/ironcore-dev/feos/go/internal/env/ctl"
+	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
+	"github.com/ironcore-dev/feos/go/internal/env/spec"
+	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 // The operations of the environments' REST routes (the contract's §5),
 // one method each. tenant is the request's tenant (auth.Tenant.Name); env
 // is the path's {env}: the environment's UUID or its name. An environment
 // the tenant does not have, foreign or absent, is 404 "no such
-// environment". Errors are *apierr.Error with their statuses, or an
-// InvalidSpecError (422) or a BaseMismatchError (409), which WriteError
-// answers; any other error is a 500.
+// environment"; a change of one being deleted is 409. Errors are
+// *apierr.Error with their statuses, or an InvalidSpecError (422) or a
+// BaseMismatchError (409), which WriteError answers; any other error is a
+// 500.
+
+// The bounds of the listings.
+const (
+	defaultReleases = 50
+	maxReleases     = 1000
+	defaultLogLines = 200
+	maxLogLines     = 10000
+)
+
+// tagName is a tag's rule (env_tags).
+var tagName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // CreateEnv is POST /api/v1/environments: the new environment's status
 // and created true (201), or the existing one's and false when the same
 // ID and name exist (200); 409 CodeNameTaken or CodeIDTaken. A deleting
 // tenant is refused.
 func (s *Service) CreateEnv(ctx context.Context, tenant string, req CreateEnvRequest) (EnvStatus, bool, error) {
-	return EnvStatus{}, false, errNotImplemented("creating an environment")
+	id, err := checkNewEnv(req.Name, req.ID, req.Labels)
+	if err != nil {
+		return EnvStatus{}, false, err
+	}
+	var row store.Environment
+	var created bool
+	err = s.inTxRetry(ctx, func(tx *store.Store) error {
+		if err := lockTenant(ctx, tx, tenant); err != nil {
+			return err
+		}
+		row, created, err = insertEnv(ctx, tx, tenant, id, req.Name, req.Labels, true)
+		return err
+	})
+	if err != nil {
+		return EnvStatus{}, false, err
+	}
+	st, err := s.status(ctx, row)
+	return st, created, err
 }
 
 // ListEnvs is GET /api/v1/environments: the tenant's environments with
 // every label of labels (?label=k=v, repeatable, AND), by name.
 func (s *Service) ListEnvs(ctx context.Context, tenant string, labels map[string]string) (EnvList, error) {
-	return EnvList{}, errNotImplemented("listing environments")
+	rows, err := s.st.EnvSummaries(ctx, tenant, labels)
+	if err != nil {
+		return EnvList{}, fmt.Errorf("list environments: %w", err)
+	}
+	out := EnvList{Environments: make([]EnvSummary, 0, len(rows))}
+	for _, r := range rows {
+		out.Environments = append(out.Environments, summaryOf(r))
+	}
+	return out, nil
 }
 
 // GetEnv is GET /api/v1/environments/{env}: its status (§4.9), a read
 // that wakes nothing.
 func (s *Service) GetEnv(ctx context.Context, tenant, env string) (EnvStatus, error) {
-	return EnvStatus{}, errNotImplemented("reading an environment")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return EnvStatus{}, err
+	}
+	return s.status(ctx, e)
 }
 
 // DeleteEnv is DELETE /api/v1/environments/{env}: marks it deleting
 // (202); the controller deletes its instances, volumes and groups, then
-// the environment.
+// the environment. Deleting one that is being deleted is no error.
 func (s *Service) DeleteEnv(ctx context.Context, tenant, env string) error {
-	return errNotImplemented("deleting an environment")
+	return s.st.InTx(ctx, func(tx *store.Store) error {
+		e, err := resolveEnv(ctx, tx, tenant, env, store.ForUpdate)
+		if err != nil || e.Deleting {
+			return err
+		}
+		after := e
+		after.Deleting = true
+		if _, err := tx.UpdateEnvironment(ctx, e, after); err != nil {
+			return err
+		}
+		return wake(ctx, tx, ctl.LoopDelete, ctl.HintReconcile)
+	})
 }
 
 // PlanSpec is POST /api/v1/environments/plan: a spec validated without an
-// environment (spec.ModeSpec).
+// environment (spec.ModeSpec): no secrets, no release to compare with, but
+// the tenant's sandboxes and the images.
 func (s *Service) PlanSpec(ctx context.Context, tenant string, req PlanSpecRequest) (PlanSpecAnswer, error) {
-	return PlanSpecAnswer{}, errNotImplemented("planning a spec")
+	sp, fs := spec.Parse(req.Spec)
+	if !spec.HasErrors(fs) {
+		vc, pins, err := s.loadContext(ctx, tenant, nil, sp, spec.ModeSpec, map[string]spec.SecretInfo{})
+		if err != nil {
+			return PlanSpecAnswer{}, err
+		}
+		fs = append(fs, spec.Validate(vc, sp, nil)...)
+		_, nfs := spec.Normalise(sp, pins)
+		fs = append(fs, nfs...)
+	}
+	fs = spec.SortFindings(fs)
+	return PlanSpecAnswer{Valid: !spec.HasErrors(fs), Findings: nonNilFindings(fs)}, nil
 }
 
 // Plan is POST /api/v1/environments/{env}/plan: parse, validate, resolve
 // the images (unresolvable: a warning), normalise, and diff against
 // req.Base or the current release. It changes nothing.
 func (s *Service) Plan(ctx context.Context, tenant, env string, req PlanRequest) (PlanAnswer, error) {
-	return PlanAnswer{}, errNotImplemented("planning a release")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return PlanAnswer{}, err
+	}
+	p, err := s.plan(ctx, tenant, e, req.Spec, req.Base, spec.ModePlan, nil)
+	if err != nil {
+		return PlanAnswer{}, err
+	}
+	return p.answer(), nil
 }
 
 // Apply is POST /api/v1/environments/{env}/releases: plan, refuse on any
@@ -64,19 +148,75 @@ func (s *Service) Plan(ctx context.Context, tenant, env string, req PlanRequest)
 // spec equal to the current release's answers that release Unchanged
 // (200), unless it failed.
 func (s *Service) Apply(ctx context.Context, tenant, env string, req ApplyRequest) (ApplyAnswer, error) {
-	return ApplyAnswer{}, errNotImplemented("applying a release")
+	if err := checkReleaseMeta(req.Author, req.Message, req.Annotations); err != nil {
+		return ApplyAnswer{}, err
+	}
+	return s.apply(ctx, tenant, env, applyArgs{raw: req.Spec, base: req.Base, author: req.Author, message: req.Message,
+		annotations: req.Annotations, origin: model.OriginApply})
 }
 
 // Releases is GET /api/v1/environments/{env}/releases: the newest limit
 // releases (default 50), newest first.
 func (s *Service) Releases(ctx context.Context, tenant, env string, limit int) (ReleaseList, error) {
-	return ReleaseList{}, errNotImplemented("listing releases")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return ReleaseList{}, err
+	}
+	if limit <= 0 {
+		limit = defaultReleases
+	}
+	limit = min(limit, maxReleases)
+	rows, err := s.st.ListReleases(ctx, e.ID, limit)
+	if err != nil {
+		return ReleaseList{}, fmt.Errorf("releases: %w", err)
+	}
+	tags, err := s.tagsByRelease(ctx, e.ID)
+	if err != nil {
+		return ReleaseList{}, err
+	}
+	out := ReleaseList{Releases: make([]ReleaseInfo, 0, len(rows))}
+	for _, r := range rows {
+		out.Releases = append(out.Releases, releaseInfo(r, tags[r.Number]))
+	}
+	return out, nil
 }
 
 // Release is GET /api/v1/environments/{env}/releases/{n}: the release,
 // its spec and its diff against release n-1; 404 "no such release".
 func (s *Service) Release(ctx context.Context, tenant, env string, number int) (ReleaseDetail, error) {
-	return ReleaseDetail{}, errNotImplemented("reading a release")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return ReleaseDetail{}, err
+	}
+	r, err := s.st.GetRelease(ctx, e.ID, number)
+	if errors.Is(err, store.ErrNoRow) {
+		return ReleaseDetail{}, errNoRelease()
+	}
+	if err != nil {
+		return ReleaseDetail{}, fmt.Errorf("release %d: %w", number, err)
+	}
+	sp, err := s.releaseSpec(ctx, e.ID, number)
+	if err != nil {
+		return ReleaseDetail{}, err
+	}
+	var prev *spec.Spec
+	if number > 1 {
+		if prev, err = s.releaseSpec(ctx, e.ID, number-1); err != nil && !isNotFound(err) {
+			return ReleaseDetail{}, err
+		}
+	}
+	tags, err := s.tagsByRelease(ctx, e.ID)
+	if err != nil {
+		return ReleaseDetail{}, err
+	}
+	return ReleaseDetail{ReleaseInfo: releaseInfo(r, tags[number]), Spec: r.Spec,
+		Diff: spec.DiffWith(prev, sp, s.addonEffect)}, nil
+}
+
+// isNotFound reports an answer 404.
+func isNotFound(err error) bool {
+	var ae *apierr.Error
+	return errors.As(err, &ae) && ae.Status == http.StatusNotFound
 }
 
 // Revert is POST /api/v1/environments/{env}/releases/{n}/revert: Apply of
@@ -84,122 +224,442 @@ func (s *Service) Release(ctx context.Context, tenant, env string, number int) (
 // plus "ferun.revertOf": n. A secret version n pins that was deleted is an
 // error finding.
 func (s *Service) Revert(ctx context.Context, tenant, env string, number int, req RevertRequest) (ApplyAnswer, error) {
-	return ApplyAnswer{}, errNotImplemented("reverting to a release")
+	if err := checkReleaseMeta(req.Author, req.Message, nil); err != nil {
+		return ApplyAnswer{}, err
+	}
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return ApplyAnswer{}, err
+	}
+	r, err := s.st.GetRelease(ctx, e.ID, number)
+	if errors.Is(err, store.ErrNoRow) {
+		return ApplyAnswer{}, errNoRelease()
+	}
+	if err != nil {
+		return ApplyAnswer{}, fmt.Errorf("release %d: %w", number, err)
+	}
+	return s.apply(ctx, tenant, e.ID.String(), applyArgs{raw: r.Spec, base: req.Base, author: req.Author,
+		message: req.Message, annotations: revertAnnotations(r), origin: model.OriginRevert,
+		originRef: strconv.Itoa(number)})
+}
+
+// currentRaw is the current release's spec as stored, nil without one.
+func (s *Service) currentRaw(ctx context.Context, e store.Environment) ([]byte, error) {
+	if e.Release == 0 {
+		return nil, nil
+	}
+	r, err := s.st.GetRelease(ctx, e.ID, e.Release)
+	if err != nil {
+		return nil, fmt.Errorf("release %d: %w", e.Release, err)
+	}
+	return r.Spec, nil
 }
 
 // PutObject is PUT /api/v1/environments/{env}/objects/{kind}/{name}: the
-// current release's spec with the object set, applied (origin object) or,
-// with DryRun, planned. kind is spec.KindService, KindJob, KindAddon,
-// KindRoute or KindSecret.
+// current release's spec with the object set, applied (origin object,
+// originRef "<kind>/<name>") or, with DryRun, planned against req.Base.
+// kind is spec.KindService, KindJob, KindAddon, KindRoute or KindSecret.
 func (s *Service) PutObject(ctx context.Context, tenant, env, kind, name string, req PutObjectRequest) (ObjectAnswer, error) {
-	return ObjectAnswer{}, errNotImplemented("putting an object")
+	if len(req.Object) == 0 {
+		return ObjectAnswer{}, errBadRequest("object is required: the object as a spec has it under its kind")
+	}
+	return s.objectChange(ctx, tenant, env, kind, name, req.Object, req.Base, req.DryRun, req.Author, req.Message)
 }
 
 // DeleteObject is DELETE /api/v1/environments/{env}/objects/{kind}/{name}:
-// the current release's spec without the object, applied or planned.
+// the current release's spec without the object, applied or planned; 404
+// "no such object" when the current release has none.
 func (s *Service) DeleteObject(ctx context.Context, tenant, env, kind, name string, req DeleteObjectRequest) (ObjectAnswer, error) {
-	return ObjectAnswer{}, errNotImplemented("deleting an object")
+	return s.objectChange(ctx, tenant, env, kind, name, nil, req.Base, req.DryRun, req.Author, req.Message)
+}
+
+// objectChange is PutObject (object set) and DeleteObject (nil).
+func (s *Service) objectChange(ctx context.Context, tenant, env, kind, name string, object []byte, base int, dryRun bool,
+	author, message string) (ObjectAnswer, error) {
+	if err := checkReleaseMeta(author, message, nil); err != nil {
+		return ObjectAnswer{}, err
+	}
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return ObjectAnswer{}, err
+	}
+	current, err := s.currentRaw(ctx, e)
+	if err != nil {
+		return ObjectAnswer{}, err
+	}
+	raw, had, err := withObject(current, kind, name, object)
+	if err != nil {
+		return ObjectAnswer{}, err
+	}
+	if object == nil && !had {
+		return ObjectAnswer{}, errNoObject(kind, name)
+	}
+	if dryRun {
+		p, err := s.plan(ctx, tenant, e, raw, &base, spec.ModePlan, nil)
+		if err != nil {
+			return ObjectAnswer{}, err
+		}
+		return ObjectAnswer{DryRun: true, Plan: p.answer()}, nil
+	}
+	a, err := s.apply(ctx, tenant, e.ID.String(), applyArgs{raw: raw, base: base, author: author, message: message,
+		origin: model.OriginObject, originRef: kind + "/" + name})
+	if err != nil {
+		return ObjectAnswer{}, err
+	}
+	return ObjectAnswer{Apply: a}, nil
 }
 
 // Clone is POST /api/v1/environments/{env}/clone: a new environment
-// (201, its status) with the secrets of req.Secrets, whose release 1
-// (origin clone, originRef "<env id>/<number>", annotations copied) is
-// req.Spec or the source release's spec without its attached services.
-// No data is copied.
+// (201, its status) with the secrets of req.Secrets (copied: the
+// source's latest version, unsealed and sealed again for the new
+// environment; or set), whose release 1 (origin clone, originRef "<env
+// id>/<number>", annotations copied) is req.Spec or the source release's
+// spec without its attached services. No data is copied (Data is an
+// error finding); a secret reference the new environment would not have
+// is one too.
 func (s *Service) Clone(ctx context.Context, tenant, env string, req CloneRequest) (EnvStatus, error) {
-	return EnvStatus{}, errNotImplemented("cloning an environment")
+	return s.clone(ctx, tenant, env, req)
+}
+
+// tagOf is a tag as the answers show it.
+func tagOf(t store.EnvTag) Tag {
+	return Tag{Tag: t.Tag, Release: t.Number, MovedBy: t.MovedBy, MovedAt: rfc3339(t.MovedAt)}
 }
 
 // Tags is GET /api/v1/environments/{env}/tags.
 func (s *Service) Tags(ctx context.Context, tenant, env string) (TagList, error) {
-	return TagList{}, errNotImplemented("listing tags")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return TagList{}, err
+	}
+	tags, err := s.st.ListTags(ctx, e.ID)
+	if err != nil {
+		return TagList{}, fmt.Errorf("tags: %w", err)
+	}
+	out := TagList{Tags: make([]Tag, 0, len(tags))}
+	for _, t := range tags {
+		out.Tags = append(out.Tags, tagOf(t))
+	}
+	return out, nil
 }
 
 // Tag is GET /api/v1/environments/{env}/tags/{tag}; 404 "no such tag".
 func (s *Service) Tag(ctx context.Context, tenant, env, tag string) (Tag, error) {
-	return Tag{}, errNotImplemented("reading a tag")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return Tag{}, err
+	}
+	t, err := s.st.GetTag(ctx, e.ID, tag)
+	if errors.Is(err, store.ErrNoRow) {
+		return Tag{}, errNoTag()
+	}
+	if err != nil {
+		return Tag{}, fmt.Errorf("tag %s: %w", tag, err)
+	}
+	return tagOf(t), nil
 }
 
 // PutTag is PUT /api/v1/environments/{env}/tags/{tag}: set or move the
-// tag to a release; 404 "no such release".
+// tag to a release (movedBy the author, else the tenant); 404 "no such
+// release".
 func (s *Service) PutTag(ctx context.Context, tenant, env, tag string, req PutTagRequest) (Tag, error) {
-	return Tag{}, errNotImplemented("moving a tag")
+	if !tagName.MatchString(tag) {
+		return Tag{}, errBadRequest("tag %q must match %s", tag, tagName)
+	}
+	if err := checkReleaseMeta(req.Author, "", nil); err != nil {
+		return Tag{}, err
+	}
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return Tag{}, err
+	}
+	if req.Release < 1 {
+		return Tag{}, errNoRelease()
+	}
+	by := req.Author
+	if by == "" {
+		by = tenant
+	}
+	t, err := s.st.PutTag(ctx, store.EnvTag{EnvID: e.ID, Tag: tag, Number: req.Release, MovedBy: by})
+	if errors.Is(err, store.ErrNoRow) {
+		return Tag{}, errNoRelease()
+	}
+	if err != nil {
+		return Tag{}, fmt.Errorf("tag %s: %w", tag, err)
+	}
+	return tagOf(t), nil
 }
 
-// DeleteTag is DELETE /api/v1/environments/{env}/tags/{tag} (204).
+// DeleteTag is DELETE /api/v1/environments/{env}/tags/{tag} (204); 404
+// "no such tag".
 func (s *Service) DeleteTag(ctx context.Context, tenant, env, tag string) error {
-	return errNotImplemented("deleting a tag")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return err
+	}
+	ok, err := s.st.DeleteTag(ctx, e.ID, tag)
+	if err != nil {
+		return fmt.Errorf("tag %s: %w", tag, err)
+	}
+	if !ok {
+		return errNoTag()
+	}
+	return nil
 }
 
-// Secrets is GET /api/v1/environments/{env}/secrets; 503 without a
-// sealer.
+// Secrets is GET /api/v1/environments/{env}/secrets: the tenant's
+// secrets at their latest versions, never a value; 503 without a sealer.
 func (s *Service) Secrets(ctx context.Context, tenant, env string) (SecretList, error) {
-	return SecretList{}, errNotImplemented("listing secrets")
+	if s.d.Sealer == nil {
+		return SecretList{}, errNoSecrets()
+	}
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return SecretList{}, err
+	}
+	rows, err := s.st.ListSecrets(ctx, e.ID, false)
+	if err != nil {
+		return SecretList{}, fmt.Errorf("secrets: %w", err)
+	}
+	out := SecretList{Secrets: make([]SecretInfo, 0, len(rows))}
+	for _, r := range rows {
+		out.Secrets = append(out.Secrets, SecretInfo{Name: r.Name, Version: r.Version, CreatedBy: r.CreatedBy,
+			CreatedAt: rfc3339(r.CreatedAt)})
+	}
+	return out, nil
 }
 
 // PutSecret is PUT /api/v1/environments/{env}/secrets/{name}: a new
-// version, sealed (200); 503 without a sealer.
+// version (the highest ever plus one), sealed under its AAD (200); 503
+// without a sealer. A release pins it at its next apply.
 func (s *Service) PutSecret(ctx context.Context, tenant, env, name string, req PutSecretRequest) (SecretVersion, error) {
-	return SecretVersion{}, errNotImplemented("setting a secret")
+	if s.d.Sealer == nil {
+		return SecretVersion{}, errNoSecrets()
+	}
+	if !spec.IsSecretName(name) {
+		return SecretVersion{}, errBadRequest("secret name %q must be lowercase letters, digits, '.', '_' and '-' "+
+			"(at most 63, not beginning with \"addon.\")", name)
+	}
+	if len(req.Value) > maxSecretBytes {
+		return SecretVersion{}, errBadRequest("the value has %d bytes; at most %d are allowed", len(req.Value),
+			maxSecretBytes)
+	}
+	if err := checkReleaseMeta(req.Author, "", nil); err != nil {
+		return SecretVersion{}, err
+	}
+	by := req.Author
+	if by == "" {
+		by = tenant
+	}
+	var version int
+	err := s.st.InTx(ctx, func(tx *store.Store) error {
+		if err := lockTenant(ctx, tx, tenant); err != nil {
+			return err
+		}
+		e, err := resolveEnv(ctx, tx, tenant, env, store.ForUpdate)
+		if err != nil {
+			return err
+		}
+		if e.Deleting {
+			return errDeleting(e.Name)
+		}
+		version = 1
+		if last, err := tx.LatestSecret(ctx, e.ID, name); err == nil {
+			version = last.Version + 1
+		} else if !errors.Is(err, store.ErrNoRow) {
+			return err
+		}
+		sealed, err := s.d.Sealer.Seal([]byte(req.Value), envdeps.SecretAAD(e.ID, name, version))
+		if err != nil {
+			return fmt.Errorf("seal secret %s: %w", name, err)
+		}
+		_, err = tx.InsertSecret(ctx, store.EnvSecret{EnvID: e.ID, Name: name, Version: version, Sealed: sealed,
+			CreatedBy: by})
+		return err
+	})
+	if err != nil {
+		return SecretVersion{}, err
+	}
+	return SecretVersion{Name: name, Version: version}, nil
 }
 
 // DeleteSecret is DELETE /api/v1/environments/{env}/secrets/{name}: every
-// version soft-deleted (204); 409 while the latest release pins it.
+// version soft-deleted (204); 409 while the latest release pins it, 404
+// "no such secret", 503 without a sealer.
 func (s *Service) DeleteSecret(ctx context.Context, tenant, env, name string) error {
-	return errNotImplemented("deleting a secret")
+	if s.d.Sealer == nil {
+		return errNoSecrets()
+	}
+	if !spec.IsSecretName(name) {
+		// A system secret is no tenant's to delete.
+		return errNoSecret()
+	}
+	return s.st.InTx(ctx, func(tx *store.Store) error {
+		e, err := resolveEnv(ctx, tx, tenant, env, store.ForUpdate)
+		if err != nil {
+			return err
+		}
+		if e.Release > 0 {
+			r, err := tx.GetRelease(ctx, e.ID, e.Release)
+			if err != nil {
+				return fmt.Errorf("release %d: %w", e.Release, err)
+			}
+			sp, err := parseStored(r.Spec)
+			if err != nil {
+				return err
+			}
+			if _, pinned := sp.Secrets[name]; pinned || slices.Contains(spec.Referenced(*sp), name) {
+				return apierr.New(http.StatusConflict, "release %d pins secret %s: apply a release without it first",
+					e.Release, name)
+			}
+		}
+		n, err := tx.DeleteSecret(ctx, e.ID, name)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errNoSecret()
+		}
+		return nil
+	})
 }
 
 // Incidents is GET /api/v1/environments/{env}/incidents: newest first,
 // only the open ones with openOnly.
 func (s *Service) Incidents(ctx context.Context, tenant, env string, openOnly bool) (IncidentList, error) {
-	return IncidentList{}, errNotImplemented("listing incidents")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return IncidentList{}, err
+	}
+	rows, err := s.st.ListIncidents(ctx, e.ID, openOnly)
+	if err != nil {
+		return IncidentList{}, fmt.Errorf("incidents: %w", err)
+	}
+	out := IncidentList{Incidents: make([]Incident, 0, len(rows))}
+	for _, r := range rows {
+		out.Incidents = append(out.Incidents, incidentOf(r))
+	}
+	return out, nil
 }
 
 // Incident is GET /api/v1/environments/{env}/incidents/{id}; 404 "no
 // such incident".
 func (s *Service) Incident(ctx context.Context, tenant, env string, id int64) (Incident, error) {
-	return Incident{}, errNotImplemented("reading an incident")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return Incident{}, err
+	}
+	r, err := s.st.GetIncident(ctx, e.ID, id)
+	if errors.Is(err, store.ErrNoRow) {
+		return Incident{}, errNoIncident()
+	}
+	if err != nil {
+		return Incident{}, fmt.Errorf("incident %d: %w", id, err)
+	}
+	return incidentOf(r), nil
+}
+
+// ctlError maps the controller's answers: ErrNoObject 404, ErrPaused
+// 409 "paused", ErrNoContainerLogs 501.
+func ctlError(err error, kind, name string) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ctl.ErrNoObject):
+		return errNoObject(kind, name)
+	case errors.Is(err, ctl.ErrPaused):
+		return apierr.New(http.StatusConflict, "paused")
+	case errors.Is(err, ctl.ErrNoContainerLogs):
+		return apierr.New(http.StatusNotImplemented, "%s", ctl.ErrNoContainerLogs.Error())
+	}
+	return err
 }
 
 // Logs is GET /api/v1/environments/{env}/objects/{kind}/{name}/logs: the
-// last lines lines (default 200) of replica replica's log
+// last lines lines (default 200, at most 10000) of replica replica's log
 // (ctl.Controller.LogTail); 501 when the node serves no container logs,
 // 409 "paused" for a paused instance (never woken).
 func (s *Service) Logs(ctx context.Context, tenant, env, kind, name string, lines, replica int) (LogsAnswer, error) {
-	return LogsAnswer{}, errNotImplemented("reading logs")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return LogsAnswer{}, err
+	}
+	switch kind {
+	case spec.KindService, spec.KindAddon, spec.KindJob:
+	default:
+		return LogsAnswer{}, errNoObject(kind, name)
+	}
+	if replica < 0 {
+		return LogsAnswer{}, errBadRequest("replica %d is negative", replica)
+	}
+	if lines <= 0 {
+		lines = defaultLogLines
+	}
+	lines = min(lines, maxLogLines)
+	out, source, err := s.ctl.LogTail(ctx, e.ID, kind, name, replica, lines)
+	if err != nil {
+		return LogsAnswer{}, ctlError(err, kind, name)
+	}
+	if out == nil {
+		out = []string{}
+	}
+	return LogsAnswer{Lines: out, Source: source}, nil
 }
 
 // RestartService is POST /api/v1/environments/{env}/services/{name}/restart
-// (202).
+// (202): an attached service's process, an image service's replicas one
+// at a time.
 func (s *Service) RestartService(ctx context.Context, tenant, env, name string) error {
-	return errNotImplemented("restarting a service")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return err
+	}
+	if e.Deleting {
+		return errDeleting(e.Name)
+	}
+	return ctlError(s.ctl.RestartService(ctx, e.ID, name), spec.KindService, name)
 }
 
-// RunJob is POST /api/v1/environments/{env}/jobs/{name}/run (202).
+// RunJob is POST /api/v1/environments/{env}/jobs/{name}/run (202): a new
+// run, attempt 1.
 func (s *Service) RunJob(ctx context.Context, tenant, env, name string) error {
-	return errNotImplemented("running a job")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return err
+	}
+	if e.Deleting {
+		return errDeleting(e.Name)
+	}
+	return ctlError(s.ctl.RunJob(ctx, e.ID, name), spec.KindJob, name)
 }
 
 // CreateRouteToken is POST /api/v1/environments/{env}/route-tokens: a new
-// token of the route door (32 random bytes, base64url), shown once (201).
+// token of the route door (32 random bytes, base64url), shown once (201);
+// only its SHA-256 is kept.
 func (s *Service) CreateRouteToken(ctx context.Context, tenant, env string) (RouteToken, error) {
-	return RouteToken{}, errNotImplemented("minting a route token")
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return RouteToken{}, err
+	}
+	tok, hash, err := mintRouteToken()
+	if err != nil {
+		return RouteToken{}, fmt.Errorf("mint a route token: %w", err)
+	}
+	if _, err := s.st.InsertRouteToken(ctx, hash, e.ID); errors.Is(err, store.ErrNoRow) {
+		return RouteToken{}, errNoEnvironment()
+	} else if err != nil {
+		return RouteToken{}, err
+	}
+	return RouteToken{Token: tok}, nil
 }
 
 // RevokeRouteTokens is DELETE /api/v1/environments/{env}/route-tokens:
 // every route token of the environment revoked (204).
 func (s *Service) RevokeRouteTokens(ctx context.Context, tenant, env string) error {
-	return errNotImplemented("revoking route tokens")
-}
-
-// ServeRoute is the route door, ANY
-// /api/v1/environments/{env}/http/{path...}, an auth class of its own: a
-// route token of the environment as Bearer (401 "route token required";
-// a tenant token is refused), the longest segment-aware prefix match over
-// the routes of the realised release (the latest when none is), and the
-// request forwarded to a ready instance of the route's service (a paused
-// one is woken; none: 503 with Retry-After 5) or to an attached service's
-// sandbox. Its answers are plain text.
-func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "the route door is not implemented yet", http.StatusNotImplemented)
+	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
+	if err != nil {
+		return err
+	}
+	_, err = s.st.DeleteRouteTokens(ctx, e.ID)
+	return err
 }

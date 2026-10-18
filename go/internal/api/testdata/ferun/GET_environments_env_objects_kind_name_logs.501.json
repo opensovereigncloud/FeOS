@@ -1,0 +1,10 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/objects/addon/postgres/logs",
+  "query": {},
+  "status": 501,
+  "request": null,
+  "response": {
+    "error": "this node does not serve container logs yet"
+  }
+}

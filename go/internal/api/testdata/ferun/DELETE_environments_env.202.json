@@ -1,0 +1,9 @@
+{
+  "method": "DELETE",
+  "path": "/api/v1/environments/0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b03",
+  "query": {},
+  "status": 202,
+  "request": null,
+  "response": null,
+  "note": "no body; the controller deletes instances, volumes and groups, then the row"
+}
