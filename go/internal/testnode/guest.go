@@ -189,7 +189,10 @@ func (c *containerService) Exec(req *containerv1.ExecRequest, stream grpc.Server
 		return status.Error(codes.InvalidArgument, "no command")
 	}
 	out := &frameSender{stream: stream}
-	if f := c.n.script.execFunc(); f != nil {
+	for _, f := range []ExecFunc{c.n.script.podExecFunc(g.uid), c.n.script.execFunc()} {
+		if f == nil {
+			continue
+		}
 		code, ok, err := f(ctx, g.uid, req, out)
 		if err != nil {
 			return err
@@ -197,6 +200,10 @@ func (c *containerService) Exec(req *containerv1.ExecRequest, stream grpc.Server
 		if ok {
 			return out.send(&containerv1.ExecStreamFrame{Frame: &containerv1.ExecStreamFrame_ExitCode{ExitCode: code}})
 		}
+	}
+	if c.n.cfg.FakeExec || g.envPod {
+		// Nothing runs: an environment's probes and provisioning pass.
+		return out.send(&containerv1.ExecStreamFrame{Frame: &containerv1.ExecStreamFrame_ExitCode{ExitCode: 0}})
 	}
 	code, err := c.run(ctx, g, container, req, out)
 	if err != nil {
@@ -242,6 +249,48 @@ func (c *containerService) run(ctx context.Context, g *guest, container string, 
 		return 0, status.Errorf(codes.Internal, "exec: %v", err)
 	}
 	return exitCode(cmd.ProcessState), nil
+}
+
+// envLabel is the label of an environment's pods (model.LabelEnvironment).
+const envLabel = "ferun.environment"
+
+// maxTailLines is the most lines a StreamContainerLogs tail_lines sends.
+const maxTailLines = 10000
+
+// StreamContainerLogs serves a container's log lines (Script.AppendLog):
+// the last tail_lines of them when above 0 (at most 10000), else all with
+// tail, else none; with follow the stream then stays open until the
+// caller ends it, without new lines.
+func (c *containerService) StreamContainerLogs(req *containerv1.StreamContainerLogsRequest, stream grpc.ServerStreamingServer[containerv1.LogEntry]) error {
+	ctx := stream.Context()
+	g, err := guestFrom(ctx)
+	if err != nil {
+		return err
+	}
+	container := req.GetContainerId()
+	if container == "" {
+		container = "main"
+	}
+	if !g.containers[container] {
+		return status.Errorf(codes.NotFound, "no container %s", container)
+	}
+	lines := c.n.pods.containerLog(g.id, container)
+	switch n := int(min(req.GetTailLines(), maxTailLines)); {
+	case n > 0:
+		lines = lines[max(0, len(lines)-n):]
+	case !req.GetTail():
+		lines = nil
+	}
+	for _, l := range lines {
+		if err := stream.Send(&containerv1.LogEntry{Line: []byte(l)}); err != nil {
+			return err
+		}
+	}
+	if req.GetFollow() {
+		<-ctx.Done()
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	return nil
 }
 
 // defaultPath is a command's PATH when the test node's own has none.

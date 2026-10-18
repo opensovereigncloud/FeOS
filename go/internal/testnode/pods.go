@@ -78,6 +78,18 @@ type pod struct {
 	// the last maxRequestIDs: a late HibernatePod with one of them is
 	// answered ABORTED instead of starting a hibernation of the resumed pod.
 	abandonedIDs []string
+	// exited are the containers whose process exited while the pod runs
+	// (Script.ExitContainer), until the pod boots again.
+	exited map[string]containerExit
+	// logs are the containers' log lines (Script.AppendLog).
+	logs map[string][]string
+}
+
+// containerExit is how a container's process ended: its code, or none
+// (the node reported no exit status).
+type containerExit struct {
+	code    int32
+	hasCode bool
 }
 
 // maxRequestIDs is how many request ids a hibernation keeps of the calls
@@ -243,6 +255,16 @@ func normalize(in *podv1.PodSpec) (*podv1.PodSpec, error) {
 			return nil, status.Errorf(codes.InvalidArgument, "volume %s is named twice", v.VolumeId)
 		}
 		volumes[v.Name], ids[v.VolumeId] = true, true
+	}
+	groups := map[string]bool{}
+	for _, g := range spec.GetNetwork().GetSecurityGroups() {
+		if !validGroupID(g) {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid security group ID %q: 1 to 64 letters, digits, \"-\", \"_\" and \".\"", g)
+		}
+		if groups[g] {
+			return nil, status.Errorf(codes.InvalidArgument, "security group %s is named twice", g)
+		}
+		groups[g] = true
 	}
 	for _, c := range spec.Containers {
 		paths := map[string]bool{}
@@ -461,6 +483,12 @@ func (p *podService) bringUpPod(ctx context.Context, id string, pd *pod) {
 	if ctx.Err() != nil {
 		return
 	}
+	if failed == nil {
+		p.mu.Lock()
+		groups := pd.info.GetSpec().GetNetwork().GetSecurityGroups()
+		p.mu.Unlock()
+		failed = p.n.groups.attachError(groups)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// Ended meanwhile: whoever ended it holds the say now. spawnBringUp and
@@ -472,8 +500,9 @@ func (p *podService) bringUpPod(ctx context.Context, id string, pd *pod) {
 	if failed != nil {
 		pd.info.State, pd.info.Reason = podv1.PodState_POD_STATE_FAILED, failed.Error()
 	} else {
-		pd.guestDown = false
+		pd.guestDown, pd.exited = false, nil
 		pd.info.State, pd.info.Reason = podv1.PodState_POD_STATE_RUNNING, ""
+		p.n.volumes.booted(id)
 	}
 	p.announceLocked(pd.info, false)
 }
@@ -549,11 +578,19 @@ func whyCold(cold, memory bool, unrestorable string) string {
 }
 
 // containerStatuses is what the guest reports of a running pod's
-// containers.
-func containerStatuses(spec *podv1.PodSpec) []*podv1.ContainerStatus {
+// containers: running, or exited (with its code when it has one).
+func containerStatuses(spec *podv1.PodSpec, exited map[string]containerExit) []*podv1.ContainerStatus {
 	var out []*podv1.ContainerStatus
 	for _, c := range spec.GetContainers() {
-		out = append(out, &podv1.ContainerStatus{Name: c.Name, State: podv1.ContainerState_CONTAINER_STATE_RUNNING})
+		st := &podv1.ContainerStatus{Name: c.Name, State: podv1.ContainerState_CONTAINER_STATE_RUNNING}
+		if e, ok := exited[c.Name]; ok {
+			st.State = podv1.ContainerState_CONTAINER_STATE_EXITED
+			if e.hasCode {
+				code := e.code
+				st.ExitCode = &code
+			}
+		}
+		out = append(out, st)
 	}
 	return out
 }
@@ -583,16 +620,22 @@ func (p *podService) create(ctx context.Context, id string, spec *podv1.PodSpec)
 		p.mu.Unlock()
 		return sameSpec(info, spec)
 	}
-	if len(spec.Volumes) > 0 {
-		p.mu.Unlock()
-		return nil, status.Errorf(codes.FailedPrecondition, "no volume %s on this node", spec.Volumes[0].VolumeId)
-	}
 	info := &podv1.PodInfo{PodId: id, Spec: spec, State: podv1.PodState_POD_STATE_PENDING}
 	if hasNetwork(spec) {
 		if err := p.allocateLocked(info); err != nil {
 			p.mu.Unlock()
 			return nil, err
 		}
+	}
+	// The volumes are claimed synchronously, all or none: one the node
+	// does not have, or another pod holds, fails the create.
+	var volumeIDs []string
+	for _, v := range spec.Volumes {
+		volumeIDs = append(volumeIDs, v.VolumeId)
+	}
+	if err := p.n.volumes.claim(id, volumeIDs); err != nil {
+		p.mu.Unlock()
+		return nil, err
 	}
 	if err := os.MkdirAll(p.n.podDir(uid), 0o755); err != nil {
 		p.mu.Unlock()
@@ -697,7 +740,7 @@ func (p *podService) stop(ctx context.Context, id string) error {
 		p.change(id, func(pd *pod) { pd.guestDown = true })
 		return err
 	}
-	p.change(id, func(pd *pod) { pd.snapshot = false })
+	p.change(id, func(pd *pod) { pd.snapshot, pd.exited = false, nil })
 	p.setState(id, podv1.PodState_POD_STATE_STOPPED, "stopped")
 	return nil
 }
@@ -727,6 +770,7 @@ func (p *podService) delete(ctx context.Context, id string) error {
 	delete(p.pods, id)
 	p.announceLocked(pd.info, true)
 	p.mu.Unlock()
+	p.n.volumes.release(id)
 	if err := os.RemoveAll(p.n.podDir(pd.uid)); err != nil {
 		p.n.log.Warn("test node: the directory of a deleted pod stays", "pod", id, "err", err)
 	}
@@ -1067,10 +1111,12 @@ func (p *podService) hibernate(ctx context.Context, req *podv1.HibernatePodReque
 	if err := p.n.script.point(ctx, HibernateHead, req); err != nil {
 		return nil, err
 	}
-	key, err := store.put(&checkpoint{podID: id, epoch: epoch, memory: memory, spec: cloneSpec(info.Spec), files: files, bytes: diskBytes})
+	key, err := store.put(&checkpoint{podID: id, epoch: epoch, memory: memory, spec: cloneSpec(info.Spec), files: files, bytes: diskBytes,
+		volumes: p.n.volumes.checkpointed(id, epoch)})
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "diskd: upload the checkpoint of pod %s: %v", id, err)
 	}
+	p.n.volumes.checkpoint(id, epoch)
 	p.hibernating(h, func(h *hibernation) { h.phase = podv1.HibernationPhase_HIBERNATION_PHASE_LEAVING })
 	cp := &podv1.Checkpoint{HeadKey: key, Epoch: epoch, Memory: memory}
 	p.change(id, func(pd *pod) {
@@ -1156,6 +1202,10 @@ func (p *podService) restore(ctx context.Context, id, headKey string, cold bool)
 			return nil, err
 		}
 	}
+	if err := p.n.volumes.takeOver(id, c.volumes); err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
 	pd.info.Checkpoint = &podv1.Checkpoint{HeadKey: key, Epoch: c.epoch, Memory: c.memory}
 	p.mu.Unlock()
 	if err := restoreDir(p.n.podDir(pd.uid), c.files); err != nil {
@@ -1169,7 +1219,12 @@ func (p *podService) restore(ctx context.Context, id, headKey string, cold bool)
 	}
 	reason := whyCold(cold, c.memory, p.n.script.unrestorableReason())
 	if reason == "" {
+		if err := p.n.groups.attachError(info.GetSpec().GetNetwork().GetSecurityGroups()); err != nil {
+			p.setState(id, podv1.PodState_POD_STATE_FAILED, err.Error())
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		p.change(id, func(pd *pod) { pd.guestDown, pd.snapshot = false, false })
+		p.n.volumes.booted(id)
 		p.setState(id, podv1.PodState_POD_STATE_RUNNING, "")
 		out, err := p.get(id)
 		if err != nil {
@@ -1241,7 +1296,7 @@ func (p *podService) GetPod(_ context.Context, req *podv1.GetPodRequest) (*podv1
 			GuestVersion:  guestVersion,
 			GuestAttached: !pd.guestDown && !p.n.script.isUnreachable(pd.uid),
 		}
-		info.Containers = containerStatuses(info.Spec)
+		info.Containers = containerStatuses(info.Spec, pd.exited)
 	}
 	return info, nil
 }
@@ -1355,6 +1410,9 @@ type guest struct {
 	dir        string
 	containers map[string]bool
 	env        map[string]map[string]string // the containers' environments by name, from the spec
+	// envPod: the pod is an environment's (its spec's label
+	// ferun.environment).
+	envPod bool
 }
 
 // reach is the routing of a forwarded call (forward.rs): the pod must be
@@ -1377,7 +1435,8 @@ func (p *podService) reach(id string) (*guest, error) {
 	case down || p.n.script.isUnreachable(pd.uid):
 		return nil, status.Errorf(codes.Unavailable, "the guest of pod %s: connection reset by peer", id)
 	}
-	g := &guest{id: id, uid: pd.uid, dir: p.n.podDir(pd.uid), containers: map[string]bool{"main": true}, env: map[string]map[string]string{}}
+	g := &guest{id: id, uid: pd.uid, dir: p.n.podDir(pd.uid), containers: map[string]bool{"main": true}, env: map[string]map[string]string{},
+		envPod: spec.GetLabels()[envLabel] != ""}
 	for _, c := range spec.GetContainers() {
 		g.containers[c.Name] = true
 		g.env[c.Name] = c.GetEnv()
@@ -1426,4 +1485,75 @@ func InventoryHash(pods []*podv1.PodInfo) string {
 		h.Write([]byte(l))
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// namesGroup reports whether a pod on the node, in any state, names the
+// security group id.
+func (p *podService) namesGroup(id string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, pd := range p.pods {
+		if slices.Contains(pd.info.GetSpec().GetNetwork().GetSecurityGroups(), id) {
+			return true
+		}
+	}
+	return false
+}
+
+// byUID returns the pod whose ID is uid; p.mu held.
+func (p *podService) byUIDLocked(uid uuid.UUID) *pod {
+	for _, pd := range p.pods {
+		if pd.uid == uid {
+			return pd
+		}
+	}
+	return nil
+}
+
+// exitContainer makes the process of a running pod's container exit
+// (Script.ExitContainer).
+func (p *podService) exitContainer(uid uuid.UUID, container string, e containerExit) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pd := p.byUIDLocked(uid)
+	if pd == nil {
+		return notFound(uid.String())
+	}
+	if pd.info.State != podv1.PodState_POD_STATE_RUNNING {
+		return status.Errorf(codes.FailedPrecondition, "pod %s is %s, not running", pd.info.PodId, pd.info.State)
+	}
+	if !slices.ContainsFunc(pd.info.GetSpec().GetContainers(), func(c *podv1.ContainerSpec) bool { return c.Name == container }) {
+		return status.Errorf(codes.NotFound, "pod %s has no container %s", pd.info.PodId, container)
+	}
+	if pd.exited == nil {
+		pd.exited = map[string]containerExit{}
+	}
+	pd.exited[container] = e
+	return nil
+}
+
+// appendLog adds a line to a container's log.
+func (p *podService) appendLog(uid uuid.UUID, container, line string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pd := p.byUIDLocked(uid)
+	if pd == nil {
+		return notFound(uid.String())
+	}
+	if pd.logs == nil {
+		pd.logs = map[string][]string{}
+	}
+	pd.logs[container] = append(pd.logs[container], line)
+	return nil
+}
+
+// containerLog returns a copy of a container's log lines.
+func (p *podService) containerLog(id, container string) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pd := p.pods[id]
+	if pd == nil {
+		return nil
+	}
+	return slices.Clone(pd.logs[container])
 }
