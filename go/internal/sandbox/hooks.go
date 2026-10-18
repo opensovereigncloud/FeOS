@@ -36,8 +36,8 @@ type SecretResolver func(ctx context.Context, envID uuid.UUID, name string, vers
 // error before the pod call means nothing was sent: the op rolls back
 // with the error as its cause, and only an error that wraps ErrNodeUnfit
 // (and not model.ErrNodeUnavailable) puts the node of an unpinned create
-// on avoid_nodes. Inside callRepair it counts as sent (the observation
-// decides).
+// on avoid_nodes. Inside callRepair it counts as sent and as no call made
+// (the observation decides).
 type PrepareHook func(ctx context.Context, node string, sb store.Sandbox, kind OpKind) error
 
 // ErrNodeUnfit is what a PrepareHook's error wraps when the node itself

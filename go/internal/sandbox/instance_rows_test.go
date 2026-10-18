@@ -337,25 +337,64 @@ func TestResolverFailureRollsBack(t *testing.T) {
 	wantSteps(t, seq.take(), "hook create n1", "CreatePod")
 }
 
-// A prepare hook that fails inside a repair counts as sent: no pod call
-// is made, and the observation decides (the pod still runs).
+// A prepare hook that fails inside a repair counts as sent and as no call
+// made: no pod call is made, the observation decides (the pod still
+// runs), the description says that the repair was not done, and the
+// process holds survive; a repair that restarts the pod ends them.
 func TestPrepareHookFailureInRepair(t *testing.T) {
 	h := newHarness(t)
 	h.addNode("n1")
 	seq := &sequence{}
 	h.eng().SetPrepareHook(seq.hook)
 	h.recordCalls("n1", seq)
-	env := h.environment()
-	sb := h.instance(env, plainTemplate(env))
+	// An attachable sandbox: a tenant's row with a template, held by its
+	// background processes.
+	id := uuid.New()
+	sb := h.instance(uuid.Nil, &model.PodTemplate{Command: []string{"/bin/sh"},
+		SecurityGroups: []string{model.SandboxGroupID(id)}}, func(n *store.NewSandbox) { n.ID = id })
 	h.ensure(sb.ID)
 	seq.take()
+	if err := h.eng().HoldProcess(bg, sb.ID, "p1", 0); err != nil {
+		t.Fatal(err)
+	}
+	processHolds := func() int {
+		n := 0
+		for _, hd := range h.holds(sb.ID) {
+			if hd.Kind == model.HoldProcess {
+				n++
+			}
+		}
+		return n
+	}
+
 	seq.failOn(OpRepair, errors.New("no group"))
 	if err := h.eng().Restart(bg, sb.ID, "exited"); err != nil {
 		t.Fatal(err)
 	}
 	h.activityNamed(sb.ID, activity.KindLifecycleEnd, "repair on node n1: running")
-	wantState(t, h.row(sb.ID), model.StateRunning)
+	row := h.row(sb.ID)
+	wantState(t, row, model.StateRunning)
+	if row.StatusDescription != "repair not done: prepare node n1 for repair: no group" {
+		t.Fatalf("description after the failed repair %q", row.StatusDescription)
+	}
 	wantSteps(t, seq.take(), "hook repair n1")
+	if n := processHolds(); n != 1 {
+		t.Fatalf("%d process holds after a repair that made no call, want 1", n)
+	}
+
+	// A restart that happens ends the processes, and their holds.
+	seq.failOn(OpRepair, nil)
+	if err := h.eng().Restart(bg, sb.ID, "exited again"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 10*time.Second, "the restart's end", func() bool {
+		row := h.row(sb.ID)
+		return row.Op == "" && row.ClientState == model.StateRunning && row.StatusDescription == ""
+	})
+	wantSteps(t, seq.take(), "hook repair n1", "StopPod", "StartPod")
+	if n := processHolds(); n != 0 {
+		t.Fatalf("%d process holds after a restart, want 0", n)
+	}
 }
 
 // Restart restarts a running row's pod (StopPod and StartPod) with its
