@@ -23,26 +23,39 @@ import (
 // readiness checks of their instances and attached services, which take
 // no hold and count as no activity, and the route door's forward.
 
-// errProbeCap is a check that found every slot of the sandbox's cap taken:
-// it fails at once rather than wait for one, so that a busy sandbox's
-// checks do not stall.
-var errProbeCap = errors.New("every forwarded connection into the sandbox on this instance is in use")
+// ProbeSlots is how many checks (Probe, DialPod) of one sandbox may be
+// open at once on one instance: the probe slots, apart from the sandbox's
+// stream cap of 32 forwarded connections, so that forwarded traffic that
+// fills the cap (websockets, event streams, a page load) never makes a
+// check of a busy sandbox fail. A check holds its slot for at most its
+// timeout (a DialPod's connection until Close). Four let the checks of
+// one pass overlap (an instance's readiness, a sandbox's attached
+// services) while a sandbox's checks add at most four Forward streams to
+// its 32; a caller probes one sandbox at most ProbeSlots at a time.
+const ProbeSlots = 4
+
+// ErrProbeBusy is a check that found every probe slot of the sandbox
+// taken by its other checks: it fails at once rather than wait for one,
+// so that a check never stalls. It says nothing about the sandbox.
+var ErrProbeBusy = errors.New("every probe slot of the sandbox on this instance is in use")
 
 // DialPod opens a port-forward to the pod's port of the lease's sandbox,
 // answered by the guest's ready (something listens): a TCP readiness
 // check, or the connection of an HTTP one. It takes no hold and touches
-// nothing; the dial has its own timeout (2 s) and never waits for a slot
-// of the sandbox's stream cap (errProbeCap when none is free once the
-// idle pooled connections are closed). The connection lives until Close.
+// nothing; the dial has its own timeout (2 s) and takes a probe slot of
+// the sandbox, never one of its stream cap: it fails at once with
+// ErrProbeBusy when every probe slot is taken, and never waits. The
+// connection is the caller's alone (never one of the forwarding pools'),
+// and holds its probe slot until Close.
 func (h *Handler) DialPod(ctx context.Context, lease model.Lease, port int) (net.Conn, error) {
 	if port < 1 || port > 65535 {
 		return nil, fmt.Errorf("port %d is out of range", port)
 	}
 	ctx, cancel := context.WithTimeout(ctx, h.t.probeTimeout)
 	defer cancel()
-	release, ok := h.trySlot(lease.SandboxID)
+	release, ok := h.tryProbeSlot(lease.SandboxID)
 	if !ok {
-		return nil, errProbeCap
+		return nil, ErrProbeBusy
 	}
 	c, err := h.openStream(ctx, tkey{lease.SandboxID, port}, lease.Node, release)
 	if err != nil && ctx.Err() != nil {
@@ -55,8 +68,9 @@ func (h *Handler) DialPod(ctx context.Context, lease model.Lease, port int) (net
 // port-forward, with Host localhost:<port> (dev servers check it) and
 // Connection: close, and returns the answer's status code; the body is
 // not read. It takes no hold and touches nothing; the whole check has its
-// own timeout (2 s) and never waits for a slot of the sandbox's stream
-// cap.
+// own timeout (2 s) and its connection is a DialPod's: a probe slot,
+// never a slot of the sandbox's stream cap, ErrProbeBusy at once when
+// every probe slot is taken.
 func (h *Handler) Probe(ctx context.Context, lease model.Lease, port int, path string) (int, error) {
 	if path == "" {
 		path = "/"
