@@ -11,7 +11,6 @@ import (
 	"google.golang.org/grpc/codes"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 // The labels of a sandbox's pod (§2, §9). A pod belongs to ferund when it
@@ -25,26 +24,6 @@ const (
 
 // mainContainer is the one container of a sandbox's pod.
 const mainContainer = "main"
-
-// podSpec is the spec of the sandbox's pod: identical on every retry and
-// takeover, because feosd compares the normalised spec, labels included,
-// to make a create idempotent.
-func podSpec(sb store.Sandbox) *podv1.PodSpec {
-	return &podv1.PodSpec{
-		Resources: &podv1.Resources{Vcpus: uint32(sb.VCPUs), MemoryMib: uint64(sb.MemoryMiB)},
-		Containers: []*podv1.ContainerSpec{{
-			Name:     mainContainer,
-			ImageRef: sb.ImageRef,
-			Command:  []string{"sleep", "infinity"},
-		}},
-		Network: &podv1.PodNetwork{},
-		Labels: map[string]string{
-			LabelSandbox:     sb.ID.String(),
-			LabelTenant:      sb.Owner,
-			LabelIncarnation: sb.Incarnation.String(),
-		},
-	}
-}
 
 // podIncarnation is the incarnation a pod's label names: uuid.Nil for a pod
 // without it, or with one that is not a UUID, which no row has.

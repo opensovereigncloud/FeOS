@@ -154,7 +154,7 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 		after.Op, after.OpID, after.OpOwner = string(in.Kind), uuid.New(), e.id
 		after.OpDeadline, after.OpTarget, after.OpFromState = now.Add(d), target, row.ClientState
 		after.ClientState = transitional(in.Kind)
-		after.StatusDescription = ""
+		after.StatusDescription = in.reason
 		if in.Kind == OpCreate || in.Kind == OpRestore {
 			after.Node = target
 		}
@@ -209,7 +209,11 @@ func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target 
 		h.read.state, h.read.node, h.read.lostFrom, h.read.materialised = row.ClientState, row.Node, row.LostFrom, row.Materialised
 		h.tombstones = tombs
 		h.noAbandon = noAbandon
-		events = append(events, h.startEvent(row))
+		ev := h.startEvent(row)
+		if in.reason != "" {
+			ev.Detail["reason"] = in.reason
+		}
+		events = append(events, ev)
 		return nil
 	})
 	if e.beginTxHook != nil {
@@ -394,6 +398,7 @@ func (r *runner) noAbandon(ctx context.Context, tx *store.Store, trigger OpTrigg
 // unreachable; begun by the repair loop or Ensure, for longer than the
 // threshold that made them begin it (a Sync that applied RUNNING, or a
 // healthy call that cleared unreachable_since, after their read stops it).
+// Restart's repair needs only a running row.
 func (r *runner) precheck(ctx context.Context, tx *store.Store, row store.Sandbox, in OpIntent, target string) error {
 	st := row.ClientState
 	ok := false
@@ -420,7 +425,8 @@ func (r *runner) precheck(ctx context.Context, tx *store.Store, row store.Sandbo
 		}
 	case OpRepair:
 		ok = (st == model.StateCreating && !row.PendingSince.IsZero()) ||
-			(st == model.StateRunning && !row.UnreachableSince.IsZero())
+			(st == model.StateRunning && !row.UnreachableSince.IsZero()) ||
+			(st == model.StateRunning && in.Trigger == TriggerRestart)
 	default:
 		return fmt.Errorf("sandbox: unknown op %q", in.Kind)
 	}

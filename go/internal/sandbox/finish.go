@@ -34,10 +34,11 @@ func (r *runner) finish(h *OpHandle, res callResult, obs observation) (OpResult,
 }
 
 // rollback is §9 "Rollback": the op could not get a connection to its
-// target after its begin, so this run sent nothing.
-func (r *runner) rollback(h *OpHandle) OpResult {
+// target after its begin, or what comes before its pod call failed
+// (cause, nil for the former), so this run sent nothing.
+func (r *runner) rollback(h *OpHandle, cause *prepareError) OpResult {
 	res, _ := r.retry(h, func(ctx context.Context) (OpResult, afterCommit, error) {
-		return r.rollbackOnce(ctx, h)
+		return r.rollbackOnce(ctx, h, cause)
 	})
 	return res
 }
@@ -166,13 +167,22 @@ func (r *runner) fencedOut(ctx context.Context, tx *store.Store, h *OpHandle, ro
 	return result, ac, events, nil
 }
 
-func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle) (OpResult, afterCommit, error) {
+// rollbackOnce is one transaction of a rollback. Its error and the row's
+// description name why nothing was sent: the node not connected, or the
+// cause (a prepare hook's failure, a secret that did not resolve). A
+// fresh unpinned create whose prepare hook failed avoids the node from
+// now on, as a create the node refused does.
+func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle, cause *prepareError) (OpResult, afterCommit, error) {
 	e := r.e
-	unavailable := errorf(model.ErrNodeUnavailable, "node %s is not connected to instance %s", h.target, e.id)
-	result := OpResult{Err: unavailable}
+	why := fmt.Sprintf("node %s is not connected to instance %s", h.target, e.id)
+	failure := errorf(model.ErrNodeUnavailable, "%s", why)
+	if cause != nil {
+		why, failure = cause.Error(), cause
+	}
+	result := OpResult{Err: failure}
 	var events []activity.Event
 	err := e.st.InTx(ctx, func(tx *store.Store) error {
-		result, events = OpResult{Err: unavailable}, nil
+		result, events = OpResult{Err: failure}, nil
 		row, err := tx.LockSandbox(ctx, h.id, store.ForUpdate)
 		gone := errors.Is(err, model.ErrNotFound)
 		if err != nil && !gone {
@@ -184,7 +194,7 @@ func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle) (OpResult, after
 				result.State, result.Node, result.Description = row.ClientState, row.Node, row.StatusDescription
 			}
 			events = []activity.Event{h.endEvent(store.Sandbox{Owner: h.row.Owner, ClientState: "fenced out"},
-				callResult{err: unavailable})}
+				callResult{err: failure})}
 			return nil
 		}
 		c, err := e.newChange(ctx, tx, row)
@@ -198,11 +208,14 @@ func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle) (OpResult, after
 			// The hibernate it took the place of goes on at the node, its
 			// op fenced out: what the pod is decides.
 			a.ClientState = model.StateUnknown
-			a.StatusDescription = fmt.Sprintf("node %s is not connected to instance %s; the hibernate the resume was to abandon goes on",
-				h.target, e.id)
+			a.StatusDescription = why + "; the hibernate the resume was to abandon goes on"
 		case !h.takeover:
 			a.ClientState, a.Node, a.LostFrom, a.Materialised = h.read.state, h.read.node, h.read.lostFrom, h.read.materialised
-			a.StatusDescription = fmt.Sprintf("node %s is not connected to instance %s; nothing was sent", h.target, e.id)
+			a.StatusDescription = why + "; nothing was sent"
+			if cause != nil && cause.hook && h.kind == OpCreate && a.PinNode == "" {
+				a.AvoidNodes = appendUnique(a.AvoidNodes, h.target)
+				a.StatusDescription += "; placed elsewhere on the next use"
+			}
 			for _, k := range h.tombstones {
 				if _, err := tx.DeleteTombstone(ctx, k); err != nil {
 					return err
@@ -211,15 +224,14 @@ func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle) (OpResult, after
 		default:
 			// The previous owner may have sent the call.
 			a.ClientState = model.StateUnknown
-			a.StatusDescription = fmt.Sprintf("node %s is not connected to instance %s; the outcome of %s is unknown",
-				h.target, e.id, h.kind)
+			a.StatusDescription = fmt.Sprintf("%s; the outcome of %s is unknown", why, h.kind)
 		}
 		if err := c.commit(ctx); err != nil {
 			return err
 		}
 		w := c.written
 		result.State, result.Node, result.Description = w.ClientState, w.Node, w.StatusDescription
-		events = append(c.events, h.endEvent(w, callResult{err: unavailable}))
+		events = append(c.events, h.endEvent(w, callResult{err: failure}))
 		return nil
 	})
 	if err != nil {
@@ -316,6 +328,7 @@ func policyBackoff(n int, least, most time.Duration) time.Duration {
 func applyOurs(c *change, h *OpHandle, res callResult, info *podv1.PodInfo) {
 	a := &c.after
 	a.Node, a.Materialised, a.LostFrom = h.target, true, ""
+	a.Address = podAddress(info)
 	c.mergeCheckpoint(info.GetCheckpoint(), h.target)
 	// A repair restarts the pod and ends its processes, unless it found the
 	// pod healthy and made no call; a takeover cannot know what the first

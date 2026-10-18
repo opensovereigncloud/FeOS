@@ -5,11 +5,14 @@ package sandbox
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -31,9 +34,6 @@ type SecretResolver func(ctx context.Context, envID uuid.UUID, name string, vers
 // nothing was sent: the op rolls back with the error as its cause; inside
 // callRepair it counts as sent (the observation decides).
 type PrepareHook func(ctx context.Context, node string, sb store.Sandbox, kind OpKind) error
-
-// errNoRestart is Restart's answer until the engine implements it.
-var errNoRestart = errors.New("sandbox: Restart is not implemented yet")
 
 // engineHooks are the hooks the server sets after the engine and the
 // environments both exist.
@@ -81,7 +81,124 @@ func (e *Engine) prepareHook() PrepareHook {
 // description. It returns once the op began; the op's outcome arrives as
 // the row's state.
 func (e *Engine) Restart(ctx context.Context, id uuid.UUID, reason string) error {
-	return errNoRestart
+	row, err := e.st.GetSandbox(ctx, id)
+	if err != nil {
+		return err
+	}
+	if row.Op != "" {
+		return errorf(model.ErrBusy, "an op %s of instance %s is in flight", row.Op, row.OpOwner)
+	}
+	if row.ClientState != model.StateRunning {
+		return errorf(model.ErrPrecondition, "sandbox %s is %s: no restart", id, row.ClientState)
+	}
+	h, err := e.runner.Start(ctx, id, OpIntent{Kind: OpRepair, Trigger: TriggerRestart, Target: row.Node,
+		Incarnation: row.Incarnation, reason: reason})
+	if err != nil {
+		return err
+	}
+	if h.kind != OpRepair || h.trigger != TriggerRestart {
+		// This instance's op of another kind, begun after the read.
+		return errorf(model.ErrBusy, "an op %s is in flight", h.kind)
+	}
+	return nil
+}
+
+// prepareError is a failure of what an op does before its pod call
+// (Engine.prepare): the prepare hook's, or the building of a create's pod
+// spec. Nothing was sent: the op rolls back with it as its cause.
+type prepareError struct {
+	node string
+	kind OpKind
+	// hook: the prepare hook failed (the node's side); else the pod spec
+	// (a secret that does not resolve).
+	hook bool
+	err  error
+}
+
+func (e *prepareError) Error() string {
+	if e.hook {
+		return fmt.Sprintf("prepare node %s for %s: %v", e.node, e.kind, e.err)
+	}
+	return fmt.Sprintf("build the pod spec for %s: %v", e.kind, e.err)
+}
+
+func (e *prepareError) Unwrap() error { return e.err }
+
+// prepares reports whether the prepare hook runs before an op's pod call:
+// the ops that bring a pod up (a repair calls it inside callRepair).
+func prepares(k OpKind) bool {
+	return k == OpCreate || k == OpStart || k == OpResume || k == OpRestore
+}
+
+// prepare is what an op does before its pod call, where a failure means
+// that nothing was sent: a create builds its pod spec (a secret that does
+// not resolve fails it), then a row with a pod template has its node
+// prepared by the prepare hook (create, start, resume, restore). The spec
+// comes first, so that a create that cannot be sent leaves nothing on the
+// node.
+func (e *Engine) prepare(ctx context.Context, h *OpHandle) error {
+	if h.kind == OpCreate {
+		spec, err := e.podSpec(ctx, h.row)
+		if err != nil {
+			return &prepareError{node: h.target, kind: h.kind, err: err}
+		}
+		h.spec = spec
+	}
+	if h.row.PodTemplate == nil || !prepares(h.kind) {
+		return nil
+	}
+	return e.runPrepareHook(ctx, h)
+}
+
+// prepareRepair runs the prepare hook inside callRepair, before its pod
+// calls, for a row with a pod template.
+func (e *Engine) prepareRepair(ctx context.Context, h *OpHandle) error {
+	if h.row.PodTemplate == nil {
+		return nil
+	}
+	return e.runPrepareHook(ctx, h)
+}
+
+func (e *Engine) runPrepareHook(ctx context.Context, h *OpHandle) error {
+	hook := e.prepareHook()
+	if hook == nil {
+		return nil
+	}
+	if err := hook(ctx, h.target, h.row, h.kind); err != nil {
+		return &prepareError{node: h.target, kind: h.kind, hook: true, err: err}
+	}
+	return nil
+}
+
+// hasVolumes reports whether the row's pod has volumes: its repair never
+// deletes and restores it, since a volume that a deleted pod released
+// does not restore from the checkpoint.
+func hasVolumes(sb store.Sandbox) bool {
+	return sb.PodTemplate != nil && len(sb.PodTemplate.Volumes) > 0
+}
+
+// noteAddress records the address of the op's pod as its call answered it
+// (CreatePod, RestorePod: the address is the pod's from its record on,
+// before its microVM boots), so that the environments' security groups
+// take it as a member while the pod comes up. Best effort: the op's finish
+// writes the address it observes.
+func (e *Engine) noteAddress(h *OpHandle, info *podv1.PodInfo) {
+	if podIncarnation(info) != h.inc {
+		return
+	}
+	addr := info.GetIpv6Address()
+	if addr == "" || addr == h.row.Address {
+		return
+	}
+	ctx, cancel := context.WithTimeout(e.bg, 10*time.Second)
+	defer cancel()
+	err := e.st.InTx(ctx, func(tx *store.Store) error {
+		_, err := tx.SetSandboxAddress(ctx, h.id, h.inc, addr)
+		return err
+	})
+	if err != nil {
+		e.rl.warn("address", "cannot record a pod's address", "sandbox", h.id, "err", err)
+	}
 }
 
 // ResolveImage pins an image to its digest as a sandbox's create does:
