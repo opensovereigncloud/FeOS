@@ -5,6 +5,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -28,12 +29,25 @@ import (
 type SecretResolver func(ctx context.Context, envID uuid.UUID, name string, version int) (string, error)
 
 // PrepareHook prepares node for the op of kind on the row sb, which has a
-// pod template: called in execute after the connection hook and before
-// the pod call (CreatePod, StartPod, ResumePod, RestorePod), and inside
-// callRepair before its pod calls. An error before the pod call means
-// nothing was sent: the op rolls back with the error as its cause; inside
-// callRepair it counts as sent (the observation decides).
+// pod template: called in execute once the op has its connection to node
+// and before the pod call (CreatePod, StartPod, ResumePod, RestorePod),
+// and inside callRepair before its pod calls. A node that is not
+// connected never reaches the hook: its op rolls back without a cause. An
+// error before the pod call means nothing was sent: the op rolls back
+// with the error as its cause, and only an error that wraps ErrNodeUnfit
+// (and not model.ErrNodeUnavailable) puts the node of an unpinned create
+// on avoid_nodes. Inside callRepair it counts as sent and as no call made
+// (the observation decides).
 type PrepareHook func(ctx context.Context, node string, sb store.Sandbox, kind OpKind) error
+
+// ErrNodeUnfit is what a PrepareHook's error wraps when the node itself
+// cannot take the pod (a volume the node refuses to create, one in use by
+// another pod or failed there): a fresh unpinned create then avoids the
+// node, as a create the node refused does (placementFailure). Any other
+// hook error may pass (a node that went away, a transient RPC or database
+// error) and is a plain rollback: avoiding the node for it would leave a
+// single-node system unplaceable, since only a run clears avoid_nodes.
+var ErrNodeUnfit = errors.New("the node cannot take the pod")
 
 // engineHooks are the hooks the server sets after the engine and the
 // environments both exist.
@@ -104,8 +118,9 @@ func (e *Engine) Restart(ctx context.Context, id uuid.UUID, reason string) error
 }
 
 // prepareError is a failure of what an op does before its pod call
-// (Engine.prepare): the prepare hook's, or the building of a create's pod
-// spec. Nothing was sent: the op rolls back with it as its cause.
+// (prepareSpec, prepareNode): the prepare hook's, or the building of a
+// create's pod spec. Nothing was sent: the op rolls back with it as its
+// cause.
 type prepareError struct {
 	node string
 	kind OpKind
@@ -130,20 +145,31 @@ func prepares(k OpKind) bool {
 	return k == OpCreate || k == OpStart || k == OpResume || k == OpRestore
 }
 
-// prepare is what an op does before its pod call, where a failure means
-// that nothing was sent: a create builds its pod spec (a secret that does
-// not resolve fails it), then a row with a pod template has its node
-// prepared by the prepare hook (create, start, resume, restore). The spec
-// comes first, so that a create that cannot be sent leaves nothing on the
-// node.
-func (e *Engine) prepare(ctx context.Context, h *OpHandle) error {
-	if h.kind == OpCreate {
-		spec, err := e.podSpec(ctx, h.row)
-		if err != nil {
-			return &prepareError{node: h.target, kind: h.kind, err: err}
-		}
-		h.spec = spec
+// What an op does before its pod call, where a failure means that
+// nothing was sent: a create builds its pod spec (prepareSpec: a secret
+// that does not resolve fails it), the op gets its connection, then a row
+// with a pod template has its node prepared by the prepare hook
+// (prepareNode: create, start, resume, restore). The spec comes first, so
+// that a create that cannot be sent leaves nothing on the node; the
+// connection before the hook, so that a node that is not connected is a
+// rollback without a cause and never the hook's failure.
+
+// prepareSpec builds a create's pod spec.
+func (e *Engine) prepareSpec(ctx context.Context, h *OpHandle) error {
+	if h.kind != OpCreate {
+		return nil
 	}
+	spec, err := e.podSpec(ctx, h.row)
+	if err != nil {
+		return &prepareError{node: h.target, kind: h.kind, err: err}
+	}
+	h.spec = spec
+	return nil
+}
+
+// prepareNode runs the prepare hook before the pod call of an op that
+// brings a pod up, for a row with a pod template.
+func (e *Engine) prepareNode(ctx context.Context, h *OpHandle) error {
 	if h.row.PodTemplate == nil || !prepares(h.kind) {
 		return nil
 	}

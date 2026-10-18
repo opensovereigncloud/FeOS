@@ -373,6 +373,32 @@ func TestPostgresDocker(t *testing.T) {
 			if out, code := psql(expense, "SELECT count(*) FROM expenses"); code != 0 || out != "1" {
 				t.Fatalf("after a restart: exit %d: %s", code, out)
 			}
+
+			// A role added later whose schema another role made first, open
+			// to everyone: provisioning fails naming the schema rather than
+			// adopt it (expense_svc would own what late_svc's unqualified
+			// names resolve to).
+			if out, code := psql(expense, "CREATE SCHEMA late_svc; GRANT USAGE, CREATE ON SCHEMA late_svc TO PUBLIC"); code != 0 {
+				t.Fatalf("expense_svc makes late_svc's schema: exit %d: %s", code, out)
+			}
+			later := addon(t, "postgres", `{"type":"postgres","version":"`+version+`","plan":"dev",
+				"options":{"databases":["expensa","reports"],"roles":["expense_svc","approval_svc","late_svc"]}}`)
+			if fs := b.Validate(&a, later); len(fs) != 0 {
+				t.Fatalf("findings:\n%s", findingText(fs))
+			}
+			creds["role.late_svc.password"] = randomHex(t, 16)
+			for _, st := range b.Provision(later, c) {
+				out, code := lab.exec(pod, resolveEnv(t, st.Env, creds), st.Argv...)
+				out = redact(out, creds)
+				if code == 0 || !strings.Contains(out, "schema late_svc in database expensa belongs to role expense_svc, not to role late_svc") {
+					t.Fatalf("step %s past a squatted schema: exit %d\n%s", st.Name, code, out)
+				}
+				t.Logf("step %s past a squatted schema: exit %d: %s", st.Name, code, strings.TrimSpace(out))
+			}
+			if out, code := psql(super, "SELECT nspowner::regrole FROM pg_namespace WHERE nspname = 'late_svc'"); code != 0 ||
+				out != "expense_svc" {
+				t.Fatalf("late_svc's schema after the failed step: exit %d: %s", code, out)
+			}
 		})
 	}
 }

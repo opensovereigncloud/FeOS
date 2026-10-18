@@ -507,8 +507,9 @@ func (r *runner) run(starter context.Context, h *OpHandle) {
 // callResult is what an op's node calls answered.
 type callResult struct {
 	err error
-	// skipped: a repair found the pod no longer in the state it was begun
-	// for and made no call; the observation decides alone.
+	// skipped: a repair made no call: it found the pod no longer in the
+	// state it was begun for, or its prepare hook failed before its first
+	// call (err is then the *prepareError); the observation decides alone.
 	skipped bool
 	// restored: a restore's RestorePodResponse arrived; memoryRestored
 	// and reason are its fields.
@@ -522,19 +523,22 @@ type callResult struct {
 
 // execute runs the op's node calls and waits for the pod to settle. sent
 // is false when nothing was sent: no connection to the target could be
-// had, or what comes before the pod call failed (prepare: a
-// *prepareError).
+// had, or what comes before the pod call failed (prepareSpec before the
+// connection, prepareNode after it: a *prepareError).
 func (e *Engine) execute(ctx context.Context, h *OpHandle) (callResult, observation, bool) {
 	if e.connHook != nil {
 		if err := e.connHook(h); err != nil {
 			return callResult{err: err}, observation{}, false
 		}
 	}
-	if err := e.prepare(ctx, h); err != nil {
+	if err := e.prepareSpec(ctx, h); err != nil {
 		return callResult{err: err}, observation{}, false
 	}
 	pc, err := e.podClient(ctx, h.target)
 	if err != nil {
+		return callResult{err: err}, observation{}, false
+	}
+	if err := e.prepareNode(ctx, h); err != nil {
 		return callResult{err: err}, observation{}, false
 	}
 	res := e.callOp(ctx, pc, h)
@@ -612,7 +616,7 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 // takeover may find the pod stopped halfway by the first owner and starts
 // it; it leaves one that the first owner brought up running. A row with a
 // template has the node prepared before the pod calls; a failure there
-// makes none, and the observation decides.
+// makes none (skipped), and the observation decides.
 func (e *Engine) callRepair(ctx context.Context, pc podv1.PodServiceClient, h *OpHandle) callResult {
 	id := h.id.String()
 	var obs observation
@@ -644,7 +648,7 @@ func (e *Engine) callRepair(ctx context.Context, pc podv1.PodServiceClient, h *O
 		}
 	}
 	if err := e.prepareRepair(ctx, h); err != nil {
-		return callResult{err: err}
+		return callResult{err: err, skipped: true}
 	}
 	if info.GetState() == podv1.PodState_POD_STATE_PENDING && strings.HasPrefix(info.GetReason(), "restoring from") &&
 		h.row.CheckpointHead != "" && !hasVolumes(h.row) {
