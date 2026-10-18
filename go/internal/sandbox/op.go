@@ -483,11 +483,10 @@ func (r *runner) run(starter context.Context, h *OpHandle) {
 	var result OpResult
 	var after afterCommit
 	if !sent {
-		var pe *prepareError
-		if !errors.As(res.err, &pe) {
-			pe = nil
-		}
-		result = r.rollback(h, pe)
+		// A connection that could not be had leaves cause nil.
+		var cause *prepareError
+		errors.As(res.err, &cause)
+		result = r.rollback(h, cause)
 	} else {
 		result, after = r.finish(h, res, obs)
 	}
