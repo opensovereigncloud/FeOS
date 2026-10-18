@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -376,17 +377,31 @@ func (c *Controller) objectSteady(v *view, kind, object string, after store.EnvI
 	return n > 0
 }
 
-// addonSecrets are an addon's credential values, for redaction.
+// addonSecrets are an addon's credential values as T and R have it (an
+// addon kept as R has it while R failed has R's), for redaction.
 func (c *Controller) addonSecrets(ctx context.Context, v *view, addon string) []string {
-	a, ok := v.target.Addons[addon]
-	if !ok {
-		a = v.latestSpec.Addons[addon]
+	var keys []string
+	var bp addons.Blueprint
+	for _, sp := range []*spec.Spec{v.target, v.latestSpec} {
+		a, ok := sp.Addons[addon]
+		if !ok {
+			continue
+		}
+		b, ok := c.d.Blueprint(a.Type)
+		if !ok || (bp != nil && b.Type() != bp.Type()) {
+			continue
+		}
+		bp = b
+		for _, k := range b.Credentials(specAddon(b, addon, a)) {
+			if !slices.Contains(keys, k) {
+				keys = append(keys, k)
+			}
+		}
 	}
-	bp, ok := c.d.Blueprint(a.Type)
-	if !ok {
+	if len(keys) == 0 {
 		return nil
 	}
-	return c.credentialValues(ctx, v.env.ID, addon, bp.Credentials(specAddon(bp, addon, a)))
+	return c.credentialValues(ctx, v.env.ID, addon, keys)
 }
 
 // writeInstance writes what a probe changed of an instance onto the row
