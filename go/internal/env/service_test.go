@@ -727,3 +727,108 @@ func TestReusedEnvID(t *testing.T) {
 		t.Fatalf("release 1 %+v %v", d, err)
 	}
 }
+
+// Plan, apply and revert validate an addon against the data its volume
+// holds, which the controller keeps by the addon's name: a removal or a
+// type change the controller has not acted on yet deletes nothing.
+func TestAddonAgainstVolume(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	e := h.env("stage")
+	addon := func(typ, version string) string {
+		return `{"addons": {"db": {"type": "` + typ + `", "version": "` + version + `"}}}`
+	}
+	const none = `{"services": {"web": {"image": "ghcr.io/acme/web:1"}}}`
+	refused := func(raw string, base int, path, problem string) {
+		t.Helper()
+		_, err := h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Spec: json.RawMessage(raw), Base: base})
+		var ise *InvalidSpecError
+		if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, path, problem) {
+			t.Fatalf("apply %s on %d: %v", raw, base, describe(err))
+		}
+	}
+	volume := func(typ, version string) store.EnvVolume {
+		t.Helper()
+		v, err := h.st.InsertEnvVolume(ctx, store.EnvVolume{EnvID: e.ID, Object: "addon/db", VolumeID: uuid.New(),
+			SizeMiB: 1024, AddonType: typ, DataVersion: version})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	deleting := func(v store.EnvVolume) {
+		t.Helper()
+		after := v
+		after.Deleting = true
+		if _, err := h.st.UpdateEnvVolume(ctx, v, after); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.apply("stage", addon("postgres", "16"), 0)
+	pg16 := volume("postgres", "16")
+
+	// Removed, and added again as 17 before the controller deleted the
+	// volume: postgres 17 would start on 16's data directory.
+	h.apply("stage", none, 1)
+	refused(addon("postgres", "17"), 2, "addons.db.version", "needs a data migration")
+	if a := h.apply("stage", addon("postgres", "16"), 2); a.Number != 3 {
+		t.Fatalf("re-added as it was %+v", a)
+	}
+
+	// A type round trip the controller has not acted on: valkey is told
+	// the data goes, and back to postgres the data is still 16's.
+	a := h.apply("stage", addon("valkey", "8"), 3)
+	if !hasFinding(a.Findings, spec.SeverityWarning, "addons.db.type", "volume holds postgres data, not valkey: its data is deleted") {
+		t.Fatalf("to valkey %+v", a.Findings)
+	}
+	refused(addon("postgres", "17"), 4, "addons.db.version", "needs a data migration")
+	p, err := h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(addon("postgres", "16"))})
+	if err != nil || !p.Valid || hasFinding(p.Findings, spec.SeverityWarning, "addons.db.type", "") {
+		t.Fatalf("back to postgres 16 %+v %v", p, err)
+	}
+	// A revert to release 1 is checked the same way.
+	if _, err := h.svc.Revert(ctx, tenantA, "stage", 1, RevertRequest{Base: 4}); err != nil {
+		t.Fatalf("revert to postgres 16: %v", describe(err))
+	}
+
+	// Once the controller acts on valkey, postgres 16's volume is being
+	// deleted and constrains nothing; once it is gone, valkey's new one
+	// holds valkey data.
+	h.apply("stage", addon("valkey", "8"), 5)
+	deleting(pg16)
+	p, err = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(addon("postgres", "17"))})
+	if err != nil || !p.Valid || !hasFinding(p.Findings, spec.SeverityWarning, "addons.db.type", "changes its type from valkey to postgres") {
+		t.Fatalf("postgres 17 beside a deleting volume %+v %v", p, err)
+	}
+	h.exec("DELETE FROM env_volumes WHERE env_id = $1", e.ID)
+	volume("valkey", "8")
+	a = h.apply("stage", addon("postgres", "17"), 6)
+	if a.Number != 7 || !hasFinding(a.Findings, spec.SeverityWarning, "addons.db.type", "volume holds valkey data, not postgres") {
+		t.Fatalf("postgres 17 over valkey's volume %+v", a)
+	}
+
+	// The version that ran ready on the volume decides a downgrade, not
+	// the latest release: an upgrade to 8 that never ran may go back.
+	h.exec("DELETE FROM env_volumes WHERE env_id = $1", e.ID)
+	h.apply("stage", addon("valkey", "7.2"), 7)
+	vk72 := volume("valkey", "7.2")
+	h.apply("stage", addon("valkey", "8"), 8)
+	if _, err := h.svc.Revert(ctx, tenantA, "stage", 8, RevertRequest{Base: 9}); err != nil {
+		t.Fatalf("revert of an upgrade that never ran: %v", describe(err))
+	}
+	// Once 8 ran ready on it, the data is 8's.
+	h.apply("stage", addon("valkey", "8"), 10)
+	after := vk72
+	after.DataVersion = "8"
+	if _, err := h.st.UpdateEnvVolume(ctx, vk72, after); err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.svc.Revert(ctx, tenantA, "stage", 8, RevertRequest{Base: 11})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "addons.db.version", "cannot go back from 8 to 7.2") {
+		t.Fatalf("revert over 8's data: %v", describe(err))
+	}
+}
