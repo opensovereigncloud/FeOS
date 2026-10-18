@@ -24,12 +24,23 @@
 // environment_id) and runs Engine.Ensure for the rows that should run in
 // a bounded pool of its own (8 workers per instance, single flight per
 // row); reconcile steps enqueue, never call Ensure themselves.
+//
+// The target T of an environment is its latest release R, unless R
+// failed: then the realised release (nothing when none was realised), so
+// that a failed release is never retried until a new one arrives. An
+// instance's template hash is model.PodTemplate.Hash over its rendered
+// template; an instance whose hash differs from T's is replaced (rolled
+// for image services, recreated for addons). An addon's hash takes its
+// image as the blueprint writes it (its tag): the row pins the digest at
+// its insert, so that a new digest under the tag never recreates it.
 package ctl
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -90,8 +101,16 @@ const (
 	SourceProcess = "process"
 )
 
-// errNotImplemented is the answer of what a later lane implements.
-var errNotImplemented = errors.New("environment controller: not implemented yet")
+// errNoSealer is the answer of everything that needs a secret's value
+// while the instance has no --secret-key-file.
+var errNoSealer = errors.New("secrets need --secret-key-file")
+
+// errTenantDeleting refuses an instance insert of a tenant being deleted.
+var errTenantDeleting = errors.New("the tenant is being deleted")
+
+// errEnvDeleting refuses an instance insert of an environment being
+// deleted.
+var errEnvDeleting = errors.New("the environment is being deleted")
 
 // Deps are the parts of the instance the controller works with. DB,
 // Engine and Elector are required; Store is made from DB when nil;
@@ -109,19 +128,101 @@ type Deps struct {
 	Runner     envdeps.Runner
 	Ports      envdeps.Ports
 	Sealer     envdeps.Sealer
-	// ResolveSecret unseals a secret of an environment: the attached
-	// services' env is resolved with it (and never written to disk).
+	// ResolveSecret is not used: the controller resolves secrets itself
+	// (Controller.ResolveSecret), which the environment service's resolver
+	// delegates to. It stays so that callers that set it keep compiling.
 	ResolveSecret sandbox.SecretResolver
 	// Blueprint looks up an addon type.
 	Blueprint func(typ string) (addons.Blueprint, bool)
 	Log       *slog.Logger
 }
 
+// timings are the controller's durations, fields so that the package's
+// tests shorten them.
+type timings struct {
+	// retireGrace is how long a retiring instance stays (routes stop
+	// sending to it, hosts blocks drop it) before it is deleted.
+	retireGrace time.Duration
+	// crashWindow: so many exits within it open crash_loop; restarts
+	// reset after an instance was ready for as long.
+	crashWindow time.Duration
+	crashExits  int
+	// restartMax bounds the restart backoff (2^(n-1) s).
+	restartMax time.Duration
+	// restartUnit is the backoff's first step.
+	restartUnit time.Duration
+	// steadyAfter: without a readiness check, an instance is ready when
+	// its container still runs so long after it was first seen running.
+	steadyAfter time.Duration
+	// noCapacityAfter: an instance pending without capacity for so long
+	// opens no_capacity.
+	noCapacityAfter time.Duration
+	// provisionRetry is the wait after a failed provisioning step.
+	provisionRetry time.Duration
+	// stepTimeout bounds one provisioning step; probeTimeout an exec
+	// check.
+	stepTimeout, probeTimeout time.Duration
+	// nodeCall bounds a node call of a loop.
+	nodeCall time.Duration
+	// attachedReady bounds how long a woken sandbox is held for its
+	// process's first readiness.
+	attachedReady time.Duration
+	// restartReady bounds how long RestartService waits for a restarted
+	// replica to be ready before it restarts the next.
+	restartReady time.Duration
+}
+
+func defaultTimings() timings {
+	return timings{
+		retireGrace:     5 * time.Second,
+		crashWindow:     10 * time.Minute,
+		crashExits:      3,
+		restartMax:      5 * time.Minute,
+		restartUnit:     time.Second,
+		steadyAfter:     2 * time.Second,
+		noCapacityAfter: 2 * time.Minute,
+		provisionRetry:  10 * time.Second,
+		stepTimeout:     2 * time.Minute,
+		probeTimeout:    10 * time.Second,
+		nodeCall:        10 * time.Second,
+		attachedReady:   time.Minute,
+		restartReady:    5 * time.Minute,
+	}
+}
+
+// The fenced transactions' timeouts (as the engine's loops).
+const (
+	fencedLockTimeout = time.Second
+	fencedStmtTimeout = 3 * time.Second
+)
+
 // Controller is the environment controller of one instance.
 type Controller struct {
 	d   Deps
 	st  *store.Store
 	log *slog.Logger
+	rl  *rateLog
+	t   timings
+
+	pool  *pool
+	specs *specCache
+
+	// bg is the parent of the work that outlives a call (RestartService's
+	// replica restarts); Run's end cancels it and waits for wg.
+	bg       context.Context
+	cancelBg context.CancelFunc
+	wg       sync.WaitGroup
+
+	mu sync.Mutex
+	// seen is what the probe loop remembers of instances and attached
+	// services: when their container (process) was first seen running in
+	// the phase it observed last, and when they were last checked.
+	seen map[string]*seenState
+	// locks serialise the supervision of each attached service.
+	locks map[string]*sync.Mutex
+	// provisionFailed holds when an addon instance's provisioning failed
+	// last, for provisionRetry.
+	provisionFailed map[uuid.UUID]time.Time
 }
 
 // New returns the controller of an instance.
@@ -139,62 +240,112 @@ func New(deps Deps) (*Controller, error) {
 	if st == nil {
 		st = store.New(deps.DB)
 	}
-	return &Controller{d: deps, st: st, log: deps.Log.With("component", "env-ctl")}, nil
+	log := deps.Log.With("component", "env-ctl")
+	c := &Controller{d: deps, st: st, log: log, rl: newRateLog(log), t: defaultTimings(),
+		specs: newSpecCache(), seen: map[string]*seenState{}, locks: map[string]*sync.Mutex{},
+		provisionFailed: map[uuid.UUID]time.Time{}}
+	c.pool = newPool(poolWorkers, log)
+	c.bg, c.cancelBg = context.WithCancel(context.Background())
+	return c, nil
 }
 
 // Run runs the controller's background work until ctx ends and waits for
 // it: what outlives a loop's run (the Ensure pool ends with the leader's
-// term, inside the loops).
+// term, inside the loops; a restart of a service's replicas with ctx).
 func (c *Controller) Run(ctx context.Context) error {
 	<-ctx.Done()
+	c.cancelBg()
+	c.wg.Wait()
+	c.pool.wait()
 	return nil
 }
 
 // Loops returns the controller's leader loops (§4.2).
 func (c *Controller) Loops() []model.Loop {
-	idle := func(context.Context) error { return nil }
 	return []model.Loop{
-		{Name: LoopReconcile, Interval: reconcileEvery, Run: idle},
-		{Name: LoopProbe, Interval: probeEvery, Run: idle},
-		{Name: LoopGroups, Interval: groupsEvery, Run: idle},
-		{Name: LoopVolumes, Interval: volumesEvery, Run: idle},
-		{Name: LoopDelete, Interval: deleteEvery, Run: idle},
+		{Name: LoopReconcile, Interval: reconcileEvery, Run: c.reconcile},
+		{Name: LoopProbe, Interval: probeEvery, Run: c.probe},
+		{Name: LoopGroups, Interval: groupsEvery, Run: c.groupsLoop},
+		{Name: LoopVolumes, Interval: volumesEvery, Run: c.volumesLoop},
+		{Name: LoopDelete, Interval: deleteEvery, Run: c.deleteLoop},
 	}
 }
 
-// PrepareHook is the engine's prepare hook (sandbox.PrepareHook) for a
-// row with a pod template: it puts the row's security groups, and those
-// their rules reference, on node (whole groups); before a create it also
-// makes sure the row's volume is there: created on node when it never was
-// (then provisioned, its node and the row's pin_node set in a transaction
-// of its own), else present there and free (AVAILABLE, CHECKPOINTED
-// without a pod, or held by this pod); otherwise it fails and opens
-// volume_unavailable.
-func (c *Controller) PrepareHook(ctx context.Context, node string, sb store.Sandbox, kind sandbox.OpKind) error {
-	return nil
+// fenced runs fn in a transaction of the leader: short lock and statement
+// timeouts, the lease checked first (ErrNotLeader without one).
+func (c *Controller) fenced(ctx context.Context, fn func(tx *store.Store) error) error {
+	if c.d.Elector == nil {
+		return leader.ErrNotLeader
+	}
+	return c.st.InTx(ctx, func(tx *store.Store) error {
+		if err := tx.SetLocalTimeouts(ctx, fencedLockTimeout, fencedStmtTimeout); err != nil {
+			return err
+		}
+		if err := c.d.Elector.Fence(ctx, tx.Q()); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 }
 
-// LogTail returns the last lines lines of an object's log, oldest first,
-// and their source: the main container's log of replica replica of an
-// image service, of an addon (replica 0), or of a job's latest run (its
-// stored tail once the run's row is gone) (SourceContainer); the process
-// log of an attached service (SourceProcess). It never wakes an instance
-// (ErrPaused); ErrNoObject, ErrNoContainerLogs.
-func (c *Controller) LogTail(ctx context.Context, envID uuid.UUID, kind, name string, replica, lines int) ([]string, string, error) {
-	return nil, "", errNotImplemented
+// notify sends a hint to the leader's loops outside a transaction.
+func (c *Controller) notify(ctx context.Context, hint string) {
+	if err := c.st.Notify(ctx, db.ChanLeader, hint); err != nil {
+		c.rl.warn("notify", "cannot wake the leader's loops", "hint", hint, "err", err)
+	}
 }
 
-// RestartService restarts a service of the environment's target release:
-// an attached service's process is stopped and started again (never its
-// sandbox's pod); an image service's replicas are restarted one at a
-// time. It returns once the restart is under way; ErrNoObject.
-func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name string) error {
-	return errNotImplemented
+// lease is the lease of a row as the row says: no Acquire.
+func lease(sb store.Sandbox) model.Lease {
+	return model.Lease{SandboxID: sb.ID, Incarnation: sb.Incarnation, Node: sb.Node}
 }
 
-// RunJob starts a run of a job of the environment's target release (what
-// jobs on "manual" are for): a new attempt 1. It returns once the run's
-// row is inserted; ErrNoObject.
-func (c *Controller) RunJob(ctx context.Context, envID uuid.UUID, name string) error {
-	return errNotImplemented
+// steady reports whether a row runs without an op: what the probes and
+// the detached calls need.
+func steady(sb store.Sandbox) bool {
+	return sb.ClientState == model.StateRunning && sb.Op == "" && sb.Node != ""
 }
+
+// attachedKey names an attached service in the controller's maps.
+func attachedKey(envID uuid.UUID, service string) string { return envID.String() + "/" + service }
+
+// attachedLock is the lock of an attached service's supervision.
+func (c *Controller) attachedLock(envID uuid.UUID, service string) *sync.Mutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	k := attachedKey(envID, service)
+	m := c.locks[k]
+	if m == nil {
+		m = &sync.Mutex{}
+		c.locks[k] = m
+	}
+	return m
+}
+
+// rateLog logs a warning of each kind at most once a minute.
+type rateLog struct {
+	log  *slog.Logger
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func newRateLog(log *slog.Logger) *rateLog { return &rateLog{log: log, last: map[string]time.Time{}} }
+
+func (r *rateLog) warn(kind, msg string, args ...any) {
+	r.mu.Lock()
+	now := time.Now()
+	if t, ok := r.last[kind]; ok && now.Sub(t) < time.Minute {
+		r.mu.Unlock()
+		r.log.Debug(msg, args...)
+		return
+	}
+	r.last[kind] = now
+	r.mu.Unlock()
+	r.log.Warn(msg, args...)
+}
+
+// objectName is an object's name as incidents and labels write it.
+func objectName(kind, name string) string { return kind + "/" + name }
+
+// errorf is fmt.Errorf, for the package's messages.
+var errorf = fmt.Errorf
