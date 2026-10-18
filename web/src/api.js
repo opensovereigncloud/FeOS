@@ -10,7 +10,8 @@
 //   admin    /api/v1/admin/…: the session cookie of an OIDC sign-in, or the
 //            Basic credentials of this tab (sessionStorage). Tenants, nodes,
 //            join tokens, instances and the activity log.
-//   tenant   /api/v1/sandboxes, /api/v1/tools: a tenant's token as Bearer.
+//   tenant   /api/v1/sandboxes, /api/v1/tools, /api/v1/environments: a
+//            tenant's token as Bearer.
 //            Tenant tokens are stored as hashes only, so the UI cannot read
 //            one back: it keeps the tokens it minted (localStorage) and works
 //            "as the tenant" with them.
@@ -232,6 +233,18 @@ function query(params) {
   return s ? '?' + s : '';
 }
 
+// labelQuery renders "key=value" label filters as ferund's repeated
+// ?label= parameters (every one must match).
+export function labelQuery(labels) {
+  const q = new URLSearchParams();
+  for (const l of labels || []) q.append('label', l);
+  const s = q.toString();
+  return s ? '?' + s : '';
+}
+
+// LOG_LINES is how many lines of an object's log the UI reads.
+export const LOG_LINES = 200;
+
 // ACTIVITY_LIMIT is the page the activity views read.
 export const ACTIVITY_LIMIT = 300;
 
@@ -283,6 +296,25 @@ export const api = {
   // The Kubernetes and SSH bindings with their use: fingerprints and
   // public keys, never key material.
   getAccess: (sandboxId) => tenantCall('GET', `/sandboxes/${enc(sandboxId)}/access`),
+
+  // As the tenant, read-only: its environments. env is the name or the
+  // UUID. The UI applies, reverts and deletes nothing, and reads no
+  // secret and no route token.
+  listEnvironments: (labels = []) => tenantCall('GET', '/environments' + labelQuery(labels)),
+  getEnvironment: (env) => tenantCall('GET', `/environments/${enc(env)}`),
+  listReleases: (env, limit = 50) => tenantCall('GET', `/environments/${enc(env)}/releases${query({ limit })}`),
+  // A release with its normalised spec and its diff against the one
+  // before.
+  getRelease: (env, n) => tenantCall('GET', `/environments/${enc(env)}/releases/${enc(n)}`),
+  listIncidents: (env, { open } = {}) =>
+    tenantCall('GET', `/environments/${enc(env)}/incidents${open ? '?open=1' : ''}`),
+  getIncident: (env, id) => tenantCall('GET', `/environments/${enc(env)}/incidents/${enc(id)}`),
+  // The last lines of an object's log: an image pod's container (replica
+  // 0 unless given), an attached service's process, a job's last run.
+  // 501: the node serves no container logs; 409: the instance is paused
+  // (never woken for its logs).
+  objectLogs: (env, kind, name, { lines = LOG_LINES, replica = 0 } = {}) =>
+    tenantCall('GET', `/environments/${enc(env)}/objects/${enc(kind)}/${enc(name)}/logs${query({ lines, replica })}`),
 };
 
 // mcpURL is the MCP door of this origin, which the UI shows to connect
