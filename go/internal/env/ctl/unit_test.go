@@ -6,6 +6,7 @@ package ctl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"net/url"
 	"slices"
@@ -20,6 +21,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -277,6 +279,16 @@ func TestDefaults(t *testing.T) {
 		if got := ctl.backoff(n); got != want {
 			t.Errorf("backoff(%d) %v, want %v", n, got, want)
 		}
+	}
+}
+
+// A hook's error for a node that cannot take the pod wraps
+// sandbox.ErrNodeUnfit beside its cause, and reads as its cause.
+func TestUnfit(t *testing.T) {
+	cause := errors.New("volume v is attached to pod p on node n1")
+	err := error(unfit{cause})
+	if !errors.Is(err, sandbox.ErrNodeUnfit) || !errors.Is(err, cause) || err.Error() != cause.Error() {
+		t.Errorf("unfit %v", err)
 	}
 }
 

@@ -67,7 +67,14 @@ func (c *Controller) prepareVolume(ctx context.Context, node string, sb store.Sa
 	if !vol.Provisioned {
 		if _, err := vc.CreateVolume(ctx, &volumev1.CreateVolumeRequest{VolumeId: volumeID, SizeBytes: uint64(vol.SizeMiB) << 20,
 			Labels: volumeLabels(vol)}); err != nil {
-			return fmt.Errorf("create volume %s on node %s: %w", volumeID, node, err)
+			err = fmt.Errorf("create volume %s on node %s: %w", volumeID, node, err)
+			switch status.Code(err) {
+			case codes.AlreadyExists, codes.FailedPrecondition, codes.ResourceExhausted, codes.InvalidArgument:
+				// The node refuses it (one of the ID with another size,
+				// no room): a fresh create goes elsewhere.
+				return unfit{err}
+			}
+			return err
 		}
 		err := c.st.InTx(ctx, func(tx *store.Store) error {
 			cur, err := tx.LockEnvVolume(ctx, vol.EnvID, vol.Object, store.ForUpdate)
@@ -127,8 +134,17 @@ func (c *Controller) prepareVolume(ctx context.Context, node string, sb store.Sa
 	if r, err := c.st.GetEnvInstance(ctx, sb.ID); err == nil {
 		c.volumeIncident(ctx, vol, r.Release, why)
 	}
-	return errors.New(why)
+	return unfit{errors.New(why)}
 }
+
+// unfit is a prepare hook's error for a node that cannot take the pod (a
+// volume it refuses, or has not, or holds for another pod): it wraps
+// sandbox.ErrNodeUnfit, so that an unpinned create avoids the node. Any
+// other error of the hook is a plain rollback.
+type unfit struct{ err error }
+
+func (e unfit) Error() string   { return e.err.Error() }
+func (e unfit) Unwrap() []error { return []error{e.err, sandbox.ErrNodeUnfit} }
 
 // volumeByID reads an env volume by its volume ID.
 func (c *Controller) volumeByID(ctx context.Context, id uuid.UUID) (store.EnvVolume, error) {

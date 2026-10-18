@@ -380,7 +380,9 @@ func (c *Controller) attachedReadiness(ctx context.Context, p *attachedPlan, l m
 		return
 	}
 	ok, why := c.runCheck(ctx, l, p.check, seen)
-	applyCheck(ok, why, p.check, now, &after.Phase, &after.ReadySince, &after.ProbeFailures, &after.Detail)
+	if ok || why != errNoVerdict.Error() {
+		applyCheck(ok, why, p.check, now, &after.Phase, &after.ReadySince, &after.ProbeFailures, &after.Detail)
+	}
 	if after.Phase == model.PhaseReady && after.Restarts > 0 && !after.ReadySince.IsZero() &&
 		now.Sub(after.ReadySince) >= c.t.crashWindow {
 		after.Restarts = 0

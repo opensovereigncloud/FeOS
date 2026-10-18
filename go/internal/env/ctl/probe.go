@@ -16,6 +16,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/ports"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -87,10 +88,16 @@ func (c *Controller) forget(key string) {
 	delete(c.seen, key)
 }
 
+// errNoVerdict is a check that could not run for a reason of this
+// instance's (every probe slot of the sandbox in use): it counts neither
+// way.
+var errNoVerdict = errors.New("no verdict")
+
 // runCheck runs a readiness check against the lease's pod: http (a GET
 // over a port-forward, 200..399), tcp (a port-forward answered), exec
 // (exit 0 in the main container); none: ready once it has run steadyAfter
-// since it was first seen.
+// since it was first seen. A check without a verdict answers why
+// errNoVerdict.Error().
 func (c *Controller) runCheck(ctx context.Context, l model.Lease, chk check, seen seenState) (bool, string) {
 	switch chk.kind {
 	case "":
@@ -107,7 +114,10 @@ func (c *Controller) runCheck(ctx context.Context, l model.Lease, chk check, see
 		}
 		if chk.kind == "tcp" {
 			conn, err := c.d.Ports.DialPod(ctx, l, chk.port)
-			if err != nil {
+			switch {
+			case errors.Is(err, ports.ErrProbeBusy):
+				return false, errNoVerdict.Error()
+			case err != nil:
 				return false, fmt.Sprintf("tcp port %d: %v", chk.port, err)
 			}
 			conn.Close()
@@ -115,6 +125,8 @@ func (c *Controller) runCheck(ctx context.Context, l model.Lease, chk check, see
 		}
 		code, err := c.d.Ports.Probe(ctx, l, chk.port, chk.path)
 		switch {
+		case errors.Is(err, ports.ErrProbeBusy):
+			return false, errNoVerdict.Error()
 		case err != nil:
 			return false, fmt.Sprintf("GET %s on port %d: %v", chk.path, chk.port, err)
 		case code < 200 || code > 399:
@@ -311,7 +323,9 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 		if !ok && inst.Kind == spec.KindAddon {
 			why = redact(why, c.addonSecrets(ctx, v, inst.Object))
 		}
-		applyCheck(ok, why, chk, v.now, &after.Phase, &after.ReadySince, &after.ProbeFailures, &after.Detail)
+		if ok || why != errNoVerdict.Error() {
+			applyCheck(ok, why, chk, v.now, &after.Phase, &after.ReadySince, &after.ProbeFailures, &after.Detail)
+		}
 	}
 	if after.Phase == model.PhaseReady && after.Restarts > 0 && !after.ReadySince.IsZero() &&
 		v.now.Sub(after.ReadySince) >= c.t.crashWindow {
