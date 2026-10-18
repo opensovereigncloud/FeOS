@@ -258,7 +258,15 @@ func (c *Controller) load(ctx context.Context, envID uuid.UUID) (*view, error) {
 		return nil, nil
 	}
 	v := &view{env: env}
-	if v.latest, err = c.st.GetRelease(ctx, envID, env.Release); err != nil {
+	// The latest release without its spec (up to 1 MiB, read every
+	// second by the probes): the spec comes from the cache.
+	latest, err := c.st.ListReleases(ctx, envID, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(latest) == 1 && latest[0].Number == env.Release {
+		v.latest = latest[0]
+	} else if v.latest, err = c.st.GetRelease(ctx, envID, env.Release); err != nil {
 		return nil, fmt.Errorf("release %d: %w", env.Release, err)
 	}
 	if v.latestSpec, err = c.releaseSpec(ctx, envID, env.Release); err != nil {
