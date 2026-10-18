@@ -197,7 +197,7 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	}
 	var sp *spec.Spec
 	if number > 0 {
-		if sp, err = s.releaseSpec(ctx, e.ID, number); err != nil {
+		if sp, err = s.releaseSpec(ctx, e, number); err != nil {
 			s.routeFailed(w, r, err)
 			return
 		}

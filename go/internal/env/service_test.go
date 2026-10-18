@@ -661,3 +661,69 @@ func TestRouteTokens(t *testing.T) {
 	_, err = h.svc.CreateRouteToken(ctx, tenantB, "stage")
 	wantStatus(t, err, http.StatusNotFound, "no such environment")
 }
+
+// An environment's ID is free again once env-delete removed it; the next
+// environment of that ID, another tenant's here, never sees the old one's
+// releases through the parsed-spec cache.
+func TestReusedEnvID(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	id := uuid.New()
+	if _, _, err := h.svc.CreateEnv(ctx, tenantA, CreateEnvRequest{Name: "stage", ID: id.String()}); err != nil {
+		t.Fatal(err)
+	}
+	h.putSecret("stage", "token", "x")
+	h.apply("stage", stageSpec, 0)
+	// Read release 1 every way the service caches it.
+	if st, err := h.svc.GetEnv(ctx, tenantA, "stage"); err != nil || len(st.Objects) != 5 {
+		t.Fatalf("status %+v %v", st, err)
+	}
+	if _, err := h.svc.Release(ctx, tenantA, "stage", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(stageSpec)}); err != nil {
+		t.Fatal(err)
+	}
+	// env-delete removes the row, its releases with it.
+	h.exec("DELETE FROM environments WHERE id = $1", id)
+
+	if _, _, err := h.svc.CreateEnv(ctx, tenantB, CreateEnvRequest{Name: "solo", ID: id.String()}); err != nil {
+		t.Fatal(err)
+	}
+	own := `{"services": {"solo": {"image": "ghcr.io/b/solo:1", "ports": [{"name": "http", "port": 80}]}},
+	  "routes": {"root": {"path": "/", "service": "solo", "port": "http"}}}`
+	a, err := h.svc.Apply(ctx, tenantB, "solo", ApplyRequest{Spec: json.RawMessage(own)})
+	if err != nil || a.Number != 1 {
+		t.Fatalf("apply %+v %v", a, describe(err))
+	}
+	st, err := h.svc.GetEnv(ctx, tenantB, "solo")
+	if err != nil || len(st.Objects) != 1 || st.Objects[0].Name != "solo" || len(st.Routes) != 1 || st.Routes[0].Port != 80 {
+		t.Fatalf("the new environment's status %+v %v", st, err)
+	}
+	// The same spec again is unchanged; the old environment's is a change
+	// that removes solo, with nothing of the old one's as "from".
+	if a, err := h.svc.Apply(ctx, tenantB, "solo", ApplyRequest{Spec: json.RawMessage(own), Base: 1}); err != nil || !a.Unchanged {
+		t.Fatalf("unchanged %+v %v", a, describe(err))
+	}
+	p, err := h.svc.Plan(ctx, tenantB, "solo", PlanRequest{Spec: json.RawMessage(strings.Replace(stageSpec,
+		`"TOKEN": {"secret": "token"},`, "", 1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := false
+	for _, d := range p.Diff {
+		if d.Kind == spec.KindService && d.Name == "solo" && d.Change == spec.ChangeRemove {
+			removed = true
+		}
+		if d.Kind == spec.KindService && d.Name == "api" && d.Change != spec.ChangeAdd {
+			t.Fatalf("api is %s: the old environment's spec leaked into the diff", d.Change)
+		}
+	}
+	if !removed {
+		t.Fatalf("diff %+v", p.Diff)
+	}
+	if d, err := h.svc.Release(ctx, tenantB, "solo", 1); err != nil || len(d.Diff) != 2 {
+		t.Fatalf("release 1 %+v %v", d, err)
+	}
+}

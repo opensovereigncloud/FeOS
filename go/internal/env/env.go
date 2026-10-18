@@ -213,10 +213,12 @@ func (s *Service) addonEffect(name string, prev, next spec.Addon) string {
 	return spec.EffectInPlace
 }
 
-// releaseKey names a release.
+// releaseKey names a release: its environment's ID and creation time
+// (in microseconds, the database's precision), and its number.
 type releaseKey struct {
-	env    uuid.UUID
-	number int
+	env     uuid.UUID
+	created int64
+	number  int
 }
 
 // specCache holds parsed release specs, for reading only: a release

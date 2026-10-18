@@ -105,7 +105,7 @@ func TestClone(t *testing.T) {
 	if v, err := h.sealer.Open(sec.Sealed, envdeps.SecretAAD(e2.ID, "token", 1)); err != nil || string(v) != "fresh" {
 		t.Fatalf("set secret %q %v", v, err)
 	}
-	sp2, _ := h.svc.releaseSpec(ctx, e2.ID, 1)
+	sp2, _ := h.svc.releaseSpec(ctx, e2, 1)
 	if *sp2.Services["api"].Replicas != 1 {
 		t.Fatalf("given spec %+v", sp2.Services["api"])
 	}

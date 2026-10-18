@@ -272,7 +272,7 @@ func (s *Service) plan(ctx context.Context, tenant string, env store.Environment
 		p.base = *base
 	}
 	if env.Release > 0 {
-		cur, err := s.releaseSpec(ctx, env.ID, env.Release)
+		cur, err := s.releaseSpec(ctx, env, env.Release)
 		if err != nil {
 			return planned{}, err
 		}
@@ -294,7 +294,7 @@ func (s *Service) plan(ctx context.Context, tenant string, env store.Environment
 	if p.base != p.current {
 		baseSpec = nil
 		if p.base > 0 {
-			if baseSpec, err = s.releaseSpec(ctx, env.ID, p.base); err != nil {
+			if baseSpec, err = s.releaseSpec(ctx, env, p.base); err != nil {
 				return planned{}, err
 			}
 		}

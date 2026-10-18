@@ -195,13 +195,13 @@ func (s *Service) Release(ctx context.Context, tenant, env string, number int) (
 	if err != nil {
 		return ReleaseDetail{}, fmt.Errorf("release %d: %w", number, err)
 	}
-	sp, err := s.releaseSpec(ctx, e.ID, number)
+	sp, err := s.releaseSpec(ctx, e, number)
 	if err != nil {
 		return ReleaseDetail{}, err
 	}
 	var prev *spec.Spec
 	if number > 1 {
-		if prev, err = s.releaseSpec(ctx, e.ID, number-1); err != nil && !isNotFound(err) {
+		if prev, err = s.releaseSpec(ctx, e, number-1); err != nil && !isNotFound(err) {
 			return ReleaseDetail{}, err
 		}
 	}
