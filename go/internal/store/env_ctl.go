@@ -94,6 +94,23 @@ func (s *Store) EnvCtlMarkVolumesDeleting(ctx context.Context, envID uuid.UUID) 
 	return ct.RowsAffected(), err
 }
 
+// EnvCtlVolumesByID returns the volumes of the ids that have a row, by
+// volume ID.
+func (s *Store) EnvCtlVolumesByID(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]EnvVolume, error) {
+	out := map[uuid.UUID]EnvVolume{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	vols, err := collectEnvVolumes(s.q.Query(ctx, "SELECT "+envVolumeCols+" FROM env_volumes WHERE volume_id = ANY($1)", ids))
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range vols {
+		out[v.VolumeID] = v
+	}
+	return out, nil
+}
+
 // EnvCtlTouchVolume sets a volume's updated_at to now(), so that one that
 // waits goes to the end of DeletingEnvVolumes's order; ErrNoRow when it is
 // gone.

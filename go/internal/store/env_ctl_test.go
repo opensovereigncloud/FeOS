@@ -176,6 +176,14 @@ func TestEnvCtlQueries(t *testing.T) {
 	if err := s.EnvCtlTouchVolume(bg, env.ID, "addon/none"); err != store.ErrNoRow {
 		t.Fatalf("touch a volume that is not there: %v", err)
 	}
+	kv, _ := s.GetEnvVolume(bg, env.ID, "addon/kv")
+	byID, err := s.EnvCtlVolumesByID(bg, []uuid.UUID{kv.VolumeID, uuid.New()})
+	if err != nil || len(byID) != 1 || byID[kv.VolumeID].Object != "addon/kv" {
+		t.Fatalf("volumes by id %+v %v", byID, err)
+	}
+	if byID, err := s.EnvCtlVolumesByID(bg, nil); err != nil || len(byID) != 0 {
+		t.Fatalf("volumes by no id %+v %v", byID, err)
+	}
 
 	// Which environments and sandboxes exist.
 	gone := uuid.New()

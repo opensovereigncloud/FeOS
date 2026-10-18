@@ -302,8 +302,19 @@ func TestAddonMovesWithDrain(t *testing.T) {
 	if nv := n2.Volumes(); len(nv) != 1 || nv[0].PodId != first.Sandbox.ID.String() {
 		t.Errorf("n2's volumes %v", nv)
 	}
-	_ = n1
 	h.waitRows(env.ID, spec.KindAddon, "cache", 1, 30*time.Second, "ready on n2", ready)
+	// The record the volume left on n1 goes once n1's stale pod is gone.
+	eventually(t, 60*time.Second, "n1's record of the volume gone", func() bool {
+		h.c.notify(bg, LoopVolumes)
+		return len(n1.Volumes()) == 0
+	})
+	// The environment deleted, no record of its volume is left anywhere.
+	h.exec(`UPDATE environments SET deleting = true WHERE id = $1`, env.ID)
+	eventually(t, 60*time.Second, "the environment and its volume gone", func() bool {
+		h.c.notify(bg, LoopVolumes)
+		_, err := h.st.GetEnvironment(bg, env.ID)
+		return errors.Is(err, store.ErrNoRow) && len(n1.Volumes()) == 0 && len(n2.Volumes()) == 0
+	})
 }
 
 // removeNode removes a node as the admin API does with force: its row

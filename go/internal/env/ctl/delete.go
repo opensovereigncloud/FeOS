@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -25,13 +26,13 @@ const volumesBatch = 64
 // done), then their rows. A volume never created on a node, or of a node
 // that is gone or removed, only loses its row. A volume that has to wait
 // goes to the end of the queue, so that those that wait long never hold
-// the batch.
+// the batch. Then the copies left on nodes go (sweepVolumes).
 func (c *Controller) volumesLoop(ctx context.Context) error {
 	vols, err := c.st.DeletingEnvVolumes(ctx, volumesBatch)
 	if err != nil {
 		return err
 	}
-	var errs []error
+	errs := []error{c.sweepVolumes(ctx)}
 	for _, vol := range vols {
 		gone, err := c.deleteVolume(ctx, vol)
 		if err != nil && ctx.Err() == nil {
@@ -43,6 +44,80 @@ func (c *Controller) volumesLoop(ctx context.Context) error {
 			}); err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
 				errs = append(errs, fmt.Errorf("volume %s of %s: %w", vol.VolumeID, vol.Object, err))
 			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// sweepVolumes deletes, on each connected node, the records of
+// environments' volumes that no pod holds and that are not the volume as
+// its row has it: a volume whose row is gone (its addon or environment
+// was deleted while the record stayed elsewhere), or a copy on another
+// node than the row's (a restore elsewhere took the volume over, and the
+// node it left keeps a checkpointed record of it). DeleteVolume refuses a
+// volume a pod holds by then (FAILED_PRECONDITION: a later pass), so that
+// a restore or create that takes it meanwhile keeps it. A row not yet
+// provisioned keeps every record of its volume: its create may be in
+// flight.
+func (c *Controller) sweepVolumes(ctx context.Context) error {
+	if c.d.Conns == nil {
+		return nil
+	}
+	var errs []error
+	for _, node := range c.d.Conns.Nodes() {
+		if err := c.sweepNodeVolumes(ctx, node); err != nil && ctx.Err() == nil {
+			errs = append(errs, fmt.Errorf("node %s: %w", node, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// sweepNodeVolumes is sweepVolumes for one node.
+func (c *Controller) sweepNodeVolumes(ctx context.Context, node string) error {
+	lctx, cancel := context.WithTimeout(ctx, c.t.nodeCall)
+	defer cancel()
+	cc, err := c.conn(lctx, node)
+	if err != nil {
+		return err
+	}
+	vc := volumev1.NewVolumeServiceClient(cc)
+	list, err := vc.ListVolumes(lctx, &volumev1.ListVolumesRequest{})
+	if err != nil {
+		return err
+	}
+	var ids []uuid.UUID
+	for _, v := range list.GetVolumes() {
+		if v.GetLabels()[model.LabelEnvironment] == "" || v.GetPodId() != "" {
+			continue
+		}
+		if id, err := uuid.Parse(v.GetVolumeId()); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows, err := c.st.EnvCtlVolumesByID(ctx, ids)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, id := range ids {
+		vol, ok := rows[id]
+		why := "its row is gone"
+		switch {
+		case !ok:
+		case vol.Provisioned && vol.Node != "" && vol.Node != node:
+			why = "the volume is on node " + vol.Node
+		default:
+			continue
+		}
+		dctx, dcancel := context.WithTimeout(ctx, c.t.nodeCall)
+		_, err := vc.DeleteVolume(dctx, &volumev1.DeleteVolumeRequest{VolumeId: id.String()})
+		dcancel()
+		switch status.Code(err) {
+		case codes.OK:
+			c.log.Info("a volume's record left on a node deleted", "node", node, "volume", id, "why", why)
+		case codes.NotFound, codes.FailedPrecondition:
+		default:
+			errs = append(errs, fmt.Errorf("delete volume %s: %w", id, err))
 		}
 	}
 	return errors.Join(errs...)
