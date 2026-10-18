@@ -6,6 +6,7 @@ package ctl
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"time"
 
@@ -147,7 +148,8 @@ func (c *Controller) processLog(ctx context.Context, v *view, name string, lines
 // RestartService restarts a service of the environment's target release:
 // an attached service's process is stopped and started again (never its
 // sandbox's pod); an image service's replicas are restarted one at a
-// time. It returns once the restart is under way; ErrNoObject.
+// time. It returns once the restart is under way; ErrNoObject, ErrPaused
+// and ErrNotRunning (attached), model.ErrBusy (an op in flight).
 func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name string) error {
 	v, err := c.load(ctx, envID)
 	if errors.Is(err, store.ErrNoRow) || (err == nil && v == nil) {
@@ -200,13 +202,27 @@ func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name s
 
 // restartReplica restarts one replica's pod: its phase is starting again
 // (no traffic until it is ready), then Engine.Restart. A row that is not
-// running is left to the controller (Ensure brings it up anew).
+// running is left to the controller (Ensure brings it up anew); one with
+// an op in flight is model.ErrBusy, and its instance stays as it was (a
+// restart the engine refuses puts it back), so that a refused restart
+// takes no traffic away.
 func (c *Controller) restartReplica(ctx context.Context, id uuid.UUID) error {
-	err := c.st.InTx(ctx, func(tx *store.Store) error {
+	sb, err := c.st.GetSandbox(ctx, id)
+	switch {
+	case err != nil:
+		return err
+	case sb.Op != "":
+		return fmt.Errorf("an op %s of instance %s is in flight: %w", sb.Op, sb.OpOwner, model.ErrBusy)
+	case sb.ClientState != model.StateRunning:
+		return nil
+	}
+	var before store.EnvInstance
+	err = c.st.InTx(ctx, func(tx *store.Store) error {
 		inst, err := tx.LockEnvInstance(ctx, id, store.ForUpdate)
 		if err != nil {
 			return err
 		}
+		before = inst
 		after := inst
 		after.Phase, after.ReadySince, after.ProbeFailures, after.Detail = model.PhaseStarting, time.Time{}, 0, "restarting"
 		_, err = tx.UpdateEnvInstance(ctx, inst, after)
@@ -216,10 +232,32 @@ func (c *Controller) restartReplica(ctx context.Context, id uuid.UUID) error {
 		return err
 	}
 	err = c.d.Engine.Restart(ctx, id, "restart requested")
-	if errors.Is(err, model.ErrPrecondition) {
+	switch {
+	case errors.Is(err, model.ErrPrecondition):
 		return nil
+	case errors.Is(err, model.ErrBusy):
+		c.unrestart(ctx, before)
 	}
 	return err
+}
+
+// unrestart puts an instance back as it was before a restart the engine
+// refused, unless something wrote it meanwhile.
+func (c *Controller) unrestart(ctx context.Context, before store.EnvInstance) {
+	err := c.st.InTx(ctx, func(tx *store.Store) error {
+		cur, err := tx.LockEnvInstance(ctx, before.SandboxID, store.ForUpdate)
+		if err != nil || cur.Phase != model.PhaseStarting || cur.Detail != "restarting" {
+			return err
+		}
+		after := cur
+		after.Phase, after.ReadySince, after.ProbeFailures, after.Detail = before.Phase, before.ReadySince, before.ProbeFailures,
+			before.Detail
+		_, err = tx.UpdateEnvInstance(ctx, cur, after)
+		return err
+	})
+	if err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
+		c.rl.warn("restart", "cannot put back an instance whose restart was refused", "sandbox", before.SandboxID, "err", err)
+	}
 }
 
 // waitReady waits until an instance is ready again (true), or gone, or

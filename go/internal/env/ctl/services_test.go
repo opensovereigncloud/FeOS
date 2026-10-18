@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
@@ -657,5 +658,51 @@ func TestAddonAddressRollsDependents(t *testing.T) {
 	mu.Unlock()
 	if e, _ := h.st.GetEnvironment(bg, env.ID); e.Release != r2 || e.Realised != r2 {
 		t.Errorf("environment %+v", e)
+	}
+}
+
+// A restart while the replica has an op in flight is refused with
+// model.ErrBusy and takes no traffic away (the instance stays ready).
+func TestRefusalsOfExpectedStates(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	id := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0].Sandbox.ID
+	block := make(chan struct{})
+	n1.Script().SetHook(podv1.PodService_SuspendPod_FullMethodName, func(ctx context.Context, _ string, _ any) error {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	defer close(block)
+	go func() { _ = h.eng.Pause(bg, id) }()
+	eventually(t, 10*time.Second, "a pause in flight", func() bool {
+		sb, err := h.st.GetSandbox(bg, id)
+		return err == nil && sb.Op != ""
+	})
+	if err := h.c.RestartService(bg, env.ID, "web"); !errors.Is(err, model.ErrBusy) {
+		t.Fatalf("a restart while an op is in flight: %v", err)
+	}
+	if inst, err := h.st.GetEnvInstance(bg, id); err != nil || inst.Phase != model.PhaseReady || inst.Detail != "" {
+		t.Fatalf("the refused restart changed the instance: %+v %v", inst, err)
+	}
+}
+
+// A manual job whose template cannot render yet is refused with
+// ErrNotReady, its text as before.
+func TestRunJobNotReady(t *testing.T) {
+	// Without a sealer an addon never gets an address.
+	h := newHarness(t, options{noSealer: true})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	h.apply(env.ID, fmt.Sprintf(`{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev"}},
+		"jobs":{"once":{"image":%q,"on":"manual","env":{"CACHE":{"addon":"cache","key":"url"}}}}}`, testImage))
+	err := h.c.RunJob(bg, env.ID, "once")
+	if !errors.Is(err, ErrNotReady) || err.Error() != "job once cannot run yet: waits for the address of addon cache" {
+		t.Fatalf("a job that cannot run yet: %v", err)
 	}
 }

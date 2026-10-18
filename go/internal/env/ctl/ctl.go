@@ -96,6 +96,9 @@ var (
 	// not the tenant's has no process to read or restart. The error's text
 	// says which. It wraps model.ErrNotRunning.
 	ErrNotRunning = fmt.Errorf("not running: %w", model.ErrNotRunning)
+	// ErrNotReady: the object cannot run yet, an expected state (409): a
+	// job whose template does not render ("job X cannot run yet: …").
+	ErrNotReady = errors.New("not ready")
 )
 
 // stateError is an answer for an expected state: its text as the caller

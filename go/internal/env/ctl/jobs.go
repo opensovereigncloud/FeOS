@@ -260,7 +260,7 @@ func appendExit(exits []store.EnvExit, e store.EnvExit) []store.EnvExit {
 
 // RunJob starts a run of a job of the environment's target release (what
 // jobs on "manual" are for): a new attempt 1. It returns once the run's
-// row is inserted; ErrNoObject.
+// row is inserted; ErrNoObject, ErrNotReady.
 func (c *Controller) RunJob(ctx context.Context, envID uuid.UUID, name string) error {
 	v, err := c.load(ctx, envID)
 	if errors.Is(err, store.ErrNoRow) || (err == nil && v == nil) {
@@ -275,7 +275,7 @@ func (c *Controller) RunJob(ctx context.Context, envID uuid.UUID, name string) e
 	}
 	p := c.planJob(v, name, j)
 	if !p.ok() {
-		return fmt.Errorf("job %s cannot run yet: %s", name, p.why())
+		return &stateError{msg: fmt.Sprintf("job %s cannot run yet: %s", name, p.why()), kind: ErrNotReady}
 	}
 	run := &store.EnvJobRun{EnvID: v.env.ID, Job: name, TemplateHash: p.hash, Release: v.targetNum, Attempt: 1,
 		Phase: model.RunRunning}
