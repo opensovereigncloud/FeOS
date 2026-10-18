@@ -406,6 +406,17 @@ func TestRouteDoor(t *testing.T) {
 	w = httptest.NewRecorder()
 	h.svc.ServeRoute(w, r)
 	wantPlain(t, w, 400, "the path has a .. segment\n")
+	r = httptest.NewRequest("GET", "/api/v1/environments/stage/http/api/%2e/admin", nil)
+	r.Header.Set("Authorization", "Bearer "+tok.Token)
+	r.SetPathValue("env", "stage")
+	w = httptest.NewRecorder()
+	h.svc.ServeRoute(w, r)
+	wantPlain(t, w, 400, "the path has a . segment\n")
+	// A percent sign is a character like any other.
+	routeRequest(mux, "GET", "/api/v1/environments/stage/http/api/q/100%25", tok.Token)
+	if f := h.ports.last(t); f.path != "/q/100%" || f.rawPath != "" {
+		t.Fatalf("percent %+v", f)
+	}
 
 	// The token was used; revoked, it opens nothing.
 	rt, _ := h.st.ResolveRouteToken(ctx, store.HashToken(tok.Token))
@@ -463,15 +474,16 @@ func TestRoutePaths(t *testing.T) {
 			t.Errorf("strip %s %d: %q %q %v", c.raw, c.n, p, rp, err)
 		}
 	}
-	for _, c := range []struct {
-		path, raw string
-		bad       bool
-	}{
-		{"/a/../b", "/a/../b", true}, {"/a/../b", "/a/%2e%2e/b", true}, {"/a/%2e%2e/b", "/a/%252e%252e/b", true},
-		{"/a/..b/c", "/a/..b/c", false}, {"/a/b", "/a/b", false},
+	// Only a segment that is, or decodes once or twice to, . or .. is
+	// refused; a % that starts no escape after a decode is a character.
+	for _, c := range []struct{ raw, want string }{
+		{"/a/../b", ".."}, {"/a/%2e%2e/b", ".."}, {"/a/%252e%252e/b", ".."}, {"/a%2F..%2Fb", ".."},
+		{"/%252e%252e/x%25", ".."}, {"/%252e%2e/x", ".."}, {"/a/%2e/b", "."}, {"/a/%252E", "."},
+		{"/a/..b/c", ""}, {"/a/b", ""}, {"/q/100%25", ""}, {"/search/50%25off", ""}, {"/a%2541", ""},
+		{"/a/%25252e%25252e/b", ""}, {"/%2e%2e%zz", ""}, {"/files/a%25zz/..x", ""},
 	} {
-		if got := hasDotDot(c.path, c.raw); got != c.bad {
-			t.Errorf("dotdot %s %s: %v", c.path, c.raw, got)
+		if got := dotSegment(c.raw); got != c.want {
+			t.Errorf("dot segment of %s: %q, want %q", c.raw, got, c.want)
 		}
 	}
 }

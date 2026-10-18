@@ -26,6 +26,7 @@ import (
 const (
 	textRouteToken = "route token required"
 	textDotDot     = "the path has a .. segment"
+	textDot        = "the path has a . segment"
 	textNoDoor     = "not available on this instance"
 )
 
@@ -62,24 +63,58 @@ func routePath(r *http.Request) (path, raw string, err error) {
 	return path, raw, err
 }
 
-// hasDotDot reports a ".." segment in a path, its escaped form, or
-// either unescaped once more.
-func hasDotDot(path, raw string) bool {
-	for _, p := range []string{path, raw} {
-		for range 2 {
-			for seg := range strings.SplitSeq(p, "/") {
-				if seg == ".." {
-					return true
-				}
+// dotSegment is ".." or "." when a segment of a path's escaped form is
+// that, as it is or decoded once or twice, else "". Each decode is
+// lenient, as an upstream that decodes again may be: a valid %XX becomes
+// its byte and any other "%" stays, so a "%" that the first decode made
+// ("/q/100%25") is a character, not a reason to refuse, and still hides
+// no "%2e%2e" beside it.
+func dotSegment(raw string) string {
+	p := raw
+	for i := range 3 {
+		for seg := range strings.SplitSeq(p, "/") {
+			if seg == "." || seg == ".." {
+				return seg
 			}
-			dec, err := url.PathUnescape(p)
-			if err != nil {
-				return true
-			}
-			p = dec
+		}
+		if i < 2 {
+			p = lenientUnescape(p)
 		}
 	}
-	return false
+	return ""
+}
+
+// lenientUnescape decodes each valid %XX of s and leaves any other "%"
+// as it is.
+func lenientUnescape(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c >= 'a':
+		return c - 'a' + 10
+	case c >= 'A':
+		return c - 'A' + 10
+	}
+	return c - '0'
 }
 
 // matchRoute returns the route whose path is the longest segment-aware
@@ -187,8 +222,12 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the path is not escaped correctly", http.StatusBadRequest)
 		return
 	}
-	if hasDotDot(path, raw) {
+	switch dotSegment(raw) {
+	case "..":
 		http.Error(w, textDotDot, http.StatusBadRequest)
+		return
+	case ".":
+		http.Error(w, textDot, http.StatusBadRequest)
 		return
 	}
 	number := e.Realised
