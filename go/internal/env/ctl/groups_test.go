@@ -125,9 +125,11 @@ func TestEnvDeletion(t *testing.T) {
 	if len(n1.Volumes()) != 0 {
 		t.Errorf("volumes stay: %v", n1.Volumes())
 	}
-	if h.group("n1", model.EnvGroupID(env.ID)) != nil {
-		t.Error("the env group stays")
-	}
+	// env-groups may have put the group again from rows it read just
+	// before they went; its next pass removes it as of an environment
+	// that is gone.
+	h.c.notify(bg, HintGroups)
+	eventually(t, 30*time.Second, "the env group gone", func() bool { return h.group("n1", model.EnvGroupID(env.ID)) == nil })
 	var n int
 	if err := h.d.Pool.QueryRow(bg, `SELECT (SELECT count(*) FROM sandboxes WHERE environment_id IS NOT NULL)
 		+ (SELECT count(*) FROM env_volumes) + (SELECT count(*) FROM env_secrets) + (SELECT count(*) FROM env_releases)`).Scan(&n); err != nil || n != 0 {
