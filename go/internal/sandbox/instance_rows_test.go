@@ -6,6 +6,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -138,9 +139,11 @@ func TestPrepareHookOrder(t *testing.T) {
 }
 
 // A prepare hook that fails before a create sends nothing: the row is
-// pending again with the hook's error as the op's error and description,
-// and an unpinned create avoids the node; a pinned one does not, and a
-// pinned row is placed on its node whatever it avoids.
+// pending again with the hook's error as the op's error and description.
+// An error that may pass leaves the node to the next try; one that says
+// the node cannot take the pod (ErrNodeUnfit) avoids it on an unpinned
+// create; a pinned create does not avoid it, and a pinned row is placed
+// on its node whatever it avoids.
 func TestPrepareHookFailureRollsBack(t *testing.T) {
 	h := newHarness(t)
 	h.addNode("n1")
@@ -157,8 +160,8 @@ func TestPrepareHookFailureRollsBack(t *testing.T) {
 	wantErr(t, err, nil, "create on node n1 failed: prepare node n1 for create: security group env-x: unavailable")
 	row := h.row(sb.ID)
 	wantState(t, row, model.StatePending)
-	if row.StatusDescription != "prepare node n1 for create: security group env-x: unavailable; nothing was sent; placed elsewhere on the next use" ||
-		!slices.Equal(row.AvoidNodes, []string{"n1"}) || row.Node != "" {
+	if row.StatusDescription != "prepare node n1 for create: security group env-x: unavailable; nothing was sent" ||
+		len(row.AvoidNodes) != 0 || row.Node != "" {
 		t.Fatalf("row after the failed hook %q %v %q", row.StatusDescription, row.AvoidNodes, row.Node)
 	}
 	if _, ok := h.booking(sb.ID); ok {
@@ -167,13 +170,26 @@ func TestPrepareHookFailureRollsBack(t *testing.T) {
 	wantSteps(t, seq.take(), "hook create n1")
 	h.activityNamed(sb.ID, activity.KindLifecycleEnd, "create on node n1: pending")
 
+	// The node cannot take the pod: avoided from now on.
+	unfit := fmt.Errorf("volume data: %w: no space left", ErrNodeUnfit)
+	seq.failOn(OpCreate, unfit)
+	_, err = h.eng().Ensure(ctx, sb.ID)
+	wantErr(t, err, ErrNodeUnfit, "create on node n1 failed: prepare node n1 for create: "+unfit.Error())
+	row = h.row(sb.ID)
+	wantState(t, row, model.StatePending)
+	if row.StatusDescription != "prepare node n1 for create: "+unfit.Error()+"; nothing was sent; placed elsewhere on the next use" ||
+		!slices.Equal(row.AvoidNodes, []string{"n1"}) || row.Node != "" {
+		t.Fatalf("row after the unfit node %q %v %q", row.StatusDescription, row.AvoidNodes, row.Node)
+	}
+	wantSteps(t, seq.take(), "hook create n1")
+
 	// Pinned: the node is not avoided, and a pinned row passes the node it
 	// avoids.
 	pinned := h.instance(env, plainTemplate(env), func(n *store.NewSandbox) { n.PinNode = "n1" })
 	_, err = h.eng().Ensure(ctx, pinned.ID)
-	wantErr(t, err, nil, "prepare node n1 for create")
+	wantErr(t, err, ErrNodeUnfit, "prepare node n1 for create")
 	if row := h.row(pinned.ID); len(row.AvoidNodes) != 0 ||
-		row.StatusDescription != "prepare node n1 for create: security group env-x: unavailable; nothing was sent" {
+		row.StatusDescription != "prepare node n1 for create: "+unfit.Error()+"; nothing was sent" {
 		t.Fatalf("pinned row %q %v", row.StatusDescription, row.AvoidNodes)
 	}
 	seq.failOn(OpCreate, nil)
@@ -198,6 +214,92 @@ func TestPrepareHookFailureRollsBack(t *testing.T) {
 	}
 	h.podState("n1", pinned.ID, podv1.PodState_POD_STATE_SUSPENDED)
 	wantSteps(t, seq.take(), "SuspendPod", "hook resume n1")
+}
+
+// A prepare hook whose node went away (its error wraps
+// model.ErrNodeUnavailable, as nodelink's does after its wait) never
+// avoids the node, not even when it says unfit as well: on a single node
+// the next Ensure places the row there again and its pod runs.
+func TestPrepareHookNodeUnavailable(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	seq := &sequence{}
+	h.eng().SetPrepareHook(seq.hook)
+	h.recordCalls("n1", seq)
+	env := h.environment()
+	sb := h.instance(env, plainTemplate(env))
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	for _, cause := range []error{
+		fmt.Errorf("security group %s: %w", model.EnvGroupID(env), model.ErrNodeUnavailable),
+		fmt.Errorf("volume data: %w: %w", ErrNodeUnfit, model.ErrNodeUnavailable),
+	} {
+		seq.failOn(OpCreate, cause)
+		_, err := h.eng().Ensure(ctx, sb.ID)
+		wantErr(t, err, model.ErrNodeUnavailable, "create on node n1 failed: prepare node n1 for create: "+cause.Error())
+		row := h.row(sb.ID)
+		wantState(t, row, model.StatePending)
+		if row.StatusDescription != "prepare node n1 for create: "+cause.Error()+"; nothing was sent" ||
+			len(row.AvoidNodes) != 0 {
+			t.Fatalf("row after %q: %q %v", cause, row.StatusDescription, row.AvoidNodes)
+		}
+		wantSteps(t, seq.take(), "hook create n1")
+	}
+	seq.failOn(OpCreate, nil)
+	if lease := h.ensure(sb.ID); lease.Node != "n1" {
+		t.Fatalf("lease %+v", lease)
+	}
+	wantState(t, h.row(sb.ID), model.StateRunning)
+	wantSteps(t, seq.take(), "hook create n1", "CreatePod")
+}
+
+// A node that is no longer connected when the op gets its connection
+// rolls the create back without a cause, before the prepare hook could
+// be called: the description names the missing connection, and the node
+// is not avoided.
+func TestPrepareHookNeedsTheConnection(t *testing.T) {
+	h := newHarness(t)
+	n := h.addNode("n1")
+	seq := &sequence{}
+	h.eng().SetPrepareHook(seq.hook)
+	h.recordCalls("n1", seq)
+	env := h.environment()
+	sb := h.instance(env, plainTemplate(env))
+	connected := func() bool { return h.ins[0].srv.Connected("n1") }
+	var once sync.Once
+	gone := make(chan bool, 1)
+	h.eng().connHook = func(*OpHandle) error {
+		once.Do(func() {
+			// The node goes away between the begin's claim and the op's
+			// connection.
+			n.Partition(true)
+			deadline := time.Now().Add(10 * time.Second)
+			for connected() && time.Now().Before(deadline) {
+				time.Sleep(20 * time.Millisecond)
+			}
+			gone <- !connected()
+		})
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	_, err := h.eng().Ensure(ctx, sb.ID)
+	if !<-gone {
+		t.Fatal("n1 stayed connected")
+	}
+	wantErr(t, err, model.ErrNodeUnavailable, "create on node n1 failed: node n1 is not connected to instance i1")
+	row := h.row(sb.ID)
+	wantState(t, row, model.StatePending)
+	if row.StatusDescription != "node n1 is not connected to instance i1; nothing was sent" || len(row.AvoidNodes) != 0 {
+		t.Fatalf("row after the lost connection %q %v", row.StatusDescription, row.AvoidNodes)
+	}
+	wantSteps(t, seq.take())
+
+	// Back: the next Ensure prepares the node and creates the pod there.
+	n.Partition(false)
+	eventually(t, 20*time.Second, "n1 back", connected)
+	h.ensure(sb.ID)
+	wantSteps(t, seq.take(), "hook create n1", "CreatePod")
 }
 
 // A secret that does not resolve fails a create before anything reaches

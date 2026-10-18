@@ -170,8 +170,9 @@ func (r *runner) fencedOut(ctx context.Context, tx *store.Store, h *OpHandle, ro
 // rollbackOnce is one transaction of a rollback. Its error and the row's
 // description name why nothing was sent: the node not connected, or the
 // cause (a prepare hook's failure, a secret that did not resolve). A
-// fresh unpinned create whose prepare hook failed avoids the node from
-// now on, as a create the node refused does.
+// fresh unpinned create whose prepare hook found the node unfit
+// (nodeUnfit) avoids the node from now on, as a create the node refused
+// does.
 func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle, cause *prepareError) (OpResult, afterCommit, error) {
 	e := r.e
 	why := fmt.Sprintf("node %s is not connected to instance %s", h.target, e.id)
@@ -212,7 +213,7 @@ func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle, cause *prepareEr
 		case !h.takeover:
 			a.ClientState, a.Node, a.LostFrom, a.Materialised = h.read.state, h.read.node, h.read.lostFrom, h.read.materialised
 			a.StatusDescription = why + "; nothing was sent"
-			if cause != nil && cause.hook && h.kind == OpCreate && a.PinNode == "" {
+			if nodeUnfit(cause) && h.kind == OpCreate && a.PinNode == "" {
 				a.AvoidNodes = appendUnique(a.AvoidNodes, h.target)
 				a.StatusDescription += "; placed elsewhere on the next use"
 			}
@@ -239,6 +240,14 @@ func (r *runner) rollbackOnce(ctx context.Context, h *OpHandle, cause *prepareEr
 	}
 	e.record(events...)
 	return result, afterCommit{}, nil
+}
+
+// nodeUnfit reports whether a rollback's cause says that the node itself
+// cannot take the pod: a prepare hook's error that wraps ErrNodeUnfit and
+// not model.ErrNodeUnavailable. Any other cause may pass, as a create's
+// error that is not a placementFailure may.
+func nodeUnfit(cause *prepareError) bool {
+	return cause != nil && cause.hook && errors.Is(cause, ErrNodeUnfit) && !errors.Is(cause, model.ErrNodeUnavailable)
 }
 
 // clearOp clears the op columns of a row.

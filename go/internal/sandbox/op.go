@@ -522,19 +522,22 @@ type callResult struct {
 
 // execute runs the op's node calls and waits for the pod to settle. sent
 // is false when nothing was sent: no connection to the target could be
-// had, or what comes before the pod call failed (prepare: a
-// *prepareError).
+// had, or what comes before the pod call failed (prepareSpec before the
+// connection, prepareNode after it: a *prepareError).
 func (e *Engine) execute(ctx context.Context, h *OpHandle) (callResult, observation, bool) {
 	if e.connHook != nil {
 		if err := e.connHook(h); err != nil {
 			return callResult{err: err}, observation{}, false
 		}
 	}
-	if err := e.prepare(ctx, h); err != nil {
+	if err := e.prepareSpec(ctx, h); err != nil {
 		return callResult{err: err}, observation{}, false
 	}
 	pc, err := e.podClient(ctx, h.target)
 	if err != nil {
+		return callResult{err: err}, observation{}, false
+	}
+	if err := e.prepareNode(ctx, h); err != nil {
 		return callResult{err: err}, observation{}, false
 	}
 	res := e.callOp(ctx, pc, h)
