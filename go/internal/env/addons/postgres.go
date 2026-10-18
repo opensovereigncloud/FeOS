@@ -297,7 +297,7 @@ func (p postgres) Provision(a Addon, _ Context) []Step {
 
 // postgresScript is the provisioning's shell command: databases in
 // their order (d<i>), then roles (r<j>), each granted on every database
-// and given a schema in each.
+// and given a schema in each (postgresSchemaOwnerCheck first).
 func postgresScript(dbs, roles []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "exec psql -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -p %d -U %s -d %s", postgresPort,
@@ -332,10 +332,29 @@ func postgresScript(dbs, roles []string) string {
 		for i := range dbs {
 			fmt.Fprintf(&b, "\\connect :\"d%d\"\n", i)
 			for j := range roles {
+				fmt.Fprintf(&b, "%s\n", postgresSchemaOwnerCheck(j))
 				fmt.Fprintf(&b, "CREATE SCHEMA IF NOT EXISTS :\"r%d\" AUTHORIZATION :\"r%d\";\n", j, j)
 			}
 		}
 	}
 	b.WriteString("SQL\n")
 	return b.String()
+}
+
+// postgresSchemaOwnerCheck is the psql line before role r<j>'s CREATE
+// SCHEMA IF NOT EXISTS in a database: it fails the step (a DO block that
+// raises, run by \gexec; ON_ERROR_STOP makes psql exit non-zero) when a
+// schema of the role's name exists there and another role owns it. Every
+// role may create schemas in every listed database, so a role added later
+// can find its schema made by another one, which would own what the new
+// role's unqualified names resolve to; IF NOT EXISTS would adopt it
+// silently, and handing it over (ALTER SCHEMA OWNER) would keep the
+// objects and grants the other role put in it. The message names the
+// schema, the database and the owner, and quotes them (%I, %L) as
+// PostgreSQL would.
+func postgresSchemaOwnerCheck(j int) string {
+	return fmt.Sprintf("SELECT format('DO %%L', format('BEGIN RAISE EXCEPTION USING MESSAGE = %%L; END', "+
+		"format('schema %%I in database %%I belongs to role %%I, not to role %%I', nspname, current_database(), "+
+		"pg_get_userbyid(nspowner), nspname))) FROM pg_namespace WHERE nspname = :'r%d' "+
+		"AND nspowner <> (SELECT oid FROM pg_roles WHERE rolname = :'r%d') \\gexec", j, j)
 }
