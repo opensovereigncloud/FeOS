@@ -50,7 +50,8 @@ const (
 )
 
 // Loops returns the engine's leader loops (§9 "Policies"): the down sweep
-// (5 s), lost grace (30 s), idle pause (1 s, when --idle-pause is set),
+// (5 s), lost grace (30 s), idle pause (1 s; a row's idle_after_s beside
+// --idle-pause, so also when that is 0),
 // hibernate-after (5 s, when set), drain (5 s), tombstones (10 s), stale
 // ops (10 s), the unknown sweep (15 s), repair (30 s), the pending
 // re-description (30 s), process holds (60 s), expired holds (60 s) and
@@ -61,9 +62,7 @@ func (e *Engine) Loops() []leader.Loop {
 	loops := []leader.Loop{
 		{Name: LoopDownSweep, Interval: 5 * time.Second, Run: e.downSweep},
 		{Name: LoopLostGrace, Interval: 30 * time.Second, Run: e.lostGrace},
-	}
-	if e.cfg.IdlePause > 0 {
-		loops = append(loops, leader.Loop{Name: LoopIdlePause, Interval: time.Second, Run: e.idlePause})
+		{Name: LoopIdlePause, Interval: time.Second, Run: e.idlePause},
 	}
 	if e.cfg.HibernateAfter > 0 {
 		loops = append(loops, leader.Loop{Name: LoopHibernateAfter, Interval: 5 * time.Second, Run: e.hibernateAfter})
@@ -204,8 +203,9 @@ func quiet(err error) bool {
 }
 
 // idlePause pauses running sandboxes without a live hold whose last
-// activity is older than --idle-pause (trigger idle: the begin rechecks
-// both with fresh statements).
+// activity is older than their idle interval, the row's idle_after_s or
+// else --idle-pause, 0 for never (trigger idle: the begin rechecks both
+// with fresh statements).
 func (e *Engine) idlePause(ctx context.Context) error {
 	rows, err := e.st.IdleSandboxes(ctx, e.cfg.IdlePause, e.conns.Nodes(), loopBatch)
 	if err != nil {

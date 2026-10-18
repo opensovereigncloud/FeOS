@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
 )
 
@@ -68,6 +70,31 @@ type Sandbox struct {
 	PolicyFailed    string
 	PolicyFailures  int
 	PolicyNotBefore time.Time
+
+	// The columns of an environment's instance (ADR 0018). EnvironmentID
+	// (uuid.Nil: NULL, an ordinary sandbox) and PodTemplate (nil: NULL,
+	// the sandbox's own pod) are fixed at the insert; an attachable
+	// sandbox has a template without an environment.
+	EnvironmentID uuid.UUID
+	PodTemplate   *model.PodTemplate
+	// PinNode is the only node a create or start may go to ("": any).
+	PinNode string
+	// IdleAfterS is the idle pause's interval in seconds: nil (NULL) the
+	// instance's --idle-pause, 0 never.
+	IdleAfterS *int
+	// Address is the pod's IPv6 address as the engine last observed it;
+	// "" when there is none (no pod, or a hibernated one).
+	Address string
+}
+
+// IsInstance reports whether the row is an instance of an environment,
+// which the sandbox doors treat as absent.
+func (s *Sandbox) IsInstance() bool { return s.EnvironmentID != uuid.Nil }
+
+// HasGroups reports whether the row's pod has security groups of its own
+// (an instance's env group, an attachable sandbox's sbx group).
+func (s *Sandbox) HasGroups() bool {
+	return s.PodTemplate != nil && len(s.PodTemplate.SecurityGroups) > 0
 }
 
 // The policies that back off after a failed op (Sandbox.PolicyFailed).
@@ -88,7 +115,7 @@ func sandboxColumns(p string) string {
 		"checkpoint_epoch", "checkpoint_head", "checkpoint_memory", "checkpoint_at", "checkpoint_store",
 		"pending_since", "unreachable_since", "run_id", "kube_version", "ssh_version",
 		"created_at", "updated_at", "last_active_at", "paused_at", "policy_failed", "policy_failures",
-		"policy_not_before"}
+		"policy_not_before", "environment_id", "pod_template", "pin_node", "idle_after_s", "address"}
 	if p != "" {
 		for i, c := range cols {
 			cols[i] = p + "." + c
@@ -104,13 +131,15 @@ func scanSandbox(row pgx.Row) (Sandbox, error) {
 	var node, lostFrom *string
 	var opID *uuid.UUID
 	var opDeadline, cpAt, pendingSince, unreachableSince, pausedAt, policyNotBefore *time.Time
+	var envID *uuid.UUID
+	var template []byte
 	err := row.Scan(&s.ID, &s.Incarnation, &s.Owner, &s.Image, &s.ImageRef, &s.VCPUs, &s.MemoryMiB,
 		&s.ClientState, &s.StatusDescription, &node, &s.Materialised, &lostFrom, &s.AvoidNodes,
 		&s.Op, &opID, &s.OpOwner, &opDeadline, &s.OpTarget, &s.OpFromState, &s.Gen,
 		&s.CheckpointEpoch, &s.CheckpointHead, &s.CheckpointMemory, &cpAt, &s.CheckpointStore,
 		&pendingSince, &unreachableSince, &s.RunID, &s.KubeVersion, &s.SSHVersion,
 		&s.CreatedAt, &s.UpdatedAt, &s.LastActiveAt, &pausedAt, &s.PolicyFailed, &s.PolicyFailures,
-		&policyNotBefore)
+		&policyNotBefore, &envID, &template, &s.PinNode, &s.IdleAfterS, &s.Address)
 	if err != nil {
 		return Sandbox{}, err
 	}
@@ -118,7 +147,46 @@ func scanSandbox(row pgx.Row) (Sandbox, error) {
 	s.OpDeadline, s.CheckpointAt, s.PendingSince = timeOf(opDeadline), timeOf(cpAt), timeOf(pendingSince)
 	s.UnreachableSince, s.PausedAt, s.PolicyNotBefore = timeOf(unreachableSince), timeOf(pausedAt), timeOf(policyNotBefore)
 	s.AvoidNodes = nonNil(s.AvoidNodes)
+	s.EnvironmentID = uuidOf(envID)
+	if template != nil {
+		var t model.PodTemplate
+		if err := json.Unmarshal(template, &t); err != nil {
+			return Sandbox{}, fmt.Errorf("sandbox %s: pod_template: %w", s.ID, err)
+		}
+		s.PodTemplate = &t
+	}
 	return s, nil
+}
+
+// templateJSON is a pod template as pod_template stores it: nil for none
+// (NULL).
+func templateJSON(t *model.PodTemplate) (any, error) {
+	if t == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(t)
+	if err != nil {
+		return nil, fmt.Errorf("pod template: %w", err)
+	}
+	return string(b), nil
+}
+
+// sameTemplate reports whether two rows' templates are the same: both
+// none, or equal as JSON.
+func sameTemplate(a, b *model.PodTemplate) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ja, errA := templateJSON(a)
+	jb, errB := templateJSON(b)
+	return errA == nil && errB == nil && ja == jb
+}
+
+func sameIntPtr(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 func collectSandboxes(rows pgx.Rows, err error) ([]Sandbox, error) {
@@ -162,16 +230,35 @@ type NewSandbox struct {
 	Image     string
 	VCPUs     int
 	MemoryMiB int
+	// ImageRef is the image pinned to its digest, when the caller resolved
+	// it already (an environment's instances of one template share one);
+	// "": the first create resolves Image.
+	ImageRef string
+	// EnvironmentID makes the row an instance of the environment (the
+	// caller holds the tenant and the environment); uuid.Nil: none.
+	EnvironmentID uuid.UUID
+	// PodTemplate is what the pod is built from; nil: the sandbox's own
+	// pod.
+	PodTemplate *model.PodTemplate
+	PinNode     string
+	// IdleAfterS: nil the instance's --idle-pause, 0 never, n seconds.
+	IdleAfterS *int
 }
 
 // CreateSandbox inserts the sandbox unless its ID exists. It returns the
 // new row and true, or the existing row (of whatever owner) and false. An
 // insert sends ferun_sandbox.
 func (s *Store) CreateSandbox(ctx context.Context, n NewSandbox) (Sandbox, bool, error) {
+	template, err := templateJSON(n.PodTemplate)
+	if err != nil {
+		return Sandbox{}, false, fmt.Errorf("create sandbox %s: %w", n.ID, err)
+	}
 	for range 3 {
-		sb, err := scanSandbox(s.q.QueryRow(ctx, `INSERT INTO sandboxes (id, owner, image, vcpus, memory_mib)
-			VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING RETURNING `+sandboxCols,
-			n.ID, n.Owner, n.Image, n.VCPUs, n.MemoryMiB))
+		sb, err := scanSandbox(s.q.QueryRow(ctx, `INSERT INTO sandboxes (id, owner, image, vcpus, memory_mib, image_ref,
+				environment_id, pod_template, pin_node, idle_after_s)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10) ON CONFLICT (id) DO NOTHING RETURNING `+sandboxCols,
+			n.ID, n.Owner, n.Image, n.VCPUs, n.MemoryMiB, n.ImageRef, nullUUID(n.EnvironmentID), template, n.PinNode,
+			n.IdleAfterS))
 		if err == nil {
 			return sb, true, s.Notify(ctx, chanSandbox, sb.ID.String())
 		}
@@ -204,13 +291,15 @@ func (s *Store) DeleteSandbox(ctx context.Context, id uuid.UUID) (bool, error) {
 	return true, s.Notify(ctx, chanSandbox, id.String())
 }
 
-// ListSandboxes returns the sandboxes of owner, or every sandbox when owner
-// is "", ordered by created_at and id.
+// ListSandboxes returns the sandboxes of owner, without the instance rows
+// of its environments, or every row when owner is "", ordered by
+// created_at and id.
 func (s *Store) ListSandboxes(ctx context.Context, owner string) ([]Sandbox, error) {
 	if owner == "" {
 		return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+" FROM sandboxes ORDER BY created_at, id"))
 	}
-	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+" FROM sandboxes WHERE owner = $1 ORDER BY created_at, id", owner))
+	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+` FROM sandboxes
+		WHERE owner = $1 AND environment_id IS NULL ORDER BY created_at, id`, owner))
 }
 
 // LockSandboxesOfOwner locks up to limit sandboxes of owner, ordered by id:
@@ -377,8 +466,9 @@ func nullableColumn(name string, lifecycle bool, get func(*Sandbox) string) sand
 
 // sandboxWritable lists the columns UpdateSandbox writes. A lifecycle
 // write is one of client_state, node, op*, incarnation, materialised or
-// the checkpoint columns. id, owner, image, vcpus, memory_mib and
-// created_at are never written; gen and updated_at are UpdateSandbox's.
+// the checkpoint columns. id, owner, image, vcpus, memory_mib,
+// environment_id, pod_template and created_at are never written; gen and
+// updated_at are UpdateSandbox's.
 var sandboxWritable = []sandboxColumn{
 	plainColumn("incarnation", true, func(s *Sandbox) uuid.UUID { return s.Incarnation }),
 	plainColumn("image_ref", false, func(s *Sandbox) string { return s.ImageRef }),
@@ -411,6 +501,10 @@ var sandboxWritable = []sandboxColumn{
 	plainColumn("policy_failed", false, func(s *Sandbox) string { return s.PolicyFailed }),
 	plainColumn("policy_failures", false, func(s *Sandbox) int { return s.PolicyFailures }),
 	timeColumn("policy_not_before", false, func(s *Sandbox) time.Time { return s.PolicyNotBefore }),
+	plainColumn("pin_node", false, func(s *Sandbox) string { return s.PinNode }),
+	{name: "idle_after_s", equal: func(a, b *Sandbox) bool { return sameIntPtr(a.IdleAfterS, b.IdleAfterS) },
+		value: func(s *Sandbox) any { return s.IdleAfterS }},
+	plainColumn("address", false, func(s *Sandbox) string { return s.Address }),
 }
 
 // sandboxFixed lists the columns UpdateSandbox refuses to change.
@@ -422,6 +516,8 @@ var sandboxFixed = []sandboxColumn{
 	plainColumn("gen", false, func(s *Sandbox) int64 { return s.Gen }),
 	timeColumn("created_at", false, func(s *Sandbox) time.Time { return s.CreatedAt }),
 	timeColumn("updated_at", false, func(s *Sandbox) time.Time { return s.UpdatedAt }),
+	{name: "environment_id", equal: func(a, b *Sandbox) bool { return a.EnvironmentID == b.EnvironmentID }},
+	{name: "pod_template", equal: func(a, b *Sandbox) bool { return sameTemplate(a.PodTemplate, b.PodTemplate) }},
 }
 
 // UpdateSandbox writes the columns in which after differs from before, the
@@ -477,6 +573,41 @@ func (s *Store) UpdateSandbox(ctx context.Context, before, after Sandbox) (Sandb
 		}
 	}
 	return row, nil
+}
+
+// HintEnvGroups is the ferun_leader hint of a change of an environment's
+// security group members: the address of an instance row, or of a row
+// whose pod has groups of its own (an attachable sandbox), changed. It
+// wakes the environments' loop env-groups.
+const HintEnvGroups = "env-groups"
+
+// groupMember is the condition on a sandbox row s under which its address
+// is a member of a security group the environments keep: an instance row,
+// or a row whose template names groups.
+const groupMember = "(s.environment_id IS NOT NULL OR coalesce(jsonb_array_length(s.pod_template->'securityGroups'), 0) > 0)"
+
+// SetSandboxAddress writes the IPv6 address of the sandbox's pod as an
+// op's call answered it (CreatePod, RestorePod), when the row is still of
+// incarnation and has another: a write of its own that bumps no gen. It
+// sends ferun_leader HintEnvGroups when the row is a group member
+// (IsInstance, HasGroups). Inside a transaction, as the hint goes with
+// the write. It reports whether it wrote.
+func (s *Store) SetSandboxAddress(ctx context.Context, id, incarnation uuid.UUID, address string) (bool, error) {
+	var member bool
+	err := s.q.QueryRow(ctx, `UPDATE sandboxes s SET address = $3 WHERE s.id = $1 AND s.incarnation = $2 AND s.address <> $3
+		RETURNING `+groupMember, id, incarnation, address).Scan(&member)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if member {
+		if err := s.Notify(ctx, db.ChanLeader, HintEnvGroups); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 // TouchSandbox sets last_active_at = now(): activity, no lifecycle write.
@@ -592,7 +723,8 @@ type LostRow struct {
 // pending without a node ("; its pod was never seen there; created on the
 // next use"), as a sync makes of a pod that is not found; a pod the node
 // still has when it returns belongs to no row there, and reconcile
-// tombstones it. pending_since is cleared. Their bookings and process
+// tombstones it. pending_since and the address are cleared (ferun_leader
+// HintEnvGroups when a group member had one). Their bookings and process
 // holds are deleted (these states end the pod's use of the node and its
 // processes); no tombstone is written. Rows locked by others are skipped.
 // It returns the rows and notifies them.
@@ -603,13 +735,14 @@ func (s *Store) LostGrace(ctx context.Context, grace time.Duration, limit int) (
 				AND (n.status = 'removed' OR (n.status = 'down' AND n.down_since < now() - $1::interval))
 			ORDER BY s.id LIMIT $2 FOR UPDATE OF s SKIP LOCKED),
 		old AS (SELECT s.id, s.node, s.status_description,
-				s.checkpoint_head <> '' AS checkpoint, s.checkpoint_head <> '' OR s.materialised AS kept
+				s.checkpoint_head <> '' AS checkpoint, s.checkpoint_head <> '' OR s.materialised AS kept,
+				s.address <> '' AND `+groupMember+` AS member
 			FROM sandboxes s JOIN c ON c.id = s.id)
 		UPDATE sandboxes s SET
 			client_state = CASE WHEN old.checkpoint THEN 'hibernated' WHEN old.kept THEN 'lost' ELSE 'pending' END,
 			node = CASE WHEN old.kept THEN s.node END,
 			lost_from = CASE WHEN old.kept THEN s.node END,
-			pending_since = NULL,
+			pending_since = NULL, address = '',
 			status_description = 'node ' || n.name || ' down since ' || `+nodeDownSince+`
 				|| CASE WHEN old.checkpoint THEN '; restored from the checkpoint of '
 					|| `+rfc3339("coalesce(s.checkpoint_at, now())")+` || ' on the next use'
@@ -617,17 +750,25 @@ func (s *Store) LostGrace(ctx context.Context, grace time.Duration, limit int) (
 				ELSE '; its pod was never seen there; created on the next use' END,
 			gen = s.gen + 1, updated_at = now()
 		FROM c, nodes n, old WHERE s.id = c.id AND old.id = s.id AND n.name = s.node
-		RETURNING s.id, s.owner, old.node, s.client_state, s.run_id, old.status_description`, interval(grace), limit)
+		RETURNING s.id, s.owner, old.node, s.client_state, s.run_id, old.status_description, old.member`, interval(grace), limit)
 	if err != nil {
 		return nil, err
 	}
+	members := false
 	lost, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (LostRow, error) {
 		var l LostRow
-		err := r.Scan(&l.ID, &l.Owner, &l.Node, &l.State, &l.RunID, &l.Previous)
+		var member bool
+		err := r.Scan(&l.ID, &l.Owner, &l.Node, &l.State, &l.RunID, &l.Previous, &member)
+		members = members || member
 		return l, err
 	})
 	if err != nil || len(lost) == 0 {
 		return lost, err
+	}
+	if members {
+		if err := s.Notify(ctx, db.ChanLeader, HintEnvGroups); err != nil {
+			return nil, err
+		}
 	}
 	ids := make([]uuid.UUID, len(lost))
 	for i, l := range lost {
@@ -659,13 +800,25 @@ func policyDue(policy string) string {
 	return "(s.policy_failed <> '" + policy + "' OR s.policy_not_before IS NULL OR s.policy_not_before <= now())"
 }
 
+// idleAfter is the idle pause's interval of a sandbox row s as SQL, with
+// $n the instance's --idle-pause (an interval): its idle_after_s, else
+// $n. idleOn is the condition under which s idles at all: not 0 (never).
+func idleAfter(n int) string {
+	return fmt.Sprintf("coalesce(make_interval(secs => s.idle_after_s), $%d::interval)", n)
+}
+
+func idleOn(n int) string {
+	return fmt.Sprintf("coalesce(s.idle_after_s > 0, $%d::interval > interval '0')", n)
+}
+
 // IdleSandboxes returns up to limit running sandboxes without an op on one
-// of nodes whose last_active_at is older than idle, that have no live
-// hold of any kind and that no failed idle pause backs off, the least
-// recently active first.
+// of nodes whose last_active_at is older than their idle interval (their
+// idle_after_s, or idle for a row without one; 0 never idles), that have
+// no live hold of any kind and that no failed idle pause backs off, the
+// least recently active first.
 func (s *Store) IdleSandboxes(ctx context.Context, idle time.Duration, nodes []string, limit int) ([]Sandbox, error) {
 	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
-		WHERE s.client_state = 'running' AND s.op = '' AND s.last_active_at < now() - $1::interval
+		WHERE s.client_state = 'running' AND s.op = '' AND `+idleOn(1)+` AND s.last_active_at < now() - `+idleAfter(1)+`
 			AND s.node = ANY($2) AND `+policyDue(PolicyIdle)+`
 			AND NOT EXISTS (SELECT 1 FROM sandbox_holds h WHERE h.sandbox_id = s.id AND h.lease_until > now())
 		ORDER BY s.last_active_at LIMIT $3`, interval(idle), nonNil(nodes), limit))

@@ -42,20 +42,21 @@ func tenantOf(r *http.Request) string {
 }
 
 // errUnknownSandbox is the answer to a sandbox the tenant does not own,
-// the same whether it is foreign or absent.
+// the same whether it is foreign, absent or an environment's instance
+// (ADR 0018: the environments' API shows those).
 func errUnknownSandbox(id string) error {
 	return apierr.New(http.StatusNotFound, "unknown sandbox %s", id)
 }
 
 // owned reads the sandbox of the path's {id} that the request's tenant
-// owns.
+// owns; an environment's instance row is none.
 func (s *server) owned(r *http.Request) (store.Sandbox, error) {
 	id, err := pathSandboxID(r)
 	if err != nil {
 		return store.Sandbox{}, err
 	}
 	sb, err := s.st.GetSandbox(r.Context(), id)
-	if errors.Is(err, model.ErrNotFound) || (err == nil && sb.Owner != tenantOf(r)) {
+	if errors.Is(err, model.ErrNotFound) || (err == nil && (sb.Owner != tenantOf(r) || sb.IsInstance())) {
 		return store.Sandbox{}, errUnknownSandbox(id.String())
 	}
 	if err != nil {
@@ -73,10 +74,34 @@ type createSandboxRequest struct {
 	// The size, fixed for the sandbox's life; 0: the default.
 	Vcpus     int `json:"vcpus"`
 	MemoryMib int `json:"memoryMib"`
+	// Attachable gives the sandbox's pod a security group of its own,
+	// sbx-<id>, which an environment's attached services in it reach the
+	// environment's addons through (ADR 0018). Fixed for its life.
+	Attachable bool `json:"attachable"`
+}
+
+// sandboxView is a sandbox as the sandbox routes show it: its status and
+// whether it is attachable.
+type sandboxView struct {
+	sandboxStatus
+	Attachable bool `json:"attachable"`
+}
+
+// viewOf renders a row for the sandbox routes.
+func viewOf(sb store.Sandbox) sandboxView {
+	return sandboxView{sandboxStatus: statusOf(sb), Attachable: sb.PodTemplate != nil && !sb.IsInstance()}
+}
+
+// attachableTemplate is the pod template of an attachable sandbox (ADR
+// 0018 §2.3): the command of every sandbox's pod, no env, the default
+// labels, and the sandbox's own security group, which the environments
+// it serves let reach their addons.
+func attachableTemplate(id uuid.UUID) *model.PodTemplate {
+	return &model.PodTemplate{Command: []string{"sleep", "infinity"}, SecurityGroups: []string{model.SandboxGroupID(id)}}
 }
 
 type createSandboxResponse struct {
-	Status sandboxStatus `json:"status"`
+	Status sandboxView `json:"status"`
 	// Token is the first token, only when this call created the sandbox.
 	Token   string `json:"token,omitempty"`
 	Created bool   `json:"created"`
@@ -106,7 +131,8 @@ func (s *server) size(req createSandboxRequest) (vcpus, memoryMiB int, err error
 // (refused while it is being deleted), the row unless the ID exists, and
 // the first token. Nothing reaches a node: the sandbox materialises at its
 // first tool call. A repeat for an existing sandbox of the caller is a 200
-// without a token; an ID of another tenant's sandbox is a 409.
+// without a token (an attachable one stays as it was created); an ID of
+// another tenant's sandbox, or of an environment's instance, is a 409.
 func (s *server) createSandbox(w http.ResponseWriter, r *http.Request) error {
 	var req createSandboxRequest
 	if _, err := decodeJSON(r, &req); err != nil {
@@ -144,14 +170,16 @@ func (s *server) createSandbox(w http.ResponseWriter, r *http.Request) error {
 		if t.Deleting() {
 			return apierr.New(http.StatusConflict, "tenant %s is being deleted", tenant)
 		}
-		row, created, err = tx.CreateSandbox(r.Context(), store.NewSandbox{
-			ID: id, Owner: tenant, Image: image, VCPUs: vcpus, MemoryMiB: memoryMiB,
-		})
+		n := store.NewSandbox{ID: id, Owner: tenant, Image: image, VCPUs: vcpus, MemoryMiB: memoryMiB}
+		if req.Attachable {
+			n.PodTemplate = attachableTemplate(id)
+		}
+		row, created, err = tx.CreateSandbox(r.Context(), n)
 		if err != nil {
 			return err
 		}
 		if !created {
-			if row.Owner != tenant {
+			if row.Owner != tenant || row.IsInstance() {
 				return apierr.New(http.StatusConflict, "sandbox id %s already exists", id)
 			}
 			return nil
@@ -163,22 +191,23 @@ func (s *server) createSandbox(w http.ResponseWriter, r *http.Request) error {
 		return passOr(err, "create "+id.String())
 	}
 	if !created {
-		return writeJSON(w, http.StatusOK, createSandboxResponse{Status: statusOf(row)})
+		return writeJSON(w, http.StatusOK, createSandboxResponse{Status: viewOf(row)})
 	}
-	return writeJSON(w, http.StatusCreated, createSandboxResponse{Status: statusOf(row), Token: token, Created: true})
+	return writeJSON(w, http.StatusCreated, createSandboxResponse{Status: viewOf(row), Token: token, Created: true})
 }
 
-// listSandboxes is GET /api/v1/sandboxes: the tenant's, oldest first.
+// listSandboxes is GET /api/v1/sandboxes: the tenant's, oldest first,
+// without its environments' instances.
 func (s *server) listSandboxes(w http.ResponseWriter, r *http.Request) error {
 	rows, err := s.st.ListSandboxes(r.Context(), tenantOf(r))
 	if err != nil {
 		return fmt.Errorf("list: %w", err)
 	}
 	out := struct {
-		Sandboxes []sandboxStatus `json:"sandboxes"`
-	}{Sandboxes: make([]sandboxStatus, 0, len(rows))}
+		Sandboxes []sandboxView `json:"sandboxes"`
+	}{Sandboxes: make([]sandboxView, 0, len(rows))}
 	for _, sb := range rows {
-		out.Sandboxes = append(out.Sandboxes, statusOf(sb))
+		out.Sandboxes = append(out.Sandboxes, viewOf(sb))
 	}
 	return writeJSON(w, http.StatusOK, out)
 }
@@ -189,18 +218,20 @@ func (s *server) getSandbox(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	return writeJSON(w, http.StatusOK, statusOf(sb))
+	return writeJSON(w, http.StatusOK, viewOf(sb))
 }
 
 // deleteSandbox is DELETE /api/v1/sandboxes/{id}: the row goes in one
 // transaction (§9 "Delete"), its pod through tombstones. The answer is the
 // status read, desired state deleted, and client state absent when a pod
-// is being deleted.
+// is being deleted. An environment's instance is not deleted here: its
+// ID is fixed to it for its row's life, so the read before is enough.
 func (s *server) deleteSandbox(w http.ResponseWriter, r *http.Request) error {
-	id, err := pathSandboxID(r)
+	sb, err := s.owned(r)
 	if err != nil {
 		return err
 	}
+	id := sb.ID
 	row, tombstoned, err := s.deps.Engine.Delete(r.Context(), tenantOf(r), id)
 	if errors.Is(err, model.ErrNotFound) {
 		return errUnknownSandbox(id.String())
@@ -208,7 +239,7 @@ func (s *server) deleteSandbox(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return internalf("delete: %v", err)
 	}
-	st := statusOf(row)
+	st := viewOf(row)
 	st.DesiredState = desiredDeleted
 	if tombstoned {
 		st.ClientState, st.State = stateAbsent, stateAbsent
@@ -234,7 +265,7 @@ func (s *server) pauseSandbox(w http.ResponseWriter, r *http.Request) error {
 	default:
 		return internalf("pause: %v", err)
 	}
-	return writeJSON(w, http.StatusOK, statusOf(sb))
+	return writeJSON(w, http.StatusOK, viewOf(sb))
 }
 
 // resumeSandbox is POST /api/v1/sandboxes/{id}/resume: Ensure (within the
@@ -253,7 +284,7 @@ func (s *server) resumeSandbox(w http.ResponseWriter, r *http.Request) error {
 	default:
 		return internalf("resume: %v", err)
 	}
-	return writeJSON(w, http.StatusOK, statusOf(sb))
+	return writeJSON(w, http.StatusOK, viewOf(sb))
 }
 
 // tokenInfo is a sandbox token as listed: its hash, never the token.
@@ -297,7 +328,8 @@ type mintedToken struct {
 
 // createSandboxToken is POST /api/v1/sandboxes/{id}/tokens {label?}, in
 // one transaction with the row FOR SHARE, so that a delete cannot slip in
-// between the ownership check and the insert.
+// between the ownership check and the insert. An environment's instance
+// gets no token.
 func (s *server) createSandboxToken(w http.ResponseWriter, r *http.Request) error {
 	id, err := pathSandboxID(r)
 	if err != nil {
@@ -316,7 +348,7 @@ func (s *server) createSandboxToken(w http.ResponseWriter, r *http.Request) erro
 	var tok store.SandboxToken
 	err = s.st.InTx(r.Context(), func(tx *store.Store) error {
 		sb, err := tx.LockSandbox(r.Context(), id, store.ForShare)
-		if errors.Is(err, model.ErrNotFound) || (err == nil && sb.Owner != tenantOf(r)) {
+		if errors.Is(err, model.ErrNotFound) || (err == nil && (sb.Owner != tenantOf(r) || sb.IsInstance())) {
 			return errUnknownSandbox(id.String())
 		}
 		if err != nil {

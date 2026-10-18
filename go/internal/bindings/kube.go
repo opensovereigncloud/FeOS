@@ -355,7 +355,7 @@ func (s *Service) sealKube(id uuid.UUID, b kubeBinding) (store.KubeBinding, erro
 	if err != nil {
 		return store.KubeBinding{}, err
 	}
-	sealed, err := sealBlob(s.aead, pt, sealAAD(tableKube, id, b.Name, b.Auth.Type))
+	sealed, err := s.sealer.Seal(pt, sealAAD(tableKube, id, b.Name, b.Auth.Type))
 	if err != nil {
 		return store.KubeBinding{}, fmt.Errorf("seal binding %s: %w", b.Name, err)
 	}
@@ -364,7 +364,7 @@ func (s *Service) sealKube(id uuid.UUID, b kubeBinding) (store.KubeBinding, erro
 }
 
 func (s *Service) openKubeRow(id uuid.UUID, r store.KubeBinding) (kubeBinding, error) {
-	pt, err := openBlob(s.aead, r.Sealed, sealAAD(tableKube, id, r.Name, r.AuthType))
+	pt, err := s.sealer.Open(r.Sealed, sealAAD(tableKube, id, r.Name, r.AuthType))
 	if err != nil {
 		return kubeBinding{}, err
 	}

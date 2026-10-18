@@ -312,6 +312,16 @@ func (h *harness) pods(node string) podv1.PodServiceClient {
 	return podv1.NewPodServiceClient(cc)
 }
 
+// podSpec is the spec the engine builds for a row without a secret
+// resolver (an ordinary sandbox's, or a template's without secrets).
+func podSpec(sb store.Sandbox) *podv1.PodSpec {
+	spec, err := buildPodSpec(bg, sb, nil)
+	if err != nil {
+		panic(err)
+	}
+	return spec
+}
+
 // testImage is a pinned image: no registry is asked.
 const testImage = "docker.io/library/alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1"
 

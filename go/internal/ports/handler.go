@@ -69,6 +69,8 @@ type timings struct {
 	upgradedWait time.Duration
 	// rowTimeout bounds Run's read of a sandbox's row.
 	rowTimeout time.Duration
+	// probeTimeout bounds a Probe and a DialPod.
+	probeTimeout time.Duration
 }
 
 func defaultTimings() timings {
@@ -85,6 +87,7 @@ func defaultTimings() timings {
 		wakeTimeout:  8 * time.Minute,
 		upgradedWait: 10 * time.Second,
 		rowTimeout:   10 * time.Second,
+		probeTimeout: 2 * time.Second,
 	}
 }
 
@@ -269,21 +272,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply{http.StatusNotFound, textNoSandbox, 0}.write(w)
 		return
 	}
-	if h.kp != nil {
-		kube, err := h.kp.KubePorts(r.Context(), sb.ID)
-		if err != nil {
-			h.rl.warn("lookup", "forward: binding lookup failed", "sandbox", sb.ID, "err", err)
-			reply{http.StatusInternalServerError, "binding lookup failed", 0}.write(w)
-			return
-		}
-		// A Kubernetes listener injects the binding's credential for
-		// whoever reaches it; the guest refuses it too.
-		if slices.Contains(kube, tg.port) {
-			reply{http.StatusForbidden, kubeText(tg.port), 0}.write(w)
-			return
-		}
+	if rp := h.kubeRefusal(r.Context(), sb.ID, tg.port); rp != nil {
+		rp.write(w)
+		return
 	}
 	h.forward(w, r, sb.ID, tg)
+}
+
+// kubeRefusal is the answer to a forward to a port of the sandbox's
+// Kubernetes bindings, or to a failed lookup of them; nil when the port
+// may be forwarded. A Kubernetes listener injects the binding's credential
+// for whoever reaches it; the guest refuses it too.
+func (h *Handler) kubeRefusal(ctx context.Context, id uuid.UUID, port int) *reply {
+	if h.kp == nil {
+		return nil
+	}
+	kube, err := h.kp.KubePorts(ctx, id)
+	if err != nil {
+		h.rl.warn("lookup", "forward: binding lookup failed", "sandbox", id, "err", err)
+		return &reply{http.StatusInternalServerError, "binding lookup failed", 0}
+	}
+	if slices.Contains(kube, port) {
+		return &reply{http.StatusForbidden, kubeText(port), 0}
+	}
+	return nil
 }
 
 // notSandboxToken answers a bearer that is no sandbox's token. A tenant's
