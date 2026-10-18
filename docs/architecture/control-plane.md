@@ -8,8 +8,9 @@ replication, and how nodes connect),
 [ADR 0014](../adr/0014-identity-and-credentials.md) (identity and
 credentials), [ADR 0013](../adr/0013-traffic-records.md) (traffic records),
 [ADR 0017](../adr/0017-pod-mesh.md) (the pods' mesh),
-[ADR 0009](../adr/0009-node-os-and-packages.md) (packages). The node's side
-of the wire is in [node.md](node.md#the-control-plane).
+[ADR 0018](../adr/0018-environments-and-releases.md) (environments and
+releases), [ADR 0009](../adr/0009-node-os-and-packages.md) (packages). The
+node's side of the wire is in [node.md](node.md#the-control-plane).
 
 ferund is the successor of the sandbox system's control plane. Its REST
 API, MCP and port front door keep that system's paths, bodies, status codes
@@ -62,7 +63,7 @@ that.
 | `--trust-domain` | `feos.local` | the SPIFFE trust domain |
 | `--ca-dir` | `/etc/ferun/ca` | the issuer: `issuer.crt`, `issuer.key`, `issuer.json`, `bundle.crt`; never `root.key` |
 | `--node-server-names` | the control-plane domain | the DNS names of the instance's certificate on the nodes' port, each under the control-plane domain |
-| `--secret-key-file` | none | 32 bytes (raw, hex or base64) that seal the bindings at rest |
+| `--secret-key-file` | none | 32 bytes (raw, hex or base64) that seal the bindings and the environments' secrets at rest |
 | `--bindings` | off | serve the Kubernetes and SSH bindings; only with `--secret-key-file` |
 | `--deny-prefix` | a built-in set | a destination that preflights, bindings and the image resolver may not reach, repeatable |
 | `--admin-users` | none | `user:password,...` for the admin API: Basic, beside or instead of OIDC |
@@ -129,6 +130,8 @@ of `proto/` is in `go/gen/feos/<api>/v1` (`make go-gen`), the rest in
 | `ports` | the port door |
 | `watch` | file watches across instances |
 | `bindings` | Kubernetes and SSH bindings |
+| `seal` | AES-256-GCM sealing under `--secret-key-file`'s key: the bindings' credentials, the environments' secrets |
+| `env`, `env/spec`, `env/addons`, `env/ctl`, `env/envdeps` | the environments ([Environments](#environments)) |
 | `api`, `auth`, `apierr` | the REST router, its auth classes and errors, human sign-in |
 | `ui` | the embedded build of `web/` |
 | `server` | one instance, built from its configuration, and its stop |
@@ -161,7 +164,9 @@ replicate synchronously ([Operations](#operations)).
   `0003_policy_backoff_and_placements.sql`, the policies' backoff
   ([Policies](#policies)) and an empty `placements`;
   `0004_traffic_node_foreign.sql`, the partial index of a node's foreign
-  traffic records ([Nodes](#nodes)); `0005_mesh.sql`, the pods' mesh) and
+  traffic records ([Nodes](#nodes)); `0005_mesh.sql`, the pods' mesh;
+  `0006_environments.sql`, the environments' tables and five columns of
+  `sandboxes` ([Environments](#environments))) and
   applied under an advisory lock, recorded in `schema_migrations`. The
   same locked section creates the cluster's MCP session key, reconciles
   `--pod-network` with the database's ([The pods'
@@ -180,7 +185,7 @@ replicate synchronously ([Operations](#operations)).
 | `ferun_sandbox` | a sandbox ID, or `*` for more than 256 | a sandbox's state, op, node, incarnation or checkpoint changed, or it was created or deleted |
 | `ferun_node` | a node name | its certificates were revoked or superseded, it was removed, its identity forked, its restart was announced, its draining changed |
 | `ferun_reconcile` | a node name | an instance not connected to the node asks one that is to reconcile it |
-| `ferun_leader` | a hint | the leader's loops have work |
+| `ferun_leader` | a hint | the leader's loops have work: the hint wakes those whose name contains it (`mesh-peers`, `env-reconcile`, `env-groups`, `env-delete`), every loop when none does or the hint is empty or `*` |
 | `ferun_watch` | a watch ID | a watch's paths, owner or result changed |
 | `ferun_cancel` | JSON | an exec or an MCP call is to be cancelled on whichever instance runs it |
 
@@ -192,8 +197,12 @@ updates a second at 512 nodes, never locked by placement), `node_certs`
 row while the cluster is meshed); `sandboxes`, `sandbox_tokens`, `sandbox_holds`,
 `pod_tombstones`, `bookings`; `activity` and `traffic_records`,
 partitioned by day; `issued_certs` (pods' certificates); `watches`;
-`kube_bindings`, `ssh_bindings`; `auth_logins`, `ui_sessions`. Tokens are
-stored as SHA-256 hashes only, and shown once, at their creation.
+`kube_bindings`, `ssh_bindings`; `auth_logins`, `ui_sessions`;
+`environments`, `env_releases`, `env_tags`, `env_secrets`,
+`env_instances`, `env_job_runs`, `env_attached`, `env_volumes`,
+`env_incidents`, `env_route_tokens` ([Environments](#environments)).
+Tokens are stored as SHA-256 hashes only, and shown once, at their
+creation.
 `placements`, which held the placement decisions, is written and read by
 nothing since `0003` emptied it, and goes in a later migration: the
 previous version, which a rolling deploy runs beside this one, still
@@ -234,7 +243,7 @@ audit is its activity row.
 | mesh peers | 15 s | sends every node on the pods' mesh that the leader is connected to its peers ([The pods' mesh](#the-pods-mesh)) |
 | down sweep | 5 s | sandboxes of down and removed nodes become `unknown` |
 | lost grace | 30 s | `unknown` sandboxes of nodes down past `--lost-grace` become `hibernated`, `lost`, or `pending` when their pod was never seen |
-| idle pause | 1 s | pauses running sandboxes idle for `--idle-pause`, unless a failed pause backs off |
+| idle pause | 1 s | pauses running sandboxes idle for `--idle-pause` (a row's own `idle_after_s` when set; 0 never), unless a failed pause backs off |
 | hibernate-after | 5 s | hibernates sandboxes paused for `--hibernate-after`, unless a failed hibernation backs off |
 | drain | 5 s | moves sandboxes off draining nodes |
 | tombstones | 10 s | deletes pods that belong to no sandbox |
@@ -248,6 +257,7 @@ audit is its activity row.
 | stale instances | 60 s | deletes instance rows older than an hour |
 | activity partitions | 1 h | keeps partitions for today and the next two days; drops those past retention |
 | sign-in clean-up | 10 min | deletes stale sign-ins and expired UI sessions |
+| `env-reconcile`, `env-probe`, `env-groups`, `env-volumes`, `env-delete` | 2 s, 1 s, 10 s, 30 s, 5 s | the environments' controller ([Environments](#the-controller)) |
 
 ### Stopping
 
@@ -569,7 +579,9 @@ retry: feosd compares specs, labels included, so a create against a
 leftover pod of an earlier incarnation fails instead of returning it. A
 pod is **ours** when its incarnation label is the row's; ferund never
 touches a pod without `ferun.sandbox`, and never adopts the state of a pod
-that is not ours.
+that is not ours. A row with a pod template, an environment's instance or
+an attachable sandbox, builds its pod from the template instead
+([Environments](#instances-are-sandbox-rows)).
 
 ### States
 
@@ -611,7 +623,7 @@ finished in another transaction that applies what the node did.
 | restore | hibernated | creating | RestorePod of the checkpoint | 7 min 5 s + 8 s/GiB |
 | pause | running | pausing | SuspendPod | 2 min + 4 s/GiB |
 | hibernate | paused; stopped, failed and running when draining | hibernating | HibernatePod | `--hibernate-timeout` + 16 s/GiB |
-| repair | creating without an op, running with an unreachable guest | creating | StopPod and StartPod; for a pod stuck in its restore, DeletePod and RestorePod | 7 min 5 s + 8 s/GiB |
+| repair | creating without an op, running with an unreachable guest; running, for an instance whose container exited (`Restart`, [Environments](#probes-exits-and-restarts)) | creating | StopPod and StartPod; for a pod stuck in its restore, DeletePod and RestorePod, never for a pod with volumes | 7 min 5 s + 8 s/GiB |
 
 GiB is the sandbox's memory, rounded up. A hibernation uploads the pod's
 disk and memory to the object store and takes minutes per GiB, hence its
@@ -759,14 +771,17 @@ the sandbox until the process is stopped or found ended.
 
 Gates, in order, each with the reason that the description and the
 placement audit (the placement's activity row, with every node's
-verdict) show: the node is `ready`; not draining; not forked;
-connected to this instance; no tombstone of this pod ID on it; not
-avoided after a failed create; no other sandbox on it whose ID starts with
-the same 8 hex digits and may hold a TAP device (feosd derives the TAP
-name from them); for a restore, the checkpoint's object store; slots;
-CPU, `floor(cores × cpu_overcommit)`, not gated when 0; memory, the total
-less the headroom; free memory, the reported available less the headroom;
-disk, the available against `--disk-budget`. Among the nodes that pass,
+verdict) show: the node is `ready`; for a create or a start of a row
+pinned to a node (`pin_node`, [Environments](#instances-are-sandbox-rows)),
+that node ("pinned to node <n>: its volume is there"); not draining; not
+forked; connected to this instance; no tombstone of this pod ID on it; not
+avoided after a failed create (a pinned row never is); no other sandbox
+on it whose ID starts with the same 8 hex digits and may hold a TAP
+device (feosd derives the TAP name from them); for a restore, the
+checkpoint's object store; slots; CPU, `floor(cores × cpu_overcommit)`,
+not gated when 0; memory, the total less the headroom; free memory, the
+reported available less the headroom; disk, the available against
+`--disk-budget`. Among the nodes that pass,
 `binpack` takes the one whose scarcest resource has the least free share,
 `spread` the most, ties by name; a hibernated sandbox prefers the node
 that holds its record. The op's begin rechecks the gates under the
@@ -877,10 +892,11 @@ The routes, bodies, status codes and texts are the sandbox system's;
 | Class | Routes | Credential |
 |---|---|---|
 | admin | `/api/v1/admin/…` | an admin's UI session (cookie), or Basic with `--admin-users` |
-| tenant | `/api/v1/sandboxes`, `/api/v1/sandboxes/{id}` (create, list, get, delete, pause, resume, tokens, access), `/api/v1/tools` | a tenant's token |
+| tenant | `/api/v1/sandboxes`, `/api/v1/sandboxes/{id}` (create, list, get, delete, pause, resume, tokens, access), `/api/v1/tools`, `/api/v1/environments[/…]` but the route door | a tenant's token |
 | sandbox | `/api/v1/sandboxes/{id}/…`: exec, files, dirs, search, fetch, processes, watches, bindings | the sandbox's own token |
 | mcp | `/mcp` | the sandbox's token, with the door's own answers |
 | forward | `/fwd/…`, `/api/v1/sandboxes/{id}/ports/…` | the sandbox's token in `Authorization` alone ([ports](#ports)) |
+| route | `/api/v1/environments/{env}/http/…` | a route token of the environment ([the route door](#the-route-door)) |
 | public | `/healthz`, `/readyz`, `/auth/…`, the UI | none |
 
 A tenant's token is not accepted on a sandbox route, not even for its own
@@ -1013,7 +1029,10 @@ pod …" that the guest does not answer (503), anything else that the node
 connection failed (503). A refused Kubernetes listener is 403, a pod that
 does not run yet 503 with a retry. A feosd that does not forward this
 service for pods answers `UNIMPLEMENTED`, and the door 502 "node <n> does
-not forward ports yet" ([follow-ups](#follow-ups-for-feosd)).
+not forward ports yet" ([follow-ups](#follow-ups-for-feosd)). The
+environments use the door too: their readiness checks with probe slots of
+their own beside the 32, and their route door through its forward
+([Environments](#probes-exits-and-restarts)).
 
 ### Watches
 
@@ -1064,6 +1083,582 @@ live, stopping while it stops but still writes its row (it serves on),
 or gone once its row is older than 15 s; the API's `live` and `fresh`
 say which, on the database clock.
 
+Behind the tenant gate, with a tenant's token that the UI minted and
+keeps in the browser, it shows the tenant's sandboxes and, read only, its
+environments (`/tenants/<t>/environments[/<env>[/<tab>]]`): the
+list, with label filters; an environment's overview (its rollout, its
+objects by kind with their instances, its routes, its open incidents);
+its releases with their tags, annotations, diff and spec; its incidents
+with their evidence; and an object's logs, where the 501 of a node that
+serves none and the 409 of a paused instance are messages, not errors.
+It polls (the list every 4 s, an environment every 3 s, the rest every
+5 s), writes nothing, and shows no secret value and no route token. The
+instance tables fit a 1280 px wide window. Its tests read the fixtures
+of ferund's API tests (`go/internal/api/testdata/ferun`).
+
+## Environments
+
+An environment ([ADR 0018](../adr/0018-environments-and-releases.md)) is
+a tenant's set of typed objects that run together: services, jobs,
+addons, routes and secrets, each with a DNS label for its name. It
+changes only by releases, numbered from 1 per environment and never
+changed: a release holds the whole desired state as a spec, the release
+it was made on, who made it, why, and annotations of the caller's. The
+controller brings each environment to its latest release and keeps it
+there. FeCode drives environments for its projects' applications
+(FeCode's ADR 0008); the management UI reads them.
+
+### The environments' packages
+
+| Package | What it is |
+|---|---|
+| `env` | the service: plan, apply, revert, object changes, clone, releases, tags, secrets, status, incidents, logs, the route door and its tokens; the wire bodies and error answers; `New`, `Run`, `Loops` |
+| `env/spec` | the release spec: types, strict parse, validation, normalisation, diff, merge patch, hashing |
+| `env/addons` | the addon blueprints and their registry |
+| `env/ctl` | the controller: its leader loops, the Ensure pool, probes and restarts, attached services, hosts blocks, security groups, the engine's prepare hook, secret resolution |
+| `env/envdeps` | the interfaces both reach the instance through (`Engine`, `Runner`, `Ports`, `Sealer`) and `SecretAAD` |
+
+`store/env_*.go` hold the queries, `api/environments.go` the routes.
+`server.New` builds the service after the streams, with the engine, the
+tools' runner and the port door (`Streams.Forwarder`), each picked up by
+its type, and the sealer when `--secret-key-file` is set, then sets the
+engine's secret resolver and prepare hook to the controller's. What is
+missing is named in one log line at the start, "environments run without
+some parts": without the runner, attached services and exec checks fail;
+without the port door, http and tcp checks and the route door; without
+the sealer, secrets and addons.
+
+### Instances are sandbox rows
+
+Every pod of an environment, a service's replica, an addon, a job's run,
+is a row of `sandboxes` with `environment_id` set: the engine places,
+creates, syncs, moves, pauses, hibernates and deletes it as any sandbox,
+with its ops, bookings, tombstones and holds. `0006` adds five columns:
+
+| Column | What it is |
+|---|---|
+| `environment_id` | the instance's environment; fixed |
+| `pod_template` | `model.PodTemplate`: the pod's command, env (literals, secrets by name and version, or parts of both with a URL's userinfo escaped), volumes, mounts, security groups and labels; fixed. NULL: the sandbox's own pod |
+| `pin_node` | a create or a start goes to this node alone, never a restore, whose checkpoint carries the volume; a pinned row avoids no node |
+| `idle_after_s` | NULL: `--idle-pause`; 0: never; n: seconds |
+| `address` | the pod's IPv6 address as last observed in CreatePod, RestorePod, GetPod and ListPods, cleared when the pod is gone or hibernated; a change on an instance row, or on a row whose pod has groups of its own, sends `env-groups` in its transaction |
+
+A row with a template builds its pod from it: the container `main` with
+the row's pinned image and the template's command (none: the image's
+entrypoint and command run), its env resolved by the engine's secret
+resolver (one that does not resolve fails the op before any pod call),
+its volumes, mounts and groups, and the sandbox's labels beside the
+template's `ferun.environment`, `ferun.object` (`<kind>/<name>`) and
+`ferun.template` (the template hash). There is no release label: an
+object a release does not change keeps its pods. Rows are inserted with
+`idle_after_s` always written, random IDs (UUIDv4: the placement's TAP
+gate compares the first 8 hex digits, which two UUIDv7s made within a
+minute share), and at least 256 MiB, the rows' floor, which valkey's and
+nats's `dev` plans are raised to.
+
+Instance rows are no tenant's sandboxes: the tenant's listing leaves
+them out, the tenant routes answer them 404 `unknown sandbox <id>`, the
+sandbox-token doors `no such sandbox`, a create with an instance's ID 409
+`sandbox id <id> already exists`, and no sandbox token is minted for one.
+A tenant with environments is not deleted: `DeleteTenantIfEmpty` waits
+for them, `env-delete` marks the environments of a deleting tenant
+deleting, and an environment's create, apply, clone and secret, and the
+controller's instance insert, take the tenant's row FOR SHARE and refuse
+a deleting one.
+
+| Table | Holds |
+|---|---|
+| `environments` | owner, name (a DNS label, never a UUID, unique per owner), labels, `release` (the latest desired), `realised`, `deleting`, `gen` (the env group's version) |
+| `env_releases` | per number: the normalised spec, `base`, author, message, annotations (a string map, at most 4 KiB), `origin` (`apply`, `revert`, `clone`, `object`) with `origin_ref` (the number reverted to, `<env id>/<number>` of a clone's source, `<kind>/<name>` of an object change), `state` (`pending`, `rolling`, `realised`, `failed`, `superseded`), `reason`, start and end |
+| `env_tags` | a tag's release, who moved it and when |
+| `env_secrets` | one version of a secret, sealed; `system` for an addon's credential, `addon.<addon>.<key>`, never listed; soft-deleted |
+| `env_instances` | the controller's view of an instance row: kind, object, replica, template hash, release, phase (`starting`, `ready`, `unready`, `exited`, `succeeded`, `failed`, `retiring`), restarts, the last 5 exits, probe failures, the next restart, the hash of the hosts block written, an addon's provisioning hash, detail |
+| `env_job_runs` | one attempt of a job: template hash, release, attempt, phase, exit code, detail, the last 50 lines of its log |
+| `env_attached` | an attached service: its sandbox and that sandbox's incarnation, template hash, process ID, phase, restarts, the hosts block written |
+| `env_volumes` | an addon's volume (`addon/<name>`): ID, size, node, `provisioned`, holder, `addon_type` (fixed) and `data_version`, `deleting` |
+| `env_incidents` | a condition of an object in a release: `rollout_failed`, `crash_loop`, `job_failed`, `no_capacity`, `addon_unhealthy` or `volume_unavailable` (`attach_failed` is reserved), opened, closed, summary, evidence; one open per object, release and condition |
+| `env_route_tokens` | the route door's tokens, as hashes |
+
+The database holds no secret value. A writer that wants the controller
+to act sends `env-reconcile` (or `env-groups`) on `ferun_leader` in its
+transaction.
+
+### The release spec
+
+JSON, its objects in maps keyed by name (`services`, `jobs`, `addons`,
+`routes`, `secrets`), parsed strictly: an unknown field, a wrong type, a
+duplicate key or trailing data is a finding at its path, and null is
+absent for lists, maps and objects. Every problem is a finding
+`{severity, path, problem, remedy}`; an error refuses the spec. Beyond the
+shapes:
+
+- **Services** run `image`, pods of their own: replicas 0 to 20 (1),
+  vCPUs 1 to 32 (1), memory 256 to 65536 MiB (512), readiness by http,
+  tcp or exec with an initial delay (0s), a period of at least 1 s (2s)
+  and a failure threshold (3), `idle` of at least 1m only on a route's
+  target ("nothing would wake it"), `rollout.timeout` (10m). Or they run
+  `attached`: a sandbox of the tenant, a command, an absolute `cwd`, and
+  none of image, replicas, resources, idle and rollout. Port names are
+  required DNS labels; two attached services in one sandbox, in any
+  environment, do not share a port number. A service and an addon do not
+  share a name: both are names of the hosts block.
+- **Env values**: a string, `{value}`, `{secret}`, `{addon, key, …}` with
+  the blueprint's fields, `{service, port, key}` with key `url`, `host` or
+  `port`. Every reference resolves, and none from an image service or a
+  job names an attached service: image pods cannot reach a sandbox.
+- **Jobs**: an image, `on` `release` (the default) or `manual`, retries 0
+  to 5, a timeout of 10m by default and 2h at most.
+- **Addons**: a registered type and a version, both required; the plan
+  (the blueprint's default when absent) and the options are the
+  blueprint's to check, against the addon that the volume holds when it
+  has one (its `addon_type` and `data_version`), else the latest
+  release's: a postgres major version change and a valkey downgrade are
+  errors, a volume of another type is the warning that its data is
+  deleted.
+- **Routes**: a path of unreserved characters without empty, `.` or
+  `..` segments, unique; a service and one of its ports; `strip`; `host`
+  is stored and not realised (info).
+- **Secrets**: every `{"secret": n}` names a tenant secret of the
+  environment that exists and is not deleted.
+- `volumes` and a service's `mounts` are errors: not available yet.
+- At most 1 MiB, 64 services, 32 jobs, 16 addons, 128 routes.
+
+Normalisation fills the defaults, writes durations as Go does, pins
+every image to `<registry>/<repository>@sha256:…` (keeping
+`imageAsWritten`; a digest reference stays) and every referenced secret
+to its latest version, and drops the secrets nothing references. The
+normalised spec is what a release stores and what plans diff. A diff
+entry is `{kind, name, change, fields: [{path, from, to}], effect}`, the
+effect `in place`, `restarts` (a job's template), `replaces N pods` (an
+image service's), `recreates (downtime)` (an addon's version, plan or
+rendered option), `reprovisions` (an addon's databases or roles), or
+`deletes data` (an addon removed, or of another type); a secret shows by
+its version, an image as written with its digest.
+
+### Plan, apply, revert, clone
+
+- **Plan** parses, validates, resolves the images (one that does not
+  resolve is a warning), normalises and diffs against `base` or the
+  current release; it writes nothing. `POST /api/v1/environments/plan`
+  validates without an environment.
+- **Apply** plans and refuses any error (422 with every finding), pins
+  the images outside the transaction (one that does not resolve is now
+  an error), then in one transaction locks the tenant FOR SHARE and the
+  environment FOR UPDATE (each refused while it is deleted), checks the
+  pinned secret versions again, answers a spec equal to the current
+  release's with that release (200 `unchanged`, checked before the base,
+  so that a no-op on a stale base is no conflict) unless that release
+  failed, where the same spec is the retry, checks `base` (409
+  `base_mismatch` with `current`), inserts release `current+1` pending,
+  supersedes older pending and rolling ones, and sends `env-reconcile`.
+- **Revert** to n applies n's stored spec, origin `revert`, with n's
+  annotations and `ferun.revertOf: n`; the call takes no annotations of
+  its own. A secret version n pins that was deleted is an error.
+- **Object changes**, `PUT` and `DELETE …/objects/{kind}/{name}`, apply
+  the current spec with the object set or removed (origin `object`), or
+  plan it with `dryRun`.
+- **Clone** creates an environment (a name or ID taken is 409: a clone is
+  not repeated), sets its secrets (`{"copy": true}` the source's latest
+  version that is not deleted, opened and sealed again as version 1,
+  `{"value": …}` version 1), and applies as its release 1 (origin
+  `clone`, the source's annotations) the given spec, or the source
+  release's without its attached services and their routes (info
+  findings) and with its secret pins reset. `data: true` is an error: no
+  data is copied.
+
+### The controller
+
+The leader runs five loops of `env/ctl`, fenced, none with a node call
+inside a transaction:
+
+| Loop | Interval | Does |
+|---|---|---|
+| `env-reconcile` | 2 s, hint `env-reconcile` | a step ([below](#a-reconcile-step)) for each environment that has a release and is not deleted, four at once |
+| `env-probe` | 1 s | exits, restarts and readiness of the instances whose rows run without an op on a node this instance is connected to; attached services; hosts blocks; at most 16 checks at once |
+| `env-groups` | 10 s, hint `env-groups` | per connected node, the groups its rows' templates name and the groups their rules name, put again where the node's differ; the groups of environments and sandboxes that are gone deleted, once no pod names them |
+| `env-volumes` | 30 s | volumes marked deleting, 64 a pass, deleted on their node once no pod holds them (`FAILED_PRECONDITION`: later, at the end of the queue; `NOT_FOUND`: done), then their rows; a removed node's lose their rows only; records of environments' volumes on a connected node that no pod holds and no row places there are deleted |
+| `env-delete` | 5 s | the environments of deleting tenants marked deleting; per deleting environment, 16 a pass: its instances deleted, its attached services' processes stopped and their hosts entries removed, its volumes marked deleting, its env group deleted from every connected node; its row goes once no instance, volume or group is left, and its releases, secrets, runs, incidents and route tokens with it |
+
+**The Ensure pool.** The controller runs `Engine.Ensure` for the rows
+that should run, and its other slow work (an addon's provisioning, an
+attached service's start in a sandbox it wakes), in a pool of 8 workers
+per instance, one task per key at a time, each ending with the loop's
+context. A step never calls Ensure itself; it enqueues. A paused or
+hibernated row of a service that idles is not enqueued: traffic wakes it.
+
+### A reconcile step
+
+The target T is the latest release R, unless R failed: then the realised
+release (nothing when none was), so that a failed release is not tried
+again until a new one comes. R pending turns rolling when T is R. An
+instance's template hash is the sha256 of its rendered template without
+labels, with the image, vCPUs and memory; an addon's takes the image as
+the blueprint writes it, its tag, so that a new digest under the tag
+never recreates it. Instance rows are inserted in a fenced transaction
+together with the controller's row (and a job's run). Then:
+
+1. **Addons**, each by its blueprint ([Addons](#addons)):
+   - Credentials: system secrets `addon.<addon>.<key>`, 32 hex
+     characters (valkey's flags are split at words), version 1,
+     generated once and never changed. Without a sealer the release
+     stays rolling with the reason "secrets need --secret-key-file", and
+     no incident.
+   - The volume row, `addon/<name>`, with the plan's size at its first
+     creation, never resized, its type and its version.
+   - No instance: one is inserted, never idle, pinned to the volume's
+     node once the volume was created there, but only when the pod that
+     held the volume last has no row and no tombstone left, and never
+     onto a removed node (`volume_unavailable`).
+   - Another template (a version, a plan, a rendered option): recreated,
+     only while the instance runs on a ready node (else it is brought up
+     first, a restore): the old row retires and goes, the volume records
+     its node and the old row as holder, and the new row comes on that
+     node once the old pod is gone.
+   - Before any create or recreate onto a volume, its data decides:
+     another `addon_type` is a removal and an add (the old instance and
+     credentials go, the volume is deleted, a new one comes); the same
+     type is checked by the blueprint with the volume's `data_version` as
+     the previous version, and an error keeps the current row, fails a
+     rolling R (`rollout_failed`, the finding its reason) or else opens
+     `addon_unhealthy`. `data_version` becomes the version an instance
+     ran ready with.
+   - While R failed, an addon whose row runs R's template stays as R has
+     it, never recreated back.
+   - Ready, with a provisioning hash that is not the steps': the steps
+     run in the container, hold-free, the credentials in their env, at
+     most 2 minutes each; their output is redacted of every credential
+     before it is stored anywhere; a failure is the instance's detail and
+     runs again after 10 s. Databases and roles change the steps, never
+     the pod.
+   - A lost row is never replaced, its volume being on the lost node:
+     `volume_unavailable` opens, and Ensure stays queued to sync it if the
+     node returns. A row restored on another node takes the volume's node
+     and its pin there.
+2. **Jobs** `on: release`, while R rolls: one whose template hash has no
+   succeeded run runs once every addon is provisioned. Exit 0 succeeds;
+   another code, none ("the node did not report an exit status"), its
+   timeout or a lost row fail the attempt, which runs again while
+   retries are left; the run keeps the last 50 lines of the log before
+   its row goes. A failed last attempt fails R (`job_failed`). Jobs `on:
+   manual` run on `POST …/jobs/{name}/run`.
+3. **Image services**, while R rolls only after the addons are
+   provisioned and the release jobs succeeded: rows of T's template are
+   kept (their release and idle updated in place) and healed; the others
+   are replaced one at a time, surge 1: a new one, ready, then an old one
+   retires (`retire_at` 5 s ahead: routes and hosts blocks drop it at
+   once) and goes; surplus replicas retire from the highest; a lost row
+   is replaced. The service's `rollout.timeout` counts from R's start:
+   past it, or once one of R's new instances exited 3 times, R fails
+   (`rollout_failed`, with the exits, the log tail and the diff since
+   the realised release), and R's new instances retire while the old
+   serve on. Healing, always: a desired row stopped, failed, pending,
+   unknown, or paused or hibernated without idling, gets Ensure.
+4. **Attached services** ([below](#attached-services-and-hosts-blocks)),
+   ready within 10 minutes of R's start, or R fails (`rollout_failed`).
+5. **Removed objects**: their instances retire and go; an addon neither T
+   nor R has loses its volume (marked deleting) and its credentials,
+   while an addon of a failed R that T lacks stays, so that a failed
+   first release deletes no data; an attached service loses its process,
+   its hosts entries and its row. The open `crash_loop`,
+   `volume_unavailable` and `addon_unhealthy` incidents of objects that
+   neither T nor R has close.
+6. **Realised**, when T is R: every object as R has it and ready, addons
+   provisioned, release jobs succeeded, nothing retiring. R is
+   `realised`, the environment's `realised` with it, older realised and
+   pending releases are superseded, and the open `rollout_failed`,
+   `job_failed` and `crash_loop` incidents of older releases close.
+
+**The release's deadline.** A rolling R fails (`rollout_failed`) once it
+rolled longer than the longest of T's image services' `rollout.timeout`,
+T's release jobs' timeout × (retries + 1), and 10 minutes, naming the
+first object it still waits for; the evidence lists what it waits for
+and those instances' details, credentials redacted. A release without a
+sealer is spared. An instance pending without capacity for 2 minutes
+opens `no_capacity`, with the placement's text, which closes once it
+places.
+
+### Probes, exits and restarts
+
+`env-probe` reads each running instance's pod with the lease its row
+gives, without a hold:
+
+- **An exit** of the container `main`, with its code from GetPod: a job's
+  run ends; a service's or an addon's instance counts a restart, keeps
+  the exit (the last 5), is `exited` ("exited with code 1; restarting in
+  4s"), and is restarted after 2^(n-1) s, at most 5 minutes, by
+  `Engine.Restart`, a repair op of trigger `restart`: the precheck allows
+  it on any running row, it skips the repair's recheck, and it stops and
+  starts the pod. An exit counts only for a new run: the same microVM pid
+  with no restart due is a restart that did not happen ("repair not done:
+  …"), scheduled again without counting. 3 exits within 10 minutes open
+  `crash_loop` (the exits, the log tail), which closes once every
+  instance of the object has been ready for 10 minutes, or at a later
+  realisation. Restarts count from zero again after 10 minutes ready.
+- **Readiness**: http, a GET of the path over a port-forward with `Host:
+  localhost:<port>`, 200 to 399 within 2 s; tcp, a port-forward that is
+  answered; exec, exit 0 in `main` within 10 s; an addon's, its
+  blueprint's probe, its output redacted. `starting` becomes `ready` on
+  the first success after the initial delay, `ready` becomes `unready`
+  after the threshold's failures in a row, and `ready` again on a
+  success. Without a check, an instance is ready once its container has
+  run 2 s since it was first seen running. Routes use only `ready`
+  instances.
+- **The hosts block** of service and job instances
+  ([below](#attached-services-and-hosts-blocks)).
+
+The checks use exports of the port door, `Probe` and `DialPod`, which
+take no hold and touch nothing, each within 2 s and with one of
+`ports.ProbeSlots`, 4 probe slots per sandbox and instance apart from its
+32 streams, so that forwarded traffic never fails a check; with every
+probe slot taken a check fails at once with `ErrProbeBusy`, which counts
+neither way. The runner's detached calls (`tools/detached.go`: exec, file
+read and write, process start, list, logs and stop) take no hold, record
+no activity and touch nothing; a process's env travels in its exec
+request and is never written down. `VolumeService` and
+`SecurityGroupService` calls count as lifecycle calls in the node
+connections' budgets.
+
+**Logs**: `StreamContainerLogs` with `tail_lines` (200 by default, 10000
+at most), never followed. A node that answers Unimplemented is 501 "this
+node does not serve container logs yet", a paused or hibernated instance
+409 "paused" (never woken for it), an instance that does not run 409
+`not_running`. A job's log is its latest run's, the stored tail once its
+row is gone; an attached service's is its process log.
+
+### Security groups
+
+The controller's groups are `env-<env id>` and `sbx-<sandbox id>`. Both
+carry the egress table: any protocol to `0.0.0.0/0` except `0.0.0.0/8`,
+`10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`,
+`172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`,
+`192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`,
+`224.0.0.0/4` and `240.0.0.0/4`, and to `2000::/3` except `2001::/23`,
+`2001:db8::/32`, `2002::/16` and `3fff::/20`, feosd's internet sets; never
+`::/0` or a bare `0.0.0.0/0`. DNS and the metadata service need no rule.
+
+- **The env group** adds ingress and egress of any protocol from and to
+  itself. Its members are the IPv6 addresses of the environment's
+  instance rows, in any phase until the row goes, and of the sandboxes
+  its attached services run in, while the service may use them.
+- **The sbx group** of an attachable sandbox adds egress to each env
+  group the sandbox's attached services belong to, and no ingress: image
+  pods never reach a sandbox.
+- **Versions.** An env group's is `environments.gen`, counted up when a
+  node holds the group at that version with other content; an sbx
+  group's is a hash of its content. Put ignores versions, so a group is
+  put again whenever version or content differ from the node's.
+
+**Attachable sandboxes.** `POST /api/v1/sandboxes` with `"attachable":
+true` gives the sandbox a template: `sleep infinity`, no env, the group
+`sbx-<id>`; its status says `attachable`. Only such a sandbox reaches an
+environment's addons and image services.
+
+**The prepare hook** (`Engine.SetPrepareHook`) runs for a row with a
+template once its op has the node's connection and its pod spec (a
+secret that does not resolve fails first), before CreatePod, StartPod,
+ResumePod and RestorePod, and inside a repair before its pod calls. The
+controller's hook puts the row's groups, and those their rules name, on
+the node, whole. Before a create it also sees to the volumes: one never
+created is created on the node with its size and labels, then recorded
+provisioned, with its node, its holder and the row's `pin_node`, in a
+transaction of its own; one created is read on the node and passes when
+it is AVAILABLE, CHECKPOINTED without a pod, or held by this pod, else
+`volume_unavailable` opens. A hook error before the pod call means
+nothing was sent: the op rolls back with the error as its cause and
+description ("…; nothing was sent"). Only an error wrapping
+`sandbox.ErrNodeUnfit`, and not `model.ErrNodeUnavailable`, puts the
+node of an unpinned create on `avoid_nodes`: a create of the volume
+that the node refuses (`ALREADY_EXISTS`, `FAILED_PRECONDITION`,
+`RESOURCE_EXHAUSTED`, `INVALID_ARGUMENT`), a volume the node does not
+have, has attached to another pod, or has in another state. A node that is
+not connected never reaches the hook. Inside a repair a hook error is a
+repair not done: the pod's next observation decides, process holds stay,
+and a running pod's description reads "repair not done: <cause>".
+
+### Attached services and hosts blocks
+
+An attached service is a supervised process in the main container of a
+sandbox of the tenant's, named `ferun-env-<env>-<service>`. The step
+records it with the sandbox's incarnation, moves it when the spec names
+another sandbox, and wakes a sandbox that does not run (Acquire with an
+exec hold) only to start its process, holding it up to a minute for the
+first readiness. The supervisor in `env-probe` looks at it while the
+sandbox runs, and never wakes a paused one for that: it starts the
+process with argv, cwd and the resolved env, after stopping any other
+process of that name; a changed template stops the old process and
+starts the new; a process that is gone counts as an exit and is restarted
+with the backoff above; a cwd that does not exist yet keeps it `starting`
+("cwd <dir> does not exist yet"); readiness is checked against the
+sandbox's port, or by exec. Every use checks that the sandbox exists, is
+the environment owner's, is no instance row and is the incarnation
+recorded: otherwise the service is `failed`, "sandbox <id> is gone or not
+this tenant's", and is never started, checked, routed to or made a group
+member there, until the spec names another sandbox. Attached services
+have no `crash_loop`. A restart stops and starts the process, never the
+sandbox's pod; in a paused sandbox it is 409 "paused".
+
+**Hosts blocks.** In `/etc/hosts` of an environment's service and job
+instances, and of the sandboxes its attached services run in, the
+environment's block lies between `# ferun environment <name> begin` and
+`# ferun environment <name> end`; the rest of the file stays, and a file
+that is missing is made with the two `localhost` lines. The block names
+the addons and image services by their addresses (a ready replica's, any
+one's while none is ready, never a retiring one's) and, in a sandbox,
+its own attached services as `127.0.0.1` and `::1`. It is written when
+the container is first seen running and again when an address changes
+or an instance it names retires; `hosts_written` keeps the hash of the
+block last written.
+
+**References** resolve thus: an addon's output (`{addon, key, …}`) to the
+blueprint's parts against the addon instance's address (in brackets in a
+URL), so that a dependent waits while the addon has none, and gets a new
+template when it changes, rolled as a release would be; a service's
+(`{service, port, key}`) to its name, its port number or
+`http://<name>:<port>`, which the hosts block resolves; a secret to its
+pinned version.
+
+### The route door
+
+`ANY /api/v1/environments/{env}/http/{path...}` has an auth class of its
+own, `route`: a route token of the environment as Bearer (401 "route
+token required", for a tenant's token too) and plain-text answers.
+`POST /api/v1/environments/{env}/route-tokens` mints one (32 random
+bytes, base64url, shown once, only its SHA-256 kept); `DELETE` revokes
+them all. The door matches the longest prefix, segment by segment, over
+the routes of the realised release (the latest while none is realised;
+no match is 404 "no route for <path>") and forwards with the port door's
+`ForwardTo`: a forward hold and a touch, the Host passed on,
+`Authorization` dropped, upgrades and streams kept, a Kubernetes
+binding's port refused.
+
+- An image service's request goes to a ready instance whose sandbox
+  runs, round-robin; with none, to a paused or hibernated one, which the
+  forward wakes (scale from zero); with none at all, 503 "no ready
+  instance of <service>" with `Retry-After: 5`. The port is the one the
+  chosen instance's own release gives the route's port name.
+- An attached service's goes to the sandbox of its `env_attached` row
+  while that is the owner's, no instance row and the incarnation
+  recorded; else 503 "sandbox <id> of service <service> is gone or not
+  this tenant's".
+- The path loses the route's prefix only with `strip`; the query stays.
+  A segment that is, or decodes once or twice to, `.` or `..` is 400
+  ("the path has a .. segment"); `%25` passes. Go's mux redirects (307) a
+  plain `..` and `/http` without its slash before the door.
+
+FeCode's environment hosts forward to the door with the environment's
+route token.
+
+### Secrets
+
+A tenant secret is named `^[a-z0-9][a-z0-9._-]{0,62}$`, never beginning
+with `addon.`, the system secrets' prefix, and holds at most 64 KiB; a
+new value is a new version, the highest ever plus one, also after a
+delete. Versions are sealed with `internal/seal` under
+`--secret-key-file`'s key, the associated data `env_secrets|<env
+id>|<name>|<version>`; without the key the secrets routes answer 503
+"secrets need --secret-key-file" and nothing that names a secret or has
+an addon is realised. The controller resolves them (`ResolveSecret`,
+also the engine's resolver) into a pod's env at its create, a process's
+and a provisioning step's, and writes them nowhere. A delete is refused
+(409) while the latest release pins the secret, and soft-deletes every
+version, so that an older release still resolves.
+
+**Known exposure.** A resolved env reaches feosd's record of the pod,
+`GetPod` and `ListPods`, the node's disk and hibernation checkpoints in
+the clear ([follow-ups](#follow-ups-for-feosd), item 10), and the nats
+addon's password is in its server's argv inside the pod.
+
+### Addons
+
+`env/addons` registers a blueprint per type: its versions, its plans and
+default plan (`small` for all three), its validation of an addon against
+the previous one, the keys of its credentials, its pod (image, command,
+env with credential parts, port, mount, probe), its outputs, and its
+provisioning steps, idempotent. A version is required. A plan change
+keeps the volume's size (a warning). An output before the addon has an
+address names the addon instead (validation only); a URL's userinfo is
+percent-encoded.
+
+| Type | Versions | Plans: vCPUs, memory, volume | Pod | Outputs |
+|---|---|---|---|---|
+| `postgres` | 16, 17 | `dev` 1, 256 MiB, 1 GiB; `small` 1, 1 GiB, 10 GiB; `medium` 2, 4 GiB, 50 GiB; `large` 4, 16 GiB, 200 GiB | `postgres:<v>-alpine`, `docker-entrypoint.sh postgres -c shared_buffers=<memory/4>MB`, `PGDATA=/var/lib/postgresql/data/pgdata`, `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256` (loopback asks for a password too), the volume at `/var/lib/postgresql/data`; probe `pg_isready -U postgres -h 127.0.0.1` | `host`, `port` (5432), `user`, `password`, `database`, `url` `postgres://<user>:<password>@[<address>]:5432/<database>?sslmode=disable`; fields `role` and `database` |
+| `valkey` | 7.2, 8 | `dev` 1, 128 MiB, 256 MiB; `small` 1, 512 MiB, 2 GiB; `medium` 1, 2 GiB, 8 GiB; `large` 2, 8 GiB, 32 GiB | `valkey/valkey:<v>-alpine` with its own command and `VALKEY_EXTRA_FLAGS` `--appendonly yes --requirepass <password> --maxmemory <70 % of memory>mb --maxmemory-policy <policy>`, the volume at `/data`; probe `valkey-cli ping` with `REDISCLI_AUTH` | `host`, `port` (6379), `user` (`default`), `password`, `url` `redis://default:<password>@[<address>]:6379/0` |
+| `nats` | 2 | `dev` 1, 128 MiB, 1 GiB; `small` 1, 512 MiB, 10 GiB | `nats:2-alpine`, `sh -c` writing a config that binds the monitor to loopback, then `nats-server -a :: -p 4222 --user nats --pass "$NATS_PASSWORD"`, with `-js -sd /data` and the volume at `/data` while option `jetstream` (default true) holds; probe `wget -qO- http://127.0.0.1:8222/healthz` | `host`, `port` (4222), `user` (`nats`), `password`, `url` `nats://nats:<password>@[<address>]:4222` |
+
+- **postgres** options: `databases` and `roles`, names
+  `^[a-z][a-z0-9_]{0,62}$`; no role `postgres`, `public`, `none`,
+  `current_user`, `current_role`, `session_user`, `information_schema` or
+  `pg_*`, no database `template0`, `template1` or `postgres`; roles need a
+  listed database. A major version change either way is an error.
+  Provisioning is one step, `sh -c` with a heredoc into `psql` (`\gexec`,
+  `ON_ERROR_STOP`), the superuser's password in `PGPASSWORD` and each
+  role's in `FERUN_ROLE_PASSWORD_<role>`: the databases and roles that are
+  missing are created, every role's password is set, and each role gets
+  CONNECT and CREATE on every listed database and a schema of its name,
+  its own, in each; such a schema that another role owns fails the step.
+  Nothing is dropped: a database or role no longer listed stays (a
+  warning). A role's output needs one of the listed databases;
+  `database: postgres` is the superuser's alone.
+- **valkey**: option `maxmemoryPolicy`, `noeviction` by default, one of
+  the eight policies. A downgrade is an error, an upgrade an info.
+- **nats**: JetStream turned off is a warning; its volume stays, unused.
+
+`FERUN_ADDON_DOCKER=1 go test -run Docker ./internal/env/addons/` runs
+each blueprint against its image in docker, as FeOS would start it.
+
+### Status and incidents
+
+`GET /api/v1/environments/{env}` answers the environment, its rollout
+(the latest release's state, start and reason), its objects as the
+target release has them (an image service with desired and ready counts
+and its instances, an addon with type, version, plan, phase and
+`provisioned`, a job with its last run, an attached service with its
+sandbox, phase, restarts and last exit; `starting` before an object has
+an instance), its routes (of the realised release, else the latest) and
+the number of open incidents. An incident has its object, release,
+condition, summary, opening and closing, and evidence: `exits`,
+`logTail`, `diff` (since the realised release), `placement`, `pending`.
+A failed release's reason is its incident's summary.
+
+### The environments' REST API
+
+Tenant class, JSON in camelCase. `{env}` is the environment's UUID or its
+name; one the tenant does not have is 404 "no such environment".
+
+| Method and path | Answers |
+|---|---|
+| `POST /api/v1/environments` `{name, id?, labels?}` | 201 its status; the same ID and name again 200; 409 `name_taken`, `id_taken` |
+| `GET /api/v1/environments?label=k=v` | `{environments: [{id, name, labels, release, realised, state, openIncidents, createdAt}]}`, the labels ANDed; `state` is the latest release's, `none` or `deleting` |
+| `GET`, `DELETE /api/v1/environments/{env}` | the status; 202 |
+| `POST /api/v1/environments/plan` `{spec}` | `{valid, findings}` |
+| `POST …/{env}/plan` `{spec, base?}` | `{valid, findings, diff, base, current}` |
+| `POST …/{env}/releases` `{spec, base, author?, message?, annotations?}` | 201 the release; 200 with `unchanged: true`; 422 `invalid_spec` with `findings`; 409 `base_mismatch` with `current` |
+| `GET …/{env}/releases?limit=50`, `…/releases/{n}` | newest first, with their tags; one with its spec and its diff against n-1 |
+| `POST …/releases/{n}/revert` `{base, author?, message?}` | as a release |
+| `PUT`, `DELETE …/{env}/objects/{kind}/{name}` | as a release; with `dryRun` a plan |
+| `GET`, `PUT`, `DELETE …/{env}/tags[/{tag}]` | the tags, a tag (`PUT {release, author?}`), 204 |
+| `POST …/{env}/clone` | 201 the new environment's status; 422 findings |
+| `GET …/{env}/secrets`, `PUT`, `DELETE …/secrets/{name}` | the names with their latest versions; `{name, version}`; 204, 409 while pinned |
+| `GET …/{env}/incidents[?open=1]`, `…/incidents/{id}` | newest first; one |
+| `GET …/{env}/objects/{kind}/{name}/logs?lines=200&replica=0` | `{lines, source}`, the source `container` or `process`; 501; 409 |
+| `POST …/{env}/services/{name}/restart` | 202: an image service's replicas one at a time, each waited for up to 5 minutes, or an attached service's process |
+| `POST …/{env}/jobs/{name}/run` | 202 |
+| `POST`, `DELETE …/{env}/route-tokens` | 201 `{token}`; 204 |
+| `ANY …/{env}/http/{path...}` | the route door |
+
+Other answers: plain 409s "environment X is being deleted", "tenant X is
+being deleted", "release N pins secret X: apply a release without it
+first" and "paused"; 409s with a code for states the controller expects:
+`busy` (with `Retry-After`) while the object has an op in flight,
+`not_running` for an instance that does not run, `not_ready` for a job
+whose template cannot render yet ("job X cannot run yet: …"); 404 "no
+such release", "no such tag", "no such secret", "no such incident", "no
+such object: <kind>/<name>"; 503 "secrets need --secret-key-file". An
+author has at most 1 KiB, a message 64 KiB, annotations 4 KiB, labels 64
+of at most 253 bytes. Not built: MCP tools and grants for environments,
+an admin listing, volumes for services, a copy of data on a clone, addon
+backups and minor upgrades, a CLI.
+
 ## The activity log
 
 `activity` holds ferund's own rows (tool calls, ops, runs, state changes,
@@ -1096,13 +1691,34 @@ report its hibernations, whose resume waits for one. With `Mesh` it is on
 the pods' mesh: it asks `JoinMesh` with a random key and its endpoint on
 every new uplink and whenever its endpoint changes, and keeps the peers
 that `MeshService` gets in memory; without, `MeshService` answers
-`FAILED_PRECONDITION`. `ferun-testnode` runs one for development:
+`FAILED_PRECONDITION`. For the environments it serves `VolumeService`
+(a create idempotent by ID with the same size and labels,
+`ALREADY_EXISTS` otherwise; a pod claims its volumes at its create, all
+or none, `FAILED_PRECONDITION` at once for one missing or held;
+AVAILABLE, ATTACHED, CHECKPOINTED; a restore takes them over under
+feosd's rules and leaves nothing behind when they refuse it; no delete of
+a held one) and `SecurityGroupService` (members and rules checked as
+feosd does; no delete of a group a pod names; with
+`CheckSecurityGroups`, a pod naming a group the node lacks goes FAILED
+"the node does not have the security groups …"), reports a pod's IPv6
+address, gives a pod a new microVM pid on every boot and restore, and
+its script exits a container with a code (`ExitContainer`), appends to
+its log (`AppendLog`, served by `StreamContainerLogs` with `tail_lines`),
+and sets a pod's exec and port addresses (`SetPodExec`,
+`SetPodPortAddr`); an exec into a pod labelled `ferun.environment` exits
+0 by default, so that addon probes and provisioning pass.
+`ferun-testnode` runs one for development:
 
     ferun-testnode --join-token feos-join-<secret>.<pin> \
         --server-name ferun.example.com --addr 127.0.0.1:7443 \
         [--name NAME] [--trust-domain feos.local] [--state-dir DIR] \
         [--object-store-dir DIR] [--pending-delay 2s] \
-        [--mesh [--mesh-endpoint ADDRESS:PORT]]
+        [--mesh [--mesh-endpoint ADDRESS:PORT]] \
+        [--fake-exec] [--check-security-groups=false]
+
+`--fake-exec` makes every exec into a pod exit 0 without running
+anything; `--check-security-groups` (on by default) fails a pod whose
+groups the node does not have, as feosd does.
 
 ## Operations
 
@@ -1282,6 +1898,16 @@ changes to feosd it relies on or improves with:
    repeated with the same key, whose answer was lost, is answered again.
    Too many requests for one pod fail with RESOURCE_EXHAUSTED.", and
    `feos-authn` retries `RESOURCE_EXHAUSTED` with backoff.
+10. **A sealed pod record.** An environment's pod gets its env with the
+    secrets resolved, which feosd keeps in the pod's record and answers
+    in `GetPod` and `ListPods`, on the node's disk and in hibernation
+    checkpoints in the clear ([Secrets](#secrets)).
+11. **Restarts and probes in the guest** ([ADR 0004](../adr/0004-pods.md)):
+    until then ferund restarts an environment's exited container by
+    restarting its pod, and runs the readiness checks over the node
+    connection ([Probes, exits and restarts](#probes-exits-and-restarts)).
+    The guest reports a container's exit code and serves its log
+    ([guest.md](guest.md#containers)).
 
 ## Development
 
