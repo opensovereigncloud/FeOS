@@ -243,8 +243,11 @@ func (c *Controller) waitReady(ctx context.Context, id uuid.UUID) bool {
 	return false
 }
 
-// restartAttached stops an attached service's process (when its sandbox
-// runs) and has the supervisor start it again at once.
+// restartAttached stops an attached service's process and has the
+// supervisor start it again at once. A sandbox that may keep the process
+// without running it (paused, hibernated, or with an op in flight) is
+// ErrPaused: the process would survive a warm resume beside the new one
+// (§13.5); one that cannot keep it (stopped, failed, …) needs no stop.
 func (c *Controller) restartAttached(ctx context.Context, v *view, name string) error {
 	a, ok := v.attached[name]
 	if !ok {
@@ -254,16 +257,32 @@ func (c *Controller) restartAttached(ctx context.Context, v *view, name string) 
 	if !usable {
 		return notRunning("%s: no process to restart", goneDetail(a.SandboxID))
 	}
-	if steady(sb) && a.ProcessID != "" && c.d.Runner != nil {
-		if err := c.d.Runner.StopProcessDetached(ctx, lease(sb), a.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) {
+	if keepsProcesses(sb) && !steady(sb) {
+		return ErrPaused
+	}
+	l := lease(sb)
+	stop := func(id string) error {
+		if !steady(sb) || id == "" || c.d.Runner == nil {
+			return nil
+		}
+		if err := c.d.Runner.StopProcessDetached(ctx, l, id); err != nil && !errors.Is(err, tools.ErrNoProcess) {
 			return err
 		}
+		return nil
 	}
-	return c.st.InTx(ctx, func(tx *store.Store) error {
+	if err := stop(a.ProcessID); err != nil {
+		return err
+	}
+	var cleared string
+	err := c.st.InTx(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockAttached(ctx, v.env.ID, name, store.ForUpdate)
 		if err != nil {
 			return err
 		}
+		if cur.SandboxID != a.SandboxID {
+			return nil // moved meanwhile: the move stopped it
+		}
+		cleared = cur.ProcessID
 		after := cur
 		after.ProcessID, after.Phase, after.ReadySince, after.ProbeFailures = "", model.PhaseStarting, time.Time{}, 0
 		after.NextRestartAt, after.Detail = time.Time{}, "restarting"
@@ -272,4 +291,22 @@ func (c *Controller) restartAttached(ctx context.Context, v *view, name string) 
 		}
 		return tx.Notify(ctx, db.ChanLeader, HintReconcile)
 	})
+	if err != nil || cleared == a.ProcessID {
+		return err
+	}
+	// The supervisor recorded another process meanwhile: stopped too, now
+	// that the row forgot it.
+	return stop(cleared)
+}
+
+// keepsProcesses reports whether a sandbox in its state keeps its
+// processes (or may, an op in flight): running, or suspended in a way a
+// warm resume or restore brings back.
+func keepsProcesses(sb store.Sandbox) bool {
+	switch sb.ClientState {
+	case model.StateRunning, model.StatePausing, model.StatePaused, model.StateResuming, model.StateHibernating,
+		model.StateHibernated:
+		return true
+	}
+	return sb.Op != ""
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
+	"github.com/ironcore-dev/feos/go/internal/tools"
 )
 
 // processRoot is where the process scripts keep their records in a
@@ -367,4 +368,104 @@ func TestAttachedSandboxReusedByAnotherTenant(t *testing.T) {
 	if starts.count(sb.ID) != before {
 		t.Error("a process started in the other tenant's sandbox")
 	}
+}
+
+// runningNamed are the IDs of the sandbox's running processes named name.
+func (h *harness) runningNamed(sb store.Sandbox, name string) []string {
+	h.t.Helper()
+	ps, err := h.runner.ProcessesDetached(bg, lease(sb))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	var out []string
+	for _, p := range ps {
+		if p.Running && p.Name == name {
+			out = append(out, p.ID)
+		}
+	}
+	return out
+}
+
+// An attached service's processes the row does not record never run on:
+// one with its name is stopped before a new one starts (a look whose
+// write was lost), one a look started but could not record is stopped at
+// once; a restart in a paused sandbox is refused (ErrPaused) instead of
+// leaving the process to survive the resume beside a new one.
+func TestAttachedStrayProcesses(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	hostProcesses(n1, t.TempDir())
+	sb := h.attachable()
+	env := h.newEnv("dev")
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"web":{"runtime":"attached","sandbox":%q,"command":["sleep","60"]}}}`, sb.ID))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	a, err := h.st.GetAttached(bg, env.ID, "web")
+	if err != nil || a.ProcessID == "" {
+		t.Fatalf("attached %+v %v", a, err)
+	}
+
+	// A row that lost its process's ID: the next start stops the process.
+	h.exec(`UPDATE env_attached SET process_id = '' WHERE env_id = $1 AND service = 'web'`, env.ID)
+	var b store.EnvAttached
+	eventually(t, 30*time.Second, "a new process", func() bool {
+		b, err = h.st.GetAttached(bg, env.ID, "web")
+		return err == nil && b.ProcessID != "" && b.ProcessID != a.ProcessID && b.Phase == model.PhaseReady
+	})
+	if got := h.runningNamed(sb, "ferun-env-dev-web"); !slices.Equal(got, []string{b.ProcessID}) {
+		t.Fatalf("running %v, the row records %s", got, b.ProcessID)
+	}
+
+	// A process a look started but could not record (the row moved).
+	orphan, err := h.runner.StartProcessDetached(bg, lease(sb), tools.ProcessStart{Argv: []string{"sleep", "60"}, Name: "orphan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := b
+	before.SandboxID = uuid.New()
+	after := before
+	after.ProcessID = orphan
+	h.c.writeAttached(bg, before, after, lease(sb))
+	if got := h.runningNamed(sb, "orphan"); len(got) != 0 {
+		t.Fatalf("the unrecorded process runs: %v", got)
+	}
+	if c, _ := h.st.GetAttached(bg, env.ID, "web"); c.ProcessID != b.ProcessID {
+		t.Fatalf("the row changed: %+v", c)
+	}
+
+	// A restart in a paused sandbox is refused and wakes nothing.
+	if err := h.eng.Pause(bg, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "paused", func() bool {
+		s, _ := h.st.GetSandbox(bg, sb.ID)
+		return s.ClientState == model.StatePaused && s.Op == ""
+	})
+	if err := h.c.RestartService(bg, env.ID, "web"); !errors.Is(err, ErrPaused) {
+		t.Fatalf("a restart in a paused sandbox: %v", err)
+	}
+	never(t, 3*time.Second, "the refused restart changed something", func() bool {
+		s, _ := h.st.GetSandbox(bg, sb.ID)
+		c, _ := h.st.GetAttached(bg, env.ID, "web")
+		return s.ClientState != model.StatePaused || c.ProcessID != b.ProcessID
+	})
+	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
+	defer cancel()
+	if _, err := h.eng.Ensure(ctx, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.runningNamed(sb, "ferun-env-dev-web"); !slices.Equal(got, []string{b.ProcessID}) {
+		t.Fatalf("after the resume: running %v, the row records %s", got, b.ProcessID)
+	}
+	// Running again, the restart goes through: one new process.
+	if err := h.c.RestartService(bg, env.ID, "web"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "the restarted process", func() bool {
+		c, err := h.st.GetAttached(bg, env.ID, "web")
+		return err == nil && c.ProcessID != "" && c.ProcessID != b.ProcessID &&
+			slices.Equal(h.runningNamed(sb, "ferun-env-dev-web"), []string{c.ProcessID})
+	})
 }

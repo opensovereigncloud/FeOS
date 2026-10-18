@@ -194,11 +194,13 @@ func (c *Controller) moveAttached(ctx context.Context, v *view, a store.EnvAttac
 	if found && attachedUsable(v.env, store.EnvAttached{SandboxID: p.sandbox}, sb) {
 		inc = sb.Incarnation
 	}
+	var cleared store.EnvAttached
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockAttached(ctx, v.env.ID, a.Service, store.ForUpdate)
 		if err != nil {
 			return err
 		}
+		cleared = cur
 		after := cur
 		after.SandboxID, after.SandboxIncarnation, after.ProcessID, after.TemplateHash = p.sandbox, inc, "", ""
 		after.Phase, after.ReadySince, after.Restarts, after.LastExit = model.PhaseStarting, time.Time{}, 0, nil
@@ -210,6 +212,12 @@ func (c *Controller) moveAttached(ctx context.Context, v *view, a store.EnvAttac
 	})
 	if err != nil && ctx.Err() == nil {
 		c.rl.warn("attached", "cannot move an attached service", "environment", v.env.ID, "service", a.Service, "err", err)
+		return
+	}
+	// A process the supervisor recorded after the view was read: stopped
+	// too, so that no process the row forgot runs on.
+	if err == nil && cleared.SandboxID == a.SandboxID && cleared.ProcessID != "" && cleared.ProcessID != a.ProcessID {
+		c.stopAttached(ctx, v, cleared)
 	}
 }
 
@@ -387,7 +395,7 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 	if after.ProcessID != "" && after.TemplateHash != p.hash {
 		if err := c.d.Runner.StopProcessDetached(ctx, l, after.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) {
 			after.Detail = "stop the old process: " + err.Error()
-			c.writeAttached(ctx, a, after)
+			c.writeAttached(ctx, a, after, l)
 			return
 		}
 		after.ProcessID, after.Phase, after.ReadySince, after.ProbeFailures = "", model.PhaseStarting, time.Time{}, 0
@@ -397,7 +405,7 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 		ps, err := c.d.Runner.ProcessesDetached(ctx, l)
 		if err != nil {
 			after.Detail = "list the processes: " + err.Error()
-			c.writeAttached(ctx, a, after)
+			c.writeAttached(ctx, a, after, l)
 			return
 		}
 		var st *tools.ProcessStatus
@@ -418,6 +426,11 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 		}
 	}
 	if after.ProcessID == "" && (after.NextRestartAt.IsZero() || !now.Before(after.NextRestartAt)) {
+		if err := c.stopStrays(ctx, v, p.name, sb, l); err != nil {
+			after.Detail = "stop the service's other processes: " + err.Error()
+			c.writeAttached(ctx, a, after, l)
+			return
+		}
 		c.startAttached(ctx, v, p, sb, l, &after)
 	}
 	if after.ProcessID != "" {
@@ -431,7 +444,51 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 			after.HostsWritten = h
 		}
 	}
-	c.writeAttached(ctx, a, after)
+	c.writeAttached(ctx, a, after, l)
+}
+
+// processName is the name of an attached service's process (§13.4).
+func processName(env, service string) string { return "ferun-env-" + env + "-" + service }
+
+// stopStrays stops the processes of an attached service that its row does
+// not record, before a new one starts (§13.5): running processes in the
+// sandbox with its name, but those another attached service of the
+// sandbox records (an environment and service whose names join to the
+// same name). Such a process was started by a look whose write was lost
+// (a leader change, a row moved or restarted meanwhile), or survived a
+// restart of a paused sandbox; it would hold the port and the secrets.
+func (c *Controller) stopStrays(ctx context.Context, v *view, service string, sb store.Sandbox, l model.Lease) error {
+	ps, err := c.d.Runner.ProcessesDetached(ctx, l)
+	if err != nil {
+		return err
+	}
+	name := processName(v.env.Name, service)
+	var strays []string
+	for _, pr := range ps {
+		if pr.Running && pr.Name == name {
+			strays = append(strays, pr.ID)
+		}
+	}
+	if len(strays) == 0 {
+		return nil
+	}
+	others, err := c.st.AttachedOfSandbox(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	for _, id := range strays {
+		if slices.ContainsFunc(others, func(o store.EnvAttached) bool {
+			return o.ProcessID == id && (o.EnvID != v.env.ID || o.Service != service)
+		}) {
+			continue
+		}
+		if err := c.d.Runner.StopProcessDetached(ctx, l, id); err != nil && !errors.Is(err, tools.ErrNoProcess) {
+			return err
+		}
+		c.log.Warn("an attached service's stray process stopped", "environment", v.env.ID, "service", service,
+			"sandbox", sb.ID, "process", id)
+	}
+	return nil
 }
 
 // startAttached starts an attached service's process: its env resolved
@@ -443,7 +500,7 @@ func (c *Controller) startAttached(ctx context.Context, v *view, p *attachedPlan
 		return
 	}
 	id, err := c.d.Runner.StartProcessDetached(ctx, l, tools.ProcessStart{Argv: p.argv, Cwd: p.cwd, Env: env.vars,
-		Name: "ferun-env-" + v.env.Name + "-" + p.name})
+		Name: processName(v.env.Name, p.name)})
 	switch {
 	case errors.Is(err, tools.ErrNoCwd):
 		after.Phase, after.Detail = model.PhaseStarting, fmt.Sprintf("cwd %s does not exist yet", p.cwd)
@@ -481,11 +538,14 @@ func (c *Controller) attachedReadiness(ctx context.Context, p *attachedPlan, l m
 }
 
 // writeAttached writes what the supervisor changed of an attached
-// service onto the row as it is now.
-func (c *Controller) writeAttached(ctx context.Context, before, after store.EnvAttached) {
+// service onto the row as it is now. A process the look started (with
+// the lease l) whose ID the row does not get (the row moved or went
+// meanwhile, the write failed) is stopped: nothing would know of it.
+func (c *Controller) writeAttached(ctx context.Context, before, after store.EnvAttached, l model.Lease) {
 	if before == after {
 		return
 	}
+	written := false
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockAttached(ctx, before.EnvID, before.Service, store.ForUpdate)
 		if err != nil {
@@ -494,6 +554,7 @@ func (c *Controller) writeAttached(ctx context.Context, before, after store.EnvA
 		if cur.SandboxID != before.SandboxID {
 			return nil // moved meanwhile
 		}
+		written = true
 		next := cur
 		next.SandboxIncarnation, next.TemplateHash, next.ProcessID = after.SandboxIncarnation, after.TemplateHash, after.ProcessID
 		next.Phase, next.ReadySince, next.Restarts, next.LastExit = after.Phase, after.ReadySince, after.Restarts, after.LastExit
@@ -509,5 +570,11 @@ func (c *Controller) writeAttached(ctx context.Context, before, after store.EnvA
 	})
 	if err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
 		c.rl.warn("attached", "cannot write an attached service", "service", before.Service, "err", err)
+	}
+	if (err != nil || !written) && after.ProcessID != "" && after.ProcessID != before.ProcessID {
+		if err := c.d.Runner.StopProcessDetached(ctx, l, after.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) &&
+			ctx.Err() == nil {
+			c.rl.warn("attached", "cannot stop a process whose start was not recorded", "service", before.Service, "err", err)
+		}
 	}
 }
