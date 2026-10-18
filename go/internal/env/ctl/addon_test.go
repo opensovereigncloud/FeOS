@@ -12,13 +12,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -220,4 +221,84 @@ func TestAddonWithoutSealer(t *testing.T) {
 	}
 }
 
-var _ = store.ErrNoRow
+const valkeySpec = `{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev"}}}`
+
+// An addon whose row goes is inserted again on its volume's node once the
+// old pod let go of the volume; a node without the volume fails the
+// create in the prepare hook and opens volume_unavailable, which closes
+// once the addon runs again.
+func TestAddonVolumeUnavailable(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+	if err != nil || vol.SizeMiB != 256 || vol.Holder != first.Sandbox.ID {
+		t.Fatalf("volume %+v %v", vol, err)
+	}
+	if first.Sandbox.MemoryMiB != 256 {
+		t.Errorf("a 128 MiB plan's pod has %d MiB", first.Sandbox.MemoryMiB)
+	}
+	// The node loses the volume.
+	n1.Script().SetHook(volumev1.VolumeService_GetVolume_FullMethodName, func(context.Context, string, any) error {
+		return status.Error(codes.NotFound, "no volume "+vol.VolumeID.String())
+	})
+	if _, _, err := h.eng.Delete(bg, "", first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	inc := h.incident(env.ID, "addon/cache", model.ConditionVolumeUnavailable, 60*time.Second)
+	if !strings.Contains(inc.Summary, "node n1 does not have volume "+vol.VolumeID.String()) {
+		t.Errorf("incident %+v", inc)
+	}
+	rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+	if len(rows) != 1 || rows[0].Sandbox.PinNode != "n1" || rows[0].Sandbox.ClientState == model.StateRunning {
+		t.Fatalf("rows %+v", rows)
+	}
+	// The volume is back: the addon runs again with it, the incident closes.
+	n1.Script().SetHook(volumev1.VolumeService_GetVolume_FullMethodName, nil)
+	second := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 60*time.Second, "ready again", ready)[0]
+	if second.Sandbox.ID == first.Sandbox.ID || second.Sandbox.Node != "n1" {
+		t.Fatalf("second %+v", second.Sandbox)
+	}
+	eventually(t, 30*time.Second, "the incident closed", func() bool { return len(h.incidents(env.ID, true)) == 0 })
+	if nv := n1.Volumes(); len(nv) != 1 || nv[0].PodId != second.Sandbox.ID.String() {
+		t.Errorf("the node's volume %v", nv)
+	}
+	if v2, _ := h.st.GetEnvVolume(bg, env.ID, "addon/cache"); v2.Holder != second.Sandbox.ID || v2.VolumeID != vol.VolumeID {
+		t.Errorf("volume %+v", v2)
+	}
+}
+
+// A drained node's addon restores on another node with its volume (the
+// pin gates creates and starts only); the controller records the volume's
+// new node and pins the row there.
+func TestAddonMovesWithDrain(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	if first.Sandbox.Node != "n1" {
+		t.Fatalf("on %s", first.Sandbox.Node)
+	}
+	n2 := h.addNode("n2")
+	h.exec("UPDATE nodes SET draining = true, drain_started_at = now() WHERE name = 'n1'")
+	eventually(t, 90*time.Second, "the addon on n2", func() bool {
+		h.c.notify(bg, "drain")
+		rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+		return len(rows) == 1 && rows[0].Sandbox.ID == first.Sandbox.ID && rows[0].Sandbox.Node == "n2" && running(rows[0])
+	})
+	eventually(t, 30*time.Second, "the volume's node and the pin", func() bool {
+		vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+		rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+		return err == nil && vol.Node == "n2" && len(rows) == 1 && rows[0].Sandbox.PinNode == "n2"
+	})
+	if nv := n2.Volumes(); len(nv) != 1 || nv[0].PodId != first.Sandbox.ID.String() {
+		t.Errorf("n2's volumes %v", nv)
+	}
+	_ = n1
+	h.waitRows(env.ID, spec.KindAddon, "cache", 1, 30*time.Second, "ready on n2", ready)
+}

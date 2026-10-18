@@ -38,7 +38,6 @@ package ctl
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -349,6 +348,3 @@ func (r *rateLog) warn(kind, msg string, args ...any) {
 
 // objectName is an object's name as incidents and labels write it.
 func objectName(kind, name string) string { return kind + "/" + name }
-
-// errorf is fmt.Errorf, for the package's messages.
-var errorf = fmt.Errorf
