@@ -172,7 +172,8 @@ func (c *Controller) setReason(ctx context.Context, v *view, reason string) erro
 
 // realise marks R realised (§4.3 step 7): the environment's realised
 // release, older realised and pending ones superseded, the open
-// rollout_failed and job_failed incidents of older releases closed.
+// rollout_failed, job_failed and crash_loop incidents of older releases
+// closed (every instance of R is ready).
 func (c *Controller) realise(ctx context.Context, v *view) error {
 	n := v.latest.Number
 	return c.fenced(ctx, func(tx *store.Store) error {
@@ -211,7 +212,8 @@ func (c *Controller) realise(ctx context.Context, v *view) error {
 			model.ReleaseRolling); err != nil {
 			return err
 		}
-		if _, err := tx.EnvCtlCloseIncidents(ctx, env.ID, n, model.ConditionRolloutFailed, model.ConditionJobFailed); err != nil {
+		if _, err := tx.EnvCtlCloseIncidents(ctx, env.ID, n, model.ConditionRolloutFailed, model.ConditionJobFailed,
+			model.ConditionCrashLoop); err != nil {
 			return err
 		}
 		c.log.Info("release realised", "environment", env.ID, "release", n)
@@ -557,6 +559,45 @@ func (c *Controller) stepRemoved(ctx context.Context, s *stepState) {
 		s.wait("attached service %s is being removed", name)
 		c.removeAttached(ctx, v, v.attached[name])
 	}
+	c.closeRemovedIncidents(ctx, v)
+}
+
+// closeRemovedIncidents closes the open crash_loop, volume_unavailable and
+// addon_unhealthy incidents of objects that neither T nor R has: nothing
+// closes them otherwise (no_capacity closes in stepStarved, rollout_failed
+// and job_failed on a realisation).
+func (c *Controller) closeRemovedIncidents(ctx context.Context, v *view) {
+	done := map[[2]string]bool{}
+	for _, i := range v.open {
+		switch i.Condition {
+		case model.ConditionCrashLoop, model.ConditionVolumeUnavailable, model.ConditionAddonUnhealthy:
+		default:
+			continue
+		}
+		k := [2]string{i.Object, i.Condition}
+		if done[k] || hasObject(v.target, i.Object) || hasObject(v.latestSpec, i.Object) {
+			continue
+		}
+		done[k] = true
+		c.closeIncidents(ctx, v, i.Object, i.Condition)
+	}
+}
+
+// hasObject reports whether a spec has an object ("<kind>/<name>").
+func hasObject(s *spec.Spec, object string) bool {
+	kind, name, _ := strings.Cut(object, "/")
+	switch kind {
+	case spec.KindService:
+		_, ok := s.Services[name]
+		return ok
+	case spec.KindAddon:
+		_, ok := s.Addons[name]
+		return ok
+	case spec.KindJob:
+		_, ok := s.Jobs[name]
+		return ok
+	}
+	return false
 }
 
 // purgeCredentials deletes the system secrets of addons that neither T

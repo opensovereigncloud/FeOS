@@ -332,6 +332,34 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 		after.Restarts = 0
 	}
 	c.writeInstance(ctx, inst, after)
+	// A crash loop is over once every instance of the object has been
+	// ready for the crash window (the crash-looping one, or those that
+	// replaced it).
+	if obj := objectName(inst.Kind, inst.Object); v.isOpen(obj, model.ConditionCrashLoop) &&
+		c.objectSteady(v, inst.Kind, inst.Object, after) {
+		c.closeIncidents(ctx, v, obj, model.ConditionCrashLoop)
+	}
+}
+
+// objectSteady reports whether every instance of an object (but those
+// retiring) has been ready for the crash window, with after as one of
+// them is now.
+func (c *Controller) objectSteady(v *view, kind, object string, after store.EnvInstance) bool {
+	n := 0
+	for _, r := range v.rowsOf(kind, object) {
+		i := r.Instance
+		if i.SandboxID == after.SandboxID {
+			i = after
+		}
+		if i.Phase == model.PhaseRetiring {
+			continue
+		}
+		if i.Phase != model.PhaseReady || i.ReadySince.IsZero() || v.now.Sub(i.ReadySince) < c.t.crashWindow {
+			return false
+		}
+		n++
+	}
+	return n > 0
 }
 
 // addonSecrets are an addon's credential values, for redaction.

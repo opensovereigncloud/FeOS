@@ -329,3 +329,97 @@ func TestReadinessPhases(t *testing.T) {
 	code.Store(0)
 	h.waitRelease(env.ID, r3, model.ReleaseRealised, 30*time.Second)
 }
+
+// crash makes an instance's container exit n times (each once the
+// container runs again), its restarts counting from restarts.
+func crash(t *testing.T, h *harness, n *testnode.Node, envID, id uuid.UUID, restarts, times int) {
+	t.Helper()
+	for i := 1; i <= times; i++ {
+		eventually(t, 30*time.Second, "the container running", func() bool {
+			p := h.pod("n1", id)
+			inst, err := h.st.GetEnvInstance(bg, id)
+			return p != nil && len(p.Containers) == 1 && p.Containers[0].State.String() == "CONTAINER_STATE_RUNNING" &&
+				err == nil && inst.Phase != model.PhaseExited
+		})
+		if err := n.Script().ExitContainer(id, "main", 1); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, 10*time.Second, fmt.Sprintf("exit %d recorded", i), func() bool {
+			inst, _ := h.st.GetEnvInstance(bg, id)
+			return inst.Restarts == restarts+i && inst.Phase == model.PhaseExited
+		})
+	}
+}
+
+// A crash loop's incident closes once the object has been ready for the
+// crash window, and a later crash loop of the same release opens a new
+// one.
+func TestCrashLoopCloses(t *testing.T) {
+	h := newHarness(t, options{timings: func(t *timings) { t.crashWindow = 12 * time.Second }})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	id := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0].Sandbox.ID
+	crash(t, h, n1, env.ID, id, 0, 3)
+	first := h.incident(env.ID, "service/web", model.ConditionCrashLoop, 10*time.Second)
+	eventually(t, 60*time.Second, "the crash loop closed", func() bool {
+		for _, i := range h.incidents(env.ID, false) {
+			if i.ID == first.ID {
+				return !i.ClosedAt.IsZero()
+			}
+		}
+		return false
+	})
+	inst, _ := h.st.GetEnvInstance(bg, id)
+	if inst.Restarts != 0 {
+		t.Errorf("restarts %d after the crash window", inst.Restarts)
+	}
+	crash(t, h, n1, env.ID, id, 0, 3)
+	second := h.incident(env.ID, "service/web", model.ConditionCrashLoop, 10*time.Second)
+	if second.ID == first.ID || second.Release != r1 {
+		t.Fatalf("the second crash loop %+v, the first %+v", second, first)
+	}
+}
+
+// Incidents that nothing else closes: crash_loop, volume_unavailable and
+// addon_unhealthy of objects that neither T nor R has close; a crash
+// loop of an older release closes once a later release is realised.
+func TestIncidentsClose(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	open := func(object, condition string) int64 {
+		i, _, err := h.st.OpenIncident(bg, store.EnvIncident{EnvID: env.ID, Object: object, Release: r1, Condition: condition,
+			Summary: "test", Evidence: []byte("{}")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return i.ID
+	}
+	gone := []int64{open("addon/cache", model.ConditionVolumeUnavailable), open("service/old", model.ConditionCrashLoop),
+		open("addon/cache", model.ConditionAddonUnhealthy)}
+	stays := open("service/web", model.ConditionCrashLoop)
+	closed := func(id int64) bool {
+		for _, i := range h.incidents(env.ID, false) {
+			if i.ID == id {
+				return !i.ClosedAt.IsZero()
+			}
+		}
+		return false
+	}
+	eventually(t, 30*time.Second, "the removed objects' incidents closed", func() bool {
+		h.c.notify(bg, HintReconcile)
+		return closed(gone[0]) && closed(gone[1]) && closed(gone[2])
+	})
+	if closed(stays) {
+		t.Fatal("the crash loop of an object T has closed")
+	}
+	r2 := h.apply(env.ID, serviceSpec(1, "2", ""))
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 30*time.Second)
+	if !closed(stays) {
+		t.Error("the crash loop of release 1 stays open after release 2 was realised")
+	}
+}
