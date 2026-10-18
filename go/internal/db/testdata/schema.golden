@@ -61,6 +61,192 @@ TABLE cluster_secrets
   CONSTRAINT CHECK ((length(value) = 32))
   CONSTRAINT PRIMARY KEY (name)
   CREATE UNIQUE INDEX cluster_secrets_pkey ON public.cluster_secrets USING btree (name)
+TABLE env_attached
+  COLUMN env_id uuid NOT NULL
+  COLUMN service text NOT NULL
+  COLUMN sandbox_id uuid NOT NULL
+  COLUMN sandbox_incarnation uuid
+  COLUMN template_hash text NOT NULL DEFAULT ''::text
+  COLUMN process_id text NOT NULL DEFAULT ''::text
+  COLUMN phase text NOT NULL DEFAULT 'starting'::text
+  COLUMN ready_since timestamp with time zone
+  COLUMN restarts integer NOT NULL DEFAULT 0
+  COLUMN last_exit integer
+  COLUMN probe_failures integer NOT NULL DEFAULT 0
+  COLUMN next_restart_at timestamp with time zone
+  COLUMN hosts_written text NOT NULL DEFAULT ''::text
+  COLUMN detail text NOT NULL DEFAULT ''::text
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK ((phase = ANY (ARRAY['starting'::text, 'ready'::text, 'unready'::text, 'exited'::text, 'failed'::text])))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (env_id, service)
+  CREATE INDEX env_attached_sandbox ON public.env_attached USING btree (sandbox_id)
+  CREATE UNIQUE INDEX env_attached_pkey ON public.env_attached USING btree (env_id, service)
+TABLE env_incidents
+  COLUMN id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
+  COLUMN env_id uuid NOT NULL
+  COLUMN object text NOT NULL
+  COLUMN release integer NOT NULL
+  COLUMN condition text NOT NULL
+  COLUMN opened_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN closed_at timestamp with time zone
+  COLUMN summary text NOT NULL DEFAULT ''::text
+  COLUMN evidence jsonb NOT NULL DEFAULT '{}'::jsonb
+  CONSTRAINT CHECK ((condition = ANY (ARRAY['rollout_failed'::text, 'crash_loop'::text, 'job_failed'::text, 'no_capacity'::text, 'addon_unhealthy'::text, 'volume_unavailable'::text, 'attach_failed'::text])))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (id)
+  CREATE INDEX env_incidents_env ON public.env_incidents USING btree (env_id, id)
+  CREATE UNIQUE INDEX env_incidents_open ON public.env_incidents USING btree (env_id, object, release, condition) WHERE (closed_at IS NULL)
+  CREATE UNIQUE INDEX env_incidents_pkey ON public.env_incidents USING btree (id)
+TABLE env_instances
+  COLUMN sandbox_id uuid NOT NULL
+  COLUMN env_id uuid NOT NULL
+  COLUMN kind text NOT NULL
+  COLUMN object text NOT NULL
+  COLUMN replica integer NOT NULL DEFAULT 0
+  COLUMN template_hash text NOT NULL
+  COLUMN release integer NOT NULL
+  COLUMN phase text NOT NULL DEFAULT 'starting'::text
+  COLUMN ready_since timestamp with time zone
+  COLUMN retire_at timestamp with time zone
+  COLUMN restarts integer NOT NULL DEFAULT 0
+  COLUMN last_exit integer
+  COLUMN probe_failures integer NOT NULL DEFAULT 0
+  COLUMN next_restart_at timestamp with time zone
+  COLUMN exits jsonb NOT NULL DEFAULT '[]'::jsonb
+  COLUMN hosts_written text NOT NULL DEFAULT ''::text
+  COLUMN provisioned_hash text NOT NULL DEFAULT ''::text
+  COLUMN detail text NOT NULL DEFAULT ''::text
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK ((kind = ANY (ARRAY['service'::text, 'addon'::text, 'job'::text])))
+  CONSTRAINT CHECK ((phase = ANY (ARRAY['starting'::text, 'ready'::text, 'unready'::text, 'exited'::text, 'succeeded'::text, 'failed'::text, 'retiring'::text])))
+  CONSTRAINT CHECK ((replica >= 0))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id)
+  CONSTRAINT FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (sandbox_id)
+  CREATE INDEX env_instances_env ON public.env_instances USING btree (env_id, kind, object, replica)
+  CREATE UNIQUE INDEX env_instances_pkey ON public.env_instances USING btree (sandbox_id)
+TABLE env_job_runs
+  COLUMN id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
+  COLUMN env_id uuid NOT NULL
+  COLUMN job text NOT NULL
+  COLUMN template_hash text NOT NULL
+  COLUMN release integer NOT NULL
+  COLUMN attempt integer NOT NULL DEFAULT 1
+  COLUMN sandbox_id uuid
+  COLUMN phase text NOT NULL DEFAULT 'running'::text
+  COLUMN exit_code integer
+  COLUMN detail text NOT NULL DEFAULT ''::text
+  COLUMN log_tail jsonb NOT NULL DEFAULT '[]'::jsonb
+  COLUMN started_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN finished_at timestamp with time zone
+  CONSTRAINT CHECK ((attempt >= 1))
+  CONSTRAINT CHECK ((phase = ANY (ARRAY['running'::text, 'succeeded'::text, 'failed'::text])))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (id)
+  CREATE INDEX env_job_runs_job ON public.env_job_runs USING btree (env_id, job, id)
+  CREATE UNIQUE INDEX env_job_runs_pkey ON public.env_job_runs USING btree (id)
+TABLE env_releases
+  COLUMN env_id uuid NOT NULL
+  COLUMN number integer NOT NULL
+  COLUMN spec jsonb NOT NULL
+  COLUMN base integer NOT NULL
+  COLUMN author text NOT NULL DEFAULT ''::text
+  COLUMN message text NOT NULL DEFAULT ''::text
+  COLUMN annotations jsonb NOT NULL DEFAULT '{}'::jsonb
+  COLUMN origin text NOT NULL
+  COLUMN origin_ref text NOT NULL DEFAULT ''::text
+  COLUMN state text NOT NULL DEFAULT 'pending'::text
+  COLUMN reason text NOT NULL DEFAULT ''::text
+  COLUMN started_at timestamp with time zone
+  COLUMN finished_at timestamp with time zone
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK ((base >= 0))
+  CONSTRAINT CHECK ((number >= 1))
+  CONSTRAINT CHECK ((origin = ANY (ARRAY['apply'::text, 'revert'::text, 'clone'::text, 'object'::text])))
+  CONSTRAINT CHECK ((state = ANY (ARRAY['pending'::text, 'rolling'::text, 'realised'::text, 'failed'::text, 'superseded'::text])))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (env_id, number)
+  CREATE UNIQUE INDEX env_releases_pkey ON public.env_releases USING btree (env_id, number)
+TABLE env_route_tokens
+  COLUMN hash text NOT NULL
+  COLUMN env_id uuid NOT NULL
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN last_used_at timestamp with time zone
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (hash)
+  CREATE INDEX env_route_tokens_env ON public.env_route_tokens USING btree (env_id)
+  CREATE UNIQUE INDEX env_route_tokens_pkey ON public.env_route_tokens USING btree (hash)
+TABLE env_secrets
+  COLUMN env_id uuid NOT NULL
+  COLUMN name text NOT NULL
+  COLUMN version integer NOT NULL
+  COLUMN sealed bytea NOT NULL
+  COLUMN system boolean NOT NULL DEFAULT false
+  COLUMN created_by text NOT NULL DEFAULT ''::text
+  COLUMN deleted_at timestamp with time zone
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK (
+CASE
+    WHEN system THEN (name ~ '^addon\.[a-z0-9._-]{1,121}$'::text)
+    ELSE ((name ~ '^[a-z0-9][a-z0-9._-]{0,62}$'::text) AND (name !~~ 'addon.%'::text))
+END)
+  CONSTRAINT CHECK ((version >= 1))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (env_id, name, version)
+  CREATE UNIQUE INDEX env_secrets_pkey ON public.env_secrets USING btree (env_id, name, version)
+TABLE env_tags
+  COLUMN env_id uuid NOT NULL
+  COLUMN tag text NOT NULL
+  COLUMN number integer NOT NULL
+  COLUMN moved_by text NOT NULL DEFAULT ''::text
+  COLUMN moved_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK ((tag ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'::text))
+  CONSTRAINT FOREIGN KEY (env_id, number) REFERENCES env_releases(env_id, number) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (env_id, tag)
+  CREATE UNIQUE INDEX env_tags_pkey ON public.env_tags USING btree (env_id, tag)
+TABLE env_volumes
+  COLUMN env_id uuid NOT NULL
+  COLUMN object text NOT NULL
+  COLUMN volume_id uuid NOT NULL
+  COLUMN size_mib integer NOT NULL
+  COLUMN node text NOT NULL DEFAULT ''::text
+  COLUMN provisioned boolean NOT NULL DEFAULT false
+  COLUMN holder uuid
+  COLUMN deleting boolean NOT NULL DEFAULT false
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK ((size_mib > 0))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id)
+  CONSTRAINT PRIMARY KEY (env_id, object)
+  CONSTRAINT UNIQUE (volume_id)
+  CREATE INDEX env_volumes_deleting ON public.env_volumes USING btree (env_id) WHERE deleting
+  CREATE UNIQUE INDEX env_volumes_pkey ON public.env_volumes USING btree (env_id, object)
+  CREATE UNIQUE INDEX env_volumes_volume_id_key ON public.env_volumes USING btree (volume_id)
+TABLE environments
+  COLUMN id uuid NOT NULL
+  COLUMN owner text NOT NULL
+  COLUMN name text NOT NULL
+  COLUMN labels jsonb NOT NULL DEFAULT '{}'::jsonb
+  COLUMN release integer NOT NULL DEFAULT 0
+  COLUMN realised integer NOT NULL DEFAULT 0
+  COLUMN deleting boolean NOT NULL DEFAULT false
+  COLUMN gen bigint NOT NULL DEFAULT 0
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK (((name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'::text) AND (name !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::text)))
+  CONSTRAINT CHECK ((realised >= 0))
+  CONSTRAINT CHECK ((release >= 0))
+  CONSTRAINT FOREIGN KEY (owner) REFERENCES tenants(id)
+  CONSTRAINT PRIMARY KEY (id)
+  CONSTRAINT UNIQUE (owner, name)
+  CREATE INDEX environments_owner ON public.environments USING btree (owner, created_at)
+  CREATE UNIQUE INDEX environments_owner_name_key ON public.environments USING btree (owner, name)
+  CREATE UNIQUE INDEX environments_pkey ON public.environments USING btree (id)
 TABLE event_gaps
   COLUMN node text NOT NULL
   COLUMN start_id uuid NOT NULL
@@ -321,16 +507,24 @@ TABLE sandboxes
   COLUMN policy_failed text NOT NULL DEFAULT ''::text
   COLUMN policy_failures integer NOT NULL DEFAULT 0
   COLUMN policy_not_before timestamp with time zone
+  COLUMN environment_id uuid
+  COLUMN pod_template jsonb
+  COLUMN pin_node text NOT NULL DEFAULT ''::text
+  COLUMN idle_after_s integer
+  COLUMN address text NOT NULL DEFAULT ''::text
   CONSTRAINT CHECK (((memory_mib >= 256) AND (memory_mib <= 65536)))
   CONSTRAINT CHECK (((op = ''::text) = (op_id IS NULL)))
   CONSTRAINT CHECK (((vcpus >= 1) AND (vcpus <= 32)))
   CONSTRAINT CHECK ((client_state = ANY (ARRAY['pending'::text, 'creating'::text, 'running'::text, 'pausing'::text, 'paused'::text, 'resuming'::text, 'hibernating'::text, 'hibernated'::text, 'stopped'::text, 'failed'::text, 'unknown'::text, 'lost'::text])))
+  CONSTRAINT CHECK ((idle_after_s >= 0))
   CONSTRAINT CHECK ((op = ANY (ARRAY[''::text, 'create'::text, 'start'::text, 'resume'::text, 'restore'::text, 'pause'::text, 'hibernate'::text, 'repair'::text])))
+  CONSTRAINT FOREIGN KEY (environment_id) REFERENCES environments(id)
   CONSTRAINT FOREIGN KEY (lost_from) REFERENCES nodes(name)
   CONSTRAINT FOREIGN KEY (node) REFERENCES nodes(name)
   CONSTRAINT FOREIGN KEY (owner) REFERENCES tenants(id)
   CONSTRAINT PRIMARY KEY (id)
   CREATE INDEX sandboxes_attention ON public.sandboxes USING btree (client_state) WHERE ((client_state = ANY (ARRAY['unknown'::text, 'creating'::text, 'pending'::text])) OR (unreachable_since IS NOT NULL))
+  CREATE INDEX sandboxes_environment ON public.sandboxes USING btree (environment_id) WHERE (environment_id IS NOT NULL)
   CREATE INDEX sandboxes_idle ON public.sandboxes USING btree (last_active_at) WHERE ((client_state = 'running'::text) AND (op = ''::text))
   CREATE INDEX sandboxes_lost_from ON public.sandboxes USING btree (lost_from) WHERE (lost_from IS NOT NULL)
   CREATE INDEX sandboxes_node ON public.sandboxes USING btree (node) WHERE (node IS NOT NULL)

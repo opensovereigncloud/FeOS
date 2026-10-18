@@ -159,6 +159,11 @@ message StreamContainerLogsRequest {
   bool follow = 2;
   // If true, sends all previous logs before streaming new ones.
   bool tail = 3;
+  // If above 0, sends only the last tail_lines lines of the previous logs
+  // (at most 10000) before streaming new ones, whatever tail says; 0: tail
+  // decides. ferund reads a log tail this way, without follow. A node that
+  // predates this field ignores it.
+  uint32 tail_lines = 4;
 }
 
 message LogEntry {

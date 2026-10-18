@@ -957,7 +957,12 @@ type StreamContainerLogsRequest struct {
 	// but will wait for new log entries.
 	Follow bool `protobuf:"varint,2,opt,name=follow,proto3" json:"follow,omitempty"`
 	// If true, sends all previous logs before streaming new ones.
-	Tail          bool `protobuf:"varint,3,opt,name=tail,proto3" json:"tail,omitempty"`
+	Tail bool `protobuf:"varint,3,opt,name=tail,proto3" json:"tail,omitempty"`
+	// If above 0, sends only the last tail_lines lines of the previous logs
+	// (at most 10000) before streaming new ones, whatever tail says; 0: tail
+	// decides. ferund reads a log tail this way, without follow. A node that
+	// predates this field ignores it.
+	TailLines     uint32 `protobuf:"varint,4,opt,name=tail_lines,json=tailLines,proto3" json:"tail_lines,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1011,6 +1016,13 @@ func (x *StreamContainerLogsRequest) GetTail() bool {
 		return x.Tail
 	}
 	return false
+}
+
+func (x *StreamContainerLogsRequest) GetTailLines() uint32 {
+	if x != nil {
+		return x.TailLines
+	}
+	return 0
 }
 
 type LogEntry struct {
@@ -1364,11 +1376,13 @@ const file_feos_container_v1_container_proto_rawDesc = "" +
 	"containers\";\n" +
 	"\x16DeleteContainerRequest\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\"\x19\n" +
-	"\x17DeleteContainerResponse\"k\n" +
+	"\x17DeleteContainerResponse\"\x8a\x01\n" +
 	"\x1aStreamContainerLogsRequest\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12\x16\n" +
 	"\x06follow\x18\x02 \x01(\bR\x06follow\x12\x12\n" +
-	"\x04tail\x18\x03 \x01(\bR\x04tail\"\x94\x01\n" +
+	"\x04tail\x18\x03 \x01(\bR\x04tail\x12\x1d\n" +
+	"\n" +
+	"tail_lines\x18\x04 \x01(\rR\ttailLines\"\x94\x01\n" +
 	"\bLogEntry\x12\x12\n" +
 	"\x04line\x18\x01 \x01(\fR\x04line\x12:\n" +
 	"\x06source\x18\x02 \x01(\x0e2\".feos.container.v1.LogEntry.SourceR\x06source\"8\n" +

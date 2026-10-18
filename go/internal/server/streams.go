@@ -25,6 +25,7 @@ func buildStreams(i *Instance) Streams {
 	w := watch.New(i.Engine, i.Links, i.DB, i.ID(), i.log)
 	return Streams{
 		Ports:         p,
+		Forwarder:     p,
 		Watches:       w,
 		Run:           []func(context.Context) error{p.Run, w.Run},
 		Loops:         w.Loops(),

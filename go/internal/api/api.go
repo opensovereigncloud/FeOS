@@ -42,6 +42,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/db"
+	envs "github.com/ironcore-dev/feos/go/internal/env"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
@@ -82,6 +83,40 @@ type Bindings interface {
 	KubePreflight(http.ResponseWriter, *http.Request)
 	SSHPreflight(http.ResponseWriter, *http.Request)
 	Access(http.ResponseWriter, *http.Request)
+}
+
+// Environments is the environments service (*env.Service, ADR 0018):
+// one method per environment route, tenant class, and the route door, a
+// class of its own. nil: no environment route is registered.
+type Environments interface {
+	CreateEnv(ctx context.Context, tenant string, req envs.CreateEnvRequest) (envs.EnvStatus, bool, error)
+	ListEnvs(ctx context.Context, tenant string, labels map[string]string) (envs.EnvList, error)
+	GetEnv(ctx context.Context, tenant, envRef string) (envs.EnvStatus, error)
+	DeleteEnv(ctx context.Context, tenant, envRef string) error
+	PlanSpec(ctx context.Context, tenant string, req envs.PlanSpecRequest) (envs.PlanSpecAnswer, error)
+	Plan(ctx context.Context, tenant, envRef string, req envs.PlanRequest) (envs.PlanAnswer, error)
+	Apply(ctx context.Context, tenant, envRef string, req envs.ApplyRequest) (envs.ApplyAnswer, error)
+	Releases(ctx context.Context, tenant, envRef string, limit int) (envs.ReleaseList, error)
+	Release(ctx context.Context, tenant, envRef string, number int) (envs.ReleaseDetail, error)
+	Revert(ctx context.Context, tenant, envRef string, number int, req envs.RevertRequest) (envs.ApplyAnswer, error)
+	PutObject(ctx context.Context, tenant, envRef, kind, name string, req envs.PutObjectRequest) (envs.ObjectAnswer, error)
+	DeleteObject(ctx context.Context, tenant, envRef, kind, name string, req envs.DeleteObjectRequest) (envs.ObjectAnswer, error)
+	Clone(ctx context.Context, tenant, envRef string, req envs.CloneRequest) (envs.EnvStatus, error)
+	Tags(ctx context.Context, tenant, envRef string) (envs.TagList, error)
+	Tag(ctx context.Context, tenant, envRef, tag string) (envs.Tag, error)
+	PutTag(ctx context.Context, tenant, envRef, tag string, req envs.PutTagRequest) (envs.Tag, error)
+	DeleteTag(ctx context.Context, tenant, envRef, tag string) error
+	Secrets(ctx context.Context, tenant, envRef string) (envs.SecretList, error)
+	PutSecret(ctx context.Context, tenant, envRef, name string, req envs.PutSecretRequest) (envs.SecretVersion, error)
+	DeleteSecret(ctx context.Context, tenant, envRef, name string) error
+	Incidents(ctx context.Context, tenant, envRef string, openOnly bool) (envs.IncidentList, error)
+	Incident(ctx context.Context, tenant, envRef string, id int64) (envs.Incident, error)
+	Logs(ctx context.Context, tenant, envRef, kind, name string, lines, replica int) (envs.LogsAnswer, error)
+	RestartService(ctx context.Context, tenant, envRef, name string) error
+	RunJob(ctx context.Context, tenant, envRef, name string) error
+	CreateRouteToken(ctx context.Context, tenant, envRef string) (envs.RouteToken, error)
+	RevokeRouteTokens(ctx context.Context, tenant, envRef string) error
+	ServeRoute(w http.ResponseWriter, r *http.Request)
 }
 
 // Config is the API's part of the instance's configuration.
@@ -149,6 +184,9 @@ type Deps struct {
 	Ports    http.Handler
 	Watches  Watches
 	Bindings Bindings
+	// Environments serves the environment routes; nil: none are
+	// registered.
+	Environments Environments
 	// UI is the built management UI; nil: none.
 	UI fs.FS
 	// Ready is /readyz (§11): server's check of the database, stopping,

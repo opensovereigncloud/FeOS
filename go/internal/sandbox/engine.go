@@ -239,6 +239,9 @@ type Engine struct {
 	// it.
 	resolveImage func(ctx context.Context, image string) (string, error)
 
+	// hooks are the environments' hooks (hooks.go).
+	hooks engineHooks
+
 	runner *runner
 	syncs  syncer
 

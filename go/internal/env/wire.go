@@ -1,0 +1,477 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package env
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/ironcore-dev/feos/go/internal/env/spec"
+)
+
+// The request and answer bodies of the environments' REST routes (the
+// contract's §4.9 and §5), as the API reads and writes them: camelCase,
+// times as RFC 3339 in seconds, UTC ("" for none), release numbers as
+// JSON numbers, incident IDs as strings. Answers carry every field, so
+// that clients see the same shape every time.
+
+// CreateEnvRequest is POST /api/v1/environments.
+type CreateEnvRequest struct {
+	// Name is a DNS label, never a UUID, unique per tenant.
+	Name string `json:"name"`
+	// ID is the environment's UUID; "": a new one. Creating the same ID
+	// and name again answers 200 with the environment.
+	ID     string            `json:"id,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// EnvList is GET /api/v1/environments[?label=k=v…].
+type EnvList struct {
+	Environments []EnvSummary `json:"environments"`
+}
+
+// EnvSummary is an environment in the list.
+type EnvSummary struct {
+	ID       string            `json:"id"`
+	Name     string            `json:"name"`
+	Labels   map[string]string `json:"labels"`
+	Release  int               `json:"release"`
+	Realised int               `json:"realised"`
+	// State is the latest release's state (model.Release…),
+	// model.EnvNone without a release, model.EnvDeleting.
+	State         string `json:"state"`
+	OpenIncidents int    `json:"openIncidents"`
+	CreatedAt     string `json:"createdAt"`
+}
+
+// EnvStatus is GET /api/v1/environments/{env}, and the answer of a create
+// and a clone.
+type EnvStatus struct {
+	ID       string            `json:"id"`
+	Name     string            `json:"name"`
+	Labels   map[string]string `json:"labels"`
+	Release  int               `json:"release"`
+	Realised int               `json:"realised"`
+	Deleting bool              `json:"deleting"`
+	// Rollout is the latest release's; null without a release.
+	Rollout       *RolloutStatus `json:"rollout"`
+	Objects       []ObjectStatus `json:"objects"`
+	Routes        []RouteStatus  `json:"routes"`
+	OpenIncidents int            `json:"openIncidents"`
+	CreatedAt     string         `json:"createdAt"`
+}
+
+// RolloutStatus is the latest release's rollout.
+type RolloutStatus struct {
+	Release   int    `json:"release"`
+	State     string `json:"state"`
+	StartedAt string `json:"startedAt"`
+	Reason    string `json:"reason"`
+}
+
+// ObjectStatus is an object of the environment's target release, as the
+// status shows it. Its JSON has the fields of its kind only:
+//
+//	image service     kind, name, runtime, desired, ready, instances
+//	attached service  kind, name, runtime, sandbox, phase, restarts, lastExit, detail
+//	addon             kind, name, type, version, plan, phase, provisioned, instances
+//	job               kind, name, lastRun (null before its first run)
+type ObjectStatus struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+	// Runtime is a service's (spec.RuntimeImage, spec.RuntimeAttached).
+	Runtime string `json:"runtime,omitempty"`
+	// Desired and Ready count an image service's replicas.
+	Desired int `json:"desired,omitempty"`
+	Ready   int `json:"ready,omitempty"`
+	// Type, Version and Plan are an addon's.
+	Type    string `json:"type,omitempty"`
+	Version string `json:"version,omitempty"`
+	Plan    string `json:"plan,omitempty"`
+	// Phase is an addon's instance's or an attached service's
+	// (model.Phase…).
+	Phase string `json:"phase,omitempty"`
+	// Provisioned: an addon's provisioning ran for its options.
+	Provisioned bool `json:"provisioned,omitempty"`
+	// Sandbox, Restarts, LastExit and Detail are an attached service's.
+	Sandbox  string `json:"sandbox,omitempty"`
+	Restarts int    `json:"restarts,omitempty"`
+	LastExit *int   `json:"lastExit,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+	// Instances are an image service's or an addon's pods.
+	Instances []InstanceStatus `json:"instances,omitempty"`
+	// LastRun is a job's latest run.
+	LastRun *JobRunStatus `json:"lastRun,omitempty"`
+}
+
+// MarshalJSON writes the fields of the object's kind, all of them.
+func (o ObjectStatus) MarshalJSON() ([]byte, error) {
+	inst := o.Instances
+	if inst == nil {
+		inst = []InstanceStatus{}
+	}
+	switch {
+	case o.Kind == spec.KindService && o.Runtime == spec.RuntimeAttached:
+		return json.Marshal(struct {
+			Kind     string `json:"kind"`
+			Name     string `json:"name"`
+			Runtime  string `json:"runtime"`
+			Sandbox  string `json:"sandbox"`
+			Phase    string `json:"phase"`
+			Restarts int    `json:"restarts"`
+			LastExit *int   `json:"lastExit"`
+			Detail   string `json:"detail"`
+		}{o.Kind, o.Name, o.Runtime, o.Sandbox, o.Phase, o.Restarts, o.LastExit, o.Detail})
+	case o.Kind == spec.KindService:
+		return json.Marshal(struct {
+			Kind      string           `json:"kind"`
+			Name      string           `json:"name"`
+			Runtime   string           `json:"runtime"`
+			Desired   int              `json:"desired"`
+			Ready     int              `json:"ready"`
+			Instances []InstanceStatus `json:"instances"`
+		}{o.Kind, o.Name, o.Runtime, o.Desired, o.Ready, inst})
+	case o.Kind == spec.KindAddon:
+		return json.Marshal(struct {
+			Kind        string           `json:"kind"`
+			Name        string           `json:"name"`
+			Type        string           `json:"type"`
+			Version     string           `json:"version"`
+			Plan        string           `json:"plan"`
+			Phase       string           `json:"phase"`
+			Provisioned bool             `json:"provisioned"`
+			Instances   []InstanceStatus `json:"instances"`
+		}{o.Kind, o.Name, o.Type, o.Version, o.Plan, o.Phase, o.Provisioned, inst})
+	case o.Kind == spec.KindJob:
+		return json.Marshal(struct {
+			Kind    string        `json:"kind"`
+			Name    string        `json:"name"`
+			LastRun *JobRunStatus `json:"lastRun"`
+		}{o.Kind, o.Name, o.LastRun})
+	}
+	type plain ObjectStatus
+	return json.Marshal(plain(o))
+}
+
+// InstanceStatus is a pod of an image service or an addon.
+type InstanceStatus struct {
+	// ID is the instance's sandbox row's ID.
+	ID      string `json:"id"`
+	Replica int    `json:"replica"`
+	// Phase is the controller's (model.Phase…), State the row's client
+	// state (model.State…).
+	Phase      string `json:"phase"`
+	State      string `json:"state"`
+	Node       string `json:"node"`
+	Address    string `json:"address"`
+	Release    int    `json:"release"`
+	Restarts   int    `json:"restarts"`
+	LastExit   *int   `json:"lastExit"`
+	ReadySince string `json:"readySince"`
+	Detail     string `json:"detail"`
+}
+
+// JobRunStatus is a run of a job.
+type JobRunStatus struct {
+	Release int `json:"release"`
+	Attempt int `json:"attempt"`
+	// Phase is model.RunRunning, RunSucceeded or RunFailed.
+	Phase      string `json:"phase"`
+	ExitCode   *int   `json:"exitCode"`
+	FinishedAt string `json:"finishedAt"`
+	// Detail says why a run failed without an exit code ("the node did not
+	// report an exit status", "timed out after 10m0s").
+	Detail string `json:"detail"`
+}
+
+// RouteStatus is a route of the realised release (the latest when none
+// is realised), its port resolved to a number.
+type RouteStatus struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Service string `json:"service"`
+	Port    int    `json:"port"`
+}
+
+// PlanSpecRequest is POST /api/v1/environments/plan: validation without
+// an environment.
+type PlanSpecRequest struct {
+	Spec json.RawMessage `json:"spec"`
+}
+
+// PlanSpecAnswer is its answer.
+type PlanSpecAnswer struct {
+	// Valid: no error finding.
+	Valid    bool           `json:"valid"`
+	Findings []spec.Finding `json:"findings"`
+}
+
+// PlanRequest is POST /api/v1/environments/{env}/plan.
+type PlanRequest struct {
+	Spec json.RawMessage `json:"spec"`
+	// Base is the release to diff against; nil: the current one.
+	Base *int `json:"base,omitempty"`
+}
+
+// PlanAnswer is a plan's answer.
+type PlanAnswer struct {
+	Valid    bool             `json:"valid"`
+	Findings []spec.Finding   `json:"findings"`
+	Diff     []spec.DiffEntry `json:"diff"`
+	// Base is the release the diff is against, Current the environment's
+	// current release (0: none); an apply passes Current as its base.
+	Base    int `json:"base"`
+	Current int `json:"current"`
+}
+
+// ApplyRequest is POST /api/v1/environments/{env}/releases.
+type ApplyRequest struct {
+	Spec json.RawMessage `json:"spec"`
+	// Base must be the environment's current release (0: none), or the
+	// apply is refused (BaseMismatchError).
+	Base    int    `json:"base"`
+	Author  string `json:"author,omitempty"`
+	Message string `json:"message,omitempty"`
+	// Annotations are the client's, stored with the release: a string map
+	// of at most 4 KiB ("fecode.dev/revision", …).
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+
+// ReleaseList is GET /api/v1/environments/{env}/releases, newest first.
+type ReleaseList struct {
+	Releases []ReleaseInfo `json:"releases"`
+}
+
+// ReleaseInfo is a release without its spec.
+type ReleaseInfo struct {
+	Number int `json:"number"`
+	// State is model.Release….
+	State string `json:"state"`
+	// Origin is model.Origin…; OriginRef the reverted release's number,
+	// the cloned "<env id>/<number>" or the object "<kind>/<name>".
+	Origin      string            `json:"origin"`
+	OriginRef   string            `json:"originRef"`
+	Author      string            `json:"author"`
+	Message     string            `json:"message"`
+	Annotations map[string]string `json:"annotations"`
+	Base        int               `json:"base"`
+	// Reason is a failed release's.
+	Reason     string `json:"reason"`
+	CreatedAt  string `json:"createdAt"`
+	StartedAt  string `json:"startedAt"`
+	FinishedAt string `json:"finishedAt"`
+	// Tags are the tags on it.
+	Tags []string `json:"tags"`
+}
+
+// ReleaseDetail is GET /api/v1/environments/{env}/releases/{n}: the
+// release, its normalised spec and its diff against release n-1.
+type ReleaseDetail struct {
+	ReleaseInfo
+	Spec json.RawMessage  `json:"spec"`
+	Diff []spec.DiffEntry `json:"diff"`
+}
+
+// ApplyAnswer is the answer of an apply, a revert and an object put or
+// delete: 201 with the new release, or 200 with the current one and
+// Unchanged when the normalised spec equals the current release's (and
+// that one did not fail).
+type ApplyAnswer struct {
+	ReleaseInfo
+	Unchanged bool             `json:"unchanged,omitempty"`
+	Diff      []spec.DiffEntry `json:"diff"`
+	Findings  []spec.Finding   `json:"findings"`
+}
+
+// StatusCode is the answer's HTTP status.
+func (a ApplyAnswer) StatusCode() int {
+	if a.Unchanged {
+		return http.StatusOK
+	}
+	return http.StatusCreated
+}
+
+// RevertRequest is POST /api/v1/environments/{env}/releases/{n}/revert.
+type RevertRequest struct {
+	Base    int    `json:"base"`
+	Author  string `json:"author,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// PutObjectRequest is PUT /api/v1/environments/{env}/objects/{kind}/{name}:
+// the current release's spec with the object set.
+type PutObjectRequest struct {
+	// Object is the object as a spec has it under its kind's map.
+	Object  json.RawMessage `json:"object"`
+	Base    int             `json:"base"`
+	Author  string          `json:"author,omitempty"`
+	Message string          `json:"message,omitempty"`
+	// DryRun plans instead of applying.
+	DryRun bool `json:"dryRun,omitempty"`
+}
+
+// DeleteObjectRequest is DELETE
+// /api/v1/environments/{env}/objects/{kind}/{name}?base=&dryRun=1[&author=&message=],
+// read from the query.
+type DeleteObjectRequest struct {
+	Base    int
+	DryRun  bool
+	Author  string
+	Message string
+}
+
+// ObjectAnswer is an object put's or delete's answer: a plan's (DryRun)
+// or an apply's.
+type ObjectAnswer struct {
+	DryRun bool
+	Plan   PlanAnswer
+	Apply  ApplyAnswer
+}
+
+// MarshalJSON writes the plan or the apply answer.
+func (o ObjectAnswer) MarshalJSON() ([]byte, error) {
+	if o.DryRun {
+		return json.Marshal(o.Plan)
+	}
+	return json.Marshal(o.Apply)
+}
+
+// StatusCode is the answer's HTTP status.
+func (o ObjectAnswer) StatusCode() int {
+	if o.DryRun {
+		return http.StatusOK
+	}
+	return o.Apply.StatusCode()
+}
+
+// CloneRequest is POST /api/v1/environments/{env}/clone: a new
+// environment whose release 1 is the source's release (or Spec).
+type CloneRequest struct {
+	Name string `json:"name"`
+	// ID is the new environment's UUID; "": a new one.
+	ID string `json:"id,omitempty"`
+	// Release is the source's release to clone; nil: its current one.
+	Release *int `json:"release,omitempty"`
+	// Spec, when set, is applied instead of the source release's spec
+	// (whose attached services a clone drops).
+	Spec   json.RawMessage   `json:"spec,omitempty"`
+	Labels map[string]string `json:"labels,omitempty"`
+	// Secrets are the new environment's secrets: copied from the source
+	// (its latest version) or set.
+	Secrets map[string]CloneSecret `json:"secrets,omitempty"`
+	Author  string                 `json:"author,omitempty"`
+	// Data asks for a copy of the addons' data, which is not available: an
+	// error finding.
+	Data bool `json:"data,omitempty"`
+}
+
+// CloneSecret is a secret of a clone: exactly one of {"copy": true} and
+// {"value": "s"}.
+type CloneSecret struct {
+	Copy  bool    `json:"copy,omitempty"`
+	Value *string `json:"value,omitempty"`
+}
+
+// TagList is GET /api/v1/environments/{env}/tags.
+type TagList struct {
+	Tags []Tag `json:"tags"`
+}
+
+// Tag is a movable name of a release.
+type Tag struct {
+	Tag     string `json:"tag"`
+	Release int    `json:"release"`
+	MovedBy string `json:"movedBy"`
+	MovedAt string `json:"movedAt"`
+}
+
+// PutTagRequest is PUT /api/v1/environments/{env}/tags/{tag}.
+type PutTagRequest struct {
+	Release int    `json:"release"`
+	Author  string `json:"author,omitempty"`
+}
+
+// SecretList is GET /api/v1/environments/{env}/secrets: the tenant's
+// secrets of the environment at their latest versions (never a value,
+// never a system secret).
+type SecretList struct {
+	Secrets []SecretInfo `json:"secrets"`
+}
+
+// SecretInfo is a secret's latest version.
+type SecretInfo struct {
+	Name      string `json:"name"`
+	Version   int    `json:"version"`
+	CreatedBy string `json:"createdBy"`
+	CreatedAt string `json:"createdAt"`
+}
+
+// PutSecretRequest is PUT /api/v1/environments/{env}/secrets/{name}: a new
+// version.
+type PutSecretRequest struct {
+	Value  string `json:"value"`
+	Author string `json:"author,omitempty"`
+}
+
+// SecretVersion is a secret put's answer.
+type SecretVersion struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
+}
+
+// IncidentList is GET /api/v1/environments/{env}/incidents[?open=1],
+// newest first.
+type IncidentList struct {
+	Incidents []Incident `json:"incidents"`
+}
+
+// Incident is a condition of an object that needs a look.
+type Incident struct {
+	// ID is the incident's number, as a string.
+	ID string `json:"id"`
+	// Object is "<kind>/<name>".
+	Object  string `json:"object"`
+	Release int    `json:"release"`
+	// Condition is model.Condition….
+	Condition string `json:"condition"`
+	OpenedAt  string `json:"openedAt"`
+	// ClosedAt is "" while it is open.
+	ClosedAt string           `json:"closedAt"`
+	Summary  string           `json:"summary"`
+	Evidence IncidentEvidence `json:"evidence"`
+}
+
+// IncidentEvidence is what the controller saw.
+type IncidentEvidence struct {
+	// Exits are the container's last exits.
+	Exits []Exit `json:"exits,omitempty"`
+	// LogTail is the end of its log.
+	LogTail []string `json:"logTail,omitempty"`
+	// Diff is a failed rollout's diff against the realised release.
+	Diff []spec.DiffEntry `json:"diff,omitempty"`
+	// Placement is why an instance could not be placed.
+	Placement string `json:"placement,omitempty"`
+}
+
+// Exit is an exit of a container (env_instances.exits): when, and its
+// code (null when the node reported none).
+type Exit struct {
+	At   string `json:"at"`
+	Code *int   `json:"code"`
+}
+
+// LogsAnswer is GET /api/v1/environments/{env}/objects/{kind}/{name}/logs.
+type LogsAnswer struct {
+	// Lines are the last lines, oldest first.
+	Lines []string `json:"lines"`
+	// Source is "container" (an image pod's main container) or "process"
+	// (an attached service's process).
+	Source string `json:"source"`
+}
+
+// RouteToken is POST /api/v1/environments/{env}/route-tokens's answer:
+// the token, shown once (only its hash is kept).
+type RouteToken struct {
+	Token string `json:"token"`
+}
