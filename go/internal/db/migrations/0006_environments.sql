@@ -133,6 +133,8 @@ CREATE TABLE env_volumes (                     -- an addon's volume; created onc
   node text NOT NULL DEFAULT '',               -- the node that has it; '': none yet
   provisioned boolean NOT NULL DEFAULT false,  -- created on node: never CreateVolume again
   holder uuid,                                 -- the instance row that last held it
+  addon_type text NOT NULL DEFAULT '',         -- the addon type whose data it holds; fixed
+  data_version text NOT NULL DEFAULT '',       -- the newest blueprint version that ran ready on it
   deleting boolean NOT NULL DEFAULT false,     -- env-volumes deletes it on its node, then the row
   created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (env_id, object));

@@ -23,18 +23,25 @@ type EnvVolume struct {
 	// Provisioned: created on Node; never CreateVolume again.
 	Provisioned bool
 	// Holder is the instance row that last held it; uuid.Nil: NULL.
-	Holder    uuid.UUID
-	Deleting  bool
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Holder uuid.UUID
+	// AddonType is the addon type whose data the volume holds; fixed. A
+	// target addon of another type never mounts it.
+	AddonType string
+	// DataVersion is the newest blueprint version that ran ready on the
+	// volume: what its data was written by, the prev of the blueprint's
+	// Validate for whatever mounts it next.
+	DataVersion string
+	Deleting    bool
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
-const envVolumeCols = "env_id, object, volume_id, size_mib, node, provisioned, holder, deleting, created_at, updated_at"
+const envVolumeCols = "env_id, object, volume_id, size_mib, node, provisioned, holder, addon_type, data_version, deleting, created_at, updated_at"
 
 func scanEnvVolume(row pgx.Row) (EnvVolume, error) {
 	var v EnvVolume
 	var holder *uuid.UUID
-	if err := row.Scan(&v.EnvID, &v.Object, &v.VolumeID, &v.SizeMiB, &v.Node, &v.Provisioned, &holder, &v.Deleting,
+	if err := row.Scan(&v.EnvID, &v.Object, &v.VolumeID, &v.SizeMiB, &v.Node, &v.Provisioned, &holder, &v.AddonType, &v.DataVersion, &v.Deleting,
 		&v.CreatedAt, &v.UpdatedAt); err != nil {
 		return EnvVolume{}, err
 	}
@@ -53,9 +60,10 @@ func collectEnvVolumes(rows pgx.Rows, err error) ([]EnvVolume, error) {
 // volume ID that exists is ErrExists, an unknown environment ErrNoRow.
 func (s *Store) InsertEnvVolume(ctx context.Context, v EnvVolume) (EnvVolume, error) {
 	out, err := scanEnvVolume(s.q.QueryRow(ctx, `INSERT INTO env_volumes (env_id, object, volume_id, size_mib, node,
-			provisioned, holder, deleting)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING `+envVolumeCols,
-		v.EnvID, v.Object, v.VolumeID, v.SizeMiB, v.Node, v.Provisioned, nullUUID(v.Holder), v.Deleting))
+			provisioned, holder, addon_type, data_version, deleting)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING `+envVolumeCols,
+		v.EnvID, v.Object, v.VolumeID, v.SizeMiB, v.Node, v.Provisioned, nullUUID(v.Holder), v.AddonType, v.DataVersion,
+		v.Deleting))
 	if err != nil {
 		return EnvVolume{}, insertError("insert volume of "+v.Object, err)
 	}
@@ -101,20 +109,22 @@ func (s *Store) DeletingEnvVolumes(ctx context.Context, limit int) ([]EnvVolume,
 		WHERE deleting ORDER BY updated_at, volume_id LIMIT $1`, limit))
 }
 
-// UpdateEnvVolume writes the node, provisioned, holder and deleting in
+// UpdateEnvVolume writes the node, provisioned, holder, data version and
+// deleting in
 // which after differs from before (updated_at = now()); the other columns
 // are refused. When nothing differs, before is returned unwritten.
 func (s *Store) UpdateEnvVolume(ctx context.Context, before, after EnvVolume) (EnvVolume, error) {
 	what := fmt.Sprintf("volume of %s of environment %s", before.Object, before.EnvID)
 	if err := fixed(what, map[string]bool{"env_id": before.EnvID != after.EnvID, "object": before.Object != after.Object,
 		"volume_id": before.VolumeID != after.VolumeID, "size_mib": before.SizeMiB != after.SizeMiB,
-		"created_at": !before.CreatedAt.Equal(after.CreatedAt)}); err != nil {
+		"addon_type": before.AddonType != after.AddonType, "created_at": !before.CreatedAt.Equal(after.CreatedAt)}); err != nil {
 		return EnvVolume{}, err
 	}
 	u := newUpdates(before.EnvID, before.Object)
 	u.set("node", before.Node != after.Node, after.Node)
 	u.set("provisioned", before.Provisioned != after.Provisioned, after.Provisioned)
 	u.set("holder", before.Holder != after.Holder, nullUUID(after.Holder))
+	u.set("data_version", before.DataVersion != after.DataVersion, after.DataVersion)
 	u.set("deleting", before.Deleting != after.Deleting, after.Deleting)
 	if u.empty() {
 		return before, nil

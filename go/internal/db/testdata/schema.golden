@@ -217,6 +217,8 @@ TABLE env_volumes
   COLUMN node text NOT NULL DEFAULT ''::text
   COLUMN provisioned boolean NOT NULL DEFAULT false
   COLUMN holder uuid
+  COLUMN addon_type text NOT NULL DEFAULT ''::text
+  COLUMN data_version text NOT NULL DEFAULT ''::text
   COLUMN deleting boolean NOT NULL DEFAULT false
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
