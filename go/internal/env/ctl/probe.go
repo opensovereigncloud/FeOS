@@ -270,7 +270,7 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 	seen, due := c.seenDue(sb.ID.String(), fmt.Sprintf("%s/%d/%s", sb.Incarnation, inst.Restarts, class), chk)
 	if due {
 		ok, why := c.runCheck(ctx, lease(sb), chk, seen)
-		if inst.Kind == spec.KindAddon {
+		if !ok && inst.Kind == spec.KindAddon {
 			why = redact(why, c.addonSecrets(ctx, v, inst.Object))
 		}
 		applyCheck(ok, why, chk, v.now, &after.Phase, &after.ReadySince, &after.ProbeFailures, &after.Detail)
@@ -356,10 +356,11 @@ func (c *Controller) instanceExited(ctx context.Context, v *view, r store.EnvIns
 		after.LastExit = code
 		after.Exits = appendExit(inst.Exits, store.EnvExit{At: now, Code: code})
 		after.Phase, after.ReadySince, after.ProbeFailures = model.PhaseExited, time.Time{}, 0
-		after.NextRestartAt = now.Add(c.backoff(after.Restarts))
-		after.Detail = "the container exited"
+		wait := c.backoff(after.Restarts)
+		after.NextRestartAt = now.Add(wait)
+		after.Detail = "exited without a code; restarting in " + wait.String()
 		if code != nil {
-			after.Detail = fmt.Sprintf("the container exited with code %d", *code)
+			after.Detail = fmt.Sprintf("exited with code %d; restarting in %s", *code, wait)
 		}
 		if _, err := tx.UpdateEnvInstance(ctx, inst, after); err != nil {
 			return err
@@ -376,7 +377,7 @@ func (c *Controller) instanceExited(ctx context.Context, v *view, r store.EnvIns
 				last = fmt.Sprintf("with code %d", *code)
 			}
 			summary := fmt.Sprintf("%s (release %d) exited %d times within %s, last %s", r.Instance.Object, inst.Release,
-				recent, c.t.crashWindow, last)
+				recent, spell(c.t.crashWindow), last)
 			if _, err := openIncident(ctx, tx, v.env.ID, obj, inst.Release, model.ConditionCrashLoop, summary,
 				evidence{Exits: after.Exits, LogTail: tail}); err != nil {
 				return err
@@ -436,4 +437,16 @@ func (c *Controller) syncInstanceHosts(ctx context.Context, v *view, r store.Env
 // an address.
 func addonsContext(v *view, name string) addons.Context {
 	return addons.Context{Env: v.env.Name, Name: name}
+}
+
+// spell writes a duration as the incidents' summaries do: whole minutes
+// as "10 minutes", anything else as Go writes it.
+func spell(d time.Duration) string {
+	switch {
+	case d == time.Minute:
+		return "1 minute"
+	case d > 0 && d%time.Minute == 0:
+		return fmt.Sprintf("%d minutes", d/time.Minute)
+	}
+	return d.String()
 }

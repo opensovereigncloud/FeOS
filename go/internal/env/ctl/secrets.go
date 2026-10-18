@@ -97,16 +97,19 @@ func (c *Controller) ensureCredentials(ctx context.Context, envID uuid.UUID, add
 		}
 		blobs = append(blobs, sealed{name, blob})
 	}
-	return c.fenced(ctx, func(tx *store.Store) error {
-		for _, b := range blobs {
+	// One transaction each: a credential made meanwhile (ErrExists) ends
+	// its transaction, and stays as it is.
+	for _, b := range blobs {
+		err := c.fenced(ctx, func(tx *store.Store) error {
 			_, err := tx.InsertSecret(ctx, store.EnvSecret{EnvID: envID, Name: b.name, Version: 1, Sealed: b.blob,
 				System: true, CreatedBy: "ferund"})
-			if err != nil && !errors.Is(err, store.ErrExists) {
-				return err
-			}
+			return err
+		})
+		if err != nil && !errors.Is(err, store.ErrExists) {
+			return err
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // resolvedEnv is an env with its secrets' values, and those values (for

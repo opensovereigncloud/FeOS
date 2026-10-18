@@ -280,6 +280,15 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
+func TestSpell(t *testing.T) {
+	for d, want := range map[time.Duration]string{10 * time.Minute: "10 minutes", time.Minute: "1 minute",
+		90 * time.Second: "1m30s", 2 * time.Second: "2s"} {
+		if got := spell(d); got != want {
+			t.Errorf("spell(%v) %q, want %q", d, got, want)
+		}
+	}
+}
+
 func TestApplyCheck(t *testing.T) {
 	chk := check{threshold: 2}
 	now := time.Now()

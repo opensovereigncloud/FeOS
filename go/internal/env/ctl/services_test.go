@@ -182,7 +182,8 @@ func TestCrashLoopAndRolloutFailure(t *testing.T) {
 			return inst.Restarts == i && inst.Phase == model.PhaseExited
 		})
 		last := inst.Exits[len(inst.Exits)-1]
-		if last.Code == nil || *last.Code != 1 || inst.LastExit == nil || *inst.LastExit != 1 {
+		if last.Code == nil || *last.Code != 1 || inst.LastExit == nil || *inst.LastExit != 1 ||
+			!strings.HasPrefix(inst.Detail, "exited with code 1; restarting in ") {
 			t.Fatalf("exit %+v", inst)
 		}
 		if !inst.NextRestartAt.IsZero() {
@@ -195,7 +196,7 @@ func TestCrashLoopAndRolloutFailure(t *testing.T) {
 	inc := h.incident(env.ID, "service/web", model.ConditionCrashLoop, 10*time.Second)
 	var ev evidence
 	if err := json.Unmarshal(inc.Evidence, &ev); err != nil || len(ev.Exits) != 3 || len(ev.LogTail) != 3 ||
-		inc.Release != r1 || !strings.HasPrefix(inc.Summary, "web (release 1) exited 3 times within 10m0s, last with code 1") {
+		inc.Release != r1 || inc.Summary != "web (release 1) exited 3 times within 10 minutes, last with code 1" {
 		t.Fatalf("incident %+v %+v", inc, ev)
 	}
 	// Restarted once more, it is ready again.

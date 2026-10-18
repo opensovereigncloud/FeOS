@@ -126,14 +126,15 @@ func (c *Controller) addonVolume(ctx context.Context, v *view, bp addons.Bluepri
 	}
 	var out store.EnvVolume
 	err := c.fenced(ctx, func(tx *store.Store) error {
-		vol, err := tx.InsertEnvVolume(ctx, store.EnvVolume{EnvID: v.env.ID, Object: object, VolumeID: uuid.New(),
+		var err error
+		out, err = tx.InsertEnvVolume(ctx, store.EnvVolume{EnvID: v.env.ID, Object: object, VolumeID: uuid.New(),
 			SizeMiB: plan.VolumeMib})
-		if errors.Is(err, store.ErrExists) {
-			vol, err = tx.GetEnvVolume(ctx, v.env.ID, object)
-		}
-		out = vol
 		return err
 	})
+	if errors.Is(err, store.ErrExists) {
+		// Recorded meanwhile (the failed insert ended its transaction).
+		out, err = c.st.GetEnvVolume(ctx, v.env.ID, object)
+	}
 	if err != nil {
 		return store.EnvVolume{}, err
 	}

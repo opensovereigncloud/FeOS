@@ -47,6 +47,11 @@ func (c *Controller) stepAttached(ctx context.Context, s *stepState) {
 			c.recordAttached(ctx, s, p)
 			continue
 		}
+		if c.d.Runner == nil {
+			c.attachedDetail(ctx, v.env.ID, name, "attached services need the tools' runner, which this instance lacks")
+			s.wait("attached service %s: no tools' runner", name)
+			continue
+		}
 		if a.SandboxID != p.sandbox {
 			c.moveAttached(ctx, v, a, p)
 			s.wait("attached service %s moves to sandbox %s", name, p.sandbox)
@@ -86,18 +91,14 @@ func (c *Controller) stepAttached(ctx context.Context, s *stepState) {
 // recordAttached records an attached service of T.
 func (c *Controller) recordAttached(ctx context.Context, s *stepState, p *attachedPlan) {
 	err := c.fenced(ctx, func(tx *store.Store) error {
-		_, err := tx.InsertAttached(ctx, store.EnvAttached{EnvID: s.v.env.ID, Service: p.name, SandboxID: p.sandbox,
-			Phase: model.PhaseStarting})
-		if errors.Is(err, store.ErrExists) {
-			return nil
-		}
-		if err != nil {
+		if _, err := tx.InsertAttached(ctx, store.EnvAttached{EnvID: s.v.env.ID, Service: p.name, SandboxID: p.sandbox,
+			Phase: model.PhaseStarting}); err != nil {
 			return err
 		}
 		// The sandbox joins the environment's group.
 		return tx.Notify(ctx, db.ChanLeader, HintGroups)
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, store.ErrExists) {
 		s.wait("attached service %s: %v", p.name, err)
 		return
 	}
