@@ -228,7 +228,7 @@ func (c *Controller) realisedService(ctx context.Context, v *view, name string) 
 	if v.env.Realised == 0 {
 		return spec.Service{}, false
 	}
-	sp, err := c.releaseSpec(ctx, v.env.ID, v.env.Realised)
+	sp, err := c.releaseSpec(ctx, v.env, v.env.Realised)
 	if err != nil {
 		return v.target.Services[name], true
 	}

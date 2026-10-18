@@ -174,7 +174,7 @@ func (c *Controller) dataRefusal(ctx context.Context, v *view, p *addonPlan, vol
 		prev.Type = vol.AddonType
 	}
 	if hasCur {
-		if sp, err := c.releaseSpec(ctx, v.env.ID, cur.Instance.Release); err == nil {
+		if sp, err := c.releaseSpec(ctx, v.env, cur.Instance.Release); err == nil {
 			if ra, ok := sp.Addons[p.name]; ok && ra.Type == prev.Type {
 				ran := specAddon(p.bp, p.name, ra)
 				prev.Plan, prev.Options = ran.Plan, ran.Options

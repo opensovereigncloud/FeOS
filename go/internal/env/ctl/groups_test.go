@@ -300,3 +300,29 @@ func TestNoCapacity(t *testing.T) {
 	h.waitRelease(env.ID, r2, model.ReleaseRealised, 30*time.Second)
 	eventually(t, 30*time.Second, "the incident closed", func() bool { return len(h.incidents(env.ID, true)) == 0 })
 }
+
+// An environment's ID taken again after its deletion is another
+// environment: the controller brings up the new one's release 1, not the
+// spec it read of the old one's.
+func TestEnvIDReused(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"old":{"image":%q}}}`, testImage))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	h.exec(`UPDATE environments SET deleting = true WHERE id = $1`, env.ID)
+	eventually(t, 60*time.Second, "the environment gone", func() bool {
+		_, err := h.st.GetEnvironment(bg, env.ID)
+		return errors.Is(err, store.ErrNoRow)
+	})
+	again, err := h.st.InsertEnvironment(bg, store.NewEnvironment{ID: env.ID, Owner: testTenant, Name: "stage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := h.apply(again.ID, fmt.Sprintf(`{"services":{"new":{"image":%q}}}`, testImage))
+	h.waitRelease(again.ID, r, model.ReleaseRealised, 30*time.Second)
+	rows := h.rows(again.ID)
+	if len(rows) != 1 || rows[0].Instance.Object != "new" {
+		t.Fatalf("rows of the new environment %+v", rows)
+	}
+}

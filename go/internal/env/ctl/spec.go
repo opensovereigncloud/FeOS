@@ -23,10 +23,13 @@ import (
 // by the service's apply), but never relies on the normalisation: every
 // default of the contract's §3 is applied here where a field is empty.
 
-// specKey names a release.
+// specKey names a release: of the environment of its ID created when
+// (an environment's ID is free again once it is deleted, and the client
+// chooses it, so the ID alone does not name the environment).
 type specKey struct {
-	env    uuid.UUID
-	number int
+	env     uuid.UUID
+	created time.Time
+	number  int
 }
 
 // specCache keeps parsed specs: a release's spec never changes.
@@ -42,24 +45,19 @@ const maxCachedSpecs = 1024
 
 // releaseSpec reads (and caches) the spec of release number of the
 // environment.
-func (c *Controller) releaseSpec(ctx context.Context, envID uuid.UUID, number int) (*spec.Spec, error) {
-	k := specKey{envID, number}
+func (c *Controller) releaseSpec(ctx context.Context, env store.Environment, number int) (*spec.Spec, error) {
+	k := specKey{env: env.ID, created: env.CreatedAt, number: number}
 	c.specs.mu.Lock()
 	s, ok := c.specs.m[k]
 	c.specs.mu.Unlock()
 	if ok {
 		return s, nil
 	}
-	r, err := c.st.GetRelease(ctx, envID, number)
+	r, err := c.st.GetRelease(ctx, env.ID, number)
 	if err != nil {
 		return nil, fmt.Errorf("release %d: %w", number, err)
 	}
-	return c.cacheSpec(r)
-}
-
-// cacheSpec parses a release's spec into the cache.
-func (c *Controller) cacheSpec(r store.EnvRelease) (*spec.Spec, error) {
-	s := &spec.Spec{}
+	s = &spec.Spec{}
 	if err := json.Unmarshal(r.Spec, s); err != nil {
 		return nil, fmt.Errorf("release %d of environment %s: its spec: %w", r.Number, r.EnvID, err)
 	}
@@ -68,7 +66,7 @@ func (c *Controller) cacheSpec(r store.EnvRelease) (*spec.Spec, error) {
 	if len(c.specs.m) >= maxCachedSpecs {
 		c.specs.m = map[specKey]*spec.Spec{}
 	}
-	c.specs.m[specKey{r.EnvID, r.Number}] = s
+	c.specs.m[k] = s
 	return s, nil
 }
 
@@ -269,14 +267,14 @@ func (c *Controller) load(ctx context.Context, envID uuid.UUID) (*view, error) {
 	} else if v.latest, err = c.st.GetRelease(ctx, envID, env.Release); err != nil {
 		return nil, fmt.Errorf("release %d: %w", env.Release, err)
 	}
-	if v.latestSpec, err = c.releaseSpec(ctx, envID, env.Release); err != nil {
+	if v.latestSpec, err = c.releaseSpec(ctx, env, env.Release); err != nil {
 		return nil, err
 	}
 	switch {
 	case v.latest.State != model.ReleaseFailed:
 		v.target, v.targetNum, v.targetIsLatest = v.latestSpec, env.Release, true
 	case env.Realised > 0:
-		if v.target, err = c.releaseSpec(ctx, envID, env.Realised); err != nil {
+		if v.target, err = c.releaseSpec(ctx, env, env.Realised); err != nil {
 			return nil, err
 		}
 		v.targetNum = env.Realised

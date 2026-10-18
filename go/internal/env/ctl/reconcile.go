@@ -341,7 +341,7 @@ func (c *Controller) failRelease(ctx context.Context, v *view, reason, object, c
 func (c *Controller) releaseDiff(ctx context.Context, v *view) []spec.DiffEntry {
 	var prev *spec.Spec
 	if v.env.Realised > 0 {
-		prev, _ = c.releaseSpec(ctx, v.env.ID, v.env.Realised)
+		prev, _ = c.releaseSpec(ctx, v.env, v.env.Realised)
 	}
 	return spec.Diff(prev, v.latestSpec)
 }
