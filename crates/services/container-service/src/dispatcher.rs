@@ -180,7 +180,7 @@ impl Dispatcher {
                         state: rec.status.state as i32,
                         config: Some(rec.config),
                         pid: rec.status.process_id,
-                        exit_code: None, // This would require waiting for the process
+                        exit_code: rec.status.exit_code,
                     });
                 let _ = responder.send(result);
             }
@@ -196,13 +196,23 @@ impl Dispatcher {
                                 state: rec.status.state as i32,
                                 config: Some(rec.config),
                                 pid: rec.status.process_id,
-                                exit_code: None,
+                                exit_code: rec.status.exit_code,
                             })
                             .collect();
                         ListContainersResponse { containers }
                     })
                     .map_err(ContainerServiceError::Persistence);
                 let _ = responder.send(result);
+            }
+            Command::StreamContainerLogs(req, responder) => {
+                match Self::get_container_record(&repository, &req.container_id).await {
+                    Ok(_) => {
+                        tokio::spawn(worker::handle_stream_logs(req, responder, repository));
+                    }
+                    Err(e) => {
+                        let _ = responder.send(Err(e));
+                    }
+                }
             }
             Command::Exec(req, responder) => {
                 let record = Self::get_container_record(&repository, &req.container_id).await;

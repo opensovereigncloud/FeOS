@@ -160,6 +160,17 @@ reaps.
   does not know are stopped, and interrupted creations are removed. A
   container survives a reboot of the guest with its writable layer, and a
   create with `adopt` takes it over.
+- A container's exit code, 128 + the signal when it was killed, is in its
+  record from when its process exits until it starts again or is
+  adopted. `GetContainer` and `ListContainers` report it, and so feosd's
+  `GetPod`; a container that did not survive a reboot has none.
+- A container's stdout and stderr go to one file, `logs/container.log` in
+  its directory, which an adoption keeps. `StreamContainerLogs` serves
+  it: the last `tail_lines` lines (at most 10 000, found reading back
+  from the end), or all of it with `tail`, then with `follow` what the
+  container appends, until the container is deleted or the caller ends
+  the call. A line goes out without its newline, one over 64 KiB in
+  parts; the source of a line is not known.
 
 ## Power
 

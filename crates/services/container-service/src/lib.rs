@@ -5,16 +5,17 @@ use crate::error::ContainerServiceError;
 use feos_proto::container_service::{
     ContainerInfo, CreateContainerRequest, CreateContainerResponse, DeleteContainerRequest,
     DeleteContainerResponse, ExecRequest, GetContainerRequest, ListContainersRequest,
-    ListContainersResponse, StartContainerRequest, StartContainerResponse, StopContainerRequest,
-    StopContainerResponse,
+    ListContainersResponse, LogEntry, StartContainerRequest, StartContainerResponse,
+    StopContainerRequest, StopContainerResponse, StreamContainerLogsRequest,
 };
 use feos_proto::task_service::ExecFrame;
-use tokio::sync::oneshot;
-use tonic::Streaming;
+use tokio::sync::{mpsc, oneshot};
+use tonic::{Status, Streaming};
 
 pub mod api;
 pub mod dispatcher;
 pub mod error;
+pub mod logs;
 pub mod persistence;
 pub mod runtime;
 pub mod worker;
@@ -48,6 +49,10 @@ pub enum Command {
         ExecRequest,
         oneshot::Sender<Result<Streaming<ExecFrame>, ContainerServiceError>>,
     ),
+    StreamContainerLogs(
+        StreamContainerLogsRequest,
+        oneshot::Sender<Result<mpsc::Receiver<Result<LogEntry, Status>>, ContainerServiceError>>,
+    ),
 }
 
 impl std::fmt::Debug for Command {
@@ -64,6 +69,9 @@ impl std::fmt::Debug for Command {
                 f.debug_tuple("DeleteContainer").field(req).finish()
             }
             Command::Exec(req, _) => f.debug_tuple("Exec").field(req).finish(),
+            Command::StreamContainerLogs(req, _) => {
+                f.debug_tuple("StreamContainerLogs").field(req).finish()
+            }
         }
     }
 }
