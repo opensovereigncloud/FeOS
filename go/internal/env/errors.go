@@ -117,18 +117,35 @@ func WriteError(w http.ResponseWriter, err error) {
 	apierr.Write(w, err)
 }
 
-// errNotImplemented is the answer of an operation that a later lane
-// implements: 501.
-func errNotImplemented(what string) error {
-	return apierr.New(http.StatusNotImplemented, "environments: %s is not implemented yet", what)
-}
-
 // errNoEnvironment is the answer for an environment the tenant does not
 // have (absent or foreign alike).
 func errNoEnvironment() error { return apierr.New(http.StatusNotFound, textNoEnvironment) }
 
 // errNoSecrets is the answer of the secrets routes without a sealer.
 func errNoSecrets() error { return apierr.New(http.StatusServiceUnavailable, textNoSecrets) }
+
+// errBadRequest is a 400 of a request that cannot be served as it is.
+func errBadRequest(format string, args ...any) error {
+	return apierr.New(http.StatusBadRequest, format, args...)
+}
+
+// errNoRelease, errNoTag, errNoSecret and errNoIncident are the 404s of
+// what the environment does not have.
+func errNoRelease() error  { return apierr.New(http.StatusNotFound, "no such release") }
+func errNoTag() error      { return apierr.New(http.StatusNotFound, "no such tag") }
+func errNoSecret() error   { return apierr.New(http.StatusNotFound, "no such secret") }
+func errNoIncident() error { return apierr.New(http.StatusNotFound, "no such incident") }
+
+// errNoObject is the 404 of an object the environment's release does not
+// have.
+func errNoObject(kind, name string) error {
+	return apierr.New(http.StatusNotFound, "no such object: %s/%s", kind, name)
+}
+
+// errDeleting refuses a change of an environment being deleted.
+func errDeleting(name string) error {
+	return apierr.New(http.StatusConflict, "environment %s is being deleted", name)
+}
 
 func nonNilFindings(fs []spec.Finding) []spec.Finding {
 	if fs == nil {
