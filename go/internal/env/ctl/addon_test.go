@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -548,4 +549,61 @@ func TestAddonRefusedOnItsData(t *testing.T) {
 	never(t, 3*time.Second, "an instance started on the newer data", func() bool {
 		return len(h.rowsOf(env.ID, spec.KindAddon, "db")) != 0
 	})
+}
+
+// failingProvisioning makes the node's provisioning steps ("sh") exit
+// with code's value, echoing the step's credential (and its URL escaping)
+// on stderr as a failed psql statement may; 0 hands them to the node (exit
+// 0). It returns how many provisioning steps ran.
+func failingProvisioning(n *testnode.Node, code *atomic.Int32) *atomic.Int32 {
+	var runs atomic.Int32
+	n.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+		if len(req.Command) == 0 || req.Command[0] != "sh" {
+			return 0, false, nil
+		}
+		runs.Add(1)
+		c := code.Load()
+		if c == 0 {
+			return 0, false, nil
+		}
+		pw := req.Env["PGPASSWORD"]
+		_ = out.Stderr([]byte(fmt.Sprintf("psql: error: password authentication failed for %s (%s)\n", pw, escapeUserinfo(pw))))
+		return c, true, nil
+	})
+	return &runs
+}
+
+// A provisioning step that fails keeps the addon unprovisioned and the
+// release rolling, with the step's output as the instance's detail and
+// the credentials redacted from it; the step runs again after the retry
+// wait, and once it succeeds the release is realised.
+func TestAddonProvisioningFails(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	var code atomic.Int32
+	code.Store(1)
+	runs := failingProvisioning(n1, &code)
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, postgresSpec)
+	row := h.waitRows(env.ID, spec.KindAddon, "postgres", 1, 60*time.Second, "failing its provisioning", func(r store.EnvInstanceRow) bool {
+		return strings.Contains(r.Instance.Detail, "provisioning step provision exited 1")
+	})[0]
+	pw, err := h.c.ResolveSecret(bg, env.ID, "addon.postgres.password", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := row.Instance.Detail; !strings.Contains(d, redactedMark) || strings.Contains(d, pw) ||
+		strings.Contains(d, escapeUserinfo(pw)) || row.Instance.ProvisionedHash != "" {
+		t.Fatalf("instance %+v", row.Instance)
+	}
+	eventually(t, 10*time.Second, "the step run again", func() bool { return runs.Load() >= 2 })
+	if rel := h.release(env.ID, r1); rel.State != model.ReleaseRolling {
+		t.Fatalf("release %s while its addon is not provisioned", rel.State)
+	}
+	code.Store(0)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	row = h.waitRows(env.ID, spec.KindAddon, "postgres", 1, 10*time.Second, "ready", ready)[0]
+	if row.Instance.ProvisionedHash == "" || row.Instance.Detail != "" {
+		t.Fatalf("instance after the provisioning %+v", row.Instance)
+	}
 }

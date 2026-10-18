@@ -159,13 +159,18 @@ func (c *Controller) runCheck(ctx context.Context, l model.Lease, chk check, see
 
 // applyCheck moves a phase by a check's outcome (§4.4): starting →
 // ready on the first success; ready → unready after threshold failures in
-// a row; unready → ready on a success.
+// a row; unready → ready on a success. A success clears the detail the
+// checks (or the start) wrote, never one of a ready instance that passes
+// its checks (a failed provisioning's, which stays until it succeeds).
 func applyCheck(ok bool, why string, chk check, now time.Time, phase *string, readySince *time.Time, failures *int, detail *string) {
 	if ok {
+		if *phase != model.PhaseReady || *failures > 0 {
+			*detail = ""
+		}
 		if *phase != model.PhaseReady {
 			*phase, *readySince = model.PhaseReady, now
 		}
-		*failures, *detail = 0, ""
+		*failures = 0
 		return
 	}
 	*failures++
