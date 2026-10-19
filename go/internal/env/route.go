@@ -25,11 +25,16 @@ import (
 
 // The route door's plain answers.
 const (
-	textRouteToken = "route token required"
-	textDotDot     = "the path has a .. segment"
-	textDot        = "the path has a . segment"
-	textNoDoor     = "not available on this instance"
+	textRouteToken  = "route token required"
+	textDotDot      = "the path has a .. segment"
+	textDot         = "the path has a . segment"
+	textNoDoor      = "not available on this instance"
+	textRouteFailed = "the route door failed"
 )
+
+// RouteTokenHeader carries a route token to the route door beside the
+// client's own Authorization, which then reaches the upstream.
+const RouteTokenHeader = "X-FeRun-Route-Token"
 
 // mintRouteToken returns a new route token and its hash: 32 random
 // bytes, base64url without padding. Only the hash is stored.
@@ -49,6 +54,17 @@ func bearer(r *http.Request) string {
 		return ""
 	}
 	return strings.TrimSpace(h[len("Bearer "):])
+}
+
+// routeToken is a request's route token and the headers that carried
+// it, which stop at the door: RouteTokenHeader's when it is set (the
+// client's Authorization then goes on to the upstream), else
+// Authorization's bearer token (old clients; Authorization stops).
+func routeToken(r *http.Request) (string, []string) {
+	if tok := strings.TrimSpace(r.Header.Get(RouteTokenHeader)); tok != "" {
+		return tok, []string{RouteTokenHeader}
+	}
+	return bearer(r), []string{"Authorization", RouteTokenHeader}
 }
 
 // routePath is the path the route door forwards: the request's path
@@ -173,8 +189,10 @@ func rawOf(path, raw string) string {
 
 // ServeRoute is the route door, ANY
 // /api/v1/environments/{env}/http/{path...}, an auth class of its own: a
-// route token of the environment as Bearer (401 "route token required";
-// a tenant token is refused the same way), the longest segment-aware
+// route token of the environment in X-FeRun-Route-Token, else as Bearer
+// (401 "route token required"; a tenant token is refused the same way),
+// which stops here (from X-FeRun-Route-Token, the client's Authorization
+// goes on to the upstream), the longest segment-aware
 // prefix match over the routes of the realised release (the latest when
 // none is), and the request forwarded through the port door to a ready
 // instance of the route's service, round-robin, or, when none is ready,
@@ -185,10 +203,11 @@ func rawOf(path, raw string) string {
 // go to its sandbox, only while that is the environment owner's and the
 // incarnation its process was started in (else 503). The path is
 // stripped of the route's path when the route says so; the query is
-// kept. Its answers are plain text.
+// kept. Its answers are plain text; a failure inside ferund is logged
+// and answered 500 "the route door failed", without its cause.
 func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tok := bearer(r)
+	tok, creds := routeToken(r)
 	if tok == "" {
 		http.Error(w, textRouteToken, http.StatusUnauthorized)
 		return
@@ -284,7 +303,7 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, refusal, http.StatusServiceUnavailable)
 			return
 		}
-		s.d.Ports.ForwardTo(w, r, id, port, upPath, upRaw)
+		s.d.Ports.ForwardTo(w, r, id, port, upPath, upRaw, creds)
 		return
 	}
 	inst, err := s.pickInstance(ctx, e.ID, route.Service)
@@ -315,7 +334,7 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "route "+route.Path+" names no port of "+route.Service, http.StatusBadGateway)
 		return
 	}
-	s.d.Ports.ForwardTo(w, r, inst.id, port, upPath, upRaw)
+	s.d.Ports.ForwardTo(w, r, inst.id, port, upPath, upRaw, creds)
 }
 
 // attachedSandbox is the sandbox an attached service's requests go to:
@@ -388,6 +407,8 @@ func (s *Service) pickInstance(ctx context.Context, envID uuid.UUID, service str
 }
 
 // routeFailed answers a route door request that failed inside ferund.
+// The door serves anonymous clients, so the cause (database addresses,
+// sandbox IDs) goes to the log only.
 func (s *Service) routeFailed(w http.ResponseWriter, r *http.Request, err error) {
 	var ae *apierr.Error
 	if errors.As(err, &ae) && ae.Status < 500 {
@@ -395,5 +416,5 @@ func (s *Service) routeFailed(w http.ResponseWriter, r *http.Request, err error)
 		return
 	}
 	s.log.Warn("route door request failed", "path", r.URL.Path, "err", err)
-	http.Error(w, "the route door failed: "+err.Error(), http.StatusInternalServerError)
+	http.Error(w, textRouteFailed, http.StatusInternalServerError)
 }

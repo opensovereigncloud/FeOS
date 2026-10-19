@@ -147,7 +147,8 @@ func (s *Service) resolveImages(ctx context.Context, images []string) map[string
 
 // loadContext reads what a spec names for its validation, and the pins
 // of its normalisation: the tenant's sandboxes its attached services run
-// in (with the ports other environments' attached services use there),
+// in (with the ports other environments' attached services use there,
+// and the names those environments write into their hosts),
 // the environment's secrets (secrets, when not nil, stands in for them:
 // a clone's), what its addon volumes hold, the addon types and the
 // images. env is nil for a spec without an environment.
@@ -203,6 +204,7 @@ func (s *Service) loadContext(ctx context.Context, tenant string, env *store.Env
 				s.log.Warn("a stored spec does not parse", "env", o.EnvID, "err", err)
 				continue
 			}
+			named := map[string]bool{}
 			for _, name := range slices.Sorted(maps.Keys(other.Services)) {
 				svc := other.Services[name]
 				sb := strings.ToLower(svc.Sandbox)
@@ -213,12 +215,22 @@ func (s *Service) loadContext(ctx context.Context, tenant string, env *store.Env
 				for _, p := range svc.Ports {
 					info.AttachedPorts = append(info.AttachedPorts, spec.AttachedPort{Env: o.EnvName, Service: name, Port: p.Port})
 				}
+				if !named[sb] {
+					named[sb] = true
+					for _, hn := range spec.HostNames(*other, sb) {
+						info.HostNames = append(info.HostNames, spec.HostName{Env: o.EnvName, Name: hn})
+					}
+				}
 				vc.sandboxes[sb] = info
 			}
 		}
 	}
 
-	if env != nil && len(sp.Addons) > 0 {
+	// An environment without a release has no addon volumes. A clone
+	// plans for one that is not there yet, under an ID that may be
+	// another tenant's environment's (its insert refuses that later):
+	// what that one's volumes hold is no business of the clone's.
+	if env != nil && env.Release > 0 && len(sp.Addons) > 0 {
 		vols, err := s.st.ListEnvVolumes(ctx, env.ID)
 		if err != nil {
 			return nil, pins, fmt.Errorf("volumes: %w", err)

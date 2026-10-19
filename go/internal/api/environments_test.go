@@ -527,8 +527,10 @@ func (envPorts) Probe(context.Context, model.Lease, int, string) (int, error) {
 func (envPorts) DialPod(context.Context, model.Lease, int) (net.Conn, error) {
 	return nil, errors.New("no")
 }
-func (envPorts) ForwardTo(w http.ResponseWriter, r *http.Request, id uuid.UUID, port int, path, rawPath string) {
-	_, _ = fmt.Fprintf(w, "forwarded %d %s %s auth=%q", port, path, r.URL.RawQuery, r.Header.Get("Authorization"))
+func (envPorts) ForwardTo(w http.ResponseWriter, r *http.Request, id uuid.UUID, port int, path, rawPath string,
+	credentials []string) {
+	_, _ = fmt.Fprintf(w, "forwarded %d %s %s auth=%q strip=%q", port, path, r.URL.RawQuery, r.Header.Get("Authorization"),
+		credentials)
 }
 
 // The real service behind the routes: create, secrets, plan, apply,

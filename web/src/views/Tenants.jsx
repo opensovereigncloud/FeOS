@@ -6,7 +6,7 @@ import { api, getTenantToken, setTenantToken, storedTokenHash } from '../api.js'
 import { Icon } from '../Icon.jsx';
 import { Ago, ArmButton, ErrBox, LiveBadge, Secret, useArm, useNow, usePoll } from '../components.jsx';
 import { fmtDate } from '../format.js';
-import { tokenRows } from './fleet.js';
+import { tenantDeleteText, tokenRows } from './fleet.js';
 
 // The tenants: create, delete, and their tokens. ferund stores a tenant's
 // tokens as hashes only, so a token is shown once, when it is made; this
@@ -91,6 +91,7 @@ export function Tenants({ navigate, user }) {
               const held = getTenantToken(t.name);
               const heldHash = storedTokenHash(t.name);
               const valid = held && (t.tokens || []).some((tk) => tk.hash === heldHash);
+              const del = tenantDeleteText(t);
               return (
                 <React.Fragment key={t.name}>
                   <tr className={'clickable' + (open === t.name ? ' sel' : '')} onClick={() => go(t.name)}
@@ -115,8 +116,7 @@ export function Tenants({ navigate, user }) {
                       <button className="iconbtn mini" title="work as this tenant" onClick={() => go(t.name)}>
                         <Icon name="chevronRight" size={13} /></button>
                       <ArmButton armKey={t.name} armed={armed} arm={arm} disarm={disarm} icon="trash"
-                        className="mini" confirmLabel={t.sandboxCount ? `delete with ${t.sandboxCount} sandboxes?` : 'delete?'}
-                        title="delete the tenant, its tokens and every sandbox of it"
+                        className="mini" confirmLabel={del.confirm} title={del.title}
                         onConfirm={async () => {
                           try {
                             await api.deleteTenant(t.name);

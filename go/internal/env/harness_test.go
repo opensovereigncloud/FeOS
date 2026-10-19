@@ -108,6 +108,8 @@ type forward struct {
 	path, rawPath string
 	query         string
 	authz, host   string
+	// credentials are the headers the door was told to strip.
+	credentials []string
 }
 
 // fakePorts is the port door: ForwardTo answers 200 with what it was
@@ -123,9 +125,11 @@ func (f *fakePorts) Probe(context.Context, model.Lease, int, string) (int, error
 func (f *fakePorts) DialPod(context.Context, model.Lease, int) (net.Conn, error) {
 	return nil, errors.New("no dials here")
 }
-func (f *fakePorts) ForwardTo(w http.ResponseWriter, r *http.Request, id uuid.UUID, port int, path, rawPath string) {
+func (f *fakePorts) ForwardTo(w http.ResponseWriter, r *http.Request, id uuid.UUID, port int, path, rawPath string,
+	credentials []string) {
 	f.mu.Lock()
-	f.calls = append(f.calls, forward{id, port, path, rawPath, r.URL.RawQuery, r.Header.Get("Authorization"), r.Host})
+	f.calls = append(f.calls, forward{id, port, path, rawPath, r.URL.RawQuery, r.Header.Get("Authorization"), r.Host,
+		credentials})
 	f.mu.Unlock()
 	_, _ = fmt.Fprintf(w, "%s %d %s", id, port, path)
 }

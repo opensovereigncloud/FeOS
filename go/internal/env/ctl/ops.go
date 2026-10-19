@@ -30,7 +30,10 @@ const maxLogLines = 10000
 // image service, of an addon (replica 0), or of a job's latest run (its
 // stored tail once the run's row is gone) (SourceContainer); the process
 // log of an attached service (SourceProcess). It never wakes an instance
-// (ErrPaused); ErrNoObject, ErrNoContainerLogs.
+// (ErrPaused); ErrNoObject (its text names a replica the object does not
+// have), ErrNotRunning for a replica the target release has but that has
+// no instance yet (the release waits for its addons or a job, or for
+// capacity), ErrNoContainerLogs.
 func (c *Controller) LogTail(ctx context.Context, envID uuid.UUID, kind, name string, replica, lines int) ([]string, string, error) {
 	if lines <= 0 {
 		lines = 200
@@ -43,6 +46,7 @@ func (c *Controller) LogTail(ctx context.Context, envID uuid.UUID, kind, name st
 	if err != nil {
 		return nil, "", err
 	}
+	desired := 1
 	switch kind {
 	case spec.KindService:
 		svc, ok := v.target.Services[name]
@@ -52,8 +56,9 @@ func (c *Controller) LogTail(ctx context.Context, envID uuid.UUID, kind, name st
 		if runtimeOf(svc) == spec.RuntimeAttached {
 			return c.processLog(ctx, v, name, lines)
 		}
+		desired = replicasOf(svc)
 	case spec.KindAddon:
-		if _, ok := v.target.Addons[name]; !ok || replica != 0 {
+		if _, ok := v.target.Addons[name]; !ok {
 			return nil, "", ErrNoObject
 		}
 	case spec.KindJob:
@@ -75,8 +80,15 @@ func (c *Controller) LogTail(ctx context.Context, envID uuid.UUID, kind, name st
 			row = &r
 		}
 	}
-	if row == nil {
-		return nil, "", ErrNoObject
+	switch {
+	case row != nil:
+	case replica < desired:
+		return nil, "", notRunning("%s %s has no instance of replica %d yet: no log to read", kind, name, replica)
+	case desired == 0:
+		return nil, "", notRunning("%s %s runs no replica (replicas: 0): no log to read", kind, name)
+	default:
+		return nil, "", &stateError{msg: fmt.Sprintf("%s %s has no replica %d (it has %d)", kind, name, replica, desired),
+			kind: ErrNoObject}
 	}
 	out, err := c.instanceLog(ctx, row.Sandbox, lines)
 	return out, SourceContainer, err

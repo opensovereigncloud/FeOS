@@ -197,7 +197,8 @@ func TestLogsAndRestart(t *testing.T) {
 	if err != nil || source != SourceContainer || !slices.Equal(lines, []string{"line 3", "line 4"}) {
 		t.Fatalf("logs %q %s %v", lines, source, err)
 	}
-	if _, _, err := h.c.LogTail(bg, env.ID, spec.KindService, "web", 5, 2); err != ErrNoObject {
+	if _, _, err := h.c.LogTail(bg, env.ID, spec.KindService, "web", 5, 2); !errors.Is(err, ErrNoObject) ||
+		err.Error() != "service web has no replica 5 (it has 2)" {
 		t.Errorf("an unknown replica: %v", err)
 	}
 	if _, _, err := h.c.LogTail(bg, env.ID, spec.KindAddon, "pg", 0, 2); err != ErrNoObject {

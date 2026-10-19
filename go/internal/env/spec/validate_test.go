@@ -15,6 +15,9 @@ import (
 // The sandbox the Expensa spec's attached service runs in.
 const webSandbox = "0193a000-0000-7000-8000-00000000000a"
 
+// Another attachable sandbox of the tenant.
+const otherSandbox = "0193a000-0000-7000-8000-00000000000b"
+
 // fakeBlueprint is an addon type whose versions and keys are listed.
 type fakeBlueprint struct {
 	versions []string
@@ -111,8 +114,9 @@ func pinnedOf(image string) string {
 
 func defaultVC(mode Mode) fakeVC {
 	return fakeVC{mode: mode,
-		sandboxes: map[string]SandboxInfo{webSandbox: {ID: webSandbox, Attachable: true}},
-		secrets:   map[string]SecretInfo{"internal-token": {Latest: 3, Versions: []int{2, 3}, Deleted: []int{1}}},
+		sandboxes: map[string]SandboxInfo{webSandbox: {ID: webSandbox, Attachable: true},
+			otherSandbox: {ID: otherSandbox, Attachable: true}},
+		secrets: map[string]SecretInfo{"internal-token": {Latest: 3, Versions: []int{2, 3}, Deleted: []int{1}}},
 	}
 }
 
@@ -367,6 +371,22 @@ func TestValidateRules(t *testing.T) {
 					"APPROVAL": {Kind: EnvService, Service: "approval-service", Port: PortRef{Name: "http"}, Key: "url"}}
 			})
 		}, nil},
+		{"attached references attached in another sandbox", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["api"] = Service{Runtime: RuntimeAttached, Sandbox: otherSandbox, Command: []string{"x"},
+				Ports: []Port{{Name: "http", Port: 8081}}}
+			svc(s, "web", func(v *Service) {
+				v.Env = map[string]EnvValue{"API": {Kind: EnvService, Service: "api", Port: PortRef{Name: "http"}, Key: "url"}}
+			})
+		}, []expect{e("services.web.env.API", "api is an attached service in another sandbox")}},
+		{"attached references attached in its sandbox written in capitals", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["api"] = Service{Runtime: RuntimeAttached, Sandbox: strings.ToUpper(webSandbox), Command: []string{"x"},
+				Ports: []Port{{Name: "http", Port: 8081}}}
+			svc(s, "web", func(v *Service) {
+				v.Env = map[string]EnvValue{"API": {Kind: EnvService, Service: "api", Port: PortRef{Name: "http"}, Key: "url"}}
+			})
+		}, nil},
 		{"job references attached", ModePlan, func(s *Spec) {
 			approval(s)
 			s.Jobs["migrate"] = Job{Image: "img", Env: map[string]EnvValue{"W": {Kind: EnvService, Service: "web", Key: "host"}}}
@@ -468,6 +488,28 @@ func TestValidateContextDependent(t *testing.T) {
 		"port 5173 is used in sandbox "+webSandbox+" by service vite of environment other")})
 	vc.mode = ModeSpec
 	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{w("services.web.ports[0].port", "service vite")})
+
+	// A name another environment with attached services in the sandbox
+	// writes into its hosts too: an error, a warning without an
+	// environment; names it does not share, and its names in a sandbox
+	// this spec has no attached service in, are fine.
+	vc = defaultVC(ModePlan)
+	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox, Attachable: true, HostNames: []HostName{
+		{Env: "other", Name: "approval-service"}, {Env: "other", Name: "postgres"}, {Env: "other", Name: "web"},
+		{Env: "third", Name: "web"}, {Env: "other", Name: "vite"}}}
+	vc.sandboxes[otherSandbox] = SandboxInfo{ID: otherSandbox, Attachable: true,
+		HostNames: []HostName{{Env: "other", Name: "nats"}}}
+	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{
+		e("addons.postgres", "postgres is in the hosts of sandbox "+webSandbox+" as environment other's too"),
+		e("services.approval-service", "environment other's"),
+		e("services.web", "environment other's"), e("services.web", "environment third's")})
+	vc.mode = ModeSpec
+	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{w("addons.postgres", "other's"),
+		w("services.approval-service", "other's"), w("services.web", "other's"), w("services.web", "third's")})
+	vc = defaultVC(ModePlan)
+	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox, Attachable: true,
+		HostNames: []HostName{{Env: "other", Name: "vite"}, {Env: "other", Name: "db"}}}
+	checkFindings(t, validateMutated(t, vc, nil, approval), nil)
 
 	// A sandbox that is not attachable cannot reach the pods.
 	vc = defaultVC(ModePlan)

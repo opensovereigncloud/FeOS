@@ -96,14 +96,16 @@ func TestTenants(t *testing.T) {
 	expect(t, w, http.StatusOK, "")
 	list := decode[struct {
 		Tenants []struct {
-			Name         string            `json:"name"`
-			CreatedAt    string            `json:"createdAt"`
-			SandboxCount int               `json:"sandboxCount"`
-			Tokens       []json.RawMessage `json:"tokens"`
+			Name             string            `json:"name"`
+			CreatedAt        string            `json:"createdAt"`
+			SandboxCount     int               `json:"sandboxCount"`
+			EnvironmentCount *int              `json:"environmentCount"`
+			Tokens           []json.RawMessage `json:"tokens"`
 		} `json:"tenants"`
 	}](t, w)
 	if len(list.Tenants) != 2 || list.Tenants[0].Name != testTenant || list.Tenants[1].Name != "beta" ||
-		list.Tenants[0].SandboxCount != 1 || len(list.Tenants[1].Tokens) != 1 {
+		list.Tenants[0].SandboxCount != 1 || len(list.Tenants[1].Tokens) != 1 ||
+		list.Tenants[0].EnvironmentCount == nil || *list.Tenants[0].EnvironmentCount != 0 {
 		t.Fatalf("tenants %+v", list.Tenants)
 	}
 	if strings.Contains(w.Body.String(), created.Token) {

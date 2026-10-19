@@ -205,6 +205,29 @@ export function tokenRows(tokens, heldHash) {
     .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
 }
 
+// tenantDeleteText is the delete button's confirmation and title for a
+// tenant of the admin list: a tenant's deletion takes its sandboxes and
+// its environments, with their addons' data, along.
+export function tenantDeleteText(t) {
+  const n = (v) => Number(v) || 0;
+  const of = (k, one, many) => `${k} ${k === 1 ? one : many}`;
+  const sandboxes = n(t && t.sandboxCount);
+  const envs = n(t && t.environmentCount);
+  let confirm = 'delete?';
+  if (sandboxes && envs) {
+    confirm = `delete with ${of(sandboxes, 'sandbox', 'sandboxes')} and ${of(envs, 'environment', 'environments')} `
+      + 'and their data?';
+  } else if (envs) {
+    confirm = `delete with ${of(envs, 'environment', 'environments')} and their data?`;
+  } else if (sandboxes) {
+    confirm = `delete with ${of(sandboxes, 'sandbox', 'sandboxes')}?`;
+  }
+  return {
+    confirm,
+    title: 'delete the tenant, its tokens, every sandbox and every environment of it, with the environments\' addon data',
+  };
+}
+
 // fmtSeconds renders a duration in seconds as the flags' values read:
 // "5 s", "1.5 s", "90 s", "10 min", "1 h", "1 h 30 min"; whole minutes
 // as minutes, anything else in seconds; '' when unset.

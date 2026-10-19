@@ -286,7 +286,8 @@ describe('the environments routes', () => {
 
   it('reads the incidents, the open ones, and one incident', async () => {
     let r = await ask('GET_environments_env_incidents.200', () => api.listIncidents(STAGE));
-    expect(r.out.incidents.map((i) => i.id)).toEqual(['12', '9']);
+    expect(r.out.incidents.map((i) => i.id)).toEqual(['13', '12', '9']);
+    expect(r.out.incidents[0].evidence.pending).toHaveLength(3);
     r = await ask('GET_environments_env_incidents.200.open', () => api.listIncidents(STAGE, { open: true }));
     expect(r.out.incidents.map((i) => i.id)).toEqual(['12']);
     r = await ask('GET_environments_env_incidents_id.200', () => api.getIncident(STAGE, '12'));

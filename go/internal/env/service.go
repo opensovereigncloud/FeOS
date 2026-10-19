@@ -588,6 +588,8 @@ func ctlError(err error, kind, name string) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, ctl.ErrNoObject) && msg != ctl.ErrNoObject.Error():
+		return apierr.New(http.StatusNotFound, "%s", msg)
 	case errors.Is(err, ctl.ErrNoObject):
 		return errNoObject(kind, name)
 	case errors.Is(err, ctl.ErrPaused):
@@ -625,7 +627,8 @@ func ctlError(err error, kind, name string) error {
 // last lines lines (default 200, at most 10000) of replica replica's log
 // (ctl.Controller.LogTail); 501 when the node serves no container logs,
 // 409 "paused" for a paused instance (never woken), 409 CodeNotRunning
-// for one that does not run.
+// for one that does not run or is not there yet, 404 naming the replica
+// for one the object does not have.
 func (s *Service) Logs(ctx context.Context, tenant, env, kind, name string, lines, replica int) (LogsAnswer, error) {
 	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
 	if err != nil {

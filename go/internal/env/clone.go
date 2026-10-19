@@ -181,6 +181,20 @@ func (s *Service) clone(ctx context.Context, tenant, ref string, req CloneReques
 	if err := checkReleaseMeta(req.Author, "", nil); err != nil {
 		return EnvStatus{}, err
 	}
+	// A taken ID is refused before anything is planned under it: it may
+	// be another tenant's environment. insertEnv checks again.
+	if req.ID != "" {
+		byID, err := s.st.GetEnvironment(ctx, id)
+		switch {
+		case err == nil && byID.Owner == tenant && byID.Name == req.Name:
+			return EnvStatus{}, apierr.WithCode(http.StatusConflict, CodeIDTaken, "an environment of id %s exists", id)
+		case err == nil:
+			return EnvStatus{}, apierr.WithCode(http.StatusConflict, CodeIDTaken,
+				"an environment of id %s exists with another name", id)
+		case !errors.Is(err, store.ErrNoRow):
+			return EnvStatus{}, err
+		}
+	}
 	var fs []spec.Finding
 	if req.Data {
 		fs = append(fs, spec.Finding{Severity: spec.SeverityError, Path: "data", Problem: "copying data is not available",

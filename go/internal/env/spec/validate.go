@@ -82,6 +82,17 @@ type SandboxInfo struct {
 	// environments use in it: two attached services in one sandbox must
 	// not share a port number.
 	AttachedPorts []AttachedPort
+	// HostNames are the names other environments with attached services
+	// in it write into its hosts (HostNames of their specs): two
+	// environments in one sandbox must not share one, or a process there
+	// reaches whichever block comes first.
+	HostNames []HostName
+}
+
+// HostName is a name an environment writes into a sandbox's hosts.
+type HostName struct {
+	// Env is the environment's name, Name the addon's or service's.
+	Env, Name string
 }
 
 // AttachedPort is a port an attached service uses in a sandbox.
@@ -184,6 +195,7 @@ func Validate(vc ValidateContext, s Spec, prev *Spec) []Finding {
 	v.routePaths()
 	v.secrets()
 	v.attachedPorts()
+	v.hostNames()
 	return SortFindings(v.out)
 }
 
@@ -338,7 +350,11 @@ func (v *validator) service(name string, svc Service) {
 		v.errorf(p+".mounts", "keep the data in an addon (postgres, valkey, nats), which has a volume of its own",
 			"volumes for services are not available yet")
 	}
-	v.env(p+".env", svc.Env, runtime == RuntimeImage)
+	sandbox := ""
+	if runtime == RuntimeAttached {
+		sandbox = svc.Sandbox
+	}
+	v.env(p+".env", svc.Env, runtime == RuntimeImage, sandbox)
 }
 
 // sandbox checks an attached service's sandbox.
@@ -502,8 +518,9 @@ func (v *validator) readiness(path string, r *Readiness, ports []Port) {
 
 // env checks environment variables; fromImage: they are an image pod's
 // (an image service's or a job's), which cannot reach an attached
-// service.
-func (v *validator) env(path string, env map[string]EnvValue, fromImage bool) {
+// service; sandbox: they are an attached service's in that sandbox,
+// which reaches only the attached services there.
+func (v *validator) env(path string, env map[string]EnvValue, fromImage bool, sandbox string) {
 	for _, key := range slices.Sorted(maps.Keys(env)) {
 		val := env[key]
 		kp := path + "." + key
@@ -542,9 +559,15 @@ func (v *validator) env(path string, env map[string]EnvValue, fromImage bool) {
 			default:
 				v.errorf(kp, "use key url, host or port", "a service reference's key is url, host or port, not %q", val.Key)
 			}
-			if fromImage && target.Runtime == RuntimeAttached {
+			switch {
+			case target.Runtime != RuntimeAttached:
+			case fromImage:
 				v.errorf(kp, "run both attached or both as images", "%s is an attached service: image pods cannot reach a "+
 					"sandbox", val.Service)
+			case sandbox != "" && target.Sandbox != "" && !strings.EqualFold(sandbox, target.Sandbox):
+				v.errorf(kp, "run both in one sandbox, or run "+val.Service+" as an image",
+					"%s is an attached service in another sandbox: a sandbox reaches only its own attached services",
+					val.Service)
 			}
 		}
 	}
@@ -627,7 +650,7 @@ func (v *validator) job(name string, j Job) {
 		}
 	}
 	v.resources(p+".resources", j.Resources)
-	v.env(p+".env", j.Env, true)
+	v.env(p+".env", j.Env, true, "")
 }
 
 func (v *validator) addon(name string, a Addon) {
@@ -815,6 +838,71 @@ func (v *validator) attachedPorts() {
 			}
 		}
 	}
+}
+
+// hostNames refuses a name in the hosts of a sandbox this spec's
+// attached services run in that another environment with attached
+// services there writes into them too: the resolver answers the first
+// block's address, so a process there could reach the other
+// environment's addon or service (a warning in ModeSpec, which replaces
+// none).
+func (v *validator) hostNames() {
+	sandboxes := map[string]bool{}
+	for _, svc := range v.s.Services {
+		if svc.Runtime == RuntimeAttached && svc.Sandbox != "" {
+			sandboxes[strings.ToLower(svc.Sandbox)] = true
+		}
+	}
+	sev := SeverityError
+	if v.mode == ModeSpec {
+		sev = SeverityWarning
+	}
+	for _, sb := range slices.Sorted(maps.Keys(sandboxes)) {
+		info, ok := v.vc.Sandbox(sb)
+		if !ok || len(info.HostNames) == 0 {
+			continue
+		}
+		others := map[string][]string{}
+		for _, hn := range info.HostNames {
+			if !slices.Contains(others[hn.Name], hn.Env) {
+				others[hn.Name] = append(others[hn.Name], hn.Env)
+			}
+		}
+		for _, name := range HostNames(v.s, sb) {
+			p := "services." + name
+			if _, ok := v.s.Addons[name]; ok {
+				p = "addons." + name
+			}
+			for _, env := range slices.Sorted(slices.Values(others[name])) {
+				v.add(sev, p, "rename one, or run the two environments' attached services in separate sandboxes",
+					"%s is in the hosts of sandbox %s as environment %s's too: a process there could reach either", name,
+					sb, env)
+			}
+		}
+	}
+}
+
+// HostNames are the names the environment of spec s writes into the
+// hosts of a sandbox (its ID in lowercase) one of its attached services
+// runs in: its addons, its image services and its attached services in
+// that sandbox; sorted.
+func HostNames(s Spec, sandbox string) []string {
+	var out []string
+	for name := range s.Addons {
+		out = append(out, name)
+	}
+	for name, svc := range s.Services {
+		switch svc.Runtime {
+		case "", RuntimeImage:
+			out = append(out, name)
+		case RuntimeAttached:
+			if strings.EqualFold(svc.Sandbox, sandbox) {
+				out = append(out, name)
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // Referenced returns the secrets the env values of the spec's services

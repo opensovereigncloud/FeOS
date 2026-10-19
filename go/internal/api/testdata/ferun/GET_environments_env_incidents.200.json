@@ -7,6 +7,37 @@
   "response": {
     "incidents": [
       {
+        "id": "13",
+        "object": "addon/postgres",
+        "release": 8,
+        "condition": "rollout_failed",
+        "openedAt": "2026-10-18T15:30:02Z",
+        "closedAt": "2026-10-18T15:41:10Z",
+        "summary": "release 8 did not roll out within 10m0s: addon postgres is not ready",
+        "evidence": {
+          "diff": [
+            {
+              "kind": "addon",
+              "name": "postgres",
+              "change": "update",
+              "fields": [
+                {
+                  "path": "plan",
+                  "from": "small",
+                  "to": "medium"
+                }
+              ],
+              "effect": "replaces 1 pod"
+            }
+          ],
+          "pending": [
+            "addon postgres is not ready",
+            "service expense-service waits for the addons",
+            "addon/postgres replica 0: provisioning step provision exited 1: psql: FATAL:  password authentication failed for user \"postgres\""
+          ]
+        }
+      },
+      {
         "id": "12",
         "object": "service/expense-service",
         "release": 7,

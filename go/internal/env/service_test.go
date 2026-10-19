@@ -313,15 +313,17 @@ func TestAttachedValidation(t *testing.T) {
 	plain := h.sandbox(tenantA, false)
 	h.create("one", nil)
 	h.create("two", nil)
-	attached := func(sandbox uuid.UUID, port string) string {
-		return `{"services": {"vite": {"runtime": "attached", "sandbox": "` + sandbox.String() + `", "command": ["vite"],
-			"ports": [{"name": "http", "port": ` + port + `}]}}, "routes": {"root": {"path": "/", "service": "vite", "port": "http"}}}`
+	attachedAs := func(sandbox uuid.UUID, name, port string) string {
+		return `{"services": {"` + name + `": {"runtime": "attached", "sandbox": "` + sandbox.String() + `", "command": ["vite"],
+			"ports": [{"name": "http", "port": ` + port + `}]}}, "routes": {"root": {"path": "/", "service": "` + name +
+			`", "port": "http"}}}`
 	}
+	attached := func(sandbox uuid.UUID, port string) string { return attachedAs(sandbox, "vite", port) }
 	h.apply("one", attached(sb, "5173"), 0)
 	// Another environment's attached service holds the port in the
 	// sandbox.
-	p, err := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attached(sb, "5173"))})
-	if err != nil || p.Valid || !hasFinding(p.Findings, spec.SeverityError, "services.vite.ports[0].port",
+	p, err := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attachedAs(sb, "web", "5173"))})
+	if err != nil || p.Valid || !hasFinding(p.Findings, spec.SeverityError, "services.web.ports[0].port",
 		"port 5173 is used in sandbox "+sb.String()+" by service vite of environment one") {
 		t.Fatalf("clash %+v %v", p, err)
 	}
@@ -329,8 +331,33 @@ func TestAttachedValidation(t *testing.T) {
 	if p, _ := h.svc.Plan(ctx, tenantA, "one", PlanRequest{Spec: json.RawMessage(attached(sb, "5173"))}); !p.Valid {
 		t.Fatalf("own %+v", p)
 	}
-	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attached(sb, "5174"))}); !p.Valid {
+	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attachedAs(sb, "web", "5174"))}); !p.Valid {
 		t.Fatalf("other port %+v", p)
+	}
+	// Nor may a name be in the sandbox's hosts as both environments':
+	// their attached services', image services' or addons'.
+	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attached(sb, "5174"))}); p.Valid ||
+		!hasFinding(p.Findings, spec.SeverityError, "services.vite",
+			"vite is in the hosts of sandbox "+sb.String()+" as environment one's too") {
+		t.Fatalf("attached name %+v", p)
+	}
+	withAPI := func(sandbox uuid.UUID, name, port string) string {
+		return strings.Replace(attachedAs(sandbox, name, port), `"services": {`,
+			`"services": {"api": {"image": "ghcr.io/acme/api:1", "ports": [{"name": "http", "port": 8080}]}, `, 1)
+	}
+	h.create("three", nil)
+	h.create("four", nil)
+	h.apply("three", withAPI(sb, "web3", "5175"), 0)
+	_, err = h.svc.Apply(ctx, tenantA, "four", ApplyRequest{Spec: json.RawMessage(withAPI(sb, "web4", "5176"))})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "services.api",
+		"api is in the hosts of sandbox "+sb.String()+" as environment three's too") {
+		t.Fatalf("image service name: %s", describe(err))
+	}
+	// In separate sandboxes the names are their own.
+	other := h.sandbox(tenantA, true)
+	if p, _ := h.svc.Plan(ctx, tenantA, "four", PlanRequest{Spec: json.RawMessage(withAPI(other, "web4", "5176"))}); !p.Valid {
+		t.Fatalf("separate sandboxes %+v", p)
 	}
 	// A sandbox that is not attachable warns when there is something to
 	// reach; an instance row is no sandbox.
@@ -911,6 +938,34 @@ func TestControllerRefusals(t *testing.T) {
 	if code(err) != "not_ready" {
 		t.Fatalf("code %q", code(err))
 	}
+
+	// A replica the release has but that has no instance yet (it waits
+	// for its addons) has no log; one the object does not have is no
+	// object, and the answer says which.
+	for _, c := range []struct {
+		kind, name string
+		replica    int
+		status     int
+		msg, code  string
+	}{
+		{spec.KindService, "api", 1, http.StatusConflict, "service api has no instance of replica 1 yet: no log to read",
+			"not_running"},
+		{spec.KindAddon, "pg", 0, http.StatusConflict, "addon pg has no instance of replica 0 yet: no log to read", "not_running"},
+		{spec.KindService, "api", 5, http.StatusNotFound, "service api has no replica 5 (it has 2)", ""},
+		{spec.KindAddon, "pg", 1, http.StatusNotFound, "addon pg has no replica 1 (it has 1)", ""},
+		{spec.KindService, "nope", 0, http.StatusNotFound, "no such object: service/nope", ""},
+	} {
+		_, err := h.svc.Logs(ctx, tenantA, "stage", c.kind, c.name, 0, c.replica)
+		wantStatus(t, err, c.status, c.msg)
+		if code(err) != c.code {
+			t.Fatalf("%s/%s replica %d: code %q", c.kind, c.name, c.replica, code(err))
+		}
+	}
+	// replicas: 0 runs none.
+	h.apply("stage", strings.Replace(previewSpec(sb), `"replicas": 2`, `"replicas": 0`, 1), 1)
+	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "api", 0, 0)
+	wantStatus(t, err, http.StatusConflict, "service api runs no replica (replicas: 0): no log to read")
+	h.apply("stage", previewSpec(sb), 2)
 
 	// A pending instance has no log.
 	h.instance(e.ID, spec.KindService, "api", 0, 1, model.PhaseStarting, model.StatePending, "", "")
