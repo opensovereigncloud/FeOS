@@ -277,14 +277,14 @@ func shellCommand(argv []string) string {
 
 // StartProcessDetached starts a background process as process_start does
 // with timeout 0 (no limit): argv shell-quoted into the start script's
-// command, in p.Cwd ("": /), named p.Name, after the records of the
-// processes of that name that are over but the newest keptExited went. p.Env reaches the process only
-// through ExecRequest.Env, which the script's process inherits, and with
-// HOME=/root unless it sets HOME: no value of it is written to the
-// container's disk (the process record keeps the command, the name and
-// the times). A working directory that does not exist is an error
-// wrapping ErrNoCwd. No hold is taken: the process does not keep the
-// sandbox awake.
+// command, in p.Cwd ("": /), named p.Name, once the records of the
+// processes of that name that are over went, but the newest keptExited.
+// p.Env reaches the process only through ExecRequest.Env, which the
+// script's process inherits, and with HOME=/root unless it sets HOME: no
+// value of it is written to the container's disk (the process record
+// keeps the command, the name and the times). A working directory that
+// does not exist is an error wrapping ErrNoCwd. No hold is taken: the
+// process does not keep the sandbox awake.
 func (r *Runner) StartProcessDetached(ctx context.Context, lease model.Lease, p ProcessStart) (string, error) {
 	if len(p.Argv) == 0 {
 		return "", errors.New("start a process: no command")
