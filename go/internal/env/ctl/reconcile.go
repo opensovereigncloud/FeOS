@@ -558,9 +558,12 @@ func lostNode(sb store.Sandbox) string {
 }
 
 // heal brings a desired instance's row back up (§4.3): Ensure for a row
-// that is stopped, failed, pending, unknown, or paused or hibernated when
-// it does not idle (an idle one wakes on traffic). It reports whether the
-// row is lost (the caller replaces it, or keeps an addon's).
+// that is stopped, failed or pending, and for one that is unknown, paused
+// or hibernated when it does not idle (an idle one wakes on traffic; an
+// unknown one may be paused in truth, and the engine's unknown sweep or
+// lost grace finds out without waking it, so that the next pass acts on
+// what it is). It reports whether the row is lost (the caller replaces
+// it, or keeps an addon's).
 func (c *Controller) heal(ctx context.Context, r store.EnvInstanceRow, idles bool) (lost bool) {
 	sb := r.Sandbox
 	if sb.Op != "" {
@@ -569,9 +572,9 @@ func (c *Controller) heal(ctx context.Context, r store.EnvInstanceRow, idles boo
 	switch sb.ClientState {
 	case model.StateLost:
 		return true
-	case model.StateStopped, model.StateFailed, model.StatePending, model.StateUnknown:
+	case model.StateStopped, model.StateFailed, model.StatePending:
 		c.ensure(ctx, sb.ID)
-	case model.StatePaused, model.StateHibernated:
+	case model.StateUnknown, model.StatePaused, model.StateHibernated:
 		if !idles {
 			c.ensure(ctx, sb.ID)
 		}

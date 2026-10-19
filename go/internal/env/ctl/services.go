@@ -102,7 +102,7 @@ func (c *Controller) stepService(ctx context.Context, s *stepState, name string,
 	}
 	ready := 0
 	for _, r := range cur {
-		if r.Instance.Phase == model.PhaseReady {
+		if live(r, idles) {
 			ready++
 		}
 	}
@@ -188,7 +188,7 @@ func (c *Controller) rolloutFailed(ctx context.Context, s *stepState, name strin
 	if reason == "" && !v.latest.StartedAt.IsZero() && v.now.After(v.latest.StartedAt.Add(budget)) {
 		ready := 0
 		for _, r := range cur {
-			if r.Instance.Phase == model.PhaseReady {
+			if live(r, idleOf(svc) > 0) {
 				ready++
 			}
 		}

@@ -13,7 +13,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
@@ -104,23 +107,33 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 	}
 	c.keep(ctx, v, cur, 0)
 	sb := cur.Sandbox
+	if vol != nil && vol.Provisioned && materialised(sb) && (vol.Node != sb.Node || sb.PinNode != sb.Node) {
+		// Restored elsewhere: its volume came along, whether its pod runs
+		// there or stopped or failed there since.
+		c.moveVolume(ctx, v, *vol, sb)
+	}
 	if c.heal(ctx, cur, false) {
-		// Never replaced: its volume is on the lost node. Ensure syncs it
-		// when the node returns.
+		// Replaced only on its volume's node, once that node is up and
+		// reports the volume free (§13.7); otherwise never: its volume is
+		// on the lost node, and Ensure syncs it when the node returns.
+		replaced, why := c.replaceLostAddon(ctx, v, p, cur, vol)
+		if replaced {
+			s.wait(obj, "addon %s was lost; it is replaced on node %s", name, lostNode(sb))
+			return false
+		}
 		c.ensure(ctx, sb.ID)
 		if !v.isOpen(obj, model.ConditionVolumeUnavailable) {
-			c.incident(ctx, v.env.ID, obj, v.targetNum, model.ConditionVolumeUnavailable,
-				fmt.Sprintf("addon %s is lost with node %s, which has its volume", name, lostNode(sb)), evidence{})
+			summary := fmt.Sprintf("addon %s is lost with node %s, which has its volume", name, lostNode(sb))
+			if why != "" {
+				summary = fmt.Sprintf("addon %s is lost on node %s and not replaced there: %s", name, lostNode(sb), why)
+			}
+			c.incident(ctx, v.env.ID, obj, v.targetNum, model.ConditionVolumeUnavailable, summary, evidence{})
 		}
 		s.wait(obj, "addon %s is lost", name)
 		return false
 	}
-	if vol != nil && vol.Provisioned && steady(sb) && (vol.Node != sb.Node || sb.PinNode != sb.Node) {
-		// Restored elsewhere: its volume came along.
-		c.moveVolume(ctx, v, *vol, sb)
-	}
-	if cur.Instance.Phase != model.PhaseReady {
-		s.wait(obj, "addon %s is %s", name, cur.Instance.Phase)
+	if !live(cur, false) {
+		s.wait(obj, "addon %s is %s", name, addonState(cur))
 		return false
 	}
 	c.closeIncidents(ctx, v, obj, model.ConditionVolumeUnavailable)
@@ -371,13 +384,19 @@ func (c *Controller) stillHolds(ctx context.Context, id uuid.UUID) (bool, error)
 
 // recreateAddon replaces an addon whose template changed (a version, a
 // plan, a rendered option): only while its instance runs on a ready node
-// (else that instance is brought up first, a restore); the volume
-// records the node and the old row as its holder, the old row goes, and
-// newAddon inserts the new one on that node once the old pod is gone.
+// (else that instance is brought up first, a restore), or when it is lost
+// on a node that is up and has its volume free (replaceLostAddon); the
+// volume records the node and the old row as its holder, the old row
+// goes, and newAddon inserts the new one on that node once the old pod
+// is gone.
 func (c *Controller) recreateAddon(ctx context.Context, s *stepState, p *addonPlan, cur store.EnvInstanceRow, vol *store.EnvVolume) {
 	v := s.v
 	sb := cur.Sandbox
 	if c.heal(ctx, cur, false) {
+		if replaced, _ := c.replaceLostAddon(ctx, v, p, cur, vol); replaced {
+			s.wait(p.object(), "addon %s was lost; it is recreated on node %s", p.name, lostNode(sb))
+			return
+		}
 		c.ensure(ctx, sb.ID)
 		s.wait(p.object(), "addon %s is lost; it is recreated once it runs again", p.name)
 		return
@@ -429,8 +448,143 @@ func (c *Controller) recreateAddon(ctx context.Context, s *stepState, p *addonPl
 	s.wait(p.object(), "addon %s is being recreated", p.name)
 }
 
+// addonState says why an addon instance is not ready: its phase, or,
+// with a ready phase, its row's state (and op, and description).
+func addonState(r store.EnvInstanceRow) string {
+	sb := r.Sandbox
+	switch {
+	case r.Instance.Phase != model.PhaseReady:
+		return r.Instance.Phase
+	case sb.Op != "":
+		return fmt.Sprintf("%s, %s in flight", sb.ClientState, sb.Op)
+	case sb.StatusDescription != "":
+		return fmt.Sprintf("%s (%s)", sb.ClientState, sb.StatusDescription)
+	}
+	return sb.ClientState
+}
+
+// replaceLostAddon replaces an addon lost on a node that is up (§13.7):
+// the node lost the pod, and nothing would ever bring the row back.
+// Only when that node (the volume's, since the volume is attached where
+// the pod was) is ready and connected, its pod is not found there, and
+// GetVolume there reports the volume free (no pod, or this pod;
+// AVAILABLE or CHECKPOINTED), all read outside a transaction: then, as
+// recreateAddon does, the volume records the node and the lost row as its
+// holder, the row retires and goes, and newAddon inserts the new one on
+// that node once the old pod is gone. It reports whether it replaced the
+// row, and else what the node said when that kept it ("" when it never
+// asked: no volume, the node down, removed or draining).
+func (c *Controller) replaceLostAddon(ctx context.Context, v *view, p *addonPlan, cur store.EnvInstanceRow,
+	vol *store.EnvVolume) (bool, string) {
+	sb := cur.Sandbox
+	node := lostNode(sb)
+	if vol == nil || node == "" || !c.connected(node) || !c.nodeReady(ctx, node) {
+		return false, ""
+	}
+	free, why, err := c.lostPodFree(ctx, node, sb.ID, *vol)
+	if err != nil {
+		if ctx.Err() == nil {
+			c.rl.warn("lost", "cannot read a lost addon's pod or volume", "sandbox", sb.ID, "node", node, "err", err)
+		}
+		return false, ""
+	}
+	if !free {
+		return false, why
+	}
+	err = c.fenced(ctx, func(tx *store.Store) error {
+		row, err := tx.GetSandbox(ctx, sb.ID)
+		if err != nil {
+			return err
+		}
+		if row.ClientState != model.StateLost || row.Op != "" || lostNode(row) != node {
+			return errNotLost
+		}
+		inst, err := tx.LockEnvInstance(ctx, sb.ID, store.ForUpdate)
+		if err != nil {
+			return err
+		}
+		now, err := tx.Now(ctx)
+		if err != nil {
+			return err
+		}
+		after := inst
+		after.Phase, after.RetireAt = model.PhaseRetiring, now
+		if _, err := tx.UpdateEnvInstance(ctx, inst, after); err != nil {
+			return err
+		}
+		vv, err := tx.LockEnvVolume(ctx, v.env.ID, vol.Object, store.ForUpdate)
+		if err != nil {
+			return err
+		}
+		if vv.VolumeID != vol.VolumeID || vv.Deleting {
+			return errNotLost
+		}
+		va := vv
+		va.Holder = sb.ID
+		if vv.Provisioned {
+			va.Node = node
+		}
+		_, err = tx.UpdateEnvVolume(ctx, vv, va)
+		return err
+	})
+	if err != nil {
+		if !errors.Is(err, errNotLost) && !errors.Is(err, model.ErrNotFound) && ctx.Err() == nil {
+			c.rl.warn("lost", "cannot replace a lost addon", "sandbox", sb.ID, "err", err)
+		}
+		return false, ""
+	}
+	c.log.Info("a lost addon is replaced on its volume's node", "environment", v.env.ID, "addon", p.name, "old", sb.ID,
+		"node", node)
+	if err := c.deleteInstance(ctx, sb); err != nil && ctx.Err() == nil {
+		c.rl.warn("lost", "cannot delete a lost addon's instance", "sandbox", sb.ID, "err", err)
+	}
+	return true, ""
+}
+
+// errNotLost: the row or its volume changed since the step read them.
+var errNotLost = errors.New("no longer lost as read")
+
+// lostPodFree asks a node that is up whether a lost addon's volume is
+// free there for a new pod: true when the pod is not found there and the
+// volume is (not provisioned anywhere yet, or on the node with no pod or
+// this pod, AVAILABLE or CHECKPOINTED); else why not ("" when the node
+// still has the pod: Ensure syncs it back, it is not replaced).
+func (c *Controller) lostPodFree(ctx context.Context, node string, pod uuid.UUID, vol store.EnvVolume) (bool, string, error) {
+	_, err := c.getPod(ctx, node, pod)
+	switch {
+	case err == nil:
+		return false, "", nil
+	case status.Code(err) != codes.NotFound:
+		return false, "", err
+	}
+	if !vol.Provisioned {
+		return true, "", nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.t.nodeCall)
+	defer cancel()
+	cc, err := c.conn(ctx, node)
+	if err != nil {
+		return false, "", err
+	}
+	volumeID := vol.VolumeID.String()
+	got, err := volumev1.NewVolumeServiceClient(cc).GetVolume(ctx, &volumev1.GetVolumeRequest{VolumeId: volumeID})
+	switch {
+	case status.Code(err) == codes.NotFound:
+		return false, fmt.Sprintf("the node does not have volume %s", volumeID), nil
+	case err != nil:
+		return false, "", err
+	case got.GetPodId() != "" && got.GetPodId() != pod.String():
+		return false, fmt.Sprintf("volume %s is attached to pod %s there", volumeID, got.GetPodId()), nil
+	case got.GetState() == volumev1.VolumeState_VOLUME_STATE_AVAILABLE,
+		got.GetState() == volumev1.VolumeState_VOLUME_STATE_CHECKPOINTED:
+		return true, "", nil
+	}
+	return false, fmt.Sprintf("volume %s is %s there", volumeID, got.GetState()), nil
+}
+
 // moveVolume records that an addon's volume is on the node its instance
-// runs on now (a restore elsewhere took it along), and pins the row there.
+// is materialised on now (a restore elsewhere took it along), and pins
+// the row there.
 func (c *Controller) moveVolume(ctx context.Context, v *view, vol store.EnvVolume, sb store.Sandbox) {
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockEnvVolume(ctx, v.env.ID, vol.Object, store.ForUpdate)

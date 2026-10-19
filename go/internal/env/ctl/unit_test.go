@@ -153,7 +153,7 @@ func TestHostsBlock(t *testing.T) {
 	row := func(kind, name string, replica int, phase, addr string) store.EnvInstanceRow {
 		return store.EnvInstanceRow{
 			Instance: store.EnvInstance{SandboxID: uuid.New(), Kind: kind, Object: name, Replica: replica, Phase: phase},
-			Sandbox:  store.Sandbox{Address: addr},
+			Sandbox:  store.Sandbox{Address: addr, ClientState: model.StateRunning, Node: "n1"},
 		}
 	}
 	v := &view{
@@ -204,6 +204,107 @@ func TestHostsBlock(t *testing.T) {
 	}
 	if got := spliceHosts(spliceHosts("", "stage", block), "stage", block); got != hostsBase+block {
 		t.Errorf("a second splice: %q", got)
+	}
+}
+
+// Readiness counts live rows only (§13.7): a ready phase left from a pod
+// whose row is unknown, stopped, failed or has an op in flight is not
+// ready, for the hosts entries and the crash loop's end alike; a paused
+// or hibernated replica of an idle service is.
+func TestLiveReadiness(t *testing.T) {
+	row := func(replica int, phase, state, addr string) store.EnvInstanceRow {
+		id := uuid.New()
+		return store.EnvInstanceRow{
+			Instance: store.EnvInstance{SandboxID: id, Kind: spec.KindService, Object: "web", Replica: replica, Phase: phase},
+			Sandbox:  store.Sandbox{ID: id, ClientState: state, Node: "n1", Address: addr},
+		}
+	}
+	for _, tc := range []struct {
+		state, op string
+		idles     bool
+		want      bool
+	}{
+		{model.StateRunning, "", false, true},
+		{model.StateRunning, "pause", false, false},
+		{model.StateUnknown, "", false, false},
+		{model.StateStopped, "", false, false},
+		{model.StateFailed, "", false, false},
+		{model.StateLost, "", false, false},
+		{model.StatePending, "", false, false},
+		{model.StatePaused, "", false, false},
+		{model.StatePaused, "", true, true},
+		{model.StateHibernated, "", true, true},
+		{model.StatePaused, "resume", true, false},
+		{model.StateUnknown, "", true, false},
+	} {
+		r := row(0, model.PhaseReady, tc.state, "fd00::1")
+		r.Sandbox.Op = tc.op
+		if got := live(r, tc.idles); got != tc.want {
+			t.Errorf("%s op %q idles %v: live %v", tc.state, tc.op, tc.idles, got)
+		}
+		r.Instance.Phase = model.PhaseUnready
+		if live(r, tc.idles) {
+			t.Errorf("%s: an unready phase is live", tc.state)
+		}
+	}
+
+	// web's replica 0 was ready when its node went down (unknown, its
+	// address kept); replica 1 runs: the hosts name replica 1.
+	v := &view{
+		env:    store.Environment{ID: uuid.New(), Name: "stage"},
+		target: &spec.Spec{Services: map[string]spec.Service{"web": {Image: "img"}}},
+		rows: []store.EnvInstanceRow{
+			row(0, model.PhaseReady, model.StateUnknown, "fd00::10"),
+			row(1, model.PhaseReady, model.StateRunning, "fd00::11"),
+		},
+	}
+	if got := hostsEntries(v)["web"]; got != "fd00::11" {
+		t.Errorf("web -> %s, want the running replica's fd00::11", got)
+	}
+	// Replica 1 is still starting: its address is still better than one
+	// that may be stale.
+	v.rows[1].Instance.Phase = model.PhaseStarting
+	if got := hostsEntries(v)["web"]; got != "fd00::11" {
+		t.Errorf("web -> %s, want the known replica's fd00::11", got)
+	}
+	// Only the unknown one has an address: it is named, nothing better.
+	v.rows[1].Sandbox.Address = ""
+	if got := hostsEntries(v)["web"]; got != "fd00::10" {
+		t.Errorf("web -> %q, want the only address fd00::10", got)
+	}
+	// An idle service's paused ready replica is ready.
+	v.target.Services["web"] = spec.Service{Image: "img", Idle: "15m"}
+	v.rows[0].Sandbox.ClientState = model.StatePaused
+	v.rows[1].Sandbox.Address = "fd00::11"
+	if got := hostsEntries(v)["web"]; got != "fd00::10" {
+		t.Errorf("web -> %s, want the idle service's paused ready replica fd00::10", got)
+	}
+
+	// The crash loop ends only once every instance has been ready for the
+	// crash window, each one live.
+	c := &Controller{t: defaultTimings()}
+	v.target.Services["web"] = spec.Service{Image: "img"}
+	v.now = time.Now()
+	long := v.now.Add(-2 * c.t.crashWindow)
+	for i := range v.rows {
+		v.rows[i].Instance.Phase, v.rows[i].Instance.ReadySince = model.PhaseReady, long
+		v.rows[i].Sandbox.ClientState = model.StateRunning
+	}
+	probed := v.rows[1].Instance
+	if !c.objectSteady(v, spec.KindService, "web", probed) {
+		t.Fatal("not steady with every replica ready and running")
+	}
+	v.rows[0].Sandbox.ClientState = model.StateUnknown
+	if c.objectSteady(v, spec.KindService, "web", probed) {
+		t.Error("steady while a replica is unknown")
+	}
+	v.rows[0].Sandbox.ClientState = model.StatePaused
+	if c.objectSteady(v, spec.KindService, "web", probed) {
+		t.Error("steady while a replica of a service that does not idle is paused")
+	}
+	v.target.Services["web"] = spec.Service{Image: "img", Idle: "15m"}
+	if !c.objectSteady(v, spec.KindService, "web", probed) {
+		t.Error("not steady while an idle service's ready replica is paused")
 	}
 }
 

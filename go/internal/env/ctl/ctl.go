@@ -337,6 +337,35 @@ func steady(sb store.Sandbox) bool {
 	return sb.ClientState == model.StateRunning && sb.Op == "" && sb.Node != ""
 }
 
+// live reports whether an instance counts as ready (§13.7): its phase is
+// ready and its row runs without an op. For an idle service (idles) a
+// replica paused or hibernated without an op counts too, so that an idle
+// service still realises. A phase left from a pod that is unknown,
+// stopped, failed or lost does not count: the probes only look at rows
+// that run, so nothing else resets it.
+func live(r store.EnvInstanceRow, idles bool) bool {
+	return r.Instance.Phase == model.PhaseReady && liveRow(r.Sandbox, idles)
+}
+
+// liveRow is the row's half of live.
+func liveRow(sb store.Sandbox, idles bool) bool {
+	if steady(sb) {
+		return true
+	}
+	return idles && sb.Op == "" && (sb.ClientState == model.StatePaused || sb.ClientState == model.StateHibernated)
+}
+
+// materialised reports whether a row's pod sits on its node without an
+// op: running, paused, stopped or failed there, where its volumes are
+// attached (not lost, hibernated or unknown).
+func materialised(sb store.Sandbox) bool {
+	switch sb.ClientState {
+	case model.StateRunning, model.StatePaused, model.StateStopped, model.StateFailed:
+		return sb.Node != "" && sb.Op == "" && sb.Materialised
+	}
+	return false
+}
+
 // attachedKey names an attached service in the controller's maps.
 func attachedKey(envID uuid.UUID, service string) string { return envID.String() + "/" + service }
 
