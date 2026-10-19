@@ -466,6 +466,28 @@ func TestRouteDoor(t *testing.T) {
 	wantPlain(t, withHeader(tenantTok, ""), 401, "route token required\n")
 	wantPlain(t, withHeader(tenantTok, "Bearer "+tok.Token), 401, "route token required\n")
 	wantPlain(t, withHeader("not-a-token", "Bearer "+tok.Token), 401, "route token required\n")
+	// Beside the header, the Authorization that would go on may hold no
+	// FeRun credential: a tenant's or a sandbox's token as its bearer is
+	// refused and nothing forwarded; any other passes, as above.
+	sandboxTok := "sandbox-token"
+	if _, err := h.st.CreateSandboxToken(ctx, store.HashToken(sandboxTok), sb, "s"); err != nil {
+		t.Fatal(err)
+	}
+	forwards := func() int {
+		h.ports.mu.Lock()
+		defer h.ports.mu.Unlock()
+		return len(h.ports.calls)
+	}
+	for _, authz := range []string{"Bearer " + tenantTok, "bearer " + tenantTok, "Bearer " + sandboxTok} {
+		before := forwards()
+		wantPlain(t, withHeader(tok.Token, authz), 401, "route token required\n")
+		if forwards() != before {
+			t.Fatalf("%.12s…: forwarded %+v", authz, h.ports.last(t))
+		}
+	}
+	if w := withHeader(tok.Token, "Bearer client-jwt"); w.Code != 200 || h.ports.last(t).authz != "Bearer client-jwt" {
+		t.Fatalf("a client's own bearer beside the header: %d %s", w.Code, w.Body)
+	}
 	// Segment-aware: /apix is the root's; the root does not strip; a
 	// paused instance is woken by the forward (scale from zero).
 	for _, c := range []struct{ path, up string }{
@@ -566,6 +588,15 @@ func TestRouteDoorFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The lookup of a bearer token beside the route token header.
+	h.exec(`ALTER TABLE tenant_tokens RENAME TO tenant_tokens_away`)
+	r := httptest.NewRequest("GET", "/api/v1/environments/stage/http/api/x", nil)
+	r.Header.Set(RouteTokenHeader, tok.Token)
+	r.Header.Set("Authorization", "Bearer client-jwt")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	wantPlain(t, w, 500, "the route door failed\n")
+	h.exec(`ALTER TABLE tenant_tokens_away RENAME TO tenant_tokens`)
 	// A stored spec that does not parse.
 	h.exec(`UPDATE env_releases SET spec = '{"services": 5}' WHERE env_id = $1`, h.env("stage").ID)
 	wantPlain(t, routeRequest(mux, "GET", "/api/v1/environments/stage/http/api/x", tok.Token), 500,
