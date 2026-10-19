@@ -60,6 +60,9 @@ const (
 	ConditionAddonUnhealthy    = "addon_unhealthy"
 	ConditionVolumeUnavailable = "volume_unavailable"
 	ConditionAttachFailed      = "attach_failed"
+	// ConditionNamesUnserved: a pod of the object runs on a node whose
+	// feosd serves no names (it predates the NameService).
+	ConditionNamesUnserved = "names_unserved"
 )
 
 // The states of an environment in the list (GET /api/v1/environments)

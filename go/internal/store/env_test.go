@@ -558,7 +558,7 @@ func TestEnvInstancesAndJobRuns(t *testing.T) {
 	after := i
 	after.Phase, after.ReadySince, after.Restarts, after.LastExit = model.PhaseExited, now, 1, &code
 	after.Exits = []store.EnvExit{{At: now, Code: &code}, {At: now.Add(time.Second)}}
-	after.NextRestartAt, after.Detail, after.HostsWritten = now.Add(time.Minute), "exited", "hh"
+	after.NextRestartAt, after.Detail = now.Add(time.Minute), "exited"
 	w, err := s.UpdateEnvInstance(bg, i, after)
 	if err != nil || w.Phase != model.PhaseExited || *w.LastExit != 137 || len(w.Exits) != 2 || *w.Exits[0].Code != 137 ||
 		w.Exits[1].Code != nil || !w.ReadySince.Equal(now) || w.Detail != "exited" {

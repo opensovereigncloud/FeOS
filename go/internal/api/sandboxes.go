@@ -94,10 +94,13 @@ func viewOf(sb store.Sandbox) sandboxView {
 
 // attachableTemplate is the pod template of an attachable sandbox (ADR
 // 0018 §2.3): the command of every sandbox's pod, no env, the default
-// labels, and the sandbox's own security group, which the environments
-// it serves let reach their addons.
+// labels, the sandbox's own security group, which the environments it
+// serves let reach their addons, and its own name table, which names its
+// attached services and the addons and image services of their
+// environments.
 func attachableTemplate(id uuid.UUID) *model.PodTemplate {
-	return &model.PodTemplate{Command: []string{"sleep", "infinity"}, SecurityGroups: []string{model.SandboxGroupID(id)}}
+	return &model.PodTemplate{Command: []string{"sleep", "infinity"}, SecurityGroups: []string{model.SandboxGroupID(id)},
+		NameTables: []string{model.SandboxTableID(id)}}
 }
 
 type createSandboxResponse struct {

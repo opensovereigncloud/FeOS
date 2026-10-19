@@ -281,8 +281,7 @@ func (c *Controller) instanceCheck(v *view, inst store.EnvInstance) check {
 
 // probeInstance is one look at an instance whose row runs (§4.4): the
 // main container's exit (a job's end; a service's or an addon's restart
-// with backoff, crash_loop), the restart when due, the hosts block, the
-// readiness.
+// with backoff, crash_loop), the restart when due, the readiness.
 func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInstanceRow) {
 	inst, sb := r.Instance, r.Sandbox
 	info, err := c.getPod(ctx, sb.Node, sb.ID)
@@ -320,7 +319,6 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 		return
 	}
 	if inst.Kind == spec.KindJob {
-		c.syncInstanceHosts(ctx, v, r)
 		return
 	}
 	after := inst
@@ -328,9 +326,6 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 		// Restarted: a new run of the container.
 		after.Phase, after.NextRestartAt, after.ReadySince, after.ProbeFailures = model.PhaseStarting, time.Time{}, time.Time{}, 0
 		after.Detail = ""
-	}
-	if inst.Kind == spec.KindService {
-		after.HostsWritten = c.instanceHosts(ctx, v, r)
 	}
 	class := "up"
 	if after.Phase == model.PhaseStarting {
@@ -418,7 +413,7 @@ func (c *Controller) addonSecrets(ctx context.Context, v *view, addon string) []
 // as it is now, and wakes env-reconcile when its phase moved.
 func (c *Controller) writeInstance(ctx context.Context, before, after store.EnvInstance) {
 	if before.Phase == after.Phase && before.ReadySince.Equal(after.ReadySince) && before.ProbeFailures == after.ProbeFailures &&
-		before.Detail == after.Detail && before.HostsWritten == after.HostsWritten && before.Restarts == after.Restarts &&
+		before.Detail == after.Detail && before.Restarts == after.Restarts &&
 		before.NextRestartAt.Equal(after.NextRestartAt) {
 		return
 	}
@@ -432,11 +427,16 @@ func (c *Controller) writeInstance(ctx context.Context, before, after store.EnvI
 		}
 		next := cur
 		next.Phase, next.ReadySince, next.ProbeFailures, next.Detail = after.Phase, after.ReadySince, after.ProbeFailures, after.Detail
-		next.HostsWritten, next.Restarts, next.NextRestartAt = after.HostsWritten, after.Restarts, after.NextRestartAt
+		next.Restarts, next.NextRestartAt = after.Restarts, after.NextRestartAt
 		if _, err := tx.UpdateEnvInstance(ctx, cur, next); err != nil {
 			return err
 		}
 		if cur.Phase != next.Phase {
+			// A replica that becomes ready or stops being so changes
+			// its environment's names.
+			if err := tx.Notify(ctx, db.ChanLeader, HintNames); err != nil {
+				return err
+			}
 			return tx.Notify(ctx, db.ChanLeader, HintReconcile)
 		}
 		return nil
@@ -553,31 +553,6 @@ func (c *Controller) restartInstance(ctx context.Context, r store.EnvInstanceRow
 	}
 	after := r.Instance
 	after.NextRestartAt = time.Time{}
-	c.writeInstance(ctx, r.Instance, after)
-}
-
-// instanceHosts writes the environment's hosts block into an image
-// instance when it differs from the one it has, and returns the block's
-// hash as written (the old one when the write failed).
-func (c *Controller) instanceHosts(ctx context.Context, v *view, r store.EnvInstanceRow) string {
-	block := hostsBlock(v, nil)
-	h := blockHash(block)
-	if r.Instance.HostsWritten == h {
-		return h
-	}
-	if err := c.writeHosts(ctx, lease(r.Sandbox), v.env.Name, block); err != nil {
-		if ctx.Err() == nil {
-			c.rl.warn("hosts", "cannot write an instance's hosts block", "sandbox", r.Sandbox.ID, "err", err)
-		}
-		return r.Instance.HostsWritten
-	}
-	return h
-}
-
-// syncInstanceHosts writes a job instance's hosts block.
-func (c *Controller) syncInstanceHosts(ctx context.Context, v *view, r store.EnvInstanceRow) {
-	after := r.Instance
-	after.HostsWritten = c.instanceHosts(ctx, v, r)
 	c.writeInstance(ctx, r.Instance, after)
 }
 

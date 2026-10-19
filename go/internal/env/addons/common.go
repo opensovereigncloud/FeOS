@@ -240,7 +240,7 @@ func firstError(typ string, fs []spec.Finding) error {
 }
 
 // host is how a reference reaches the instance: its address, or, before
-// it has one, the addon's name, which the environment's hosts block
+// it has one, the addon's name, which the environment's name table
 // resolves to it.
 func host(c Context) string {
 	if c.Address != "" {

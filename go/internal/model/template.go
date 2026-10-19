@@ -36,6 +36,16 @@ func EnvGroupID(envID uuid.UUID) string { return "env-" + envID.String() }
 // "sbx-<sandbox UUID>", 40 characters.
 func SandboxGroupID(id uuid.UUID) string { return "sbx-" + id.String() }
 
+// EnvTableID is the name table of an environment's pods (feosd's
+// NameService): its addons and image services. It is the ID of the
+// environment's security group.
+func EnvTableID(envID uuid.UUID) string { return EnvGroupID(envID) }
+
+// SandboxTableID is the name table of an attachable sandbox: its own
+// attached services, and the env tables of the environments they belong
+// to. It is the ID of the sandbox's security group.
+func SandboxTableID(id uuid.UUID) string { return SandboxGroupID(id) }
+
 // The escapes of a secret in a template value.
 const (
 	// EscapeNone puts the secret's value in as it is.
@@ -68,6 +78,10 @@ type PodTemplate struct {
 	// SecurityGroups are the pod's security groups (EnvGroupID,
 	// SandboxGroupID); none: feosd's default group.
 	SecurityGroups []string `json:"securityGroups,omitempty"`
+	// NameTables are the name tables whose names feosd's resolver answers
+	// the pod (EnvTableID, SandboxTableID), in order; none: no names but
+	// the upstreams'.
+	NameTables []string `json:"nameTables,omitempty"`
 	// Labels are added to the sandbox labels (which win on a clash).
 	// Hash leaves them out.
 	Labels map[string]string `json:"labels,omitempty"`
@@ -169,9 +183,11 @@ func (t PodTemplate) HasCredential() bool {
 // canonical JSON of what the pod runs, that is the image (pinned to its
 // digest), the resources, and the template without its labels (command,
 // env with secrets as name and version, volumes, mounts, security groups
-// in sorted order). Equal pods hash equal: a nil and an empty list or map
-// hash alike. What an instance is not rebuilt for (its labels, the idle
-// policy, the release) is not in it.
+// in sorted order, name tables in order, and only when there are any, so
+// that a template without them hashes as before they were). Equal pods
+// hash equal: a nil and an empty list or map hash alike. What an instance
+// is not rebuilt for (its labels, the idle policy, the release) is not in
+// it.
 func (t PodTemplate) Hash(image string, vcpus, memoryMiB int) string {
 	groups := slices.Clone(t.SecurityGroups)
 	slices.Sort(groups)
@@ -185,10 +201,11 @@ func (t PodTemplate) Hash(image string, vcpus, memoryMiB int) string {
 		Volumes        []TemplateVolume         `json:"volumes"`
 		Mounts         []TemplateMount          `json:"mounts"`
 		SecurityGroups []string                 `json:"securityGroups"`
+		NameTables     []string                 `json:"nameTables,omitempty"`
 	}{
 		Scheme: 1, Image: image, VCPUs: vcpus, MemoryMiB: memoryMiB,
 		Command: nonNil(t.Command), Env: t.Env, Volumes: nonNil(t.Volumes), Mounts: nonNil(t.Mounts),
-		SecurityGroups: nonNil(groups),
+		SecurityGroups: nonNil(groups), NameTables: t.NameTables,
 	}
 	if h.Env == nil {
 		h.Env = map[string]TemplateValue{}

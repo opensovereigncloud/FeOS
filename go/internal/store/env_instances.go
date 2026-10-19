@@ -44,8 +44,6 @@ type EnvInstance struct {
 	ProbeFailures int
 	NextRestartAt time.Time // zero: NULL
 	Exits         []EnvExit
-	// HostsWritten is the hash of the hosts block last written; "" none.
-	HostsWritten string
 	// ProvisionedHash is an addon's hash of the provisioning steps last
 	// run.
 	ProvisionedHash string
@@ -57,7 +55,7 @@ type EnvInstance struct {
 func envInstanceColumns(p string) string {
 	cols := []string{"sandbox_id", "env_id", "kind", "object", "replica", "template_hash", "release", "phase",
 		"ready_since", "retire_at", "restarts", "last_exit", "probe_failures", "next_restart_at", "exits",
-		"hosts_written", "provisioned_hash", "detail", "created_at", "updated_at"}
+		"provisioned_hash", "detail", "created_at", "updated_at"}
 	return prefixed(p, cols)
 }
 
@@ -80,7 +78,7 @@ func envInstanceTargets(i *EnvInstance) ([]any, func()) {
 	var ready, retire, next *time.Time
 	return []any{&i.SandboxID, &i.EnvID, &i.Kind, &i.Object, &i.Replica, &i.TemplateHash, &i.Release, &i.Phase,
 			&ready, &retire, &i.Restarts, &i.LastExit, &i.ProbeFailures, &next, &i.Exits,
-			&i.HostsWritten, &i.ProvisionedHash, &i.Detail, &i.CreatedAt, &i.UpdatedAt}, func() {
+			&i.ProvisionedHash, &i.Detail, &i.CreatedAt, &i.UpdatedAt}, func() {
 			i.ReadySince, i.RetireAt, i.NextRestartAt = timeOf(ready), timeOf(retire), timeOf(next)
 			i.Exits = nonNil(i.Exits)
 		}
@@ -116,12 +114,12 @@ func (s *Store) InsertEnvInstance(ctx context.Context, i EnvInstance) (EnvInstan
 	}
 	out, err := scanEnvInstance(s.q.QueryRow(ctx, `INSERT INTO env_instances (sandbox_id, env_id, kind, object, replica,
 			template_hash, release, phase, ready_since, retire_at, restarts, last_exit, probe_failures, next_restart_at,
-			exits, hosts_written, provisioned_hash, detail)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18)
+			exits, provisioned_hash, detail)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17)
 		RETURNING `+envInstanceCols,
 		i.SandboxID, i.EnvID, i.Kind, i.Object, i.Replica, i.TemplateHash, i.Release, i.Phase, nullTime(i.ReadySince),
 		nullTime(i.RetireAt), i.Restarts, nullInt(i.LastExit), i.ProbeFailures, nullTime(i.NextRestartAt), exits,
-		i.HostsWritten, i.ProvisionedHash, i.Detail))
+		i.ProvisionedHash, i.Detail))
 	if err != nil {
 		return EnvInstance{}, insertError("insert instance "+i.SandboxID.String(), err)
 	}
@@ -182,7 +180,7 @@ func (s *Store) ListEnvInstanceRows(ctx context.Context, envID uuid.UUID) ([]Env
 // UpdateEnvInstance writes the columns in which after differs from before,
 // the row as the caller read it (normally locked FOR UPDATE): release,
 // phase, ready_since, retire_at, restarts, last_exit, probe_failures,
-// next_restart_at, exits, hosts_written, provisioned_hash and detail;
+// next_restart_at, exits, provisioned_hash and detail;
 // updated_at = now(). The fixed columns are refused. When nothing
 // differs, before is returned unwritten.
 func (s *Store) UpdateEnvInstance(ctx context.Context, before, after EnvInstance) (EnvInstance, error) {
@@ -204,7 +202,6 @@ func (s *Store) UpdateEnvInstance(ctx context.Context, before, after EnvInstance
 	if err := u.setJSON("exits", !sameExits(before.Exits, after.Exits), nonNil(after.Exits)); err != nil {
 		return EnvInstance{}, err
 	}
-	u.set("hosts_written", before.HostsWritten != after.HostsWritten, after.HostsWritten)
 	u.set("provisioned_hash", before.ProvisionedHash != after.ProvisionedHash, after.ProvisionedHash)
 	u.set("detail", before.Detail != after.Detail, after.Detail)
 	if u.empty() {

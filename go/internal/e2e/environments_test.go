@@ -69,6 +69,23 @@ func (c *cluster) waitRelease(envID uuid.UUID, n int, state string, within time.
 	})
 }
 
+// nodeTable is a name table of a test node; nil when it has none.
+func nodeTable(n *node, id string) *networkv1.NameTable {
+	for _, t := range n.NameTables() {
+		if t.Id == id {
+			return t
+		}
+	}
+	return nil
+}
+
+// resolves reports whether the pod resolves name on its test node, as
+// feosd's resolver would, to exactly addrs (none: not a name of the pod's).
+func resolves(n *node, pod uuid.UUID, name string, addrs ...string) bool {
+	got, ok := n.Resolve(pod, name)
+	return ok == (len(addrs) > 0) && slices.Equal(got, addrs)
+}
+
 // nodeGroup is a security group of a test node; nil when it has none.
 func nodeGroup(n *node, id string) *networkv1.SecurityGroup {
 	for _, g := range n.SecurityGroups() {
@@ -80,12 +97,13 @@ func nodeGroup(n *node, id string) *networkv1.SecurityGroup {
 }
 
 // The environment controller in a running ferund, on a node that checks
-// security groups: an attachable sandbox made over REST gets its group
-// before its pod; an environment's image service and an attached service
-// in that sandbox come up and the release is realised; the env group has
-// both as members and the sandbox's group reaches it; the hosts blocks
-// name what they should; the controller reads the process's log; a
-// deleted environment leaves its sandbox alone and nothing of its own.
+// security groups and name tables: an attachable sandbox made over REST
+// gets its group and its name table before its pod; an environment's image
+// service and an attached service in that sandbox come up and the release
+// is realised; the env group has both as members and the sandbox's group
+// reaches it; the node's resolver answers each pod the names it should;
+// the controller reads the process's log; a deleted environment leaves
+// its sandbox alone and nothing of its own.
 func TestEnvironments(t *testing.T) {
 	t.Parallel()
 	if _, err := exec.LookPath("python3"); err != nil {
@@ -93,7 +111,7 @@ func TestEnvironments(t *testing.T) {
 	}
 	c := newCluster(t, nil)
 	a := c.start("a")
-	n1 := c.join("n1", func(cfg *testnode.Config) { cfg.CheckSecurityGroups = true })
+	n1 := c.join("n1", func(cfg *testnode.Config) { cfg.CheckSecurityGroups, cfg.CheckNameTables = true, true })
 	root := t.TempDir()
 	// The process scripts' records go to a directory of the test, and an
 	// attached service's working directory beneath the pod's directory:
@@ -128,6 +146,9 @@ func TestEnvironments(t *testing.T) {
 	if g := nodeGroup(n1, model.SandboxGroupID(sb.id)); g == nil {
 		t.Fatal("the attachable sandbox runs without its group on the node")
 	}
+	if nt := nodeTable(n1, model.SandboxTableID(sb.id)); nt == nil {
+		t.Fatal("the attachable sandbox runs without its name table on the node")
+	}
 	if err := os.MkdirAll(filepath.Join(n1.PodDir(sb.id), "app"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -155,10 +176,10 @@ func TestEnvironments(t *testing.T) {
 		return eg != nil && sg != nil && slices.Contains(eg.Members, api.Address) && slices.Contains(eg.Members, host.Address) &&
 			slices.ContainsFunc(sg.Rules, func(r *networkv1.Rule) bool { return r.GetGroup() == model.EnvGroupID(env.ID) })
 	})
-	block := fmt.Sprintf("# ferun environment dev begin\n%s api\n127.0.0.1 web\n::1 web\n# ferun environment dev end\n", api.Address)
-	if hosts, err := os.ReadFile(filepath.Join(n1.PodDir(sb.id), "etc", "hosts")); err != nil || !strings.HasSuffix(string(hosts), block) {
-		t.Errorf("the sandbox's hosts %q, %v", hosts, err)
-	}
+	eventually(t, 10*time.Second, "the names", func() bool {
+		return resolves(n1, sb.id, "api", api.Address) && resolves(n1, sb.id, "web", "127.0.0.1", "::1") &&
+			resolves(n1, api.ID, "api", api.Address) && resolves(n1, api.ID, "web")
+	})
 	var lines []string
 	eventually(t, 10*time.Second, "the process's log", func() bool {
 		lines, _, err = a.Env.Controller().LogTail(bg, env.ID, "service", "web", 0, 5)
@@ -171,8 +192,8 @@ func TestEnvironments(t *testing.T) {
 		t.Errorf("logs of an unknown object: %v", err)
 	}
 
-	// Deleted, the environment takes its instance, process, hosts block and
-	// group along, and leaves the sandbox running.
+	// Deleted, the environment takes its instance, process, names, group
+	// and name table along, and leaves the sandbox running.
 	c.sql(`UPDATE environments SET deleting = true WHERE id = $1`, env.ID)
 	c.wake(ctl.LoopDelete)
 	eventually(t, 60*time.Second, "the environment gone", func() bool {
@@ -185,8 +206,11 @@ func TestEnvironments(t *testing.T) {
 	if nodeGroup(n1, model.EnvGroupID(env.ID)) != nil {
 		t.Error("the env group stays")
 	}
-	if hosts, _ := os.ReadFile(filepath.Join(n1.PodDir(sb.id), "etc", "hosts")); strings.Contains(string(hosts), "ferun environment") {
-		t.Errorf("the sandbox's hosts after the deletion %q", hosts)
+	if nodeTable(n1, model.EnvTableID(env.ID)) != nil {
+		t.Error("the env table stays")
+	}
+	if resolves(n1, sb.id, "api", api.Address) || resolves(n1, sb.id, "web", "127.0.0.1", "::1") {
+		t.Error("the sandbox resolves the deleted environment's names")
 	}
 	if out := c.run(a, sb, "echo alive"); strings.TrimSpace(out) != "alive" {
 		t.Errorf("the sandbox after the deletion: %q", out)
