@@ -43,6 +43,28 @@ service MeshService {
   rpc GetMesh(GetMeshRequest) returns (Mesh);
 }
 
+// The names of the node's pods (ADR 0010, ADR 0018): tables of names and
+// their addresses, from which feosd's resolver answers the pods whose
+// network names a table (PodNetwork.name_tables). The control plane owns
+// the tables and sends each node the tables of its pods, and every table
+// they include: whole, or as a delta of entries from one version to the
+// next. feosd keeps them on disk.
+service NameService {
+  // Puts a table whole: its entries, includes and version. It replaces the
+  // table feosd has, whatever its version.
+  rpc PutNameTable(PutNameTableRequest) returns (PutNameTableResponse);
+  // Puts and removes entries of a table, from one version to the next.
+  // Fails with FAILED_PRECONDITION unless feosd has the table at
+  // from_version: the control plane then puts the table whole.
+  rpc UpdateNameTable(UpdateNameTableRequest) returns (UpdateNameTableResponse);
+  // Removes a table. Fails with FAILED_PRECONDITION while a pod on the
+  // node names it.
+  rpc DeleteNameTable(DeleteNameTableRequest) returns (DeleteNameTableResponse);
+  rpc GetNameTable(GetNameTableRequest) returns (NameTable);
+  // The tables feosd has, with their entries and versions.
+  rpc ListNameTables(ListNameTablesRequest) returns (ListNameTablesResponse);
+}
+
 // What the node's pods did on the network (ADR 0013): flows, drops, DNS
 // queries and server names, as feosd records them.
 service TrafficService {
@@ -140,6 +162,71 @@ message ListSecurityGroupsRequest {}
 
 message ListSecurityGroupsResponse {
   repeated SecurityGroup groups = 1;
+}
+
+// Names and their addresses. A pod whose network names the table gets
+// them from feosd's resolver: a query for a name of one label, in any
+// case, that the pod's tables hold is answered from them, and never asked
+// upstream.
+message NameTable {
+  // 1 to 64 characters of letters, digits, "-", "_" and ".".
+  string id = 1;
+  // Changes with every change of the table; the control plane chooses it
+  // (ferund: a hash of the content). A delta names the version it starts
+  // from and the one it makes.
+  uint64 version = 2;
+  // The table's names, each once.
+  repeated NameEntry entries = 3;
+  // Tables whose names the pods that name this one resolve too, after this
+  // one's own and in this order, as a rule names a peer group: by ID. Their
+  // includes are not followed. One the node does not have holds no names.
+  repeated string includes = 4;
+}
+
+message NameEntry {
+  // One label of a DNS name: 1 to 63 letters, digits and "-", "-" neither
+  // first nor last. Kept in lower case; a query matches it in any case.
+  string name = 1;
+  // At least one: IPv6 addresses answer AAAA queries, IPv4 addresses A
+  // queries.
+  repeated string addresses = 2;
+}
+
+message PutNameTableRequest {
+  NameTable table = 1;
+}
+
+message PutNameTableResponse {}
+
+message UpdateNameTableRequest {
+  string id = 1;
+  // The version feosd must have.
+  uint64 from_version = 2;
+  // The version after this change; not from_version.
+  uint64 version = 3;
+  // Entries that are new or changed, by name: an entry replaces the
+  // addresses the name had.
+  repeated NameEntry put_entries = 4;
+  // The names that go.
+  repeated string remove_names = 5;
+}
+
+message UpdateNameTableResponse {}
+
+message DeleteNameTableRequest {
+  string id = 1;
+}
+
+message DeleteNameTableResponse {}
+
+message GetNameTableRequest {
+  string id = 1;
+}
+
+message ListNameTablesRequest {}
+
+message ListNameTablesResponse {
+  repeated NameTable tables = 1;
 }
 
 message Mesh {
