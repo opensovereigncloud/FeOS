@@ -234,7 +234,7 @@ func TestValidateRules(t *testing.T) {
 		{"service and addon share a name", ModePlan, func(s *Spec) {
 			approval(s)
 			s.Services["nats"] = Service{Image: "img"}
-		}, []expect{e("services.nats", "share the hosts names")}},
+		}, []expect{e("services.nats", "share the environment's names")}},
 		{"jobs may share names", ModePlan, func(s *Spec) {
 			approval(s)
 			s.Jobs["nats"] = Job{Image: "img"}
@@ -490,17 +490,17 @@ func TestValidateContextDependent(t *testing.T) {
 	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{w("services.web.ports[0].port", "service vite")})
 
 	// A name another environment with attached services in the sandbox
-	// writes into its hosts too: an error, a warning without an
+	// gives it too: an error, a warning without an
 	// environment; names it does not share, and its names in a sandbox
 	// this spec has no attached service in, are fine.
 	vc = defaultVC(ModePlan)
-	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox, Attachable: true, HostNames: []HostName{
+	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox, Attachable: true, Names: []SandboxName{
 		{Env: "other", Name: "approval-service"}, {Env: "other", Name: "postgres"}, {Env: "other", Name: "web"},
 		{Env: "third", Name: "web"}, {Env: "other", Name: "vite"}}}
 	vc.sandboxes[otherSandbox] = SandboxInfo{ID: otherSandbox, Attachable: true,
-		HostNames: []HostName{{Env: "other", Name: "nats"}}}
+		Names: []SandboxName{{Env: "other", Name: "nats"}}}
 	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{
-		e("addons.postgres", "postgres is in the hosts of sandbox "+webSandbox+" as environment other's too"),
+		e("addons.postgres", "postgres is a name in sandbox "+webSandbox+" of environment other's too"),
 		e("services.approval-service", "environment other's"),
 		e("services.web", "environment other's"), e("services.web", "environment third's")})
 	vc.mode = ModeSpec
@@ -508,7 +508,7 @@ func TestValidateContextDependent(t *testing.T) {
 		w("services.approval-service", "other's"), w("services.web", "other's"), w("services.web", "third's")})
 	vc = defaultVC(ModePlan)
 	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox, Attachable: true,
-		HostNames: []HostName{{Env: "other", Name: "vite"}, {Env: "other", Name: "db"}}}
+		Names: []SandboxName{{Env: "other", Name: "vite"}, {Env: "other", Name: "db"}}}
 	checkFindings(t, validateMutated(t, vc, nil, approval), nil)
 
 	// A sandbox that is not attachable cannot reach the pods.

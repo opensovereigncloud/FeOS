@@ -82,15 +82,16 @@ type SandboxInfo struct {
 	// environments use in it: two attached services in one sandbox must
 	// not share a port number.
 	AttachedPorts []AttachedPort
-	// HostNames are the names other environments with attached services
-	// in it write into its hosts (HostNames of their specs): two
-	// environments in one sandbox must not share one, or a process there
-	// reaches whichever block comes first.
-	HostNames []HostName
+	// Names are the names other environments with attached services in
+	// it give it (SandboxNames of their specs): two environments in one
+	// sandbox must not share one, or a process there reaches whichever
+	// environment's comes first.
+	Names []SandboxName
 }
 
-// HostName is a name an environment writes into a sandbox's hosts.
-type HostName struct {
+// SandboxName is a name an environment gives a sandbox its attached
+// services run in.
+type SandboxName struct {
 	// Env is the environment's name, Name the addon's or service's.
 	Env, Name string
 }
@@ -195,7 +196,7 @@ func Validate(vc ValidateContext, s Spec, prev *Spec) []Finding {
 	v.routePaths()
 	v.secrets()
 	v.attachedPorts()
-	v.hostNames()
+	v.sandboxNames()
 	return SortFindings(v.out)
 }
 
@@ -258,7 +259,7 @@ func (v *validator) limits() {
 	for n := range v.s.Services {
 		if _, ok := v.s.Addons[n]; ok {
 			v.errorf("services."+n, "rename one", "a service and an addon are both named %s: services and addons share "+
-				"the hosts names", n)
+				"the environment's names", n)
 		}
 	}
 }
@@ -840,13 +841,13 @@ func (v *validator) attachedPorts() {
 	}
 }
 
-// hostNames refuses a name in the hosts of a sandbox this spec's
-// attached services run in that another environment with attached
-// services there writes into them too: the resolver answers the first
-// block's address, so a process there could reach the other
-// environment's addon or service (a warning in ModeSpec, which replaces
-// none).
-func (v *validator) hostNames() {
+// sandboxNames refuses a name of a sandbox this spec's attached services
+// run in that another environment with attached services there gives it
+// too: the sandbox's name table includes both environments' tables, and
+// the resolver answers from the first, so a process there could reach the
+// other environment's addon or service (a warning in ModeSpec, which
+// replaces none).
+func (v *validator) sandboxNames() {
 	sandboxes := map[string]bool{}
 	for _, svc := range v.s.Services {
 		if svc.Runtime == RuntimeAttached && svc.Sandbox != "" {
@@ -859,34 +860,33 @@ func (v *validator) hostNames() {
 	}
 	for _, sb := range slices.Sorted(maps.Keys(sandboxes)) {
 		info, ok := v.vc.Sandbox(sb)
-		if !ok || len(info.HostNames) == 0 {
+		if !ok || len(info.Names) == 0 {
 			continue
 		}
 		others := map[string][]string{}
-		for _, hn := range info.HostNames {
+		for _, hn := range info.Names {
 			if !slices.Contains(others[hn.Name], hn.Env) {
 				others[hn.Name] = append(others[hn.Name], hn.Env)
 			}
 		}
-		for _, name := range HostNames(v.s, sb) {
+		for _, name := range SandboxNames(v.s, sb) {
 			p := "services." + name
 			if _, ok := v.s.Addons[name]; ok {
 				p = "addons." + name
 			}
 			for _, env := range slices.Sorted(slices.Values(others[name])) {
 				v.add(sev, p, "rename one, or run the two environments' attached services in separate sandboxes",
-					"%s is in the hosts of sandbox %s as environment %s's too: a process there could reach either", name,
+					"%s is a name in sandbox %s of environment %s's too: a process there could reach either", name,
 					sb, env)
 			}
 		}
 	}
 }
 
-// HostNames are the names the environment of spec s writes into the
-// hosts of a sandbox (its ID in lowercase) one of its attached services
-// runs in: its addons, its image services and its attached services in
-// that sandbox; sorted.
-func HostNames(s Spec, sandbox string) []string {
+// SandboxNames are the names the environment of spec s gives a sandbox
+// (its ID in lowercase) one of its attached services runs in: its addons,
+// its image services and its attached services in that sandbox; sorted.
+func SandboxNames(s Spec, sandbox string) []string {
 	var out []string
 	for name := range s.Addons {
 		out = append(out, name)
