@@ -10,6 +10,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -23,7 +24,11 @@ import (
 // and, while R rolls, runs its release jobs (§4.3 step 3): a job runs
 // when no run of its template hash succeeded, once every addon is
 // provisioned; a failed attempt is retried while attempt ≤ retries; a
-// failed last attempt fails R (job_failed).
+// failed last attempt fails R (job_failed). A job runs once at a time
+// across releases (§13.7): while a run of it that is not R's runs (a
+// superseded release's, a manual one, another template's), R's waits for
+// it to end, never cancelling it; R may then roll until that run ended
+// and its own attempts had their time (stepState.until).
 func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 	v := s.v
 	c.stepRuns(ctx, s)
@@ -61,14 +66,30 @@ func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 			s.wait(objectName(spec.KindJob, name), "job %s: %v", name, err)
 			continue
 		}
-		var last *store.EnvJobRun
+		var last, other *store.EnvJobRun
+		timeout := jobTimeout(j)
 		for i := range runs {
 			if runs[i].TemplateHash == p.hash && runs[i].Release == v.targetNum {
-				last = &runs[i]
-				break
+				if last == nil {
+					last = &runs[i]
+				}
+				continue
+			}
+			end := runs[i].FinishedAt
+			if runs[i].Phase == model.RunRunning {
+				end = runs[i].StartedAt.Add(timeout)
+				if other == nil {
+					other = &runs[i]
+				}
+			}
+			if end.After(v.latest.StartedAt) {
+				s.extend(end.Add(timeout * time.Duration(max(j.Retries, 0)+1)))
 			}
 		}
 		switch {
+		case other != nil:
+			s.wait(objectName(spec.KindJob, name), "job %s waits for its run of release %d (attempt %d)", name, other.Release,
+				other.Attempt)
 		case last == nil:
 			c.startRun(ctx, s, p, 1)
 		case last.Phase == model.RunRunning:
@@ -99,12 +120,19 @@ func runOutcome(r store.EnvJobRun) string {
 	return ""
 }
 
-// startRun inserts a run of a job (attempt n) with its instance row.
+// startRun inserts a run of a job (attempt n) with its instance row,
+// refused while a run of the job runs (once: checked under the
+// environment's row lock, as RunJob is, so that a run the API inserted
+// meanwhile is waited for, never run beside).
 func (c *Controller) startRun(ctx context.Context, s *stepState, p *podPlan, attempt int) {
 	v := s.v
 	run := &store.EnvJobRun{EnvID: v.env.ID, Job: p.name, TemplateHash: p.hash, Release: v.targetNum, Attempt: attempt,
 		Phase: model.RunRunning}
-	if _, err := c.insertInstance(ctx, v, insert{plan: p, release: v.targetNum, run: run}); err != nil {
+	if _, err := c.insertInstance(ctx, v, insert{plan: p, release: v.targetNum, run: run, once: true}); err != nil {
+		if errors.Is(err, ErrJobRunning) {
+			s.wait(objectName(spec.KindJob, p.name), "%v", err)
+			return
+		}
 		s.wait(objectName(spec.KindJob, p.name), "job %s: %v", p.name, err)
 		return
 	}
