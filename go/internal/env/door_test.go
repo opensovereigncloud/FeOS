@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -363,6 +364,34 @@ func TestRouteDoor(t *testing.T) {
 	if seen[a0] != 2 || seen[a1] != 2 {
 		t.Fatalf("round robin %v (want %s and %s twice)", seen, a0, a1)
 	}
+	if f := h.ports.last(t); !slices.Equal(f.credentials, []string{"Authorization", RouteTokenHeader}) {
+		t.Fatalf("a bearer route token: the door strips %q", f.credentials)
+	}
+	// The route token in X-FeRun-Route-Token: that header stops at the
+	// door, the client's Authorization goes on; it wins over a bearer
+	// token, and a tenant token is no route token there either.
+	withHeader := func(routeTok, authz string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/api/v1/environments/stage/http/api/me", nil)
+		r.Header.Set(RouteTokenHeader, routeTok)
+		if authz != "" {
+			r.Header.Set("Authorization", authz)
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		return w
+	}
+	if w := withHeader(tok.Token, "Bearer client-jwt"); w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	if f := h.ports.last(t); f.authz != "Bearer client-jwt" || !slices.Equal(f.credentials, []string{RouteTokenHeader}) {
+		t.Fatalf("a route token header: %+v", f)
+	}
+	if w := withHeader(tok.Token, ""); w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	wantPlain(t, withHeader(tenantTok, ""), 401, "route token required\n")
+	wantPlain(t, withHeader(tenantTok, "Bearer "+tok.Token), 401, "route token required\n")
+	wantPlain(t, withHeader("not-a-token", "Bearer "+tok.Token), 401, "route token required\n")
 	// Segment-aware: /apix is the root's; the root does not strip; a
 	// paused instance is woken by the forward (scale from zero).
 	for _, c := range []struct{ path, up string }{

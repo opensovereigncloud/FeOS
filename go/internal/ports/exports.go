@@ -120,13 +120,17 @@ const textDotDot = "the path has a .. segment"
 // authorised the request: the sandbox is brought up and held with a
 // forward hold for the request, and touched after it (a route to a paused
 // or hibernated instance wakes it); the Host the client named goes on,
-// Authorization stops here, upgrades and streams are kept, and a port of
-// the sandbox's Kubernetes bindings is refused (403). upstreamPath is the
-// path the pod sees ("" is "/"), rawPath its escaped form ("" when it
-// needs none); the query is kept. A path with a ".." segment, also one
+// upgrades and streams are kept, and a port of the sandbox's Kubernetes
+// bindings is refused (403). credentials are the request headers that
+// carried the route door's credential: they stop here, as
+// Proxy-Authorization always does, and every other header goes on; nil
+// is Authorization, as for a sandbox token. upstreamPath is the path the
+// pod sees ("" is "/"), rawPath its escaped form ("" when it needs none);
+// the query is kept. A path with a ".." segment, also one
 // percent-encoded, is refused with 400. Every answer of the door's own is
 // plain text.
-func (h *Handler) ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID uuid.UUID, port int, upstreamPath, rawPath string) {
+func (h *Handler) ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID uuid.UUID, port int, upstreamPath, rawPath string,
+	credentials []string) {
 	if port < 1 || port > 65535 {
 		reply{http.StatusBadGateway, fmt.Sprintf("port %d is out of range", port), 0}.write(w)
 		return
@@ -145,7 +149,8 @@ func (h *Handler) ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID uu
 		rp.write(w)
 		return
 	}
-	h.forward(w, r, sandboxID, target{id: sandboxID.String(), port: port, path: upstreamPath, rawPath: rawPath})
+	h.forward(w, r, sandboxID, target{id: sandboxID.String(), port: port, path: upstreamPath, rawPath: rawPath,
+		credentials: credentials})
 }
 
 // dotDot reports whether a path has a ".." segment: in the path, in its

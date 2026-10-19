@@ -95,12 +95,14 @@ type Ports interface {
 	DialPod(ctx context.Context, lease model.Lease, port int) (net.Conn, error)
 	// ForwardTo forwards the request to the sandbox's port as the door
 	// does: Acquire with a forward hold (it wakes a paused row) and Touch,
-	// Host passed through, Authorization stripped, upgrades and streaming
-	// kept, a Kubernetes binding's port refused. upstreamPath and rawPath
-	// are the path the pod sees (rawPath its escaped form, "" when it
-	// needs none); the query is kept. It writes the answer, errors too
-	// (plain text).
-	ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID uuid.UUID, port int, upstreamPath, rawPath string)
+	// Host passed through, the headers in credentials (nil:
+	// Authorization) and Proxy-Authorization stripped, every other header
+	// kept, upgrades and streaming kept, a Kubernetes binding's port
+	// refused. upstreamPath and rawPath are the path the pod sees (rawPath
+	// its escaped form, "" when it needs none); the query is kept. It
+	// writes the answer, errors too (plain text).
+	ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID uuid.UUID, port int, upstreamPath, rawPath string,
+		credentials []string)
 }
 
 // Sealer seals the secrets of environments at rest (AES-256-GCM under the

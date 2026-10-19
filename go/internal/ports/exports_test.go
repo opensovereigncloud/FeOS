@@ -251,8 +251,9 @@ func TestProbePastAFullStreamCap(t *testing.T) {
 }
 
 // routeFront serves ForwardTo as the route door would: /route/<rest> to
-// the world's sandbox's guest port, the rest as the upstream path.
-func (w *world) routeFront() *httptest.Server {
+// the world's sandbox's guest port, the rest as the upstream path,
+// credentials the headers that stop at the door.
+func (w *world) routeFront(credentials []string) *httptest.Server {
 	// No ServeMux: it would clean the paths before the door sees them.
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		up := strings.TrimPrefix(r.URL.Path, "/route")
@@ -260,7 +261,7 @@ func (w *world) routeFront() *httptest.Server {
 		if raw == up {
 			raw = ""
 		}
-		w.h.ForwardTo(rw, r, w.sb.ID, guestPort, up, raw)
+		w.h.ForwardTo(rw, r, w.sb.ID, guestPort, up, raw, credentials)
 	}))
 	w.t.Cleanup(srv.Close)
 	return srv
@@ -272,9 +273,10 @@ func (w *world) routeFront() *httptest.Server {
 // and so is a Kubernetes port; upgrades work.
 func TestForwardTo(t *testing.T) {
 	w := newWorld(t)
-	front := w.routeFront()
+	front := w.routeFront(nil)
 	touches, _ := w.eng.counts()
-	hdr := http.Header{"Authorization": {"Bearer route-token"}, "Host": {"stage.preview.example.test"}}
+	hdr := http.Header{"Authorization": {"Bearer route-token"}, "Proxy-Authorization": {"Basic eDp5"},
+		"Host": {"stage.preview.example.test"}}
 	code, _, body := w.do("POST", front.URL+"/route/api/a%2Fb?x=1", hdr, "hi")
 	if code != 200 {
 		t.Fatalf("%d %s", code, body)
@@ -305,6 +307,20 @@ func TestForwardTo(t *testing.T) {
 			t.Errorf("%s: %d %q", p, resp.StatusCode, b)
 		}
 	}
+	// The route token in a header of its own: that header stops here, and
+	// so does Proxy-Authorization, but the client's Authorization goes on.
+	own := w.routeFront([]string{"X-FeRun-Route-Token"})
+	code, _, body = w.do("GET", own.URL+"/route/me", http.Header{"Authorization": {"Bearer client-jwt"},
+		"X-Ferun-Route-Token": {"route-token"}, "Proxy-Authorization": {"Basic eDp5"}}, "")
+	s = seen{}
+	if err := json.Unmarshal([]byte(body), &s); code != 200 || err != nil {
+		t.Fatalf("%d %s %v", code, body, err)
+	}
+	if s.Authorization != "Bearer client-jwt" || s.RouteToken != "" || s.ProxyAuthorization != "" {
+		t.Fatalf("the guest saw %+v", s)
+	}
+	w.noHoldsLeft()
+
 	// "..." and "a..b" are names, not parent segments.
 	if code, _, body := w.do("GET", front.URL+"/route/.../a..b", nil, ""); code != 200 {
 		t.Errorf("dots in names: %d %s", code, body)

@@ -196,6 +196,10 @@ type target struct {
 	// path and rawPath are the rest of the path after the port, with
 	// its leading "/" ("/" when there is none): unescaped and as sent.
 	path, rawPath string
+	// credentials are the request headers that carried the caller's
+	// credential, which stop at the door with Proxy-Authorization; nil
+	// is Authorization (a sandbox token's).
+	credentials []string
 }
 
 // splitPath reads the sandbox, the port and the rest from the escaped
@@ -502,8 +506,15 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request, lease model.Leas
 			// (FeCode's preview host): allowed-hosts checks and hot-reload
 			// URLs are built from it.
 			pr.Out.Host = pr.In.Host
-			// The sandbox's token stops here.
-			pr.Out.Header.Del("Authorization")
+			// The caller's credential stops here: the sandbox's token,
+			// or what the route door names.
+			creds := tg.credentials
+			if creds == nil {
+				creds = []string{"Authorization"}
+			}
+			for _, name := range creds {
+				pr.Out.Header.Del(name)
+			}
 			pr.Out.Header.Del("Proxy-Authorization")
 		},
 		Transport:     tr,
