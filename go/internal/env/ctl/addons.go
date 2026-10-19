@@ -104,6 +104,11 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 	}
 	c.keep(ctx, v, cur, 0)
 	sb := cur.Sandbox
+	if vol != nil && vol.Provisioned && materialised(sb) && (vol.Node != sb.Node || sb.PinNode != sb.Node) {
+		// Restored elsewhere: its volume came along, whether its pod runs
+		// there or stopped or failed there since.
+		c.moveVolume(ctx, v, *vol, sb)
+	}
 	if c.heal(ctx, cur, false) {
 		// Never replaced: its volume is on the lost node. Ensure syncs it
 		// when the node returns.
@@ -114,10 +119,6 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 		}
 		s.wait(obj, "addon %s is lost", name)
 		return false
-	}
-	if vol != nil && vol.Provisioned && steady(sb) && (vol.Node != sb.Node || sb.PinNode != sb.Node) {
-		// Restored elsewhere: its volume came along.
-		c.moveVolume(ctx, v, *vol, sb)
 	}
 	if cur.Instance.Phase != model.PhaseReady {
 		s.wait(obj, "addon %s is %s", name, cur.Instance.Phase)
@@ -430,7 +431,8 @@ func (c *Controller) recreateAddon(ctx context.Context, s *stepState, p *addonPl
 }
 
 // moveVolume records that an addon's volume is on the node its instance
-// runs on now (a restore elsewhere took it along), and pins the row there.
+// is materialised on now (a restore elsewhere took it along), and pins
+// the row there.
 func (c *Controller) moveVolume(ctx context.Context, v *view, vol store.EnvVolume, sb store.Sandbox) {
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockEnvVolume(ctx, v.env.ID, vol.Object, store.ForUpdate)

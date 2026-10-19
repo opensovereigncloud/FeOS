@@ -337,6 +337,17 @@ func steady(sb store.Sandbox) bool {
 	return sb.ClientState == model.StateRunning && sb.Op == "" && sb.Node != ""
 }
 
+// materialised reports whether a row's pod sits on its node without an
+// op: running, paused, stopped or failed there, where its volumes are
+// attached (not lost, hibernated or unknown).
+func materialised(sb store.Sandbox) bool {
+	switch sb.ClientState {
+	case model.StateRunning, model.StatePaused, model.StateStopped, model.StateFailed:
+		return sb.Node != "" && sb.Op == "" && sb.Materialised
+	}
+	return false
+}
+
 // attachedKey names an attached service in the controller's maps.
 func attachedKey(envID uuid.UUID, service string) string { return envID.String() + "/" + service }
 

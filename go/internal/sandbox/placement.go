@@ -31,7 +31,7 @@ const (
 	gateMemory     = 11 // booked memory within the total less the headroom
 	gateFreeMemory = 12 // live memory less the headroom
 	gateDisk       = 13 // live disk within the disk budget
-	gatePin        = 14 // create, start: the node the row is pinned to
+	gatePin        = 14 // create: the node the row is pinned to
 )
 
 // The gates of each check: a placement's snapshot, the claim of a create
@@ -42,7 +42,7 @@ var (
 		gateStore, gateSlots, gateCPU, gateMemory, gateFreeMemory, gateDisk}
 	claimGates = []int{gateStatus, gatePin, gateDraining, gateForked, gateConnected, gateTombstone, gateTAP, gateStore,
 		gateSlots, gateCPU, gateMemory}
-	admitGates    = []int{gateStatus, gatePin, gateDraining, gateForked, gateConnected, gateSlots, gateCPU, gateMemory}
+	admitGates    = []int{gateStatus, gateDraining, gateForked, gateConnected, gateSlots, gateCPU, gateMemory}
 	capacityGates = []int{gateSlots, gateCPU, gateMemory}
 )
 
@@ -58,7 +58,7 @@ type gateInput struct {
 
 	pod             uuid.UUID
 	vcpus, memMiB   int64
-	pin             string // the only node a create or start may go to; "": any
+	pin             string // the only node a create may go to; "": any
 	avoid           []string
 	restore         bool
 	checkpointStore string
@@ -254,10 +254,12 @@ func (e *Engine) place(ctx context.Context, sb store.Sandbox, kind OpKind) (plac
 }
 
 // gateInput is the pod's side of the gates for a sandbox's op on node. A
-// pinned row's create and start go only to its pin_node (an addon's
-// volume is there); its restore goes anywhere, since the checkpoint
-// carries the volume. A pinned row avoids no node: a create that failed
-// on its only node must not lock it out of it.
+// pinned row's create goes only to its pin_node (an addon's volume is
+// there); its restore goes anywhere, since the checkpoint carries the
+// volume; a start or resume goes to the row's own node, where its pod and
+// the volume attached to it are, whatever pin_node says (a restore
+// elsewhere may not have moved it yet). A pinned row avoids no node: a
+// create that failed on its only node must not lock it out of it.
 func (e *Engine) gateInput(sb store.Sandbox, kind OpKind, n store.Node) gateInput {
 	in := gateInput{
 		node: n, connected: e.conns.Connected(n.Name), pod: sb.ID,
@@ -266,7 +268,7 @@ func (e *Engine) gateInput(sb store.Sandbox, kind OpKind, n store.Node) gateInpu
 	}
 	if sb.PinNode != "" {
 		in.avoid = nil
-		if kind == OpCreate || kind == OpStart {
+		if kind == OpCreate {
 			in.pin = sb.PinNode
 		}
 	}

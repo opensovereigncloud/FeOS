@@ -77,7 +77,7 @@ type Sandbox struct {
 	// sandbox has a template without an environment.
 	EnvironmentID uuid.UUID
 	PodTemplate   *model.PodTemplate
-	// PinNode is the only node a create or start may go to ("": any).
+	// PinNode is the only node a create may go to ("": any).
 	PinNode string
 	// IdleAfterS is the idle pause's interval in seconds: nil (NULL) the
 	// instance's --idle-pause, 0 never.

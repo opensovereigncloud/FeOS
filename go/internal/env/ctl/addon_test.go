@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
@@ -300,7 +301,7 @@ func TestAddonLostOnLiveNode(t *testing.T) {
 }
 
 // A drained node's addon restores on another node with its volume (the
-// pin gates creates and starts only); the controller records the volume's
+// pin gates creates only); the controller records the volume's
 // new node and pins the row there.
 func TestAddonMovesWithDrain(t *testing.T) {
 	h := newHarness(t, options{})
@@ -340,6 +341,53 @@ func TestAddonMovesWithDrain(t *testing.T) {
 		_, err := h.st.GetEnvironment(bg, env.ID)
 		return errors.Is(err, store.ErrNoRow) && len(n1.Volumes()) == 0 && len(n2.Volumes()) == 0
 	})
+}
+
+// An addon restored on another node whose pod stopped there before the
+// controller moved its volume's record (env_volumes.node and pin_node
+// still the old node): the step moves both to the node its pod is
+// materialised on although it does not run, and it starts there again
+// (§13.7; a start is never pinned).
+func TestAddonVolumeFollowsStoppedRow(t *testing.T) {
+	h := newHarness(t, options{})
+	h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	n2 := h.addNode("n2")
+	h.exec("UPDATE nodes SET draining = true, drain_started_at = now() WHERE name = 'n1'")
+	eventually(t, 90*time.Second, "the addon running on n2, its volume recorded there", func() bool {
+		h.c.notify(bg, "drain")
+		rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+		vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+		return len(rows) == 1 && rows[0].Sandbox.ID == first.Sandbox.ID && rows[0].Sandbox.Node == "n2" && running(rows[0]) &&
+			err == nil && vol.Node == "n2" && rows[0].Sandbox.PinNode == "n2"
+	})
+	// n2 refuses to start it for now; its pod stops there; the record
+	// says n1 again, as before the controller saw the restore.
+	n2.Script().SetHook(podv1.PodService_StartPod_FullMethodName, func(context.Context, string, any) error {
+		return status.Error(codes.FailedPrecondition, "not now")
+	})
+	if _, err := podv1.NewPodServiceClient(h.conn("n2")).StopPod(bg, &podv1.StopPodRequest{PodId: first.Sandbox.ID.String()}); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "the addon stopped on n2", func() bool {
+		sb, err := h.st.GetSandbox(bg, first.Sandbox.ID)
+		return err == nil && (sb.ClientState == model.StateStopped || sb.ClientState == model.StateFailed) && sb.Node == "n2"
+	})
+	h.exec(`UPDATE env_volumes SET node = 'n1' WHERE env_id = $1`, env.ID)
+	h.exec(`UPDATE sandboxes SET pin_node = 'n1' WHERE id = $1`, first.Sandbox.ID)
+	eventually(t, 30*time.Second, "the volume's node and the pin moved to n2 while it does not run", func() bool {
+		vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+		sb, err2 := h.st.GetSandbox(bg, first.Sandbox.ID)
+		return err == nil && err2 == nil && vol.Node == "n2" && sb.PinNode == "n2" && sb.ClientState != model.StateRunning
+	})
+	n2.Script().SetHook(podv1.PodService_StartPod_FullMethodName, nil)
+	again := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 60*time.Second, "ready again", ready)[0]
+	if again.Sandbox.ID != first.Sandbox.ID || again.Sandbox.Node != "n2" {
+		t.Errorf("the addon after the start: %+v", again.Sandbox)
+	}
 }
 
 // removeNode removes a node as the admin API does with force: its row

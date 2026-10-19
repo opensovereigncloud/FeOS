@@ -467,27 +467,30 @@ func TestPinGate(t *testing.T) {
 	h.ensure(pinned.ID)
 	wantState(t, h.row(pinned.ID), model.StateRunning)
 
-	// A stopped row starts only on the pinned node.
-	if _, err := h.pods(h.row(pinned.ID).Node).StopPod(bg, &podv1.StopPodRequest{PodId: pinned.ID.String()}); err != nil {
+	// A row restored elsewhere and stopped there before its pin moved
+	// starts on its own node, where its pod and volume are: the pin gates
+	// creates only.
+	restored := h.row(pinned.ID).Node
+	if _, err := h.pods(restored).StopPod(bg, &podv1.StopPodRequest{PodId: pinned.ID.String()}); err != nil {
 		t.Fatal(err)
 	}
 	h.waitState(pinned.ID, model.StateStopped, 10*time.Second)
-	_, err = h.eng().Ensure(ctx, pinned.ID)
-	wantErr(t, err, model.ErrNoCapacity, "pinned to node n9: its volume is there")
-	h.exec("UPDATE sandboxes SET pin_node = node WHERE id = $1", pinned.ID)
 	h.ensure(pinned.ID)
+	if row := h.row(pinned.ID); row.ClientState != model.StateRunning || row.Node != restored || row.PinNode != "n9" {
+		t.Fatalf("after the start: %s on %s, pinned to %s", row.ClientState, row.Node, row.PinNode)
+	}
 
-	// The gate unit: create and start only.
+	// The gate unit: create only.
 	in := readyNode("n1")
 	in.pin = "n2"
 	if r := in.check(placementGates); r == nil || r.gate != gatePin {
 		t.Fatalf("refusal %+v", r)
 	}
-	if r := in.check(admitGates); r == nil || r.text != "pinned to node n2: its volume is there" {
+	if r := in.check(admitGates); r != nil {
 		t.Fatalf("admission refusal %+v", r)
 	}
 	sb := store.Sandbox{PinNode: "n2", AvoidNodes: []string{"n2"}}
-	for kind, pin := range map[OpKind]string{OpCreate: "n2", OpStart: "n2", OpRestore: "", OpResume: ""} {
+	for kind, pin := range map[OpKind]string{OpCreate: "n2", OpStart: "", OpRestore: "", OpResume: ""} {
 		g := h.eng().gateInput(sb, kind, store.Node{Name: "n1"})
 		if g.pin != pin || g.avoid != nil {
 			t.Fatalf("%s: pin %q avoid %v", kind, g.pin, g.avoid)
