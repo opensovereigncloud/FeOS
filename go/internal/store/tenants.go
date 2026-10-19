@@ -68,15 +68,19 @@ func (s *Store) LockTenant(ctx context.Context, id string, lock RowLock) (Tenant
 type TenantInfo struct {
 	Tenant
 	SandboxCount int64
-	Tokens       []TenantToken
+	// EnvironmentCount is its environments that are not being deleted:
+	// a tenant's deletion takes them, and their addons' data, along.
+	EnvironmentCount int64
+	Tokens           []TenantToken
 }
 
 // ListTenants returns every tenant ordered by name, with its number of
-// sandboxes (an environment's instance rows are none) and its tokens
-// (oldest first).
+// sandboxes (an environment's instance rows are none), of environments
+// (those being deleted are none) and its tokens (oldest first).
 func (s *Store) ListTenants(ctx context.Context) ([]TenantInfo, error) {
 	rows, err := s.q.Query(ctx, `SELECT t.id, t.created_at, t.deleting_at,
-			(SELECT count(*) FROM sandboxes s WHERE s.owner = t.id AND s.environment_id IS NULL)
+			(SELECT count(*) FROM sandboxes s WHERE s.owner = t.id AND s.environment_id IS NULL),
+			(SELECT count(*) FROM environments e WHERE e.owner = t.id AND NOT e.deleting)
 		FROM tenants t ORDER BY t.id`)
 	if err != nil {
 		return nil, err
@@ -84,7 +88,7 @@ func (s *Store) ListTenants(ctx context.Context) ([]TenantInfo, error) {
 	tenants, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (TenantInfo, error) {
 		var ti TenantInfo
 		var deleting *time.Time
-		err := r.Scan(&ti.ID, &ti.CreatedAt, &deleting, &ti.SandboxCount)
+		err := r.Scan(&ti.ID, &ti.CreatedAt, &deleting, &ti.SandboxCount, &ti.EnvironmentCount)
 		ti.DeletingAt = timeOf(deleting)
 		return ti, err
 	})

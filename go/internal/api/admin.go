@@ -82,10 +82,13 @@ func tenantTokenOf(t store.TenantToken) tenantTokenInfo {
 }
 
 type tenantInfo struct {
-	Name         string            `json:"name"`
-	CreatedAt    string            `json:"createdAt"`
-	SandboxCount int64             `json:"sandboxCount"`
-	Tokens       []tenantTokenInfo `json:"tokens"`
+	Name         string `json:"name"`
+	CreatedAt    string `json:"createdAt"`
+	SandboxCount int64  `json:"sandboxCount"`
+	// EnvironmentCount is its environments not being deleted, which its
+	// deletion takes along with their addons' data.
+	EnvironmentCount int64             `json:"environmentCount"`
+	Tokens           []tenantTokenInfo `json:"tokens"`
 	// Deleting is set while a deletion is under way.
 	Deleting bool `json:"deleting,omitempty"`
 }
@@ -101,7 +104,7 @@ func (s *server) listTenants(w http.ResponseWriter, r *http.Request) error {
 	}{Tenants: make([]tenantInfo, 0, len(ts))}
 	for _, t := range ts {
 		ti := tenantInfo{Name: t.ID, CreatedAt: rfc3339(t.CreatedAt), SandboxCount: t.SandboxCount,
-			Tokens: make([]tenantTokenInfo, 0, len(t.Tokens)), Deleting: t.Deleting()}
+			EnvironmentCount: t.EnvironmentCount, Tokens: make([]tenantTokenInfo, 0, len(t.Tokens)), Deleting: t.Deleting()}
 		for _, tk := range t.Tokens {
 			ti.Tokens = append(ti.Tokens, tenantTokenOf(tk))
 		}

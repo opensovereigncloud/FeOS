@@ -771,14 +771,22 @@ func TestEnvAttachedVolumesIncidents(t *testing.T) {
 }
 
 // The admin listing's count of a tenant's sandboxes leaves its
-// environments' instance rows out, as the tenant's sandbox listing does.
+// environments' instance rows out, as the tenant's sandbox listing does;
+// its environments are counted apart (one being deleted is none).
 func TestTenantCountLeavesInstancesOut(t *testing.T) {
 	s, _ := newStore(t)
 	mkTenant(t, s, "acme")
 	mkSandbox(t, s, "acme")
 	mkInstance(t, s, mkEnv(t, s, "acme", "stage"))
+	gone := mkEnv(t, s, "acme", "gone")
+	after := gone
+	after.Deleting = true
+	if _, err := s.UpdateEnvironment(bg, gone, after); err != nil {
+		t.Fatal(err)
+	}
+	mkEnv(t, s, "acme", "prod")
 	list, err := s.ListTenants(bg)
-	if err != nil || len(list) != 1 || list[0].SandboxCount != 1 {
+	if err != nil || len(list) != 1 || list[0].SandboxCount != 1 || list[0].EnvironmentCount != 2 {
 		t.Fatalf("tenants %+v %v", list, err)
 	}
 }
