@@ -5,6 +5,7 @@ package ctl
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -163,6 +164,11 @@ func TestJobTimeoutAndManual(t *testing.T) {
 	if err := h.c.RunJob(bg, env.ID, "backfill"); err != nil {
 		t.Fatal(err)
 	}
+	// Asked again while it runs: refused, never a second run at once.
+	if err := h.c.RunJob(bg, env.ID, "backfill"); !errors.Is(err, model.ErrBusy) ||
+		err.Error() != fmt.Sprintf("job backfill runs already (release %d, attempt 1)", r3) {
+		t.Fatalf("a second run while one runs: %v", err)
+	}
 	var id uuid.UUID
 	eventually(t, 30*time.Second, "the manual run", func() bool {
 		for _, r := range h.rowsOf(env.ID, spec.KindJob, "backfill") {
@@ -180,4 +186,11 @@ func TestJobTimeoutAndManual(t *testing.T) {
 		r, err := h.st.LatestJobRun(bg, env.ID, "backfill")
 		return err == nil && r.Phase == model.RunSucceeded && r.Attempt == 1 && r.Release == r3
 	})
+	// Once it ended, it runs again.
+	if err := h.c.RunJob(bg, env.ID, "backfill"); err != nil {
+		t.Fatalf("a run after the first ended: %v", err)
+	}
+	if runs, _ := h.st.ListJobRuns(bg, env.ID, "backfill", 10); len(runs) != 2 {
+		t.Errorf("runs %+v", runs)
+	}
 }

@@ -354,6 +354,9 @@ type insert struct {
 	pin     string
 	// run is a job's run, inserted with the row.
 	run *store.EnvJobRun
+	// once: a run of a job that is refused while a run of the job runs
+	// (RunJob), checked under the environment's row lock.
+	once bool
 }
 
 // insertInstance inserts an instance row and the controller's row of it
@@ -389,12 +392,21 @@ func (c *Controller) insertFrom(ctx context.Context, v *view, in insert, leaderS
 		if t.Deleting() {
 			return errTenantDeleting
 		}
-		e, err := tx.LockEnvironment(ctx, v.env.ID, store.ForShare)
+		lock := store.ForShare
+		if in.once {
+			lock = store.ForUpdate
+		}
+		e, err := tx.LockEnvironment(ctx, v.env.ID, lock)
 		if err != nil {
 			return err
 		}
 		if e.Deleting {
 			return errEnvDeleting
+		}
+		if in.once && in.run != nil {
+			if err := noRunOf(ctx, tx, v.env.ID, in.run.Job); err != nil {
+				return err
+			}
 		}
 		_, created, err := tx.CreateSandbox(ctx, store.NewSandbox{ID: id, Owner: v.env.Owner, Image: p.image,
 			VCPUs: p.vcpus, MemoryMiB: p.memoryMB, ImageRef: ref, EnvironmentID: v.env.ID, PodTemplate: &tmpl,
