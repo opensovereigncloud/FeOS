@@ -25,10 +25,11 @@ import (
 
 // The route door's plain answers.
 const (
-	textRouteToken = "route token required"
-	textDotDot     = "the path has a .. segment"
-	textDot        = "the path has a . segment"
-	textNoDoor     = "not available on this instance"
+	textRouteToken  = "route token required"
+	textDotDot      = "the path has a .. segment"
+	textDot         = "the path has a . segment"
+	textNoDoor      = "not available on this instance"
+	textRouteFailed = "the route door failed"
 )
 
 // RouteTokenHeader carries a route token to the route door beside the
@@ -202,7 +203,8 @@ func rawOf(path, raw string) string {
 // go to its sandbox, only while that is the environment owner's and the
 // incarnation its process was started in (else 503). The path is
 // stripped of the route's path when the route says so; the query is
-// kept. Its answers are plain text.
+// kept. Its answers are plain text; a failure inside ferund is logged
+// and answered 500 "the route door failed", without its cause.
 func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tok, creds := routeToken(r)
@@ -403,6 +405,8 @@ func (s *Service) pickInstance(ctx context.Context, envID uuid.UUID, service str
 }
 
 // routeFailed answers a route door request that failed inside ferund.
+// The door serves anonymous clients, so the cause (database addresses,
+// sandbox IDs) goes to the log only.
 func (s *Service) routeFailed(w http.ResponseWriter, r *http.Request, err error) {
 	var ae *apierr.Error
 	if errors.As(err, &ae) && ae.Status < 500 {
@@ -410,5 +414,5 @@ func (s *Service) routeFailed(w http.ResponseWriter, r *http.Request, err error)
 		return
 	}
 	s.log.Warn("route door request failed", "path", r.URL.Path, "err", err)
-	http.Error(w, "the route door failed: "+err.Error(), http.StatusInternalServerError)
+	http.Error(w, textRouteFailed, http.StatusInternalServerError)
 }

@@ -479,6 +479,29 @@ func TestRouteDoor(t *testing.T) {
 		"not available on this instance\n")
 }
 
+// The route door serves anonymous clients: a failure inside ferund is
+// logged, and its answer names no cause.
+func TestRouteDoorFailure(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	mux := doorMux(h.svc)
+	h.create("stage", nil)
+	h.putSecret("stage", "token", "x")
+	h.apply("stage", stageSpec, 0)
+	tok, err := h.svc.CreateRouteToken(h.ctx(), tenantA, "stage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A stored spec that does not parse.
+	h.exec(`UPDATE env_releases SET spec = '{"services": 5}' WHERE env_id = $1`, h.env("stage").ID)
+	wantPlain(t, routeRequest(mux, "GET", "/api/v1/environments/stage/http/api/x", tok.Token), 500,
+		"the route door failed\n")
+	// A database that is gone.
+	h.d.Close()
+	wantPlain(t, routeRequest(mux, "GET", "/api/v1/environments/stage/http/api/x", tok.Token), 500,
+		"the route door failed\n")
+}
+
 func TestRoutePaths(t *testing.T) {
 	routes := map[string]spec.Route{
 		"root": {Path: "/"}, "api": {Path: "/api"}, "deep": {Path: "/api/v2/"}, "x": {Path: "/a b"},
