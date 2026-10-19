@@ -10,6 +10,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -23,7 +24,11 @@ import (
 // and, while R rolls, runs its release jobs (§4.3 step 3): a job runs
 // when no run of its template hash succeeded, once every addon is
 // provisioned; a failed attempt is retried while attempt ≤ retries; a
-// failed last attempt fails R (job_failed).
+// failed last attempt fails R (job_failed). A job runs once at a time
+// across releases (§13.7): while a run of it that is not R's runs (a
+// superseded release's, a manual one, another template's), R's waits for
+// it to end, never cancelling it; R may then roll until that run ended
+// and its own attempts had their time (stepState.until).
 func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 	v := s.v
 	c.stepRuns(ctx, s)
@@ -61,14 +66,30 @@ func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 			s.wait(objectName(spec.KindJob, name), "job %s: %v", name, err)
 			continue
 		}
-		var last *store.EnvJobRun
+		var last, other *store.EnvJobRun
+		timeout := jobTimeout(j)
 		for i := range runs {
 			if runs[i].TemplateHash == p.hash && runs[i].Release == v.targetNum {
-				last = &runs[i]
-				break
+				if last == nil {
+					last = &runs[i]
+				}
+				continue
+			}
+			end := runs[i].FinishedAt
+			if runs[i].Phase == model.RunRunning {
+				end = runs[i].StartedAt.Add(timeout)
+				if other == nil {
+					other = &runs[i]
+				}
+			}
+			if end.After(v.latest.StartedAt) {
+				s.extend(end.Add(timeout * time.Duration(max(j.Retries, 0)+1)))
 			}
 		}
 		switch {
+		case other != nil:
+			s.wait(objectName(spec.KindJob, name), "job %s waits for its run of release %d (attempt %d)", name, other.Release,
+				other.Attempt)
 		case last == nil:
 			c.startRun(ctx, s, p, 1)
 		case last.Phase == model.RunRunning:
@@ -99,12 +120,19 @@ func runOutcome(r store.EnvJobRun) string {
 	return ""
 }
 
-// startRun inserts a run of a job (attempt n) with its instance row.
+// startRun inserts a run of a job (attempt n) with its instance row,
+// refused while a run of the job runs (once: checked under the
+// environment's row lock, as RunJob is, so that a run the API inserted
+// meanwhile is waited for, never run beside).
 func (c *Controller) startRun(ctx context.Context, s *stepState, p *podPlan, attempt int) {
 	v := s.v
 	run := &store.EnvJobRun{EnvID: v.env.ID, Job: p.name, TemplateHash: p.hash, Release: v.targetNum, Attempt: attempt,
 		Phase: model.RunRunning}
-	if _, err := c.insertInstance(ctx, v, insert{plan: p, release: v.targetNum, run: run}); err != nil {
+	if _, err := c.insertInstance(ctx, v, insert{plan: p, release: v.targetNum, run: run, once: true}); err != nil {
+		if errors.Is(err, ErrJobRunning) {
+			s.wait(objectName(spec.KindJob, p.name), "%v", err)
+			return
+		}
 		s.wait(objectName(spec.KindJob, p.name), "job %s: %v", p.name, err)
 		return
 	}
@@ -181,12 +209,13 @@ func (c *Controller) failOrphanRun(ctx context.Context, run store.EnvJobRun) {
 
 // finishJob ends a job's run (§4.3 step 3): exit code 0 → succeeded;
 // another code, none ("the node did not report an exit status"), a
-// timeout or a lost instance → failed. Its log tail (the last 50 lines)
-// is kept in the run before its row goes.
+// timeout or a lost instance → failed. Its log tail (the last 50 lines,
+// redacted and bounded: storedTail) is kept in the run before its row
+// goes.
 func (c *Controller) finishJob(ctx context.Context, v *view, r store.EnvInstanceRow, code *int, detail string) {
 	var tail []string
 	if steady(r.Sandbox) && c.connected(r.Sandbox.Node) {
-		tail, _ = c.containerLog(ctx, lease(r.Sandbox), logTailLines)
+		tail = c.storedTail(ctx, v, r.Sandbox)
 	}
 	succeeded := code != nil && *code == 0 && detail == ""
 	if code == nil && detail == "" {
@@ -260,8 +289,9 @@ func appendExit(exits []store.EnvExit, e store.EnvExit) []store.EnvExit {
 
 // RunJob starts a run of a job of the environment's target release (what
 // jobs on "manual" are for): a new attempt 1. It returns once the run's
-// row is inserted; ErrNoObject, ErrNotReady, and model.ErrBusy while a
-// run of the job runs (a repeated request never runs it twice at once).
+// row is inserted; ErrNoObject, ErrNotReady, and ErrJobRunning (a
+// model.ErrBusy) while a run of the job runs, of any release (a repeated
+// request never runs it twice at once).
 func (c *Controller) RunJob(ctx context.Context, envID uuid.UUID, name string) error {
 	v, err := c.load(ctx, envID)
 	if errors.Is(err, store.ErrNoRow) || (err == nil && v == nil) {
@@ -284,7 +314,7 @@ func (c *Controller) RunJob(ctx context.Context, envID uuid.UUID, name string) e
 	return err
 }
 
-// noRunOf refuses with model.ErrBusy while a run of the job runs.
+// noRunOf refuses with ErrJobRunning while a run of the job runs.
 func noRunOf(ctx context.Context, tx *store.Store, envID uuid.UUID, job string) error {
 	runs, err := tx.EnvCtlRunningJobRuns(ctx, envID)
 	if err != nil {
@@ -293,7 +323,7 @@ func noRunOf(ctx context.Context, tx *store.Store, envID uuid.UUID, job string) 
 	for _, r := range runs {
 		if r.Job == job {
 			return &stateError{msg: fmt.Sprintf("job %s runs already (release %d, attempt %d)", job, r.Release, r.Attempt),
-				kind: model.ErrBusy}
+				kind: ErrJobRunning}
 		}
 	}
 	return nil

@@ -74,6 +74,17 @@ type stepState struct {
 	reason string
 	// failed: the step failed R.
 	failed bool
+	// until is when R may roll to at least, beyond its deadline: a
+	// release job that waited for a run that was not R's may take until
+	// that run's end and its own attempts' time (zero: no such run).
+	until time.Time
+}
+
+// extend lets R roll until at least t.
+func (s *stepState) extend(t time.Time) {
+	if t.After(s.until) {
+		s.until = t
+	}
 }
 
 // pending is one thing a rolling release waits for: the object ("" for
@@ -127,7 +138,7 @@ func (c *Controller) step(ctx context.Context, envID uuid.UUID) error {
 	case s.failed || !rolling(v):
 	case len(s.pending) == 0:
 		return c.realise(ctx, v)
-	case s.reason == "" && c.pastDeadline(v):
+	case s.reason == "" && c.pastDeadline(s):
 		return c.failLate(ctx, s)
 	case s.reason != v.latest.Reason:
 		return c.setReason(ctx, v, s.reason)
@@ -153,9 +164,20 @@ func (c *Controller) deadline(v *view) time.Duration {
 	return d
 }
 
-// pastDeadline reports whether R has rolled longer than its deadline.
-func (c *Controller) pastDeadline(v *view) bool {
-	return !v.latest.StartedAt.IsZero() && v.now.After(v.latest.StartedAt.Add(c.deadline(v)))
+// within is how long R may roll: its deadline, or longer when a release
+// job waited for a run that was not R's (stepState.until).
+func (c *Controller) within(s *stepState) time.Duration {
+	d := c.deadline(s.v)
+	if !s.until.IsZero() && !s.v.latest.StartedAt.IsZero() {
+		d = max(d, s.until.Sub(s.v.latest.StartedAt))
+	}
+	return d
+}
+
+// pastDeadline reports whether R has rolled longer than it may (within).
+func (c *Controller) pastDeadline(s *stepState) bool {
+	v := s.v
+	return !v.latest.StartedAt.IsZero() && v.now.After(v.latest.StartedAt.Add(c.within(s)))
 }
 
 // failLate fails a rolling R past its deadline (rollout_failed), naming
@@ -193,7 +215,8 @@ func (c *Controller) failLate(ctx context.Context, s *stepState) error {
 		}
 	}
 	ev.Diff = c.releaseDiff(ctx, v)
-	reason := redact(fmt.Sprintf("release %d did not roll out within %s: %s", v.latest.Number, c.deadline(v), first.text), secrets)
+	reason := redact(fmt.Sprintf("release %d did not roll out within %s: %s", v.latest.Number,
+		c.within(s).Round(time.Second), first.text), secrets)
 	if err := c.failRelease(ctx, v, reason, first.object, model.ConditionRolloutFailed, ev); err != nil {
 		return err
 	}
