@@ -1866,7 +1866,10 @@ feosd does; no delete of a group a pod names; with
 address, gives a pod a new microVM pid on every boot and restore, and
 its script exits a container with a code (`ExitContainer`), appends to
 its log (`AppendLog`, served by `StreamContainerLogs` with `tail_lines`,
-capped at 10000 lines but not at the guest's 4 MiB), sets a pod's exec
+capped as the guest's at 10000 lines and 4 MiB from the log's end, a
+line that starts further back cut to its last whole 64 KiB parts within
+them; it sends each line as one entry, where the guest splits a line
+over 64 KiB into parts), sets a pod's exec
 and port addresses (`SetPodExec`, `SetPodPortAddr`), and drops a pod's
 record without an event (`ForgetPod`), as a node that comes back
 without the pod does, its volumes let go; an exec into a pod labelled

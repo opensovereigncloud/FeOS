@@ -263,13 +263,50 @@ func (c *containerService) run(ctx context.Context, g *guest, container string, 
 // envLabel is the label of an environment's pods (model.LabelEnvironment).
 const envLabel = "ferun.environment"
 
-// maxTailLines is the most lines a StreamContainerLogs tail_lines sends.
-const maxTailLines = 10000
+// The guest's bounds of a StreamContainerLogs tail: maxTailLines is the
+// most lines tail_lines sends (MAX_TAIL_LINES), maxTailBytes how far back
+// from the log's end it reaches (MAX_TAIL_BYTES), each line counted with
+// its newline, and maxLinePart the parts of a line (MAX_LINE) that a line
+// cut at that bound keeps.
+const (
+	maxTailLines = 10000
+	maxTailBytes = 4 << 20
+	maxLinePart  = 64 << 10
+)
+
+// tailOf is what a tail of n lines (n > 0) of a log sends, as the guest's
+// does: the last n lines, at most maxTailLines, that start within
+// maxTailBytes of the log's end. A line that starts further back goes out
+// cut to its last whole maxLinePart parts within those bytes, as one line
+// (the test node does not split lines into the guest's parts), or not at
+// all when not one part fits.
+func tailOf(lines []string, n int) []string {
+	n = min(n, maxTailLines)
+	first := max(0, len(lines)-n)
+	left := maxTailBytes
+	i := len(lines)
+	for i > first && len(lines[i-1])+1 <= left {
+		left -= len(lines[i-1]) + 1
+		i--
+	}
+	out := slices.Clone(lines[i:])
+	if i == first {
+		return out
+	}
+	// lines[i-1] starts further back than the bytes reach: its own bytes
+	// within them are all that is left but its newline.
+	l := lines[i-1]
+	if whole := (left - 1) / maxLinePart; whole > 0 {
+		out = slices.Insert(out, 0, l[len(l)-whole*maxLinePart:])
+	}
+	return out
+}
 
 // StreamContainerLogs serves a container's log lines (Script.AppendLog):
-// the last tail_lines of them when above 0 (at most 10000), else all with
-// tail, else none; with follow the stream then stays open until the
-// caller ends it, without new lines.
+// the last tail_lines of them when above 0 within the guest's bounds
+// (tailOf: at most 10000 lines and 4 MiB), else all with tail, else none;
+// with follow the stream then stays open until the caller ends it,
+// without new lines.
 func (c *containerService) StreamContainerLogs(req *containerv1.StreamContainerLogsRequest, stream grpc.ServerStreamingServer[containerv1.LogEntry]) error {
 	ctx := stream.Context()
 	g, err := guestFrom(ctx)
@@ -286,7 +323,7 @@ func (c *containerService) StreamContainerLogs(req *containerv1.StreamContainerL
 	lines := c.n.pods.containerLog(g.id, container)
 	switch n := int(min(req.GetTailLines(), maxTailLines)); {
 	case n > 0:
-		lines = lines[max(0, len(lines)-n):]
+		lines = tailOf(lines, n)
 	case !req.GetTail():
 		lines = nil
 	}
