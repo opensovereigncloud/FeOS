@@ -119,6 +119,38 @@ func TestClone(t *testing.T) {
 		!hasFinding(ise.Findings, spec.SeverityError, "secrets.absent", "has no secret absent to copy") {
 		t.Fatalf("bad secrets %v", describe(err))
 	}
+	// Another tenant's environment's ID: refused as taken before the spec
+	// is planned under it, so nothing of what that environment's volumes
+	// hold shows; planned for an environment that is not there yet, no
+	// volume is read.
+	if _, err := h.st.InsertEnvVolume(ctx, store.EnvVolume{EnvID: srcID, Object: "addon/db", VolumeID: uuid.New(),
+		SizeMiB: 1024, AddonType: "postgres", DataVersion: "16"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.svc.CreateEnv(ctx, tenantB, CreateEnvRequest{Name: "own"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.Apply(ctx, tenantB, "own", ApplyRequest{Spec: json.RawMessage(
+		`{"services": {"web": {"image": "ghcr.io/acme/web:1"}}}`)}); err != nil {
+		t.Fatal(describe(err))
+	}
+	probe := `{"addons": {"db": {"type": "postgres", "version": "17"}}, "routes": {"bad": {"path": "x", "service": "nope"}}}`
+	_, err = h.svc.Clone(ctx, tenantB, "own", CloneRequest{Name: "probe", ID: src.ID, Spec: json.RawMessage(probe)})
+	if errors.As(err, &ise) {
+		t.Fatalf("a foreign ID was planned: %v", describe(err))
+	}
+	wantStatus(t, err, http.StatusConflict, "an environment of id "+src.ID+" exists with another name")
+	p, err := h.svc.plan(ctx, tenantB, store.Environment{ID: srcID, Owner: tenantB, Name: "probe"}, json.RawMessage(probe),
+		nil, spec.ModeApply, map[string]spec.SecretInfo{})
+	if err != nil || p.valid() {
+		t.Fatalf("plan %+v %v", p, err)
+	}
+	for _, f := range p.findings {
+		if strings.HasPrefix(f.Path, "addons.db") {
+			t.Fatalf("a finding from a foreign volume: %+v", f)
+		}
+	}
+
 	nine := 9
 	_, err = h.svc.Clone(ctx, tenantA, "preview", CloneRequest{Name: "demo3", Release: &nine})
 	wantStatus(t, err, http.StatusNotFound, "no such release")

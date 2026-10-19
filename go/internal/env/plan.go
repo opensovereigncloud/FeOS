@@ -226,7 +226,11 @@ func (s *Service) loadContext(ctx context.Context, tenant string, env *store.Env
 		}
 	}
 
-	if env != nil && len(sp.Addons) > 0 {
+	// An environment without a release has no addon volumes. A clone
+	// plans for one that is not there yet, under an ID that may be
+	// another tenant's environment's (its insert refuses that later):
+	// what that one's volumes hold is no business of the clone's.
+	if env != nil && env.Release > 0 && len(sp.Addons) > 0 {
 		vols, err := s.st.ListEnvVolumes(ctx, env.ID)
 		if err != nil {
 			return nil, pins, fmt.Errorf("volumes: %w", err)
