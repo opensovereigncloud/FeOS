@@ -1675,9 +1675,9 @@ and a touch, the Host passed on, upgrades and streams kept, a
 Kubernetes binding's port refused. `X-FeRun-Route-Token` and
 `Proxy-Authorization` stop at the door; with the token from
 `X-FeRun-Route-Token` the client's `Authorization` reaches the upstream
-unchanged, unless its bearer token (the scheme in any case) is a FeRun
-credential, a tenant's or a sandbox's token, which is 401 "route token
-required" with nothing forwarded; with the token from `Authorization`
+unchanged, unless a bearer token in it (in any of its values, the scheme
+in any case) is a FeRun credential, a tenant's or a sandbox's token,
+which is 401 "route token required" with nothing forwarded; with the token from `Authorization`
 that stops too. A failure
 inside ferund (the database, a stored spec that does not parse) is 500
 "the route door failed", its cause only in the log, since the door

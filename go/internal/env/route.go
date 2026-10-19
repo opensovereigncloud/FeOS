@@ -67,27 +67,30 @@ func routeToken(r *http.Request) (tok string, creds []string, header bool) {
 	return bearer(r), []string{"Authorization", RouteTokenHeader}, false
 }
 
-// ferunBearer reports whether a request's Authorization carries a FeRun
-// credential as its bearer token, a tenant's token or a sandbox's (the
-// scheme in any case): one the door refuses to pass on to an upstream.
+// ferunBearer reports whether a request's Authorization, any of its
+// values, carries a FeRun credential as its bearer token, a tenant's
+// token or a sandbox's (the scheme in any case): one the door refuses to
+// pass on to an upstream.
 func (s *Service) ferunBearer(ctx context.Context, r *http.Request) (bool, error) {
-	scheme, tok, _ := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
-	tok = strings.TrimSpace(tok)
-	if !strings.EqualFold(scheme, "Bearer") || tok == "" {
-		return false, nil
-	}
-	hash := store.HashToken(tok)
-	switch _, err := s.st.ResolveTenantToken(ctx, hash); {
-	case err == nil:
-		return true, nil
-	case !errors.Is(err, model.ErrUnknownToken):
-		return false, err
-	}
-	switch _, _, err := s.st.ResolveSandboxToken(ctx, hash); {
-	case err == nil:
-		return true, nil
-	case !errors.Is(err, model.ErrUnknownToken):
-		return false, err
+	for _, v := range r.Header.Values("Authorization") {
+		scheme, tok, _ := strings.Cut(strings.TrimSpace(v), " ")
+		tok = strings.TrimSpace(tok)
+		if !strings.EqualFold(scheme, "Bearer") || tok == "" {
+			continue
+		}
+		hash := store.HashToken(tok)
+		switch _, err := s.st.ResolveTenantToken(ctx, hash); {
+		case err == nil:
+			return true, nil
+		case !errors.Is(err, model.ErrUnknownToken):
+			return false, err
+		}
+		switch _, _, err := s.st.ResolveSandboxToken(ctx, hash); {
+		case err == nil:
+			return true, nil
+		case !errors.Is(err, model.ErrUnknownToken):
+			return false, err
+		}
 	}
 	return false, nil
 }

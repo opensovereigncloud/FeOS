@@ -495,6 +495,18 @@ func TestRouteDoor(t *testing.T) {
 	if w := withHeader(tok.Token, "Bearer client-jwt"); w.Code != 200 || h.ports.last(t).authz != "Bearer client-jwt" {
 		t.Fatalf("a client's own bearer beside the header: %d %s", w.Code, w.Body)
 	}
+	// Nor in a second Authorization behind the client's own.
+	before := forwards()
+	r2 := httptest.NewRequest("GET", "/api/v1/environments/stage/http/api/me", nil)
+	r2.Header.Set(RouteTokenHeader, tok.Token)
+	r2.Header.Add("Authorization", "Bearer client-jwt")
+	r2.Header.Add("Authorization", "Bearer "+tenantTok)
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, r2)
+	wantPlain(t, w2, 401, "route token required\n")
+	if forwards() != before {
+		t.Fatalf("a second Authorization: forwarded %+v", h.ports.last(t))
+	}
 	// Segment-aware: /apix is the root's; the root does not strip; a
 	// paused instance is woken by the forward (scale from zero).
 	for _, c := range []struct{ path, up string }{
