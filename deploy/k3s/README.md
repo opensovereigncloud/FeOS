@@ -79,6 +79,11 @@ instances' certificates on the nodes' port carry and the nodes check
       --from-literal=FERUN_DATABASE_URL="postgres://ferun:<password>@postgres.ferun.svc.cluster.local:5432/ferun?sslmode=disable" \
       --from-literal=FERUN_ADMIN_USERS="<user>:<password>" \
       --from-literal=FERUN_BOOTSTRAP_TOKEN=$(openssl rand -hex 32)
+    kubectl -n ferun create secret generic ferund-secret-key --from-literal=key=$(openssl rand -hex 32)
+
+The secret key seals environments' secrets and addons' credentials at
+rest (ADR 0018); without it ferund refuses both. Losing it loses every
+sealed value, so keep a copy beside the CA's root.
 
 The bootstrap token becomes a token of the tenant `operator` while there is
 no tenant: FeChat's `FERUN_TOKEN`. The admin users are a fallback: people

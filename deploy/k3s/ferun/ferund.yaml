@@ -84,6 +84,9 @@ spec:
               value: admins
             - name: FERUN_SESSION_TTL
               value: 12h
+            # Seals environments' secrets and addons' credentials at rest.
+            - name: FERUN_SECRET_KEY_FILE
+              value: /etc/ferun/secret-key/key
           ports:
             - name: http
               containerPort: 8100
@@ -112,6 +115,9 @@ spec:
             - name: oidc
               mountPath: /etc/ferun/oidc
               readOnly: true
+            - name: secret-key
+              mountPath: /etc/ferun/secret-key
+              readOnly: true
       volumes:
         - name: ca
           secret:
@@ -125,6 +131,10 @@ spec:
             items:
               - key: client_secret
                 path: secret
+        - name: secret-key
+          secret:
+            secretName: ferund-secret-key
+            defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service
