@@ -71,10 +71,12 @@ type Runner interface {
 	ReadFileDetached(ctx context.Context, lease model.Lease, path string) (string, error)
 	// StartProcessDetached starts a background process without a time
 	// limit and returns its id; an error wrapping tools.ErrNoCwd when its
-	// working directory does not exist.
+	// working directory does not exist. The records of the processes of
+	// its name that are over go but the newest few (tools.keptExited).
 	StartProcessDetached(ctx context.Context, lease model.Lease, p tools.ProcessStart) (id string, err error)
-	// ProcessesDetached lists the background processes of the container.
-	ProcessesDetached(ctx context.Context, lease model.Lease) ([]tools.ProcessStatus, error)
+	// ProcessesDetached lists the background processes of the container
+	// named name (every one for ""), running or not.
+	ProcessesDetached(ctx context.Context, lease model.Lease, name string) ([]tools.ProcessStatus, error)
 	// ProcessLogsDetached returns the last lines lines of a process's
 	// output; an error wrapping tools.ErrNoProcess for an unknown id.
 	ProcessLogsDetached(ctx context.Context, lease model.Lease, id string, lines int) ([]string, error)

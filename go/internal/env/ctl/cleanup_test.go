@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -128,4 +129,72 @@ func TestAttachedNewIncarnation(t *testing.T) {
 		g := h.group("n1", model.EnvGroupID(env.ID))
 		return g != nil && slices.Contains(g.Members, again.Address)
 	})
+}
+
+// seedRecords writes n records of processes that are over, named name,
+// under dir, as the start script writes them.
+func seedRecords(t *testing.T, dir, prefix, name string, n int) {
+	t.Helper()
+	for i := range n {
+		d := filepath.Join(dir, fmt.Sprintf("%s%06d", prefix, i))
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range map[string]string{"name": name, "cmd": strings.Repeat("node server.js --port 3000 ", 7), "pgid": "0",
+			"timeout": "0", "started_at": strconv.Itoa(1000 + i), "exit": "1"} {
+			if err := os.WriteFile(filepath.Join(d, k), []byte(v), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// Process records pile up in a sandbox (the agent's own processes, and
+// every restart of an attached service): the supervisor lists only its
+// service's, so that it keeps supervising however many there are, and a
+// start removes its name's records that are over but the newest few.
+func TestAttachedSupervisedPastManyRecords(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	pp := hostProcessesPerPod(n1, t.TempDir())
+	sb := h.attachable()
+	env := h.newEnv("dev")
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"web":{"runtime":"attached","sandbox":%q,"command":["sleep","120"]}}}`, sb.ID))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	a, err := h.st.GetAttached(bg, env.ID, "web")
+	if err != nil || a.ProcessID == "" {
+		t.Fatalf("attached %+v %v", a, err)
+	}
+	seedRecords(t, pp.dir(sb.ID), "000000-agent", "", 300)
+	seedRecords(t, pp.dir(sb.ID), "000000-web", "ferun-env-dev-web", 10)
+
+	if err := h.runner.StopProcessDetached(bg, lease(sb), a.ProcessID); err != nil {
+		t.Fatal(err)
+	}
+	var b store.EnvAttached
+	eventually(t, 30*time.Second, "the restart after the exit", func() bool {
+		b, err = h.st.GetAttached(bg, env.ID, "web")
+		return err == nil && b.Restarts == 1 && b.ProcessID != "" && b.ProcessID != a.ProcessID && b.Phase == model.PhaseReady
+	})
+	ps, err := h.runner.ProcessesDetached(bg, lease(sb), "ferun-env-dev-web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var over []string
+	for _, p := range ps {
+		if !p.Running {
+			over = append(over, p.ID)
+		}
+	}
+	// The newest three that are over: the process stopped above and the
+	// two newest seeded ones.
+	if want := []string{"000000-web000008", "000000-web000009", a.ProcessID}; !slices.Equal(over, want) || len(ps) != 4 {
+		t.Fatalf("records of the service %+v, over %v, want %v", ps, over, want)
+	}
+	if all, err := h.runner.ProcessesDetached(bg, lease(sb), ""); err != nil || len(all) != 304 {
+		t.Fatalf("every record: %d %v", len(all), err)
+	}
 }

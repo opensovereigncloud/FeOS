@@ -495,13 +495,14 @@ func (c *Controller) backoff(n int) time.Duration {
 
 // superviseAttached is one look of the supervisor at an attached service
 // in its running sandbox, with the sandbox's lease (§4.6), when the
-// service may use the sandbox (attachedUsable: a sandbox of another
-// incarnation is another sandbox, never the service's; the reconcile step
-// fails the service): a changed template stops the old process; a process
+// service may use the sandbox (attachedUsable; else the reconcile step
+// fails the service): a new incarnation of the sandbox starts the service
+// anew (renewed); a changed template stops the old process; a process
 // that is gone counts as an exit, restarted after the backoff; a working
 // directory that does not exist yet keeps it starting; a running process
-// is checked (readiness) and the sandbox's hosts block written. wait:
-// wait for another look in flight instead of leaving it to that one.
+// is checked (readiness) and the sandbox's hosts block written. It lists
+// only the processes of the service's name. wait: wait for another look
+// in flight instead of leaving it to that one.
 func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attachedPlan, sb store.Sandbox, l model.Lease, wait bool) {
 	if c.d.Runner == nil {
 		return
@@ -534,7 +535,7 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 		after.NextRestartAt = time.Time{}
 	}
 	if after.ProcessID != "" {
-		ps, err := c.d.Runner.ProcessesDetached(ctx, l)
+		ps, err := c.d.Runner.ProcessesDetached(ctx, l, processName(v.env.Name, p.name))
 		if err != nil {
 			after.Detail = "list the processes: " + err.Error()
 			c.writeAttached(ctx, a, after, l)
@@ -590,11 +591,11 @@ func processName(env, service string) string { return "ferun-env-" + env + "-" +
 // (a leader change, a row moved or restarted meanwhile), or survived a
 // restart of a paused sandbox; it would hold the port and the secrets.
 func (c *Controller) stopStrays(ctx context.Context, v *view, service string, sb store.Sandbox, l model.Lease) error {
-	ps, err := c.d.Runner.ProcessesDetached(ctx, l)
+	name := processName(v.env.Name, service)
+	ps, err := c.d.Runner.ProcessesDetached(ctx, l, name)
 	if err != nil {
 		return err
 	}
-	name := processName(v.env.Name, service)
 	var strays []string
 	for _, pr := range ps {
 		if pr.Running && pr.Name == name {

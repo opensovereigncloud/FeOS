@@ -37,14 +37,80 @@ const detachedReadPage = 2000
 // process's working directory does not exist.
 const noCwdExit = 3
 
+// keptExited is how many records of processes that are over a detached
+// start keeps of its name (the newest, by start time): the logs of the
+// last few runs of an attached service stay readable, while a service
+// that restarts for days leaves no more behind.
+const keptExited = 3
+
 // detachedStartScript is processStartScript with a check of the working
 // directory first, so that a directory that does not exist yet (an
 // attached service whose checkout is not there) is told apart from a
-// failed start: it exits noCwdExit then.
-const detachedStartScript = `import os,sys
+// failed start: it exits noCwdExit then. Before it starts a named
+// process, it removes the records of processes of that name that are
+// over (exited, stopped, or lost with a cold restore) but the newest
+// argv[5] (keptExited): nothing else removes a record, and every restart
+// of an attached service writes one. A running process keeps its record,
+// and so does one whose start is not fully recorded yet (no started_at).
+const detachedStartScript = `import os,shutil,sys
 if sys.argv[4] and not os.path.isdir(sys.argv[4]):
     print("no such working directory: %s" % sys.argv[4]); raise SystemExit(3)
+def prune(root, name, keep):
+    def read(d,k):
+        try: return open(os.path.join(d,k)).read().strip()
+        except OSError: return ""
+    def alive(d):
+        try:
+            pgid = int(read(d,"pgid") or 0)
+            rest = open("/proc/%d/stat" % pgid).read().rsplit(") ",1)[1].split()
+        except (OSError, ValueError, IndexError):
+            return False
+        want = read(d,"start")
+        return rest[0] != "Z" and rest[2] == str(pgid) and (not want or rest[19] == want)
+    over = []
+    for tid in os.listdir(root) if os.path.isdir(root) else []:
+        d = os.path.join(root,tid)
+        if read(d,"name") != name or not read(d,"started_at").isdigit(): continue
+        if read(d,"exit") == "" and alive(d): continue
+        over.append((int(read(d,"started_at")), tid))
+    for _,tid in sorted(over)[:-keep]:
+        shutil.rmtree(os.path.join(root,tid), ignore_errors=True)
+if sys.argv[3] and len(sys.argv) > 5:
+    prune("` + processRoot + `", sys.argv[3], int(sys.argv[5]))
 ` + processStartScript
+
+// detachedListScript prints the records of the processes named argv[1]
+// (every one for "") as one compact JSON array: id, name, running and the
+// exit code once there is one. The supervisor of attached services lists
+// only its own name, so that neither the history of other processes nor
+// the agent's own make the answer longer than a tool's output may be.
+const detachedListScript = `import json,os,sys
+root = "` + processRoot + `"
+name = sys.argv[1]
+def read(d,k,default=""):
+    try: return open(os.path.join(d,k)).read().strip()
+    except OSError: return default
+def alive(pgid, want_start=""):
+    if not pgid: return False
+    try:
+        rest = open("/proc/%d/stat" % pgid).read().rsplit(") ",1)[1].split()
+    except (OSError, IndexError):
+        return False
+    if rest[0] == "Z" or rest[2] != str(pgid): return False
+    return not want_start or rest[19] == want_start
+out = []
+for tid in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+    d = os.path.join(root,tid)
+    n = read(d,"name")
+    if name and n != name: continue
+    exit_code = read(d,"exit")
+    try: pgid = int(read(d,"pgid","0") or 0)
+    except ValueError: pgid = 0
+    row = {"id":tid,"name":n,"running":exit_code == "" and alive(pgid, read(d,"start"))}
+    if exit_code.lstrip("-").isdigit(): row["exit_code"] = int(exit_code)
+    out.append(row)
+print(json.dumps(out,separators=(",",":")))
+`
 
 // ExecDetached runs argv in the main container of the lease's pod with env
 // added to the container's environment, in cwd ("": /), for at most
@@ -211,7 +277,8 @@ func shellCommand(argv []string) string {
 
 // StartProcessDetached starts a background process as process_start does
 // with timeout 0 (no limit): argv shell-quoted into the start script's
-// command, in p.Cwd ("": /), named p.Name. p.Env reaches the process only
+// command, in p.Cwd ("": /), named p.Name, after the records of the
+// processes of that name that are over but the newest keptExited went. p.Env reaches the process only
 // through ExecRequest.Env, which the script's process inherits, and with
 // HOME=/root unless it sets HOME: no value of it is written to the
 // container's disk (the process record keeps the command, the name and
@@ -229,7 +296,7 @@ func (r *Runner) StartProcessDetached(ctx context.Context, lease model.Lease, p 
 	if _, ok := env["HOME"]; !ok {
 		env["HOME"] = "/root"
 	}
-	argv := []string{"python3", "-c", detachedStartScript, shellCommand(p.Argv), "0", p.Name, p.Cwd}
+	argv := []string{"python3", "-c", detachedStartScript, shellCommand(p.Argv), "0", p.Name, p.Cwd, strconv.Itoa(keptExited)}
 	code, stdout, stderr, err := r.ExecDetached(ctx, lease, argv, env, "/", r.defaultTimeout)
 	if err != nil {
 		return "", err
@@ -257,9 +324,9 @@ type detachedRow struct {
 }
 
 // ProcessesDetached lists the background processes of the lease's main
-// container, running or not.
-func (r *Runner) ProcessesDetached(ctx context.Context, lease model.Lease) ([]ProcessStatus, error) {
-	code, stdout, stderr, err := r.ExecDetached(ctx, lease, []string{"python3", "-c", processListScript}, nil, "/",
+// container named name (every one for ""), running or not, by id.
+func (r *Runner) ProcessesDetached(ctx context.Context, lease model.Lease, name string) ([]ProcessStatus, error) {
+	code, stdout, stderr, err := r.ExecDetached(ctx, lease, []string{"python3", "-c", detachedListScript, name}, nil, "/",
 		r.defaultTimeout)
 	if err != nil {
 		return nil, err
@@ -267,12 +334,11 @@ func (r *Runner) ProcessesDetached(ctx context.Context, lease model.Lease) ([]Pr
 	if code != 0 {
 		return nil, fmt.Errorf("process_list exited with %d: %s", code, firstLine(stderr+stdout))
 	}
-	trimmed := strings.TrimSpace(stdout)
-	if trimmed == noProcesses {
-		return nil, nil
+	if strings.Contains(stdout, streamMarker) {
+		return nil, errors.New("process_list: the output is longer than a tool's output may be")
 	}
 	var rows []detachedRow
-	if err := json.Unmarshal([]byte(trimmed), &rows); err != nil {
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &rows); err != nil {
 		return nil, fmt.Errorf("process_list: unexpected output %q", firstLine(stdout))
 	}
 	out := make([]ProcessStatus, 0, len(rows))
