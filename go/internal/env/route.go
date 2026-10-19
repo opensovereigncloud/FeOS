@@ -200,8 +200,8 @@ func rawOf(path, raw string) string {
 // none at all is 503 with Retry-After 5. The port is the one the chosen
 // instance's own release gives the route's port name (the matched
 // release's when that release has none). An attached service's requests
-// go to its sandbox, only while that is the environment owner's and the
-// incarnation its process was started in (else 503). The path is
+// go to its sandbox, only while that is the environment owner's and no
+// instance row (else 503; §13.6). The path is
 // stripped of the route's path when the route says so; the query is
 // kept. Its answers are plain text; a failure inside ferund is logged
 // and answered 500 "the route door failed", without its cause.
