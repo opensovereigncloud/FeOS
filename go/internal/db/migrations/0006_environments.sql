@@ -113,7 +113,7 @@ CREATE TABLE env_attached (                    -- an attached service: a supervi
   env_id uuid NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
   service text NOT NULL,
   sandbox_id uuid NOT NULL,                    -- the tenant's sandbox it runs in; no FK
-  sandbox_incarnation uuid,                    -- the incarnation the process was started in
+  sandbox_incarnation uuid,                    -- the incarnation last used; a new one starts the service anew
   template_hash text NOT NULL DEFAULT '', process_id text NOT NULL DEFAULT '',   -- '': not started
   phase text NOT NULL DEFAULT 'starting' CHECK (phase IN ('starting','ready','unready','exited','failed')),
   ready_since timestamptz,

@@ -43,8 +43,7 @@ func TestEnvCtlQueries(t *testing.T) {
 		t.Fatalf("attached to %v %v", envs, err)
 	}
 	// A sandbox the attached service may not use is neither a member nor
-	// attached: another tenant's, an instance row, or another incarnation
-	// than the one the service recorded.
+	// attached: another tenant's, or an instance row.
 	mkTenant(t, s, "evil")
 	foreign := mkSandbox(t, s, "evil")
 	exec(t, s, `UPDATE sandboxes SET address = 'fd00::7' WHERE id = $1`, foreign.ID)
@@ -67,16 +66,14 @@ func TestEnvCtlQueries(t *testing.T) {
 	if envs, err := s.EnvCtlWithAttached(bg, b.ID); err != nil || len(envs) != 0 {
 		t.Fatalf("an instance row attached to %v %v", envs, err)
 	}
+	// A new incarnation of the owner's sandbox under the same ID (the
+	// recorded one is older) is the service's still (§13.6).
 	exec(t, s, `UPDATE env_attached SET sandbox_incarnation = $2 WHERE env_id = $1 AND service = 'web'`, env.ID, uuid.New())
-	if m, err := s.EnvCtlMembers(bg, env.ID); err != nil || !slices.Equal(m, []string{"fd00::2", "fd00::8"}) {
+	if m, err := s.EnvCtlMembers(bg, env.ID); err != nil || !slices.Equal(m, []string{"fd00::2", "fd00::8", "fd00::9"}) {
 		t.Fatalf("members with another incarnation recorded %v %v", m, err)
 	}
-	if envs, err := s.EnvCtlWithAttached(bg, sbx.ID); err != nil || len(envs) != 0 {
-		t.Fatalf("another incarnation attached to %v %v", envs, err)
-	}
-	exec(t, s, `UPDATE env_attached SET sandbox_incarnation = $2 WHERE env_id = $1 AND service = 'web'`, env.ID, sbx.Incarnation)
 	if envs, err := s.EnvCtlWithAttached(bg, sbx.ID); err != nil || !slices.Equal(envs, []uuid.UUID{env.ID}) {
-		t.Fatalf("its incarnation attached to %v %v", envs, err)
+		t.Fatalf("another incarnation attached to %v %v", envs, err)
 	}
 	exec(t, s, `DELETE FROM env_attached WHERE service IN ('api', 'inst')`)
 	if rows, err := s.EnvCtlSandboxes(bg, env.ID); err != nil || len(rows) != 2 {

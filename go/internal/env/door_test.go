@@ -496,9 +496,10 @@ func TestRoutePaths(t *testing.T) {
 }
 
 // The route door forwards to an attached service's sandbox only while it
-// is the environment owner's, not an instance row, and the incarnation
-// the process was started in: a sandbox ID is free again once deleted,
-// and another tenant may take it.
+// is the environment owner's and not an instance row: a sandbox ID is
+// free again once deleted, and another tenant may take it. The owner's
+// sandbox created again under the same ID (FeCode's replaceLostSandbox)
+// is a new incarnation, which is routed to (§13.6).
 func TestRouteDoorAttachedOwner(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, harnessOptions{})
@@ -563,25 +564,23 @@ func TestRouteDoorAttachedOwner(t *testing.T) {
 	recreate(store.NewSandbox{Owner: tenantA, EnvironmentID: e.ID, IdleAfterS: &zero,
 		PodTemplate: &model.PodTemplate{SecurityGroups: []string{model.EnvGroupID(e.ID)}}})
 	refused("an instance row")
-	// The owner's own sandbox again, but a new incarnation: not the one
-	// the process was started in.
+	// The owner's own sandbox again, a new incarnation under the same ID
+	// (the row still records the first one): routed to.
 	recreate(store.NewSandbox{Owner: tenantA, PodTemplate: &model.PodTemplate{Command: []string{"sleep", "infinity"},
 		SecurityGroups: []string{model.SandboxGroupID(sb)}}})
-	refused("another incarnation")
-	// Once the supervisor starts it there (or before it records one), it
-	// is routed to.
-	a, err := h.st.GetAttached(ctx, e.ID, "dev")
-	if err != nil {
-		t.Fatal(err)
+	if again, err := h.st.GetSandbox(ctx, sb); err != nil || again.Incarnation == first.Incarnation {
+		t.Fatalf("the recreated sandbox %+v %v", again, err)
 	}
-	after := a
-	after.SandboxIncarnation, after.ProcessID = uuid.Nil, ""
-	if _, err := h.st.UpdateAttached(ctx, a, after); err != nil {
-		t.Fatal(err)
+	if a, err := h.st.GetAttached(ctx, e.ID, "dev"); err != nil || a.SandboxIncarnation != first.Incarnation {
+		t.Fatalf("attached %+v %v", a, err)
 	}
 	if w := routeRequest(mux, "GET", path, tok.Token); w.Code != 200 || h.ports.last(t).sandbox != sb {
 		t.Fatalf("recreated own sandbox: %d %s", w.Code, w.Body)
 	}
+	// Another tenant's again: refused.
+	recreate(store.NewSandbox{Owner: tenantB, PodTemplate: &model.PodTemplate{Command: []string{"sleep", "infinity"},
+		SecurityGroups: []string{model.SandboxGroupID(sb)}}})
+	refused("another tenant's after the owner's")
 }
 
 // The port of a request comes from the release of the instance it goes

@@ -58,8 +58,9 @@ func (c *Controller) stepAttached(ctx context.Context, s *stepState) {
 
 // stepOneAttached keeps one attached service of T and reports whether it
 // is ready: recorded (with its sandbox's incarnation), moved to the
-// sandbox T names, its sandbox woken for a (re)start. A sandbox it may
-// not use (attachedUsable) fails it, and nothing is done in that sandbox.
+// sandbox T names, started anew in a new incarnation of its sandbox, its
+// sandbox woken for a (re)start. A sandbox it may not use
+// (attachedUsable) fails it, and nothing is done in that sandbox.
 func (c *Controller) stepOneAttached(ctx context.Context, s *stepState, name string, svc spec.Service) bool {
 	v := s.v
 	p := c.planAttached(v, name, svc)
@@ -93,6 +94,12 @@ func (c *Controller) stepOneAttached(ctx context.Context, s *stepState, name str
 		s.wait(objectName(spec.KindService, name), "attached service %s: %s", name, goneDetail(p.sandbox))
 		return false
 	}
+	if newIncarnation(a, sb) {
+		c.renewAttached(ctx, v.env.ID, a, sb)
+		s.wait(objectName(spec.KindService, name), "attached service %s starts anew in a new incarnation of sandbox %s",
+			name, sb.ID)
+		return false
+	}
 	needsStart := a.ProcessID == "" || a.TemplateHash != p.hash
 	if needsStart && !steady(sb) && sb.Op == "" && (a.NextRestartAt.IsZero() || !v.now.Before(a.NextRestartAt)) {
 		c.wakeAttached(ctx, v.env.ID, name, sb.ID)
@@ -111,15 +118,55 @@ func goneDetail(id uuid.UUID) string {
 }
 
 // attachedUsable reports whether an attached service of env may use the
-// sandbox row sb, the one it names (§13.5): a sandbox of env's owner, not
-// an instance row, and the incarnation the service recorded (any, while
-// it recorded none). A sandbox ID deleted and created again, by another
-// tenant or the same, is another sandbox: the service is never started,
-// checked, named or made a member there. store.EnvCtlMembers and
-// EnvCtlWithAttached apply the same condition.
+// sandbox row sb, the one it names (§13.6): a sandbox of env's owner and
+// not an instance row. A sandbox of another tenant under a reused ID is
+// never the service's: it is never started, checked, named or made a
+// member there. The owner's sandbox deleted and created again under the
+// same ID (FeCode replaces a lost workspace sandbox so) is a new
+// incarnation, in which the service starts anew (newIncarnation).
+// store.EnvCtlMembers and EnvCtlWithAttached apply the same condition.
 func attachedUsable(env store.Environment, a store.EnvAttached, sb store.Sandbox) bool {
-	return sb.ID == a.SandboxID && sb.Owner == env.Owner && !sb.IsInstance() &&
-		(a.SandboxIncarnation == uuid.Nil || a.SandboxIncarnation == sb.Incarnation)
+	return sb.ID == a.SandboxID && sb.Owner == env.Owner && !sb.IsInstance()
+}
+
+// newIncarnation reports whether sb, the sandbox a names, is another
+// incarnation than the one a recorded (none recorded: no): the process a
+// records ran in a sandbox that is gone, with its disk.
+func newIncarnation(a store.EnvAttached, sb store.Sandbox) bool {
+	return a.SandboxIncarnation != uuid.Nil && a.SandboxIncarnation != sb.Incarnation
+}
+
+// renewed is a reset for a new incarnation of its sandbox, sb (§13.6): the
+// new incarnation recorded, no process (the old one went with the old
+// incarnation), phase starting, restarts, next_restart_at, probe_failures
+// and hosts_written reset, so that the process starts again at once.
+func renewed(a store.EnvAttached, sb store.Sandbox) store.EnvAttached {
+	after := a
+	after.SandboxIncarnation, after.ProcessID, after.Phase, after.ReadySince, after.Detail =
+		sb.Incarnation, "", model.PhaseStarting, time.Time{}, ""
+	after.Restarts, after.NextRestartAt, after.ProbeFailures, after.HostsWritten = 0, time.Time{}, 0, ""
+	return after
+}
+
+// renewAttached writes renewed onto an attached service's row, while the
+// row still names a's sandbox and incarnation.
+func (c *Controller) renewAttached(ctx context.Context, envID uuid.UUID, a store.EnvAttached, sb store.Sandbox) {
+	err := c.fenced(ctx, func(tx *store.Store) error {
+		cur, err := tx.LockAttached(ctx, envID, a.Service, store.ForUpdate)
+		if err != nil || cur.SandboxID != a.SandboxID || cur.SandboxIncarnation != a.SandboxIncarnation {
+			return err
+		}
+		if _, err := tx.UpdateAttached(ctx, cur, renewed(cur, sb)); err != nil {
+			return err
+		}
+		c.log.Info("an attached service starts anew in a new incarnation of its sandbox", "environment", envID,
+			"service", a.Service, "sandbox", sb.ID)
+		return tx.Notify(ctx, db.ChanLeader, HintReconcile)
+	})
+	if err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
+		c.rl.warn("attached", "cannot renew an attached service", "service", a.Service, "err", err)
+	}
+	c.forget("a/" + attachedKey(envID, a.Service))
 }
 
 // usableSandbox reads an attached service's sandbox, and reports whether
@@ -131,8 +178,9 @@ func (c *Controller) usableSandbox(ctx context.Context, env store.Environment, a
 
 // attachedGone fails an attached service whose sandbox it may not use:
 // phase failed, the detail saying so, no process (its process ran in a
-// sandbox that is gone); the incarnation it recorded stays, so that the
-// sandbox now under its ID is never taken for it.
+// sandbox that is gone); the incarnation it recorded stays, so that a
+// sandbox of the owner under its ID again is a new incarnation, in which
+// the service starts anew with its counters reset (renewed).
 func (c *Controller) attachedGone(ctx context.Context, envID uuid.UUID, a store.EnvAttached) {
 	detail := goneDetail(a.SandboxID)
 	if a.Phase == model.PhaseFailed && a.Detail == detail && a.ProcessID == "" {
@@ -470,6 +518,11 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 		return
 	}
 	after := a
+	if newIncarnation(a, sb) {
+		after = renewed(a, sb)
+		c.log.Info("an attached service starts anew in a new incarnation of its sandbox", "environment", v.env.ID,
+			"service", p.name, "sandbox", sb.ID)
+	}
 	now := c.dbNow(ctx)
 	if after.ProcessID != "" && after.TemplateHash != p.hash {
 		if err := c.d.Runner.StopProcessDetached(ctx, l, after.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) {
