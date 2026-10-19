@@ -11,7 +11,11 @@
 //! of the log, each as many lines as it has parts. A tail is found reading
 //! back from the end in blocks, never the whole file: a line that reaches
 //! further back than the parts asked for could fill is cut, so that its
-//! last parts are a full [`MAX_LINE`] each.
+//! last parts are a full [`MAX_LINE`] each. Nor does a tail reach back
+//! further than [`MAX_TAIL_BYTES`] from the end, however few lines that
+//! is, so it never sends more bytes than that: a line that starts further
+//! back is cut the same way, to its last whole parts within those bytes,
+//! or left out when not one part fits.
 //!
 //! With `follow`, the stream polls the file, which is only ever appended
 //! to, and ends when the container is deleted (its log file goes, or
@@ -33,6 +37,8 @@ use tonic::Status;
 pub const MAX_LINE: usize = 64 * 1024;
 /// The most lines `tail_lines` sends.
 pub const MAX_TAIL_LINES: u32 = 10_000;
+/// The most bytes of the log a `tail_lines` tail reaches back, from its end.
+pub const MAX_TAIL_BYTES: u64 = 4 << 20;
 /// What a tail reads at a time, going back from the end.
 const BLOCK: usize = 64 * 1024;
 /// What one read takes from the file going forward.
@@ -52,17 +58,21 @@ fn parts(len: u64, max: u64) -> u64 {
 
 /// Where the last `lines` lines of a log of `len` bytes start, and how many
 /// leading parts of the line there to leave out. Reads back from the end in
-/// blocks of `block` bytes; a line counts as many lines as it has parts of
-/// at most `max` bytes. A line whose start lies further back than `lines`
-/// parts reach is cut to its last `lines` × `max` bytes.
+/// blocks of `block` bytes, never further than `bytes` from the end; a line
+/// counts as many lines as it has parts of at most `max` bytes. A line
+/// whose start lies further back than `lines` parts reach is cut to its
+/// last `lines` × `max` bytes; one whose start lies further back than
+/// `bytes` reach is cut to its last whole parts within them, or left out
+/// when not one fits.
 pub(crate) fn tail_start(
     file: &File,
     len: u64,
     lines: u64,
+    bytes: u64,
     block: usize,
     max: usize,
 ) -> io::Result<(u64, u64)> {
-    if len == 0 || lines == 0 {
+    if len == 0 || lines == 0 || bytes == 0 {
         return Ok((len, 0));
     }
     let max = max.max(1) as u64;
@@ -71,11 +81,12 @@ pub(crate) fn tail_start(
     // its newline.
     let mut need = lines;
     let mut line_end = len;
-    // Bytes below hi are still to be looked at.
+    // Bytes below hi are still to be looked at, down to floor.
+    let floor = len.saturating_sub(bytes);
     let mut hi = len;
     let mut last_block = true;
-    while hi > 0 {
-        let lo = hi.saturating_sub(buf.len() as u64);
+    while hi > floor {
+        let lo = hi.saturating_sub(buf.len() as u64).max(floor);
         let n = (hi - lo) as usize;
         let block = &mut buf[..n];
         file.read_exact_at(block, lo)?;
@@ -103,7 +114,23 @@ pub(crate) fn tail_start(
         }
         hi = lo;
     }
-    Ok(settle(0, line_end, need, max).unwrap_or((0, 0)))
+    if floor == 0 {
+        return Ok(settle(0, line_end, need, max).unwrap_or((0, 0)));
+    }
+    // The bytes end inside the line looked at, or just before it starts.
+    let mut before = [0u8; 1];
+    file.read_exact_at(&mut before, floor - 1)?;
+    if before[0] == b'\n' {
+        return Ok(settle(floor, line_end, need, max).unwrap_or((floor, 0)));
+    }
+    // It started further back: its last whole parts within the bytes, at
+    // most need of them (more would have been settled above); without one,
+    // the tail starts after it.
+    let whole = (line_end - floor) / max;
+    if whole > 0 {
+        return Ok((line_end - whole * max, 0));
+    }
+    Ok(((line_end + 1).min(len), 0))
 }
 
 /// Where the tail starts if the line from `start` to `end` holds the last
@@ -247,8 +274,9 @@ pub(crate) struct Opened {
 }
 
 /// Opens the log at `path` and finds where the stream starts: the last
-/// `tail_lines` lines (capped at [`MAX_TAIL_LINES`]) when above 0, else
-/// the whole log with `tail`, else its end.
+/// `tail_lines` lines (capped at [`MAX_TAIL_LINES`] and
+/// [`MAX_TAIL_BYTES`]) when above 0, else the whole log with `tail`, else
+/// its end.
 pub(crate) fn open(path: &Path, tail_lines: u32, tail: bool) -> io::Result<Opened> {
     let Some(mut log) = LogFile::open(path)? else {
         return Ok(Opened { log: None, end: 0 });
@@ -257,7 +285,14 @@ pub(crate) fn open(path: &Path, tail_lines: u32, tail: bool) -> io::Result<Opene
     let (start, skip) = match tail_lines.min(MAX_TAIL_LINES) {
         0 if tail => (0, 0),
         0 => (len, 0),
-        lines => tail_start(&log.file, len, lines.into(), BLOCK, MAX_LINE)?,
+        lines => tail_start(
+            &log.file,
+            len,
+            lines.into(),
+            MAX_TAIL_BYTES,
+            BLOCK,
+            MAX_LINE,
+        )?,
     };
     log.offset = start;
     log.lines = Lines::new(MAX_LINE, skip);
@@ -427,8 +462,20 @@ mod tests {
     /// blocks of `block` bytes, with parts of at most `max` bytes.
     fn tail(content: &[u8], lines: u64, block: usize, max: usize) -> Vec<Vec<u8>> {
         let file = file_with(content);
+        tail_of(file.as_file(), content, lines, u64::MAX, block, max)
+    }
+
+    /// The same of `content` in `file`, reaching back at most `bytes`.
+    fn tail_of(
+        file: &File,
+        content: &[u8],
+        lines: u64,
+        bytes: u64,
+        block: usize,
+        max: usize,
+    ) -> Vec<Vec<u8>> {
         let len = content.len() as u64;
-        let (start, skip) = tail_start(file.as_file(), len, lines, block, max).unwrap();
+        let (start, skip) = tail_start(file, len, lines, bytes, block, max).unwrap();
         let mut split = Lines::new(max, skip);
         let mut out = Vec::new();
         split.push(&content[start as usize..], &mut out);
@@ -494,7 +541,7 @@ mod tests {
     fn an_empty_log_has_no_tail() {
         let file = file_with(b"");
         assert_eq!(
-            tail_start(file.as_file(), 0, 10, BLOCK, MAX_LINE).unwrap(),
+            tail_start(file.as_file(), 0, 10, MAX_TAIL_BYTES, BLOCK, MAX_LINE).unwrap(),
             (0, 0)
         );
         assert!(tail(b"", 10, BLOCK, MAX_LINE).is_empty());
@@ -555,7 +602,7 @@ mod tests {
         let file = file_with(&content);
         let len = content.len() as u64;
         assert_eq!(
-            tail_start(file.as_file(), len, 2, 7, max).unwrap(),
+            tail_start(file.as_file(), len, 2, u64::MAX, 7, max).unwrap(),
             (len - 200, 0)
         );
         assert_eq!(
@@ -570,9 +617,15 @@ mod tests {
 
     /// The tail as the module's documentation says it, in memory.
     fn model(content: &[u8], lines: usize, max: usize) -> Vec<Vec<u8>> {
+        model_in(content, lines, usize::MAX, max)
+    }
+
+    /// The same, reaching back at most `bytes` from the end.
+    fn model_in(content: &[u8], lines: usize, bytes: usize, max: usize) -> Vec<Vec<u8>> {
         if content.is_empty() {
             return Vec::new();
         }
+        let floor = content.len().saturating_sub(bytes);
         let mut all: Vec<&[u8]> = content.split(|&b| b == b'\n').collect();
         if content.ends_with(b"\n") {
             all.pop();
@@ -586,8 +639,21 @@ mod tests {
         };
         let mut need = lines;
         let mut picked = Vec::new();
+        // Where the line looked at ends, at its newline if it has one.
+        let mut end = content.len() - usize::from(content.ends_with(b"\n"));
         for line in all.iter().rev() {
             if need == 0 {
+                break;
+            }
+            let start = end - line.len();
+            end = start.saturating_sub(1);
+            if start < floor {
+                // It starts further back than the bytes reach: its last
+                // whole parts within them, if one fits.
+                let whole = ((start + line.len()).saturating_sub(floor) / max).min(need);
+                if whole > 0 {
+                    picked.push(parts(&line[line.len() - whole * max..]));
+                }
                 break;
             }
             if line.len() > need * max {
@@ -642,6 +708,96 @@ mod tests {
     }
 
     #[test]
+    fn a_tail_reaches_back_no_further_than_its_bytes() {
+        // "aa" at 0, newline at 2; ten b at 3, newline at 13; "cc" at 14,
+        // newline at 16.
+        let content = b"aa\nbbbbbbbbbb\ncc\n";
+        let file = file_with(content);
+        let read = |lines, bytes, block| {
+            strings(&tail_of(file.as_file(), content, lines, bytes, block, 4))
+        };
+        for block in [1, 3, 4, 64] {
+            // The bytes end just before a line: it is the first.
+            assert_eq!(read(10, 3, block), ["cc"], "block {block}");
+            assert_eq!(read(10, 14, block), ["bbbb", "bbbb", "bb", "cc"]);
+            // They end at a newline, or in a line too short for one whole
+            // part: the line is left out.
+            assert_eq!(read(10, 4, block), ["cc"], "block {block}");
+            assert_eq!(read(10, 15, block), ["bbbb", "bbbb", "bb", "cc"]);
+            assert_eq!(read(10, 16, block), ["bbbb", "bbbb", "bb", "cc"]);
+            // They end in a long line: its last whole parts within them,
+            // cut as from its end, as a line the lines do not reach.
+            assert_eq!(read(10, 8, block), ["bbbb", "cc"], "block {block}");
+            assert_eq!(read(10, 12, block), ["bbbb", "bbbb", "cc"]);
+            assert_eq!(read(10, 13, block), ["bbbb", "bbbb", "cc"]);
+            // The lines still count: no more parts than they ask for.
+            assert_eq!(read(2, 12, block), ["bbbb", "cc"], "block {block}");
+            assert_eq!(read(1, 12, block), ["cc"], "block {block}");
+            // All bytes: all of the log; none: none of it.
+            assert_eq!(read(10, 17, block), ["aa", "bbbb", "bbbb", "bb", "cc"]);
+            assert_eq!(read(10, 1000, block), ["aa", "bbbb", "bbbb", "bb", "cc"]);
+            assert!(read(10, 0, block).is_empty());
+            // An empty last line takes its newline.
+            assert!(read(10, 1, block).is_empty());
+            let empty = b"a\n\n";
+            let file = file_with(empty);
+            let got = tail_of(file.as_file(), empty, 10, 1, block, 4);
+            assert_eq!(strings(&got), [""], "block {block}");
+        }
+        // An unfinished last line is cut the same way.
+        let content = b"aa\nbbbbbbbbbb";
+        let file = file_with(content);
+        for block in [1, 5, 64] {
+            let read = |bytes| strings(&tail_of(file.as_file(), content, 10, bytes, block, 4));
+            assert_eq!(read(6), ["bbbb"], "block {block}");
+            assert!(read(3).is_empty(), "block {block}");
+            assert_eq!(read(11), ["bbbb", "bbbb", "bb"], "block {block}");
+        }
+    }
+
+    #[test]
+    fn tails_capped_in_bytes_are_the_same_whatever_the_blocks() {
+        // Lines of pseudo-random lengths, some empty, some over the most.
+        let max = 8;
+        let mut content = Vec::new();
+        let mut seed: u32 = 7;
+        for i in 0..60 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let len = (seed >> 16) % 30;
+            content.extend(std::iter::repeat_n(b'a' + (i % 26) as u8, len as usize));
+            content.push(b'\n');
+        }
+        content.extend_from_slice(b"unfinished");
+        let file = file_with(&content);
+        for bytes in 0..=content.len() + 1 {
+            for lines in [1, 2, 5, 40, 1000] {
+                let want = model_in(&content, lines, bytes, max);
+                let sent: usize = want.iter().map(Vec::len).sum();
+                assert!(sent <= bytes && want.len() <= lines);
+                for block in [1, 3, 8, 9, 4096] {
+                    let got = tail_of(
+                        file.as_file(),
+                        &content,
+                        lines as u64,
+                        bytes as u64,
+                        block,
+                        max,
+                    );
+                    assert_eq!(got, want, "{lines} lines, {bytes} bytes, block {block}");
+                }
+            }
+        }
+        // With all of its bytes, a tail is the tail by lines alone.
+        let len = content.len();
+        for lines in [1, 2, 5, 40, 1000] {
+            assert_eq!(
+                model_in(&content, lines, len, max),
+                model(&content, lines, max)
+            );
+        }
+    }
+
+    #[test]
     fn the_tail_is_capped() {
         let content: Vec<u8> = (0..MAX_TAIL_LINES + 5)
             .flat_map(|i| format!("{i}\n").into_bytes())
@@ -652,6 +808,55 @@ mod tests {
         let (got, _) = log.read(Some(opened.end)).unwrap();
         assert_eq!(got.len(), MAX_TAIL_LINES as usize);
         assert_eq!(got[0], b"5");
+    }
+
+    /// The entries a stream without follow sends for the log at `path`.
+    fn read_all(path: &Path, tail_lines: u32, tail: bool) -> Vec<Vec<u8>> {
+        let opened = open(path, tail_lines, tail).unwrap();
+        let mut log = opened.log.unwrap();
+        let mut out = Vec::new();
+        loop {
+            let (got, n) = log.read(Some(opened.end)).unwrap();
+            out.extend(got);
+            if n == 0 {
+                break;
+            }
+        }
+        log.lines.flush(&mut out);
+        out
+    }
+
+    #[test]
+    fn the_tail_is_capped_in_bytes() {
+        // A few short lines, 100 of 64 KiB, and a few short ones again:
+        // 6.4 MiB in all, so 10 000 lines would be the whole log.
+        let mut content = Vec::new();
+        for i in 0..3 {
+            content.extend(format!("first {i}\n").into_bytes());
+        }
+        for i in 0..100u8 {
+            content.extend(vec![b'0' + i % 75; MAX_LINE]);
+            content.push(b'\n');
+        }
+        for i in 0..3 {
+            content.extend(format!("last {i}\n").into_bytes());
+        }
+        let file = file_with(&content);
+        let all = entries(&content, MAX_LINE);
+        assert_eq!(all.len(), 106);
+
+        let got = read_all(file.path(), MAX_TAIL_LINES, false);
+        let bytes: usize = got.iter().map(Vec::len).sum();
+        assert!(
+            bytes as u64 <= MAX_TAIL_BYTES,
+            "{bytes} bytes in a tail, more than {MAX_TAIL_BYTES}"
+        );
+        // The last lines of the log, whole: the line the budget ends in is
+        // left out, as not one part of it fits.
+        assert_eq!(got, all[all.len() - 66..]);
+        assert_eq!(got.last().unwrap(), b"last 2");
+        // The whole log still goes out with tail.
+        assert_eq!(read_all(file.path(), 0, true), all);
     }
 
     #[test]

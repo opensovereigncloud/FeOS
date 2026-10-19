@@ -166,13 +166,15 @@ reaps.
   `GetPod`; a container that did not survive a reboot has none.
 - A container's stdout and stderr go to one file, `logs/container.log` in
   its directory, which an adoption keeps. `StreamContainerLogs` serves
-  it: the last `tail_lines` lines (at most 10 000, found reading back
-  from the end), or all of it with `tail`, then with `follow` what the
-  container appends, until the container is deleted or the caller ends
-  the call. A line goes out without its newline, one over 64 KiB in
-  parts; the source of a line is not known. A tail counts each part as
-  a line, and cuts a line that reaches further back than the parts asked
-  for, so that its last parts are 64 KiB each; a follow sends a last line
+  it: the last `tail_lines` lines (at most 10 000, and from no further
+  back than 4 MiB before the end, found reading back from the end), or
+  all of it with `tail`, then with `follow` what the container appends,
+  until the container is deleted or the caller ends the call. A line
+  goes out without its newline, one over 64 KiB in parts; the source of
+  a line is not known. A tail counts each part as a line, and cuts a
+  line that reaches further back than the parts asked for, or than the
+  4 MiB, so that its last parts are 64 KiB each (a line of which not one
+  such part fits in the 4 MiB is left out); a follow sends a last line
   that stays unfinished for a second as it is.
 
 ## Power
