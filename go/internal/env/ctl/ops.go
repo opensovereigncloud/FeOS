@@ -92,7 +92,7 @@ func (c *Controller) instanceLog(ctx context.Context, sb store.Sandbox, lines in
 	case sb.ClientState != model.StateRunning || sb.Node == "":
 		return nil, notRunning("the instance is %s: no log to read", sb.ClientState)
 	}
-	return c.containerLog(ctx, lease(sb), lines)
+	return c.containerLog(ctx, lease(sb), lines, answerLog)
 }
 
 // jobLog is a job's latest run's log: its container's while its row runs,

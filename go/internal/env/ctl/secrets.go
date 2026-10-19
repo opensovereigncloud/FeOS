@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -16,6 +17,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
+	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
@@ -184,6 +186,58 @@ func (c *Controller) credentialValues(ctx context.Context, envID uuid.UUID, addo
 	return out
 }
 
+// envSecretValues are the values a stored log tail is redacted of
+// (§13.7): the credentials of every addon of T and R, the environment's
+// tenant secrets (their latest versions and the versions T and R pin),
+// and the secrets tmpl's env refers to (the versions the instance runs
+// with). Those that do not resolve are left out.
+func (c *Controller) envSecretValues(ctx context.Context, v *view, tmpl *model.PodTemplate) []string {
+	var out []string
+	specs := []*spec.Spec{v.target, v.latestSpec}
+	addonNames := map[string]bool{}
+	for _, sp := range specs {
+		if sp != nil {
+			for name := range sp.Addons {
+				addonNames[name] = true
+			}
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(addonNames)) {
+		out = append(out, c.addonSecrets(ctx, v, name)...)
+	}
+	seen := map[string]bool{}
+	resolve := func(name string, version int) {
+		k := fmt.Sprintf("%s@%d", name, version)
+		if name == "" || version <= 0 || seen[k] {
+			return
+		}
+		seen[k] = true
+		if s, err := c.ResolveSecret(ctx, v.env.ID, name, version); err == nil {
+			out = append(out, s)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(v.secrets)) {
+		resolve(name, v.secrets[name])
+	}
+	for _, sp := range specs {
+		if sp != nil {
+			for _, name := range slices.Sorted(maps.Keys(sp.Secrets)) {
+				resolve(name, sp.Secrets[name].Version)
+			}
+		}
+	}
+	if tmpl != nil {
+		for _, k := range slices.Sorted(maps.Keys(tmpl.Env)) {
+			val := tmpl.Env[k]
+			resolve(val.Secret, val.Version)
+			for _, p := range val.Parts {
+				resolve(p.Secret, p.Version)
+			}
+		}
+	}
+	return out
+}
+
 // escapeUserinfo escapes s for the user or the password of a URL's
 // userinfo (RFC 3986 §3.2.1), as the engine's pod spec does: the
 // unreserved characters and the sub-delims stay, every other byte is
@@ -209,8 +263,8 @@ func escapeUserinfo(s string) string {
 const redactedMark = "[redacted]"
 
 // redact removes every value of secrets from s (and its userinfo
-// escaping), longest first: step and probe output never carries a
-// credential into a detail, an incident or a log.
+// escaping), longest first: step and probe output and stored log tails
+// never carry a credential into a detail, an incident or a log.
 func redact(s string, secrets []string) string {
 	vals := slices.Clone(secrets)
 	for _, v := range secrets {

@@ -209,12 +209,13 @@ func (c *Controller) failOrphanRun(ctx context.Context, run store.EnvJobRun) {
 
 // finishJob ends a job's run (§4.3 step 3): exit code 0 → succeeded;
 // another code, none ("the node did not report an exit status"), a
-// timeout or a lost instance → failed. Its log tail (the last 50 lines)
-// is kept in the run before its row goes.
+// timeout or a lost instance → failed. Its log tail (the last 50 lines,
+// redacted and bounded: storedTail) is kept in the run before its row
+// goes.
 func (c *Controller) finishJob(ctx context.Context, v *view, r store.EnvInstanceRow, code *int, detail string) {
 	var tail []string
 	if steady(r.Sandbox) && c.connected(r.Sandbox.Node) {
-		tail, _ = c.containerLog(ctx, lease(r.Sandbox), logTailLines)
+		tail = c.storedTail(ctx, v, r.Sandbox)
 	}
 	succeeded := code != nil && *code == 0 && detail == ""
 	if code == nil && detail == "" {

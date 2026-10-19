@@ -465,16 +465,11 @@ func (c *Controller) restartAgain(ctx context.Context, v *view, r store.EnvInsta
 
 // instanceExited records an exit of a service's or an addon's container
 // (§4.4): restarts counted, the exit kept (the last five), the restart
-// due after the backoff; 3 exits within 10 minutes open crash_loop. pid is
-// the microVM's (0: unknown), remembered with the exit.
+// due after the backoff; 3 exits within 10 minutes open crash_loop with
+// the exits and the log tail (storedTail: redacted, bounded). pid is the
+// microVM's (0: unknown), remembered with the exit.
 func (c *Controller) instanceExited(ctx context.Context, v *view, r store.EnvInstanceRow, code *int, pid int64) {
-	tail, _ := c.containerLog(ctx, lease(r.Sandbox), logTailLines)
-	if r.Instance.Kind == spec.KindAddon {
-		secrets := c.addonSecrets(ctx, v, r.Instance.Object)
-		for i := range tail {
-			tail[i] = redact(tail[i], secrets)
-		}
-	}
+	tail := c.storedTail(ctx, v, r.Sandbox)
 	obj := objectName(r.Instance.Kind, r.Instance.Object)
 	recorded := false
 	err := c.fenced(ctx, func(tx *store.Store) error {

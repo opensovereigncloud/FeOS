@@ -207,7 +207,7 @@ func (c *Controller) rolloutFailed(ctx context.Context, s *stepState, name strin
 	if culprit != nil {
 		ev.Exits = culprit.Instance.Exits
 		if steady(culprit.Sandbox) && c.connected(culprit.Sandbox.Node) {
-			ev.LogTail, _ = c.containerLog(ctx, lease(culprit.Sandbox), logTailLines)
+			ev.LogTail = c.storedTail(ctx, v, culprit.Sandbox)
 		}
 	}
 	if err := c.failRelease(ctx, v, reason, objectName(spec.KindService, name), model.ConditionRolloutFailed, ev); err != nil {
