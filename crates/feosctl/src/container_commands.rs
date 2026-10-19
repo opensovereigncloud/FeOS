@@ -105,7 +105,7 @@ pub enum ContainerCommand {
         #[arg(
             long,
             short = 'n',
-            help = "Only the last lines (at most 10000); 0: none of the log so far"
+            help = "Only the last lines (at most 10000 and 4 MiB); 0: none of the log so far"
         )]
         tail: Option<u32>,
 

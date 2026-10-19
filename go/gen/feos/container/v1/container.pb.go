@@ -959,9 +959,12 @@ type StreamContainerLogsRequest struct {
 	// If true, sends all previous logs before streaming new ones.
 	Tail bool `protobuf:"varint,3,opt,name=tail,proto3" json:"tail,omitempty"`
 	// If above 0, sends only the last tail_lines lines of the previous logs
-	// (at most 10000) before streaming new ones, whatever tail says; 0: tail
-	// decides. ferund reads a log tail this way, without follow. A node that
-	// predates this field ignores it.
+	// (at most 10000, and never from further back than 4 MiB before the
+	// log's end: the line there is cut to its last whole 64 KiB parts, or
+	// left out when not one fits) before streaming new ones, whatever tail
+	// says; 0: tail decides. ferund reads a log tail this way, without
+	// follow. A node that predates this field ignores it; one that predates
+	// the 4 MiB cap sends up to 10000 lines of 64 KiB.
 	TailLines     uint32 `protobuf:"varint,4,opt,name=tail_lines,json=tailLines,proto3" json:"tail_lines,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
