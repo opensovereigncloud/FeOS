@@ -1,0 +1,202 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage",
+  "query": {},
+  "status": 200,
+  "request": null,
+  "response": {
+    "id": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b01",
+    "name": "expensa-stage",
+    "labels": {
+      "fecode.class": "stage",
+      "fecode.env": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b01",
+      "fecode.project": "0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01"
+    },
+    "release": 7,
+    "realised": 6,
+    "deleting": false,
+    "rollout": {
+      "release": 7,
+      "state": "rolling",
+      "startedAt": "2026-10-18T14:02:11Z",
+      "reason": ""
+    },
+    "objects": [
+      {
+        "kind": "service",
+        "name": "approval-service",
+        "runtime": "image",
+        "desired": 1,
+        "ready": 1,
+        "instances": [
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000001",
+            "replica": 0,
+            "phase": "ready",
+            "state": "running",
+            "node": "n1",
+            "address": "fd6b:a01:2::11",
+            "release": 7,
+            "restarts": 0,
+            "lastExit": null,
+            "readySince": "2026-10-16T16:22:58Z",
+            "detail": ""
+          }
+        ]
+      },
+      {
+        "kind": "service",
+        "name": "expense-service",
+        "runtime": "image",
+        "desired": 2,
+        "ready": 1,
+        "instances": [
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000002",
+            "replica": 0,
+            "phase": "ready",
+            "state": "running",
+            "node": "n2",
+            "address": "fd6b:a01:3::14",
+            "release": 7,
+            "restarts": 0,
+            "lastExit": null,
+            "readySince": "2026-10-18T14:04:02Z",
+            "detail": ""
+          },
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000003",
+            "replica": 1,
+            "phase": "ready",
+            "state": "running",
+            "node": "n1",
+            "address": "fd6b:a01:2::12",
+            "release": 6,
+            "restarts": 0,
+            "lastExit": null,
+            "readySince": "2026-10-16T16:22:58Z",
+            "detail": ""
+          },
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000004",
+            "replica": 1,
+            "phase": "exited",
+            "state": "running",
+            "node": "n2",
+            "address": "fd6b:a01:3::15",
+            "release": 7,
+            "restarts": 3,
+            "lastExit": 1,
+            "readySince": "",
+            "detail": "exited with code 1; restarting in 4s"
+          }
+        ]
+      },
+      {
+        "kind": "service",
+        "name": "web",
+        "runtime": "image",
+        "desired": 1,
+        "ready": 1,
+        "instances": [
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000005",
+            "replica": 0,
+            "phase": "ready",
+            "state": "running",
+            "node": "n1",
+            "address": "fd6b:a01:2::16",
+            "release": 7,
+            "restarts": 0,
+            "lastExit": null,
+            "readySince": "2026-10-18T14:04:02Z",
+            "detail": ""
+          }
+        ]
+      },
+      {
+        "kind": "addon",
+        "name": "nats",
+        "type": "nats",
+        "version": "2",
+        "plan": "small",
+        "phase": "ready",
+        "provisioned": true,
+        "instances": [
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000006",
+            "replica": 0,
+            "phase": "ready",
+            "state": "running",
+            "node": "n2",
+            "address": "fd6b:a01:3::6",
+            "release": 7,
+            "restarts": 0,
+            "lastExit": null,
+            "readySince": "2026-10-16T16:21:40Z",
+            "detail": ""
+          }
+        ]
+      },
+      {
+        "kind": "addon",
+        "name": "postgres",
+        "type": "postgres",
+        "version": "17",
+        "plan": "small",
+        "phase": "ready",
+        "provisioned": true,
+        "instances": [
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000007",
+            "replica": 0,
+            "phase": "ready",
+            "state": "running",
+            "node": "n1",
+            "address": "fd6b:a01:2::5",
+            "release": 7,
+            "restarts": 0,
+            "lastExit": null,
+            "readySince": "2026-10-16T16:21:40Z",
+            "detail": ""
+          }
+        ]
+      },
+      {
+        "kind": "job",
+        "name": "migrate",
+        "lastRun": {
+          "release": 7,
+          "attempt": 1,
+          "phase": "succeeded",
+          "exitCode": 0,
+          "finishedAt": "2026-10-18T14:03:37Z",
+          "detail": ""
+        }
+      }
+    ],
+    "routes": [
+      {
+        "name": "api-approval",
+        "path": "/api/approval",
+        "service": "approval-service",
+        "port": 8080
+      },
+      {
+        "name": "api-expense",
+        "path": "/api/expense",
+        "service": "expense-service",
+        "port": 8080
+      },
+      {
+        "name": "root",
+        "path": "/",
+        "service": "web",
+        "port": 8080
+      }
+    ],
+    "openIncidents": 1,
+    "createdAt": "2026-10-01T09:12:44Z"
+  },
+  "note": "{env} is the UUID or the name; stage rolls release 7 while 6 serves"
+}

@@ -1,0 +1,616 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package spec
+
+import (
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"testing"
+)
+
+// The sandbox the Expensa spec's attached service runs in.
+const webSandbox = "0193a000-0000-7000-8000-00000000000a"
+
+// Another attachable sandbox of the tenant.
+const otherSandbox = "0193a000-0000-7000-8000-00000000000b"
+
+// fakeBlueprint is an addon type whose versions and keys are listed.
+type fakeBlueprint struct {
+	versions []string
+	keys     []string
+	fields   []string
+}
+
+func (b fakeBlueprint) Validate(name string, prev *Addon, next Addon) []Finding {
+	var fs []Finding
+	if !slices.Contains(b.versions, next.Version) {
+		fs = append(fs, Finding{Severity: SeverityError, Path: "version", Problem: "no version " + next.Version,
+			Remedy: "use " + strings.Join(b.versions, ", ")})
+	}
+	if prev != nil && prev.Version != next.Version {
+		fs = append(fs, Finding{Severity: SeverityError, Path: "version", Problem: "a major version change",
+			Remedy: "keep the version"})
+	}
+	if next.Options["bad"] != nil {
+		fs = append(fs, Finding{Severity: SeverityError, Path: "options.bad", Problem: "bad", Remedy: "remove it"})
+	}
+	if next.Options["whole"] != nil {
+		fs = append(fs, Finding{Severity: SeverityWarning, Path: "", Problem: "whole", Remedy: ""})
+	}
+	return fs
+}
+
+func (b fakeBlueprint) Ref(name string, a Addon, key string, fields map[string]string) error {
+	if !slices.Contains(b.keys, key) {
+		return fmt.Errorf("%s has no key %q", a.Type, key)
+	}
+	for f := range fields {
+		if !slices.Contains(b.fields, f) {
+			return fmt.Errorf("a reference to %s has no field %q", a.Type, f)
+		}
+	}
+	return nil
+}
+
+// fakeVC answers Validate from maps.
+type fakeVC struct {
+	mode      Mode
+	sandboxes map[string]SandboxInfo
+	secrets   map[string]SecretInfo
+	// badImages fail to resolve with their error text.
+	badImages map[string]string
+	types     bool
+	// volumes are the environment's volumes by addon name.
+	volumes map[string]AddonData
+}
+
+func (f fakeVC) Mode() Mode { return f.mode }
+func (f fakeVC) Sandbox(id string) (SandboxInfo, bool) {
+	s, ok := f.sandboxes[id]
+	return s, ok
+}
+func (f fakeVC) Secret(name string) (SecretInfo, bool) {
+	s, ok := f.secrets[name]
+	return s, ok
+}
+func (f fakeVC) Volume(addon string) (AddonData, bool) {
+	d, ok := f.volumes[addon]
+	return d, ok
+}
+func (f fakeVC) Blueprint(typ string) (Blueprint, bool) {
+	switch typ {
+	case "postgres":
+		return fakeBlueprint{versions: []string{"16", "17"}, keys: []string{"url", "host", "port", "password"},
+			fields: []string{"role", "database"}}, true
+	case "nats":
+		return fakeBlueprint{versions: []string{"2"}, keys: []string{"url", "host"}}, true
+	}
+	return nil, false
+}
+func (f fakeVC) Image(image string) (string, error) {
+	if IsDigestRef(image) {
+		return image, nil
+	}
+	if e, ok := f.badImages[image]; ok {
+		return "", errors.New(e)
+	}
+	return pinnedOf(image), nil
+}
+
+// fakeTypesVC also lists its addon types.
+type fakeTypesVC struct{ fakeVC }
+
+func (fakeTypesVC) BlueprintTypes() []string { return []string{"nats", "postgres"} }
+
+// pinnedOf is the digest reference the fake resolves an image to.
+func pinnedOf(image string) string {
+	repo, _, _ := strings.Cut(image, ":")
+	return repo + "@sha256:" + strings.Repeat(fmt.Sprintf("%x", len(image)%16), 64)
+}
+
+func defaultVC(mode Mode) fakeVC {
+	return fakeVC{mode: mode,
+		sandboxes: map[string]SandboxInfo{webSandbox: {ID: webSandbox, Attachable: true},
+			otherSandbox: {ID: otherSandbox, Attachable: true}},
+		secrets: map[string]SecretInfo{"internal-token": {Latest: 3, Versions: []int{2, 3}, Deleted: []int{1}}},
+	}
+}
+
+// expect is one finding a case wants: severity, path and a part of the
+// problem.
+type expect struct {
+	sev     Severity
+	path    string
+	problem string
+}
+
+func e(path, problem string) expect { return expect{SeverityError, path, problem} }
+func w(path, problem string) expect { return expect{SeverityWarning, path, problem} }
+func i(path, problem string) expect { return expect{SeverityInfo, path, problem} }
+
+func checkFindings(t *testing.T, fs []Finding, want []expect) {
+	t.Helper()
+	if len(fs) != len(want) {
+		t.Fatalf("findings\n%s\nwant %d: %+v", dump(fs), len(want), want)
+	}
+	for n, x := range want {
+		f := fs[n]
+		if f.Severity != x.sev || f.Path != x.path || !strings.Contains(f.Problem, x.problem) {
+			t.Fatalf("finding %d\n%s\nwant %+v", n, dump(fs), x)
+		}
+		if f.Severity != SeverityInfo && f.Remedy == "" && f.Path != "addons.postgres" {
+			t.Fatalf("finding without a remedy: %+v", f)
+		}
+	}
+}
+
+func dump(fs []Finding) string {
+	var b strings.Builder
+	for _, f := range fs {
+		fmt.Fprintf(&b, "  %s %s: %s — %s\n", f.Severity, f.Path, f.Problem, f.Remedy)
+	}
+	return b.String()
+}
+
+// mutate parses the Expensa spec, changes it and validates it.
+func validateMutated(t *testing.T, vc ValidateContext, prev *Spec, change func(s *Spec)) []Finding {
+	t.Helper()
+	s := mustParse(t, expensa)
+	if change != nil {
+		change(&s)
+	}
+	return Validate(vc, s, prev)
+}
+
+func intp(n int) *int { return &n }
+
+func svc(s *Spec, name string, f func(*Service)) {
+	v := s.Services[name]
+	f(&v)
+	s.Services[name] = v
+}
+
+func TestValidateExpensa(t *testing.T) {
+	// approval-service as an image service makes the §3 example whole.
+	approval := func(s *Spec) {
+		s.Services["approval-service"] = Service{Image: "ghcr.io/acme/approval:1.2", Ports: []Port{{Name: "http", Port: 8080}}}
+	}
+	for _, mode := range []Mode{ModePlan, ModeApply} {
+		fs := validateMutated(t, defaultVC(mode), nil, approval)
+		checkFindings(t, fs, nil)
+	}
+	// Env-less: no secret checks; the sandbox is still checked.
+	vc := defaultVC(ModeSpec)
+	vc.secrets = nil
+	checkFindings(t, validateMutated(t, vc, nil, approval), nil)
+	vc.sandboxes = nil
+	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{e("services.web.sandbox", "no sandbox")})
+	// The fixtures' stage spec too.
+	s, fs := Parse(readFile(t, "testdata/expensa-stage-request.json"))
+	checkFindings(t, append(fs, Validate(defaultVC(ModeApply), s, nil)...), nil)
+	s, fs = Parse(readFile(t, "testdata/expensa-stage-release7.json"))
+	checkFindings(t, append(fs, Validate(defaultVC(ModeApply), s, &s)...), nil)
+}
+
+func TestValidateRules(t *testing.T) {
+	approval := func(s *Spec) {
+		s.Services["approval-service"] = Service{Image: "ghcr.io/acme/approval:1.2", Ports: []Port{{Name: "http", Port: 8080}}}
+	}
+	cases := []struct {
+		name   string
+		mode   Mode
+		change func(s *Spec)
+		want   []expect
+	}{
+		{"missing service reference", ModePlan, nil, []expect{e("services.expense-service.env.EXPENSA_APPROVAL_URL",
+			"no service approval-service")}},
+		{"limits", ModePlan, func(s *Spec) {
+			approval(s)
+			for n := range 65 {
+				s.Services[fmt.Sprintf("s%d", n)] = Service{Image: "img"}
+			}
+			for n := range 129 {
+				s.Routes[fmt.Sprintf("r%d", n)] = Route{Path: fmt.Sprintf("/r%d", n), Service: "web", Port: PortRef{Name: "http"}}
+			}
+		}, []expect{e("routes", "131 routes; at most 128"), e("services", "68 services; at most 64")}},
+		{"volumes", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Volumes = []byte(`{}`)
+			svc(s, "expense-service", func(v *Service) { v.Mounts = []byte(`[]`) })
+		}, []expect{e("services.expense-service.mounts", "volumes for services are not available yet"),
+			e("volumes", "volumes for services are not available yet")}},
+		{"names", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["Bad_Name"] = Service{Image: "img"}
+			s.Jobs["-j"] = Job{Image: "img"}
+			s.Addons["a.b"] = Addon{Type: "nats", Version: "2"}
+			s.Routes["R"] = Route{Path: "/r", Service: "web", Port: PortRef{Name: "http"}}
+		}, []expect{e("addons.a.b", "not a DNS label"), e("jobs.-j", "not a DNS label"), e("routes.R", "not a DNS label"),
+			e("services.Bad_Name", "not a DNS label")}},
+		{"service and addon share a name", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["nats"] = Service{Image: "img"}
+		}, []expect{e("services.nats", "share the hosts names")}},
+		{"jobs may share names", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Jobs["nats"] = Job{Image: "img"}
+			s.Jobs["web"] = Job{Image: "img"}
+		}, nil},
+		{"image service needs an image", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) { v.Image, v.Runtime = "", "" })
+		}, []expect{e("services.expense-service.image", "needs an image")}},
+		{"image service fields of attached", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) { v.Sandbox, v.Cwd = webSandbox, "/x" })
+		}, []expect{e("services.expense-service.cwd", "for attached"), e("services.expense-service.sandbox", "for attached")}},
+		{"unknown runtime", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "approval-service", func(v *Service) { v.Runtime = "vm" })
+		}, []expect{e("services.approval-service.runtime", `runtime "vm" is unknown`)}},
+		{"ranges", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) {
+				v.Replicas = intp(21)
+				v.Resources = &Resources{VCPUs: 33, MemoryMib: 64}
+				v.Rollout = &Rollout{Timeout: "-1m"}
+			})
+			s.Jobs["migrate"] = Job{Image: "img", Retries: 6, Timeout: "3h", On: "never", Resources: &Resources{VCPUs: -1}}
+		}, []expect{e("jobs.migrate.on", `on "never"`), e("jobs.migrate.resources.vcpus", "out of range"),
+			e("jobs.migrate.retries", "out of range"), e("jobs.migrate.timeout", "out of range"),
+			e("services.expense-service.replicas", "replicas 21"), e("services.expense-service.resources.memoryMib", "64"),
+			e("services.expense-service.resources.vcpus", "33"), e("services.expense-service.rollout.timeout", "not positive")}},
+		{"zero replicas and bounds", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) {
+				v.Replicas = intp(0)
+				v.Resources = &Resources{VCPUs: 32, MemoryMib: 256}
+			})
+		}, nil},
+		{"idle", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "approval-service", func(v *Service) { v.Idle = "15m" })
+			svc(s, "expense-service", func(v *Service) { v.Idle = "30s" })
+		}, []expect{e("services.approval-service.idle", "nothing would wake it: no route targets approval-service"),
+			e("services.expense-service.idle", "shorter than 1m")}},
+		{"bad durations", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) {
+				v.Idle = "soon"
+				v.Readiness.Period = "500ms"
+				v.Readiness.InitialDelay = "-1s"
+				v.Readiness.FailureThreshold = -1
+			})
+		}, []expect{e("services.expense-service.idle", `"soon" is not a duration`),
+			e("services.expense-service.readiness.failureThreshold", "negative"), e("services.expense-service.readiness.initialDelay", "negative"),
+			e("services.expense-service.readiness.period", "shorter than 1s")}},
+		{"attached service rules", ModeSpec, func(s *Spec) {
+			approval(s)
+			svc(s, "web", func(v *Service) {
+				v.Command = nil
+				v.Replicas = intp(2)
+				v.Resources = &Resources{VCPUs: 1}
+				v.Idle = "15m"
+				v.Rollout = &Rollout{}
+				v.Image = "img"
+				v.Cwd = "relative"
+			})
+		}, []expect{e("services.web.command", "an attached service needs a command"),
+			e("services.web.cwd", "not an absolute path"), e("services.web.idle", "does not idle"),
+			e("services.web.image", "runs no image"), e("services.web.replicas", "an attached service runs once"),
+			e("services.web.resources", "sandbox's resources"), e("services.web.rollout", "no rollout")}},
+		{"attached replicas 1", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "web", func(v *Service) { v.Replicas = intp(1) })
+		}, nil},
+		{"attached sandbox", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["web2"] = Service{Runtime: RuntimeAttached, Command: []string{"x"}}
+			s.Services["web3"] = Service{Runtime: RuntimeAttached, Command: []string{"x"}, Sandbox: "nope"}
+			s.Services["web4"] = Service{Runtime: RuntimeAttached, Command: []string{"x"},
+				Sandbox: "0193a000-0000-7000-8000-0000000000ff"}
+			s.Services["web5"] = Service{Runtime: RuntimeAttached, Command: []string{"x"},
+				Sandbox: strings.ToUpper(webSandbox), Ports: []Port{{Name: "http", Port: 5174}}}
+		}, []expect{e("services.web2.sandbox", "needs a sandbox"), e("services.web3.sandbox", "not a UUID"),
+			e("services.web4.sandbox", "no sandbox 0193a000-0000-7000-8000-0000000000ff of yours")}},
+		{"ports", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "approval-service", func(v *Service) {
+				v.Ports = []Port{{Name: "http", Port: 8080}, {Name: "http", Port: 0}, {Name: "", Port: 8080}, {Name: "A", Port: 70000}}
+			})
+		}, []expect{e("services.approval-service.ports[1].name", "given twice"),
+			e("services.approval-service.ports[1].port", "port 0 is out of range"),
+			e("services.approval-service.ports[2].name", "needs a name"),
+			e("services.approval-service.ports[2].port", "port 8080 is given twice"),
+			e("services.approval-service.ports[3].name", "not a DNS label"),
+			e("services.approval-service.ports[3].port", "out of range")}},
+		{"readiness", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) {
+				v.Readiness = &Readiness{HTTP: &HTTPCheck{Port: PortRef{Name: "grpc"}, Path: "readyz"}, TCP: &TCPCheck{Port: PortRef{Number: 8080}}}
+			})
+			svc(s, "approval-service", func(v *Service) { v.Readiness = &Readiness{Exec: &ExecCheck{}} })
+			svc(s, "web", func(v *Service) { v.Readiness = &Readiness{} })
+		}, []expect{e("services.approval-service.readiness.exec.command", "needs a command"),
+			e("services.expense-service.readiness", "exactly one of http, tcp and exec, not 2"),
+			e("services.expense-service.readiness.http.path", "does not begin with /"),
+			e("services.expense-service.readiness.http.port", "has no port grpc"),
+			e("services.web.readiness", "not 0")}},
+		{"env references", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) {
+				v.Env["1BAD"] = String("x")
+				v.Env["NO_ADDON"] = EnvValue{Kind: EnvAddon, Addon: "mysql", Key: "url"}
+				v.Env["BAD_KEY"] = EnvValue{Kind: EnvAddon, Addon: "postgres", Key: "dsn"}
+				v.Env["BAD_FIELD"] = EnvValue{Kind: EnvAddon, Addon: "nats", Key: "url", Fields: map[string]string{"role": "r"}}
+				v.Env["SVC_KEY"] = EnvValue{Kind: EnvService, Service: "approval-service", Port: PortRef{Name: "http"}, Key: "ip"}
+				v.Env["SVC_PORT"] = EnvValue{Kind: EnvService, Service: "approval-service", Port: PortRef{Name: "grpc"}, Key: "url"}
+				v.Env["SVC_NOPORT"] = EnvValue{Kind: EnvService, Service: "approval-service", Key: "port"}
+				v.Env["SVC_HOST"] = EnvValue{Kind: EnvService, Service: "approval-service", Key: "host"}
+				v.Env["SVC_NUM"] = EnvValue{Kind: EnvService, Service: "approval-service", Port: PortRef{Number: 8080}, Key: "url"}
+				v.Env["TO_ATTACHED"] = EnvValue{Kind: EnvService, Service: "web", Port: PortRef{Name: "http"}, Key: "url"}
+			})
+		}, []expect{e("services.expense-service.env.1BAD", "not an environment variable's name"),
+			e("services.expense-service.env.BAD_FIELD", `has no field "role"`),
+			e("services.expense-service.env.BAD_KEY", `has no key "dsn"`),
+			e("services.expense-service.env.NO_ADDON", "no addon mysql"),
+			e("services.expense-service.env.SVC_KEY", `not "ip"`),
+			e("services.expense-service.env.SVC_NOPORT", "a port is needed"),
+			e("services.expense-service.env.SVC_PORT", "approval-service has no port grpc"),
+			e("services.expense-service.env.TO_ATTACHED", "web is an attached service: image pods cannot reach a sandbox")}},
+		{"attached may reference attached and image", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["api"] = Service{Runtime: RuntimeAttached, Sandbox: webSandbox, Command: []string{"x"},
+				Ports: []Port{{Name: "http", Port: 8081}}}
+			svc(s, "web", func(v *Service) {
+				v.Env = map[string]EnvValue{"API": {Kind: EnvService, Service: "api", Port: PortRef{Name: "http"}, Key: "url"},
+					"APPROVAL": {Kind: EnvService, Service: "approval-service", Port: PortRef{Name: "http"}, Key: "url"}}
+			})
+		}, nil},
+		{"attached references attached in another sandbox", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["api"] = Service{Runtime: RuntimeAttached, Sandbox: otherSandbox, Command: []string{"x"},
+				Ports: []Port{{Name: "http", Port: 8081}}}
+			svc(s, "web", func(v *Service) {
+				v.Env = map[string]EnvValue{"API": {Kind: EnvService, Service: "api", Port: PortRef{Name: "http"}, Key: "url"}}
+			})
+		}, []expect{e("services.web.env.API", "api is an attached service in another sandbox")}},
+		{"attached references attached in its sandbox written in capitals", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["api"] = Service{Runtime: RuntimeAttached, Sandbox: strings.ToUpper(webSandbox), Command: []string{"x"},
+				Ports: []Port{{Name: "http", Port: 8081}}}
+			svc(s, "web", func(v *Service) {
+				v.Env = map[string]EnvValue{"API": {Kind: EnvService, Service: "api", Port: PortRef{Name: "http"}, Key: "url"}}
+			})
+		}, nil},
+		{"job references attached", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Jobs["migrate"] = Job{Image: "img", Env: map[string]EnvValue{"W": {Kind: EnvService, Service: "web", Key: "host"}}}
+		}, []expect{e("jobs.migrate.env.W", "image pods cannot reach a sandbox")}},
+		{"job needs an image", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Jobs["seed"] = Job{On: JobOnManual}
+		}, []expect{e("jobs.seed.image", "a job needs an image")}},
+		{"secrets", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) {
+				v.Env["NONE"] = SecretEnv("absent")
+				v.Env["SYS"] = SecretEnv("addon.postgres.password")
+				v.Env["GONE"] = SecretEnv("gone")
+			})
+			s.Secrets["unused"] = SecretRef{Version: 9}
+			s.Secrets["Bad"] = SecretRef{}
+		}, []expect{e("secrets.Bad", "not a secret name"), e("services.expense-service.env.GONE", "secret gone was deleted"),
+			e("services.expense-service.env.NONE", "no secret absent"),
+			e("services.expense-service.env.SYS", "not a secret name you can use")}},
+		{"secret versions", ModeApply, func(s *Spec) {
+			approval(s)
+			s.Secrets["internal-token"] = SecretRef{Version: 1}
+		}, []expect{e("secrets.internal-token", "version 1 of secret internal-token was deleted")}},
+		{"secret version absent", ModeApply, func(s *Spec) {
+			approval(s)
+			s.Secrets["internal-token"] = SecretRef{Version: 7}
+		}, []expect{e("secrets.internal-token", "secret internal-token has no version 7")}},
+		{"secret version negative", ModeApply, func(s *Spec) {
+			approval(s)
+			s.Secrets["internal-token"] = SecretRef{Version: -1}
+		}, []expect{e("secrets.internal-token.version", "negative")}},
+		{"secrets in spec mode", ModeSpec, func(s *Spec) {
+			approval(s)
+			s.Secrets["internal-token"] = SecretRef{Version: 99}
+			svc(s, "expense-service", func(v *Service) { v.Env["NONE"] = SecretEnv("absent") })
+		}, nil},
+		{"addons", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Addons["cache"] = Addon{Type: "valkey", Version: "8"}
+			s.Addons["notype"] = Addon{}
+			s.Addons["postgres"] = Addon{Type: "postgres", Version: "15", Options: map[string]any{"bad": true, "whole": 1}}
+		}, []expect{e("addons.cache.type", `no addon type "valkey"`), e("addons.notype.type", "needs a type"),
+			w("addons.postgres", "whole"), e("addons.postgres.options.bad", "bad"), e("addons.postgres.version", "no version 15")}},
+		{"routes", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Routes["a"] = Route{Path: "api", Service: "web", Port: PortRef{Name: "http"}}
+			s.Routes["b"] = Route{Path: "/api/expense/", Service: "expense-service", Port: PortRef{Name: "http"}}
+			s.Routes["c"] = Route{Path: "/x?y", Service: "nope", Port: PortRef{Name: "http"}}
+			s.Routes["d"] = Route{Path: "/x/../y", Service: "web", Port: PortRef{Name: "grpc"}}
+			s.Routes["e"] = Route{Path: "/e", Service: "web", Host: "example.com", Port: PortRef{Number: 5173}}
+			s.Routes["f"] = Route{Path: "/f//g", Service: "web"}
+		}, []expect{e("routes.a.path", "does not begin with /"), e("routes.b.path", "is route api-expense's too"),
+			e("routes.c.path", "needs escaping"), e("routes.c.service", `no service "nope"`),
+			e("routes.d.path", "segment"), e("routes.d.port", "web has no port grpc"), i("routes.e.host", "not realised"),
+			e("routes.f.path", "segment"), e("routes.f.port", "a port is needed")}},
+		{"images", ModePlan, func(s *Spec) {
+			approval(s)
+			svc(s, "approval-service", func(v *Service) { v.Image = "ghcr.io/acme/missing:1" })
+		}, []expect{w("services.approval-service.image", "image ghcr.io/acme/missing:1 could not be resolved: manifest unknown")}},
+		{"images on apply", ModeApply, func(s *Spec) {
+			approval(s)
+			svc(s, "approval-service", func(v *Service) { v.Image = "ghcr.io/acme/missing:1" })
+			s.Jobs["migrate"] = Job{Image: "ghcr.io/acme/missing:1"}
+		}, []expect{e("jobs.migrate.image", "could not be resolved"), e("services.approval-service.image", "could not be resolved")}},
+		{"digest images need no registry", ModeApply, func(s *Spec) {
+			approval(s)
+			svc(s, "approval-service", func(v *Service) {
+				v.Image = "ghcr.io/acme/missing@sha256:" + strings.Repeat("a", 64)
+				v.ImageAsWritten = "ghcr.io/acme/missing:1"
+			})
+		}, nil},
+		{"attached port clash in the spec", ModePlan, func(s *Spec) {
+			approval(s)
+			s.Services["api"] = Service{Runtime: RuntimeAttached, Sandbox: webSandbox, Command: []string{"x"},
+				Ports: []Port{{Name: "http", Port: 5173}}}
+		}, []expect{e("services.web.ports[0].port", "port 5173 is attached service api's too")}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			vc := defaultVC(c.mode)
+			vc.secrets["gone"] = SecretInfo{Deleted: []int{1, 2}}
+			vc.badImages = map[string]string{"ghcr.io/acme/missing:1": "manifest unknown"}
+			checkFindings(t, validateMutated(t, vc, nil, c.change), c.want)
+		})
+	}
+}
+
+func TestValidateContextDependent(t *testing.T) {
+	approval := func(s *Spec) {
+		s.Services["approval-service"] = Service{Image: "ghcr.io/acme/approval:1.2", Ports: []Port{{Name: "http", Port: 8080}}}
+	}
+	// A port of another environment's attached service in the sandbox:
+	// an error, a warning without an environment.
+	vc := defaultVC(ModePlan)
+	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox, Attachable: true,
+		AttachedPorts: []AttachedPort{{Env: "other", Service: "vite", Port: 5173}, {Env: "other", Service: "api", Port: 8081}}}
+	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{e("services.web.ports[0].port",
+		"port 5173 is used in sandbox "+webSandbox+" by service vite of environment other")})
+	vc.mode = ModeSpec
+	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{w("services.web.ports[0].port", "service vite")})
+
+	// A name another environment with attached services in the sandbox
+	// writes into its hosts too: an error, a warning without an
+	// environment; names it does not share, and its names in a sandbox
+	// this spec has no attached service in, are fine.
+	vc = defaultVC(ModePlan)
+	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox, Attachable: true, HostNames: []HostName{
+		{Env: "other", Name: "approval-service"}, {Env: "other", Name: "postgres"}, {Env: "other", Name: "web"},
+		{Env: "third", Name: "web"}, {Env: "other", Name: "vite"}}}
+	vc.sandboxes[otherSandbox] = SandboxInfo{ID: otherSandbox, Attachable: true,
+		HostNames: []HostName{{Env: "other", Name: "nats"}}}
+	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{
+		e("addons.postgres", "postgres is in the hosts of sandbox "+webSandbox+" as environment other's too"),
+		e("services.approval-service", "environment other's"),
+		e("services.web", "environment other's"), e("services.web", "environment third's")})
+	vc.mode = ModeSpec
+	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{w("addons.postgres", "other's"),
+		w("services.approval-service", "other's"), w("services.web", "other's"), w("services.web", "third's")})
+	vc = defaultVC(ModePlan)
+	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox, Attachable: true,
+		HostNames: []HostName{{Env: "other", Name: "vite"}, {Env: "other", Name: "db"}}}
+	checkFindings(t, validateMutated(t, vc, nil, approval), nil)
+
+	// A sandbox that is not attachable cannot reach the pods.
+	vc = defaultVC(ModePlan)
+	vc.sandboxes[webSandbox] = SandboxInfo{ID: webSandbox}
+	checkFindings(t, validateMutated(t, vc, nil, approval), []expect{w("services.web.sandbox", "not attachable")})
+	attachedOnly := `{"services": {"web": {"runtime": "attached", "sandbox": "` + webSandbox + `", "command": ["x"]}}}`
+	checkFindings(t, Validate(vc, mustParse(t, attachedOnly), nil), nil)
+
+	// An addon against its previous self; a changed type deletes data.
+	prev := mustParse(t, expensa)
+	vc = defaultVC(ModePlan)
+	checkFindings(t, validateMutated(t, vc, &prev, func(s *Spec) {
+		approval(s)
+		s.Addons["postgres"] = Addon{Type: "postgres", Version: "16", Options: s.Addons["postgres"].Options}
+		s.Addons["nats"] = Addon{Type: "postgres", Version: "17"}
+	}), []expect{w("addons.nats.type", "changes its type from nats to postgres"),
+		e("addons.postgres.version", "a major version change")})
+	// Env-less: no previous release.
+	vc.mode = ModeSpec
+	checkFindings(t, validateMutated(t, vc, &prev, func(s *Spec) {
+		approval(s)
+		s.Addons["postgres"] = Addon{Type: "postgres", Version: "16"}
+	}), nil)
+
+	// The registered types are named.
+	tvc := fakeTypesVC{defaultVC(ModePlan)}
+	fs := validateMutated(t, tvc, nil, func(s *Spec) {
+		approval(s)
+		s.Addons["cache"] = Addon{Type: "valkey"}
+	})
+	if len(fs) != 1 || fs[0].Remedy != "use one of: nats, postgres" {
+		t.Fatalf("%s", dump(fs))
+	}
+}
+
+// An addon is validated against the data its environment's volume holds
+// when it has one (the controller keeps a volume by the addon's name, and
+// mounts it whatever the latest release says), else against the latest
+// release's addon.
+func TestValidateAgainstVolume(t *testing.T) {
+	prev := mustParse(t, expensa)
+	pg16 := Addon{Type: "postgres", Version: "16"}
+	pg17 := Addon{Type: "postgres", Version: "17"}
+	withDB := func(a Addon) func(s *Spec) {
+		return func(s *Spec) {
+			s.Services["approval-service"] = Service{Image: "ghcr.io/acme/approval:1.2", Ports: []Port{{Name: "http", Port: 8080}}}
+			s.Addons["db"] = a
+		}
+	}
+	for _, c := range []struct {
+		name   string
+		latest *Addon
+		volume *AddonData
+		next   Addon
+		mode   Mode
+		want   []expect
+	}{
+		// The latest release removed db, but the controller has not yet
+		// deleted its volume: re-added, the volume's data decides.
+		{name: "removed then re-added", volume: &AddonData{Type: "postgres", Version: "16"}, next: pg17,
+			want: []expect{e("addons.db.version", "a major version change")}},
+		{name: "re-added as it was", volume: &AddonData{Type: "postgres", Version: "16"}, next: pg16},
+		// postgres to nats and back before the controller acted: the
+		// volume still holds postgres 16's data, nothing is deleted.
+		{name: "type round trip", latest: &Addon{Type: "nats", Version: "2"}, volume: &AddonData{Type: "postgres", Version: "16"},
+			next: pg16},
+		{name: "type round trip, other version", latest: &Addon{Type: "nats", Version: "2"},
+			volume: &AddonData{Type: "postgres", Version: "16"}, next: pg17,
+			want: []expect{e("addons.db.version", "a major version change")}},
+		// The volume holds another type's data: it is deleted, whatever the
+		// latest release says, and its version is no constraint.
+		{name: "volume of another type", latest: &pg17, volume: &AddonData{Type: "nats", Version: "2"}, next: pg16,
+			want: []expect{w("addons.db.type", "holds nats data, not postgres: its data is deleted")}},
+		// The version that ran ready on the volume decides, not the latest
+		// release's (a failed upgrade never wrote the data).
+		{name: "upgrade that never ran", latest: &Addon{Type: "postgres", Version: "17"},
+			volume: &AddonData{Type: "postgres", Version: "16"}, next: pg16},
+		// No version recorded yet: the latest release's.
+		{name: "no data version", latest: &pg17, volume: &AddonData{Type: "postgres"}, next: pg16,
+			want: []expect{e("addons.db.version", "a major version change")}},
+		// No volume: the latest release's addon, as before.
+		{name: "no volume", latest: &pg17, next: pg16, want: []expect{e("addons.db.version", "a major version change")}},
+		{name: "no volume, type change", latest: &Addon{Type: "nats", Version: "2"}, next: pg16,
+			want: []expect{w("addons.db.type", "changes its type from nats to postgres: its data is deleted")}},
+		// Without an environment there is no volume.
+		{name: "env-less", volume: &AddonData{Type: "postgres", Version: "16"}, next: pg17, mode: ModeSpec},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			vc := defaultVC(ModePlan)
+			if c.mode != "" {
+				vc.mode = c.mode
+			}
+			p := prev
+			p.Addons = maps.Clone(prev.Addons)
+			if c.latest != nil {
+				p.Addons["db"] = *c.latest
+			}
+			if c.volume != nil {
+				vc.volumes = map[string]AddonData{"db": *c.volume}
+			}
+			checkFindings(t, validateMutated(t, vc, &p, withDB(c.next)), c.want)
+		})
+	}
+}

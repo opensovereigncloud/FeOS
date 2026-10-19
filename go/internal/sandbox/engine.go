@@ -37,7 +37,8 @@ type Config struct {
 	// DiskBudget is the per-pod disk gate of placement, in bytes
 	// (--disk-budget).
 	DiskBudget int64
-	// IdlePause and HibernateAfter switch their policies off at 0.
+	// IdlePause and HibernateAfter switch their policies off at 0; a row
+	// with idle_after_s idles after it whatever IdlePause is.
 	IdlePause, HibernateAfter, LostGrace, NodeWait, DrainTimeout time.Duration
 	PendingRepairAfter, UnreachableRepairAfter                   time.Duration
 	// HibernateTimeout is how long a hibernate's node call may run
@@ -238,6 +239,9 @@ type Engine struct {
 	// resolveImage pins an image to its digest (image.go); tests replace
 	// it.
 	resolveImage func(ctx context.Context, image string) (string, error)
+
+	// hooks are the environments' hooks (hooks.go).
+	hooks engineHooks
 
 	runner *runner
 	syncs  syncer

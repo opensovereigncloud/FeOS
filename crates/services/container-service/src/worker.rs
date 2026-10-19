@@ -4,6 +4,7 @@
 use crate::{
     dispatcher::{runtime_knows, validate_container_id},
     error::ContainerServiceError,
+    logs,
     persistence::{repository::ContainerRepository, ContainerRecord, ContainerStatus},
     runtime::{
         adapter::ContainerAdapter,
@@ -13,8 +14,9 @@ use crate::{
 use feos_proto::{
     container_service::{
         ContainerConfig, ContainerState, CreateContainerRequest, CreateContainerResponse,
-        DeleteContainerRequest, DeleteContainerResponse, ExecRequest, StartContainerRequest,
-        StartContainerResponse, StopContainerRequest, StopContainerResponse,
+        DeleteContainerRequest, DeleteContainerResponse, ExecRequest, LogEntry,
+        StartContainerRequest, StartContainerResponse, StopContainerRequest, StopContainerResponse,
+        StreamContainerLogsRequest,
     },
     image_service::{
         image_service_client::ImageServiceClient, ImageState as OciImageState, PullImageRequest,
@@ -29,14 +31,17 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::StreamExt;
 use tonic::{
     transport::{Channel, Endpoint, Uri},
-    Streaming,
+    Status, Streaming,
 };
 use tower::service_fn;
 use uuid::Uuid;
+
+/// The log entries a stream holds while its caller reads slower.
+const LOG_STREAM_BUFFER: usize = 16;
 
 async fn get_image_service_client() -> Result<ImageServiceClient<Channel>, ContainerServiceError> {
     let socket_path = PathBuf::from(IMAGE_SERVICE_SOCKET);
@@ -179,6 +184,7 @@ pub async fn create_container(
         status: ContainerStatus {
             state: ContainerState::PullingImage,
             process_id: None,
+            exit_code: None,
         },
         config: config.clone(),
     };
@@ -286,6 +292,7 @@ async fn adopt_container(
         status: ContainerStatus {
             state: ContainerState::Created,
             process_id: None,
+            exit_code: None,
         },
         config: merged,
     };
@@ -314,6 +321,7 @@ async fn create_in_runtime(
     record.status = ContainerStatus {
         state: ContainerState::Created,
         process_id: Some(pid),
+        exit_code: None,
     };
     repository.save_container(record).await?;
     Ok(())
@@ -331,17 +339,17 @@ pub async fn handle_start_container(
     match result {
         Ok(_) => {
             info!("Worker: Start command sent for container {id}");
-            if let Err(e) = repository
-                .update_container_state(&id, ContainerState::Running)
-                .await
-            {
-                let err = ContainerServiceError::Persistence(e);
-                error!("Worker: {err}");
-                let _ = responder.send(Err(err));
-                return;
-            }
+            let pid = match repository.record_start(&id).await {
+                Ok(pid) => pid,
+                Err(e) => {
+                    let err = ContainerServiceError::Persistence(e);
+                    error!("Worker: {err}");
+                    let _ = responder.send(Err(err));
+                    return;
+                }
+            };
             let _ = responder.send(Ok(StartContainerResponse {}));
-            tokio::spawn(track_exit(id, repository, adapter));
+            tokio::spawn(track_exit(id, pid, repository, adapter));
         }
         Err(e) => {
             let err = ContainerServiceError::Adapter(e.to_string());
@@ -351,15 +359,18 @@ pub async fn handle_start_container(
     }
 }
 
-/// Records the container as STOPPED once its process exits.
-async fn track_exit(id: String, repository: ContainerRepository, adapter: Arc<ContainerAdapter>) {
+/// Records the container as STOPPED, with its exit code, once its process
+/// `pid` exits. The task service maps a signal to 128 + the signal.
+async fn track_exit(
+    id: String,
+    pid: Option<i64>,
+    repository: ContainerRepository,
+    adapter: Arc<ContainerAdapter>,
+) {
     match adapter.wait_container(&id).await {
         Ok(exit_code) => {
             info!("Worker: Container {id} exited with code {exit_code}");
-            if let Err(e) = repository
-                .update_container_state(&id, ContainerState::Stopped)
-                .await
-            {
+            if let Err(e) = repository.record_exit(&id, pid, exit_code).await {
                 warn!("Worker: Failed to record that container {id} stopped: {e}");
             }
         }
@@ -380,6 +391,7 @@ pub async fn handle_stop_container(
     match result {
         Ok(_) => {
             info!("Worker: Stop command sent for container {id}");
+            // Keeps the exit code, which track_exit may have recorded.
             if let Err(e) = repository
                 .update_container_state(&id, ContainerState::Stopped)
                 .await
@@ -422,6 +434,36 @@ pub async fn handle_delete_container(
         Err(e) => error!("Worker: Failed to delete container {id}: {e}"),
     }
     let _ = responder.send(result);
+}
+
+/// Opens the container's log where the request starts it and streams it
+/// from there (crate::logs).
+pub async fn handle_stream_logs(
+    req: StreamContainerLogsRequest,
+    responder: oneshot::Sender<
+        Result<mpsc::Receiver<Result<LogEntry, Status>>, ContainerServiceError>,
+    >,
+    repository: ContainerRepository,
+) {
+    let id = req.container_id.clone();
+    let path = bundle::log_file(&id);
+    let open_path = path.clone();
+    let (tail_lines, tail) = (req.tail_lines, req.tail);
+    let opened = blocking(move || {
+        logs::open(&open_path, tail_lines, tail)
+            .map_err(|e| format!("{}: {e}", open_path.display()))
+    })
+    .await;
+    match opened {
+        Ok(opened) => {
+            let (tx, rx) = mpsc::channel(LOG_STREAM_BUFFER);
+            let _ = responder.send(Ok(rx));
+            logs::stream(opened, req.follow, id, path, repository, tx).await;
+        }
+        Err(e) => {
+            let _ = responder.send(Err(e));
+        }
+    }
 }
 
 pub async fn handle_exec(

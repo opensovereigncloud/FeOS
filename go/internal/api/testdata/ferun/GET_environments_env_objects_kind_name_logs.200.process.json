@@ -1,0 +1,19 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-login-3f9a/objects/service/expense-service/logs",
+  "query": {
+    "lines": [
+      "200"
+    ]
+  },
+  "status": 200,
+  "request": null,
+  "response": {
+    "lines": [
+      "2026/10/18 13:31:02 expense-service (dev) listening on [::]:8081",
+      "2026/10/18 13:31:40 GET /api/expense/reports 200 3ms"
+    ],
+    "source": "process"
+  },
+  "note": "an attached service: its process's log in the sandbox"
+}

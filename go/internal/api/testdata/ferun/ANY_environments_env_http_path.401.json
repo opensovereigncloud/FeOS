@@ -1,0 +1,13 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/http/",
+  "query": {},
+  "status": 401,
+  "request": null,
+  "response": "route token required\n",
+  "headers": {
+    "Host": "expensa-stage.boxed.fecode.dev"
+  },
+  "responseContentType": "text/plain; charset=utf-8",
+  "note": "plain text; a tenant token is refused the same way"
+}

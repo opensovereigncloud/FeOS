@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
 )
 
 // ObjectStore is a fake of the object storage that diskd hibernates pods
@@ -46,14 +47,16 @@ type ObjectStore struct {
 }
 
 // checkpoint is what a head names: the pod, its epoch, whether it holds
-// memory, its spec and its disk.
+// memory, its spec, its disk, and its volumes' records, which a restore
+// takes over.
 type checkpoint struct {
-	podID  string
-	epoch  uint64
-	memory bool
-	spec   *podv1.PodSpec
-	files  []fileEntry
-	bytes  uint64
+	podID   string
+	epoch   uint64
+	memory  bool
+	spec    *podv1.PodSpec
+	files   []fileEntry
+	bytes   uint64
+	volumes []*volumev1.Volume
 }
 
 // fileEntry is one entry of a pod's directory: a directory, a regular file
@@ -205,6 +208,8 @@ type checkpointJSON struct {
 	Spec   []byte     `json:"spec"` // the PodSpec in protobuf
 	Files  []fileJSON `json:"files"`
 	Bytes  uint64     `json:"bytes"`
+	// Volumes are the volumes' records in protobuf.
+	Volumes [][]byte `json:"volumes,omitempty"`
 }
 
 type fileJSON struct {
@@ -231,6 +236,13 @@ func (o *ObjectStore) put(c *checkpoint) (string, error) {
 	j := checkpointJSON{PodID: c.podID, Epoch: c.epoch, Memory: c.memory, Spec: spec, Bytes: c.bytes}
 	for _, f := range c.files {
 		j.Files = append(j.Files, fileJSON{Path: f.path, Mode: f.mode, Data: f.data, Link: f.link})
+	}
+	for _, v := range c.volumes {
+		b, err := proto.Marshal(v)
+		if err != nil {
+			return "", err
+		}
+		j.Volumes = append(j.Volumes, b)
 	}
 	data, err := json.Marshal(j)
 	if err != nil {
@@ -281,6 +293,13 @@ func (o *ObjectStore) get(key string) (*checkpoint, bool, error) {
 	c := &checkpoint{podID: j.PodID, epoch: j.Epoch, memory: j.Memory, spec: spec, bytes: j.Bytes}
 	for _, f := range j.Files {
 		c.files = append(c.files, fileEntry{path: f.Path, mode: f.Mode, data: f.Data, link: f.Link})
+	}
+	for i, b := range j.Volumes {
+		v := &volumev1.Volume{}
+		if err := proto.Unmarshal(b, v); err != nil {
+			return nil, false, fmt.Errorf("%s: volume %d: %w", key, i, err)
+		}
+		c.volumes = append(c.volumes, v)
 	}
 	return c, true, nil
 }

@@ -23,6 +23,7 @@ import (
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
 	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
+	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
 	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
 	"github.com/ironcore-dev/feos/go/internal/pki"
 )
@@ -266,6 +267,8 @@ func (n *Node) newNodeServer() *grpc.Server {
 	watchv1.RegisterWatchServiceServer(srv, n.watch)
 	portforwardv1.RegisterPortForwardServiceServer(srv, n.forward)
 	networkv1.RegisterMeshServiceServer(srv, n.mesh)
+	networkv1.RegisterSecurityGroupServiceServer(srv, n.groups)
+	volumev1.RegisterVolumeServiceServer(srv, n.volumes)
 	return srv
 }
 

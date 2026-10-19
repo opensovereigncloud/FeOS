@@ -7,13 +7,14 @@ import {
 } from './api.js';
 import { Icon } from './Icon.jsx';
 import { Avatar, ThemeToggle, usePoll } from './components.jsx';
-import { TENANT_VIEWS, parsePath } from './routes.js';
+import { TENANT_VIEWS, envPath, parsePath } from './routes.js';
 import { SignIn } from './views/SignIn.jsx';
 import { TenantGate } from './views/TenantGate.jsx';
 import { Overview } from './views/Overview.jsx';
 import { Tenants } from './views/Tenants.jsx';
 import { Sandboxes } from './views/Sandboxes.jsx';
 import { Tools } from './views/Tools.jsx';
+import { Environments } from './views/Environments.jsx';
 import { Nodes } from './views/Nodes.jsx';
 import { NodeDetail } from './views/NodeDetail.jsx';
 import { JoinTokens } from './views/JoinTokens.jsx';
@@ -115,6 +116,9 @@ export default function App() {
           {!needsGate && route.view === 'sandboxes' && (
             <Sandboxes key={route.tenant} tenant={route.tenant} sel={route.sel} tab={route.tab} navigate={navigate} />)}
           {!needsGate && route.view === 'tools' && <Tools key={route.tenant} />}
+          {!needsGate && route.view === 'environments' && (
+            <Environments key={route.tenant} tenant={route.tenant} env={route.env} tab={route.tab} item={route.item}
+              replica={route.replica} navigate={navigate} />)}
           {route.view === 'nodes' && <Nodes navigate={navigate} />}
           {route.view === 'node' && <NodeDetail key={route.node} node={route.node} tab={route.tab} navigate={navigate} />}
           {route.view === 'joinTokens' && <JoinTokens />}
@@ -154,6 +158,7 @@ function Sidebar({ route, navigate }) {
           <div className="snav-label">tenant · <span className="mono">{t}</span></div>
           <NavItem icon="dashboard" label="Overview" active={route.view === 'overview'} onClick={() => navigate(`/tenants/${enc(t)}`)} />
           <NavItem icon="box" label="Sandboxes" active={route.view === 'sandboxes'} onClick={() => navigate(`/tenants/${enc(t)}/sandboxes`)} />
+          <NavItem icon="blocks" label="Environments" active={route.view === 'environments'} onClick={() => navigate(envPath(t))} />
           <NavItem icon="terminal" label="Tools" active={route.view === 'tools'} onClick={() => navigate(`/tenants/${enc(t)}/tools`)} />
         </nav>
       )}
@@ -214,6 +219,12 @@ function Topbar({ route, navigate, me, onSignOut }) {
         {route.view === 'sandboxes' && <>{sep}{crumb('sandboxes', `/tenants/${enc(t)}/sandboxes`)}</>}
         {route.view === 'sandboxes' && route.sel && <>{sep}<span className="crumb mono">{route.sel.slice(0, 8)}</span></>}
         {route.view === 'tools' && <>{sep}<span className="crumb">tools</span></>}
+        {route.view === 'environments' && <>{sep}{crumb('environments', envPath(t))}</>}
+        {route.view === 'environments' && route.env && <>{sep}{crumb(route.env, envPath(t, route.env))}</>}
+        {route.view === 'environments' && route.env && route.tab !== 'overview' && (
+          <>{sep}{crumb(route.tab, envPath(t, route.env, route.tab))}</>)}
+        {route.view === 'environments' && route.item && (
+          <>{sep}<span className="crumb mono">{route.item}{route.replica > 0 ? ` · replica ${route.replica}` : ''}</span></>)}
         {(route.view === 'nodes' || route.view === 'node') && crumb('nodes', '/nodes')}
         {route.view === 'node' && <>{sep}<span className="crumb mono strong">{route.node}</span></>}
         {route.view === 'joinTokens' && <span className="crumb">join tokens</span>}

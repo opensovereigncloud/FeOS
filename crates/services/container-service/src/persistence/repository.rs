@@ -37,6 +37,10 @@ struct StoredRecord {
     image_uuid: String,
     state: String,
     pid: Option<i64>,
+    /// How its process ended; none while it runs and in records from
+    /// before exit codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
     image_ref: String,
     command: Vec<String>,
     env: HashMap<String, String>,
@@ -81,6 +85,7 @@ impl StoredRecord {
             image_uuid: record.image_uuid.to_string(),
             state: container_state_to_string(record.status.state).to_string(),
             pid: record.status.process_id,
+            exit_code: record.status.exit_code,
             image_ref: record.config.image_ref.clone(),
             command: record.config.command.clone(),
             env: record.config.env.clone(),
@@ -104,6 +109,7 @@ impl StoredRecord {
             status: ContainerStatus {
                 state: string_to_container_state(&self.state)?,
                 process_id: self.pid,
+                exit_code: self.exit_code,
             },
             config: ContainerConfig {
                 image_ref: self.image_ref,
@@ -205,6 +211,42 @@ impl ContainerRepository {
         Ok(true)
     }
 
+    /// Records the container as RUNNING, without the exit code of an
+    /// earlier run. Returns its process ID, if it has a record.
+    pub async fn record_start(&self, container_id: &str) -> Result<Option<i64>, PersistenceError> {
+        let _guard = self.writes.lock().await;
+        let Some(mut record) = self.get_container(container_id).await? else {
+            return Ok(None);
+        };
+        record.status.state = ContainerState::Running;
+        record.status.exit_code = None;
+        self.write(&record).await?;
+        Ok(record.status.process_id)
+    }
+
+    /// Records that the container's process `pid` exited with `exit_code`:
+    /// STOPPED, with the code. A record of another process of that ID, as
+    /// after a delete and a create, is left as it is. Returns whether the
+    /// record was changed.
+    pub async fn record_exit(
+        &self,
+        container_id: &str,
+        pid: Option<i64>,
+        exit_code: i32,
+    ) -> Result<bool, PersistenceError> {
+        let _guard = self.writes.lock().await;
+        let Some(mut record) = self.get_container(container_id).await? else {
+            return Ok(false);
+        };
+        if record.status.process_id != pid {
+            return Ok(false);
+        }
+        record.status.state = ContainerState::Stopped;
+        record.status.exit_code = Some(exit_code);
+        self.write(&record).await?;
+        Ok(true)
+    }
+
     pub async fn update_container_pid(
         &self,
         container_id: &str,
@@ -246,6 +288,7 @@ mod tests {
             status: ContainerStatus {
                 state: ContainerState::PullingImage,
                 process_id: None,
+                exit_code: None,
             },
             config: ContainerConfig {
                 image_ref: "docker.io/library/busybox:1.36".to_string(),
@@ -313,6 +356,50 @@ mod tests {
         std::fs::write(dir.path().join("old").join(RECORD), old.to_string()).unwrap();
         let old = repo.get_container("old").await.unwrap().unwrap();
         assert!(old.config.volume_mounts.is_empty());
+        assert_eq!(old.status.exit_code, None);
+    }
+
+    #[tokio::test]
+    async fn exit_codes_persist_until_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = ContainerRepository::connect(dir.path()).await.unwrap();
+        let mut main = record("main");
+        main.status = ContainerStatus {
+            state: ContainerState::Created,
+            process_id: Some(7),
+            exit_code: None,
+        };
+        repo.save_container(&main).await.unwrap();
+        assert_eq!(repo.record_start("main").await.unwrap(), Some(7));
+
+        // The exit of another process of that ID changes nothing.
+        assert!(!repo.record_exit("main", Some(8), 1).await.unwrap());
+        let got = repo.get_container("main").await.unwrap().unwrap();
+        assert_eq!(got.status.state, ContainerState::Running);
+        assert_eq!(got.status.exit_code, None);
+
+        assert!(repo.record_exit("main", Some(7), 137).await.unwrap());
+        // A stop that writes STOPPED after the exit keeps the code, and a
+        // new repository reads it from the record.
+        assert!(repo
+            .update_container_state("main", ContainerState::Stopped)
+            .await
+            .unwrap());
+        let repo = ContainerRepository::connect(dir.path()).await.unwrap();
+        let got = repo.get_container("main").await.unwrap().unwrap();
+        assert_eq!(got.status.state, ContainerState::Stopped);
+        assert_eq!(got.status.exit_code, Some(137));
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("main").join(RECORD)).unwrap())
+                .unwrap();
+        assert_eq!(stored["exit_code"], 137);
+
+        // A start, as after an adoption, clears it.
+        assert_eq!(repo.record_start("main").await.unwrap(), Some(7));
+        let got = repo.get_container("main").await.unwrap().unwrap();
+        assert_eq!(got.status.exit_code, None);
+        assert!(!repo.record_exit("gone", Some(7), 0).await.unwrap());
+        assert_eq!(repo.record_start("gone").await.unwrap(), None);
     }
 
     #[tokio::test]

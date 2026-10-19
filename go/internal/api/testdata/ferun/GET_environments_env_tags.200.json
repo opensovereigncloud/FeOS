@@ -1,0 +1,17 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/tags",
+  "query": {},
+  "status": 200,
+  "request": null,
+  "response": {
+    "tags": [
+      {
+        "tag": "v1.3",
+        "release": 6,
+        "movedBy": "fecode:0193a000-aaaa-7bbb-8ccc-000000000001",
+        "movedAt": "2026-10-16T17:00:00Z"
+      }
+    ]
+  }
+}

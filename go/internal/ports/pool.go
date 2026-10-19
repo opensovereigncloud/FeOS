@@ -370,6 +370,40 @@ func (h *Handler) takeSlot(ctx context.Context, id uuid.UUID) (func(), error) {
 	}
 }
 
+// tryProbeSlot takes one of the sandbox's probe slots when one is free,
+// without waiting, and returns its release; false when every one is
+// taken. The probe slots are apart from the stream cap: a check neither
+// takes nor waits for a slot of the cap, nor closes pooled connections
+// for one.
+func (h *Handler) tryProbeSlot(id uuid.UUID) (func(), bool) {
+	h.mu.Lock()
+	c := h.probes[id]
+	if c == nil {
+		c = &capSem{slots: make(chan struct{}, h.t.probeSlots)}
+		h.probes[id] = c
+	}
+	c.refs++
+	h.mu.Unlock()
+	unref := func() {
+		h.mu.Lock()
+		c.refs--
+		if c.refs == 0 && h.probes[id] == c {
+			delete(h.probes, id)
+		}
+		h.mu.Unlock()
+	}
+	select {
+	case c.slots <- struct{}{}:
+		return func() {
+			<-c.slots
+			unref()
+		}, true
+	default:
+		unref()
+		return nil, false
+	}
+}
+
 // capReclaimEvery is how often a dial that waits for a slot closes the
 // sandbox's idle pooled connections.
 const capReclaimEvery = 50 * time.Millisecond
@@ -398,6 +432,14 @@ func (h *Handler) dial(ctx context.Context, k tkey, node string) (net.Conn, erro
 		return nil, err
 	}
 	slotTaken()
+	return h.openStream(ctx, k, node, release)
+}
+
+// openStream is the rest of a dial once it holds its slot, which release
+// gives back (at once when the stream cannot be opened, else when the
+// connection closes): the Forward stream, open{port}, and the guest's
+// ready, until which ctx ends the stream.
+func (h *Handler) openStream(ctx context.Context, k tkey, node string, release func()) (net.Conn, error) {
 	cc, err := h.conns.Conn(ctx, node)
 	if err != nil {
 		release()

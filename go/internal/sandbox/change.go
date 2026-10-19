@@ -13,6 +13,7 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/activity"
+	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
@@ -58,7 +59,9 @@ func (c *change) tombstone(node string, inc uuid.UUID, reason string) {
 // commit writes the change in its transaction: the tombstones, the row
 // (gen + 1 and NOTIFY on a lifecycle write), the booking that follows the
 // state, the end of processes, and the run spans; the activity rows are
-// kept for after the commit.
+// kept for after the commit. A new address of a security group's member
+// (an instance, a row whose pod has groups) wakes the environments' group
+// loop (ferun_leader store.HintEnvGroups).
 func (c *change) commit(ctx context.Context) error {
 	a := &c.after
 	if a.ClientState == model.StateRunning && a.RunID == "" && c.openRun == "" {
@@ -85,6 +88,11 @@ func (c *change) commit(ctx context.Context) error {
 		return err
 	}
 	c.written = written
+	if written.Address != c.before.Address && (written.IsInstance() || written.HasGroups()) {
+		if err := c.tx.Notify(ctx, db.ChanLeader, store.HintEnvGroups); err != nil {
+			return err
+		}
+	}
 	evs, err := c.e.syncBooking(ctx, c.tx, c.before, written, c.endsProcesses)
 	if err != nil {
 		return err
@@ -193,6 +201,7 @@ func (c *change) observe(node string, obs observation) {
 func (c *change) observeOurs(node string, info *podv1.PodInfo) {
 	a := &c.after
 	a.Node, a.Materialised, a.LostFrom = node, true, ""
+	a.Address = podAddress(info)
 	c.mergeCheckpoint(info.GetCheckpoint(), node)
 	switch info.GetState() {
 	case podv1.PodState_POD_STATE_PENDING:
@@ -241,6 +250,7 @@ func (c *change) observeOurs(node string, info *podv1.PodInfo) {
 // set, describes a pending sandbox.
 func (c *change) notFound(node, why string) {
 	a := &c.after
+	a.Address = ""
 	switch {
 	case a.HasCheckpoint():
 		a.ClientState, a.Node, a.Materialised = model.StateHibernated, "", false
@@ -262,6 +272,15 @@ func (c *change) notFound(node, why string) {
 		c.closeRun = "lost"
 	}
 	a.PendingSince = time.Time{}
+}
+
+// podAddress is the address of a pod as its record shows it: none while
+// it is hibernated (it holds none on the node then).
+func podAddress(info *podv1.PodInfo) string {
+	if info.GetState() == podv1.PodState_POD_STATE_HIBERNATED {
+		return ""
+	}
+	return info.GetIpv6Address()
 }
 
 // mergeCheckpoint writes the checkpoint a pod on node reports when it is

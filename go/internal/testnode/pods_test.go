@@ -141,7 +141,7 @@ func TestLifecyclePreconditions(t *testing.T) {
 	if _, err := pc.ResumePod(ctx, &podv1.ResumePodRequest{PodId: id}); err != nil {
 		t.Fatal(err)
 	}
-	waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+	resumed := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
 
 	if _, err := pc.StopPod(ctx, &podv1.StopPodRequest{PodId: id}); err != nil {
 		t.Fatal(err)
@@ -157,7 +157,11 @@ func TestLifecyclePreconditions(t *testing.T) {
 	if _, err := pc.StartPod(ctx, &podv1.StartPodRequest{PodId: id}); err != nil {
 		t.Fatal(err)
 	}
-	waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING)
+	// A start boots a new microVM process; a resume kept the old one.
+	if started := waitState(t, pc, id, podv1.PodState_POD_STATE_RUNNING); started.GetMicrovm().GetPid() == resumed.GetMicrovm().GetPid() ||
+		resumed.GetMicrovm().GetPid() == 0 {
+		t.Fatalf("the microVM's pid %d after the start, %d before", started.GetMicrovm().GetPid(), resumed.GetMicrovm().GetPid())
+	}
 
 	if _, err := pc.DeletePod(ctx, &podv1.DeletePodRequest{PodId: id}); err != nil {
 		t.Fatal(err)

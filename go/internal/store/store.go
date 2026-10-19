@@ -5,9 +5,10 @@
 // file per domain (sandboxes, tenants, tokens, nodes, telemetry, node
 // certificates, join tokens, leases, instances, holds, bookings,
 // placements, tombstones, node events, activity, traffic, issued
-// certificates, watches, bindings, cluster secrets). A Store runs either on
-// the pool or inside one transaction (InTx); its methods never begin a
-// transaction of their own unless they say so.
+// certificates, watches, bindings, cluster secrets, and the environments'
+// tables in env_*.go). A Store runs either on the pool or inside one
+// transaction (InTx); its methods never begin a transaction of their own
+// unless they say so.
 //
 // The writers send the notifications other instances wait for, in the
 // writing transaction: every write of a sandbox's client_state, op, node,

@@ -70,6 +70,35 @@ var routeClasses = map[string]class{
 	"/api/v1/sandboxes/{id}/ports/{port}":           classForward,
 	"/fwd/":                                         classForward,
 
+	"POST /api/v1/environments":                                 classTenant,
+	"GET /api/v1/environments":                                  classTenant,
+	"POST /api/v1/environments/plan":                            classTenant,
+	"GET /api/v1/environments/{env}":                            classTenant,
+	"DELETE /api/v1/environments/{env}":                         classTenant,
+	"POST /api/v1/environments/{env}/plan":                      classTenant,
+	"POST /api/v1/environments/{env}/releases":                  classTenant,
+	"GET /api/v1/environments/{env}/releases":                   classTenant,
+	"GET /api/v1/environments/{env}/releases/{n}":               classTenant,
+	"POST /api/v1/environments/{env}/releases/{n}/revert":       classTenant,
+	"PUT /api/v1/environments/{env}/objects/{kind}/{name}":      classTenant,
+	"DELETE /api/v1/environments/{env}/objects/{kind}/{name}":   classTenant,
+	"GET /api/v1/environments/{env}/objects/{kind}/{name}/logs": classTenant,
+	"GET /api/v1/environments/{env}/tags":                       classTenant,
+	"GET /api/v1/environments/{env}/tags/{tag}":                 classTenant,
+	"PUT /api/v1/environments/{env}/tags/{tag}":                 classTenant,
+	"DELETE /api/v1/environments/{env}/tags/{tag}":              classTenant,
+	"POST /api/v1/environments/{env}/clone":                     classTenant,
+	"GET /api/v1/environments/{env}/secrets":                    classTenant,
+	"PUT /api/v1/environments/{env}/secrets/{name}":             classTenant,
+	"DELETE /api/v1/environments/{env}/secrets/{name}":          classTenant,
+	"GET /api/v1/environments/{env}/incidents":                  classTenant,
+	"GET /api/v1/environments/{env}/incidents/{id}":             classTenant,
+	"POST /api/v1/environments/{env}/services/{name}/restart":   classTenant,
+	"POST /api/v1/environments/{env}/jobs/{name}/run":           classTenant,
+	"POST /api/v1/environments/{env}/route-tokens":              classTenant,
+	"DELETE /api/v1/environments/{env}/route-tokens":            classTenant,
+	"/api/v1/environments/{env}/http/{path...}":                 classRoute,
+
 	"/api/":             classPublic,
 	"GET /healthz":      classPublic,
 	"GET /readyz":       classPublic,
@@ -107,7 +136,8 @@ func concrete(pattern string, id string) (string, string) {
 		method, path = http.MethodGet, pattern
 	}
 	r := strings.NewReplacer("{id}", id, "{tenant}", testTenant, "{node}", "n1", "{hash}", "abcdef0123",
-		"{pid}", "p1", "{wid}", "w1", "{name}", "k1", "{port}", "3000", "{path...}", "etc/hosts", "{rest...}", "x/y")
+		"{pid}", "p1", "{wid}", "w1", "{name}", "k1", "{port}", "3000", "{path...}", "etc/hosts", "{rest...}", "x/y",
+		"{env}", "stage", "{n}", "7", "{kind}", "service", "{tag}", "v1")
 	return method, r.Replace(path)
 }
 
@@ -136,6 +166,10 @@ func classAnswer(t *testing.T, e *env, pattern string, c class) {
 	case classMCP:
 		if w.Header().Get("X-Door") != "mcp" {
 			t.Fatalf("%s: not the MCP door: %d %s", pattern, w.Code, w.Body.String())
+		}
+	case classRoute:
+		if w.Header().Get("X-Door") != "route" {
+			t.Fatalf("%s: not the route door: %d %s", pattern, w.Code, w.Body.String())
 		}
 	case classForward:
 		if pattern == "/fwd/" {

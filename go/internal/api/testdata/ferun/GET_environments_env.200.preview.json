@@ -1,0 +1,128 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b03",
+  "query": {},
+  "status": 200,
+  "request": null,
+  "response": {
+    "id": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b03",
+    "name": "expensa-login-3f9a",
+    "labels": {
+      "fecode.class": "preview",
+      "fecode.env": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b03",
+      "fecode.project": "0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01"
+    },
+    "release": 3,
+    "realised": 3,
+    "deleting": false,
+    "rollout": {
+      "release": 3,
+      "state": "realised",
+      "startedAt": "2026-10-18T13:30:02Z",
+      "reason": ""
+    },
+    "objects": [
+      {
+        "kind": "service",
+        "name": "approval-service",
+        "runtime": "attached",
+        "sandbox": "0193b0aa-1111-7222-8333-444455556601",
+        "phase": "ready",
+        "restarts": 0,
+        "lastExit": null,
+        "detail": ""
+      },
+      {
+        "kind": "service",
+        "name": "expense-service",
+        "runtime": "attached",
+        "sandbox": "0193b0aa-1111-7222-8333-444455556601",
+        "phase": "ready",
+        "restarts": 1,
+        "lastExit": 2,
+        "detail": ""
+      },
+      {
+        "kind": "service",
+        "name": "web",
+        "runtime": "attached",
+        "sandbox": "0193b0aa-1111-7222-8333-444455556601",
+        "phase": "starting",
+        "restarts": 0,
+        "lastExit": null,
+        "detail": "cwd /workspace/expensa/web does not exist yet"
+      },
+      {
+        "kind": "addon",
+        "name": "nats",
+        "type": "nats",
+        "version": "2",
+        "plan": "dev",
+        "phase": "ready",
+        "provisioned": true,
+        "instances": [
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000015",
+            "replica": 0,
+            "phase": "ready",
+            "state": "running",
+            "node": "n2",
+            "address": "fd6b:a01:3::21",
+            "release": 3,
+            "restarts": 0,
+            "lastExit": null,
+            "readySince": "2026-10-18T10:42:30Z",
+            "detail": ""
+          }
+        ]
+      },
+      {
+        "kind": "addon",
+        "name": "postgres",
+        "type": "postgres",
+        "version": "17",
+        "plan": "dev",
+        "phase": "ready",
+        "provisioned": true,
+        "instances": [
+          {
+            "id": "0193d5e6-0000-7000-8000-000000000016",
+            "replica": 0,
+            "phase": "ready",
+            "state": "running",
+            "node": "n2",
+            "address": "fd6b:a01:3::22",
+            "release": 3,
+            "restarts": 0,
+            "lastExit": null,
+            "readySince": "2026-10-18T10:42:51Z",
+            "detail": ""
+          }
+        ]
+      }
+    ],
+    "routes": [
+      {
+        "name": "api-approval",
+        "path": "/api/approval",
+        "service": "approval-service",
+        "port": 8082
+      },
+      {
+        "name": "api-expense",
+        "path": "/api/expense",
+        "service": "expense-service",
+        "port": 8081
+      },
+      {
+        "name": "root",
+        "path": "/",
+        "service": "web",
+        "port": 5173
+      }
+    ],
+    "openIncidents": 0,
+    "createdAt": "2026-10-18T10:41:07Z"
+  },
+  "note": "a preview: attached services in the workspace's sandbox"
+}

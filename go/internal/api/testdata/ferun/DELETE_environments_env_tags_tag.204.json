@@ -1,0 +1,8 @@
+{
+  "method": "DELETE",
+  "path": "/api/v1/environments/expensa-stage/tags/v1.3",
+  "query": {},
+  "status": 204,
+  "request": null,
+  "response": null
+}

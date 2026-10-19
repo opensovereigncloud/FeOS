@@ -8,11 +8,15 @@
 //
 //	admin     /api/v1/admin/…            an admin's UI session, or Basic (--admin-users)
 //	tenant    /api/v1/sandboxes[/{id}]   a tenant's token: create, list, delete,
-//	          /api/v1/tools              pause, resume, tokens, access
+//	          /api/v1/tools              pause, resume, tokens, access; the
+//	          /api/v1/environments[/…]   environments (ADR 0018) but their door
 //	sandbox   /api/v1/sandboxes/{id}/…   the sandbox's own token: everything that
 //	                                     acts inside the sandbox
 //	mcp       /mcp                       the MCP door's own class (internal/mcpsrv)
 //	forward   /fwd/…, …/ports/…          the port door's own class (internal/ports)
+//	route     /api/v1/environments/{env}/http/…
+//	                                     the route door's own class: a route token
+//	                                     of the environment (internal/env)
 //	public    /healthz, /readyz, /auth/…, the UI
 //
 // The two token classes stay apart: a tenant's token is not accepted on a
@@ -42,6 +46,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/db"
+	envs "github.com/ironcore-dev/feos/go/internal/env"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
@@ -82,6 +87,40 @@ type Bindings interface {
 	KubePreflight(http.ResponseWriter, *http.Request)
 	SSHPreflight(http.ResponseWriter, *http.Request)
 	Access(http.ResponseWriter, *http.Request)
+}
+
+// Environments is the environments service (*env.Service, ADR 0018):
+// one method per environment route, tenant class, and the route door, a
+// class of its own. nil: no environment route is registered.
+type Environments interface {
+	CreateEnv(ctx context.Context, tenant string, req envs.CreateEnvRequest) (envs.EnvStatus, bool, error)
+	ListEnvs(ctx context.Context, tenant string, labels map[string]string) (envs.EnvList, error)
+	GetEnv(ctx context.Context, tenant, envRef string) (envs.EnvStatus, error)
+	DeleteEnv(ctx context.Context, tenant, envRef string) error
+	PlanSpec(ctx context.Context, tenant string, req envs.PlanSpecRequest) (envs.PlanSpecAnswer, error)
+	Plan(ctx context.Context, tenant, envRef string, req envs.PlanRequest) (envs.PlanAnswer, error)
+	Apply(ctx context.Context, tenant, envRef string, req envs.ApplyRequest) (envs.ApplyAnswer, error)
+	Releases(ctx context.Context, tenant, envRef string, limit int) (envs.ReleaseList, error)
+	Release(ctx context.Context, tenant, envRef string, number int) (envs.ReleaseDetail, error)
+	Revert(ctx context.Context, tenant, envRef string, number int, req envs.RevertRequest) (envs.ApplyAnswer, error)
+	PutObject(ctx context.Context, tenant, envRef, kind, name string, req envs.PutObjectRequest) (envs.ObjectAnswer, error)
+	DeleteObject(ctx context.Context, tenant, envRef, kind, name string, req envs.DeleteObjectRequest) (envs.ObjectAnswer, error)
+	Clone(ctx context.Context, tenant, envRef string, req envs.CloneRequest) (envs.EnvStatus, error)
+	Tags(ctx context.Context, tenant, envRef string) (envs.TagList, error)
+	Tag(ctx context.Context, tenant, envRef, tag string) (envs.Tag, error)
+	PutTag(ctx context.Context, tenant, envRef, tag string, req envs.PutTagRequest) (envs.Tag, error)
+	DeleteTag(ctx context.Context, tenant, envRef, tag string) error
+	Secrets(ctx context.Context, tenant, envRef string) (envs.SecretList, error)
+	PutSecret(ctx context.Context, tenant, envRef, name string, req envs.PutSecretRequest) (envs.SecretVersion, error)
+	DeleteSecret(ctx context.Context, tenant, envRef, name string) error
+	Incidents(ctx context.Context, tenant, envRef string, openOnly bool) (envs.IncidentList, error)
+	Incident(ctx context.Context, tenant, envRef string, id int64) (envs.Incident, error)
+	Logs(ctx context.Context, tenant, envRef, kind, name string, lines, replica int) (envs.LogsAnswer, error)
+	RestartService(ctx context.Context, tenant, envRef, name string) error
+	RunJob(ctx context.Context, tenant, envRef, name string) error
+	CreateRouteToken(ctx context.Context, tenant, envRef string) (envs.RouteToken, error)
+	RevokeRouteTokens(ctx context.Context, tenant, envRef string) error
+	ServeRoute(w http.ResponseWriter, r *http.Request)
 }
 
 // Config is the API's part of the instance's configuration.
@@ -149,6 +188,9 @@ type Deps struct {
 	Ports    http.Handler
 	Watches  Watches
 	Bindings Bindings
+	// Environments serves the environment routes; nil: none are
+	// registered.
+	Environments Environments
 	// UI is the built management UI; nil: none.
 	UI fs.FS
 	// Ready is /readyz (§11): server's check of the database, stopping,
@@ -259,6 +301,10 @@ const (
 	classSandbox class = "sandbox"
 	classMCP     class = "mcp"
 	classForward class = "forward"
+	// classRoute is the route door's (ANY /api/v1/environments/{env}/http/
+	// {path...}): a route token of the environment, plain-text answers, a
+	// tenant's token refused; the environments service checks it.
+	classRoute class = "route"
 )
 
 // route is one line of the route table.
@@ -356,6 +402,9 @@ func (s *server) routes() []route {
 		tenant("POST /api/v1/kube/preflight", serve(b.KubePreflight))
 		tenant("POST /api/v1/ssh/preflight", serve(b.SSHPreflight))
 	}
+
+	// The environments (ADR 0018): the tenant's, and their route door.
+	s.envRoutes(add)
 
 	// The doors with classes of their own: their answers are plain text
 	// (forward) or the MCP door's, not this API's JSON.

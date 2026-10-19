@@ -43,6 +43,9 @@ const (
 	TriggerDrain          OpTrigger = "drain"
 	TriggerDrainForced    OpTrigger = "drain_forced"
 	TriggerRepair         OpTrigger = "repair"
+	// TriggerRestart is Restart's: a repair of a running row whose
+	// container exited, with no recheck.
+	TriggerRestart OpTrigger = "restart"
 )
 
 // waits reports whether ops of the trigger wait in Before begin for a node
@@ -67,6 +70,10 @@ type OpIntent struct {
 	// ImageRef is the resolved image of a create, written only when the
 	// row's is empty.
 	ImageRef string
+
+	// reason, when set, is the row's status description while the op
+	// runs (Restart's).
+	reason string
 
 	// verdicts is the placement's verdict per node, for the audit row.
 	verdicts []store.PlacementCandidate
@@ -127,6 +134,8 @@ type OpHandle struct {
 	tombstones []store.TombstoneKey
 	// span is the op's activity span; parent the run it began in.
 	span, parent string
+	// spec is a create's pod spec, built before its call (prepare).
+	spec *podv1.PodSpec
 
 	mu sync.Mutex
 	// dirty: a pod event arrived while the op ran; the finish syncs.
@@ -474,7 +483,10 @@ func (r *runner) run(starter context.Context, h *OpHandle) {
 	var result OpResult
 	var after afterCommit
 	if !sent {
-		result = r.rollback(h)
+		// A connection that could not be had leaves cause nil.
+		var cause *prepareError
+		errors.As(res.err, &cause)
+		result = r.rollback(h, cause)
 	} else {
 		result, after = r.finish(h, res, obs)
 	}
@@ -495,8 +507,9 @@ func (r *runner) run(starter context.Context, h *OpHandle) {
 // callResult is what an op's node calls answered.
 type callResult struct {
 	err error
-	// skipped: a repair found the pod no longer in the state it was begun
-	// for and made no call; the observation decides alone.
+	// skipped: a repair made no call: it found the pod no longer in the
+	// state it was begun for, or its prepare hook failed before its first
+	// call (err is then the *prepareError); the observation decides alone.
 	skipped bool
 	// restored: a restore's RestorePodResponse arrived; memoryRestored
 	// and reason are its fields.
@@ -504,22 +517,34 @@ type callResult struct {
 	memoryRestored bool
 	reason         string
 	checkpoint     *podv1.Checkpoint
+	// pod is the pod a CreatePod or RestorePod answered with.
+	pod *podv1.PodInfo
 }
 
 // execute runs the op's node calls and waits for the pod to settle. sent
-// is false when no connection to the target could be had, so that nothing
-// was sent.
+// is false when nothing was sent: no connection to the target could be
+// had, or what comes before the pod call failed (prepareSpec before the
+// connection, prepareNode after it: a *prepareError).
 func (e *Engine) execute(ctx context.Context, h *OpHandle) (callResult, observation, bool) {
 	if e.connHook != nil {
 		if err := e.connHook(h); err != nil {
 			return callResult{err: err}, observation{}, false
 		}
 	}
+	if err := e.prepareSpec(ctx, h); err != nil {
+		return callResult{err: err}, observation{}, false
+	}
 	pc, err := e.podClient(ctx, h.target)
 	if err != nil {
 		return callResult{err: err}, observation{}, false
 	}
+	if err := e.prepareNode(ctx, h); err != nil {
+		return callResult{err: err}, observation{}, false
+	}
 	res := e.callOp(ctx, pc, h)
+	if res.pod != nil {
+		e.noteAddress(h, res.pod)
+	}
 	obs := e.watchPod(ctx, h.target, h.id, h.inc, func() {
 		mctx, cancel := context.WithTimeout(e.bg, 10*time.Second)
 		defer cancel()
@@ -546,7 +571,11 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 	var res callResult
 	switch h.kind {
 	case OpCreate:
-		_, res.err = pc.CreatePod(ctx, &podv1.CreatePodRequest{PodId: id, Spec: podSpec(h.row)})
+		resp, err := pc.CreatePod(ctx, &podv1.CreatePodRequest{PodId: id, Spec: h.spec})
+		res.err = err
+		if err == nil {
+			res.pod = resp.GetPod()
+		}
 	case OpStart:
 		_, res.err = pc.StartPod(ctx, &podv1.StartPodRequest{PodId: id})
 	case OpResume:
@@ -556,6 +585,7 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 		res.err = err
 		if err == nil {
 			res.restored, res.memoryRestored, res.reason = true, resp.GetMemoryRestored(), resp.GetReason()
+			res.pod = resp.GetPod()
 		}
 	case OpPause:
 		_, res.err = pc.SuspendPod(ctx, &podv1.SuspendPodRequest{PodId: id})
@@ -576,13 +606,17 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 }
 
 // callRepair repairs a pod stuck PENDING or whose guest stays
-// unreachable: StopPod then StartPod; a pod stuck in a restore ("restoring
-// from …") is deleted and restored from its checkpoint again. A pod the
-// node does not hold, or one of another incarnation, is left as it is; so
-// is one no longer in the state the repair was begun for (it came up, or
-// was stopped, meanwhile), so that a healthy pod is never restarted. A
+// unreachable, or restarts one whose container exited (Restart): StopPod
+// then StartPod; a pod stuck in a restore ("restoring from …") is deleted
+// and restored from its checkpoint again, unless it has volumes (a
+// deleted pod's volume would no longer restore). A pod the node does not
+// hold, or one of another incarnation, is left as it is; so is one no
+// longer in the state the repair was begun for (it came up, or was
+// stopped, meanwhile), so that a healthy pod is never restarted. A
 // takeover may find the pod stopped halfway by the first owner and starts
-// it; it leaves one that the first owner brought up running.
+// it; it leaves one that the first owner brought up running. A row with a
+// template has the node prepared before the pod calls; a failure there
+// makes none (skipped), and the observation decides.
 func (e *Engine) callRepair(ctx context.Context, pc podv1.PodServiceClient, h *OpHandle) callResult {
 	id := h.id.String()
 	var obs observation
@@ -613,8 +647,11 @@ func (e *Engine) callRepair(ctx context.Context, pc podv1.PodServiceClient, h *O
 			return callResult{skipped: true}
 		}
 	}
+	if err := e.prepareRepair(ctx, h); err != nil {
+		return callResult{err: err, skipped: true}
+	}
 	if info.GetState() == podv1.PodState_POD_STATE_PENDING && strings.HasPrefix(info.GetReason(), "restoring from") &&
-		h.row.CheckpointHead != "" {
+		h.row.CheckpointHead != "" && !hasVolumes(h.row) {
 		if _, err := pc.DeletePod(ctx, &podv1.DeletePodRequest{PodId: id}); err != nil && grpcCode(err) != codes.NotFound {
 			res.err = err
 		}

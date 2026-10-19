@@ -189,7 +189,10 @@ func (c *containerService) Exec(req *containerv1.ExecRequest, stream grpc.Server
 		return status.Error(codes.InvalidArgument, "no command")
 	}
 	out := &frameSender{stream: stream}
-	if f := c.n.script.execFunc(); f != nil {
+	for _, f := range []ExecFunc{c.n.script.podExecFunc(g.uid), c.n.script.execFunc()} {
+		if f == nil {
+			continue
+		}
 		code, ok, err := f(ctx, g.uid, req, out)
 		if err != nil {
 			return err
@@ -197,6 +200,19 @@ func (c *containerService) Exec(req *containerv1.ExecRequest, stream grpc.Server
 		if ok {
 			return out.send(&containerv1.ExecStreamFrame{Frame: &containerv1.ExecStreamFrame_ExitCode{ExitCode: code}})
 		}
+	}
+	if c.n.cfg.FakeProcesses {
+		code, ok, err := c.n.procs.exec(g, req.GetCommand(), out)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return out.send(&containerv1.ExecStreamFrame{Frame: &containerv1.ExecStreamFrame_ExitCode{ExitCode: code}})
+		}
+	}
+	if c.n.cfg.FakeExec || g.envPod {
+		// Nothing runs: an environment's probes and provisioning pass.
+		return out.send(&containerv1.ExecStreamFrame{Frame: &containerv1.ExecStreamFrame_ExitCode{ExitCode: 0}})
 	}
 	code, err := c.run(ctx, g, container, req, out)
 	if err != nil {
@@ -242,6 +258,85 @@ func (c *containerService) run(ctx context.Context, g *guest, container string, 
 		return 0, status.Errorf(codes.Internal, "exec: %v", err)
 	}
 	return exitCode(cmd.ProcessState), nil
+}
+
+// envLabel is the label of an environment's pods (model.LabelEnvironment).
+const envLabel = "ferun.environment"
+
+// The guest's bounds of a StreamContainerLogs tail: maxTailLines is the
+// most lines tail_lines sends (MAX_TAIL_LINES), maxTailBytes how far back
+// from the log's end it reaches (MAX_TAIL_BYTES), each line counted with
+// its newline, and maxLinePart the parts of a line (MAX_LINE) that a line
+// cut at that bound keeps.
+const (
+	maxTailLines = 10000
+	maxTailBytes = 4 << 20
+	maxLinePart  = 64 << 10
+)
+
+// tailOf is what a tail of n lines (n > 0) of a log sends, as the guest's
+// does: the last n lines, at most maxTailLines, that start within
+// maxTailBytes of the log's end. A line that starts further back goes out
+// cut to its last whole maxLinePart parts within those bytes, as one line
+// (the test node does not split lines into the guest's parts), or not at
+// all when not one part fits.
+func tailOf(lines []string, n int) []string {
+	n = min(n, maxTailLines)
+	first := max(0, len(lines)-n)
+	left := maxTailBytes
+	i := len(lines)
+	for i > first && len(lines[i-1])+1 <= left {
+		left -= len(lines[i-1]) + 1
+		i--
+	}
+	out := slices.Clone(lines[i:])
+	if i == first {
+		return out
+	}
+	// lines[i-1] starts further back than the bytes reach: its own bytes
+	// within them are all that is left but its newline.
+	l := lines[i-1]
+	if whole := (left - 1) / maxLinePart; whole > 0 {
+		out = slices.Insert(out, 0, l[len(l)-whole*maxLinePart:])
+	}
+	return out
+}
+
+// StreamContainerLogs serves a container's log lines (Script.AppendLog):
+// the last tail_lines of them when above 0 within the guest's bounds
+// (tailOf: at most 10000 lines and 4 MiB), else all with tail, else none;
+// with follow the stream then stays open until the caller ends it,
+// without new lines.
+func (c *containerService) StreamContainerLogs(req *containerv1.StreamContainerLogsRequest, stream grpc.ServerStreamingServer[containerv1.LogEntry]) error {
+	ctx := stream.Context()
+	g, err := guestFrom(ctx)
+	if err != nil {
+		return err
+	}
+	container := req.GetContainerId()
+	if container == "" {
+		container = "main"
+	}
+	if !g.containers[container] {
+		return status.Errorf(codes.NotFound, "no container %s", container)
+	}
+	lines := c.n.pods.containerLog(g.id, container)
+	switch n := int(min(req.GetTailLines(), maxTailLines)); {
+	case n > 0:
+		lines = tailOf(lines, n)
+	case !req.GetTail():
+		lines = nil
+	}
+	for _, l := range lines {
+		if err := stream.Send(&containerv1.LogEntry{Line: []byte(l)}); err != nil {
+			return err
+		}
+	}
+	if req.GetFollow() {
+		<-ctx.Done()
+		return status.FromContextError(ctx.Err()).Err()
+	}
+	return nil
 }
 
 // defaultPath is a command's PATH when the test node's own has none.

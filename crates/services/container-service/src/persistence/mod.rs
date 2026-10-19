@@ -25,6 +25,10 @@ pub enum PersistenceError {
 pub struct ContainerStatus {
     pub state: ContainerState,
     pub process_id: Option<i64>,
+    /// How the container's process ended, 128 + the signal when signalled:
+    /// set when the service saw it exit, cleared when it starts again or
+    /// is adopted.
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone)]

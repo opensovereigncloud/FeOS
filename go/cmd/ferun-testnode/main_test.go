@@ -4,10 +4,15 @@
 package main
 
 import (
+	"encoding/json"
 	"log/slog"
 	"slices"
 	"testing"
 	"time"
+
+	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
 )
 
 func TestParse(t *testing.T) {
@@ -27,6 +32,27 @@ func TestParse(t *testing.T) {
 	}
 	if !cfg.Mesh || cfg.MeshEndpoint != "10.0.0.9:51820" {
 		t.Fatalf("mesh %v %q", cfg.Mesh, cfg.MeshEndpoint)
+	}
+	if cfg.FakeExec || !cfg.CheckSecurityGroups {
+		t.Fatalf("fake exec %v, security groups checked %v", cfg.FakeExec, cfg.CheckSecurityGroups)
+	}
+	cfg, _, err = parse([]string{"--fake-exec", "--check-security-groups=false"}, func(k string) string { return env[k] })
+	if err != nil || !cfg.FakeExec || cfg.CheckSecurityGroups {
+		t.Fatalf("fake exec %v, security groups checked %v, %v", cfg.FakeExec, cfg.CheckSecurityGroups, err)
+	}
+	cfg, _, err = parse(nil, func(k string) string {
+		if k == "FERUN_TESTNODE_FAKE_EXEC" {
+			return "true"
+		}
+		return env[k]
+	})
+	if err != nil || !cfg.FakeExec {
+		t.Fatalf("FERUN_TESTNODE_FAKE_EXEC: %v, %v", cfg.FakeExec, err)
+	}
+	cfg, level, err = parse([]string{"--name", "from-flag", "--disk", "512", "--log-level", "debug", "--abort-on-cancel",
+		"--mesh-endpoint", "10.0.0.9:51820"}, func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
 	}
 	if cfg.Name != "from-flag" || cfg.ServerName != "ferun.example.test" || cfg.TrustDomain != "feos.local" ||
 		!slices.Equal(cfg.Addrs, []string{"10.0.0.1:7443", "10.0.0.2:7443"}) || cfg.MemoryBytes != 8<<30 || cfg.DiskBytes != 512 ||
@@ -95,5 +121,55 @@ func TestObjectStoreFlags(t *testing.T) {
 	}
 	if _, _, err := parse([]string{"--object-store", "bucket", "--object-store-dir", dir}, none); err == nil {
 		t.Fatal("both stores passed")
+	}
+}
+
+// --exit, --start-log and --port-addr drive an environment end to end.
+func TestEnvironmentFlags(t *testing.T) {
+	cfg, _, err := parse([]string{"--exit", "job/*=0@3s", "--exit", "service/{a,b}=1", "--start-log", "--fake-processes",
+		"--port-addr", "8080=127.0.0.1:18080,5173=127.0.0.1:15173"}, func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ContainerExits) != 2 || cfg.ContainerExits[0].Object != "job/*" || cfg.ContainerExits[0].After != 3*time.Second ||
+		cfg.ContainerExits[1].Object != "service/{a,b}" || cfg.ContainerExits[1].Code != 1 || !cfg.StartLog || !cfg.FakeProcesses ||
+		cfg.PortAddrs[8080] != "127.0.0.1:18080" || cfg.PortAddrs[5173] != "127.0.0.1:15173" {
+		t.Fatalf("config %+v", cfg)
+	}
+	cfg, _, err = parse(nil, func(k string) string {
+		return map[string]string{"FERUN_TESTNODE_EXIT": "job/*=0", "FERUN_TESTNODE_START_LOG": "true"}[k]
+	})
+	if err != nil || len(cfg.ContainerExits) != 1 || !cfg.StartLog {
+		t.Fatalf("from the environment: %+v, %v", cfg, err)
+	}
+	for _, bad := range [][]string{{"--exit", "job/*"}, {"--port-addr", "8080"}, {"--port-addr", "0=127.0.0.1:1"}, {"--port-addr", "x=127.0.0.1:1"}} {
+		if _, _, err := parse(bad, func(string) string { return "" }); err == nil {
+			t.Errorf("%v passed", bad)
+		}
+	}
+}
+
+// SIGUSR1's summary names each pod's object, groups and volumes, each
+// volume's holder and each group's version and members.
+func TestSummary(t *testing.T) {
+	pods := []*podv1.PodInfo{{PodId: "p1", State: podv1.PodState_POD_STATE_RUNNING, Spec: &podv1.PodSpec{
+		Labels:  map[string]string{"ferun.object": "addon/postgres"},
+		Network: &podv1.PodNetwork{SecurityGroups: []string{"env-1"}},
+		Volumes: []*podv1.PodVolume{{Name: "data", VolumeId: "v1"}},
+	}}}
+	vols := []*volumev1.Volume{{VolumeId: "v1", State: volumev1.VolumeState_VOLUME_STATE_ATTACHED, PodId: "p1", Labels: map[string]string{"ferun.object": "addon/postgres"}}}
+	groups := []*networkv1.SecurityGroup{{Id: "env-1", Version: 3, Members: []string{"fd00::2"}, Rules: []*networkv1.Rule{{}, {}}}}
+	b, err := json.Marshal(summary(pods, vols, groups))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"pods":[{"id":"p1","state":"RUNNING","object":"addon/postgres","groups":["env-1"],"volumes":["v1"]}],` +
+		`"volumes":[{"id":"v1","state":"ATTACHED","pod":"p1","object":"addon/postgres"}],` +
+		`"groups":[{"id":"env-1","version":3,"members":["fd00::2"],"rules":2}]}`
+	if string(b) != want {
+		t.Fatalf("summary %s", b)
+	}
+	if b, _ := json.Marshal(summary(nil, nil, nil)); string(b) != `{"pods":[],"volumes":[],"groups":[]}` {
+		t.Fatalf("an empty node %s", b)
 	}
 }

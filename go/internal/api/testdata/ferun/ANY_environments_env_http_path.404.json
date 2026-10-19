@@ -1,0 +1,12 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-nope/http/",
+  "query": {},
+  "status": 404,
+  "request": null,
+  "response": "no such environment\n",
+  "headers": {
+    "Authorization": "Bearer <route token>"
+  },
+  "responseContentType": "text/plain; charset=utf-8"
+}

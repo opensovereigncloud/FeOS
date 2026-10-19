@@ -1,0 +1,14 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/http/api/approval/pending",
+  "query": {},
+  "status": 503,
+  "request": null,
+  "response": "no ready instance of approval-service\n",
+  "headers": {
+    "Authorization": "Bearer <route token>",
+    "Retry-After": "5"
+  },
+  "responseContentType": "text/plain; charset=utf-8",
+  "note": "answered with Retry-After: 5"
+}

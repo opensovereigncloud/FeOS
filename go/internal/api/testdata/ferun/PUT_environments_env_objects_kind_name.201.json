@@ -1,0 +1,83 @@
+{
+  "method": "PUT",
+  "path": "/api/v1/environments/expensa-stage/objects/service/expense-service",
+  "query": {},
+  "status": 201,
+  "request": {
+    "object": {
+      "image": "ghcr.io/acme/expense:1.4",
+      "command": [
+        "/app/expense-service"
+      ],
+      "replicas": 3,
+      "env": {
+        "EXPENSA_APPROVAL_URL": {
+          "service": "approval-service",
+          "port": "http",
+          "key": "url"
+        },
+        "EXPENSA_DATABASE_URL": {
+          "addon": "postgres",
+          "database": "expensa",
+          "key": "url",
+          "role": "expense_svc"
+        },
+        "EXPENSA_HTTP_ADDR": "[::]:8080",
+        "EXPENSA_INTERNAL_TOKEN": {
+          "secret": "internal-token"
+        },
+        "EXPENSA_NATS_URL": {
+          "addon": "nats",
+          "key": "url"
+        }
+      },
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080
+        }
+      ],
+      "readiness": {
+        "http": {
+          "port": "http",
+          "path": "/readyz"
+        }
+      }
+    },
+    "base": 7,
+    "author": "fecode:0193a000-aaaa-7bbb-8ccc-000000000001",
+    "message": "three expense-service replicas"
+  },
+  "response": {
+    "number": 8,
+    "state": "pending",
+    "origin": "object",
+    "originRef": "service/expense-service",
+    "author": "fecode:0193a000-aaaa-7bbb-8ccc-000000000001",
+    "message": "three expense-service replicas",
+    "annotations": {},
+    "base": 7,
+    "reason": "",
+    "createdAt": "2026-10-18T14:09:30Z",
+    "startedAt": "",
+    "finishedAt": "",
+    "tags": [],
+    "diff": [
+      {
+        "kind": "service",
+        "name": "expense-service",
+        "change": "update",
+        "fields": [
+          {
+            "path": "replicas",
+            "from": 2,
+            "to": 3
+          }
+        ],
+        "effect": "in place"
+      }
+    ],
+    "findings": []
+  },
+  "note": "the current release's spec with the object set, applied; originRef names the object"
+}

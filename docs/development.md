@@ -86,7 +86,11 @@ Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
   containers. None of the node's code or dependencies are in this binary.
 - **`feos-host-init`** (`crates/feos-host-init`): PID 1 when FeOS is the
   node's operating system. It sets the machine up and runs `feosd`.
-- **`feosctl`** (`crates/feosctl`): the client.
+- **`feosctl`** (`crates/feosctl`): the client. For development and the
+  guest's tests it also has `container create --volume NAME:PATH[:ro]`
+  with the command verbatim after `--`, `container logs [--tail N]
+  [--follow]`, and `guest mount-volumes`, the guest's internal call with
+  which feosd mounts a pod's volumes before it creates the containers.
 - **`diskd`** (`crates/diskd`): the disk daemon, one per node next to
   `feosd`, as root. It serves pods' disks as ublk block devices over a
   content-addressed chunk store tiered to S3, and their memory through
@@ -133,8 +137,11 @@ use) and `protoc`; for the guest also `musl-gcc` and the kernel's headers
     make guest                 # guest kernel, initramfs and blank data volume:
                                # target/guest/
     make test-guest            # boot the guest under Firecracker and talk to it
-    make test-guest-container  # run containers in the guest; needs sudo for a
-                               # network namespace and NAT
+    make test-guest-container  # run containers in the guest: exit codes,
+                               # logs, postgres and valkey on volumes, a
+                               # reboot that adopts them; needs sudo for a
+                               # network namespace and NAT, and internet
+                               # access for the images
     make test-pods             # pods against Firecracker, with the guest
                                # installed and a diskd; needs docker, ublk,
                                # S3 from the env or ~/.config/feos/diskd/s3.env
@@ -182,7 +189,9 @@ tests.
     make test-ferund-package  # installs it on Debian 13, in docker, and checks
                               # its user and its files' group
 
-    cd web && npm test   # the UI's tests (vitest)
+    cd web && npm test   # the UI's tests (vitest); they read ferund's API
+                         # fixtures in go/internal/api/testdata/ferun, so a
+                         # change there runs them too
     cd web && npm run dev  # the UI on Vite's server, /api, /auth and /mcp
                            # proxied to a ferund on localhost:8100
 
@@ -192,15 +201,56 @@ A single package's tests, with the race detector:
     cd go && go test -race ./internal/sandbox/...
 
 The tests make a database of their own per test in that server and drop
-it afterwards. A ferund on one machine, with a test node:
+it afterwards. The addon blueprints' tests against their real images run
+only with docker and `FERUN_ADDON_DOCKER=1`:
+
+    cd go && FERUN_ADDON_DOCKER=1 go test -run Docker ./internal/env/addons/
+
+A ferund on one machine, with a test node:
 
     ferund init-ca --root-dir /tmp/ferun/root --dir /tmp/ferun/ca \
         --dns-domain feos.test
+    head -c 32 /dev/urandom > /tmp/ferun/secret.key
     ferund serve --database-url "$DB" --ca-dir /tmp/ferun/ca \
-        --admin-users admin:admin --bootstrap-token "$TOKEN"
+        --admin-users admin:admin --bootstrap-token "$TOKEN" \
+        --secret-key-file /tmp/ferun/secret.key
     ferund join-token --database-url "$DB" --ca-dir /tmp/ferun/ca
     ferun-testnode --join-token feos-join-... --addr 127.0.0.1:7443 \
         --server-name ferun.feos.test
+
+Without `--secret-key-file` the sandboxes run, but an environment with
+an addon or a secret stays rolling ("secrets need --secret-key-file").
+The test node fails a pod whose security groups it does not have, as
+feosd does (`--check-security-groups`, on by default), and with
+`--fake-exec` answers every exec into a pod with exit 0 without running
+anything (an exec into an environment's pod does so by default, so that
+addon probes and provisioning pass).
+
+An environment runs end to end on test nodes with these flags beside
+the join's:
+
+    ferun-testnode ... --fake-exec --fake-processes \
+        --exit 'job/*=0@3s' --start-log \
+        --port-addr 8080=127.0.0.1:18080
+
+- `--fake-processes` answers the background-process scripts in memory,
+  without running anything (`process_start`, and an attached service's
+  start, listing, logs and stop); without it attached services never
+  start.
+- `--exit '<object glob>=<code>[@<delay>]'`, repeatable, makes the main
+  container of an environment's pod whose `ferun.object` label matches
+  exit with that code so long after each boot (2 s by default; a
+  negative code: no exit status), the first match counting: with
+  `job/*=0@3s` release jobs finish and a release can be realised,
+  `service/crasher=1` crash-loops a service, `process/<name>` ends a
+  fake process.
+- `--start-log` appends a line to a container's log at each boot and
+  each such exit, so that logs and stored tails have lines.
+- `--port-addr <port>=<host:port>`, repeatable, makes a port forward to
+  a pod's port dial that address: readiness checks and the route door
+  reach a server on the machine, here one on 18080 for the pods' 8080.
+- `kill -USR1` logs the node's pods, volumes and security groups as one
+  JSON line, `kill -HUP` restarts it gracefully.
 
 Go code follows the rules of the Rust code where they apply, and these:
 

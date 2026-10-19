@@ -12,7 +12,8 @@
 // port (nodelink) with fleet's uplink and join servers; the leader
 // election with every package's loops; the sandbox engine; the tools'
 // runner; the MCP door; the bindings; the ports and watches (through the
-// streams hook); the REST API with the UI; and its heartbeat row.
+// streams hook); the environments (ADR 0018) with their controller; the
+// REST API with the UI; and its heartbeat row.
 //
 // Its stop, at the end of Run's context:
 //  1. the row says stopping, /readyz fails, the leader resigns, and the
@@ -56,6 +57,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/bindings"
 	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/ironcore-dev/feos/go/internal/env"
 	"github.com/ironcore-dev/feos/go/internal/fleet"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/mcpsrv"
@@ -63,7 +65,9 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/ports"
 	"github.com/ironcore-dev/feos/go/internal/sandbox"
+	"github.com/ironcore-dev/feos/go/internal/seal"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/tools"
 	"github.com/ironcore-dev/feos/go/internal/ui"
@@ -75,6 +79,9 @@ import (
 type Streams struct {
 	// Ports is the forward class's handler; nil: its routes answer 503.
 	Ports http.Handler
+	// Forwarder is the same port door, typed: the environments' probes and
+	// route door forward through it (env.Ports); nil: they cannot.
+	Forwarder *ports.Handler
 	// Watches are the watch handlers; nil: their routes answer 503.
 	Watches api.Watches
 	// Run is started with the instance and ends with its last step.
@@ -134,6 +141,7 @@ type Instance struct {
 	Fleet     *fleet.Service
 	Engine    *sandbox.Engine
 	Runner    *tools.Runner
+	Env       *env.Service
 	mcp       *mcpsrv.Server
 	Bindings  *bindings.Service
 	streams   Streams
@@ -290,11 +298,14 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	if streams != nil {
 		i.streams = streams(i)
 	}
+	if i.Env, err = i.newEnvironments(key); err != nil {
+		return nil, fmt.Errorf("environments: %w", err)
+	}
 
 	deps := api.Deps{
 		DB: i.DB, Store: i.Store, Engine: i.Engine, Elector: i.Elector, Conns: i.Links, Fleet: fl,
 		Tools: tools.NewREST(i.Runner), Specs: tools.Specs, MCP: i.mcp, Ports: i.streams.Ports,
-		Watches: i.streams.Watches, Bindings: i.Bindings, Ready: i.ready,
+		Watches: i.streams.Watches, Bindings: i.Bindings, Environments: i.Env, Ready: i.ready,
 	}
 	if ui.Built() {
 		deps.UI = ui.FS()
@@ -305,6 +316,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 		Traffic: cfg.TrafficRetention}, i.log)...)
 	i.Elector.Register(api.Loops(deps)...)
 	i.Elector.Register(i.streams.Loops...)
+	i.Elector.Register(i.Env.Loops()...)
 	i.handler = api.New(api.Config{
 		AdminUsers: cfg.AdminUsers, InstanceID: i.id, PreparationWaitMs: config.PreparationBudget.Milliseconds(),
 		PublicURL: cfg.PublicURL, OIDC: oidc, SessionTTL: cfg.SessionTTL, DefaultImage: cfg.DefaultImage,
@@ -331,6 +343,39 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.heartbeat = leader.NewHeartbeat(i.DB, leader.InstanceInfo{ID: i.id, Address: i.httpLn.Addr().String(),
 		NodeAddress: cfg.NodeAdvertiseAddress, Version: i.version}, i.log)
 	return i, nil
+}
+
+// newEnvironments builds the environments service on the engine, the
+// tools' runner and the port door, and gives the engine its hooks: the
+// unsealing of a pod template's secrets and the preparation of a node for
+// an instance's pod. The runner's detached calls and the door's exports
+// are taken where the instance's runner and door have them; without, the
+// service says what does not work. The secrets are sealed under key,
+// --secret-key-file's (internal/seal); without it they are refused.
+func (i *Instance) newEnvironments(key []byte) (*env.Service, error) {
+	runner, _ := any(i.Runner).(env.Runner)
+	var fwd env.Ports
+	if i.streams.Forwarder != nil {
+		fwd, _ = any(i.streams.Forwarder).(env.Ports)
+	}
+	var sealer env.Sealer
+	if key != nil {
+		sl, err := seal.New(key)
+		if err != nil {
+			return nil, fmt.Errorf("--secret-key-file: %w", err)
+		}
+		sealer = sl
+	}
+	s, err := env.New(env.Deps{
+		InstanceID: i.id, DB: i.DB, Store: i.Store, Elector: i.Elector, Conns: i.Links, Engine: i.Engine,
+		Runner: runner, Ports: fwd, Sealer: sealer, Log: i.log,
+	})
+	if err != nil {
+		return nil, err
+	}
+	i.Engine.SetSecretResolver(s.ResolveSecret)
+	i.Engine.SetPrepareHook(s.PrepareHook)
+	return s, nil
 }
 
 // bootstrap is the migration's bootstrap: the cluster's pod network, and
@@ -589,6 +634,7 @@ func (i *Instance) run(ctx context.Context) error {
 	start(&lifeWG, "leader", life, i.Elector.Run, false)
 	start(&lifeWG, "fleet", life, i.Fleet.Run, false)
 	start(&lifeWG, "engine", life, i.Engine.Run, false)
+	start(&lifeWG, "environments", life, i.Env.Run, false)
 	start(&lifeWG, "tools", life, i.Runner.Run, false)
 	start(&lifeWG, "mcp", life, i.mcp.Run, false)
 	start(&lifeWG, "server certificate", life, i.certs.Run, false)

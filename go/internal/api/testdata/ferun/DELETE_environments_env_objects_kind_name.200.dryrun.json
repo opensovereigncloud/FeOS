@@ -1,0 +1,36 @@
+{
+  "method": "DELETE",
+  "path": "/api/v1/environments/expensa-stage/objects/addon/nats",
+  "query": {
+    "base": [
+      "7"
+    ],
+    "dryRun": [
+      "1"
+    ]
+  },
+  "status": 200,
+  "request": null,
+  "response": {
+    "valid": false,
+    "findings": [
+      {
+        "severity": "error",
+        "path": "services.expense-service.env.EXPENSA_NATS_URL",
+        "problem": "no addon nats",
+        "remedy": "declare the addon under addons, or reference one that is declared"
+      }
+    ],
+    "diff": [
+      {
+        "kind": "addon",
+        "name": "nats",
+        "change": "remove",
+        "fields": [],
+        "effect": "deletes data"
+      }
+    ],
+    "base": 7,
+    "current": 7
+  }
+}

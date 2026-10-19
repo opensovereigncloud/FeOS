@@ -1,0 +1,11 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-login-3f9a/objects/addon/nats/logs",
+  "query": {},
+  "status": 409,
+  "request": null,
+  "response": {
+    "error": "paused"
+  },
+  "note": "a paused instance is never woken for its logs"
+}

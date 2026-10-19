@@ -15,7 +15,7 @@ use feos_utils::dispatch::dispatch_and_wait;
 use log::info;
 use std::pin::Pin;
 use tokio::sync::mpsc;
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 pub struct ContainerApiHandler {
@@ -103,9 +103,16 @@ impl ContainerService for ContainerApiHandler {
 
     async fn stream_container_logs(
         &self,
-        _request: Request<StreamContainerLogsRequest>,
+        request: Request<StreamContainerLogsRequest>,
     ) -> Result<Response<Self::StreamContainerLogsStream>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
+        info!("ContainerApi: Received StreamContainerLogs request.");
+        let entries = dispatch_and_wait(&self.dispatcher_tx, |resp_tx| {
+            Command::StreamContainerLogs(request.into_inner(), resp_tx)
+        })
+        .await?
+        .into_inner();
+        // Dropping this stream ends the reader (crate::logs).
+        Ok(Response::new(Box::pin(ReceiverStream::new(entries))))
     }
 
     async fn stream_container_events(

@@ -1,11 +1,12 @@
 #!/bin/bash
 # Boot the FeOS guest with a network and a data volume, push it a pod's
 # network as feosd does, pull an image in the guest, and run a container:
-# exec, resolvers, toolbox, exit codes. Then check the network: both
+# exec, resolvers, toolbox, exit codes, logs. Then check the network: both
 # families, the same push again, other addresses as after a resume on
 # another node, each family alone, and the network of this version over
-# one of an earlier one. Then reboot and adopt the container, and check
-# that its writable layer survived.
+# one of an earlier one. Run Postgres and Valkey on volumes of their own,
+# as FeRun's addons do. Then reboot and adopt the containers, and check
+# that the writable layer and the volumes' data survived.
 #
 #   hack/guest/test-container [image]
 #
@@ -30,6 +31,12 @@ KERNEL="${KERNEL:-${GUEST_DIR}/vmlinuz}"
 INITRD="${INITRD:-${GUEST_DIR}/initramfs.cpio.zst}"
 VSOCK="${RUN_DIR}/v.sock"
 DATA_IMG="${RUN_DIR}/data.img"
+# Two volumes of the pod, drives 1 and 2, which the guest formats.
+PG_IMG="${RUN_DIR}/pgdata.img"
+KV_IMG="${RUN_DIR}/kvdata.img"
+VOLUME_SIZE=$((512 << 20))
+PG_IMAGE=docker.io/library/postgres:17-alpine
+KV_IMAGE=docker.io/valkey/valkey:8-alpine
 FEOSCTL="${REPO_ROOT}/target/debug/feosctl"
 IMAGE="${1:-docker.io/library/busybox:1.36}"
 TIMEOUT=60
@@ -75,9 +82,12 @@ log "building feosctl"
 cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" -p feosctl
 
 mkdir -p "${RUN_DIR}"
-rm -f "${DATA_IMG}"
-truncate -s 1G "${DATA_IMG}"
+rm -f "${DATA_IMG}" "${PG_IMG}" "${KV_IMG}"
+truncate -s 2G "${DATA_IMG}"
 mkfs.ext4 -q -F "${DATA_IMG}"
+truncate -s "${VOLUME_SIZE}" "${PG_IMG}" "${KV_IMG}"
+PG_VOLUME_ID="$(cat /proc/sys/kernel/random/uuid)"
+KV_VOLUME_ID="$(cat /proc/sys/kernel/random/uuid)"
 
 egress_if() { ip route show default | awk '/default/ {print $5; exit}'; }
 EGRESS="$(egress_if)"
@@ -149,7 +159,11 @@ cat > "${RUN_DIR}/config.json" <<JSON
     "initrd_path": "${INITRD}",
     "boot_args": "console=ttyS0 reboot=k panic=1 quiet"
   },
-  "drives": [{"drive_id": "data", "path_on_host": "${DATA_IMG}", "is_root_device": false, "is_read_only": false}],
+  "drives": [
+    {"drive_id": "data", "path_on_host": "${DATA_IMG}", "is_root_device": false, "is_read_only": false},
+    {"drive_id": "pgdata", "path_on_host": "${PG_IMG}", "is_root_device": false, "is_read_only": false},
+    {"drive_id": "kvdata", "path_on_host": "${KV_IMG}", "is_root_device": false, "is_read_only": false}
+  ],
   "network-interfaces": [{"iface_id": "eth0", "guest_mac": "06:00:AC:CB:02:0A", "host_dev_name": "${TAP}"}],
   "machine-config": {"vcpu_count": 2, "mem_size_mib": 512},
   "vsock": {"guest_cid": 3, "uds_path": "${VSOCK}"}
@@ -233,6 +247,56 @@ set -e
 [ "${code}" = 3 ] || fail "exit code ${code}, expected 3"
 cexec sh -c 'echo kept > /persist'
 log "exec, resolvers, toolbox and exit codes work"
+
+# A container's exit code and log, as FeRun's controller reads them:
+# feosd's GetPod takes the exit code from ListContainers, and a log's last
+# lines come with tail_lines. stdout and stderr share the log; a last line
+# without a newline counts.
+exit_code_of() { sed -n 's/^ *Exit Code: //p' <<<"$(ctl container info "$1")"; }
+wait_exit() {
+  local _
+  for _ in $(seq 100); do
+    [ "$(exit_code_of "$1")" = "$2" ] && return 0
+    sleep 0.1
+  done
+  fail "container $1 did not exit with $2: $(ctl container info "$1")"
+}
+ctl container create --image-ref "${IMAGE}" --id exits \
+  -- sh -c 'echo one; echo two >&2; printf "three\nfour"; exit 7' >/dev/null
+ctl container start exits >/dev/null
+wait_exit exits 7
+grep -q "State: Stopped" <<<"$(ctl container info exits)" || fail "exited, not stopped"
+grep -q "Exit Code" <<<"$(ctl container info main)" && fail "a running container has an exit code"
+out="$(ctl container logs exits --tail 2)"
+[ "${out}" = "$(printf 'three\nfour')" ] || fail "the log's last 2 lines: ${out}"
+out="$(ctl container logs exits)"
+[ "${out}" = "$(printf 'one\ntwo\nthree\nfour')" ] || fail "the whole log: ${out}"
+[ -z "$(ctl container logs exits --tail 0)" ] || fail "a log without the lines so far"
+ctl container create --image-ref "${IMAGE}" --id killed -- sleep 3600 >/dev/null
+ctl container start killed >/dev/null
+ctl container stop killed >/dev/null
+wait_exit killed 137
+log "exit codes, 128 + the signal when killed, and log tails"
+
+# A follow goes on with what the container writes, and ends when the
+# container is deleted.
+ctl container create --image-ref "${IMAGE}" --id ticks \
+  -- sh -c 'i=0; while :; do echo "tick $i"; i=$((i + 1)); sleep 0.1; done' >/dev/null
+ctl container start ticks >/dev/null
+FOLLOW_LOG="${RUN_DIR}/follow.log"
+ctl container logs ticks --follow --tail 1 >"${FOLLOW_LOG}" 2>&1 &
+FOLLOW_PID=$!
+for _ in $(seq 100); do [ "$(wc -l <"${FOLLOW_LOG}")" -ge 20 ] && break; sleep 0.1; done
+ctl container delete ticks >/dev/null
+for _ in $(seq 50); do [ -d "/proc/${FOLLOW_PID}" ] || break; sleep 0.1; done
+[ -d "/proc/${FOLLOW_PID}" ] && fail "the follow did not end with its container"
+wait "${FOLLOW_PID}" || fail "the follow failed: $(tail -3 "${FOLLOW_LOG}")"
+# The ticks it printed follow each other, without a gap or a repeat.
+awk '$1 != "tick" || (NR > 1 && $2 != prev + 1) {bad = 1} {prev = $2} END {exit bad || NR < 20}' \
+  "${FOLLOW_LOG}" || fail "the follow: $(head -c 400 "${FOLLOW_LOG}")"
+ctl container delete exits >/dev/null
+ctl container delete killed >/dev/null
+log "a follow streams what the container writes until it is deleted"
 
 tool() { ctl tool --container main "$@"; }
 printf 'alpha\nbeta\n' | tool write /work/notes.txt
@@ -387,6 +451,54 @@ out="$(cexec cat /etc/resolv.conf | grep -v '^#' || true)"
 grep -q "Server:.*${DNS}" <<<"$(cexec nslookup example.com)" || fail "no name through ${DNS} after the push"
 log "a running container takes the resolver of a new push"
 
+# Postgres and Valkey on volumes of their own, as FeRun's addons run them
+# (go/internal/env/addons): the guest formats the new volumes and mounts
+# them, the images' entrypoints chown them and drop their privileges, and
+# the addons' probes pass.
+mount_volumes() {
+  ctl guest mount-volumes --volume "pgdata:${PG_VOLUME_ID}:1:${VOLUME_SIZE}$1" \
+    --volume "kvdata:${KV_VOLUME_ID}:2:${VOLUME_SIZE}$1"
+}
+# Runs a probe in a container until it passes, for at most a minute.
+probe() {
+  local container=$1 _
+  shift
+  for _ in $(seq 120); do
+    ctl container exec "${container}" -- "$@" >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  return 1
+}
+pg_ready() { probe pg pg_isready -U postgres -h 127.0.0.1; }
+kv_ready() { probe kv sh -c 'REDISCLI_AUTH="$VALKEY_PASSWORD" valkey-cli ping | grep -qx PONG'; }
+psql_c() { ctl container exec pg --env PGPASSWORD=secret -- psql -X -q -At -h 127.0.0.1 -U postgres -c "$1"; }
+kv_cli() { ctl container exec kv -- sh -c "REDISCLI_AUTH=\"\$VALKEY_PASSWORD\" valkey-cli $1"; }
+out="$(mount_volumes :format)" || fail "mounting the volumes: ${out}"
+grep -qx "pgdata: mounted from /dev/vdb, formatted" <<<"${out}" \
+  && grep -qx "kvdata: mounted from /dev/vdc, formatted" <<<"${out}" || fail "the volumes: ${out}"
+log "creating postgres from ${PG_IMAGE} and valkey from ${KV_IMAGE}"
+ctl container create --image-ref "${PG_IMAGE}" --id pg \
+  --env PGDATA=/var/lib/postgresql/data/pgdata --env POSTGRES_PASSWORD=secret \
+  --env POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
+  --volume pgdata:/var/lib/postgresql/data \
+  -- docker-entrypoint.sh postgres -c shared_buffers=64MB >/dev/null
+ctl container start pg >/dev/null
+ctl container create --image-ref "${KV_IMAGE}" --id kv \
+  --env "VALKEY_EXTRA_FLAGS=--appendonly yes --requirepass secret --maxmemory 64mb --maxmemory-policy noeviction" \
+  --env VALKEY_PASSWORD=secret --volume kvdata:/data >/dev/null
+ctl container start kv >/dev/null
+pg_ready || fail "postgres is not ready: $(ctl container logs pg --tail 20)"
+kv_ready || fail "valkey is not ready: $(ctl container logs kv --tail 20)"
+grep -q "database system is ready to accept connections" <<<"$(ctl container logs pg --tail 50)" \
+  || fail "postgres's log: $(ctl container logs pg --tail 20)"
+psql_c "CREATE TABLE kept (v text); INSERT INTO kept VALUES ('survives')" || fail "psql"
+[ "$(kv_cli 'set kept survives')" = OK ] || fail "valkey set"
+grep -q "/var/lib/postgresql/data" <<<"$(ctl container exec pg -- cat /proc/mounts)" \
+  || fail "the volume is not mounted in postgres's container"
+# Valkey writes its append-only file every second.
+sleep 2
+log "postgres and valkey run on their volumes and pass their probes"
+
 # A host freezes the data volume before it stops a guest it wants to adopt
 # later; freezing writes back what is in the guest's page cache.
 ctl host freeze >/dev/null
@@ -398,10 +510,25 @@ ctl container create --id main --adopt >/dev/null || fail "adopt"
 ctl container start main
 [ "$(cexec cat /persist)" = "kept" ] || fail "writable layer lost across the reboot"
 log "adopted the container after a reboot; its writable layer survived"
+
+# The volumes again, as feosd mounts them on every boot, and the addons'
+# containers adopted on them: their data survived.
+out="$(mount_volumes "")" || fail "mounting the volumes after the reboot: ${out}"
+grep -q formatted <<<"${out}" && fail "a volume was formatted again: ${out}"
+for c in pg kv; do
+  ctl container create --id "${c}" --adopt >/dev/null || fail "adopt ${c}"
+  ctl container start "${c}" >/dev/null
+done
+pg_ready || fail "postgres is not ready after the reboot: $(ctl container logs pg --tail 20)"
+kv_ready || fail "valkey is not ready after the reboot: $(ctl container logs kv --tail 20)"
+[ "$(psql_c 'SELECT v FROM kept')" = survives ] || fail "postgres lost its data"
+[ "$(kv_cli 'get kept')" = survives ] || fail "valkey lost its data"
+log "postgres and valkey kept their data on their volumes across the reboot"
 out="$(cexec cat /proc/sys/net/ipv6/conf/eth0/accept_ra /proc/sys/net/ipv6/conf/eth0/autoconf)"
 [ "${out}" = "$(printf '0\n0')" ] || fail "router advertisements or autoconfiguration on: ${out}"
 log "a guest pushed its network at boot takes no router advertisements"
 
+for c in pg kv; do ctl container delete "${c}" >/dev/null; done
 ctl container delete main
 grep -q main <<<"$(ctl container list)" && fail "container still listed after delete"
 log "PASS"

@@ -33,8 +33,10 @@ func TestLoopsList(t *testing.T) {
 		return m
 	}
 	got := names(h.eng().Loops())
-	if _, ok := got[LoopIdlePause]; ok {
-		t.Fatal("idle pause without --idle-pause")
+	// The idle pause runs without --idle-pause too: rows idle after their
+	// own idle_after_s.
+	if got[LoopIdlePause] != time.Second {
+		t.Fatal("no idle pause without --idle-pause")
 	}
 	if _, ok := got[LoopHibernateAfter]; ok {
 		t.Fatal("hibernate-after without --hibernate-after")

@@ -1,0 +1,9 @@
+{
+  "method": "DELETE",
+  "path": "/api/v1/environments/expensa-stage/route-tokens",
+  "query": {},
+  "status": 204,
+  "request": null,
+  "response": null,
+  "note": "every route token of the environment"
+}

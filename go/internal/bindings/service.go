@@ -5,7 +5,6 @@ package bindings
 
 import (
 	"context"
-	"crypto/cipher"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -20,6 +19,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/seal"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -50,7 +50,7 @@ const (
 // It implements fleet.BindingsSource and ports.KubePorts.
 type Service struct {
 	enabled bool
-	aead    cipher.AEAD // nil when off
+	sealer  *seal.Sealer // nil when off
 	st      *store.Store
 	d       *db.DB
 	log     *slog.Logger
@@ -82,14 +82,14 @@ func New(cfg Config, st *store.Store, d *db.DB) (*Service, error) {
 	}
 	s.dest = newDestRule(deny)
 	if cfg.Key != nil {
-		aead, err := newAEAD(cfg.Key)
+		sealer, err := seal.New(cfg.Key)
 		if err != nil {
 			return nil, err
 		}
-		s.aead = aead
+		s.sealer = sealer
 	}
-	s.enabled = cfg.Enabled && s.aead != nil
-	if cfg.Enabled && s.aead == nil {
+	s.enabled = cfg.Enabled && s.sealer != nil
+	if cfg.Enabled && s.sealer == nil {
 		log.Warn("bindings: --bindings is set but no --secret-key-file is configured; the Kubernetes and SSH surfaces stay off")
 	}
 	return s, nil

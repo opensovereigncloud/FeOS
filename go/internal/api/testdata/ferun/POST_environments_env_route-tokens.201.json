@@ -1,0 +1,11 @@
+{
+  "method": "POST",
+  "path": "/api/v1/environments/expensa-stage/route-tokens",
+  "query": {},
+  "status": 201,
+  "request": null,
+  "response": {
+    "token": "q3Z7vX0kR2mH9sYc1LwP5nTbE8uJ4aGf6dKoQiVz0xM"
+  },
+  "note": "shown once; only its SHA-256 is kept. Shape: 32 random bytes, base64url (FeCode stores it encrypted)"
+}

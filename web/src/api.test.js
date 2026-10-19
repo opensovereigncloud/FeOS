@@ -3,10 +3,11 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  ApiError, api, auth, basicHeader, getBasic, getTenantToken, loginURL, onSignedOut, onTenantTokens, request,
+  ApiError, api, auth, basicHeader, getBasic, getTenantToken, labelQuery, loginURL, onSignedOut, onTenantTokens, request,
   setActiveTenant, setBasic, setTenantToken, storedTokenHash,
 } from './api.js';
 import { sha256Hex } from './sha256.js';
+import { fixture, requestOf, serveFixtures } from './testing/ferun.js';
 
 // The client's contract with ferund: X-Requested-With: ferun and
 // same-origin credentials on every request, Basic from this tab's
@@ -218,6 +219,111 @@ describe('the admin routes', () => {
     await api.createJoinToken({ ttlSeconds: 600, node: 'node-b' });
     expect(JSON.parse(calls[0].init.body)).toEqual({ ttlSeconds: 0, node: '' });
     expect(JSON.parse(calls[1].init.body)).toEqual({ ttlSeconds: 600, node: 'node-b' });
+  });
+});
+
+// The environments' routes, read as the tenant, answered with ferund's
+// fixtures: each request is the fixture's (method, path and query), each
+// answer comes back as ferund sends it, each refusal as an ApiError with
+// ferund's text and status.
+describe('the environments routes', () => {
+  const STAGE = 'expensa-stage';
+  const PREVIEW_ID = '0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b03';
+
+  beforeEach(() => {
+    setTenantToken('fecode', 'tok-fecode');
+    setActiveTenant('fecode');
+  });
+
+  // ask makes the call against the fixture and checks the request; the
+  // logs' error fixtures were recorded without the query the UI always
+  // sends (lines=200), so for them only the method and path are checked.
+  async function ask(name, call, { exactQuery = true } = {}) {
+    const fx = fixture(name);
+    const calls = serveFixtures(name);
+    let out;
+    let err = null;
+    try {
+      out = await call();
+    } catch (e) {
+      err = e;
+    }
+    expect(calls).toHaveLength(1);
+    const got = requestOf(calls[0]);
+    if (exactQuery) expect(got).toEqual({ method: fx.method, path: fx.path, query: fx.query });
+    else expect({ method: got.method, path: got.path }).toEqual({ method: fx.method, path: fx.path });
+    expect(calls[0].init.headers.Authorization).toBe('Bearer tok-fecode');
+    return { fx, out, err };
+  }
+
+  it('lists the environments with label filters, every one a ?label=', async () => {
+    const { fx, out } = await ask('GET_environments.200', () =>
+      api.listEnvironments(['fecode.project=0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01']));
+    expect(out).toEqual(fx.response);
+    expect(labelQuery(['a=b', 'c=d=e'])).toBe('?label=a%3Db&label=c%3Dd%3De');
+    expect(labelQuery([])).toBe('');
+  });
+
+  it('reads an environment by name or ID, and names a missing one', async () => {
+    let r = await ask('GET_environments_env.200', () => api.getEnvironment(STAGE));
+    expect(r.out).toEqual(r.fx.response);
+    r = await ask('GET_environments_env.200.preview', () => api.getEnvironment(PREVIEW_ID));
+    expect(r.out.objects.filter((o) => o.runtime === 'attached')).toHaveLength(3);
+    r = await ask('GET_environments_env.404', () => api.getEnvironment('expensa-nope'));
+    expect(r.err).toBeInstanceOf(ApiError);
+    expect(r.err).toMatchObject({ message: 'no such environment', status: 404 });
+  });
+
+  it('reads the releases (50, newest first) and a release with its spec and diff', async () => {
+    let r = await ask('GET_environments_env_releases.200', () => api.listReleases(STAGE));
+    expect(r.out.releases.map((x) => x.number)).toEqual([7, 6, 5]);
+    r = await ask('GET_environments_env_releases_n.200', () => api.getRelease(STAGE, 7));
+    expect(r.out.spec.services['expense-service'].imageAsWritten).toBe('ghcr.io/acme/expense:1.4');
+    expect(r.out.diff).toHaveLength(3);
+    r = await ask('GET_environments_env_releases_n.404', () => api.getRelease(STAGE, 99));
+    expect(r.err).toMatchObject({ message: 'no such release', status: 404 });
+  });
+
+  it('reads the incidents, the open ones, and one incident', async () => {
+    let r = await ask('GET_environments_env_incidents.200', () => api.listIncidents(STAGE));
+    expect(r.out.incidents.map((i) => i.id)).toEqual(['13', '12', '9']);
+    expect(r.out.incidents[0].evidence.pending).toHaveLength(3);
+    r = await ask('GET_environments_env_incidents.200.open', () => api.listIncidents(STAGE, { open: true }));
+    expect(r.out.incidents.map((i) => i.id)).toEqual(['12']);
+    r = await ask('GET_environments_env_incidents_id.200', () => api.getIncident(STAGE, '12'));
+    expect(r.out.evidence.logTail).toHaveLength(3);
+    r = await ask('GET_environments_env_incidents_id.404', () => api.getIncident(STAGE, '99'));
+    expect(r.err).toMatchObject({ message: 'no such incident', status: 404 });
+  });
+
+  it("reads an object's last 200 lines, of a replica, and ferund's refusals", async () => {
+    let r = await ask('GET_environments_env_objects_kind_name_logs.200', () =>
+      api.objectLogs(STAGE, 'service', 'expense-service', { replica: 1 }));
+    expect(r.out).toEqual({ lines: r.fx.response.lines, source: 'container' });
+    r = await ask('GET_environments_env_objects_kind_name_logs.200.process', () =>
+      api.objectLogs('expensa-login-3f9a', 'service', 'expense-service'));
+    expect(r.out.source).toBe('process');
+    const loose = { exactQuery: false };
+    r = await ask('GET_environments_env_objects_kind_name_logs.501', () => api.objectLogs(STAGE, 'addon', 'postgres'), loose);
+    expect(r.err).toMatchObject({ message: 'this node does not serve container logs yet', status: 501 });
+    r = await ask('GET_environments_env_objects_kind_name_logs.409', () =>
+      api.objectLogs('expensa-login-3f9a', 'addon', 'nats'), loose);
+    expect(r.err).toMatchObject({ message: 'paused', status: 409 });
+    r = await ask('GET_environments_env_objects_kind_name_logs.404', () => api.objectLogs(STAGE, 'service', 'nope'), loose);
+    expect(r.err).toMatchObject({ message: 'no such object: service/nope', status: 404 });
+  });
+
+  it('only ever reads: every environment call is a GET', async () => {
+    const calls = serveFixtures(...Array(7).fill('GET_environments.200'));
+    await api.listEnvironments();
+    await api.getEnvironment(STAGE);
+    await api.listReleases(STAGE);
+    await api.getRelease(STAGE, 1);
+    await api.listIncidents(STAGE);
+    await api.getIncident(STAGE, '1');
+    await api.objectLogs(STAGE, 'job', 'migrate');
+    expect(calls.map((c) => c.init.method)).toEqual(Array(7).fill('GET'));
+    expect(calls.every((c) => c.init.body === undefined)).toBe(true);
   });
 });
 
