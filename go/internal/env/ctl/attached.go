@@ -231,7 +231,11 @@ func (c *Controller) stopAttached(ctx context.Context, v *view, a store.EnvAttac
 	if !ok || !steady(sb) || c.d.Runner == nil || !c.connected(sb.Node) {
 		return
 	}
-	l := lease(sb)
+	c.stopAttachedIn(ctx, v, a, sb, lease(sb))
+}
+
+// stopAttachedIn is stopAttached with the sandbox's lease.
+func (c *Controller) stopAttachedIn(ctx context.Context, v *view, a store.EnvAttached, sb store.Sandbox, l model.Lease) {
 	if a.ProcessID != "" {
 		if err := c.d.Runner.StopProcessDetached(ctx, l, a.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) &&
 			ctx.Err() == nil {
@@ -253,10 +257,85 @@ func (c *Controller) stopAttached(ctx context.Context, v *view, a store.EnvAttac
 	}
 }
 
+// cleanAttached stops the process of an attached service that goes
+// (removed, or its environment deleted) and takes its names out of its
+// sandbox's hosts block, and reports whether its row may go. A sandbox
+// that sleeps (paused, hibernated) is woken for it, in the pool: a
+// process left there would run on with the environment's secrets once
+// the sandbox runs again, and its hosts block would name what is gone;
+// the row stays until that is done (false). Nothing is left to clean when
+// the service never started or wrote a hosts block, when the sandbox is
+// gone or not the tenant's, or when it is stopped, failed or lost (no
+// process outlives a boot); a sandbox in an op or between states is
+// looked at again in a later round.
+func (c *Controller) cleanAttached(ctx context.Context, v *view, a store.EnvAttached) bool {
+	if a.ProcessID == "" && a.HostsWritten == "" || c.d.Runner == nil {
+		return true
+	}
+	sb, ok := c.usableSandbox(ctx, v.env, a)
+	switch {
+	case !ok:
+		return true
+	case steady(sb) && c.connected(sb.Node):
+		c.stopAttachedIn(ctx, v, a, sb, lease(sb))
+		return true
+	case sb.Op != "":
+		return false
+	case sb.ClientState == model.StatePaused || sb.ClientState == model.StateHibernated:
+		c.wakeToClean(ctx, v, a)
+		return false
+	case sb.ClientState == model.StateStopped || sb.ClientState == model.StateFailed || sb.ClientState == model.StateLost:
+		return true
+	}
+	return false
+}
+
+// wakeToClean wakes the sleeping sandbox of an attached service that goes
+// (HoldExec), stops its process and rewrites its hosts block, then
+// deletes its row; a failure leaves the row for a later round.
+func (c *Controller) wakeToClean(ctx context.Context, v *view, a store.EnvAttached) {
+	c.pool.run(ctx, "attached-clean/"+attachedKey(a.EnvID, a.Service), func(ctx context.Context) {
+		l, release, err := c.d.Engine.Acquire(ctx, a.SandboxID, model.HoldExec)
+		if err != nil {
+			if ctx.Err() == nil {
+				c.rl.warn("attached", "cannot wake a sandbox to stop an attached service that goes", "sandbox", a.SandboxID,
+					"service", a.Service, "err", err)
+			}
+			return
+		}
+		defer release()
+		sb, err := c.st.GetSandbox(ctx, a.SandboxID)
+		if err != nil || !attachedUsable(v.env, a, sb) {
+			return
+		}
+		c.stopAttachedIn(ctx, v, a, sb, l)
+		c.log.Info("attached service stopped in the sandbox woken for it", "environment", a.EnvID, "service", a.Service,
+			"sandbox", a.SandboxID)
+		c.dropAttached(ctx, v.env.ID, a.Service)
+	})
+}
+
+// dropAttached deletes an attached service's row.
+func (c *Controller) dropAttached(ctx context.Context, envID uuid.UUID, service string) {
+	err := c.fenced(ctx, func(tx *store.Store) error {
+		if _, err := tx.DeleteAttached(ctx, envID, service); err != nil {
+			return err
+		}
+		return tx.Notify(ctx, db.ChanLeader, HintGroups)
+	})
+	if err != nil && ctx.Err() == nil {
+		c.rl.warn("attached", "cannot delete an attached service", "environment", envID, "service", service, "err", err)
+		return
+	}
+	c.forget("a/" + attachedKey(envID, service))
+}
+
 // removeAttached removes an attached service T no longer has: its
 // process, its hosts entries, its row.
 func (c *Controller) removeAttached(ctx context.Context, v *view, a store.EnvAttached) {
-	c.stopAttached(ctx, v, a)
+	if !c.cleanAttached(ctx, v, a) {
+		return
+	}
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		if _, err := tx.DeleteAttached(ctx, v.env.ID, a.Service); err != nil {
 			return err
