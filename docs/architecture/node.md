@@ -100,6 +100,7 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 | `/var/lib/feos/pods/next-ipv6-address` | the counter of the pods' IPv6 addresses: the next one handed out |
 | `/var/lib/feos/pods/ipv4-addresses` | the pods' IPv4 addresses: the lowest never handed out, and those freed since, the longest free first, with when |
 | `/var/lib/feos/security-groups/<id>.pb` | a security group (a `feos.network.v1.SecurityGroup`) |
+| `/var/lib/feos/name-tables/<id>.pb` | a name table (a `feos.network.v1.NameTable`) |
 | `/var/lib/feos/volumes/<id>.pb` | a volume (a `feos.volume.v1.Volume`); `empty-layer.img`, the image of the volumes' empty L0 |
 | `/var/lib/feos/vms.db` | the microVM records (SQLite) |
 | `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
@@ -442,9 +443,16 @@ refuses an upstream that is not an IP address, is the resolver itself, a
 loopback, link-local or multicast address, in a denied prefix, a pod's
 (the pod prefix or the IPv4 range) or one of the node's addresses.
 
+A name of one label, in any case, that the pod's name tables hold
+(`PodNetwork.name_tables`, [Name tables](#name-tables)) the resolver
+answers itself, with authority and never asking upstream: AAAA with the
+name's IPv6 addresses, A with its IPv4 addresses (the loopback of a
+sandbox's own attached services), each with a TTL of 5 s, and no record
+of another type. Every other name goes upstream.
+
 Answers pass as the upstream gave them: pods have IPv4, so nothing is
 synthesized. The resolver takes `ech` out of HTTPS records, and records
-every query it answers.
+every query it answers, its own answers too.
 
 Its sockets outlive `feosd`, so that a query waits in them while `feosd`
 restarts rather than fails. They are handed to `feosd` by systemd's
@@ -558,6 +566,24 @@ not have does not boot or resume: its bring-up fails, and the pod is
 `FAILED` with a reason that names them; `StartPod` brings it up once they
 are there, and `ResumePod` fails with `FAILED_PRECONDITION` until then. A
 group that a pod names cannot be deleted.
+
+### Name tables
+
+`feosd` keeps the name tables it is sent (`feos.network.v1.NameService`)
+in `/var/lib/feos/name-tables/<id>.pb`, each with an ID, a version, its
+names, each one label of a DNS name in lower case with one or more IPv6
+or IPv4 addresses, and the tables it includes. A pod's spec names its
+tables (`PodNetwork.name_tables`), and the resolver answers it their
+names ([DNS](#dns)): the first of the pod's tables that holds a name
+answers it, a table's own names before those of the tables it includes,
+in their order; the includes of an included table are not followed, and
+one the node does not have holds nothing. A pod whose tables the node
+does not have does not boot or resume, as with its groups; a table that
+a pod names cannot be deleted. A delta (`UpdateNameTable`) puts and
+removes names from the version the node has to another, which the
+control plane chooses and need not grow. The tables live on the node, so
+that a pod's names hold while it is paused, suspended or restored, with
+nothing in its guest.
 
 ### Traffic records
 
