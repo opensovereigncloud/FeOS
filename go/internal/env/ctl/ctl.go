@@ -81,7 +81,7 @@ const (
 // statuses of its own.
 var (
 	// ErrNoObject: the environment's target release has no such object
-	// (or replica).
+	// (or replica: then the error's text says so, and wraps it).
 	ErrNoObject = errors.New("no such object")
 	// ErrPaused: the instance is paused or hibernated; reading its logs
 	// would wake it (409 "paused").

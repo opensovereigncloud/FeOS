@@ -939,6 +939,34 @@ func TestControllerRefusals(t *testing.T) {
 		t.Fatalf("code %q", code(err))
 	}
 
+	// A replica the release has but that has no instance yet (it waits
+	// for its addons) has no log; one the object does not have is no
+	// object, and the answer says which.
+	for _, c := range []struct {
+		kind, name string
+		replica    int
+		status     int
+		msg, code  string
+	}{
+		{spec.KindService, "api", 1, http.StatusConflict, "service api has no instance of replica 1 yet: no log to read",
+			"not_running"},
+		{spec.KindAddon, "pg", 0, http.StatusConflict, "addon pg has no instance of replica 0 yet: no log to read", "not_running"},
+		{spec.KindService, "api", 5, http.StatusNotFound, "service api has no replica 5 (it has 2)", ""},
+		{spec.KindAddon, "pg", 1, http.StatusNotFound, "addon pg has no replica 1 (it has 1)", ""},
+		{spec.KindService, "nope", 0, http.StatusNotFound, "no such object: service/nope", ""},
+	} {
+		_, err := h.svc.Logs(ctx, tenantA, "stage", c.kind, c.name, 0, c.replica)
+		wantStatus(t, err, c.status, c.msg)
+		if code(err) != c.code {
+			t.Fatalf("%s/%s replica %d: code %q", c.kind, c.name, c.replica, code(err))
+		}
+	}
+	// replicas: 0 runs none.
+	h.apply("stage", strings.Replace(previewSpec(sb), `"replicas": 2`, `"replicas": 0`, 1), 1)
+	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "api", 0, 0)
+	wantStatus(t, err, http.StatusConflict, "service api runs no replica (replicas: 0): no log to read")
+	h.apply("stage", previewSpec(sb), 2)
+
 	// A pending instance has no log.
 	h.instance(e.ID, spec.KindService, "api", 0, 1, model.PhaseStarting, model.StatePending, "", "")
 	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "api", 0, 0)
