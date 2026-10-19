@@ -265,6 +265,48 @@ func TestStatus(t *testing.T) {
 	}
 }
 
+// An incident's answer has every part of the evidence the controller
+// stores (ctl's evidence): a release past its deadline's pending objects
+// too.
+func TestIncidentEvidence(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	stored := `{"exits":[{"at":"2026-10-18T14:05:01Z","code":1}],"logTail":["boom"],` +
+		`"diff":[{"kind":"addon","name":"postgres","change":"add","fields":[],"effect":"new pod"}],` +
+		`"placement":"no capacity","pending":["addon postgres is not ready",` +
+		`"addon/postgres replica 0: provisioning step provision exited 1"]}`
+	// Every key of it is one the answer knows.
+	dec := json.NewDecoder(strings.NewReader(stored))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&IncidentEvidence{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := h.st.OpenIncident(ctx, store.EnvIncident{EnvID: h.env("stage").ID, Object: "addon/postgres", Release: 2,
+		Condition: model.ConditionRolloutFailed, Summary: "release 2 did not roll out within 10m0s: addon postgres is not ready",
+		Evidence: json.RawMessage(stored)}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := h.svc.Incidents(ctx, tenantA, "stage", true)
+	if err != nil || len(list.Incidents) != 1 {
+		t.Fatalf("incidents %+v %v", list, err)
+	}
+	inc, err := h.svc.Incident(ctx, tenantA, "stage", mustInt64(t, list.Incidents[0].ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev := inc.Evidence
+	if len(ev.Pending) != 2 || ev.Pending[1] != "addon/postgres replica 0: provisioning step provision exited 1" ||
+		len(ev.Exits) != 1 || len(ev.LogTail) != 1 || len(ev.Diff) != 1 || ev.Placement != "no capacity" {
+		t.Fatalf("evidence %+v", ev)
+	}
+	b, _ := json.Marshal(list.Incidents[0].Evidence)
+	if !strings.Contains(string(b), `"pending":["addon postgres is not ready",`) {
+		t.Fatalf("evidence JSON %s", b)
+	}
+}
+
 func mustInt64(t *testing.T, s string) int64 {
 	t.Helper()
 	var n int64

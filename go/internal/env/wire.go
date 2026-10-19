@@ -452,6 +452,9 @@ type IncidentEvidence struct {
 	Diff []spec.DiffEntry `json:"diff,omitempty"`
 	// Placement is why an instance could not be placed.
 	Placement string `json:"placement,omitempty"`
+	// Pending is what a release past its deadline still waited for, and
+	// the details of those objects' instances (credentials redacted).
+	Pending []string `json:"pending,omitempty"`
 }
 
 // Exit is an exit of a container (env_instances.exits): when, and its

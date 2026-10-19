@@ -225,7 +225,8 @@ export function incidentObject(object) {
 // hasEvidence tells whether an incident's evidence holds anything.
 export function hasEvidence(ev) {
   if (!ev) return false;
-  return (ev.exits || []).length > 0 || (ev.logTail || []).length > 0 || (ev.diff || []).length > 0 || !!ev.placement;
+  return (ev.exits || []).length > 0 || (ev.logTail || []).length > 0 || (ev.diff || []).length > 0 || !!ev.placement
+    || (ev.pending || []).length > 0;
 }
 
 // envCounts counts the list's environments by the state of their latest

@@ -830,8 +830,9 @@ function IncidentPane({ tenant, env, id, navigate }) {
 }
 
 // IncidentView is an incident with what the controller saw: the exits,
-// the end of the log, a failed rollout's diff against the realised
-// release, why an instance found no place.
+// the end of the log, what a release past its deadline still waited for,
+// a failed rollout's diff against the realised release, why an instance
+// found no place.
 export function IncidentView({ inc, tenant, env, navigate }) {
   const open = !inc.closedAt;
   const obj = incidentObject(inc.object);
@@ -879,6 +880,11 @@ export function IncidentView({ inc, tenant, env, navigate }) {
         <>
           <div className="sect">the end of the log</div>
           <pre className="logpre">{ev.logTail.join('\n')}</pre>
+        </>)}
+      {(ev.pending || []).length > 0 && (
+        <>
+          <div className="sect">what the release waited for</div>
+          <pre className="logpre">{ev.pending.join('\n')}</pre>
         </>)}
       {(ev.diff || []).length > 0 && (
         <>

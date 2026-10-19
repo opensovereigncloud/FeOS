@@ -331,6 +331,17 @@ describe('IncidentView', () => {
     expect(out).not.toContain('the end of the log');
   });
 
+  it('shows what a release past its deadline waited for', () => {
+    const late = response('GET_environments_env_incidents_id.200.rollout');
+    const out = view(late);
+    expect(words(late)).toContain('incident 13 closed rollout failed');
+    expect(words(late)).toContain('what the release waited for');
+    expect(out).toContain('<pre class="logpre">addon postgres is not ready\nservice expense-service waits for the addons\n'
+      + 'addon/postgres replica 0: provisioning step provision exited 1');
+    expect(words(late)).toContain('the diff against the realised release');
+    expect(out).not.toContain('No evidence recorded.');
+  });
+
   it('shows why an instance found no place', () => {
     const starved = {
       ...inc, id: '14', object: 'addon/postgres', condition: 'no_capacity', closedAt: '2026-10-18T15:00:00Z',

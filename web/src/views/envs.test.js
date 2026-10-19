@@ -205,6 +205,7 @@ describe('incidents', () => {
   it('tell evidence from none', () => {
     expect(hasEvidence(response('GET_environments_env_incidents_id.200').evidence)).toBe(true);
     expect(hasEvidence({ placement: 'no capacity (retryable): no feasible node' })).toBe(true);
+    expect(hasEvidence({ pending: ['addon postgres is not ready'] })).toBe(true);
     expect(hasEvidence({})).toBe(false);
     expect(hasEvidence(null)).toBe(false);
   });
