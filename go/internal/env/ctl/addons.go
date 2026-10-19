@@ -110,7 +110,7 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 		c.ensure(ctx, sb.ID)
 		if !v.isOpen(obj, model.ConditionVolumeUnavailable) {
 			c.incident(ctx, v.env.ID, obj, v.targetNum, model.ConditionVolumeUnavailable,
-				fmt.Sprintf("addon %s is lost with node %s, which has its volume", name, sb.LostFrom), evidence{})
+				fmt.Sprintf("addon %s is lost with node %s, which has its volume", name, lostNode(sb)), evidence{})
 		}
 		s.wait(obj, "addon %s is lost", name)
 		return false

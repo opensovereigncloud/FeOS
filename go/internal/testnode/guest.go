@@ -201,6 +201,15 @@ func (c *containerService) Exec(req *containerv1.ExecRequest, stream grpc.Server
 			return out.send(&containerv1.ExecStreamFrame{Frame: &containerv1.ExecStreamFrame_ExitCode{ExitCode: code}})
 		}
 	}
+	if c.n.cfg.FakeProcesses {
+		code, ok, err := c.n.procs.exec(g, req.GetCommand(), out)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return out.send(&containerv1.ExecStreamFrame{Frame: &containerv1.ExecStreamFrame_ExitCode{ExitCode: code}})
+		}
+	}
 	if c.n.cfg.FakeExec || g.envPod {
 		// Nothing runs: an environment's probes and provisioning pass.
 		return out.send(&containerv1.ExecStreamFrame{Frame: &containerv1.ExecStreamFrame_ExitCode{ExitCode: 0}})

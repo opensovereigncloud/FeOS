@@ -248,6 +248,13 @@ func (s *Script) FailPod(pod uuid.UUID, reason string) error {
 	return s.n.pods.fail(pod, reason)
 }
 
+// ForgetPod drops a pod's record without an event, as a node that comes
+// back without it does (its volumes are let go, its directory stays):
+// the control plane finds it missing at its next reconcile.
+func (s *Script) ForgetPod(pod uuid.UUID) error {
+	return s.n.pods.forget(pod)
+}
+
 // LagPodEvents ends every StreamPodEvents stream with DATA_LOSS, as a
 // reader that fell behind feosd's broadcast.
 func (s *Script) LagPodEvents() {

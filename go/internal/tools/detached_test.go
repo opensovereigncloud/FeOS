@@ -278,3 +278,47 @@ func TestShellCommand(t *testing.T) {
 		}
 	}
 }
+
+// A test node with FakeProcesses answers the detached process calls as
+// the scripts do, without running anything: start (a missing working
+// directory is ErrNoCwd), list, logs and stop.
+func TestProcessDetachedFakeProcesses(t *testing.T) {
+	env := toolstest.New(t, toolstest.Options{FakeProcesses: true})
+	r := newRunner(env)
+	lease := detachedLease(t, env)
+	if _, err := r.StartProcessDetached(bg, lease, ProcessStart{Argv: []string{"npm", "run", "dev"}, Cwd: "/app", Name: "web"}); !errors.Is(err, ErrNoCwd) {
+		t.Fatalf("a missing working directory: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(env.Node.PodDir(lease.SandboxID), "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if ps, err := r.ProcessesDetached(bg, lease); err != nil || len(ps) != 0 {
+		t.Fatalf("no processes yet: %+v, %v", ps, err)
+	}
+	id, err := r.StartProcessDetached(bg, lease, ProcessStart{Argv: []string{"npm", "run", "dev"}, Cwd: "/app", Name: "ferun-env-stage-web"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ps, err := r.ProcessesDetached(bg, lease)
+	if err != nil || len(ps) != 1 || ps[0].ID != id || ps[0].Name != "ferun-env-stage-web" || !ps[0].Running || ps[0].ExitCode != nil {
+		t.Fatalf("processes %+v, %v", ps, err)
+	}
+	if lines, err := r.ProcessLogsDetached(bg, lease, id, 10); err != nil || len(lines) != 1 || !strings.Contains(lines[0], "npm run dev") {
+		t.Fatalf("logs %q, %v", lines, err)
+	}
+	if err := r.StopProcessDetached(bg, lease, id); err != nil {
+		t.Fatal(err)
+	}
+	if ps, err = r.ProcessesDetached(bg, lease); err != nil || len(ps) != 1 || ps[0].Running || ps[0].ExitCode != nil {
+		t.Fatalf("after the stop: %+v, %v", ps, err)
+	}
+	if err := r.StopProcessDetached(bg, lease, id); err != nil {
+		t.Errorf("a second stop: %v", err)
+	}
+	if _, err := r.ProcessLogsDetached(bg, lease, "000000-abcdef", 5); !errors.Is(err, ErrNoProcess) {
+		t.Errorf("the logs of an unknown process: %v", err)
+	}
+	if err := r.StopProcessDetached(bg, lease, "000000-abcdef"); !errors.Is(err, ErrNoProcess) {
+		t.Errorf("the stop of an unknown process: %v", err)
+	}
+}

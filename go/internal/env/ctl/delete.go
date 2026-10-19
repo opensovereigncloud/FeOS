@@ -238,8 +238,12 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 		return err
 	}
 	v := &view{env: e, target: emptySpec(), latestSpec: emptySpec()}
+	cleaning := false
 	for _, a := range attached {
-		c.stopAttached(ctx, v, a)
+		if !c.cleanAttached(ctx, v, a) {
+			cleaning = true
+			continue
+		}
 		if err := c.fenced(ctx, func(tx *store.Store) error {
 			_, err := tx.DeleteAttached(ctx, e.ID, a.Service)
 			return err
@@ -291,7 +295,7 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 			return err
 		}
 	}
-	if len(left) > 0 || len(vols) > 0 || !groupsGone {
+	if len(left) > 0 || len(vols) > 0 || !groupsGone || cleaning {
 		return nil
 	}
 	return c.fenced(ctx, func(tx *store.Store) error {

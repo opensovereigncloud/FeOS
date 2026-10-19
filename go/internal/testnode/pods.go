@@ -489,6 +489,13 @@ func (p *podService) bringUpPod(ctx context.Context, id string, pd *pod) {
 		p.mu.Unlock()
 		failed = p.n.groups.attachError(groups)
 	}
+	// What the boot schedules runs once p.mu is released.
+	var scheduled func()
+	defer func() {
+		if scheduled != nil {
+			scheduled()
+		}
+	}()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// Ended meanwhile: whoever ended it holds the say now. spawnBringUp and
@@ -506,6 +513,7 @@ func (p *podService) bringUpPod(ctx context.Context, id string, pd *pod) {
 		p.nextPID++
 		pd.pid = p.nextPID
 		p.n.volumes.booted(id)
+		scheduled = p.bootedLocked(pd, true)
 	}
 	p.announceLocked(pd.info, false)
 }
@@ -774,6 +782,7 @@ func (p *podService) delete(ctx context.Context, id string) error {
 	p.announceLocked(pd.info, true)
 	p.mu.Unlock()
 	p.n.volumes.release(id)
+	p.n.procs.deleted(id)
 	if err := os.RemoveAll(p.n.podDir(pd.uid)); err != nil {
 		p.n.log.Warn("test node: the directory of a deleted pod stays", "pod", id, "err", err)
 	}
@@ -1229,14 +1238,19 @@ func (p *podService) restore(ctx context.Context, id, headKey string, cold bool)
 			p.setState(id, podv1.PodState_POD_STATE_FAILED, err.Error())
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
+		var scheduled func()
 		p.change(id, func(pd *pod) {
 			pd.guestDown, pd.snapshot = false, false
 			// A restore runs in a new microVM process.
 			p.nextPID++
 			pd.pid = p.nextPID
+			scheduled = p.bootedLocked(pd, false)
 		})
 		p.n.volumes.booted(id)
 		p.setState(id, podv1.PodState_POD_STATE_RUNNING, "")
+		if scheduled != nil {
+			scheduled()
+		}
 		out, err := p.get(id)
 		if err != nil {
 			return nil, err
@@ -1501,6 +1515,24 @@ func InventoryHash(pods []*podv1.PodInfo) string {
 		h.Write([]byte(l))
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// forget drops a pod's record without an event (Script.ForgetPod).
+func (p *podService) forget(uid uuid.UUID) error {
+	p.mu.Lock()
+	pd := p.byUIDLocked(uid)
+	if pd == nil {
+		p.mu.Unlock()
+		return notFound(uid.String())
+	}
+	if pd.bringUp != nil {
+		pd.bringUp()
+	}
+	delete(p.pods, pd.info.PodId)
+	p.mu.Unlock()
+	p.n.volumes.release(pd.info.PodId)
+	p.n.procs.deleted(pd.info.PodId)
+	return nil
 }
 
 // namesGroup reports whether a pod on the node, in any state, names the

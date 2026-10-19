@@ -8,14 +8,22 @@
 //	ferun-testnode --join-token feos-join-<secret>.<pin> --server-name ferun.example.com \
 //	    --addr 127.0.0.1:7443 [--name NAME] [--trust-domain feos.local] [--state-dir DIR] ...
 //
+// For a control plane's environments end to end: --fake-exec (probes and
+// provisioning pass), --fake-processes (attached services start, list and
+// stop), --exit 'job/*=0@3s' (release jobs finish), --start-log (log
+// tails show lines) and --port-addr 8080=127.0.0.1:18080 (routes and
+// probes reach a local server).
+//
 // Every flag has an environment variable FERUN_TESTNODE_<NAME> (upper
 // snake case of the flag); a flag wins over its variable. SIGINT and
 // SIGTERM stop the node; SIGHUP restarts it gracefully, as an upgrade of
-// feosd does (a "stopping" event first, then a new start).
+// feosd does (a "stopping" event first, then a new start); SIGUSR1 logs
+// its pods, volumes and security groups as one JSON line.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +35,9 @@ import (
 	"syscall"
 	"time"
 
+	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -52,6 +63,17 @@ func (a *addrs) Set(v string) error {
 			*a = append(*a, s)
 		}
 	}
+	return nil
+}
+
+// list is a repeatable flag whose values are taken whole (an exit rule's
+// glob may hold commas).
+type list []string
+
+func (l *list) String() string { return strings.Join(*l, " ") }
+
+func (l *list) Set(v string) error {
+	*l = append(*l, v)
 	return nil
 }
 
@@ -107,6 +129,12 @@ func parse(args []string, getenv func(string) string) (testnode.Config, slog.Lev
 	meshEndpoint := fs.String("mesh-endpoint", "", "the node's endpoint on the mesh, address:port; empty: 127.0.0.1 and a port from the name")
 	fakeExec := fs.Bool("fake-exec", false, "every exec into a pod exits 0 without running anything (an environment's addon probes and provisioning)")
 	checkGroups := fs.Bool("check-security-groups", true, "a pod that names a security group the node does not have fails, as on feosd")
+	var exits list
+	var portAddrs addrs
+	fs.Var(&exits, "exit", "<object glob>=<code>[@<delay>]: the main container of an environment's pod whose ferun.object label matches exits with the code that long after each boot (default 2s; a negative code: no exit status), repeatable, the first match counts: job/*=0@3s, service/crasher=1")
+	fakeProcesses := fs.Bool("fake-processes", false, "answer the control plane's background-process scripts (process_start, an environment's attached services) in memory without running anything")
+	startLog := fs.Bool("start-log", false, "append a line to a container's log at each boot of its pod and at an exit of --exit")
+	fs.Var(&portAddrs, "port-addr", "<port>=<host:port>: a port forward to a pod's port dials this address in place of 127.0.0.1:<port>, repeatable")
 	logLevel := fs.String("log-level", "info", "debug, info, warn or error")
 
 	if err := fs.Parse(args); err != nil {
@@ -163,6 +191,26 @@ func parse(args []string, getenv func(string) string) (testnode.Config, slog.Lev
 
 		FakeExec:            *fakeExec,
 		CheckSecurityGroups: *checkGroups,
+		StartLog:            *startLog,
+		FakeProcesses:       *fakeProcesses,
+	}
+	for _, e := range exits {
+		r, err := testnode.ParseExitRule(e)
+		if err != nil {
+			return testnode.Config{}, level, fmt.Errorf("--exit: %w", err)
+		}
+		cfg.ContainerExits = append(cfg.ContainerExits, r)
+	}
+	for _, pa := range portAddrs {
+		portText, addr, ok := strings.Cut(pa, "=")
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if !ok || err != nil || port == 0 || addr == "" {
+			return testnode.Config{}, level, fmt.Errorf("--port-addr %q: want <port>=<host:port>", pa)
+		}
+		if cfg.PortAddrs == nil {
+			cfg.PortAddrs = map[uint32]string{}
+		}
+		cfg.PortAddrs[uint32(port)] = addr
 	}
 	switch {
 	case *objectStore != "" && *objectStoreDir != "":
@@ -194,12 +242,22 @@ func run(args []string, getenv func(string) string) error {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	defer signal.Stop(hup)
+	usr1 := make(chan os.Signal, 1)
+	signal.Notify(usr1, syscall.SIGUSR1)
+	defer signal.Stop(usr1)
 	go func() {
 		for {
 			select {
 			case <-hup:
 				log.Info("ferun-testnode: restarting gracefully")
 				n.Restart(true)
+			case <-usr1:
+				b, err := json.Marshal(summary(n.Pods(), n.Volumes(), n.SecurityGroups()))
+				if err != nil {
+					log.Warn("ferun-testnode: state", "err", err)
+					continue
+				}
+				log.Info("ferun-testnode: state", "state", string(b))
 			case <-ctx.Done():
 				return
 			}
@@ -207,4 +265,54 @@ func run(args []string, getenv func(string) string) error {
 	}()
 	log.Info("ferun-testnode: starting", "name", cfg.Name, "addrs", strings.Join(cfg.Addrs, ","), "server-name", cfg.ServerName)
 	return n.Run(ctx)
+}
+
+// state is what SIGUSR1 logs of a node: its pods, volumes and security
+// groups, briefly.
+type state struct {
+	Pods    []podState    `json:"pods"`
+	Volumes []volumeState `json:"volumes"`
+	Groups  []groupState  `json:"groups"`
+}
+
+type podState struct {
+	ID      string   `json:"id"`
+	State   string   `json:"state"`
+	Object  string   `json:"object,omitempty"`
+	Groups  []string `json:"groups,omitempty"`
+	Volumes []string `json:"volumes,omitempty"`
+}
+
+type volumeState struct {
+	ID     string `json:"id"`
+	State  string `json:"state"`
+	Pod    string `json:"pod,omitempty"`
+	Object string `json:"object,omitempty"`
+}
+
+type groupState struct {
+	ID      string   `json:"id"`
+	Version uint64   `json:"version"`
+	Members []string `json:"members"`
+	Rules   int      `json:"rules"`
+}
+
+func summary(pods []*podv1.PodInfo, volumes []*volumev1.Volume, groups []*networkv1.SecurityGroup) state {
+	out := state{Pods: []podState{}, Volumes: []volumeState{}, Groups: []groupState{}}
+	for _, p := range pods {
+		ps := podState{ID: p.GetPodId(), State: strings.TrimPrefix(p.GetState().String(), "POD_STATE_"),
+			Object: p.GetSpec().GetLabels()["ferun.object"], Groups: p.GetSpec().GetNetwork().GetSecurityGroups()}
+		for _, v := range p.GetSpec().GetVolumes() {
+			ps.Volumes = append(ps.Volumes, v.GetVolumeId())
+		}
+		out.Pods = append(out.Pods, ps)
+	}
+	for _, v := range volumes {
+		out.Volumes = append(out.Volumes, volumeState{ID: v.GetVolumeId(), State: strings.TrimPrefix(v.GetState().String(), "VOLUME_STATE_"),
+			Pod: v.GetPodId(), Object: v.GetLabels()["ferun.object"]})
+	}
+	for _, g := range groups {
+		out.Groups = append(out.Groups, groupState{ID: g.GetId(), Version: g.GetVersion(), Members: g.GetMembers(), Rules: len(g.GetRules())})
+	}
+	return out
 }

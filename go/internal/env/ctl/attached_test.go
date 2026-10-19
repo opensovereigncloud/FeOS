@@ -469,3 +469,97 @@ func TestAttachedStrayProcesses(t *testing.T) {
 			slices.Equal(h.runningNamed(sb, "ferun-env-dev-web"), []string{c.ProcessID})
 	})
 }
+
+// An attached service that goes while its sandbox sleeps — removed from
+// the spec, or its environment deleted — is stopped and taken out of the
+// sandbox's hosts block in the sandbox woken for it, before its row goes
+// (and the environment's, once nothing of it is left): a process left
+// there would run on with the environment's secrets after a resume, and
+// the hosts block would name what is gone.
+func TestAttachedGoesFromSleepingSandbox(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	hostProcesses(n1, t.TempDir())
+	sb := h.attachable()
+	hosts := func() string {
+		b, _ := os.ReadFile(filepath.Join(n1.PodDir(sb.ID), "etc", "hosts"))
+		return string(b)
+	}
+	sleep := func() {
+		t.Helper()
+		if err := h.eng.Pause(bg, sb.ID); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, 30*time.Second, "paused", func() bool {
+			s, _ := h.st.GetSandbox(bg, sb.ID)
+			return s.ClientState == model.StatePaused && s.Op == ""
+		})
+	}
+	up := func(envID uuid.UUID, r int) store.EnvAttached {
+		t.Helper()
+		h.waitRelease(envID, r, model.ReleaseRealised, 60*time.Second)
+		a, err := h.st.GetAttached(bg, envID, "web")
+		if err != nil || a.ProcessID == "" {
+			t.Fatalf("attached %+v %v", a, err)
+		}
+		return a
+	}
+	web := fmt.Sprintf(`"web":{"runtime":"attached","sandbox":%q,"command":["sleep","120"]}`, sb.ID)
+	other := `"api":{"image":"` + testImage + `","ports":[{"name":"http","port":8080}]}`
+
+	// Removed from the spec while the sandbox is paused.
+	dev := h.newEnv("dev")
+	a := up(dev.ID, h.apply(dev.ID, `{"services":{`+web+`,`+other+`}}`))
+	if !strings.Contains(hosts(), "# ferun environment dev begin") {
+		t.Fatalf("no hosts block %q", hosts())
+	}
+	sleep()
+	r2 := h.apply(dev.ID, `{"services":{`+other+`}}`)
+	h.waitRelease(dev.ID, r2, model.ReleaseRealised, 60*time.Second)
+	if _, err := h.st.GetAttached(bg, dev.ID, "web"); !errors.Is(err, store.ErrNoRow) {
+		t.Fatalf("the removed service's row: %v", err)
+	}
+	cur := h.attachableUp(sb.ID)
+	if got := h.runningNamed(cur, "ferun-env-dev-web"); len(got) != 0 {
+		t.Fatalf("the removed service's process %s runs on: %v", a.ProcessID, got)
+	}
+	if strings.Contains(hosts(), "ferun environment dev") {
+		t.Fatalf("the removed service's hosts block stayed:\n%s", hosts())
+	}
+
+	// Its environment deleted while the sandbox is paused.
+	stage := h.newEnv("stage")
+	up(stage.ID, h.apply(stage.ID, `{"services":{`+web+`}}`))
+	sleep()
+	h.exec(`UPDATE environments SET deleting = true WHERE id = $1`, stage.ID)
+	eventually(t, 60*time.Second, "the environment deleted", func() bool {
+		_, err := h.st.GetEnvironment(bg, stage.ID)
+		return errors.Is(err, store.ErrNoRow)
+	})
+	cur = h.attachableUp(sb.ID)
+	if got := h.runningNamed(cur, "ferun-env-stage-web"); len(got) != 0 {
+		t.Fatalf("the deleted environment's process runs on: %v", got)
+	}
+	if strings.Contains(hosts(), "ferun environment stage") {
+		t.Fatalf("the deleted environment's hosts block stayed:\n%s", hosts())
+	}
+}
+
+// attachableUp brings an attachable sandbox up (it may sleep) and reads
+// its row.
+func (h *harness) attachableUp(id uuid.UUID) store.Sandbox {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(bg, 60*time.Second)
+	defer cancel()
+	if _, err := h.eng.Ensure(ctx, id); err != nil {
+		h.t.Fatal(err)
+	}
+	sb, err := h.st.GetSandbox(bg, id)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return sb
+}

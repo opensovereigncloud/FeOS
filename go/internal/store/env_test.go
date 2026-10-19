@@ -769,3 +769,16 @@ func TestEnvAttachedVolumesIncidents(t *testing.T) {
 		t.Fatalf("reopened %+v %v %v", n, opened, err)
 	}
 }
+
+// The admin listing's count of a tenant's sandboxes leaves its
+// environments' instance rows out, as the tenant's sandbox listing does.
+func TestTenantCountLeavesInstancesOut(t *testing.T) {
+	s, _ := newStore(t)
+	mkTenant(t, s, "acme")
+	mkSandbox(t, s, "acme")
+	mkInstance(t, s, mkEnv(t, s, "acme", "stage"))
+	list, err := s.ListTenants(bg)
+	if err != nil || len(list) != 1 || list[0].SandboxCount != 1 {
+		t.Fatalf("tenants %+v %v", list, err)
+	}
+}

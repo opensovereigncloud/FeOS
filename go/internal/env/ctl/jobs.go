@@ -143,7 +143,7 @@ func (c *Controller) stepRuns(ctx context.Context, s *stepState) {
 		case v.now.After(run.StartedAt.Add(timeout)):
 			c.finishJob(ctx, v, r, nil, "timed out after "+timeout.String())
 		case c.heal(ctx, r, false):
-			c.finishJob(ctx, v, r, nil, "its instance was lost with node "+r.Sandbox.LostFrom)
+			c.finishJob(ctx, v, r, nil, "its instance was lost with node "+lostNode(r.Sandbox))
 		}
 	}
 	for _, r := range rows {
@@ -260,7 +260,8 @@ func appendExit(exits []store.EnvExit, e store.EnvExit) []store.EnvExit {
 
 // RunJob starts a run of a job of the environment's target release (what
 // jobs on "manual" are for): a new attempt 1. It returns once the run's
-// row is inserted; ErrNoObject, ErrNotReady.
+// row is inserted; ErrNoObject, ErrNotReady, and model.ErrBusy while a
+// run of the job runs (a repeated request never runs it twice at once).
 func (c *Controller) RunJob(ctx context.Context, envID uuid.UUID, name string) error {
 	v, err := c.load(ctx, envID)
 	if errors.Is(err, store.ErrNoRow) || (err == nil && v == nil) {
@@ -279,6 +280,21 @@ func (c *Controller) RunJob(ctx context.Context, envID uuid.UUID, name string) e
 	}
 	run := &store.EnvJobRun{EnvID: v.env.ID, Job: name, TemplateHash: p.hash, Release: v.targetNum, Attempt: 1,
 		Phase: model.RunRunning}
-	_, err = c.insertFrom(ctx, v, insert{plan: p, release: v.targetNum, run: run}, false)
+	_, err = c.insertFrom(ctx, v, insert{plan: p, release: v.targetNum, run: run, once: true}, false)
 	return err
+}
+
+// noRunOf refuses with model.ErrBusy while a run of the job runs.
+func noRunOf(ctx context.Context, tx *store.Store, envID uuid.UUID, job string) error {
+	runs, err := tx.EnvCtlRunningJobRuns(ctx, envID)
+	if err != nil {
+		return err
+	}
+	for _, r := range runs {
+		if r.Job == job {
+			return &stateError{msg: fmt.Sprintf("job %s runs already (release %d, attempt %d)", job, r.Release, r.Attempt),
+				kind: model.ErrBusy}
+		}
+	}
+	return nil
 }

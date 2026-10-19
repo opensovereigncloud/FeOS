@@ -276,6 +276,29 @@ func TestAddonVolumeUnavailable(t *testing.T) {
 	}
 }
 
+// An addon whose pod a node that is up no longer has is lost, never
+// replaced; its incident names that node (the row's lost_from is empty
+// then, its node is set).
+func TestAddonLostOnLiveNode(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	if err := n1.Script().ForgetPod(first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	inc := h.incident(env.ID, "addon/cache", model.ConditionVolumeUnavailable, 60*time.Second)
+	if inc.Summary != "addon cache is lost with node n1, which has its volume" {
+		t.Errorf("incident %+v", inc)
+	}
+	rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+	if len(rows) != 1 || rows[0].Sandbox.ID != first.Sandbox.ID || rows[0].Sandbox.ClientState != model.StateLost {
+		t.Fatalf("rows %+v", rows)
+	}
+}
+
 // A drained node's addon restores on another node with its volume (the
 // pin gates creates and starts only); the controller records the volume's
 // new node and pins the row there.

@@ -58,12 +58,20 @@ export function exitText(code) {
   return String(code);
 }
 
+// idleText names an image service's instances that are ready but paused
+// or hibernated for want of traffic: ferund counts only running ones as
+// ready, and a request through a route wakes them.
+function idleText(o) {
+  const idle = (o.instances || []).filter((i) => i.phase === 'ready' && (i.state === 'paused' || i.state === 'hibernated')).length;
+  return idle ? ` · ${idle} idle, woken by a request` : '';
+}
+
 // objectSummary is the line under an object's name.
 export function objectSummary(o) {
   switch (o.kind) {
     case 'service':
       if (isAttached(o)) return `attached · ${o.phase || 'starting'}`;
-      return `image · ${o.ready || 0} / ${o.desired || 0} ready`;
+      return `image · ${o.ready || 0} / ${o.desired || 0} ready${idleText(o)}`;
     case 'addon':
       return `${o.type} ${o.version} · plan ${o.plan} · ${o.provisioned ? 'provisioned' : 'not provisioned'}`;
     case 'job': {

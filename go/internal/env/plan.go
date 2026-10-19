@@ -500,13 +500,26 @@ func checkReleaseMeta(author, message string, annotations map[string]string) err
 	return nil
 }
 
+// annotationRevertOf is the annotation of a revert: the number of the
+// release it reverts to.
+const annotationRevertOf = "ferun.revertOf"
+
 // revertAnnotations are release n's annotations plus ferun.revertOf.
 func revertAnnotations(r store.EnvRelease) map[string]string {
 	out := maps.Clone(r.Annotations)
 	if out == nil {
 		out = map[string]string{}
 	}
-	out["ferun.revertOf"] = strconv.Itoa(r.Number)
+	out[annotationRevertOf] = strconv.Itoa(r.Number)
+	return out
+}
+
+// cloneAnnotations are the source release's annotations for a clone's
+// release 1, without ferun.revertOf: its number names a release of the
+// source, which the clone does not have.
+func cloneAnnotations(a map[string]string) map[string]string {
+	out := maps.Clone(a)
+	delete(out, annotationRevertOf)
 	return out
 }
 

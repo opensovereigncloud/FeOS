@@ -53,6 +53,8 @@ type Options struct {
 	MaxStreams int
 	// PendingDelay is how long the node's pods take to start.
 	PendingDelay time.Duration
+	// FakeProcesses is the node's testnode.Config.FakeProcesses.
+	FakeProcesses bool
 }
 
 // Env is a test's world.
@@ -145,7 +147,7 @@ func New(t testing.TB, o Options) *Env {
 	}
 	node, err := testnode.New(testnode.Config{
 		Name: NodeName, JoinToken: token, ServerName: serverName, TrustDomain: TrustDomain,
-		Addrs: []string{port.Addr().String()}, PendingDelay: o.PendingDelay, Log: log,
+		Addrs: []string{port.Addr().String()}, PendingDelay: o.PendingDelay, Log: log, FakeProcesses: o.FakeProcesses,
 	})
 	if err != nil {
 		t.Fatal(err)

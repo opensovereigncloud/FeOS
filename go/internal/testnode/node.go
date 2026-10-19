@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -108,6 +109,27 @@ type Config struct {
 	// plane whose addons' probes and provisioning run commands the host
 	// does not have.
 	FakeExec bool
+	// ContainerExits make the main container of an environment's pods
+	// exit a while after each boot, by their ferun.object label: release
+	// jobs that finish, a service that crash-loops (ferun-testnode
+	// --exit). The first matching rule counts.
+	ContainerExits []ExitRule
+	// StartLog appends a line to each container's log at every boot of its
+	// pod, and one at an exit of ContainerExits (ferun-testnode
+	// --start-log), so that a control plane's log tails have something to
+	// show.
+	StartLog bool
+	// FakeProcesses answers the control plane's background-process
+	// scripts (process_start, the environment's attached services) in
+	// memory without running anything (ferun-testnode --fake-processes):
+	// a process runs until it is stopped, its pod boots anew or an
+	// ExitRule "process/<name>" ends it, and its log has a start line.
+	FakeProcesses bool
+	// PortAddrs are where a port forward to a pod's port dials, by port,
+	// in place of 127.0.0.1:<port> (the script's SetPortAddr;
+	// ferun-testnode --port-addr): a route reaches a local server that
+	// cannot listen on the pod's port.
+	PortAddrs map[uint32]string
 }
 
 // Node is a test node.
@@ -125,6 +147,7 @@ type Node struct {
 	mesh      *meshService
 	volumes   *volumeService
 	groups    *groupService
+	procs     *processService
 	podPrefix netip.Prefix
 	podsDir   string
 	tmpDir    string // removed when Run returns; "" with a StateDir
@@ -188,6 +211,12 @@ func New(cfg Config) (*Node, error) {
 	} else if cfg.StateDir == "" {
 		return nil, errors.New("testnode: neither a join token nor a state directory")
 	}
+	cfg.ContainerExits = slices.Clone(cfg.ContainerExits)
+	for i := range cfg.ContainerExits {
+		if err := cfg.ContainerExits[i].compile(); err != nil {
+			return nil, fmt.Errorf("testnode: %w", err)
+		}
+	}
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.DiscardHandler)
 	}
@@ -237,6 +266,9 @@ func New(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	n.script = newScript(n)
+	for port, addr := range cfg.PortAddrs {
+		n.script.SetPortAddr(port, addr)
+	}
 	n.pods = newPodService(n)
 	n.watch = newWatchService(n)
 	n.tools = &toolService{n: n}
@@ -244,6 +276,7 @@ func New(cfg Config) (*Node, error) {
 	n.forward = &forwardService{n: n}
 	n.volumes = newVolumeService(n)
 	n.groups = newGroupService(n)
+	n.procs = newProcessService(n)
 	if n.mesh, err = newMeshService(n); err != nil {
 		return nil, err
 	}
