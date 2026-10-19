@@ -9,6 +9,7 @@ mod forward_commands;
 mod guest_commands;
 mod host_commands;
 mod image_commands;
+mod name_table_commands;
 mod pod_commands;
 mod security_group_commands;
 mod tool_commands;
@@ -31,6 +32,8 @@ enum Service {
     /// Security groups: what pods may send and receive
     #[command(alias = "sg")]
     SecurityGroup(security_group_commands::SecurityGroupArgs),
+    /// Name tables: the names the node's resolver answers pods
+    NameTable(name_table_commands::NameTableArgs),
     /// Volumes: disks that outlive the pods they are attached to
     Volume(volume_commands::VolumeArgs),
     Host(host_commands::HostArgs),
@@ -61,6 +64,7 @@ async fn main() -> Result<()> {
         Service::SecurityGroup(args) => {
             security_group_commands::handle_security_group_command(args).await?
         }
+        Service::NameTable(args) => name_table_commands::handle_name_table_command(args).await?,
         Service::Volume(args) => volume_commands::handle_volume_command(args).await?,
         Service::Host(args) => host_commands::handle_host_command(args).await?,
         Service::Image(args) => image_commands::handle_image_command(args).await?,

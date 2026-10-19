@@ -259,7 +259,7 @@ async fn resolver_at(
         ..config
     };
     let resolver = Resolver::new(config);
-    resolver.set_client(address.ip(), POD, upstreams);
+    resolver.set_client(address.ip(), POD, upstreams, Vec::new());
     tokio::spawn(resolver.clone().serve(udp, tcp));
     (resolver, address)
 }
@@ -554,15 +554,20 @@ async fn fails_over_and_fails() {
     assert_eq!(failing.asked(), [asked("v6.test.", RecordType::A, false)]);
 
     // No upstream that answers: SERVFAIL.
-    resolver.set_client(LOOPBACK.into(), POD, vec![silent.address]);
+    resolver.set_client(LOOPBACK.into(), POD, vec![silent.address], Vec::new());
     let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert_eq!(answer.response_code(), ResponseCode::ServFail);
     // Only failures: the last stands.
-    resolver.set_client(LOOPBACK.into(), POD, vec![silent.address, failing.address]);
+    resolver.set_client(
+        LOOPBACK.into(),
+        POD,
+        vec![silent.address, failing.address],
+        Vec::new(),
+    );
     let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert_eq!(answer.response_code(), ResponseCode::ServFail);
     // No upstream at all.
-    resolver.set_client(LOOPBACK.into(), POD, Vec::new());
+    resolver.set_client(LOOPBACK.into(), POD, Vec::new(), Vec::new());
     let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert_eq!(answer.response_code(), ResponseCode::ServFail);
 }
@@ -741,7 +746,7 @@ async fn tells_pods_apart_by_their_ipv4_address() {
     let failing = Upstream::start(IpAddr::V4(LOOPBACK), failure).await;
     let (resolver, server) = resolver(Config::default(), vec![upstream.address]).await;
     let other = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
-    resolver.set_client(other, OTHER_POD, vec![failing.address]);
+    resolver.set_client(other, OTHER_POD, vec![failing.address], Vec::new());
     let mut records = resolver.subscribe();
 
     // Each pod's queries go to its own upstreams, over UDP and TCP.
@@ -790,7 +795,7 @@ async fn knows_ipv4_clients_by_their_ipv4_address() {
     let (resolver, server) = resolver(Config::default(), vec![upstream.address]).await;
     resolver.remove_client(LOOPBACK.into());
     let mapped = IpAddr::V6(LOOPBACK.to_ipv6_mapped());
-    resolver.set_client(mapped, POD, vec![upstream.address]);
+    resolver.set_client(mapped, POD, vec![upstream.address], Vec::new());
     let answer = ask_udp(server, &query("v6.test.", RecordType::A)).await;
     assert_eq!(addresses(&answer), ips(&["1.2.3.6"]));
     resolver.remove_client(mapped);
@@ -812,4 +817,113 @@ async fn serves_ipv6_clients() {
     assert_eq!(addresses(&answer), ips(&["2001:db8::6"]));
     let answer = ask_tcp_from(source, server, &query("v4.test.", RecordType::A)).await;
     assert_eq!(addresses(&answer), ips(&["1.2.3.4", "5.6.7.8"]));
+}
+
+/// The tables of the tests' names: env-1 with web (two replicas) and db
+/// (IPv6 alone), sbx-1 with vite on loopback.
+fn names(tables: &[String], name: &str) -> Option<Vec<IpAddr>> {
+    let mut out = None;
+    for table in tables {
+        out = match (table.as_str(), name.to_ascii_lowercase().as_str()) {
+            ("env-1", "web") => Some(ips(&["fd00::a", "fd00::b"])),
+            ("env-1", "db") => Some(ips(&["fd00::d"])),
+            ("sbx-1", "vite") => Some(ips(&["127.0.0.1", "::1"])),
+            _ => continue,
+        };
+        break;
+    }
+    out
+}
+
+#[tokio::test]
+async fn answers_the_names_of_the_pods_tables() {
+    let upstream = upstream().await;
+    let (resolver, server) = resolver(Config::default(), vec![upstream.address]).await;
+    resolver.set_names(names);
+    let tables = vec!["sbx-1".to_string(), "env-1".to_string()];
+    resolver.set_client(LOOPBACK.into(), POD, vec![upstream.address], tables);
+    let mut records = resolver.subscribe();
+
+    // Every address of a name, in any case, over UDP and TCP, with a short
+    // TTL; never asked upstream.
+    let answer = ask_udp(server, &query("WeB.", RecordType::AAAA)).await;
+    assert_eq!(answer.response_code(), ResponseCode::NoError);
+    assert!(answer.authoritative() && answer.recursion_available());
+    assert_eq!(addresses(&answer), ips(&["fd00::a", "fd00::b"]));
+    assert!(answer
+        .answers()
+        .iter()
+        .all(|record| record.ttl() == NAME_TTL));
+    assert_eq!(
+        answer.answers()[0].name(),
+        &name("WeB."),
+        "the query's case"
+    );
+    let answer = ask_tcp(server, &query("vite.", RecordType::A)).await;
+    assert_eq!(addresses(&answer), ips(&["127.0.0.1"]));
+    let answer = ask_udp(server, &query("vite.", RecordType::AAAA)).await;
+    assert_eq!(addresses(&answer), ips(&["::1"]));
+    // A name of the tables has nothing of another type: NODATA.
+    for record_type in [RecordType::A, RecordType::HTTPS, RecordType::MX] {
+        let answer = ask_udp(server, &query("db.", record_type)).await;
+        assert_eq!(
+            answer.response_code(),
+            ResponseCode::NoError,
+            "{record_type}"
+        );
+        assert!(answer.answers().is_empty(), "{record_type}");
+    }
+    assert!(upstream.asked().is_empty());
+    // Each answer is recorded.
+    let record = records.try_recv().unwrap();
+    let Some(traffic_record::Record::Dns(dns)) = record.record else {
+        panic!("not a DNS record: {record:?}");
+    };
+    assert_eq!((dns.name.as_str(), dns.r#type), ("web", 28));
+    assert_eq!(dns.addresses, ["fd00::a", "fd00::b"]);
+
+    // Other names go upstream as before: one not in the tables, one of
+    // more labels, and one in another table than the pod's.
+    let answer = ask_udp(server, &query("v6.test.", RecordType::AAAA)).await;
+    assert_eq!(addresses(&answer), ips(&["2001:db8::6"]));
+    let answer = ask_udp(server, &query("web.test.", RecordType::AAAA)).await;
+    assert!(answer.answers().is_empty());
+    let answer = ask_udp(server, &query("other.", RecordType::AAAA)).await;
+    assert_eq!(answer.response_code(), ResponseCode::NXDomain);
+    resolver.set_client(
+        LOOPBACK.into(),
+        POD,
+        vec![upstream.address],
+        vec!["env-1".to_string()],
+    );
+    let answer = ask_udp(server, &query("vite.", RecordType::A)).await;
+    assert_eq!(answer.response_code(), ResponseCode::NXDomain);
+    assert_eq!(
+        upstream.asked(),
+        [
+            asked("v6.test.", RecordType::AAAA, false),
+            asked("web.test.", RecordType::AAAA, false),
+            asked("other.", RecordType::AAAA, false),
+            asked("vite.", RecordType::A, false),
+        ]
+    );
+    // A pod without tables asks upstream for every name.
+    resolver.set_client(LOOPBACK.into(), POD, vec![upstream.address], Vec::new());
+    let answer = ask_udp(server, &query("web.", RecordType::AAAA)).await;
+    assert_eq!(answer.response_code(), ResponseCode::NXDomain);
+}
+
+#[tokio::test]
+async fn without_a_lookup_no_pod_has_names() {
+    let upstream = upstream().await;
+    let (resolver, server) = resolver(Config::default(), vec![upstream.address]).await;
+    resolver.set_client(
+        LOOPBACK.into(),
+        POD,
+        vec![upstream.address],
+        vec!["env-1".to_string()],
+    );
+    let answer = ask_udp(server, &query("web.", RecordType::AAAA)).await;
+    assert_eq!(answer.response_code(), ResponseCode::NXDomain);
+    assert_eq!(upstream.asked(), [asked("web.", RecordType::AAAA, false)]);
 }

@@ -6,8 +6,9 @@
 //! of the node's link-local range for leaving through masquerade. Both are
 //! routed to its TAP device, a link of its own between the node and the
 //! pod, on which the node is `fe80::1` and answers ARP for `169.254.0.1`
-//! by proxy. Names go through feosd's resolver; the pods' security groups
-//! become nftables rules; and their traffic becomes records. Where the
+//! by proxy. Names go through feosd's resolver, which answers those of the
+//! pods' name tables itself; the pods' security groups become nftables
+//! rules; and their traffic becomes records. Where the
 //! network routes the node no prefix, the node's prefix is a /64 of the
 //! cluster's mesh (ADR 0017), which the control plane gives it, maybe after
 //! feosd started: the network comes up then.
@@ -32,7 +33,7 @@ use feos_utils::listen_fds;
 use feos_utils::nft::{self, Family, Table};
 use log::{error, info, warn};
 use mesh::Mesh;
-use network_service::{compile, delta, Delta, Policy, Prefix, SecurityGroups};
+use network_service::{compile, delta, Delta, NameTables, Policy, Prefix, SecurityGroups};
 use rtnetlink::Handle;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -251,6 +252,9 @@ fn pod_network(info: &PodInfo) -> PodNetwork {
 pub struct Network {
     config: Config,
     groups: SecurityGroups,
+    /// The name tables, from which the resolver answers the pods that name
+    /// them.
+    names: NameTables,
     records: broadcast::Sender<TrafficRecord>,
     /// The pods' directory, which keeps their addresses.
     dir: PathBuf,
@@ -308,6 +312,7 @@ impl Network {
         sockets: Vec<(OwnedFd, String)>,
         dir: &Path,
         groups: SecurityGroups,
+        names: NameTables,
         records: broadcast::Sender<TrafficRecord>,
     ) -> Self {
         let resolver = SocketAddr::new(config.dns_address.into(), DNS_PORT);
@@ -340,18 +345,20 @@ impl Network {
         }
         let parts = OnceLock::new();
         match prefix {
-            Some(prefix) => match set_up_again(&config, prefix, dir, &records, &mut handed).await {
-                Ok(set_up) => {
-                    log_set_up(&config, prefix);
-                    let _ = parts.set(set_up);
-                }
-                Err(e) => {
-                    error!(
+            Some(prefix) => {
+                match set_up_again(&config, prefix, dir, &names, &records, &mut handed).await {
+                    Ok(set_up) => {
+                        log_set_up(&config, prefix);
+                        let _ = parts.set(set_up);
+                    }
+                    Err(e) => {
+                        error!(
                         "Network: The pods' network is not set up, pods with a network fail: {e}"
                     );
-                    unready = format!("the pods' network is not set up: {e}");
+                        unready = format!("the pods' network is not set up: {e}");
+                    }
                 }
-            },
+            }
             None => {
                 if let Err(e) = remove_old_network(true, dir).await {
                     warn!("Network: Failed to remove the IPv4 network: {e}");
@@ -368,6 +375,7 @@ impl Network {
         Self {
             config,
             groups,
+            names,
             records,
             dir: dir.to_path_buf(),
             parts,
@@ -387,6 +395,10 @@ impl Network {
 
     pub fn groups(&self) -> &SecurityGroups {
         &self.groups
+    }
+
+    pub fn names(&self) -> &NameTables {
+        &self.names
     }
 
     /// The parts, if the network works.
@@ -462,8 +474,15 @@ impl Network {
             None => {
                 let mut handed = std::mem::take(&mut *lock(&self.handed));
                 let prefix = assignment.pod_prefix;
-                match set_up_again(&self.config, prefix, &self.dir, &self.records, &mut handed)
-                    .await
+                match set_up_again(
+                    &self.config,
+                    prefix,
+                    &self.dir,
+                    &self.names,
+                    &self.records,
+                    &mut handed,
+                )
+                .await
                 {
                     Ok(parts) => {
                         log_set_up(&self.config, prefix);
@@ -517,14 +536,23 @@ impl Network {
         *lock(&self.broken) = Some(reason);
     }
 
-    /// Checks the network of a pod's spec: its security groups' IDs and
-    /// its upstream resolvers.
+    /// Checks the network of a pod's spec: its security groups' and name
+    /// tables' IDs, each table named once, and its upstream resolvers.
     pub fn check(&self, spec: &PodSpec) -> Result<(), Status> {
         let Some(network) = &spec.network else {
             return Ok(());
         };
         for id in &network.security_groups {
             network_service::check_id(id)?;
+        }
+        let mut tables = HashSet::new();
+        for id in &network.name_tables {
+            network_service::check_table_id(id)?;
+            if !tables.insert(id) {
+                return Err(Status::invalid_argument(format!(
+                    "name table {id} is named twice"
+                )));
+            }
         }
         self.upstreams(network)?;
         Ok(())
@@ -722,17 +750,22 @@ impl Network {
             let Ok(address) = pod.ipv4_address.parse::<Ipv4Addr>() else {
                 continue;
             };
-            match self.upstreams(&pod_network(pod)) {
-                Ok(upstreams) => parts
-                    .resolver
-                    .set_client(address.into(), &pod.pod_id, upstreams),
+            let network = pod_network(pod);
+            match self.upstreams(&network) {
+                Ok(upstreams) => parts.resolver.set_client(
+                    address.into(),
+                    &pod.pod_id,
+                    upstreams,
+                    network.name_tables,
+                ),
                 Err(e) => warn!("Network: Pod {} gets no DNS: {}", pod.pod_id, e.message()),
             }
         }
     }
 
     /// Puts the pod on the network, if it has one: before every boot and
-    /// resume. Fails if the node does not have the pod's security groups.
+    /// resume. Fails if the node does not have the pod's security groups or
+    /// name tables.
     pub async fn attach(&self, info: &PodInfo) -> Result<Option<Attachment>, Status> {
         if !has_network(info) {
             return Ok(None);
@@ -767,6 +800,13 @@ impl Network {
                 missing.join(", ")
             )));
         }
+        let missing = self.names.missing(&network.name_tables);
+        if !missing.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "the node does not have the name tables {}",
+                missing.join(", ")
+            )));
+        }
         let upstreams = self
             .upstreams(&network)
             .map_err(|e| Status::failed_precondition(e.message()))?;
@@ -784,7 +824,9 @@ impl Network {
         devices::tap(&handle, &tap, &link)
             .await
             .map_err(|e| Status::internal(format!("attach {tap}: {e}")))?;
-        parts.resolver.set_client(ipv4.into(), pod_id, upstreams);
+        parts
+            .resolver
+            .set_client(ipv4.into(), pod_id, upstreams, network.name_tables);
         Ok(Some(Attachment {
             tap,
             mac: mac(pod_id),
@@ -965,6 +1007,7 @@ async fn set_up(
     config: &Config,
     (prefix, len): (Ipv6Addr, u8),
     dir: &Path,
+    names: &NameTables,
     records: &broadcast::Sender<TrafficRecord>,
     handed: &mut Handed,
 ) -> io::Result<Parts> {
@@ -983,6 +1026,8 @@ async fn set_up(
             .collect(),
         ..Default::default()
     });
+    let tables = names.clone();
+    resolver.set_names(move |ids, name| tables.lookup(ids, name));
     let address = SocketAddr::new(config.dns_address.into(), DNS_PORT);
     let udp = match handed.0.take() {
         Some(socket) => {
@@ -1039,12 +1084,13 @@ async fn set_up_again(
     config: &Config,
     prefix: (Ipv6Addr, u8),
     dir: &Path,
+    names: &NameTables,
     records: &broadcast::Sender<TrafficRecord>,
     handed: &mut Handed,
 ) -> io::Result<Parts> {
     let mut attempt = 1;
     loop {
-        match set_up(config, prefix, dir, records, handed).await {
+        match set_up(config, prefix, dir, names, records, handed).await {
             Err(e) if attempt < SET_UP_ATTEMPTS => {
                 warn!("Network: Setting the pods' network up failed, trying again: {e}");
                 attempt += 1;
@@ -1261,10 +1307,12 @@ mod tests {
 
     fn network(config: Config) -> Network {
         let dir = tempfile::tempdir().unwrap();
-        let groups = SecurityGroups::open(dir.path()).unwrap();
+        let groups = SecurityGroups::open(dir.path().join("groups")).unwrap();
+        let names = NameTables::open(dir.path().join("names")).unwrap();
         Network {
             config,
             groups,
+            names,
             records: broadcast::channel(4).0,
             dir: dir.path().to_path_buf(),
             parts: OnceLock::new(),
@@ -1439,6 +1487,18 @@ mod tests {
             ..Default::default()
         };
         assert!(network.check(&spec).is_err(), "a bad group ID");
+        let tables = |ids: &[&str]| PodSpec {
+            network: Some(PodNetwork {
+                name_tables: ids.iter().map(|id| id.to_string()).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        network.check(&tables(&["env-1", "sbx-1"])).unwrap();
+        for bad in [&["a/b"][..], &["env-1", "env-1"], &[""]] {
+            let error = network.check(&tables(bad)).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument, "{bad:?}");
+        }
     }
 
     #[test]

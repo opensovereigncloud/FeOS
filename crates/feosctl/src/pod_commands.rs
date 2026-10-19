@@ -133,6 +133,14 @@ pub struct CreatePodOptions {
     security_groups: Vec<String>,
 
     #[arg(
+        long = "name-table",
+        value_name = "ID",
+        conflicts_with = "no_network",
+        help = "A name table whose names the node's resolver answers the pod (repeatable)"
+    )]
+    name_tables: Vec<String>,
+
+    #[arg(
         long = "dns-upstream",
         value_name = "ADDRESS",
         conflicts_with = "no_network",
@@ -302,10 +310,14 @@ fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
             none: true,
             ..Default::default()
         })
-    } else if !opts.security_groups.is_empty() || !opts.dns_upstreams.is_empty() {
+    } else if !opts.security_groups.is_empty()
+        || !opts.dns_upstreams.is_empty()
+        || !opts.name_tables.is_empty()
+    {
         Some(PodNetwork {
             security_groups: opts.security_groups,
             dns_upstreams: opts.dns_upstreams,
+            name_tables: opts.name_tables,
             ..Default::default()
         })
     } else {
@@ -467,6 +479,9 @@ fn print_pod(pod: &PodInfo) {
     }
     if !network.dns_upstreams.is_empty() {
         println!("  DNS upstreams: {}", network.dns_upstreams.join(", "));
+    }
+    if !network.name_tables.is_empty() {
+        println!("  Name tables: {}", network.name_tables.join(", "));
     }
     for (key, value) in &spec.labels {
         println!("  Label: {key}={value}");
@@ -762,6 +777,8 @@ mod tests {
             "db",
             "--dns-upstream",
             "2620:fe::fe",
+            "--name-table",
+            "env-1",
         ])
         .unwrap();
         let PodCommand::Create(opts) = cli.command else {
@@ -770,6 +787,7 @@ mod tests {
         let network = create_pod_request(*opts).spec.unwrap().network.unwrap();
         assert_eq!(network.security_groups, ["web", "db"]);
         assert_eq!(network.dns_upstreams, ["2620:fe::fe"]);
+        assert_eq!(network.name_tables, ["env-1"]);
         assert!(!network.none);
         assert!(
             Cli::try_parse_from(["pod", "create", "--no-network", "--security-group", "web"])

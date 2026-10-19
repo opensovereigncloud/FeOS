@@ -68,9 +68,11 @@ pub(crate) async fn initialize_pod_service(
     pod_service::Pods,
     pod_service::Volumes,
     network_service::SecurityGroups,
+    network_service::NameTables,
     traffic_service::TrafficApi,
 )> {
     let groups = network_service::SecurityGroups::open(network_service::SECURITY_GROUP_DIR)?;
+    let names = network_service::NameTables::open(network_service::NAME_TABLE_DIR)?;
     // Flows, drops and server names, and the resolver's queries, for
     // TrafficService.
     let (records, _) = tokio::sync::broadcast::channel(pod_service::network::RECORDS);
@@ -80,6 +82,7 @@ pub(crate) async fn initialize_pod_service(
         dns_sockets,
         dir,
         groups.clone(),
+        names.clone(),
         records.clone(),
     )
     .await;
@@ -97,6 +100,7 @@ pub(crate) async fn initialize_pod_service(
         pods,
         volumes,
         groups,
+        names,
         traffic_service::TrafficApi::new(records),
     ))
 }

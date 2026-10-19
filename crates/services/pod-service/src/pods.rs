@@ -294,6 +294,11 @@ impl Pods {
             weak.upgrade()
                 .is_some_and(|inner| Pods { inner }.names_group(id))
         });
+        let weak = Arc::downgrade(&pods.inner);
+        pods.inner.network.names().set_in_use(move |id| {
+            weak.upgrade()
+                .is_some_and(|inner| Pods { inner }.names_table(id))
+        });
         for pod_id in running {
             if let Err(e) = pods.reattach(&pod_id).await {
                 warn!("Pods: {pod_id} runs without its network: {}", e.message());
@@ -1444,6 +1449,18 @@ impl Pods {
         })
     }
 
+    /// Whether a pod on the node names the name table.
+    fn names_table(&self, id: &str) -> bool {
+        self.pods().values().any(|pod| {
+            let network = pod
+                .info
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.network.as_ref());
+            network.is_some_and(|network| network.name_tables.iter().any(|t| t == id))
+        })
+    }
+
     /// Puts a pod that runs from before feosd started on the network again.
     async fn reattach(&self, pod_id: &str) -> Result<(), Status> {
         let attachment = self.attach(pod_id).await?;
@@ -1917,7 +1934,7 @@ impl Pods {
     /// Puts the pod on the network, if it has one: its TAP device, its
     /// routes, proxy ARP for its gateway and the resolver, before every
     /// boot and resume. Fails while the node does not have the pod's
-    /// security groups.
+    /// security groups or name tables.
     async fn attach(&self, pod_id: &str) -> Result<Option<Attachment>, Status> {
         self.inner.network.attach(&self.info(pod_id)?).await
     }
