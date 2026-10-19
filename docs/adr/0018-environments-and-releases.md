@@ -258,8 +258,9 @@ not of an environment.
   application gets the client's `Authorization` as it was sent, unless
   that holds a tenant's or a sandbox's token, which the door refuses
   rather than pass on; a client that sends the route token as its bearer
-  token gets no `Authorization` through. FeCode serves an environment on a host of its own and
-  forwards to the door with the environment's token in that header.
+  token gets no `Authorization` through. FeCode serves an environment
+  on a host of its own and forwards to the door with the environment's
+  token in that header.
 
 ### An environment is copied from a release
 

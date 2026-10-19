@@ -1448,9 +1448,9 @@ run of such a job by another release that ended after R started (the
 present while one runs), unless a run of R's template of the job had
 succeeded before R started. The shift is worked out on every step, so
 that R keeps it once its jobs are done; the reason names the time R had
-from its own start. A release without a sealer is spared. An instance pending without capacity for 2 minutes
-opens `no_capacity`, with the placement's text, which closes once it
-places.
+from its own start. A release without a sealer is spared. An instance
+pending without capacity for 2 minutes opens `no_capacity`, with the
+placement's text, which closes once it places.
 
 ### Probes, exits and restarts
 
@@ -1677,8 +1677,8 @@ Kubernetes binding's port refused. `X-FeRun-Route-Token` and
 `X-FeRun-Route-Token` the client's `Authorization` reaches the upstream
 unchanged, unless a bearer token in it (in any of its values, the scheme
 in any case) is a FeRun credential, a tenant's or a sandbox's token,
-which is 401 "route token required" with nothing forwarded; with the token from `Authorization`
-that stops too. A failure
+which is 401 "route token required" with nothing forwarded; with the
+token from `Authorization` that stops too. A failure
 inside ferund (the database, a stored spec that does not parse) is 500
 "the route door failed", its cause only in the log, since the door
 serves anonymous clients; a refusal below 500 keeps its text.
@@ -1770,16 +1770,17 @@ each blueprint against its image in docker, as FeOS would start it.
 `GET /api/v1/environments/{env}` answers the environment, its rollout
 (the latest release's state, start and reason), its objects as the
 target release has them (an image service with desired and ready counts,
-the ready ones its live instances, and its instances, an addon with type, version, plan, phase and
-`provisioned`, a job with its last run, an attached service with its
-sandbox, phase, restarts and last exit; `starting` before an object has
-an instance), its routes (of the realised release, else the latest) and
-the number of open incidents. An incident has its object, release,
-condition, summary, opening and closing, and evidence: `exits`,
-`logTail` (redacted and bounded), `diff` (since the realised release),
-`placement`, and `pending`, what a release past its deadline still
-waited for with the details of those objects' instances, credentials
-redacted. A failed release's reason is its incident's summary.
+the ready ones its live instances, and its instances, an addon with
+type, version, plan, phase and `provisioned`, a job with its last run,
+an attached service with its sandbox, phase, restarts and last exit;
+`starting` before an object has an instance), its routes (of the
+realised release, else the latest) and the number of open incidents. An
+incident has its object, release, condition, summary, opening and
+closing, and evidence: `exits`, `logTail` (redacted and bounded), `diff`
+(since the realised release), `placement`, and `pending`, what a release
+past its deadline still waited for with the details of those objects'
+instances, credentials redacted. A failed release's reason is its
+incident's summary.
 
 ### The environments' REST API
 
