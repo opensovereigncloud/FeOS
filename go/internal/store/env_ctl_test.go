@@ -182,6 +182,34 @@ func TestEnvCtlQueries(t *testing.T) {
 		t.Fatalf("volumes by no id %+v %v", byID, err)
 	}
 
+	// A touched deleting environment goes to the end of the deleting
+	// ones; one that is not deleting is not touched.
+	exec(t, s, `UPDATE environments SET deleting = true, updated_at = now() - interval '1 minute' WHERE id IN ($1, $2)`,
+		env.ID, other.ID)
+	first := env.ID
+	if other.ID.String() < env.ID.String() {
+		first = other.ID
+	}
+	if d, err := s.DeletingEnvironments(bg, 10); err != nil || len(d) != 2 || d[0].ID != first {
+		t.Fatalf("deleting environments %+v %v", d, err)
+	}
+	if err := s.EnvCtlTouchEnvironment(bg, first); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.DeletingEnvironments(bg, 10); err != nil || len(d) != 2 || d[1].ID != first {
+		t.Fatalf("deleting environments after a touch %+v %v", d, err)
+	}
+	if d, err := s.DeletingEnvironments(bg, 1); err != nil || len(d) != 1 || d[0].ID == first {
+		t.Fatalf("the first deleting environment after a touch %+v %v", d, err)
+	}
+	live := mkEnv(t, s, "acme", "live")
+	if err := s.EnvCtlTouchEnvironment(bg, live.ID); err != store.ErrNoRow {
+		t.Fatalf("touch an environment that is not deleting: %v", err)
+	}
+	if err := s.EnvCtlTouchEnvironment(bg, uuid.New()); err != store.ErrNoRow {
+		t.Fatalf("touch an environment that is not there: %v", err)
+	}
+
 	// Which environments and sandboxes exist.
 	gone := uuid.New()
 	envs, sbs, err := s.EnvCtlExisting(bg, []uuid.UUID{env.ID, gone}, []uuid.UUID{sbx.ID, gone})

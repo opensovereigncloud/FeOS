@@ -124,6 +124,20 @@ func (s *Store) EnvCtlTouchVolume(ctx context.Context, envID uuid.UUID, object s
 	return nil
 }
 
+// EnvCtlTouchEnvironment sets a deleting environment's updated_at to
+// now(), so that one whose deletion has to wait goes to the end of
+// DeletingEnvironments's order; ErrNoRow when it is gone or not deleting.
+func (s *Store) EnvCtlTouchEnvironment(ctx context.Context, id uuid.UUID) error {
+	ct, err := s.q.Exec(ctx, `UPDATE environments SET updated_at = now() WHERE id = $1 AND deleting`, id)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNoRow
+	}
+	return nil
+}
+
 // EnvCtlStarved returns the instance rows of the environment that have
 // been pending without capacity (a description beginning "no capacity")
 // for at least after, by the database's clock: their ids and

@@ -229,10 +229,11 @@ func (s *Store) ListEnvironments(ctx context.Context, owner string, labels map[s
 }
 
 // DeletingEnvironments returns up to limit environments being deleted,
-// oldest first.
+// the least recently written (or touched, EnvCtlTouchEnvironment) first,
+// so that those whose deletion waits never hold the others back.
 func (s *Store) DeletingEnvironments(ctx context.Context, limit int) ([]Environment, error) {
 	return collectEnvironments(s.q.Query(ctx, "SELECT "+environmentCols+` FROM environments
-		WHERE deleting ORDER BY created_at, id LIMIT $1`, limit))
+		WHERE deleting ORDER BY updated_at, id LIMIT $1`, limit))
 }
 
 // UpdateEnvironment writes the columns in which after differs from before,
