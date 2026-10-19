@@ -277,27 +277,199 @@ func TestAddonVolumeUnavailable(t *testing.T) {
 	}
 }
 
-// An addon whose pod a node that is up no longer has is lost, never
-// replaced; its incident names that node (the row's lost_from is empty
-// then, its node is set).
+// cacheWebSpec is a valkey addon and a service web that renders its URL.
+func cacheWebSpec() string {
+	return fmt.Sprintf(`{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev"}},
+		"services":{"web":{"image":%q,"env":{"CACHE":{"addon":"cache","key":"url"}}}}}`, testImage)
+}
+
+// An addon whose pod a node that is up no longer has (its row lost with
+// lost_from empty) is replaced on that node once the node reports the
+// volume free (§13.7): the new row is pinned there and holds the same
+// volume, and its new address rolls the dependents.
 func TestAddonLostOnLiveNode(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, cacheWebSpec())
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	web := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+	if err != nil || vol.Node != "n1" || vol.Holder != first.Sandbox.ID {
+		t.Fatalf("volume %+v %v", vol, err)
+	}
+	if err := n1.Script().ForgetPod(first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	// A pod that is not ferund's takes the lost pod's address (the test
+	// node hands out the lowest free one), so that the new addon's differs.
+	if _, err := podv1.NewPodServiceClient(h.conn("n1")).CreatePod(bg, &podv1.CreatePodRequest{PodId: uuid.NewString(),
+		Spec: &podv1.PodSpec{
+			Resources:  &podv1.Resources{Vcpus: 1, MemoryMib: 256},
+			Containers: []*podv1.ContainerSpec{{Name: "main", ImageRef: testImage, Command: []string{"sleep", "infinity"}}},
+			Network:    &podv1.PodNetwork{},
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.eng.Sync(bg, first.Sandbox.ID); err != nil { // finds it lost, sooner than the engine's loops
+		t.Fatal(err)
+	}
+	second := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 60*time.Second, "replaced and ready", func(r store.EnvInstanceRow) bool {
+		return r.Sandbox.ID != first.Sandbox.ID && ready(r)
+	})[0]
+	if second.Sandbox.Node != "n1" || second.Sandbox.PinNode != "n1" || second.Sandbox.Address == first.Sandbox.Address {
+		t.Errorf("the new addon on %s, pinned to %s, address %s (was %s)", second.Sandbox.Node, second.Sandbox.PinNode,
+			second.Sandbox.Address, first.Sandbox.Address)
+	}
+	if _, err := h.st.GetSandbox(bg, first.Sandbox.ID); err == nil {
+		t.Error("the lost row stays")
+	}
+	if v2, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache"); err != nil || v2.VolumeID != vol.VolumeID ||
+		v2.Holder != second.Sandbox.ID || v2.Node != "n1" {
+		t.Errorf("volume %+v %v", v2, err)
+	}
+	if nv := n1.Volumes(); len(nv) != 1 || nv[0].VolumeId != vol.VolumeID.String() || nv[0].PodId != second.Sandbox.ID.String() {
+		t.Errorf("the node's volumes %v", nv)
+	}
+	eventually(t, 60*time.Second, "web rolled to the new address", func() bool {
+		rows := h.rowsOf(env.ID, spec.KindService, "web")
+		if len(rows) != 1 || rows[0].Sandbox.ID == web.Sandbox.ID || !ready(rows[0]) {
+			return false
+		}
+		p := h.pod("n1", rows[0].Sandbox.ID)
+		return p != nil && strings.Contains(p.Spec.Containers[0].Env["CACHE"], "["+second.Sandbox.Address+"]")
+	})
+	for _, i := range h.incidents(env.ID, false) {
+		if i.Condition == model.ConditionVolumeUnavailable {
+			t.Errorf("incident %+v", i)
+		}
+	}
+}
+
+// A lost addon on a node that is up, with its volume free there, is
+// recreated there when a new release changes its template, as a lost one
+// is replaced: R does not wait for it to run again, which it never would.
+func TestAddonLostOnLiveNodeRecreated(t *testing.T) {
 	h := newHarness(t, options{})
 	n1 := h.addNode("n1")
 	env := h.newEnv("stage")
 	r1 := h.apply(env.ID, valkeySpec)
 	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
 	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The node loses the pod, and the next release changes the addon's
+	// template before the step replaced it.
+	h.exec(`UPDATE nodes SET draining = true WHERE name = 'n1'`) // no replacement for now
 	if err := n1.Script().ForgetPod(first.Sandbox.ID); err != nil {
 		t.Fatal(err)
 	}
+	if err := h.eng.Sync(bg, first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	if sb, _ := h.st.GetSandbox(bg, first.Sandbox.ID); sb.ClientState != model.StateLost {
+		t.Fatalf("the addon is %s after the sync", sb.ClientState)
+	}
+	r2 := h.apply(env.ID, `{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev",
+		"options":{"maxmemoryPolicy":"allkeys-lru"}}}}`)
+	h.exec(`UPDATE nodes SET draining = false, drain_started_at = NULL WHERE name = 'n1'`)
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 60*time.Second)
+	second := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	if second.Sandbox.ID == first.Sandbox.ID || second.Sandbox.Node != "n1" || second.Sandbox.PinNode != "n1" ||
+		second.Instance.TemplateHash == first.Instance.TemplateHash || second.Instance.Release != r2 {
+		t.Errorf("the recreated addon %+v / %+v", second.Instance, second.Sandbox)
+	}
+	if v2, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache"); err != nil || v2.VolumeID != vol.VolumeID ||
+		v2.Holder != second.Sandbox.ID {
+		t.Errorf("volume %+v %v", v2, err)
+	}
+	if nv := n1.Volumes(); len(nv) != 1 || nv[0].PodId != second.Sandbox.ID.String() {
+		t.Errorf("the node's volumes %v", nv)
+	}
+}
+
+// A lost addon whose node is up is not replaced while that node does not
+// have its volume, or has it attached to another pod: the row stays lost
+// and volume_unavailable says what the node answered; the volume is left
+// alone. Once the volume is free there, the addon is replaced.
+func TestAddonLostOnLiveNodeVolumeHeld(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	first := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	vol, err := h.st.GetEnvVolume(bg, env.ID, "addon/cache")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The node loses the pod, and another pod (not ferund's) takes the
+	// volume before anyone asks for it.
+	gate := make(chan struct{})
+	n1.Script().SetHook(volumev1.VolumeService_GetVolume_FullMethodName, func(ctx context.Context, _ string, _ any) error {
+		select {
+		case <-gate:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	if err := n1.Script().ForgetPod(first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	other := uuid.New()
+	pc := podv1.NewPodServiceClient(h.conn("n1"))
+	if _, err := pc.CreatePod(bg, &podv1.CreatePodRequest{PodId: other.String(), Spec: &podv1.PodSpec{
+		Resources:  &podv1.Resources{Vcpus: 1, MemoryMib: 256},
+		Containers: []*podv1.ContainerSpec{{Name: "main", ImageRef: testImage, Command: []string{"sleep", "infinity"}}},
+		Volumes:    []*podv1.PodVolume{{Name: "data", VolumeId: vol.VolumeID.String()}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+	if err := h.eng.Sync(bg, first.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
 	inc := h.incident(env.ID, "addon/cache", model.ConditionVolumeUnavailable, 60*time.Second)
-	if inc.Summary != "addon cache is lost with node n1, which has its volume" {
-		t.Errorf("incident %+v", inc)
+	want := fmt.Sprintf("addon cache is lost on node n1 and not replaced there: volume %s is attached to pod %s there",
+		vol.VolumeID, other)
+	if inc.Summary != want {
+		t.Errorf("incident %q, want %q", inc.Summary, want)
 	}
-	rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
-	if len(rows) != 1 || rows[0].Sandbox.ID != first.Sandbox.ID || rows[0].Sandbox.ClientState != model.StateLost {
-		t.Fatalf("rows %+v", rows)
+	never(t, 3*time.Second, "the lost addon replaced", func() bool {
+		rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+		return len(rows) != 1 || rows[0].Sandbox.ID != first.Sandbox.ID || rows[0].Sandbox.ClientState != model.StateLost
+	})
+	if nv := n1.Volumes(); len(nv) != 1 || nv[0].PodId != other.String() {
+		t.Errorf("the node's volumes %v", nv)
 	}
+
+	// The other pod goes, and the node loses the volume: still not
+	// replaced.
+	n1.Script().SetHook(volumev1.VolumeService_GetVolume_FullMethodName, func(context.Context, string, any) error {
+		return status.Error(codes.NotFound, "no volume "+vol.VolumeID.String())
+	})
+	if _, err := pc.DeletePod(bg, &podv1.DeletePodRequest{PodId: other.String()}); err != nil {
+		t.Fatal(err)
+	}
+	never(t, 3*time.Second, "the lost addon replaced without its volume", func() bool {
+		rows := h.rowsOf(env.ID, spec.KindAddon, "cache")
+		return len(rows) != 1 || rows[0].Sandbox.ID != first.Sandbox.ID
+	})
+
+	// The volume is free there: the addon is replaced with it, and the
+	// incident closes.
+	n1.Script().SetHook(volumev1.VolumeService_GetVolume_FullMethodName, nil)
+	second := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 60*time.Second, "replaced and ready", func(r store.EnvInstanceRow) bool {
+		return r.Sandbox.ID != first.Sandbox.ID && ready(r)
+	})[0]
+	if nv := n1.Volumes(); len(nv) != 1 || nv[0].PodId != second.Sandbox.ID.String() {
+		t.Errorf("the node's volumes %v", nv)
+	}
+	eventually(t, 30*time.Second, "the incident closed", func() bool { return len(h.incidents(env.ID, true)) == 0 })
 }
 
 // An addon counts as ready only while its row runs (§13.7): with its
