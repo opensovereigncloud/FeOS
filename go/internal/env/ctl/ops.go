@@ -275,9 +275,9 @@ func (c *Controller) unrestart(ctx context.Context, before store.EnvInstance) {
 }
 
 // waitReady waits until an instance is live again (true: its phase ready
-// and its row running without an op, or for a service that idles, idles,
-// paused or hibernated without one), or gone, or restartReady passed
-// (false).
+// and its row running without an op, or, for a service that idles
+// (idles), paused or hibernated without one), or gone, or restartReady
+// passed (false).
 func (c *Controller) waitReady(ctx context.Context, id uuid.UUID, idles bool) bool {
 	deadline := time.Now().Add(c.t.restartReady)
 	for time.Now().Before(deadline) {
