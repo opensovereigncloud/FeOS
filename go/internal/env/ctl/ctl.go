@@ -254,6 +254,9 @@ type Controller struct {
 	// still exited is the same run, whose restart did not happen (a leader
 	// change forgets it: at most one exit too many).
 	exitRun map[uuid.UUID]int64
+	// cleanWaits is the backoff of the attached services' cleanups that
+	// failed, by pool key (made when first needed).
+	cleanWaits map[string]cleanWait
 }
 
 // New returns the controller of an instance.

@@ -6,10 +6,12 @@ package tools
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -175,7 +177,7 @@ func TestProcessDetached(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ps, err := r.ProcessesDetached(bg, lease)
+	ps, err := r.ProcessesDetached(bg, lease, "")
 	if err != nil || len(ps) != 1 || ps[0].ID != id || ps[0].Name != "ferun-env-stage-web" || !ps[0].Running ||
 		ps[0].ExitCode != nil {
 		t.Fatalf("processes %+v, %v", ps, err)
@@ -209,7 +211,7 @@ func TestProcessDetached(t *testing.T) {
 	if err := r.StopProcessDetached(bg, lease, id); err != nil {
 		t.Fatal(err)
 	}
-	ps, err = r.ProcessesDetached(bg, lease)
+	ps, err = r.ProcessesDetached(bg, lease, "")
 	if err != nil || len(ps) != 1 || ps[0].Running {
 		t.Fatalf("after the stop: %+v, %v", ps, err)
 	}
@@ -225,7 +227,7 @@ func TestProcessDetached(t *testing.T) {
 	deadline = time.Now().Add(10 * time.Second)
 	var code *int
 	for time.Now().Before(deadline) && code == nil {
-		ps, err = r.ProcessesDetached(bg, lease)
+		ps, err = r.ProcessesDetached(bg, lease, "")
 		for _, p := range ps {
 			if p.ID == short && !p.Running {
 				code = p.ExitCode
@@ -292,14 +294,14 @@ func TestProcessDetachedFakeProcesses(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(env.Node.PodDir(lease.SandboxID), "app"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if ps, err := r.ProcessesDetached(bg, lease); err != nil || len(ps) != 0 {
+	if ps, err := r.ProcessesDetached(bg, lease, ""); err != nil || len(ps) != 0 {
 		t.Fatalf("no processes yet: %+v, %v", ps, err)
 	}
 	id, err := r.StartProcessDetached(bg, lease, ProcessStart{Argv: []string{"npm", "run", "dev"}, Cwd: "/app", Name: "ferun-env-stage-web"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ps, err := r.ProcessesDetached(bg, lease)
+	ps, err := r.ProcessesDetached(bg, lease, "")
 	if err != nil || len(ps) != 1 || ps[0].ID != id || ps[0].Name != "ferun-env-stage-web" || !ps[0].Running || ps[0].ExitCode != nil {
 		t.Fatalf("processes %+v, %v", ps, err)
 	}
@@ -309,7 +311,7 @@ func TestProcessDetachedFakeProcesses(t *testing.T) {
 	if err := r.StopProcessDetached(bg, lease, id); err != nil {
 		t.Fatal(err)
 	}
-	if ps, err = r.ProcessesDetached(bg, lease); err != nil || len(ps) != 1 || ps[0].Running || ps[0].ExitCode != nil {
+	if ps, err = r.ProcessesDetached(bg, lease, ""); err != nil || len(ps) != 1 || ps[0].Running || ps[0].ExitCode != nil {
 		t.Fatalf("after the stop: %+v, %v", ps, err)
 	}
 	if err := r.StopProcessDetached(bg, lease, id); err != nil {
@@ -320,5 +322,144 @@ func TestProcessDetachedFakeProcesses(t *testing.T) {
 	}
 	if err := r.StopProcessDetached(bg, lease, "000000-abcdef"); !errors.Is(err, ErrNoProcess) {
 		t.Errorf("the stop of an unknown process: %v", err)
+	}
+}
+
+// seedRecord writes a process record under root as the start script
+// does, for a process that is over: files holds the record's files.
+func seedRecord(t *testing.T, root, id string, files map[string]string) {
+	t.Helper()
+	d := filepath.Join(root, id)
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range files {
+		if err := os.WriteFile(filepath.Join(d, k), []byte(v), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A detached start removes the records of the processes of its name that
+// are over (exited, or stopped without an exit code) but the newest
+// keptExited, by start time: never a running one's, one whose start is
+// not fully recorded, or another name's. The listing by name stays short
+// however many records the container holds, and parses.
+func TestProcessDetachedPrunes(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	env := toolstest.New(t, toolstest.Options{})
+	r := newRunner(env)
+	lease := detachedLease(t, env)
+	root := t.TempDir()
+	detachedRoot(env, root)
+	const name = "ferun-env-dev-web"
+	first, err := r.StartProcessDetached(bg, lease, ProcessStart{Argv: []string{"sleep", "30"}, Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.StopProcessDetached(bg, lease, first)
+	var newest []string
+	for i := range 300 {
+		id := fmt.Sprintf("%06d-%06x", i, i)
+		files := map[string]string{"name": name, "cmd": strings.Repeat("npm run dev ", 15), "pgid": "0",
+			"started_at": strconv.Itoa(1000 + i), "timeout": "0"}
+		if i%2 == 0 {
+			files["exit"] = "1"
+		}
+		seedRecord(t, root, id, files)
+		if i >= 300-keptExited {
+			newest = append(newest, id)
+		}
+	}
+	for i := range 40 {
+		seedRecord(t, root, fmt.Sprintf("%06d-other", i), map[string]string{"name": "agent-tool", "pgid": "0",
+			"started_at": "5", "exit": "0"})
+	}
+	seedRecord(t, root, "999999-unrecorded", map[string]string{"name": name, "pgid": "0"})
+
+	second, err := r.StartProcessDetached(bg, lease, ProcessStart{Argv: []string{"sleep", "30"}, Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.StopProcessDetached(bg, lease, second)
+	ents, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	others := 0
+	for _, e := range ents {
+		b, _ := os.ReadFile(filepath.Join(root, e.Name(), "name"))
+		switch string(b) {
+		case name:
+			left = append(left, e.Name())
+		case "agent-tool":
+			others++
+		}
+	}
+	want := append(slices.Clone(newest), first, second, "999999-unrecorded")
+	slices.Sort(want)
+	if !slices.Equal(left, want) || others != 40 {
+		t.Fatalf("records of %s left %v (want %v), %d of another name", name, left, want, others)
+	}
+	ps, err := r.ProcessesDetached(bg, lease, name)
+	if err != nil || len(ps) != len(want) {
+		t.Fatalf("processes named %s: %+v %v", name, ps, err)
+	}
+	for _, p := range ps {
+		if p.Name != name || p.Running != (p.ID == first || p.ID == second) {
+			t.Errorf("process %+v", p)
+		}
+	}
+	if all, err := r.ProcessesDetached(bg, lease, ""); err != nil || len(all) != len(want)+40 {
+		t.Fatalf("every process: %d %v", len(all), err)
+	}
+	if none, err := r.ProcessesDetached(bg, lease, "nope"); err != nil || len(none) != 0 {
+		t.Fatalf("processes of a name none has: %+v %v", none, err)
+	}
+}
+
+// A test node with FakeProcesses forgets what a detached start's script
+// removes, and lists by name.
+func TestProcessDetachedFakePrunes(t *testing.T) {
+	env := toolstest.New(t, toolstest.Options{FakeProcesses: true})
+	r := newRunner(env)
+	lease := detachedLease(t, env)
+	start := func(name string) string {
+		t.Helper()
+		id, err := r.StartProcessDetached(bg, lease, ProcessStart{Argv: []string{"npm", "run", "dev"}, Name: name})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	other := start("other")
+	if err := r.StopProcessDetached(bg, lease, other); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for range 6 {
+		id := start("web")
+		ids = append(ids, id)
+		if err := r.StopProcessDetached(bg, lease, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	last := start("web")
+	ps, err := r.ProcessesDetached(bg, lease, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, p := range ps {
+		got = append(got, p.ID)
+	}
+	if want := append(slices.Clone(ids[len(ids)-keptExited:]), last); !slices.Equal(got, want) {
+		t.Fatalf("processes named web %v, want %v", got, want)
+	}
+	if all, err := r.ProcessesDetached(bg, lease, ""); err != nil || len(all) != keptExited+2 {
+		t.Fatalf("every process %+v %v", all, err)
 	}
 }

@@ -15,13 +15,12 @@ import (
 // basic reads and writes of the env_*.go files.
 
 // attachedUsable is the condition under which an attached service a of
-// environment e may use the sandbox s it names (§13.5): s is a sandbox of
-// e's owner, not an instance row, and the incarnation a recorded (any,
-// while it recorded none). A sandbox ID that was deleted and created
-// again, by another tenant or the same, is not the one the service was
-// attached to.
-const attachedUsable = `s.owner = e.owner AND s.environment_id IS NULL
-	AND (a.sandbox_incarnation IS NULL OR a.sandbox_incarnation = s.incarnation)`
+// environment e may use the sandbox s it names (§13.6): s is a sandbox of
+// e's owner and not an instance row. A sandbox of the owner deleted and
+// created again under the same ID (FeCode replaces a lost workspace
+// sandbox so) is a new incarnation the service starts in anew; one of
+// another tenant under that ID is never used.
+const attachedUsable = `s.owner = e.owner AND s.environment_id IS NULL`
 
 // EnvCtlMembers returns the members of an environment's security group:
 // the addresses of its instance rows (any state, until the row is gone)
@@ -116,6 +115,20 @@ func (s *Store) EnvCtlVolumesByID(ctx context.Context, ids []uuid.UUID) (map[uui
 // gone.
 func (s *Store) EnvCtlTouchVolume(ctx context.Context, envID uuid.UUID, object string) error {
 	ct, err := s.q.Exec(ctx, `UPDATE env_volumes SET updated_at = now() WHERE env_id = $1 AND object = $2`, envID, object)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNoRow
+	}
+	return nil
+}
+
+// EnvCtlTouchEnvironment sets a deleting environment's updated_at to
+// now(), so that one whose deletion has to wait goes to the end of
+// DeletingEnvironments's order; ErrNoRow when it is gone or not deleting.
+func (s *Store) EnvCtlTouchEnvironment(ctx context.Context, id uuid.UUID) error {
+	ct, err := s.q.Exec(ctx, `UPDATE environments SET updated_at = now() WHERE id = $1 AND deleting`, id)
 	if err != nil {
 		return err
 	}

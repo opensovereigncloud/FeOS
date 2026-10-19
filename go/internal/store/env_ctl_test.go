@@ -43,8 +43,7 @@ func TestEnvCtlQueries(t *testing.T) {
 		t.Fatalf("attached to %v %v", envs, err)
 	}
 	// A sandbox the attached service may not use is neither a member nor
-	// attached: another tenant's, an instance row, or another incarnation
-	// than the one the service recorded.
+	// attached: another tenant's, or an instance row.
 	mkTenant(t, s, "evil")
 	foreign := mkSandbox(t, s, "evil")
 	exec(t, s, `UPDATE sandboxes SET address = 'fd00::7' WHERE id = $1`, foreign.ID)
@@ -67,16 +66,14 @@ func TestEnvCtlQueries(t *testing.T) {
 	if envs, err := s.EnvCtlWithAttached(bg, b.ID); err != nil || len(envs) != 0 {
 		t.Fatalf("an instance row attached to %v %v", envs, err)
 	}
+	// A new incarnation of the owner's sandbox under the same ID (the
+	// recorded one is older) is the service's still (§13.6).
 	exec(t, s, `UPDATE env_attached SET sandbox_incarnation = $2 WHERE env_id = $1 AND service = 'web'`, env.ID, uuid.New())
-	if m, err := s.EnvCtlMembers(bg, env.ID); err != nil || !slices.Equal(m, []string{"fd00::2", "fd00::8"}) {
+	if m, err := s.EnvCtlMembers(bg, env.ID); err != nil || !slices.Equal(m, []string{"fd00::2", "fd00::8", "fd00::9"}) {
 		t.Fatalf("members with another incarnation recorded %v %v", m, err)
 	}
-	if envs, err := s.EnvCtlWithAttached(bg, sbx.ID); err != nil || len(envs) != 0 {
-		t.Fatalf("another incarnation attached to %v %v", envs, err)
-	}
-	exec(t, s, `UPDATE env_attached SET sandbox_incarnation = $2 WHERE env_id = $1 AND service = 'web'`, env.ID, sbx.Incarnation)
 	if envs, err := s.EnvCtlWithAttached(bg, sbx.ID); err != nil || !slices.Equal(envs, []uuid.UUID{env.ID}) {
-		t.Fatalf("its incarnation attached to %v %v", envs, err)
+		t.Fatalf("another incarnation attached to %v %v", envs, err)
 	}
 	exec(t, s, `DELETE FROM env_attached WHERE service IN ('api', 'inst')`)
 	if rows, err := s.EnvCtlSandboxes(bg, env.ID); err != nil || len(rows) != 2 {
@@ -183,6 +180,34 @@ func TestEnvCtlQueries(t *testing.T) {
 	}
 	if byID, err := s.EnvCtlVolumesByID(bg, nil); err != nil || len(byID) != 0 {
 		t.Fatalf("volumes by no id %+v %v", byID, err)
+	}
+
+	// A touched deleting environment goes to the end of the deleting
+	// ones; one that is not deleting is not touched.
+	exec(t, s, `UPDATE environments SET deleting = true, updated_at = now() - interval '1 minute' WHERE id IN ($1, $2)`,
+		env.ID, other.ID)
+	first := env.ID
+	if other.ID.String() < env.ID.String() {
+		first = other.ID
+	}
+	if d, err := s.DeletingEnvironments(bg, 10); err != nil || len(d) != 2 || d[0].ID != first {
+		t.Fatalf("deleting environments %+v %v", d, err)
+	}
+	if err := s.EnvCtlTouchEnvironment(bg, first); err != nil {
+		t.Fatal(err)
+	}
+	if d, err := s.DeletingEnvironments(bg, 10); err != nil || len(d) != 2 || d[1].ID != first {
+		t.Fatalf("deleting environments after a touch %+v %v", d, err)
+	}
+	if d, err := s.DeletingEnvironments(bg, 1); err != nil || len(d) != 1 || d[0].ID == first {
+		t.Fatalf("the first deleting environment after a touch %+v %v", d, err)
+	}
+	live := mkEnv(t, s, "acme", "live")
+	if err := s.EnvCtlTouchEnvironment(bg, live.ID); err != store.ErrNoRow {
+		t.Fatalf("touch an environment that is not deleting: %v", err)
+	}
+	if err := s.EnvCtlTouchEnvironment(bg, uuid.New()); err != store.ErrNoRow {
+		t.Fatalf("touch an environment that is not there: %v", err)
 	}
 
 	// Which environments and sandboxes exist.

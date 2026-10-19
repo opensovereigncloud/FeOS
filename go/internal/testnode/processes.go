@@ -22,7 +22,9 @@ import (
 // Config.FakeProcesses the test node answers those scripts itself and
 // keeps the processes in memory, without running anything: a process
 // runs until it is stopped, its pod boots anew, or an ExitRule
-// "process/<name glob>" ends it.
+// "process/<name glob>" ends it. A detached start forgets the processes of
+// its name that are over but the newest few, as its script removes their
+// records.
 
 // processRoot is where the control plane's process scripts keep their
 // records (tools.processRoot); it tells the scripts apart from other
@@ -33,8 +35,13 @@ const processRoot = `root = "/var/lib/sandbox-processes"`
 const (
 	markStart = "subprocess.Popen("
 	markList  = `print(json.dumps(out, indent=2) if out else "no background processes")`
+	markNamed = `print(json.dumps(out,separators=(",",":")))`
 	markLogs  = "tail=f.readlines()"
 	markStop  = "os.killpg(pgid, signal.SIGTERM)"
+	// markPrune: a start (the detached one) that first removes the
+	// records of its name's processes that are over, but the newest
+	// argv[5].
+	markPrune = "shutil.rmtree("
 )
 
 // fakeProc is a process of FakeProcesses.
@@ -93,6 +100,9 @@ func (s *processService) exec(g *guest, argv []string, out *frameSender) (int32,
 				return say(3, "no such working directory: %s\n", cwd)
 			}
 		}
+		if keep, err := strconv.Atoi(arg(4)); err == nil && name != "" && strings.Contains(script, markPrune) {
+			s.prune(g.id, name, keep)
+		}
 		p := s.start(g.id, cmd, name, timeout)
 		h, err := json.Marshal(map[string]any{"id": p.id, "pgid": p.pgid, "log": "/var/lib/sandbox-processes/" + p.id + "/log",
 			"timeout": timeout, "name": name})
@@ -106,6 +116,18 @@ func (s *processService) exec(g *guest, argv []string, out *frameSender) (int32,
 			return say(0, "no background processes\n")
 		}
 		b, err := json.MarshalIndent(rows, "", "  ")
+		if err != nil {
+			return 0, true, err
+		}
+		return say(0, "%s\n", b)
+	case strings.Contains(script, markNamed):
+		rows := []namedRow{}
+		for _, r := range s.list(g.id) {
+			if arg(0) == "" || r.Name == arg(0) {
+				rows = append(rows, namedRow{ID: r.ID, Name: r.Name, Running: r.Running, ExitCode: r.ExitCode})
+			}
+		}
+		b, err := json.Marshal(rows)
 		if err != nil {
 			return 0, true, err
 		}
@@ -178,6 +200,34 @@ type processRow struct {
 	StartedAt int64  `json:"started_at"`
 	Timeout   int    `json:"timeout"`
 	ExitCode  *int   `json:"exit_code,omitempty"`
+}
+
+// namedRow is a row of the detached list script's output.
+type namedRow struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Running  bool   `json:"running"`
+	ExitCode *int   `json:"exit_code,omitempty"`
+}
+
+// prune forgets the processes named name that are over, but the newest
+// keep, as the detached start script removes their records.
+func (s *processService) prune(pod, name string, keep int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	over := 0
+	for _, p := range s.pods[pod] {
+		if p.name == name && !p.running {
+			over++
+		}
+	}
+	s.pods[pod] = slices.DeleteFunc(s.pods[pod], func(p *fakeProc) bool {
+		if p.name != name || p.running || over <= keep {
+			return false
+		}
+		over--
+		return true
+	})
 }
 
 func (s *processService) list(pod string) []processRow {

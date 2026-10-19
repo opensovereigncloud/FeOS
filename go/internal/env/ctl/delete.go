@@ -185,9 +185,14 @@ const deleteBatch = 16
 // deleteLoop is env-delete: the environments of deleting tenants are
 // marked deleting; each deleting environment loses its instances
 // (Engine.Delete), its attached services (their processes stop and their
-// hosts blocks go), its volumes (marked deleting) and its group on every
-// connected node; its row goes once no instance row and no volume is
-// left (its releases, secrets, runs, incidents and route tokens cascade).
+// hosts blocks go, a sleeping sandbox woken for it, before their rows
+// go), its volumes (marked deleting) and its group on every connected
+// node; its row goes once no instance row, volume, group or attached
+// service still to clean is left (its releases, secrets, runs, incidents
+// and route tokens cascade). An environment whose pass could not finish
+// (a volume on a node that is down, a sandbox that cannot be woken yet)
+// is touched, so that it goes to the end of the queue: the oldest-touched
+// come first, and those that wait long never hold the others back.
 func (c *Controller) deleteLoop(ctx context.Context) error {
 	tenants, err := c.st.DeletingTenants(ctx)
 	if err != nil {
@@ -215,51 +220,58 @@ func (c *Controller) deleteLoop(ctx context.Context) error {
 	}
 	var errs []error
 	for _, e := range envs {
-		if err := c.deleteEnvironment(ctx, e); err != nil && ctx.Err() == nil {
+		deleted, err := c.deleteEnvironment(ctx, e)
+		if err != nil && ctx.Err() == nil {
 			errs = append(errs, fmt.Errorf("environment %s: %w", e.ID, err))
+		}
+		if !deleted && ctx.Err() == nil {
+			if err := c.fenced(ctx, func(tx *store.Store) error {
+				return tx.EnvCtlTouchEnvironment(ctx, e.ID)
+			}); err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
+				errs = append(errs, fmt.Errorf("environment %s: %w", e.ID, err))
+			}
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// deleteEnvironment is one pass of env-delete over an environment.
-func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment) error {
+// deleteEnvironment is one pass of env-delete over an environment, and
+// reports whether its row went.
+func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment) (bool, error) {
 	rows, err := c.st.EnvCtlSandboxes(ctx, e.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	for _, sb := range rows {
 		if err := c.deleteInstance(ctx, sb); err != nil {
-			return err
+			return false, err
 		}
 	}
+	// The attached services' processes stop and their names leave the
+	// hosts blocks (a sleeping sandbox is woken for it) before their rows
+	// go: cleanOld.
 	attached, err := c.st.ListAttached(ctx, e.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	v := &view{env: e, target: emptySpec(), latestSpec: emptySpec()}
 	cleaning := false
 	for _, a := range attached {
-		if !c.cleanAttached(ctx, v, a) {
+		if !c.cleanOld(ctx, v, a, c.dropCleaned) {
 			cleaning = true
 			continue
 		}
-		if err := c.fenced(ctx, func(tx *store.Store) error {
-			_, err := tx.DeleteAttached(ctx, e.ID, a.Service)
-			return err
-		}); err != nil {
-			return err
+		gone, err := c.dropAttached(ctx, a)
+		if err != nil {
+			return false, err
 		}
-		c.forget("a/" + attachedKey(e.ID, a.Service))
-	}
-	if len(attached) > 0 {
-		c.notify(ctx, HintGroups)
+		cleaning = cleaning || !gone
 	}
 	if err := c.fenced(ctx, func(tx *store.Store) error {
 		_, err := tx.EnvCtlMarkVolumesDeleting(ctx, e.ID)
 		return err
 	}); err != nil {
-		return err
+		return false, err
 	}
 	// The env group goes from every node this instance reaches, once no
 	// pod there names it any more (FAILED_PRECONDITION: a later pass); a
@@ -270,37 +282,39 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 		for _, node := range c.d.Conns.Nodes() {
 			gone, err := c.deleteGroup(ctx, node, model.EnvGroupID(e.ID))
 			if err != nil {
-				return err
+				return false, err
 			}
 			groupsGone = groupsGone && gone
 		}
 	}
 	left, err := c.st.EnvCtlSandboxes(ctx, e.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	vols, err := c.st.ListEnvVolumes(ctx, e.ID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(left) == 0 {
 		// The pods are going: their volumes may go too (env-volumes
 		// would, within its interval).
 		for _, vol := range vols {
 			if _, err := c.deleteVolume(ctx, vol); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if vols, err = c.st.ListEnvVolumes(ctx, e.ID); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if len(left) > 0 || len(vols) > 0 || !groupsGone || cleaning {
-		return nil
+		return false, nil
 	}
-	return c.fenced(ctx, func(tx *store.Store) error {
+	deleted := false
+	err = c.fenced(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockEnvironment(ctx, e.ID, store.ForUpdate)
 		if errors.Is(err, store.ErrNoRow) {
+			deleted = true
 			return nil
 		}
 		if err != nil || !cur.Deleting {
@@ -309,9 +323,11 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 		if _, err := tx.DeleteEnvironment(ctx, e.ID); err != nil {
 			return err
 		}
+		deleted = true
 		c.log.Info("environment deleted", "environment", e.ID, "name", e.Name, "owner", e.Owner)
 		return nil
 	})
+	return deleted && err == nil, err
 }
 
 // emptySpec is the spec of nothing.

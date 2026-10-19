@@ -320,10 +320,13 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 
 // attachedSandbox is the sandbox an attached service's requests go to:
 // the one its controller row names, while that sandbox exists, is the
-// environment owner's, is no instance row and is the incarnation the
-// process was started in (when it was). Otherwise refusal says why not:
-// a sandbox ID is free again once its sandbox is deleted, and another
-// tenant may take it, which the spec validated at apply never sees.
+// environment owner's and is no instance row (§13.6); readiness decides
+// the rest. A new incarnation of the owner's sandbox under the same ID
+// (FeCode replaces a lost workspace sandbox so) is routed to, as the
+// controller starts the service there anew. Otherwise refusal says why
+// not: a sandbox ID is free again once its sandbox is deleted, and
+// another tenant may take it, which the spec validated at apply never
+// sees.
 func (s *Service) attachedSandbox(ctx context.Context, e store.Environment, service string) (uuid.UUID, string, error) {
 	a, err := s.st.GetAttached(ctx, e.ID, service)
 	if errors.Is(err, store.ErrNoRow) {
@@ -336,8 +339,7 @@ func (s *Service) attachedSandbox(ctx context.Context, e store.Environment, serv
 	if err != nil && !errors.Is(err, model.ErrNotFound) {
 		return uuid.Nil, "", fmt.Errorf("sandbox %s: %w", a.SandboxID, err)
 	}
-	if err != nil || sb.Owner != e.Owner || sb.IsInstance() ||
-		(a.SandboxIncarnation != uuid.Nil && a.SandboxIncarnation != sb.Incarnation) {
+	if err != nil || sb.Owner != e.Owner || sb.IsInstance() {
 		return uuid.Nil, fmt.Sprintf("sandbox %s of service %s is gone or not this tenant's", a.SandboxID, service), nil
 	}
 	return sb.ID, "", nil

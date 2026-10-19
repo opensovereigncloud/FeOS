@@ -20,8 +20,9 @@ type EnvAttached struct {
 	EnvID     uuid.UUID
 	Service   string
 	SandboxID uuid.UUID // the tenant's sandbox it runs in (no foreign key)
-	// SandboxIncarnation is the incarnation the process was started in;
-	// uuid.Nil: NULL.
+	// SandboxIncarnation is the incarnation of the sandbox the service
+	// last used (its process started in, or recorded with); a new one
+	// under the same ID starts the service anew (§13.6). uuid.Nil: NULL.
 	SandboxIncarnation uuid.UUID
 	TemplateHash       string
 	ProcessID          string // "": not started

@@ -122,7 +122,7 @@ func TestAttachedService(t *testing.T) {
 		a.HostsWritten == "" || a.Restarts != 0 {
 		t.Fatalf("attached %+v %v", a, err)
 	}
-	ps, err := h.runner.ProcessesDetached(bg, lease(sb))
+	ps, err := h.runner.ProcessesDetached(bg, lease(sb), "")
 	if err != nil || len(ps) != 1 || ps[0].ID != a.ProcessID || ps[0].Name != "ferun-env-dev-web" || !ps[0].Running {
 		t.Fatalf("processes %+v %v", ps, err)
 	}
@@ -177,7 +177,7 @@ func TestAttachedService(t *testing.T) {
 	if c.ProcessID == b.ProcessID || c.Phase != model.PhaseReady {
 		t.Fatalf("after the template changed %+v", c)
 	}
-	ps, _ = h.runner.ProcessesDetached(bg, lease(sb))
+	ps, _ = h.runner.ProcessesDetached(bg, lease(sb), "")
 	runningProcs := 0
 	for _, p := range ps {
 		if p.Running {
@@ -206,7 +206,7 @@ func TestAttachedService(t *testing.T) {
 	if _, err := h.st.GetAttached(bg, env.ID, "web"); !errors.Is(err, store.ErrNoRow) {
 		t.Errorf("the attached row: %v", err)
 	}
-	ps, _ = h.runner.ProcessesDetached(bg, lease(sb))
+	ps, _ = h.runner.ProcessesDetached(bg, lease(sb), "")
 	for _, p := range ps {
 		if p.Running {
 			t.Errorf("a process still runs: %+v (last %s)", p, d.ProcessID)
@@ -373,7 +373,7 @@ func TestAttachedSandboxReusedByAnotherTenant(t *testing.T) {
 // runningNamed are the IDs of the sandbox's running processes named name.
 func (h *harness) runningNamed(sb store.Sandbox, name string) []string {
 	h.t.Helper()
-	ps, err := h.runner.ProcessesDetached(bg, lease(sb))
+	ps, err := h.runner.ProcessesDetached(bg, lease(sb), name)
 	if err != nil {
 		h.t.Fatal(err)
 	}
