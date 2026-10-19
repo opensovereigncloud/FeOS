@@ -363,18 +363,23 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 
 // objectSteady reports whether every instance of an object (but those
 // retiring) has been ready for the crash window, with after as one of
-// them is now.
+// them is now, each counted as live counts it (a ready phase of a row
+// that does not run is not ready).
 func (c *Controller) objectSteady(v *view, kind, object string, after store.EnvInstance) bool {
+	idles := false
+	if svc, ok := v.target.Services[object]; ok && kind == spec.KindService {
+		idles = idleOf(svc) > 0
+	}
 	n := 0
 	for _, r := range v.rowsOf(kind, object) {
-		i := r.Instance
-		if i.SandboxID == after.SandboxID {
-			i = after
+		if r.Instance.SandboxID == after.SandboxID {
+			r.Instance = after
 		}
+		i := r.Instance
 		if i.Phase == model.PhaseRetiring {
 			continue
 		}
-		if i.Phase != model.PhaseReady || i.ReadySince.IsZero() || v.now.Sub(i.ReadySince) < c.t.crashWindow {
+		if !live(r, idles) || i.ReadySince.IsZero() || v.now.Sub(i.ReadySince) < c.t.crashWindow {
 			return false
 		}
 		n++

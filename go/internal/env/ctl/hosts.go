@@ -22,8 +22,9 @@ import (
 // instances and of the sandboxes its attached services run in, the part
 // between "# ferun environment <name> begin" and "… end" names the
 // environment's addons and image services by their addresses (one ready
-// replica of a service, any replica when none is ready; never a retiring
-// one) and, in a sandbox, its own attached services by 127.0.0.1 and ::1.
+// replica of a service as live counts it, else one whose state is known,
+// else any; never a retiring one) and, in a sandbox, its own attached
+// services by 127.0.0.1 and ::1.
 // Everything else of the file stays.
 
 // hostsPath is the file the blocks are written into.
@@ -39,27 +40,35 @@ func blockEnd(env string) string   { return "# ferun environment " + env + " end
 // services with their addresses, by name.
 func hostsEntries(v *view) map[string]string {
 	out := map[string]string{}
-	best := map[string]int{} // 2: a ready replica's address, 1: another's
+	// 3: a ready replica's address (live), 2: another's, 1: one whose row
+	// is unknown (its node is out of touch: its address may be stale).
+	best := map[string]int{}
 	for _, r := range v.rows {
 		inst := r.Instance
 		if inst.Phase == model.PhaseRetiring || r.Sandbox.Address == "" {
 			continue
 		}
+		idles := false
 		switch inst.Kind {
 		case spec.KindAddon:
 			if _, ok := v.target.Addons[inst.Object]; !ok {
 				continue
 			}
 		case spec.KindService:
-			if svc, ok := v.target.Services[inst.Object]; !ok || runtimeOf(svc) != spec.RuntimeImage {
+			svc, ok := v.target.Services[inst.Object]
+			if !ok || runtimeOf(svc) != spec.RuntimeImage {
 				continue
 			}
+			idles = idleOf(svc) > 0
 		default:
 			continue
 		}
-		rank := 1
-		if inst.Phase == model.PhaseReady {
-			rank = 2
+		rank := 2
+		switch {
+		case live(r, idles):
+			rank = 3
+		case r.Sandbox.ClientState == model.StateUnknown:
+			rank = 1
 		}
 		if rank > best[inst.Object] {
 			best[inst.Object], out[inst.Object] = rank, r.Sandbox.Address

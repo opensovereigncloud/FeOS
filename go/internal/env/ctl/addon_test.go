@@ -300,6 +300,44 @@ func TestAddonLostOnLiveNode(t *testing.T) {
 	}
 }
 
+// An addon counts as ready only while its row runs (§13.7): with its
+// phase still ready and its row unknown (its node out of touch), the
+// release waits for it ("addon cache is unknown …") and its release job
+// does not start against an addon that may be down.
+func TestAddonReadyOnlyWhileLive(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, valkeySpec)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	addon := h.waitRows(env.ID, spec.KindAddon, "cache", 1, 10*time.Second, "ready", ready)[0]
+	n1.Script().SetHook(podv1.PodService_GetPod_FullMethodName, func(_ context.Context, _ string, req any) error {
+		if r, ok := req.(*podv1.GetPodRequest); ok && r.GetPodId() == addon.Sandbox.ID.String() {
+			return status.Error(codes.Unavailable, "out of touch")
+		}
+		return nil
+	})
+	h.exec(`UPDATE sandboxes SET client_state = 'unknown', status_description = 'out of touch' WHERE id = $1`, addon.Sandbox.ID)
+	r2 := h.apply(env.ID, fmt.Sprintf(`{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev"}},
+		"jobs":{"migrate":{"image":%q,"command":["/app","migrate"]}}}`, testImage))
+	never(t, 4*time.Second, "the release job started while its addon is unknown", func() bool {
+		return len(h.rowsOf(env.ID, spec.KindJob, "migrate")) > 0
+	})
+	if inst, err := h.st.GetEnvInstance(bg, addon.Sandbox.ID); err != nil || inst.Phase != model.PhaseReady {
+		t.Fatalf("the addon's phase %q %v: the test did not hold it", inst.Phase, err)
+	}
+	h.c.mu.Lock()
+	pending := h.c.lastPending["pending/"+env.ID.String()]
+	h.c.mu.Unlock()
+	if !strings.Contains(pending, "addon cache is unknown (out of touch)") {
+		t.Errorf("the release waits for %q", pending)
+	}
+	// Back in touch: the job runs, the release is realised.
+	n1.Script().SetHook(podv1.PodService_GetPod_FullMethodName, nil)
+	finishRun(t, h, n1, env.ID, 0)
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 60*time.Second)
+}
+
 // A drained node's addon restores on another node with its volume (the
 // pin gates creates only); the controller records the volume's
 // new node and pins the row there.

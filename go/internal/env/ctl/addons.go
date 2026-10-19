@@ -120,8 +120,8 @@ func (c *Controller) stepAddon(ctx context.Context, s *stepState, name string, a
 		s.wait(obj, "addon %s is lost", name)
 		return false
 	}
-	if cur.Instance.Phase != model.PhaseReady {
-		s.wait(obj, "addon %s is %s", name, cur.Instance.Phase)
+	if !live(cur, false) {
+		s.wait(obj, "addon %s is %s", name, addonState(cur))
 		return false
 	}
 	c.closeIncidents(ctx, v, obj, model.ConditionVolumeUnavailable)
@@ -428,6 +428,21 @@ func (c *Controller) recreateAddon(ctx context.Context, s *stepState, p *addonPl
 		c.rl.warn("recreate", "cannot delete an addon's old instance", "sandbox", sb.ID, "err", err)
 	}
 	s.wait(p.object(), "addon %s is being recreated", p.name)
+}
+
+// addonState says why an addon instance is not ready: its phase, or,
+// with a ready phase, its row's state (and op, and description).
+func addonState(r store.EnvInstanceRow) string {
+	sb := r.Sandbox
+	switch {
+	case r.Instance.Phase != model.PhaseReady:
+		return r.Instance.Phase
+	case sb.Op != "":
+		return fmt.Sprintf("%s, %s in flight", sb.ClientState, sb.Op)
+	case sb.StatusDescription != "":
+		return fmt.Sprintf("%s (%s)", sb.ClientState, sb.StatusDescription)
+	}
+	return sb.ClientState
 }
 
 // moveVolume records that an addon's volume is on the node its instance

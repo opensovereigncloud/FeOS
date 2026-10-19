@@ -338,6 +338,73 @@ func TestReadinessPhases(t *testing.T) {
 	h.waitRelease(env.ID, r3, model.ReleaseRealised, 30*time.Second)
 }
 
+// A rollout counts only live instances (§13.7): a new instance whose
+// phase says ready while its row is unknown (its node out of touch, its
+// syncs failing) is not ready, so the old replica keeps serving and R
+// does not realise; once the new one runs and passes its check again,
+// the rollout goes on.
+func TestRolloutCountsLiveInstances(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	var code atomic.Int32
+	code.Store(1)
+	n1.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+		if len(req.Command) > 0 && req.Command[0] == "check" {
+			return code.Load(), true, nil
+		}
+		return 0, false, nil
+	})
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	old := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	r2 := h.apply(env.ID, serviceSpec(1, "2", `,"readiness":{"exec":{"command":["check"]},"period":"1s"}`))
+	var fresh store.EnvInstanceRow
+	eventually(t, 30*time.Second, "the new instance running, its check failing", func() bool {
+		for _, r := range h.rowsOf(env.ID, spec.KindService, "web") {
+			if r.Sandbox.ID != old.Sandbox.ID && running(r) && strings.Contains(r.Instance.Detail, "check exited 1") {
+				fresh = r
+				return true
+			}
+		}
+		return false
+	})
+	// Its node falls out of touch with it: every sync fails, the row is
+	// unknown; then its phase says ready (as it would have, had its check
+	// passed just before).
+	n1.Script().SetHook(podv1.PodService_GetPod_FullMethodName, func(_ context.Context, _ string, req any) error {
+		if r, ok := req.(*podv1.GetPodRequest); ok && r.GetPodId() == fresh.Sandbox.ID.String() {
+			return status.Error(codes.Unavailable, "out of touch")
+		}
+		return nil
+	})
+	h.exec(`UPDATE sandboxes SET client_state = 'unknown' WHERE id = $1`, fresh.Sandbox.ID)
+	time.Sleep(1500 * time.Millisecond) // a probe of it that began before ends
+	h.exec(`UPDATE env_instances SET phase = 'ready', ready_since = now(), probe_failures = 0, detail = ''
+		WHERE sandbox_id = $1`, fresh.Sandbox.ID)
+	never(t, 4*time.Second, "the old replica retired while the new one is unknown", func() bool {
+		for _, r := range h.rows(env.ID) {
+			if r.Sandbox.ID == old.Sandbox.ID {
+				return r.Instance.Phase == model.PhaseRetiring
+			}
+		}
+		return true
+	})
+	if rel := h.release(env.ID, r2); rel.State != model.ReleaseRolling {
+		t.Fatalf("release %s while its new instance is unknown", rel.State)
+	}
+	if sb, _ := h.st.GetSandbox(bg, fresh.Sandbox.ID); sb.ClientState != model.StateUnknown {
+		t.Fatalf("the new instance is %s, not unknown: the test did not hold it", sb.ClientState)
+	}
+	// Back in touch, and its check passes: the rollout goes on.
+	n1.Script().SetHook(podv1.PodService_GetPod_FullMethodName, nil)
+	code.Store(0)
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 60*time.Second)
+	if rows := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready); rows[0].Sandbox.ID != fresh.Sandbox.ID {
+		t.Errorf("web after the rollout %+v", rows[0].Sandbox)
+	}
+}
+
 // An unknown row is ensured only when its service does not idle (§13.7):
 // an idle service's replica may be paused in truth, and the engine finds
 // out without waking it; another service's unknown replica comes back
