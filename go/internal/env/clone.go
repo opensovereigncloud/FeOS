@@ -322,7 +322,7 @@ func (s *Service) clone(ctx context.Context, tenant, ref string, req CloneReques
 	}
 	var annotations map[string]string
 	if srcRel != nil {
-		annotations = srcRel.Annotations
+		annotations = cloneAnnotations(srcRel.Annotations)
 	}
 	var row store.Environment
 	err = s.inTxRetry(ctx, func(tx *store.Store) error {

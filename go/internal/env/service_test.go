@@ -394,6 +394,16 @@ func TestReleasesAndRevert(t *testing.T) {
 	if a, err := h.svc.Revert(ctx, tenantA, "stage", 3, RevertRequest{Base: 3}); err != nil || !a.Unchanged {
 		t.Fatalf("revert to the current %+v %v", a, err)
 	}
+	// A clone of the revert copies its annotations without ferun.revertOf,
+	// whose number names one of the source's releases.
+	if _, err := h.svc.Clone(ctx, tenantA, "stage", CloneRequest{Name: "copy",
+		Secrets: map[string]CloneSecret{"token": {Copy: true}}}); err != nil {
+		t.Fatal(describe(err))
+	}
+	if r, err := h.svc.Release(ctx, tenantA, "copy", 1); err != nil || r.Annotations["fecode.dev/revision"] != "r1" ||
+		len(r.Annotations) != 1 {
+		t.Fatalf("the clone's release's annotations %v, %v", r.Annotations, err)
+	}
 	_, err = h.svc.Revert(ctx, tenantA, "stage", 1, RevertRequest{Base: 2})
 	var bm *BaseMismatchError
 	if errors.As(err, &bm) {
