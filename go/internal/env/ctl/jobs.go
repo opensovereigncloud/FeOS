@@ -143,7 +143,7 @@ func (c *Controller) stepRuns(ctx context.Context, s *stepState) {
 		case v.now.After(run.StartedAt.Add(timeout)):
 			c.finishJob(ctx, v, r, nil, "timed out after "+timeout.String())
 		case c.heal(ctx, r, false):
-			c.finishJob(ctx, v, r, nil, "its instance was lost with node "+r.Sandbox.LostFrom)
+			c.finishJob(ctx, v, r, nil, "its instance was lost with node "+lostNode(r.Sandbox))
 		}
 	}
 	for _, r := range rows {

@@ -536,6 +536,15 @@ func (c *Controller) stepRetiring(ctx context.Context, s *stepState) {
 	}
 }
 
+// lostNode is the node a lost row was lost with: lost_from when its node
+// went down, else its node, which is up but no longer has the pod.
+func lostNode(sb store.Sandbox) string {
+	if sb.LostFrom != "" {
+		return sb.LostFrom
+	}
+	return sb.Node
+}
+
 // heal brings a desired instance's row back up (§4.3): Ensure for a row
 // that is stopped, failed, pending, unknown, or paused or hibernated when
 // it does not idle (an idle one wakes on traffic). It reports whether the
