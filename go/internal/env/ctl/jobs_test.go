@@ -165,7 +165,7 @@ func TestJobTimeoutAndManual(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Asked again while it runs: refused, never a second run at once.
-	if err := h.c.RunJob(bg, env.ID, "backfill"); !errors.Is(err, model.ErrBusy) ||
+	if err := h.c.RunJob(bg, env.ID, "backfill"); !errors.Is(err, model.ErrBusy) || !errors.Is(err, ErrJobRunning) ||
 		err.Error() != fmt.Sprintf("job backfill runs already (release %d, attempt 1)", r3) {
 		t.Fatalf("a second run while one runs: %v", err)
 	}

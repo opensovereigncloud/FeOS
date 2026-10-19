@@ -99,6 +99,10 @@ var (
 	// ErrNotReady: the object cannot run yet, an expected state (409): a
 	// job whose template does not render ("job X cannot run yet: …").
 	ErrNotReady = errors.New("not ready")
+	// ErrJobRunning: a run of the job runs already, of any release (409
+	// busy): the error's text says which ("job X runs already (release
+	// N, attempt M)"). It wraps model.ErrBusy.
+	ErrJobRunning = fmt.Errorf("a run of the job runs: %w", model.ErrBusy)
 )
 
 // stateError is an answer for an expected state: its text as the caller

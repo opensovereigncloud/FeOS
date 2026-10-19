@@ -594,7 +594,12 @@ func ctlError(err error, kind, name string) error {
 		return apierr.New(http.StatusConflict, "paused")
 	case errors.Is(err, ctl.ErrNoContainerLogs):
 		return apierr.New(http.StatusNotImplemented, "%s", ctl.ErrNoContainerLogs.Error())
+	case errors.Is(err, ctl.ErrJobRunning):
+		// Its own text (the run's release and attempt); a run takes
+		// minutes, not seconds.
+		return apierr.WithCode(http.StatusConflict, CodeBusy, "%s", msg).RetryAfter(apierr.RetryAfterOf(err, 30))
 	case errors.Is(err, model.ErrBusy):
+		// The generic text: an op's own names instances and sandboxes.
 		return apierr.WithCode(http.StatusConflict, CodeBusy, "%s %s is busy with another operation; try again shortly",
 			kind, name).RetryAfter(apierr.RetryAfterOf(err, 5))
 	case errors.Is(err, model.ErrNotFound):
@@ -664,7 +669,9 @@ func (s *Service) RestartService(ctx context.Context, tenant, env, name string) 
 }
 
 // RunJob is POST /api/v1/environments/{env}/jobs/{name}/run (202): a new
-// run, attempt 1; 409 CodeNotReady while its template cannot render.
+// run, attempt 1; 409 CodeBusy while a run of the job runs, of any release
+// ("job X runs already (release N, attempt M)", Retry-After 30); 409
+// CodeNotReady while its template cannot render.
 func (s *Service) RunJob(ctx context.Context, tenant, env, name string) error {
 	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
 	if err != nil {
