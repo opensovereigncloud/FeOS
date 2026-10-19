@@ -1,16 +1,21 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! feosd's resolver for its pods (ADR 0010): it forwards their queries to
-//! the upstream resolvers that a pod names, or the node's.
+//! feosd's resolver for its pods (ADR 0010): it answers the names of a
+//! pod's name tables itself, and forwards the other queries to the
+//! upstream resolvers that a pod names, or the node's.
 //!
 //! It answers the pods it knows, told apart by the source address of a
-//! query, which the pod's TAP pins, and refuses everyone else. It forwards
-//! a query to the pod's upstreams in order, to the next when one does not
-//! answer, and answers SERVFAIL when none does. Answers pass as the
-//! upstream gave them, but HTTPS and SVCB records lose `ech`, so that
-//! clients send the server name in the clear (ADR 0013). Every query of a
-//! pod that is answered becomes a traffic record (ADR 0013).
+//! query, which the pod's TAP pins, and refuses everyone else. A name of
+//! one label, in any case, that the pod's name tables hold (ADR 0018) is
+//! answered from them: its IPv6 addresses to AAAA, its IPv4 addresses to
+//! A, nothing to the other types, with a TTL of a few seconds, and never
+//! asked upstream. It forwards any other query to the pod's upstreams in
+//! order, to the next when one does not answer, and answers SERVFAIL when
+//! none does. Answers pass as the upstream gave them, but HTTPS and SVCB
+//! records lose `ech`, so that clients send the server name in the clear
+//! (ADR 0013). Every query of a pod that is answered becomes a traffic
+//! record (ADR 0013).
 //!
 //! feosd binds the sockets and hands them over, so that they can come from
 //! socket activation and outlive feosd.
@@ -23,7 +28,7 @@ mod upstream;
 use feos_proto::network_service::{traffic_record, DnsQuery, TrafficRecord};
 use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
-use hickory_proto::rr::{Name, RData, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use log::{debug, warn};
 use std::collections::HashMap;
 use std::io;
@@ -60,6 +65,13 @@ const MAX_CONNECTION_QUERIES: usize = 16;
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Records kept for subscribers that fall behind.
 const RECORDS: usize = 1024;
+/// How long the answers from name tables may be kept: their addresses
+/// change as replicas come and go.
+pub const NAME_TTL: u32 = 5;
+
+/// The addresses of a name, one label in any case, in the first of the
+/// name tables of a pod that holds it; None when none does.
+pub type Names = Arc<dyn Fn(&[String], &str) -> Option<Vec<IpAddr>> + Send + Sync>;
 
 /// What the resolver does for all pods.
 #[derive(Clone, Debug)]
@@ -85,6 +97,8 @@ impl Default for Config {
 pub struct Resolver {
     config: Config,
     clients: RwLock<HashMap<IpAddr, Arc<Client>>>,
+    /// Where the names of the pods' tables are looked up.
+    names: RwLock<Option<Names>>,
     records: broadcast::Sender<TrafficRecord>,
     queries: Arc<Semaphore>,
     connections: Arc<Semaphore>,
@@ -95,6 +109,8 @@ struct Client {
     pod_id: String,
     /// Where its upstreams are asked; empty: the default upstreams.
     upstreams: Vec<SocketAddr>,
+    /// The name tables it names, in order.
+    tables: Vec<String>,
     queries: Arc<Semaphore>,
     connections: Arc<Semaphore>,
 }
@@ -114,6 +130,7 @@ impl Resolver {
         Arc::new(Self {
             config,
             clients: RwLock::default(),
+            names: RwLock::default(),
             records,
             queries: Arc::new(Semaphore::new(MAX_QUERIES)),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -121,9 +138,16 @@ impl Resolver {
     }
 
     /// Serves the pod `pod_id` at `address`, which its queries come from:
-    /// its IPv4 address. Asks `upstreams`, or the default upstreams when
-    /// there are none. Replaces what the resolver knew of `address`.
-    pub fn set_client(&self, address: IpAddr, pod_id: &str, upstreams: Vec<SocketAddr>) {
+    /// its IPv4 address. Answers the names of its name tables `tables`,
+    /// and asks `upstreams`, or the default upstreams when there are none,
+    /// the rest. Replaces what the resolver knew of `address`.
+    pub fn set_client(
+        &self,
+        address: IpAddr,
+        pod_id: &str,
+        upstreams: Vec<SocketAddr>,
+        tables: Vec<String>,
+    ) {
         let address = address.to_canonical();
         let mut clients = self.clients.write().unwrap_or_else(PoisonError::into_inner);
         // A pod that is set again keeps its limits.
@@ -137,10 +161,20 @@ impl Resolver {
         let client = Client {
             pod_id: pod_id.to_string(),
             upstreams,
+            tables,
             queries,
             connections,
         };
         clients.insert(address, Arc::new(client));
+    }
+
+    /// Looks the names of the pods' tables up in `names` from now on;
+    /// until then, no pod has any.
+    pub fn set_names(
+        &self,
+        names: impl Fn(&[String], &str) -> Option<Vec<IpAddr>> + Send + Sync + 'static,
+    ) {
+        *self.names.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(names));
     }
 
     /// Stops serving the pod at `address`: its queries are refused from
@@ -340,6 +374,11 @@ impl Resolver {
         };
         let response = match check(&request) {
             Some(code) => respond(&request, Err(code)),
+            None if let Some(answer) = self.local(&request, client) => {
+                let mut response = respond(&request, Ok(answer));
+                response.set_authoritative(true);
+                response
+            }
             None => match self.ask(&request, client, transport).await {
                 Some(mut response) => {
                     let answers = svcb::strip(response.answers_mut());
@@ -357,6 +396,37 @@ impl Resolver {
             self.record(client, question, &response);
         }
         encode(&response, limit)
+    }
+
+    /// The answer from the client's name tables to the question of
+    /// `request`, if they hold its name, a name of one label: the
+    /// addresses of the asked type, none for another type.
+    fn local(&self, request: &Message, client: &Client) -> Option<Message> {
+        if client.tables.is_empty() {
+            return None;
+        }
+        let question = request.queries().first()?;
+        let owner = question.name();
+        if owner.num_labels() != 1 || question.query_class() != DNSClass::IN {
+            return None;
+        }
+        let label = std::str::from_utf8(owner.iter().next()?).ok()?;
+        let names = self
+            .names
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        let addresses = names(&client.tables, label)?;
+        let mut answer = Message::new();
+        for address in addresses {
+            let data = match (address, question.query_type()) {
+                (IpAddr::V6(address), RecordType::AAAA) => RData::AAAA(AAAA(address)),
+                (IpAddr::V4(address), RecordType::A) => RData::A(A(address)),
+                _ => continue,
+            };
+            answer.add_answer(Record::from_rdata(owner.clone(), NAME_TTL, data));
+        }
+        Some(answer)
     }
 
     /// What the client's upstreams answer to the question of `request`.

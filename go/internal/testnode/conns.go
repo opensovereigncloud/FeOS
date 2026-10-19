@@ -268,6 +268,9 @@ func (n *Node) newNodeServer() *grpc.Server {
 	portforwardv1.RegisterPortForwardServiceServer(srv, n.forward)
 	networkv1.RegisterMeshServiceServer(srv, n.mesh)
 	networkv1.RegisterSecurityGroupServiceServer(srv, n.groups)
+	if !n.cfg.NoNameService {
+		networkv1.RegisterNameServiceServer(srv, n.names)
+	}
 	volumev1.RegisterVolumeServiceServer(srv, n.volumes)
 	return srv
 }

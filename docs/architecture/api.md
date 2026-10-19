@@ -12,7 +12,7 @@ plane, and between `feosd` and `feos-guest`. They live in
 | `feos.pod.v1` | pods: create, start, stop, delete, suspend, resume, hibernate, restore, console, events | `feosd` |
 | `feos.volume.v1` | persistent volumes: create, delete, get, list; a pod's spec names them ([node.md](node.md#volumes)) | `feosd` |
 | `feos.disk.v1` | the pods' disks and memory over a chunk store and the object store, internal to the node ([disk.md](disk.md)) | `diskd` |
-| `feos.network.v1` | the pods' security groups (`SecurityGroupService`), the records of their traffic (`TrafficService`) and the node's mesh (`MeshService`) | `feosd` |
+| `feos.network.v1` | the pods' security groups (`SecurityGroupService`), their name tables (`NameService`), the records of their traffic (`TrafficService`) and the node's mesh (`MeshService`) | `feosd` |
 | `feos.fleet.v1` | the control plane's API for nodes, on the uplink: join, the node's certificate, telemetry, events, pods' credentials, the node's place on the mesh ([control-plane.md](control-plane.md#nodes)) | `ferund` |
 | `feos.microvm.v1` | the pods' microVMs, internal to `feosd`, served on no listener | – |
 | `feos.container.v1` | containers: create, start, stop, delete, exec, logs, events | `feosd`, `feos-guest` |
@@ -76,7 +76,9 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   `security_groups`, the IDs of the pod's security groups, the node's
   default group when empty; `dns_upstreams`, the IP addresses of the
   resolvers that `feosd`'s resolver asks for the pod, the node's when
-  empty. A create with an invalid group ID or an upstream the pod may not
+  empty; `name_tables`, the IDs of the name tables whose names the
+  resolver answers the pod itself, in order. A create with an invalid
+  group or table ID, a table named twice, or an upstream the pod may not
   use fails with `INVALID_ARGUMENT`; one with a network on a node without
   `--pod-prefix`, or whose network is not set up, fails with
   `FAILED_PRECONDITION`.
@@ -104,6 +106,15 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   with exceptions, of either family, or a group's members, of IPv6. An
   IPv4 block counts in rules out alone: nothing new comes in over IPv4. A
   change applies to the pods' rules within moments of the call.
+- `NameService` (ADR 0018): `PutNameTable` replaces a table whole: its
+  names, each one label of a DNS name with one or more addresses of
+  either family, and the tables it includes; `UpdateNameTable` puts and
+  removes names from `from_version` to another `version`, and fails with
+  `FAILED_PRECONDITION` unless the node has the table at `from_version`;
+  `DeleteNameTable` fails with `FAILED_PRECONDITION` while a pod names
+  the table; `GetNameTable` and `ListNameTables`. A change answers the
+  pods' next queries ([node.md](node.md#name-tables)). `feosctl
+  name-table`.
 - `MeshService` (ADR 0017): `PutMeshPeers` replaces the node's peers on
   the mesh whole, at a version; `UpdateMeshPeers` puts and removes peers
   from `from_version` to `version`, and fails with `FAILED_PRECONDITION`

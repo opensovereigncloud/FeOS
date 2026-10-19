@@ -104,6 +104,12 @@ type Config struct {
 	// does. Without it the groups a pod names are not checked, as the test
 	// node did before it served SecurityGroupService.
 	CheckSecurityGroups bool
+	// CheckNameTables makes a pod that names a name table the node does not
+	// have fail at its bring-up and its memory restore, as feosd does.
+	CheckNameTables bool
+	// NoNameService makes the node serve no NameService (UNIMPLEMENTED),
+	// as a feosd from before it, and ignore the name tables pods name.
+	NoNameService bool
 	// FakeExec makes every Exec that the script does not answer exit 0
 	// without running anything (ferun-testnode --fake-exec): for a control
 	// plane whose addons' probes and provisioning run commands the host
@@ -147,6 +153,7 @@ type Node struct {
 	mesh      *meshService
 	volumes   *volumeService
 	groups    *groupService
+	names     *nameService
 	procs     *processService
 	podPrefix netip.Prefix
 	podsDir   string
@@ -276,6 +283,7 @@ func New(cfg Config) (*Node, error) {
 	n.forward = &forwardService{n: n}
 	n.volumes = newVolumeService(n)
 	n.groups = newGroupService(n)
+	n.names = newNameService(n)
 	n.procs = newProcessService(n)
 	if n.mesh, err = newMeshService(n); err != nil {
 		return nil, err

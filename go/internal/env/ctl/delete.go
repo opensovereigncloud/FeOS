@@ -184,11 +184,11 @@ const deleteBatch = 16
 
 // deleteLoop is env-delete: the environments of deleting tenants are
 // marked deleting; each deleting environment loses its instances
-// (Engine.Delete), its attached services (their processes stop and their
-// hosts blocks go, a sleeping sandbox woken for it, before their rows
-// go), its volumes (marked deleting) and its group on every connected
-// node; its row goes once no instance row, volume, group or attached
-// service still to clean is left (its releases, secrets, runs, incidents
+// (Engine.Delete), its attached services (their processes stop, a
+// sleeping sandbox woken for it, before their rows and names go), its
+// volumes (marked deleting) and its group and name table on every
+// connected node; its row goes once no instance row, volume, group, name
+// table or attached service still to clean is left (its releases, secrets, runs, incidents
 // and route tokens cascade). An environment whose pass could not finish
 // (a volume on a node that is down, a sandbox that cannot be woken yet)
 // is touched, so that it goes to the end of the queue: the oldest-touched
@@ -247,9 +247,8 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 			return false, err
 		}
 	}
-	// The attached services' processes stop and their names leave the
-	// hosts blocks (a sleeping sandbox is woken for it) before their rows
-	// go: cleanOld.
+	// The attached services' processes stop (a sleeping sandbox is woken
+	// for it) before their rows, and with them their names, go: cleanOld.
 	attached, err := c.st.ListAttached(ctx, e.ID)
 	if err != nil {
 		return false, err
@@ -273,10 +272,10 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 	}); err != nil {
 		return false, err
 	}
-	// The env group goes from every node this instance reaches, once no
-	// pod there names it any more (FAILED_PRECONDITION: a later pass); a
-	// node out of reach keeps it until env-groups finds it of an
-	// environment that is gone.
+	// The env group and the env table go from every node this instance
+	// reaches, once no pod there names them any more (FAILED_PRECONDITION:
+	// a later pass); a node out of reach keeps them until env-groups and
+	// env-names find them of an environment that is gone.
 	groupsGone := true
 	if c.d.Conns != nil {
 		for _, node := range c.d.Conns.Nodes() {
@@ -284,7 +283,11 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 			if err != nil {
 				return false, err
 			}
-			groupsGone = groupsGone && gone
+			tableGone, err := c.deleteTable(ctx, node, model.EnvTableID(e.ID))
+			if err != nil {
+				return false, err
+			}
+			groupsGone = groupsGone && gone && tableGone
 		}
 	}
 	left, err := c.st.EnvCtlSandboxes(ctx, e.ID)

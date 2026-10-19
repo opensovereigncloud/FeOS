@@ -505,6 +505,290 @@ var MeshService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
+	NameService_PutNameTable_FullMethodName    = "/feos.network.v1.NameService/PutNameTable"
+	NameService_UpdateNameTable_FullMethodName = "/feos.network.v1.NameService/UpdateNameTable"
+	NameService_DeleteNameTable_FullMethodName = "/feos.network.v1.NameService/DeleteNameTable"
+	NameService_GetNameTable_FullMethodName    = "/feos.network.v1.NameService/GetNameTable"
+	NameService_ListNameTables_FullMethodName  = "/feos.network.v1.NameService/ListNameTables"
+)
+
+// NameServiceClient is the client API for NameService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// The names of the node's pods (ADR 0010, ADR 0018): tables of names and
+// their addresses, from which feosd's resolver answers the pods whose
+// network names a table (PodNetwork.name_tables). The control plane owns
+// the tables and sends each node the tables of its pods, and every table
+// they include: whole, or as a delta of entries from one version to the
+// next. feosd keeps them on disk.
+type NameServiceClient interface {
+	// Puts a table whole: its entries, includes and version. It replaces the
+	// table feosd has, whatever its version.
+	PutNameTable(ctx context.Context, in *PutNameTableRequest, opts ...grpc.CallOption) (*PutNameTableResponse, error)
+	// Puts and removes entries of a table, from one version to the next.
+	// Fails with FAILED_PRECONDITION unless feosd has the table at
+	// from_version: the control plane then puts the table whole.
+	UpdateNameTable(ctx context.Context, in *UpdateNameTableRequest, opts ...grpc.CallOption) (*UpdateNameTableResponse, error)
+	// Removes a table. Fails with FAILED_PRECONDITION while a pod on the
+	// node names it.
+	DeleteNameTable(ctx context.Context, in *DeleteNameTableRequest, opts ...grpc.CallOption) (*DeleteNameTableResponse, error)
+	GetNameTable(ctx context.Context, in *GetNameTableRequest, opts ...grpc.CallOption) (*NameTable, error)
+	// The tables feosd has, with their entries and versions.
+	ListNameTables(ctx context.Context, in *ListNameTablesRequest, opts ...grpc.CallOption) (*ListNameTablesResponse, error)
+}
+
+type nameServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewNameServiceClient(cc grpc.ClientConnInterface) NameServiceClient {
+	return &nameServiceClient{cc}
+}
+
+func (c *nameServiceClient) PutNameTable(ctx context.Context, in *PutNameTableRequest, opts ...grpc.CallOption) (*PutNameTableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PutNameTableResponse)
+	err := c.cc.Invoke(ctx, NameService_PutNameTable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nameServiceClient) UpdateNameTable(ctx context.Context, in *UpdateNameTableRequest, opts ...grpc.CallOption) (*UpdateNameTableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateNameTableResponse)
+	err := c.cc.Invoke(ctx, NameService_UpdateNameTable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nameServiceClient) DeleteNameTable(ctx context.Context, in *DeleteNameTableRequest, opts ...grpc.CallOption) (*DeleteNameTableResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteNameTableResponse)
+	err := c.cc.Invoke(ctx, NameService_DeleteNameTable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nameServiceClient) GetNameTable(ctx context.Context, in *GetNameTableRequest, opts ...grpc.CallOption) (*NameTable, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NameTable)
+	err := c.cc.Invoke(ctx, NameService_GetNameTable_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nameServiceClient) ListNameTables(ctx context.Context, in *ListNameTablesRequest, opts ...grpc.CallOption) (*ListNameTablesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListNameTablesResponse)
+	err := c.cc.Invoke(ctx, NameService_ListNameTables_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// NameServiceServer is the server API for NameService service.
+// All implementations must embed UnimplementedNameServiceServer
+// for forward compatibility.
+//
+// The names of the node's pods (ADR 0010, ADR 0018): tables of names and
+// their addresses, from which feosd's resolver answers the pods whose
+// network names a table (PodNetwork.name_tables). The control plane owns
+// the tables and sends each node the tables of its pods, and every table
+// they include: whole, or as a delta of entries from one version to the
+// next. feosd keeps them on disk.
+type NameServiceServer interface {
+	// Puts a table whole: its entries, includes and version. It replaces the
+	// table feosd has, whatever its version.
+	PutNameTable(context.Context, *PutNameTableRequest) (*PutNameTableResponse, error)
+	// Puts and removes entries of a table, from one version to the next.
+	// Fails with FAILED_PRECONDITION unless feosd has the table at
+	// from_version: the control plane then puts the table whole.
+	UpdateNameTable(context.Context, *UpdateNameTableRequest) (*UpdateNameTableResponse, error)
+	// Removes a table. Fails with FAILED_PRECONDITION while a pod on the
+	// node names it.
+	DeleteNameTable(context.Context, *DeleteNameTableRequest) (*DeleteNameTableResponse, error)
+	GetNameTable(context.Context, *GetNameTableRequest) (*NameTable, error)
+	// The tables feosd has, with their entries and versions.
+	ListNameTables(context.Context, *ListNameTablesRequest) (*ListNameTablesResponse, error)
+	mustEmbedUnimplementedNameServiceServer()
+}
+
+// UnimplementedNameServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedNameServiceServer struct{}
+
+func (UnimplementedNameServiceServer) PutNameTable(context.Context, *PutNameTableRequest) (*PutNameTableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PutNameTable not implemented")
+}
+func (UnimplementedNameServiceServer) UpdateNameTable(context.Context, *UpdateNameTableRequest) (*UpdateNameTableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateNameTable not implemented")
+}
+func (UnimplementedNameServiceServer) DeleteNameTable(context.Context, *DeleteNameTableRequest) (*DeleteNameTableResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteNameTable not implemented")
+}
+func (UnimplementedNameServiceServer) GetNameTable(context.Context, *GetNameTableRequest) (*NameTable, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNameTable not implemented")
+}
+func (UnimplementedNameServiceServer) ListNameTables(context.Context, *ListNameTablesRequest) (*ListNameTablesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListNameTables not implemented")
+}
+func (UnimplementedNameServiceServer) mustEmbedUnimplementedNameServiceServer() {}
+func (UnimplementedNameServiceServer) testEmbeddedByValue()                     {}
+
+// UnsafeNameServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to NameServiceServer will
+// result in compilation errors.
+type UnsafeNameServiceServer interface {
+	mustEmbedUnimplementedNameServiceServer()
+}
+
+func RegisterNameServiceServer(s grpc.ServiceRegistrar, srv NameServiceServer) {
+	// If the following call panics, it indicates UnimplementedNameServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&NameService_ServiceDesc, srv)
+}
+
+func _NameService_PutNameTable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PutNameTableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NameServiceServer).PutNameTable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NameService_PutNameTable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NameServiceServer).PutNameTable(ctx, req.(*PutNameTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NameService_UpdateNameTable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateNameTableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NameServiceServer).UpdateNameTable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NameService_UpdateNameTable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NameServiceServer).UpdateNameTable(ctx, req.(*UpdateNameTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NameService_DeleteNameTable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteNameTableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NameServiceServer).DeleteNameTable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NameService_DeleteNameTable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NameServiceServer).DeleteNameTable(ctx, req.(*DeleteNameTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NameService_GetNameTable_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNameTableRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NameServiceServer).GetNameTable(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NameService_GetNameTable_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NameServiceServer).GetNameTable(ctx, req.(*GetNameTableRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NameService_ListNameTables_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListNameTablesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NameServiceServer).ListNameTables(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NameService_ListNameTables_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NameServiceServer).ListNameTables(ctx, req.(*ListNameTablesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// NameService_ServiceDesc is the grpc.ServiceDesc for NameService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var NameService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "feos.network.v1.NameService",
+	HandlerType: (*NameServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "PutNameTable",
+			Handler:    _NameService_PutNameTable_Handler,
+		},
+		{
+			MethodName: "UpdateNameTable",
+			Handler:    _NameService_UpdateNameTable_Handler,
+		},
+		{
+			MethodName: "DeleteNameTable",
+			Handler:    _NameService_DeleteNameTable_Handler,
+		},
+		{
+			MethodName: "GetNameTable",
+			Handler:    _NameService_GetNameTable_Handler,
+		},
+		{
+			MethodName: "ListNameTables",
+			Handler:    _NameService_ListNameTables_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "feos/network/v1/network.proto",
+}
+
+const (
 	TrafficService_StreamTrafficRecords_FullMethodName = "/feos.network.v1.TrafficService/StreamTrafficRecords"
 )
 

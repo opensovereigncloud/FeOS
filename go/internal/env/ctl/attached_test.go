@@ -62,7 +62,7 @@ func (h *harness) attachableAs(owner string, id uuid.UUID) store.Sandbox {
 	h.t.Helper()
 	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: owner, Image: testImage, ImageRef: testImage,
 		VCPUs: 1, MemoryMiB: 512, PodTemplate: &model.PodTemplate{Command: []string{"sleep", "infinity"},
-			SecurityGroups: []string{model.SandboxGroupID(id)}}}); err != nil {
+			SecurityGroups: []string{model.SandboxGroupID(id)}, NameTables: []string{model.SandboxTableID(id)}}}); err != nil {
 		h.t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(bg, 60*time.Second)
@@ -89,11 +89,12 @@ func attachedSpec(sandbox uuid.UUID, cwd, greeting string, withWeb bool) string 
 
 // An attached service is a supervised process in an attachable sandbox:
 // started (once its working directory exists) with its env, named in the
-// sandbox's hosts block beside the environment's image services, the
+// sandbox's name table on loopback beside the environment's image
+// services (which the env table names, and the image pods resolve), the
 // sandbox in the environment's group and its group reaching that group;
 // restarted on request and on a changed template; removed with its
-// process and its hosts entries. The attachable sandbox's own group is put
-// before its pod is created, also without an environment.
+// process and its name. The attachable sandbox's own group and name table
+// are put before its pod is created, also without an environment.
 func TestAttachedService(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is not installed; the process scripts need it")
@@ -105,6 +106,9 @@ func TestAttachedService(t *testing.T) {
 	sbx := h.group("n1", model.SandboxGroupID(sb.ID))
 	if sbx == nil || len(sbx.Rules) != 2 || !slices.Equal(sbx.Members, []string{sb.Address}) {
 		t.Fatalf("the sandbox's group %v", sbx)
+	}
+	if tbl := h.table("n1", model.SandboxTableID(sb.ID)); tbl == nil || len(tbl.Entries) != 0 || len(tbl.Includes) != 0 {
+		t.Fatalf("the sandbox's name table %v", tbl)
 	}
 
 	env := h.newEnv("dev")
@@ -119,7 +123,7 @@ func TestAttachedService(t *testing.T) {
 	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
 	a, err := h.st.GetAttached(bg, env.ID, "web")
 	if err != nil || a.Phase != model.PhaseReady || a.ProcessID == "" || a.SandboxIncarnation != sb.Incarnation ||
-		a.HostsWritten == "" || a.Restarts != 0 {
+		a.Restarts != 0 {
 		t.Fatalf("attached %+v %v", a, err)
 	}
 	ps, err := h.runner.ProcessesDetached(bg, lease(sb), "")
@@ -136,20 +140,18 @@ func TestAttachedService(t *testing.T) {
 		t.Errorf("log %q", lines)
 	}
 	api := h.waitRows(env.ID, spec.KindService, "api", 1, 10*time.Second, "ready", ready)[0]
-	hosts, err := os.ReadFile(filepath.Join(n1.PodDir(sb.ID), "etc", "hosts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantBlock := fmt.Sprintf("# ferun environment dev begin\n%s api\n127.0.0.1 web\n::1 web\n# ferun environment dev end\n",
-		api.Sandbox.Address)
-	if string(hosts) != hostsBase+wantBlock {
-		t.Errorf("the sandbox's hosts\n%s", hosts)
-	}
-	eventually(t, 10*time.Second, "the image instance's hosts block", func() bool {
-		b, err := os.ReadFile(filepath.Join(n1.PodDir(api.Sandbox.ID), "etc", "hosts"))
-		return err == nil && string(b) == hostsBase+fmt.Sprintf("# ferun environment dev begin\n%s api\n# ferun environment dev end\n",
-			api.Sandbox.Address)
+	eventually(t, 10*time.Second, "the names", func() bool {
+		return resolves(n1, sb.ID, "web", "127.0.0.1", "::1") && resolves(n1, sb.ID, "API", api.Sandbox.Address) &&
+			resolves(n1, api.Sandbox.ID, "api", api.Sandbox.Address) && resolves(n1, api.Sandbox.ID, "web")
 	})
+	if pod := h.pod("n1", api.Sandbox.ID); !slices.Equal(pod.GetSpec().GetNetwork().GetNameTables(),
+		[]string{model.EnvTableID(env.ID)}) {
+		t.Errorf("the image instance's name tables %v", pod.GetSpec().GetNetwork().GetNameTables())
+	}
+	if tbl := h.table("n1", model.SandboxTableID(sb.ID)); tbl == nil ||
+		!slices.Equal(tbl.Includes, []string{model.EnvTableID(env.ID)}) {
+		t.Errorf("the sandbox's name table %v", tbl)
+	}
 	// Groups: the sandbox is a member of the env group, and its group
 	// reaches the env group.
 	eventually(t, 30*time.Second, "the groups", func() bool {
@@ -199,7 +201,7 @@ func TestAttachedService(t *testing.T) {
 		return err == nil && d.Restarts == 1 && d.ProcessID != "" && d.ProcessID != c.ProcessID
 	})
 
-	// Removed: the process stops, the hosts block goes, the row goes.
+	// Removed: the process stops, the row and the name go.
 	d, _ := h.st.GetAttached(bg, env.ID, "web")
 	r3 := h.apply(env.ID, attachedSpec(sb.ID, "/app", "", false))
 	h.waitRelease(env.ID, r3, model.ReleaseRealised, 60*time.Second)
@@ -212,9 +214,11 @@ func TestAttachedService(t *testing.T) {
 			t.Errorf("a process still runs: %+v (last %s)", p, d.ProcessID)
 		}
 	}
-	if hosts, _ := os.ReadFile(filepath.Join(n1.PodDir(sb.ID), "etc", "hosts")); string(hosts) != hostsBase {
-		t.Errorf("the sandbox's hosts after the removal\n%s", hosts)
-	}
+	eventually(t, 10*time.Second, "the sandbox's names after the removal", func() bool {
+		tbl := h.table("n1", model.SandboxTableID(sb.ID))
+		return tbl != nil && len(tbl.Entries) == 0 && len(tbl.Includes) == 0 && resolves(n1, sb.ID, "web") &&
+			resolves(n1, sb.ID, "api")
+	})
 	eventually(t, 30*time.Second, "the sandbox out of the env group", func() bool {
 		eg := h.group("n1", model.EnvGroupID(env.ID))
 		return eg != nil && !slices.Contains(eg.Members, sb.Address)
@@ -302,9 +306,9 @@ func hostProcessesCounting(n *testnode.Node, root string) *startLog {
 
 // An attached service's sandbox deleted and its ID taken by another
 // tenant's attachable sandbox: the service fails ("gone or not this
-// tenant's"); nothing starts in the new sandbox, no hosts block is written
-// there, it joins no group of the environment and its own group reaches
-// none; its logs and restarts answer ErrNotRunning.
+// tenant's"); nothing starts in the new sandbox, it is given no names of
+// the environment, it joins no group of the environment and its own group
+// reaches none; its logs and restarts answer ErrNotRunning.
 func TestAttachedSandboxReusedByAnotherTenant(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is not installed; the process scripts need it")
@@ -338,9 +342,13 @@ func TestAttachedSandboxReusedByAnotherTenant(t *testing.T) {
 			b.Detail == fmt.Sprintf("sandbox %s is gone or not this tenant's", sb.ID)
 	})
 	never(t, 3*time.Second, "something happened in the other tenant's sandbox", func() bool {
-		hosts, _ := os.ReadFile(filepath.Join(n1.PodDir(sb.ID), "etc", "hosts"))
-		return starts.count(sb.ID) != before || strings.Contains(string(hosts), "ferun environment")
+		_, named := n1.Resolve(sb.ID, "web")
+		_, api := n1.Resolve(sb.ID, "api")
+		return starts.count(sb.ID) != before || named || api
 	})
+	if tbl := h.table("n1", model.SandboxTableID(sb.ID)); tbl == nil || len(tbl.Entries) != 0 || len(tbl.Includes) != 0 {
+		t.Errorf("the other tenant's sandbox's name table %v", tbl)
+	}
 	if b, _ := h.st.GetAttached(bg, env.ID, "web"); b.SandboxIncarnation != sb.Incarnation {
 		t.Errorf("the recorded incarnation changed: %+v", b)
 	}
@@ -471,11 +479,11 @@ func TestAttachedStrayProcesses(t *testing.T) {
 }
 
 // An attached service that goes while its sandbox sleeps — removed from
-// the spec, or its environment deleted — is stopped and taken out of the
-// sandbox's hosts block in the sandbox woken for it, before its row goes
-// (and the environment's, once nothing of it is left): a process left
-// there would run on with the environment's secrets after a resume, and
-// the hosts block would name what is gone.
+// the spec, or its environment deleted — is stopped in the sandbox woken
+// for it before its row goes (and the environment's, once nothing of it is
+// left): a process left there would run on with the environment's secrets
+// after a resume. Its name leaves the sandbox's table with the row; the
+// sleeping sandbox resolves its names all along, as its node answers them.
 func TestAttachedGoesFromSleepingSandbox(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is not installed; the process scripts need it")
@@ -484,10 +492,6 @@ func TestAttachedGoesFromSleepingSandbox(t *testing.T) {
 	n1 := h.addNode("n1")
 	hostProcesses(n1, t.TempDir())
 	sb := h.attachable()
-	hosts := func() string {
-		b, _ := os.ReadFile(filepath.Join(n1.PodDir(sb.ID), "etc", "hosts"))
-		return string(b)
-	}
 	sleep := func() {
 		t.Helper()
 		if err := h.eng.Pause(bg, sb.ID); err != nil {
@@ -513,10 +517,13 @@ func TestAttachedGoesFromSleepingSandbox(t *testing.T) {
 	// Removed from the spec while the sandbox is paused.
 	dev := h.newEnv("dev")
 	a := up(dev.ID, h.apply(dev.ID, `{"services":{`+web+`,`+other+`}}`))
-	if !strings.Contains(hosts(), "# ferun environment dev begin") {
-		t.Fatalf("no hosts block %q", hosts())
-	}
+	eventually(t, 10*time.Second, "the names", func() bool {
+		return resolves(n1, sb.ID, "web", "127.0.0.1", "::1")
+	})
 	sleep()
+	if !resolves(n1, sb.ID, "web", "127.0.0.1", "::1") {
+		t.Fatal("the sleeping sandbox lost its names")
+	}
 	r2 := h.apply(dev.ID, `{"services":{`+other+`}}`)
 	h.waitRelease(dev.ID, r2, model.ReleaseRealised, 60*time.Second)
 	if _, err := h.st.GetAttached(bg, dev.ID, "web"); !errors.Is(err, store.ErrNoRow) {
@@ -526,9 +533,9 @@ func TestAttachedGoesFromSleepingSandbox(t *testing.T) {
 	if got := h.runningNamed(cur, "ferun-env-dev-web"); len(got) != 0 {
 		t.Fatalf("the removed service's process %s runs on: %v", a.ProcessID, got)
 	}
-	if strings.Contains(hosts(), "ferun environment dev") {
-		t.Fatalf("the removed service's hosts block stayed:\n%s", hosts())
-	}
+	eventually(t, 10*time.Second, "the removed service's name gone", func() bool {
+		return resolves(n1, sb.ID, "web")
+	})
 
 	// Its environment deleted while the sandbox is paused.
 	stage := h.newEnv("stage")
@@ -543,9 +550,9 @@ func TestAttachedGoesFromSleepingSandbox(t *testing.T) {
 	if got := h.runningNamed(cur, "ferun-env-stage-web"); len(got) != 0 {
 		t.Fatalf("the deleted environment's process runs on: %v", got)
 	}
-	if strings.Contains(hosts(), "ferun environment stage") {
-		t.Fatalf("the deleted environment's hosts block stayed:\n%s", hosts())
-	}
+	eventually(t, 10*time.Second, "the deleted environment's names gone", func() bool {
+		return resolves(n1, sb.ID, "web")
+	})
 }
 
 // attachableUp brings an attachable sandbox up (it may sleep) and reads

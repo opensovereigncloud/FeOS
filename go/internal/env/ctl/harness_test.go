@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -241,8 +242,8 @@ func newHarness(t *testing.T, o options) *harness {
 	return h
 }
 
-// addNode joins a test node that checks security groups, and waits until
-// it is connected and ready.
+// addNode joins a test node that checks security groups and name tables,
+// and waits until it is connected and ready.
 func (h *harness) addNode(name string, mod ...func(*testnode.Config)) *testnode.Node {
 	t := h.t
 	t.Helper()
@@ -253,7 +254,7 @@ func (h *harness) addNode(name string, mod ...func(*testnode.Config)) *testnode.
 	cfg := testnode.Config{
 		Name: name, JoinToken: token, ServerName: h.iss.ControlPlaneDomain(), TrustDomain: testTD,
 		Addrs: []string{h.srv.Addr().String()}, ObjectStore: h.objs, PendingDelay: 20 * time.Millisecond,
-		CheckSecurityGroups: true, Log: dbtest.Logger(t),
+		CheckSecurityGroups: true, CheckNameTables: true, Log: dbtest.Logger(t),
 	}
 	for _, m := range mod {
 		m(&cfg)
@@ -315,6 +316,23 @@ func (h *harness) group(node, id string) *networkv1.SecurityGroup {
 		return nil
 	}
 	return g
+}
+
+// table reads a name table from a node; nil when it has none.
+func (h *harness) table(node, id string) *networkv1.NameTable {
+	h.t.Helper()
+	t, err := networkv1.NewNameServiceClient(h.conn(node)).GetNameTable(bg, &networkv1.GetNameTableRequest{Id: id})
+	if err != nil {
+		return nil
+	}
+	return t
+}
+
+// resolves reports whether the pod resolves name, on its node as feosd's
+// resolver would, to exactly addrs (none: the name is not the pod's).
+func resolves(n *testnode.Node, pod uuid.UUID, name string, addrs ...string) bool {
+	got, ok := n.Resolve(pod, name)
+	return ok == (len(addrs) > 0) && slices.Equal(got, addrs)
 }
 
 // newEnv makes an environment of the tenant.

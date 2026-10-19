@@ -21,7 +21,8 @@ import (
 // PrepareHook is the engine's prepare hook (sandbox.PrepareHook) for a
 // row with a pod template, an environment's instance or an attachable
 // sandbox: it puts the row's security groups, and those their rules
-// reference, on node (whole groups); before a create it also makes sure
+// reference, on node (whole groups), and its name tables, and those they
+// include (putNames); before a create it also makes sure
 // the row's volumes are there: created on node when they never were
 // (then provisioned, their node and the row's pin_node set in a
 // transaction of its own), else present there and free (AVAILABLE,
@@ -33,6 +34,9 @@ func (c *Controller) PrepareHook(ctx context.Context, node string, sb store.Sand
 		return nil
 	}
 	if err := c.putGroups(ctx, node, sb); err != nil {
+		return err
+	}
+	if err := c.putNames(ctx, node, sb); err != nil {
 		return err
 	}
 	if kind != sandbox.OpCreate {

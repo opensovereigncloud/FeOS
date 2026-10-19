@@ -47,8 +47,6 @@ type ProcessStatus struct {
 // The definite answers of the detached calls, which callers tell apart
 // with errors.Is.
 var (
-	// ErrNoFile: ReadFileDetached's file does not exist.
-	ErrNoFile = errors.New("no such file")
 	// ErrNoCwd: StartProcessDetached's working directory does not exist.
 	ErrNoCwd = errors.New("the working directory does not exist")
 	// ErrNoProcess: the process id names no process of the sandbox.

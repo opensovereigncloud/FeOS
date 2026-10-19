@@ -74,17 +74,11 @@ func (h *harness) sleepUntilPaused(id uuid.UUID) {
 	})
 }
 
-// hostsOf reads a pod's /etc/hosts.
-func hostsOf(n *testnode.Node, id uuid.UUID) string {
-	b, _ := os.ReadFile(filepath.Join(n.PodDir(id), "etc", "hosts"))
-	return string(b)
-}
-
 // FeCode replaces a lost workspace sandbox under the same ID: the
 // attached service in it comes back in the new incarnation (§13.6), with
-// restarts, next_restart_at, probe_failures and hosts_written reset and
-// the new incarnation recorded; its process starts there, its hosts block
-// is written there and the new sandbox is a member of the environment's
+// restarts, next_restart_at and probe_failures reset and the new
+// incarnation recorded; its process starts there, the new sandbox's pod
+// resolves its name and the new sandbox is a member of the environment's
 // group.
 func TestAttachedNewIncarnation(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
@@ -126,7 +120,7 @@ func TestAttachedNewIncarnation(t *testing.T) {
 	eventually(t, 60*time.Second, "the service back in the new incarnation", func() bool {
 		c, err = h.st.GetAttached(bg, env.ID, "web")
 		return err == nil && c.SandboxIncarnation == again.Incarnation && c.ProcessID != "" && c.ProcessID != b.ProcessID &&
-			c.Phase == model.PhaseReady && c.HostsWritten != ""
+			c.Phase == model.PhaseReady
 	})
 	if c.Restarts != 0 || c.ProbeFailures != 0 || !c.NextRestartAt.IsZero() || c.Detail != "" {
 		t.Errorf("not reset: %+v", c)
@@ -134,9 +128,9 @@ func TestAttachedNewIncarnation(t *testing.T) {
 	if got := h.runningNamed(again, "ferun-env-dev-web"); !slices.Equal(got, []string{c.ProcessID}) {
 		t.Errorf("running %v, the row records %s", got, c.ProcessID)
 	}
-	if !strings.Contains(hostsOf(n1, sb.ID), "127.0.0.1 web\n") {
-		t.Errorf("the new sandbox's hosts\n%s", hostsOf(n1, sb.ID))
-	}
+	eventually(t, 10*time.Second, "the new sandbox's names", func() bool {
+		return resolves(n1, sb.ID, "web", "127.0.0.1", "::1") && resolves(n1, sb.ID, "nope")
+	})
 	eventually(t, 30*time.Second, "the new sandbox in the env group", func() bool {
 		h.c.notify(bg, HintGroups)
 		g := h.group("n1", model.EnvGroupID(env.ID))
@@ -189,9 +183,9 @@ func TestAttachedStopFailureKeepsRow(t *testing.T) {
 	if got := h.runningNamed(sb, "ferun-env-dev-web"); len(got) != 0 {
 		t.Fatalf("the removed service's process runs on: %v", got)
 	}
-	if strings.Contains(hostsOf(n1, sb.ID), "ferun environment dev") {
-		t.Fatalf("the removed service's hosts block stayed:\n%s", hostsOf(n1, sb.ID))
-	}
+	eventually(t, 10*time.Second, "the removed service's name gone", func() bool {
+		return resolves(n1, sb.ID, "web") && resolves(n1, sb.ID, "api")
+	})
 
 	// Its environment deleted.
 	stage := h.newEnv("stage")
@@ -225,9 +219,10 @@ func TestAttachedStopFailureKeepsRow(t *testing.T) {
 }
 
 // An attached service moved away from a sandbox that sleeps: the old
-// sandbox is woken, the process stopped there and its name taken out of
-// the old sandbox's hosts block (which keeps the services that stay), and
-// only then does the row move; the service then runs in the new sandbox.
+// sandbox is woken, the process stopped there, and only then does the row
+// move, its name with it from the old sandbox's table (which keeps the
+// services that stay) to the new one's; the service then runs in the new
+// sandbox.
 func TestAttachedMovesFromSleepingSandbox(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 is not installed; the process scripts need it")
@@ -243,12 +238,12 @@ func TestAttachedMovesFromSleepingSandbox(t *testing.T) {
 	r1 := h.apply(env.ID, `{"services":{`+attached("web", s1.ID)+`,`+attached("worker", s1.ID)+`}}`)
 	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
 	a, err := h.st.GetAttached(bg, env.ID, "web")
-	if err != nil || a.ProcessID == "" || a.HostsWritten == "" {
+	if err != nil || a.ProcessID == "" {
 		t.Fatalf("attached %+v %v", a, err)
 	}
-	if hosts := hostsOf(n1, s1.ID); !strings.Contains(hosts, "127.0.0.1 web\n") || !strings.Contains(hosts, "127.0.0.1 worker\n") {
-		t.Fatalf("the first sandbox's hosts\n%s", hosts)
-	}
+	eventually(t, 10*time.Second, "the first sandbox's names", func() bool {
+		return resolves(n1, s1.ID, "web", "127.0.0.1", "::1") && resolves(n1, s1.ID, "worker", "127.0.0.1", "::1")
+	})
 	h.sleepUntilPaused(s1.ID)
 
 	r2 := h.apply(env.ID, `{"services":{`+attached("web", s2.ID)+`,`+attached("worker", s1.ID)+`}}`)
@@ -264,9 +259,9 @@ func TestAttachedMovesFromSleepingSandbox(t *testing.T) {
 	if got := h.runningNamed(cur, "ferun-env-dev-worker"); len(got) != 1 {
 		t.Fatalf("the service that stays: %v", got)
 	}
-	eventually(t, 30*time.Second, "the old sandbox's hosts block without the moved service", func() bool {
-		hosts := hostsOf(n1, s1.ID)
-		return !strings.Contains(hosts, " web\n") && strings.Contains(hosts, "127.0.0.1 worker\n")
+	eventually(t, 30*time.Second, "the moved service's name in the new sandbox alone", func() bool {
+		return resolves(n1, s1.ID, "web") && resolves(n1, s1.ID, "worker", "127.0.0.1", "::1") &&
+			resolves(n1, s2.ID, "web", "127.0.0.1", "::1") && resolves(n1, s2.ID, "worker")
 	})
 	if got := h.runningNamed(h.attachableUp(s2.ID), "ferun-env-dev-web"); !slices.Equal(got, []string{b.ProcessID}) {
 		t.Fatalf("the new sandbox runs %v, the row records %s", got, b.ProcessID)
@@ -289,7 +284,7 @@ func TestAttachedCleanLeavesNewIncarnation(t *testing.T) {
 	env := h.newEnv("dev")
 	v := &view{env: env, target: emptySpec(), latestSpec: emptySpec()}
 	a, err := h.st.InsertAttached(bg, store.EnvAttached{EnvID: env.ID, Service: "web", SandboxID: sb.ID,
-		SandboxIncarnation: uuid.New(), ProcessID: "p1", HostsWritten: "h1"})
+		SandboxIncarnation: uuid.New(), ProcessID: "p1"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -97,46 +97,6 @@ func TestExecDetached(t *testing.T) {
 	noBookkeeping(t, env, lease.SandboxID)
 }
 
-// WriteFileDetached and ReadFileDetached go through the guest's tools; a
-// file that does not exist is ErrNoFile.
-func TestFileDetached(t *testing.T) {
-	env := toolstest.New(t, toolstest.Options{})
-	r := newRunner(env)
-	lease := detachedLease(t, env)
-	content := "127.0.0.1 localhost\n::1 localhost\n# ferun environment e begin\nfd00::5 postgres\n# ferun environment e end\n"
-	if err := r.WriteFileDetached(bg, lease, "/etc/hosts", []byte(content)); err != nil {
-		t.Fatal(err)
-	}
-	got, err := r.ReadFileDetached(bg, lease, "/etc/hosts")
-	if err != nil || got != content {
-		t.Fatalf("read %q, %v", got, err)
-	}
-	// Longer than a page of the read tool.
-	var long strings.Builder
-	for i := range 4500 {
-		long.WriteString(strings.Repeat("x", i%7) + "\n")
-	}
-	if err := r.WriteFileDetached(bg, lease, "/long", []byte(long.String())); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := r.ReadFileDetached(bg, lease, "/long"); err != nil || got != long.String() {
-		t.Errorf("a long file read back as %d bytes (want %d), %v", len(got), long.Len(), err)
-	}
-	if _, err := r.ReadFileDetached(bg, lease, "/nope"); !errors.Is(err, ErrNoFile) {
-		t.Errorf("a missing file: %v", err)
-	}
-	if got, err := r.ReadFileDetached(bg, lease, "/empty"); !errors.Is(err, ErrNoFile) {
-		t.Errorf("a missing file: %q %v", got, err)
-	}
-	if err := r.WriteFileDetached(bg, lease, "/empty", nil); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := r.ReadFileDetached(bg, lease, "/empty"); err != nil || got != "" {
-		t.Errorf("an empty file: %q %v", got, err)
-	}
-	noBookkeeping(t, env, lease.SandboxID)
-}
-
 // detachedRoot makes the node run the process scripts with their records
 // under root and the working directory taken beneath the pod's directory,
 // which stands in for the container's root (the test node runs commands

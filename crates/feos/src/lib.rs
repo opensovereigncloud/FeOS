@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use container_service::api::ContainerApiHandler;
 #[cfg(feature = "host")]
 use feos_proto::network_service::{
-    mesh_service_server::MeshServiceServer,
+    mesh_service_server::MeshServiceServer, name_service_server::NameServiceServer,
     security_group_service_server::SecurityGroupServiceServer,
     traffic_service_server::TrafficServiceServer,
 };
@@ -33,7 +33,7 @@ use host_service::{api::HostApiHandler, RestartSignal};
 use image_service::{api::ImageApiHandler, IMAGE_SERVICE_SOCKET};
 use log::{error, info, warn};
 #[cfg(feature = "host")]
-use network_service::SecurityGroups;
+use network_service::{NameTables, SecurityGroups};
 use nix::unistd::{chown, Group, Uid};
 #[cfg(feature = "host")]
 use pod_service::{forward::ForwardLayer, Pods, Volumes};
@@ -147,7 +147,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     #[cfg(feature = "host")]
     let vms = initialize_vm_service(&setup_database().await?).await?;
     #[cfg(feature = "host")]
-    let (pods, volumes, groups, traffic) = initialize_pod_service(
+    let (pods, volumes, groups, names, traffic) = initialize_pod_service(
         vms,
         options.network,
         options.dns_sockets,
@@ -161,6 +161,8 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
         volumes,
         #[cfg(feature = "host")]
         groups,
+        #[cfg(feature = "host")]
+        names,
         #[cfg(feature = "host")]
         traffic,
         container: initialize_container_service().await?,
@@ -343,6 +345,8 @@ struct Services {
     #[cfg(feature = "host")]
     groups: SecurityGroups,
     #[cfg(feature = "host")]
+    names: NameTables,
+    #[cfg(feature = "host")]
     traffic: traffic_service::TrafficApi,
     container: ContainerServiceServer<ContainerApiHandler>,
     host: HostServiceServer<HostApiHandler>,
@@ -377,6 +381,7 @@ impl Services {
             .add_service(PodServiceServer::new(self.pods.clone()))
             .add_service(VolumeServiceServer::new(self.volumes.clone()))
             .add_service(SecurityGroupServiceServer::new(self.groups.clone()))
+            .add_service(NameServiceServer::new(self.names.clone()))
             .add_service(MeshServiceServer::new(self.pods.clone()))
             .add_service(TrafficServiceServer::new(self.traffic.clone()));
         #[cfg(feature = "guest")]

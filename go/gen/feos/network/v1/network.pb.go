@@ -925,6 +925,543 @@ func (x *ListSecurityGroupsResponse) GetGroups() []*SecurityGroup {
 	return nil
 }
 
+// Names and their addresses. A pod whose network names the table gets
+// them from feosd's resolver: a query for a name of one label, in any
+// case, that the pod's tables hold is answered from them, and never asked
+// upstream.
+type NameTable struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 1 to 64 characters of letters, digits, "-", "_" and ".".
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// Changes with every change of the table; the control plane chooses it
+	// (ferund: a hash of the content). A delta names the version it starts
+	// from and the one it makes.
+	Version uint64 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
+	// The table's names, each once.
+	Entries []*NameEntry `protobuf:"bytes,3,rep,name=entries,proto3" json:"entries,omitempty"`
+	// Tables whose names the pods that name this one resolve too, after this
+	// one's own and in this order, as a rule names a peer group: by ID. Their
+	// includes are not followed. One the node does not have holds no names.
+	Includes      []string `protobuf:"bytes,4,rep,name=includes,proto3" json:"includes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NameTable) Reset() {
+	*x = NameTable{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NameTable) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NameTable) ProtoMessage() {}
+
+func (x *NameTable) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NameTable.ProtoReflect.Descriptor instead.
+func (*NameTable) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *NameTable) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *NameTable) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *NameTable) GetEntries() []*NameEntry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+func (x *NameTable) GetIncludes() []string {
+	if x != nil {
+		return x.Includes
+	}
+	return nil
+}
+
+type NameEntry struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// One label of a DNS name: 1 to 63 letters, digits and "-", "-" neither
+	// first nor last. Kept in lower case; a query matches it in any case.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// At least one: IPv6 addresses answer AAAA queries, IPv4 addresses A
+	// queries.
+	Addresses     []string `protobuf:"bytes,2,rep,name=addresses,proto3" json:"addresses,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NameEntry) Reset() {
+	*x = NameEntry{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NameEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NameEntry) ProtoMessage() {}
+
+func (x *NameEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NameEntry.ProtoReflect.Descriptor instead.
+func (*NameEntry) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *NameEntry) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *NameEntry) GetAddresses() []string {
+	if x != nil {
+		return x.Addresses
+	}
+	return nil
+}
+
+type PutNameTableRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Table         *NameTable             `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PutNameTableRequest) Reset() {
+	*x = PutNameTableRequest{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PutNameTableRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PutNameTableRequest) ProtoMessage() {}
+
+func (x *PutNameTableRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PutNameTableRequest.ProtoReflect.Descriptor instead.
+func (*PutNameTableRequest) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *PutNameTableRequest) GetTable() *NameTable {
+	if x != nil {
+		return x.Table
+	}
+	return nil
+}
+
+type PutNameTableResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PutNameTableResponse) Reset() {
+	*x = PutNameTableResponse{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PutNameTableResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PutNameTableResponse) ProtoMessage() {}
+
+func (x *PutNameTableResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PutNameTableResponse.ProtoReflect.Descriptor instead.
+func (*PutNameTableResponse) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{16}
+}
+
+type UpdateNameTableRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Id    string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// The version feosd must have.
+	FromVersion uint64 `protobuf:"varint,2,opt,name=from_version,json=fromVersion,proto3" json:"from_version,omitempty"`
+	// The version after this change; not from_version.
+	Version uint64 `protobuf:"varint,3,opt,name=version,proto3" json:"version,omitempty"`
+	// Entries that are new or changed, by name: an entry replaces the
+	// addresses the name had.
+	PutEntries []*NameEntry `protobuf:"bytes,4,rep,name=put_entries,json=putEntries,proto3" json:"put_entries,omitempty"`
+	// The names that go.
+	RemoveNames   []string `protobuf:"bytes,5,rep,name=remove_names,json=removeNames,proto3" json:"remove_names,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateNameTableRequest) Reset() {
+	*x = UpdateNameTableRequest{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateNameTableRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateNameTableRequest) ProtoMessage() {}
+
+func (x *UpdateNameTableRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateNameTableRequest.ProtoReflect.Descriptor instead.
+func (*UpdateNameTableRequest) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *UpdateNameTableRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *UpdateNameTableRequest) GetFromVersion() uint64 {
+	if x != nil {
+		return x.FromVersion
+	}
+	return 0
+}
+
+func (x *UpdateNameTableRequest) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *UpdateNameTableRequest) GetPutEntries() []*NameEntry {
+	if x != nil {
+		return x.PutEntries
+	}
+	return nil
+}
+
+func (x *UpdateNameTableRequest) GetRemoveNames() []string {
+	if x != nil {
+		return x.RemoveNames
+	}
+	return nil
+}
+
+type UpdateNameTableResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateNameTableResponse) Reset() {
+	*x = UpdateNameTableResponse{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateNameTableResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateNameTableResponse) ProtoMessage() {}
+
+func (x *UpdateNameTableResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateNameTableResponse.ProtoReflect.Descriptor instead.
+func (*UpdateNameTableResponse) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{18}
+}
+
+type DeleteNameTableRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteNameTableRequest) Reset() {
+	*x = DeleteNameTableRequest{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteNameTableRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteNameTableRequest) ProtoMessage() {}
+
+func (x *DeleteNameTableRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteNameTableRequest.ProtoReflect.Descriptor instead.
+func (*DeleteNameTableRequest) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *DeleteNameTableRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type DeleteNameTableResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteNameTableResponse) Reset() {
+	*x = DeleteNameTableResponse{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteNameTableResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteNameTableResponse) ProtoMessage() {}
+
+func (x *DeleteNameTableResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteNameTableResponse.ProtoReflect.Descriptor instead.
+func (*DeleteNameTableResponse) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{20}
+}
+
+type GetNameTableRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetNameTableRequest) Reset() {
+	*x = GetNameTableRequest{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetNameTableRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetNameTableRequest) ProtoMessage() {}
+
+func (x *GetNameTableRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetNameTableRequest.ProtoReflect.Descriptor instead.
+func (*GetNameTableRequest) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *GetNameTableRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type ListNameTablesRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListNameTablesRequest) Reset() {
+	*x = ListNameTablesRequest{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListNameTablesRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListNameTablesRequest) ProtoMessage() {}
+
+func (x *ListNameTablesRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListNameTablesRequest.ProtoReflect.Descriptor instead.
+func (*ListNameTablesRequest) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{22}
+}
+
+type ListNameTablesResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Tables        []*NameTable           `protobuf:"bytes,1,rep,name=tables,proto3" json:"tables,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListNameTablesResponse) Reset() {
+	*x = ListNameTablesResponse{}
+	mi := &file_feos_network_v1_network_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListNameTablesResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListNameTablesResponse) ProtoMessage() {}
+
+func (x *ListNameTablesResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_feos_network_v1_network_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListNameTablesResponse.ProtoReflect.Descriptor instead.
+func (*ListNameTablesResponse) Descriptor() ([]byte, []int) {
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *ListNameTablesResponse) GetTables() []*NameTable {
+	if x != nil {
+		return x.Tables
+	}
+	return nil
+}
+
 type Mesh struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The cluster's ULA, a /48; empty on a node that is not on a mesh.
@@ -944,7 +1481,7 @@ type Mesh struct {
 
 func (x *Mesh) Reset() {
 	*x = Mesh{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[13]
+	mi := &file_feos_network_v1_network_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -956,7 +1493,7 @@ func (x *Mesh) String() string {
 func (*Mesh) ProtoMessage() {}
 
 func (x *Mesh) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[13]
+	mi := &file_feos_network_v1_network_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -969,7 +1506,7 @@ func (x *Mesh) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Mesh.ProtoReflect.Descriptor instead.
 func (*Mesh) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{13}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *Mesh) GetPodNetwork() string {
@@ -1031,7 +1568,7 @@ type MeshPeer struct {
 
 func (x *MeshPeer) Reset() {
 	*x = MeshPeer{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[14]
+	mi := &file_feos_network_v1_network_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1043,7 +1580,7 @@ func (x *MeshPeer) String() string {
 func (*MeshPeer) ProtoMessage() {}
 
 func (x *MeshPeer) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[14]
+	mi := &file_feos_network_v1_network_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1056,7 +1593,7 @@ func (x *MeshPeer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MeshPeer.ProtoReflect.Descriptor instead.
 func (*MeshPeer) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{14}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *MeshPeer) GetNode() string {
@@ -1097,7 +1634,7 @@ type PutMeshPeersRequest struct {
 
 func (x *PutMeshPeersRequest) Reset() {
 	*x = PutMeshPeersRequest{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[15]
+	mi := &file_feos_network_v1_network_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1109,7 +1646,7 @@ func (x *PutMeshPeersRequest) String() string {
 func (*PutMeshPeersRequest) ProtoMessage() {}
 
 func (x *PutMeshPeersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[15]
+	mi := &file_feos_network_v1_network_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1122,7 +1659,7 @@ func (x *PutMeshPeersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutMeshPeersRequest.ProtoReflect.Descriptor instead.
 func (*PutMeshPeersRequest) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{15}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *PutMeshPeersRequest) GetVersion() uint64 {
@@ -1147,7 +1684,7 @@ type PutMeshPeersResponse struct {
 
 func (x *PutMeshPeersResponse) Reset() {
 	*x = PutMeshPeersResponse{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[16]
+	mi := &file_feos_network_v1_network_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1159,7 +1696,7 @@ func (x *PutMeshPeersResponse) String() string {
 func (*PutMeshPeersResponse) ProtoMessage() {}
 
 func (x *PutMeshPeersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[16]
+	mi := &file_feos_network_v1_network_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1172,7 +1709,7 @@ func (x *PutMeshPeersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutMeshPeersResponse.ProtoReflect.Descriptor instead.
 func (*PutMeshPeersResponse) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{16}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{27}
 }
 
 type UpdateMeshPeersRequest struct {
@@ -1191,7 +1728,7 @@ type UpdateMeshPeersRequest struct {
 
 func (x *UpdateMeshPeersRequest) Reset() {
 	*x = UpdateMeshPeersRequest{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[17]
+	mi := &file_feos_network_v1_network_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1203,7 +1740,7 @@ func (x *UpdateMeshPeersRequest) String() string {
 func (*UpdateMeshPeersRequest) ProtoMessage() {}
 
 func (x *UpdateMeshPeersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[17]
+	mi := &file_feos_network_v1_network_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1216,7 +1753,7 @@ func (x *UpdateMeshPeersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateMeshPeersRequest.ProtoReflect.Descriptor instead.
 func (*UpdateMeshPeersRequest) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{17}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *UpdateMeshPeersRequest) GetFromVersion() uint64 {
@@ -1255,7 +1792,7 @@ type UpdateMeshPeersResponse struct {
 
 func (x *UpdateMeshPeersResponse) Reset() {
 	*x = UpdateMeshPeersResponse{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[18]
+	mi := &file_feos_network_v1_network_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1267,7 +1804,7 @@ func (x *UpdateMeshPeersResponse) String() string {
 func (*UpdateMeshPeersResponse) ProtoMessage() {}
 
 func (x *UpdateMeshPeersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[18]
+	mi := &file_feos_network_v1_network_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1280,7 +1817,7 @@ func (x *UpdateMeshPeersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateMeshPeersResponse.ProtoReflect.Descriptor instead.
 func (*UpdateMeshPeersResponse) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{18}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{29}
 }
 
 type GetMeshRequest struct {
@@ -1291,7 +1828,7 @@ type GetMeshRequest struct {
 
 func (x *GetMeshRequest) Reset() {
 	*x = GetMeshRequest{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[19]
+	mi := &file_feos_network_v1_network_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1303,7 +1840,7 @@ func (x *GetMeshRequest) String() string {
 func (*GetMeshRequest) ProtoMessage() {}
 
 func (x *GetMeshRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[19]
+	mi := &file_feos_network_v1_network_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1316,7 +1853,7 @@ func (x *GetMeshRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMeshRequest.ProtoReflect.Descriptor instead.
 func (*GetMeshRequest) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{19}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{30}
 }
 
 type StreamTrafficRecordsRequest struct {
@@ -1329,7 +1866,7 @@ type StreamTrafficRecordsRequest struct {
 
 func (x *StreamTrafficRecordsRequest) Reset() {
 	*x = StreamTrafficRecordsRequest{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[20]
+	mi := &file_feos_network_v1_network_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1341,7 +1878,7 @@ func (x *StreamTrafficRecordsRequest) String() string {
 func (*StreamTrafficRecordsRequest) ProtoMessage() {}
 
 func (x *StreamTrafficRecordsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[20]
+	mi := &file_feos_network_v1_network_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1354,7 +1891,7 @@ func (x *StreamTrafficRecordsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamTrafficRecordsRequest.ProtoReflect.Descriptor instead.
 func (*StreamTrafficRecordsRequest) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{20}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *StreamTrafficRecordsRequest) GetPodId() string {
@@ -1385,7 +1922,7 @@ type TrafficRecord struct {
 
 func (x *TrafficRecord) Reset() {
 	*x = TrafficRecord{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[21]
+	mi := &file_feos_network_v1_network_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1397,7 +1934,7 @@ func (x *TrafficRecord) String() string {
 func (*TrafficRecord) ProtoMessage() {}
 
 func (x *TrafficRecord) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[21]
+	mi := &file_feos_network_v1_network_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1410,7 +1947,7 @@ func (x *TrafficRecord) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficRecord.ProtoReflect.Descriptor instead.
 func (*TrafficRecord) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{21}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *TrafficRecord) GetTime() *timestamppb.Timestamp {
@@ -1521,7 +2058,7 @@ type Tuple struct {
 
 func (x *Tuple) Reset() {
 	*x = Tuple{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[22]
+	mi := &file_feos_network_v1_network_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1533,7 +2070,7 @@ func (x *Tuple) String() string {
 func (*Tuple) ProtoMessage() {}
 
 func (x *Tuple) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[22]
+	mi := &file_feos_network_v1_network_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1546,7 +2083,7 @@ func (x *Tuple) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Tuple.ProtoReflect.Descriptor instead.
 func (*Tuple) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{22}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *Tuple) GetProtocol() uint32 {
@@ -1605,7 +2142,7 @@ type Flow struct {
 
 func (x *Flow) Reset() {
 	*x = Flow{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[23]
+	mi := &file_feos_network_v1_network_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1617,7 +2154,7 @@ func (x *Flow) String() string {
 func (*Flow) ProtoMessage() {}
 
 func (x *Flow) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[23]
+	mi := &file_feos_network_v1_network_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1630,7 +2167,7 @@ func (x *Flow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Flow.ProtoReflect.Descriptor instead.
 func (*Flow) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{23}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *Flow) GetTuple() *Tuple {
@@ -1708,7 +2245,7 @@ type Drop struct {
 
 func (x *Drop) Reset() {
 	*x = Drop{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[24]
+	mi := &file_feos_network_v1_network_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1720,7 +2257,7 @@ func (x *Drop) String() string {
 func (*Drop) ProtoMessage() {}
 
 func (x *Drop) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[24]
+	mi := &file_feos_network_v1_network_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1733,7 +2270,7 @@ func (x *Drop) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Drop.ProtoReflect.Descriptor instead.
 func (*Drop) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{24}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *Drop) GetTuple() *Tuple {
@@ -1772,7 +2309,7 @@ type DnsQuery struct {
 
 func (x *DnsQuery) Reset() {
 	*x = DnsQuery{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[25]
+	mi := &file_feos_network_v1_network_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1784,7 +2321,7 @@ func (x *DnsQuery) String() string {
 func (*DnsQuery) ProtoMessage() {}
 
 func (x *DnsQuery) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[25]
+	mi := &file_feos_network_v1_network_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1797,7 +2334,7 @@ func (x *DnsQuery) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DnsQuery.ProtoReflect.Descriptor instead.
 func (*DnsQuery) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{25}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *DnsQuery) GetName() string {
@@ -1840,7 +2377,7 @@ type ServerName struct {
 
 func (x *ServerName) Reset() {
 	*x = ServerName{}
-	mi := &file_feos_network_v1_network_proto_msgTypes[26]
+	mi := &file_feos_network_v1_network_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1852,7 +2389,7 @@ func (x *ServerName) String() string {
 func (*ServerName) ProtoMessage() {}
 
 func (x *ServerName) ProtoReflect() protoreflect.Message {
-	mi := &file_feos_network_v1_network_proto_msgTypes[26]
+	mi := &file_feos_network_v1_network_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1865,7 +2402,7 @@ func (x *ServerName) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServerName.ProtoReflect.Descriptor instead.
 func (*ServerName) Descriptor() ([]byte, []int) {
-	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{26}
+	return file_feos_network_v1_network_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *ServerName) GetTuple() *Tuple {
@@ -1930,7 +2467,34 @@ const file_feos_network_v1_network_proto_rawDesc = "" +
 	"\x02id\x18\x01 \x01(\tR\x02id\"\x1b\n" +
 	"\x19ListSecurityGroupsRequest\"T\n" +
 	"\x1aListSecurityGroupsResponse\x126\n" +
-	"\x06groups\x18\x01 \x03(\v2\x1e.feos.network.v1.SecurityGroupR\x06groups\"\xc4\x01\n" +
+	"\x06groups\x18\x01 \x03(\v2\x1e.feos.network.v1.SecurityGroupR\x06groups\"\x87\x01\n" +
+	"\tNameTable\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\x04R\aversion\x124\n" +
+	"\aentries\x18\x03 \x03(\v2\x1a.feos.network.v1.NameEntryR\aentries\x12\x1a\n" +
+	"\bincludes\x18\x04 \x03(\tR\bincludes\"=\n" +
+	"\tNameEntry\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1c\n" +
+	"\taddresses\x18\x02 \x03(\tR\taddresses\"G\n" +
+	"\x13PutNameTableRequest\x120\n" +
+	"\x05table\x18\x01 \x01(\v2\x1a.feos.network.v1.NameTableR\x05table\"\x16\n" +
+	"\x14PutNameTableResponse\"\xc5\x01\n" +
+	"\x16UpdateNameTableRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12!\n" +
+	"\ffrom_version\x18\x02 \x01(\x04R\vfromVersion\x12\x18\n" +
+	"\aversion\x18\x03 \x01(\x04R\aversion\x12;\n" +
+	"\vput_entries\x18\x04 \x03(\v2\x1a.feos.network.v1.NameEntryR\n" +
+	"putEntries\x12!\n" +
+	"\fremove_names\x18\x05 \x03(\tR\vremoveNames\"\x19\n" +
+	"\x17UpdateNameTableResponse\"(\n" +
+	"\x16DeleteNameTableRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x19\n" +
+	"\x17DeleteNameTableResponse\"%\n" +
+	"\x13GetNameTableRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"\x17\n" +
+	"\x15ListNameTablesRequest\"L\n" +
+	"\x16ListNameTablesResponse\x122\n" +
+	"\x06tables\x18\x01 \x03(\v2\x1a.feos.network.v1.NameTableR\x06tables\"\xc4\x01\n" +
 	"\x04Mesh\x12\x1f\n" +
 	"\vpod_network\x18\x01 \x01(\tR\n" +
 	"podNetwork\x12\x1d\n" +
@@ -2032,7 +2596,13 @@ const file_feos_network_v1_network_proto_rawDesc = "" +
 	"\vMeshService\x12[\n" +
 	"\fPutMeshPeers\x12$.feos.network.v1.PutMeshPeersRequest\x1a%.feos.network.v1.PutMeshPeersResponse\x12d\n" +
 	"\x0fUpdateMeshPeers\x12'.feos.network.v1.UpdateMeshPeersRequest\x1a(.feos.network.v1.UpdateMeshPeersResponse\x12A\n" +
-	"\aGetMesh\x12\x1f.feos.network.v1.GetMeshRequest\x1a\x15.feos.network.v1.Mesh2x\n" +
+	"\aGetMesh\x12\x1f.feos.network.v1.GetMeshRequest\x1a\x15.feos.network.v1.Mesh2\xeb\x03\n" +
+	"\vNameService\x12[\n" +
+	"\fPutNameTable\x12$.feos.network.v1.PutNameTableRequest\x1a%.feos.network.v1.PutNameTableResponse\x12d\n" +
+	"\x0fUpdateNameTable\x12'.feos.network.v1.UpdateNameTableRequest\x1a(.feos.network.v1.UpdateNameTableResponse\x12d\n" +
+	"\x0fDeleteNameTable\x12'.feos.network.v1.DeleteNameTableRequest\x1a(.feos.network.v1.DeleteNameTableResponse\x12P\n" +
+	"\fGetNameTable\x12$.feos.network.v1.GetNameTableRequest\x1a\x1a.feos.network.v1.NameTable\x12a\n" +
+	"\x0eListNameTables\x12&.feos.network.v1.ListNameTablesRequest\x1a'.feos.network.v1.ListNameTablesResponse2x\n" +
 	"\x0eTrafficService\x12f\n" +
 	"\x14StreamTrafficRecords\x12,.feos.network.v1.StreamTrafficRecordsRequest\x1a\x1e.feos.network.v1.TrafficRecord0\x01b\x06proto3"
 
@@ -2049,7 +2619,7 @@ func file_feos_network_v1_network_proto_rawDescGZIP() []byte {
 }
 
 var file_feos_network_v1_network_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_feos_network_v1_network_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
+var file_feos_network_v1_network_proto_msgTypes = make([]protoimpl.MessageInfo, 38)
 var file_feos_network_v1_network_proto_goTypes = []any{
 	(Direction)(0),                      // 0: feos.network.v1.Direction
 	(Protocol)(0),                       // 1: feos.network.v1.Protocol
@@ -2068,21 +2638,32 @@ var file_feos_network_v1_network_proto_goTypes = []any{
 	(*GetSecurityGroupRequest)(nil),     // 14: feos.network.v1.GetSecurityGroupRequest
 	(*ListSecurityGroupsRequest)(nil),   // 15: feos.network.v1.ListSecurityGroupsRequest
 	(*ListSecurityGroupsResponse)(nil),  // 16: feos.network.v1.ListSecurityGroupsResponse
-	(*Mesh)(nil),                        // 17: feos.network.v1.Mesh
-	(*MeshPeer)(nil),                    // 18: feos.network.v1.MeshPeer
-	(*PutMeshPeersRequest)(nil),         // 19: feos.network.v1.PutMeshPeersRequest
-	(*PutMeshPeersResponse)(nil),        // 20: feos.network.v1.PutMeshPeersResponse
-	(*UpdateMeshPeersRequest)(nil),      // 21: feos.network.v1.UpdateMeshPeersRequest
-	(*UpdateMeshPeersResponse)(nil),     // 22: feos.network.v1.UpdateMeshPeersResponse
-	(*GetMeshRequest)(nil),              // 23: feos.network.v1.GetMeshRequest
-	(*StreamTrafficRecordsRequest)(nil), // 24: feos.network.v1.StreamTrafficRecordsRequest
-	(*TrafficRecord)(nil),               // 25: feos.network.v1.TrafficRecord
-	(*Tuple)(nil),                       // 26: feos.network.v1.Tuple
-	(*Flow)(nil),                        // 27: feos.network.v1.Flow
-	(*Drop)(nil),                        // 28: feos.network.v1.Drop
-	(*DnsQuery)(nil),                    // 29: feos.network.v1.DnsQuery
-	(*ServerName)(nil),                  // 30: feos.network.v1.ServerName
-	(*timestamppb.Timestamp)(nil),       // 31: google.protobuf.Timestamp
+	(*NameTable)(nil),                   // 17: feos.network.v1.NameTable
+	(*NameEntry)(nil),                   // 18: feos.network.v1.NameEntry
+	(*PutNameTableRequest)(nil),         // 19: feos.network.v1.PutNameTableRequest
+	(*PutNameTableResponse)(nil),        // 20: feos.network.v1.PutNameTableResponse
+	(*UpdateNameTableRequest)(nil),      // 21: feos.network.v1.UpdateNameTableRequest
+	(*UpdateNameTableResponse)(nil),     // 22: feos.network.v1.UpdateNameTableResponse
+	(*DeleteNameTableRequest)(nil),      // 23: feos.network.v1.DeleteNameTableRequest
+	(*DeleteNameTableResponse)(nil),     // 24: feos.network.v1.DeleteNameTableResponse
+	(*GetNameTableRequest)(nil),         // 25: feos.network.v1.GetNameTableRequest
+	(*ListNameTablesRequest)(nil),       // 26: feos.network.v1.ListNameTablesRequest
+	(*ListNameTablesResponse)(nil),      // 27: feos.network.v1.ListNameTablesResponse
+	(*Mesh)(nil),                        // 28: feos.network.v1.Mesh
+	(*MeshPeer)(nil),                    // 29: feos.network.v1.MeshPeer
+	(*PutMeshPeersRequest)(nil),         // 30: feos.network.v1.PutMeshPeersRequest
+	(*PutMeshPeersResponse)(nil),        // 31: feos.network.v1.PutMeshPeersResponse
+	(*UpdateMeshPeersRequest)(nil),      // 32: feos.network.v1.UpdateMeshPeersRequest
+	(*UpdateMeshPeersResponse)(nil),     // 33: feos.network.v1.UpdateMeshPeersResponse
+	(*GetMeshRequest)(nil),              // 34: feos.network.v1.GetMeshRequest
+	(*StreamTrafficRecordsRequest)(nil), // 35: feos.network.v1.StreamTrafficRecordsRequest
+	(*TrafficRecord)(nil),               // 36: feos.network.v1.TrafficRecord
+	(*Tuple)(nil),                       // 37: feos.network.v1.Tuple
+	(*Flow)(nil),                        // 38: feos.network.v1.Flow
+	(*Drop)(nil),                        // 39: feos.network.v1.Drop
+	(*DnsQuery)(nil),                    // 40: feos.network.v1.DnsQuery
+	(*ServerName)(nil),                  // 41: feos.network.v1.ServerName
+	(*timestamppb.Timestamp)(nil),       // 42: google.protobuf.Timestamp
 }
 var file_feos_network_v1_network_proto_depIdxs = []int32{
 	5,  // 0: feos.network.v1.SecurityGroup.rules:type_name -> feos.network.v1.Rule
@@ -2092,44 +2673,58 @@ var file_feos_network_v1_network_proto_depIdxs = []int32{
 	7,  // 4: feos.network.v1.Rule.block:type_name -> feos.network.v1.AddressBlock
 	4,  // 5: feos.network.v1.PutSecurityGroupRequest.group:type_name -> feos.network.v1.SecurityGroup
 	4,  // 6: feos.network.v1.ListSecurityGroupsResponse.groups:type_name -> feos.network.v1.SecurityGroup
-	18, // 7: feos.network.v1.Mesh.peers:type_name -> feos.network.v1.MeshPeer
-	18, // 8: feos.network.v1.PutMeshPeersRequest.peers:type_name -> feos.network.v1.MeshPeer
-	18, // 9: feos.network.v1.UpdateMeshPeersRequest.put_peers:type_name -> feos.network.v1.MeshPeer
-	31, // 10: feos.network.v1.TrafficRecord.time:type_name -> google.protobuf.Timestamp
-	27, // 11: feos.network.v1.TrafficRecord.flow:type_name -> feos.network.v1.Flow
-	28, // 12: feos.network.v1.TrafficRecord.drop:type_name -> feos.network.v1.Drop
-	29, // 13: feos.network.v1.TrafficRecord.dns:type_name -> feos.network.v1.DnsQuery
-	30, // 14: feos.network.v1.TrafficRecord.server_name:type_name -> feos.network.v1.ServerName
-	26, // 15: feos.network.v1.Flow.tuple:type_name -> feos.network.v1.Tuple
-	31, // 16: feos.network.v1.Flow.start:type_name -> google.protobuf.Timestamp
-	31, // 17: feos.network.v1.Flow.end:type_name -> google.protobuf.Timestamp
-	26, // 18: feos.network.v1.Drop.tuple:type_name -> feos.network.v1.Tuple
-	2,  // 19: feos.network.v1.Drop.reason:type_name -> feos.network.v1.DropReason
-	26, // 20: feos.network.v1.ServerName.tuple:type_name -> feos.network.v1.Tuple
-	3,  // 21: feos.network.v1.ServerName.source:type_name -> feos.network.v1.ServerNameSource
-	8,  // 22: feos.network.v1.SecurityGroupService.PutSecurityGroup:input_type -> feos.network.v1.PutSecurityGroupRequest
-	10, // 23: feos.network.v1.SecurityGroupService.UpdateSecurityGroup:input_type -> feos.network.v1.UpdateSecurityGroupRequest
-	12, // 24: feos.network.v1.SecurityGroupService.DeleteSecurityGroup:input_type -> feos.network.v1.DeleteSecurityGroupRequest
-	14, // 25: feos.network.v1.SecurityGroupService.GetSecurityGroup:input_type -> feos.network.v1.GetSecurityGroupRequest
-	15, // 26: feos.network.v1.SecurityGroupService.ListSecurityGroups:input_type -> feos.network.v1.ListSecurityGroupsRequest
-	19, // 27: feos.network.v1.MeshService.PutMeshPeers:input_type -> feos.network.v1.PutMeshPeersRequest
-	21, // 28: feos.network.v1.MeshService.UpdateMeshPeers:input_type -> feos.network.v1.UpdateMeshPeersRequest
-	23, // 29: feos.network.v1.MeshService.GetMesh:input_type -> feos.network.v1.GetMeshRequest
-	24, // 30: feos.network.v1.TrafficService.StreamTrafficRecords:input_type -> feos.network.v1.StreamTrafficRecordsRequest
-	9,  // 31: feos.network.v1.SecurityGroupService.PutSecurityGroup:output_type -> feos.network.v1.PutSecurityGroupResponse
-	11, // 32: feos.network.v1.SecurityGroupService.UpdateSecurityGroup:output_type -> feos.network.v1.UpdateSecurityGroupResponse
-	13, // 33: feos.network.v1.SecurityGroupService.DeleteSecurityGroup:output_type -> feos.network.v1.DeleteSecurityGroupResponse
-	4,  // 34: feos.network.v1.SecurityGroupService.GetSecurityGroup:output_type -> feos.network.v1.SecurityGroup
-	16, // 35: feos.network.v1.SecurityGroupService.ListSecurityGroups:output_type -> feos.network.v1.ListSecurityGroupsResponse
-	20, // 36: feos.network.v1.MeshService.PutMeshPeers:output_type -> feos.network.v1.PutMeshPeersResponse
-	22, // 37: feos.network.v1.MeshService.UpdateMeshPeers:output_type -> feos.network.v1.UpdateMeshPeersResponse
-	17, // 38: feos.network.v1.MeshService.GetMesh:output_type -> feos.network.v1.Mesh
-	25, // 39: feos.network.v1.TrafficService.StreamTrafficRecords:output_type -> feos.network.v1.TrafficRecord
-	31, // [31:40] is the sub-list for method output_type
-	22, // [22:31] is the sub-list for method input_type
-	22, // [22:22] is the sub-list for extension type_name
-	22, // [22:22] is the sub-list for extension extendee
-	0,  // [0:22] is the sub-list for field type_name
+	18, // 7: feos.network.v1.NameTable.entries:type_name -> feos.network.v1.NameEntry
+	17, // 8: feos.network.v1.PutNameTableRequest.table:type_name -> feos.network.v1.NameTable
+	18, // 9: feos.network.v1.UpdateNameTableRequest.put_entries:type_name -> feos.network.v1.NameEntry
+	17, // 10: feos.network.v1.ListNameTablesResponse.tables:type_name -> feos.network.v1.NameTable
+	29, // 11: feos.network.v1.Mesh.peers:type_name -> feos.network.v1.MeshPeer
+	29, // 12: feos.network.v1.PutMeshPeersRequest.peers:type_name -> feos.network.v1.MeshPeer
+	29, // 13: feos.network.v1.UpdateMeshPeersRequest.put_peers:type_name -> feos.network.v1.MeshPeer
+	42, // 14: feos.network.v1.TrafficRecord.time:type_name -> google.protobuf.Timestamp
+	38, // 15: feos.network.v1.TrafficRecord.flow:type_name -> feos.network.v1.Flow
+	39, // 16: feos.network.v1.TrafficRecord.drop:type_name -> feos.network.v1.Drop
+	40, // 17: feos.network.v1.TrafficRecord.dns:type_name -> feos.network.v1.DnsQuery
+	41, // 18: feos.network.v1.TrafficRecord.server_name:type_name -> feos.network.v1.ServerName
+	37, // 19: feos.network.v1.Flow.tuple:type_name -> feos.network.v1.Tuple
+	42, // 20: feos.network.v1.Flow.start:type_name -> google.protobuf.Timestamp
+	42, // 21: feos.network.v1.Flow.end:type_name -> google.protobuf.Timestamp
+	37, // 22: feos.network.v1.Drop.tuple:type_name -> feos.network.v1.Tuple
+	2,  // 23: feos.network.v1.Drop.reason:type_name -> feos.network.v1.DropReason
+	37, // 24: feos.network.v1.ServerName.tuple:type_name -> feos.network.v1.Tuple
+	3,  // 25: feos.network.v1.ServerName.source:type_name -> feos.network.v1.ServerNameSource
+	8,  // 26: feos.network.v1.SecurityGroupService.PutSecurityGroup:input_type -> feos.network.v1.PutSecurityGroupRequest
+	10, // 27: feos.network.v1.SecurityGroupService.UpdateSecurityGroup:input_type -> feos.network.v1.UpdateSecurityGroupRequest
+	12, // 28: feos.network.v1.SecurityGroupService.DeleteSecurityGroup:input_type -> feos.network.v1.DeleteSecurityGroupRequest
+	14, // 29: feos.network.v1.SecurityGroupService.GetSecurityGroup:input_type -> feos.network.v1.GetSecurityGroupRequest
+	15, // 30: feos.network.v1.SecurityGroupService.ListSecurityGroups:input_type -> feos.network.v1.ListSecurityGroupsRequest
+	30, // 31: feos.network.v1.MeshService.PutMeshPeers:input_type -> feos.network.v1.PutMeshPeersRequest
+	32, // 32: feos.network.v1.MeshService.UpdateMeshPeers:input_type -> feos.network.v1.UpdateMeshPeersRequest
+	34, // 33: feos.network.v1.MeshService.GetMesh:input_type -> feos.network.v1.GetMeshRequest
+	19, // 34: feos.network.v1.NameService.PutNameTable:input_type -> feos.network.v1.PutNameTableRequest
+	21, // 35: feos.network.v1.NameService.UpdateNameTable:input_type -> feos.network.v1.UpdateNameTableRequest
+	23, // 36: feos.network.v1.NameService.DeleteNameTable:input_type -> feos.network.v1.DeleteNameTableRequest
+	25, // 37: feos.network.v1.NameService.GetNameTable:input_type -> feos.network.v1.GetNameTableRequest
+	26, // 38: feos.network.v1.NameService.ListNameTables:input_type -> feos.network.v1.ListNameTablesRequest
+	35, // 39: feos.network.v1.TrafficService.StreamTrafficRecords:input_type -> feos.network.v1.StreamTrafficRecordsRequest
+	9,  // 40: feos.network.v1.SecurityGroupService.PutSecurityGroup:output_type -> feos.network.v1.PutSecurityGroupResponse
+	11, // 41: feos.network.v1.SecurityGroupService.UpdateSecurityGroup:output_type -> feos.network.v1.UpdateSecurityGroupResponse
+	13, // 42: feos.network.v1.SecurityGroupService.DeleteSecurityGroup:output_type -> feos.network.v1.DeleteSecurityGroupResponse
+	4,  // 43: feos.network.v1.SecurityGroupService.GetSecurityGroup:output_type -> feos.network.v1.SecurityGroup
+	16, // 44: feos.network.v1.SecurityGroupService.ListSecurityGroups:output_type -> feos.network.v1.ListSecurityGroupsResponse
+	31, // 45: feos.network.v1.MeshService.PutMeshPeers:output_type -> feos.network.v1.PutMeshPeersResponse
+	33, // 46: feos.network.v1.MeshService.UpdateMeshPeers:output_type -> feos.network.v1.UpdateMeshPeersResponse
+	28, // 47: feos.network.v1.MeshService.GetMesh:output_type -> feos.network.v1.Mesh
+	20, // 48: feos.network.v1.NameService.PutNameTable:output_type -> feos.network.v1.PutNameTableResponse
+	22, // 49: feos.network.v1.NameService.UpdateNameTable:output_type -> feos.network.v1.UpdateNameTableResponse
+	24, // 50: feos.network.v1.NameService.DeleteNameTable:output_type -> feos.network.v1.DeleteNameTableResponse
+	17, // 51: feos.network.v1.NameService.GetNameTable:output_type -> feos.network.v1.NameTable
+	27, // 52: feos.network.v1.NameService.ListNameTables:output_type -> feos.network.v1.ListNameTablesResponse
+	36, // 53: feos.network.v1.TrafficService.StreamTrafficRecords:output_type -> feos.network.v1.TrafficRecord
+	40, // [40:54] is the sub-list for method output_type
+	26, // [26:40] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_feos_network_v1_network_proto_init() }
@@ -2141,7 +2736,7 @@ func file_feos_network_v1_network_proto_init() {
 		(*Rule_Block)(nil),
 		(*Rule_Group)(nil),
 	}
-	file_feos_network_v1_network_proto_msgTypes[21].OneofWrappers = []any{
+	file_feos_network_v1_network_proto_msgTypes[32].OneofWrappers = []any{
 		(*TrafficRecord_Flow)(nil),
 		(*TrafficRecord_Drop)(nil),
 		(*TrafficRecord_Dns)(nil),
@@ -2153,9 +2748,9 @@ func file_feos_network_v1_network_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_feos_network_v1_network_proto_rawDesc), len(file_feos_network_v1_network_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   27,
+			NumMessages:   38,
 			NumExtensions: 0,
-			NumServices:   3,
+			NumServices:   4,
 		},
 		GoTypes:           file_feos_network_v1_network_proto_goTypes,
 		DependencyIndexes: file_feos_network_v1_network_proto_depIdxs,

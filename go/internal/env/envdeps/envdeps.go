@@ -63,12 +63,6 @@ type Runner interface {
 	// capped at the tools' output cap).
 	ExecDetached(ctx context.Context, lease model.Lease, argv []string, env map[string]string, cwd string,
 		timeout time.Duration) (code int, stdout, stderr string, err error)
-	// WriteFileDetached writes content to path in the main container
-	// (created or replaced).
-	WriteFileDetached(ctx context.Context, lease model.Lease, path string, content []byte) error
-	// ReadFileDetached reads the whole file path of the main container; an
-	// error wrapping tools.ErrNoFile when it does not exist.
-	ReadFileDetached(ctx context.Context, lease model.Lease, path string) (string, error)
 	// StartProcessDetached starts a background process without a time
 	// limit and returns its id; an error wrapping tools.ErrNoCwd when its
 	// working directory does not exist. The records of the processes of

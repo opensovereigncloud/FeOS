@@ -24,14 +24,16 @@ import (
 // container of a sandbox of the tenant. The supervisor looks at it every
 // second in env-probe while the sandbox runs (it never wakes a paused one
 // for that) and starts, restarts (with the backoff of §4.4), replaces (a
-// changed template), checks and names (hosts block) its process; the
-// reconcile step records it and, when its process must be (re)started in a
-// sandbox that does not run, wakes the sandbox with an exec hold for the
-// start and the first readiness. A service that goes (removed, moved to
-// another sandbox, or its environment deleted) has its process stopped and
-// its names taken out of the hosts block first, in the pool with an exec
-// hold that wakes a sleeping sandbox and keeps a running one from pausing
-// meanwhile (cleanOld); its row goes or moves only after that.
+// changed template) and checks its process; the reconcile step records it
+// and, when its process must be (re)started in a sandbox that does not
+// run, wakes the sandbox with an exec hold for the start and the first
+// readiness. Its name is in the sandbox's name table while its row names
+// the sandbox (env-names), which needs nothing of the sandbox. A service
+// that goes (removed, moved to another sandbox, or its environment
+// deleted) has its process stopped first, in the pool with an exec hold
+// that wakes a sleeping sandbox and keeps a running one from pausing
+// meanwhile (cleanOld); its row, and with it its name, goes or moves only
+// after that.
 
 // stepAttached keeps the attached services of T (§4.3 step 5).
 func (c *Controller) stepAttached(ctx context.Context, s *stepState) {
@@ -143,13 +145,13 @@ func newIncarnation(a store.EnvAttached, sb store.Sandbox) bool {
 
 // renewed is a reset for a new incarnation of its sandbox, sb (§13.6): the
 // new incarnation recorded, no process (the old one went with the old
-// incarnation), phase starting, restarts, next_restart_at, probe_failures
-// and hosts_written reset, so that the process starts again at once.
+// incarnation), phase starting, restarts, next_restart_at and
+// probe_failures reset, so that the process starts again at once.
 func renewed(a store.EnvAttached, sb store.Sandbox) store.EnvAttached {
 	after := a
 	after.SandboxIncarnation, after.ProcessID, after.Phase, after.ReadySince, after.Detail =
 		sb.Incarnation, "", model.PhaseStarting, time.Time{}, ""
-	after.Restarts, after.NextRestartAt, after.ProbeFailures, after.HostsWritten = 0, time.Time{}, 0, ""
+	after.Restarts, after.NextRestartAt, after.ProbeFailures = 0, time.Time{}, 0
 	return after
 }
 
@@ -198,7 +200,7 @@ func (c *Controller) attachedGone(ctx context.Context, envID uuid.UUID, a store.
 		}
 		after := cur
 		after.Phase, after.Detail, after.ProcessID, after.ReadySince = model.PhaseFailed, detail, "", time.Time{}
-		after.ProbeFailures, after.NextRestartAt, after.HostsWritten = 0, time.Time{}, ""
+		after.ProbeFailures, after.NextRestartAt = 0, time.Time{}
 		if after == cur {
 			return nil
 		}
@@ -207,7 +209,10 @@ func (c *Controller) attachedGone(ctx context.Context, envID uuid.UUID, a store.
 		}
 		c.log.Warn("an attached service's sandbox is gone or not its tenant's", "environment", envID,
 			"service", a.Service, "sandbox", a.SandboxID)
-		return tx.Notify(ctx, db.ChanLeader, HintGroups)
+		if err := tx.Notify(ctx, db.ChanLeader, HintGroups); err != nil {
+			return err
+		}
+		return tx.Notify(ctx, db.ChanLeader, HintNames)
 	})
 	if err != nil && ctx.Err() == nil && !errors.Is(err, store.ErrNoRow) {
 		c.rl.warn("attached", "cannot fail an attached service", "service", a.Service, "err", err)
@@ -228,8 +233,12 @@ func (c *Controller) recordAttached(ctx context.Context, s *stepState, p *attach
 		if _, err := tx.InsertAttached(ctx, a); err != nil {
 			return err
 		}
-		// The sandbox joins the environment's group.
-		return tx.Notify(ctx, db.ChanLeader, HintGroups)
+		// The sandbox joins the environment's group, and the service's
+		// name its table.
+		if err := tx.Notify(ctx, db.ChanLeader, HintGroups); err != nil {
+			return err
+		}
+		return tx.Notify(ctx, db.ChanLeader, HintNames)
 	})
 	if err != nil && !errors.Is(err, store.ErrExists) {
 		s.wait(objectName(spec.KindService, p.name), "attached service %s: %v", p.name, err)
@@ -239,10 +248,11 @@ func (c *Controller) recordAttached(ctx context.Context, s *stepState, p *attach
 }
 
 // moveAttached moves an attached service to another sandbox: its process
-// in the old one stops and its names leave the old one's hosts block
-// first (cleanOld: a sleeping old sandbox is woken for it, and until that
-// is done the row stays where it is), then the row starts over, with the
-// new sandbox's incarnation when the service may use it. A row that
+// in the old one stops first (cleanOld: a sleeping old sandbox is woken
+// for it, and until that is done the row stays where it is), then the
+// row, and with it the service's name, moves to the new sandbox's table
+// and starts over, with the new sandbox's incarnation when the service
+// may use it. A row that
 // changed since the view was read (a process the supervisor recorded
 // meanwhile) is left for a later round, which cleans that too.
 func (c *Controller) moveAttached(ctx context.Context, v *view, a store.EnvAttached, p *attachedPlan, sb store.Sandbox, found bool) {
@@ -264,48 +274,31 @@ func (c *Controller) moveAttached(ctx context.Context, v *view, a store.EnvAttac
 		after := cur
 		after.SandboxID, after.SandboxIncarnation, after.ProcessID, after.TemplateHash = p.sandbox, inc, "", ""
 		after.Phase, after.ReadySince, after.Restarts, after.LastExit = model.PhaseStarting, time.Time{}, 0, nil
-		after.ProbeFailures, after.NextRestartAt, after.HostsWritten, after.Detail = 0, time.Time{}, "", ""
+		after.ProbeFailures, after.NextRestartAt, after.Detail = 0, time.Time{}, ""
 		if _, err := tx.UpdateAttached(ctx, cur, after); err != nil {
 			return err
 		}
-		return tx.Notify(ctx, db.ChanLeader, HintGroups)
+		if err := tx.Notify(ctx, db.ChanLeader, HintGroups); err != nil {
+			return err
+		}
+		return tx.Notify(ctx, db.ChanLeader, HintNames)
 	})
 	if err != nil && ctx.Err() == nil {
 		c.rl.warn("attached", "cannot move an attached service", "environment", v.env.ID, "service", a.Service, "err", err)
 	}
 }
 
-// stopAttachedIn stops an attached service's process in sb, with its
-// lease, and takes the service's names out of sb's hosts block (the
-// block keeps T's other attached services there). A process that is not
-// there or not running any more counts as stopped. A hosts block that
-// cannot be rewritten fails it only when the service recorded one: one
-// that never could be written is no reason to keep the row.
-func (c *Controller) stopAttachedIn(ctx context.Context, v *view, a store.EnvAttached, sb store.Sandbox, l model.Lease) error {
-	var errs []error
-	if a.ProcessID != "" {
-		if err := c.d.Runner.StopProcessDetached(ctx, l, a.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) {
-			errs = append(errs, fmt.Errorf("stop process %s: %w", a.ProcessID, err))
-		}
+// stopAttachedIn stops an attached service's process in its sandbox, with
+// the sandbox's lease. A process that is not there or not running any more
+// counts as stopped.
+func (c *Controller) stopAttachedIn(ctx context.Context, a store.EnvAttached, l model.Lease) error {
+	if a.ProcessID == "" {
+		return nil
 	}
-	var own []string
-	for _, name := range ownAttached(v, sb.ID) {
-		if name != a.Service {
-			own = append(own, name)
-		}
+	if err := c.d.Runner.StopProcessDetached(ctx, l, a.ProcessID); err != nil && !errors.Is(err, tools.ErrNoProcess) {
+		return fmt.Errorf("stop process %s: %w", a.ProcessID, err)
 	}
-	block := ""
-	if len(own) > 0 {
-		block = hostsBlock(v, own)
-	}
-	if err := c.writeHosts(ctx, l, v.env.Name, block); err != nil {
-		if a.HostsWritten != "" {
-			errs = append(errs, fmt.Errorf("rewrite the hosts block: %w", err))
-		} else if ctx.Err() == nil {
-			c.rl.warn("hosts", "cannot rewrite a sandbox's hosts block", "sandbox", sb.ID, "err", err)
-		}
-	}
-	return errors.Join(errs...)
+	return nil
 }
 
 // leftNothing reports whether the sandbox row sb, the one a names, holds
@@ -319,12 +312,12 @@ func leftNothing(env store.Environment, a store.EnvAttached, sb store.Sandbox) b
 }
 
 // cleanOld stops the process of an attached service in the sandbox its
-// row names and takes its names out of that sandbox's hosts block, before
-// the row goes (removed, or its environment deleted) or moves to another
-// sandbox (§13.7), and reports whether nothing is left to clean there: the
-// caller may then delete or move the row, while it is still as a has it.
-// Nothing is left when the service never started or wrote a hosts block,
-// when the sandbox is gone, or when leftNothing says so. A running or
+// row names, before the row goes (removed, or its environment deleted) or
+// moves to another sandbox (§13.7), and reports whether nothing is left to
+// clean there: the caller may then delete or move the row, while it is
+// still as a has it, and the service's name leaves the sandbox's table
+// with it. Nothing is left when the service never started, when the
+// sandbox is gone, or when leftNothing says so. A running or
 // sleeping (paused, hibernated) sandbox is cleaned in the pool
 // (cleanInPool), which calls done with the row as it cleaned it; a
 // process left in a sleeping sandbox would run on with the environment's
@@ -332,7 +325,7 @@ func leftNothing(env store.Environment, a store.EnvAttached, sb store.Sandbox) b
 // node out of reach is looked at again in a later round.
 func (c *Controller) cleanOld(ctx context.Context, v *view, a store.EnvAttached,
 	done func(context.Context, store.EnvAttached)) bool {
-	if a.ProcessID == "" && a.HostsWritten == "" || c.d.Runner == nil {
+	if a.ProcessID == "" || c.d.Runner == nil {
 		return true
 	}
 	sb, err := c.st.GetSandbox(ctx, a.SandboxID)
@@ -360,8 +353,7 @@ func cleanKey(envID uuid.UUID, service string) string {
 // loop: Acquire with an exec hold (it wakes a paused or hibernated
 // sandbox, and a running one cannot pause until it is released), then,
 // under the service's supervision lock and with the row as it is now,
-// stop the process and rewrite the hosts block (stopAttachedIn), and call
-// done with that row. A sandbox that turns out to hold nothing of the
+// stop the process (stopAttachedIn), and call done with that row. A sandbox that turns out to hold nothing of the
 // service's (leftNothing) is done without a stop. A failure leaves the
 // row for a later round, after a backoff (cleanDue).
 func (c *Controller) cleanInPool(ctx context.Context, v *view, a store.EnvAttached, done func(context.Context, store.EnvAttached)) {
@@ -399,7 +391,7 @@ func (c *Controller) cleanInPool(ctx context.Context, v *view, a store.EnvAttach
 		case sb.Incarnation != l.Incarnation:
 			return // another incarnation came meanwhile: a later round
 		default:
-			if err := c.stopAttachedIn(ctx, v, cur, sb, l); err != nil {
+			if err := c.stopAttachedIn(ctx, cur, l); err != nil {
 				failed("cannot stop an attached service that goes", err)
 				return
 			}
@@ -468,8 +460,10 @@ func (c *Controller) dropAttached(ctx context.Context, a store.EnvAttached) (boo
 			return err
 		}
 		gone = true
-		if err := tx.Notify(ctx, db.ChanLeader, HintGroups); err != nil {
-			return err
+		for _, hint := range []string{HintGroups, HintNames} {
+			if err := tx.Notify(ctx, db.ChanLeader, hint); err != nil {
+				return err
+			}
 		}
 		return tx.Notify(ctx, db.ChanLeader, HintReconcile)
 	})
@@ -491,8 +485,8 @@ func (c *Controller) dropCleaned(ctx context.Context, a store.EnvAttached) {
 }
 
 // clearAttached is cleanOld's done for a move: the row forgets the process
-// and the hosts block it cleaned (while it still names them), so that the
-// next round finds nothing left in the old sandbox and moves the row.
+// it stopped (while it still names it), so that the next round finds
+// nothing left in the old sandbox and moves the row.
 func (c *Controller) clearAttached(ctx context.Context, a store.EnvAttached) {
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockAttached(ctx, a.EnvID, a.Service, store.ForUpdate)
@@ -500,7 +494,7 @@ func (c *Controller) clearAttached(ctx context.Context, a store.EnvAttached) {
 			return err
 		}
 		after := cur
-		after.ProcessID, after.HostsWritten, after.Phase, after.ReadySince = "", "", model.PhaseStarting, time.Time{}
+		after.ProcessID, after.Phase, after.ReadySince = "", model.PhaseStarting, time.Time{}
 		if _, err := tx.UpdateAttached(ctx, cur, after); err != nil {
 			return err
 		}
@@ -512,23 +506,11 @@ func (c *Controller) clearAttached(ctx context.Context, a store.EnvAttached) {
 }
 
 // removeAttached removes an attached service T no longer has: its
-// process, its hosts entries, then its row.
+// process, then its row, with which its name goes.
 func (c *Controller) removeAttached(ctx context.Context, v *view, a store.EnvAttached) {
 	if c.cleanOld(ctx, v, a, c.dropCleaned) {
 		c.dropCleaned(ctx, a)
 	}
-}
-
-// ownAttached are the attached services of T that run in the sandbox.
-func ownAttached(v *view, sandboxID uuid.UUID) []string {
-	var out []string
-	for name, svc := range v.target.Services {
-		if runtimeOf(svc) == spec.RuntimeAttached && svc.Sandbox == sandboxID.String() {
-			out = append(out, name)
-		}
-	}
-	slices.Sort(out)
-	return out
 }
 
 // attachedDetail writes an attached service's detail.
@@ -622,8 +604,8 @@ func (c *Controller) backoff(n int) time.Duration {
 // anew (renewed); a changed template stops the old process; a process
 // that is gone counts as an exit, restarted after the backoff; a working
 // directory that does not exist yet keeps it starting; a running process
-// is checked (readiness) and the sandbox's hosts block written. It lists
-// only the processes of the service's name. wait: wait for another look
+// is checked (readiness). It lists only the processes of the service's
+// name. wait: wait for another look
 // in flight instead of leaving it to that one.
 func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attachedPlan, sb store.Sandbox, l model.Lease, wait bool) {
 	if c.d.Runner == nil {
@@ -690,14 +672,6 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 	}
 	if after.ProcessID != "" {
 		c.attachedReadiness(ctx, p, l, a, &after, now)
-	}
-	block := hostsBlock(v, ownAttached(v, sb.ID))
-	if h := blockHash(block); after.HostsWritten != h {
-		if err := c.writeHosts(ctx, l, v.env.Name, block); err != nil {
-			c.rl.warn("hosts", "cannot write a sandbox's hosts block", "sandbox", sb.ID, "err", err)
-		} else {
-			after.HostsWritten = h
-		}
 	}
 	c.writeAttached(ctx, a, after, l)
 }
@@ -813,8 +787,7 @@ func (c *Controller) writeAttached(ctx context.Context, before, after store.EnvA
 		next := cur
 		next.SandboxIncarnation, next.TemplateHash, next.ProcessID = after.SandboxIncarnation, after.TemplateHash, after.ProcessID
 		next.Phase, next.ReadySince, next.Restarts, next.LastExit = after.Phase, after.ReadySince, after.Restarts, after.LastExit
-		next.ProbeFailures, next.NextRestartAt, next.HostsWritten, next.Detail =
-			after.ProbeFailures, after.NextRestartAt, after.HostsWritten, after.Detail
+		next.ProbeFailures, next.NextRestartAt, next.Detail = after.ProbeFailures, after.NextRestartAt, after.Detail
 		if _, err := tx.UpdateAttached(ctx, cur, next); err != nil {
 			return err
 		}

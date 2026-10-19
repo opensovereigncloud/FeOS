@@ -139,6 +139,7 @@ func (c *Controller) step(ctx context.Context, envID uuid.UUID) error {
 	c.stepRemoved(ctx, s)
 	c.stepRetiring(ctx, s)
 	c.stepStarved(ctx, s)
+	c.stepNames(ctx, s)
 	c.logPending(v, s.texts())
 	switch {
 	case s.failed || !rolling(v):
@@ -508,8 +509,9 @@ func (c *Controller) keep(ctx context.Context, v *view, r store.EnvInstanceRow, 
 	}
 }
 
-// retire marks instances retiring: routes stop sending to them and hosts
-// blocks drop them; stepRetiring deletes them after grace.
+// retire marks instances retiring: routes stop sending to them and the
+// env table drops them (env-names, woken); stepRetiring deletes them after
+// grace.
 func (c *Controller) retire(ctx context.Context, v *view, grace bool, rows ...store.EnvInstanceRow) error {
 	if len(rows) == 0 {
 		return nil
@@ -541,12 +543,13 @@ func (c *Controller) retire(ctx context.Context, v *view, grace bool, rows ...st
 			c.log.Info("instance retiring", "environment", v.env.ID, "object", objectName(inst.Kind, inst.Object),
 				"replica", inst.Replica, "sandbox", inst.SandboxID)
 		}
-		return nil
+		return tx.Notify(ctx, db.ChanLeader, HintNames)
 	})
 }
 
 // deleteInstance deletes an instance row through the engine (its pod goes
-// by tombstone) and wakes env-groups when its address leaves the group.
+// by tombstone) and wakes env-groups and env-names when its address
+// leaves the group and the table.
 func (c *Controller) deleteInstance(ctx context.Context, sb store.Sandbox) error {
 	if _, _, err := c.d.Engine.Delete(ctx, "", sb.ID); err != nil && !errors.Is(err, model.ErrNotFound) {
 		return err
@@ -554,6 +557,7 @@ func (c *Controller) deleteInstance(ctx context.Context, sb store.Sandbox) error
 	c.forget(sb.ID.String())
 	if sb.Address != "" {
 		c.notify(ctx, HintGroups)
+		c.notify(ctx, HintNames)
 	}
 	return nil
 }
@@ -613,7 +617,7 @@ func (c *Controller) heal(ctx context.Context, r store.EnvInstanceRow, idles boo
 // instances of objects not in T; an addon also gone from R loses its
 // volume (deleting) and its credentials (an addon of a failed R that T
 // lacks stays as it is, so that a failed first release deletes no data);
-// attached services lose their process and their hosts entries.
+// attached services lose their process, then their row and name.
 func (c *Controller) stepRemoved(ctx context.Context, s *stepState) {
 	v := s.v
 	var retire []store.EnvInstanceRow

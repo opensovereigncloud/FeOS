@@ -334,11 +334,11 @@ func TestAttachedValidation(t *testing.T) {
 	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attachedAs(sb, "web", "5174"))}); !p.Valid {
 		t.Fatalf("other port %+v", p)
 	}
-	// Nor may a name be in the sandbox's hosts as both environments':
+	// Nor may a name be the sandbox's as both environments':
 	// their attached services', image services' or addons'.
 	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attached(sb, "5174"))}); p.Valid ||
 		!hasFinding(p.Findings, spec.SeverityError, "services.vite",
-			"vite is in the hosts of sandbox "+sb.String()+" as environment one's too") {
+			"vite is a name in sandbox "+sb.String()+" of environment one's too") {
 		t.Fatalf("attached name %+v", p)
 	}
 	withAPI := func(sandbox uuid.UUID, name, port string) string {
@@ -351,7 +351,7 @@ func TestAttachedValidation(t *testing.T) {
 	_, err = h.svc.Apply(ctx, tenantA, "four", ApplyRequest{Spec: json.RawMessage(withAPI(sb, "web4", "5176"))})
 	var ise *InvalidSpecError
 	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "services.api",
-		"api is in the hosts of sandbox "+sb.String()+" as environment three's too") {
+		"api is a name in sandbox "+sb.String()+" of environment three's too") {
 		t.Fatalf("image service name: %s", describe(err))
 	}
 	// In separate sandboxes the names are their own.

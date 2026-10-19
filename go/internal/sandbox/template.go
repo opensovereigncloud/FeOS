@@ -72,6 +72,9 @@ func buildPodSpec(ctx context.Context, sb store.Sandbox, resolve SecretResolver)
 	if len(t.SecurityGroups) > 0 {
 		spec.Network.SecurityGroups = append([]string(nil), t.SecurityGroups...)
 	}
+	if len(t.NameTables) > 0 {
+		spec.Network.NameTables = append([]string(nil), t.NameTables...)
+	}
 	// The sandbox labels win: a template cannot make its pod another
 	// sandbox's, tenant's or incarnation's.
 	for k, v := range t.Labels {

@@ -116,6 +116,12 @@ from node to node would need a route per pod, changed with every move.
 - `feosd` asks the upstream resolvers that the pod's spec names, or the
   node's (`--dns-upstream`, Google's and Cloudflare's by default). An
   upstream in a denied prefix (below) is refused.
+- It answers the names of a pod's name tables itself (ADR 0018): a
+  name of one label that a table the pod's spec names holds, in any
+  case, with every address the table has for it and a short TTL, and
+  nothing of another type. The control plane owns the tables and sends
+  each node those of its pods, as it sends security groups (ADR 0012);
+  `feosd` keeps them on disk. Every other name is asked upstream.
 - It passes answers on as the upstream gave them. Pods have IPv4, so
   there is no DNS64.
 - It tells pods apart by the source address of a query, which the TAP
@@ -243,9 +249,9 @@ from node to node would need a route per pod, changed with every move.
   delegation or, where it is routed statically, from the kernel's
   command line.
 - `PodInfo` carries the pod's IPv6 and IPv4 addresses; the network in
-  `PodSpec` names upstream resolvers and security groups, and `PodSpec`
-  carries the pod's metadata. The guest's network configuration has
-  both families (ADR 0007).
+  `PodSpec` names upstream resolvers, security groups and name tables,
+  and `PodSpec` carries the pod's metadata. The guest's network
+  configuration has both families (ADR 0007).
 - A pod without a network has no metadata service: MMDS is part of the
   network device.
 - The control plane's front door reaches pods' ports over IPv6, without a

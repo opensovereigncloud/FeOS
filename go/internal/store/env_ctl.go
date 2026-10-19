@@ -198,6 +198,25 @@ func (s *Store) EnvCtlWithAttached(ctx context.Context, sandboxID uuid.UUID) ([]
 	return pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
 }
 
+// AttachedName is an attached service of an environment, by name.
+type AttachedName struct {
+	EnvID   uuid.UUID
+	Service string
+}
+
+// EnvCtlAttachedIn returns the attached services that run in the sandbox
+// and may use it (attachedUsable), by environment and name: the names of
+// its name table.
+func (s *Store) EnvCtlAttachedIn(ctx context.Context, sandboxID uuid.UUID) ([]AttachedName, error) {
+	rows, err := s.q.Query(ctx, `SELECT a.env_id, a.service FROM env_attached a JOIN environments e ON e.id = a.env_id
+			JOIN sandboxes s ON s.id = a.sandbox_id
+		WHERE a.sandbox_id = $1 AND `+attachedUsable+` ORDER BY a.env_id, a.service`, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[AttachedName])
+}
+
 // EnvCtlTemplatedOnNode returns the rows with a pod template whose pod is
 // on node, or is being brought there by an op: instance rows and
 // attachable sandboxes, by id.

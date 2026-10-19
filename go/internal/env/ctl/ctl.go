@@ -14,9 +14,11 @@
 //	               volume, instance, provisioning), release jobs, image services
 //	               (rolling, surge 1), attached services, removed objects, realised
 //	env-probe      1 s: containers' exits and restarts with backoff, readiness
-//	               (http, tcp, exec), attached services' processes, hosts blocks
+//	               (http, tcp, exec), attached services' processes
 //	env-groups     10 s, hint "env-groups": the security groups each connected
 //	               node should have, re-put where they differ
+//	env-names      2 s, hint "env-names": the name tables each connected node
+//	               should have, updated or re-put where they differ
 //	env-volumes    30 s: the volumes marked deleting, deleted on their nodes
 //	env-delete     5 s: environments deleting (and those of deleting tenants)
 //
@@ -57,16 +59,18 @@ import (
 
 // The controller's loops, and the hints that wake them: a writer that
 // wants the controller to act sends db.Notify(ctx, q, db.ChanLeader,
-// HintReconcile) (or HintGroups) inside its transaction.
+// HintReconcile) (or HintGroups, HintNames) inside its transaction.
 const (
 	LoopReconcile = "env-reconcile"
 	LoopProbe     = "env-probe"
 	LoopGroups    = "env-groups"
+	LoopNames     = "env-names"
 	LoopVolumes   = "env-volumes"
 	LoopDelete    = "env-delete"
 
 	HintReconcile = LoopReconcile
 	HintGroups    = LoopGroups
+	HintNames     = LoopNames
 )
 
 // The loops' intervals (§4.2).
@@ -74,6 +78,7 @@ const (
 	reconcileEvery = 2 * time.Second
 	probeEvery     = time.Second
 	groupsEvery    = 10 * time.Second
+	namesEvery     = 2 * time.Second
 	volumesEvery   = 30 * time.Second
 	deleteEvery    = 5 * time.Second
 )
@@ -164,8 +169,10 @@ type Deps struct {
 // timings are the controller's durations, fields so that the package's
 // tests shorten them.
 type timings struct {
-	// retireGrace is how long a retiring instance stays (routes stop
-	// sending to it, hosts blocks drop it) before it is deleted.
+	// retireGrace is how long a retiring instance stays before it is
+	// deleted: routes stop sending to it at once, the env table drops it
+	// within a pass of env-names, and the answers that named it expire
+	// after their TTL (5 s).
 	retireGrace time.Duration
 	// crashWindow: so many exits within it open crash_loop; restarts
 	// reset after an instance was ready for as long.
@@ -201,7 +208,7 @@ type timings struct {
 
 func defaultTimings() timings {
 	return timings{
-		retireGrace:     5 * time.Second,
+		retireGrace:     10 * time.Second,
 		crashWindow:     10 * time.Minute,
 		crashExits:      3,
 		restartMax:      5 * time.Minute,
@@ -262,6 +269,9 @@ type Controller struct {
 	// cleanWaits is the backoff of the attached services' cleanups that
 	// failed, by pool key (made when first needed).
 	cleanWaits map[string]cleanWait
+	// unserved are the nodes whose feosd serves no names, as env-names
+	// and the prepare hook last found (made when first needed).
+	unserved map[string]bool
 }
 
 // New returns the controller of an instance.
@@ -305,6 +315,7 @@ func (c *Controller) Loops() []model.Loop {
 		{Name: LoopReconcile, Interval: reconcileEvery, Run: c.reconcile},
 		{Name: LoopProbe, Interval: probeEvery, Run: c.probe},
 		{Name: LoopGroups, Interval: groupsEvery, Run: c.groupsLoop},
+		{Name: LoopNames, Interval: namesEvery, Run: c.namesLoop},
 		{Name: LoopVolumes, Interval: volumesEvery, Run: c.volumesLoop},
 		{Name: LoopDelete, Interval: deleteEvery, Run: c.deleteLoop},
 	}

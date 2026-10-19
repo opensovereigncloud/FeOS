@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/netip"
 	"net/url"
 	"slices"
@@ -145,10 +146,11 @@ func TestMembersAndVersions(t *testing.T) {
 	}
 }
 
-// The hosts block names addons and image services by address (a ready
-// replica preferred, retiring ones never) and a sandbox's own attached
-// services by loopback; splicing keeps the rest of the file.
-func TestHostsBlock(t *testing.T) {
+// The env table names addons and image services by the addresses of
+// their live replicas (retiring ones never; when none is live, those of
+// the best ranked); its version is its content's, and a delta between two
+// tables turns one into the other.
+func TestNameTable(t *testing.T) {
 	envID := uuid.New()
 	row := func(kind, name string, replica int, phase, addr string) store.EnvInstanceRow {
 		return store.EnvInstanceRow{
@@ -168,48 +170,59 @@ func TestHostsBlock(t *testing.T) {
 			row(spec.KindService, "api", 0, model.PhaseStarting, "fd00::10"),
 			row(spec.KindService, "api", 1, model.PhaseReady, "fd00::11"),
 			row(spec.KindService, "api", 2, model.PhaseRetiring, "fd00::12"),
+			row(spec.KindService, "api", 4, model.PhaseReady, "fd00:0::13"),
 			row(spec.KindService, "worker", 0, model.PhaseRetiring, "fd00::20"),
 			row(spec.KindAddon, "postgres", 0, model.PhaseReady, "fd00::5"),
 			row(spec.KindAddon, "gone", 0, model.PhaseReady, "fd00::6"),
 			row(spec.KindJob, "migrate", 0, model.PhaseStarting, "fd00::7"),
 			row(spec.KindService, "api", 3, model.PhaseReady, ""),
+			row(spec.KindService, "api", 5, model.PhaseReady, "10.0.0.1"),
 		},
 	}
-	block := hostsBlock(v, []string{"web"})
-	want := "# ferun environment stage begin\nfd00::11 api\nfd00::5 postgres\n127.0.0.1 web\n::1 web\n# ferun environment stage end\n"
-	if block != want {
-		t.Fatalf("block\n%s\nwant\n%s", block, want)
+	got := nameEntries(v)
+	want := map[string][]string{"api": {"fd00::11", "fd00::13"}, "postgres": {"fd00::5"}}
+	if !maps.EqualFunc(got, want, slices.Equal[[]string]) {
+		t.Fatalf("entries %v, want %v", got, want)
 	}
-	if hostsBlock(v, nil) == block || blockHash(block) == blockHash(hostsBlock(v, nil)) {
-		t.Error("the image instance's block names the attached service")
-	}
-	// No ready replica: any one.
-	v.rows[1].Instance.Phase = model.PhaseUnready
-	if b := hostsBlock(v, nil); !strings.Contains(b, " api\n") {
-		t.Errorf("no replica of api in\n%s", b)
+	// No live replica: the others, never a retiring one.
+	v.rows[1].Instance.Phase, v.rows[3].Instance.Phase = model.PhaseUnready, model.PhaseUnready
+	if got := nameEntries(v)["api"]; !slices.Equal(got, []string{"fd00::10", "fd00::11", "fd00::13"}) {
+		t.Errorf("api without a live replica %v", got)
 	}
 
-	for _, tc := range []struct{ file, block, want string }{
-		{"", block, hostsBase + block},
-		{"127.0.0.1 localhost\n10.0.0.1 db.internal", block, "127.0.0.1 localhost\n10.0.0.1 db.internal\n" + block},
-		{"127.0.0.1 localhost\n# ferun environment stage begin\nfd00::1 old\n# ferun environment stage end\n10.0.0.1 x\n",
-			block, "127.0.0.1 localhost\n10.0.0.1 x\n" + block},
-		{"127.0.0.1 localhost\n# ferun environment prod begin\nfd00::9 p\n# ferun environment prod end\n", block,
-			"127.0.0.1 localhost\n# ferun environment prod begin\nfd00::9 p\n# ferun environment prod end\n" + block},
-		{hostsBase + block, "", hostsBase},
-	} {
-		if got := spliceHosts(tc.file, "stage", tc.block); got != tc.want {
-			t.Errorf("splice %q:\n%q\nwant\n%q", tc.file, got, tc.want)
-		}
+	id := model.EnvTableID(envID)
+	a := newTable(id, want, nil)
+	if a.Version == 0 || a.Version >= 1<<63 || len(a.Entries) != 2 || a.Entries[0].Name != "api" {
+		t.Fatalf("table %v", a)
 	}
-	if got := spliceHosts(spliceHosts("", "stage", block), "stage", block); got != hostsBase+block {
-		t.Errorf("a second splice: %q", got)
+	same := newTable(id, map[string][]string{"postgres": {"fd00:0:0::5"}, "API": {"fd00::13", "fd00::11"}}, nil)
+	if !sameTable(a, same) || a.Version != same.Version {
+		t.Errorf("the same names in another order or case: %v %v", a, same)
+	}
+	b := newTable(id, map[string][]string{"api": {"fd00::11"}, "redis": {"fd00::7"}}, nil)
+	if sameTable(a, b) || a.Version == b.Version {
+		t.Error("other names compare equal")
+	}
+	if c := newTable(id, want, []string{"env-x"}); sameTable(a, c) || a.Version == c.Version {
+		t.Error("other includes compare equal")
+	}
+	put, remove := tableDelta(a, b)
+	if len(put) != 2 || put[0].Name != "api" || !slices.Equal(put[0].Addresses, []string{"fd00::11"}) ||
+		put[1].Name != "redis" || !slices.Equal(remove, []string{"postgres"}) {
+		t.Errorf("delta %v %v", put, remove)
+	}
+	if put, remove := tableDelta(a, same); len(put) != 0 || len(remove) != 0 {
+		t.Errorf("a delta between equal tables %v %v", put, remove)
+	}
+	if got := addressSet([]string{"::1", "127.0.0.1", "::ffff:127.0.0.1", "x", "fe80::1%eth0"}); !slices.Equal(got,
+		[]string{"127.0.0.1", "::1"}) {
+		t.Errorf("addresses %v", got)
 	}
 }
 
 // Readiness counts live rows only (§13.7): a ready phase left from a pod
 // whose row is unknown, stopped, failed or has an op in flight is not
-// ready, for the hosts entries and the crash loop's end alike; a paused
+// ready, for the names and the crash loop's end alike; a paused
 // or hibernated replica of an idle service is.
 func TestLiveReadiness(t *testing.T) {
 	row := func(replica int, phase, state, addr string) store.EnvInstanceRow {
@@ -249,7 +262,7 @@ func TestLiveReadiness(t *testing.T) {
 	}
 
 	// web's replica 0 was ready when its node went down (unknown, its
-	// address kept); replica 1 runs: the hosts name replica 1.
+	// address kept); replica 1 runs: the name is replica 1's.
 	v := &view{
 		env:    store.Environment{ID: uuid.New(), Name: "stage"},
 		target: &spec.Spec{Services: map[string]spec.Service{"web": {Image: "img"}}},
@@ -258,25 +271,25 @@ func TestLiveReadiness(t *testing.T) {
 			row(1, model.PhaseReady, model.StateRunning, "fd00::11"),
 		},
 	}
-	if got := hostsEntries(v)["web"]; got != "fd00::11" {
+	if got := nameEntries(v)["web"]; !slices.Equal(got, []string{"fd00::11"}) {
 		t.Errorf("web -> %s, want the running replica's fd00::11", got)
 	}
 	// Replica 1 is still starting: its address is still better than one
 	// that may be stale.
 	v.rows[1].Instance.Phase = model.PhaseStarting
-	if got := hostsEntries(v)["web"]; got != "fd00::11" {
+	if got := nameEntries(v)["web"]; !slices.Equal(got, []string{"fd00::11"}) {
 		t.Errorf("web -> %s, want the known replica's fd00::11", got)
 	}
 	// Only the unknown one has an address: it is named, nothing better.
 	v.rows[1].Sandbox.Address = ""
-	if got := hostsEntries(v)["web"]; got != "fd00::10" {
+	if got := nameEntries(v)["web"]; !slices.Equal(got, []string{"fd00::10"}) {
 		t.Errorf("web -> %q, want the only address fd00::10", got)
 	}
 	// An idle service's paused ready replica is ready.
 	v.target.Services["web"] = spec.Service{Image: "img", Idle: "15m"}
 	v.rows[0].Sandbox.ClientState = model.StatePaused
 	v.rows[1].Sandbox.Address = "fd00::11"
-	if got := hostsEntries(v)["web"]; got != "fd00::10" {
+	if got := nameEntries(v)["web"]; !slices.Equal(got, []string{"fd00::10"}) {
 		t.Errorf("web -> %s, want the idle service's paused ready replica fd00::10", got)
 	}
 

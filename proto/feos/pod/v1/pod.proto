@@ -167,6 +167,10 @@ message PodNetwork {
   // The resolvers feosd's resolver asks for the pod, as IP addresses; the
   // node's (feosd --dns-upstream) when empty.
   repeated string dns_upstreams = 8;
+  // The name tables (feos.network.v1.NameService) whose names feosd's
+  // resolver answers the pod, in this order, before it asks upstream; feosd
+  // must have them before the pod starts.
+  repeated string name_tables = 9;
 }
 
 enum PodState {

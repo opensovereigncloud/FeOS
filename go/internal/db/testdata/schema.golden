@@ -93,7 +93,7 @@ TABLE env_incidents
   COLUMN closed_at timestamp with time zone
   COLUMN summary text NOT NULL DEFAULT ''::text
   COLUMN evidence jsonb NOT NULL DEFAULT '{}'::jsonb
-  CONSTRAINT CHECK ((condition = ANY (ARRAY['rollout_failed'::text, 'crash_loop'::text, 'job_failed'::text, 'no_capacity'::text, 'addon_unhealthy'::text, 'volume_unavailable'::text, 'attach_failed'::text])))
+  CONSTRAINT CHECK ((condition = ANY (ARRAY['rollout_failed'::text, 'crash_loop'::text, 'job_failed'::text, 'no_capacity'::text, 'addon_unhealthy'::text, 'volume_unavailable'::text, 'attach_failed'::text, 'names_unserved'::text])))
   CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
   CONSTRAINT PRIMARY KEY (id)
   CREATE INDEX env_incidents_env ON public.env_incidents USING btree (env_id, id)

@@ -31,12 +31,14 @@ crates/
                         telemetry and events
   services/
     container-service/  containers: overlay roots, exec, adoption, persistence
-    dns-service/        the pods' resolver, which feosd serves
+    dns-service/        the pods' resolver, which feosd serves; it answers
+                        the names of the pods' name tables itself
     host-service/       host information, logs, power, upgrade, time, network
                         push, filesystem freezing, memory
     image-service/      OCI image pulls and the image store
     network-service/    security groups: their store, SecurityGroupService,
-                        and the compiler into sets of addresses and rules
+                        and the compiler into sets of addresses and rules;
+                        name tables: their store and NameService
     pod-service/        pods on top of the microVM layer, their network
                         (addresses, TAP devices, the nftables table, DNS,
                         records), and the forwarding of a pod's services to
@@ -220,8 +222,10 @@ A ferund on one machine, with a test node:
 
 Without `--secret-key-file` the sandboxes run, but an environment with
 an addon or a secret stays rolling ("secrets need --secret-key-file").
-The test node fails a pod whose security groups it does not have, as
-feosd does (`--check-security-groups`, on by default), and with
+The test node fails a pod whose security groups or name tables it does
+not have, as feosd does (`--check-security-groups`,
+`--check-name-tables`, both on by default; `--no-name-service` plays a
+feosd from before the name tables), and with
 `--fake-exec` answers every exec into a pod with exit 0 without running
 anything (an exec into an environment's pod does so by default, so that
 addon probes and provisioning pass).
@@ -249,8 +253,8 @@ the join's:
 - `--port-addr <port>=<host:port>`, repeatable, makes a port forward to
   a pod's port dial that address: readiness checks and the route door
   reach a server on the machine, here one on 18080 for the pods' 8080.
-- `kill -USR1` logs the node's pods, volumes and security groups as one
-  JSON line, `kill -HUP` restarts it gracefully.
+- `kill -USR1` logs the node's pods, volumes, security groups and name
+  tables as one JSON line, `kill -HUP` restarts it gracefully.
 
 Go code follows the rules of the Rust code where they apply, and these:
 

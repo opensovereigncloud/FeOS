@@ -32,21 +32,20 @@ type EnvAttached struct {
 	LastExit           *int
 	ProbeFailures      int
 	NextRestartAt      time.Time
-	HostsWritten       string
 	Detail             string
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 }
 
 const attachedCols = `env_id, service, sandbox_id, sandbox_incarnation, template_hash, process_id, phase, ready_since,
-	restarts, last_exit, probe_failures, next_restart_at, hosts_written, detail, created_at, updated_at`
+	restarts, last_exit, probe_failures, next_restart_at, detail, created_at, updated_at`
 
 func scanAttached(row pgx.Row) (EnvAttached, error) {
 	var a EnvAttached
 	var inc *uuid.UUID
 	var ready, next *time.Time
 	if err := row.Scan(&a.EnvID, &a.Service, &a.SandboxID, &inc, &a.TemplateHash, &a.ProcessID, &a.Phase, &ready,
-		&a.Restarts, &a.LastExit, &a.ProbeFailures, &next, &a.HostsWritten, &a.Detail, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		&a.Restarts, &a.LastExit, &a.ProbeFailures, &next, &a.Detail, &a.CreatedAt, &a.UpdatedAt); err != nil {
 		return EnvAttached{}, err
 	}
 	a.SandboxIncarnation, a.ReadySince, a.NextRestartAt = uuidOf(inc), timeOf(ready), timeOf(next)
@@ -67,12 +66,10 @@ func (s *Store) InsertAttached(ctx context.Context, a EnvAttached) (EnvAttached,
 		a.Phase = model.PhaseStarting
 	}
 	out, err := scanAttached(s.q.QueryRow(ctx, `INSERT INTO env_attached (env_id, service, sandbox_id, sandbox_incarnation,
-			template_hash, process_id, phase, ready_since, restarts, last_exit, probe_failures, next_restart_at,
-			hosts_written, detail)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING `+attachedCols,
+			template_hash, process_id, phase, ready_since, restarts, last_exit, probe_failures, next_restart_at, detail)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING `+attachedCols,
 		a.EnvID, a.Service, a.SandboxID, nullUUID(a.SandboxIncarnation), a.TemplateHash, a.ProcessID, a.Phase,
-		nullTime(a.ReadySince), a.Restarts, nullInt(a.LastExit), a.ProbeFailures, nullTime(a.NextRestartAt),
-		a.HostsWritten, a.Detail))
+		nullTime(a.ReadySince), a.Restarts, nullInt(a.LastExit), a.ProbeFailures, nullTime(a.NextRestartAt), a.Detail))
 	if err != nil {
 		return EnvAttached{}, insertError("insert attached service "+a.Service, err)
 	}
@@ -127,7 +124,6 @@ func (s *Store) UpdateAttached(ctx context.Context, before, after EnvAttached) (
 	u.set("last_exit", !sameIntPtr(before.LastExit, after.LastExit), nullInt(after.LastExit))
 	u.set("probe_failures", before.ProbeFailures != after.ProbeFailures, after.ProbeFailures)
 	u.set("next_restart_at", !before.NextRestartAt.Equal(after.NextRestartAt), nullTime(after.NextRestartAt))
-	u.set("hosts_written", before.HostsWritten != after.HostsWritten, after.HostsWritten)
 	u.set("detail", before.Detail != after.Detail, after.Detail)
 	if u.empty() {
 		return before, nil

@@ -589,7 +589,11 @@ type PodNetwork struct {
 	SecurityGroups []string `protobuf:"bytes,7,rep,name=security_groups,json=securityGroups,proto3" json:"security_groups,omitempty"`
 	// The resolvers feosd's resolver asks for the pod, as IP addresses; the
 	// node's (feosd --dns-upstream) when empty.
-	DnsUpstreams  []string `protobuf:"bytes,8,rep,name=dns_upstreams,json=dnsUpstreams,proto3" json:"dns_upstreams,omitempty"`
+	DnsUpstreams []string `protobuf:"bytes,8,rep,name=dns_upstreams,json=dnsUpstreams,proto3" json:"dns_upstreams,omitempty"`
+	// The name tables (feos.network.v1.NameService) whose names feosd's
+	// resolver answers the pod, in this order, before it asks upstream; feosd
+	// must have them before the pod starts.
+	NameTables    []string `protobuf:"bytes,9,rep,name=name_tables,json=nameTables,proto3" json:"name_tables,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -641,6 +645,13 @@ func (x *PodNetwork) GetSecurityGroups() []string {
 func (x *PodNetwork) GetDnsUpstreams() []string {
 	if x != nil {
 		return x.DnsUpstreams
+	}
+	return nil
+}
+
+func (x *PodNetwork) GetNameTables() []string {
+	if x != nil {
+		return x.NameTables
 	}
 	return nil
 }
@@ -2171,12 +2182,14 @@ const file_feos_pod_v1_pod_proto_rawDesc = "" +
 	"\vVolumeMount\x12\x16\n" +
 	"\x06volume\x18\x01 \x01(\tR\x06volume\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1b\n" +
-	"\tread_only\x18\x03 \x01(\bR\breadOnly\"\xa4\x01\n" +
+	"\tread_only\x18\x03 \x01(\bR\breadOnly\"\xc5\x01\n" +
 	"\n" +
 	"PodNetwork\x12\x12\n" +
 	"\x04none\x18\x06 \x01(\bR\x04none\x12'\n" +
 	"\x0fsecurity_groups\x18\a \x03(\tR\x0esecurityGroups\x12#\n" +
-	"\rdns_upstreams\x18\b \x03(\tR\fdnsUpstreamsJ\x04\b\x01\x10\x06R\btap_nameR\vmac_addressR\tipv4_cidrR\agatewayR\x03dns\"\xb8\x03\n" +
+	"\rdns_upstreams\x18\b \x03(\tR\fdnsUpstreams\x12\x1f\n" +
+	"\vname_tables\x18\t \x03(\tR\n" +
+	"nameTablesJ\x04\b\x01\x10\x06R\btap_nameR\vmac_addressR\tipv4_cidrR\agatewayR\x03dns\"\xb8\x03\n" +
 	"\aPodInfo\x12\x15\n" +
 	"\x06pod_id\x18\x01 \x01(\tR\x05podId\x12(\n" +
 	"\x04spec\x18\x02 \x01(\v2\x14.feos.pod.v1.PodSpecR\x04spec\x12+\n" +

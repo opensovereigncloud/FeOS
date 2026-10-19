@@ -68,7 +68,7 @@ pub fn check_id(id: &str) -> Result<(), Status> {
     }
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     (1..=64).contains(&id.len())
         && id
             .chars()

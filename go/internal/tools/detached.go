@@ -22,16 +22,12 @@ import (
 // The Runner's detached calls (detached_types.go): what the environment
 // controller runs in a pod's main container on its own behalf. Each takes
 // the lease the caller read from the row: no Acquire, no hold, no
-// activity row, no Touch, so that probes, provisioning, hosts blocks and
-// the supervisor of attached services never wake or keep awake what they
+// activity row, no Touch, so that probes, provisioning and the
+// supervisor of attached services never wake or keep awake what they
 // look at. A call into a pod that is not where the lease says fails as
 // the node answers it (a NodeError); the caller reads the row again.
 // The calls count against the sandbox's exec cap on this instance as the
 // tools' do.
-
-// detachedReadPage is how many lines a ReadFileDetached asks the guest's
-// read tool for at a time.
-const detachedReadPage = 2000
 
 // noCwdExit is the exit code of the detached start script when the
 // process's working directory does not exist.
@@ -188,70 +184,6 @@ func (r *Runner) unaryDetached(ctx context.Context, lease model.Lease,
 		return r.callError(lease.Node, deadline(ctx, actx, r.defaultTimeout, err))
 	}
 	return nil
-}
-
-// WriteFileDetached writes content to path in the main container (created
-// or replaced, its directories made), through the guest's write tool:
-// also in an image without a shell.
-func (r *Runner) WriteFileDetached(ctx context.Context, lease model.Lease, path string, content []byte) error {
-	req := &toolv1.WriteRequest{Container: mainContainer, Path: path, Content: content}
-	if len(content) > maxGuestRequest {
-		return &TooLargeError{Tool: ToolWrite}
-	}
-	var refused string
-	err := r.unaryDetached(ctx, lease, func(ctx context.Context, c toolv1.ToolServiceClient) error {
-		resp, err := c.Write(ctx, req)
-		if err != nil {
-			return err
-		}
-		refused = resp.Error
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if refused != "" {
-		return fmt.Errorf("write %s: %s", path, refused)
-	}
-	return nil
-}
-
-// missingFile is the prefix of the read tool's answer for a path that
-// does not exist (the guest's and the test node's).
-const missingFile = "Path not found: "
-
-// ReadFileDetached reads the whole text file path of the main container
-// through the guest's read tool, page by page (as UTF-8, invalid bytes
-// replaced); an error wrapping ErrNoFile when it does not exist.
-func (r *Runner) ReadFileDetached(ctx context.Context, lease model.Lease, path string) (string, error) {
-	var b strings.Builder
-	for offset := 1; ; {
-		var resp *toolv1.ReadResponse
-		err := r.unaryDetached(ctx, lease, func(ctx context.Context, c toolv1.ToolServiceClient) error {
-			var err error
-			resp, err = c.Read(ctx, &toolv1.ReadRequest{Container: mainContainer, Path: path, Offset: uint32(offset),
-				Limit: detachedReadPage})
-			return err
-		})
-		if err != nil {
-			return "", err
-		}
-		switch {
-		case strings.HasPrefix(resp.Error, missingFile):
-			return "", fmt.Errorf("read %s: %w", path, ErrNoFile)
-		case resp.Error != "":
-			return "", fmt.Errorf("read %s: %s", path, resp.Error)
-		case len(resp.Image) > 0:
-			return "", fmt.Errorf("read %s: a picture, not text", path)
-		}
-		b.WriteString(resp.Text)
-		if !resp.Truncated || resp.Text == "" {
-			return b.String(), nil
-		}
-		// A page that ends before the file does ends with its line's
-		// newline: its lines are its newlines.
-		offset += strings.Count(resp.Text, "\n")
-	}
 }
 
 // shellQuote quotes a word for a POSIX shell: as it is when it consists

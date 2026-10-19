@@ -30,10 +30,13 @@
 // (HibernateUpload, HibernateHead); Restart, Crash and Partition play what
 // happens to a real node.
 //
-// For an environment's pods (ADR 0018) it serves VolumeService and
-// SecurityGroupService over records in memory with feosd's rules (a pod
-// claims its volumes at its create; with Config.CheckSecurityGroups a pod
-// whose groups the node lacks fails at its bring-up), reports a
+// For an environment's pods (ADR 0018) it serves VolumeService,
+// SecurityGroupService and NameService over records in memory with
+// feosd's rules (a pod claims its volumes at its create; with
+// Config.CheckSecurityGroups and Config.CheckNameTables a pod whose groups
+// or name tables the node lacks fails at its bring-up; Node.Resolve
+// answers a pod's name as feosd's resolver would; Config.NoNameService
+// plays a feosd from before the name tables), reports a
 // container's exit with its code (Script.ExitContainer) and serves a
 // container's log (Script.AppendLog, StreamContainerLogs with
 // tail_lines). An Exec into an environment's pod exits 0 without running

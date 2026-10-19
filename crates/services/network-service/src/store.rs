@@ -151,7 +151,7 @@ impl Store {
 }
 
 /// Writes a file whole or not at all, and makes it last.
-fn write(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = path.with_extension("pb.new");
     let mut file = fs::File::create(&temporary)?;
     file.write_all(bytes)?;
