@@ -185,9 +185,11 @@ const deleteBatch = 16
 // deleteLoop is env-delete: the environments of deleting tenants are
 // marked deleting; each deleting environment loses its instances
 // (Engine.Delete), its attached services (their processes stop and their
-// hosts blocks go), its volumes (marked deleting) and its group on every
-// connected node; its row goes once no instance row and no volume is
-// left (its releases, secrets, runs, incidents and route tokens cascade).
+// hosts blocks go, a sleeping sandbox woken for it, before their rows
+// go), its volumes (marked deleting) and its group on every connected
+// node; its row goes once no instance row, volume, group or attached
+// service still to clean is left (its releases, secrets, runs, incidents
+// and route tokens cascade).
 func (c *Controller) deleteLoop(ctx context.Context) error {
 	tenants, err := c.st.DeletingTenants(ctx)
 	if err != nil {
@@ -233,6 +235,9 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 			return err
 		}
 	}
+	// The attached services' processes stop and their names leave the
+	// hosts blocks (a sleeping sandbox is woken for it) before their rows
+	// go: cleanOld.
 	attached, err := c.st.ListAttached(ctx, e.ID)
 	if err != nil {
 		return err
@@ -240,20 +245,15 @@ func (c *Controller) deleteEnvironment(ctx context.Context, e store.Environment)
 	v := &view{env: e, target: emptySpec(), latestSpec: emptySpec()}
 	cleaning := false
 	for _, a := range attached {
-		if !c.cleanAttached(ctx, v, a) {
+		if !c.cleanOld(ctx, v, a, c.dropCleaned) {
 			cleaning = true
 			continue
 		}
-		if err := c.fenced(ctx, func(tx *store.Store) error {
-			_, err := tx.DeleteAttached(ctx, e.ID, a.Service)
-			return err
-		}); err != nil {
+		gone, err := c.dropAttached(ctx, a)
+		if err != nil {
 			return err
 		}
-		c.forget("a/" + attachedKey(e.ID, a.Service))
-	}
-	if len(attached) > 0 {
-		c.notify(ctx, HintGroups)
+		cleaning = cleaning || !gone
 	}
 	if err := c.fenced(ctx, func(tx *store.Store) error {
 		_, err := tx.EnvCtlMarkVolumesDeleting(ctx, e.ID)

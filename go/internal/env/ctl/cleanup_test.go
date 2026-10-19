@@ -5,6 +5,7 @@ package ctl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -59,6 +60,18 @@ func hostProcessesPerPod(n *testnode.Node, root string) *podProcesses {
 		return 0, false, nil
 	})
 	return pp
+}
+
+// sleepUntilPaused pauses a sandbox and waits until it is paused.
+func (h *harness) sleepUntilPaused(id uuid.UUID) {
+	h.t.Helper()
+	if err := h.eng.Pause(bg, id); err != nil {
+		h.t.Fatal(err)
+	}
+	eventually(h.t, 30*time.Second, "paused", func() bool {
+		s, _ := h.st.GetSandbox(bg, id)
+		return s.ClientState == model.StatePaused && s.Op == ""
+	})
 }
 
 // hostsOf reads a pod's /etc/hosts.
@@ -131,6 +144,185 @@ func TestAttachedNewIncarnation(t *testing.T) {
 	})
 }
 
+// An attached service whose process cannot be stopped keeps its row (and
+// its environment keeps its own) until the stop succeeds: removed from
+// the spec, or its environment deleted, while its sandbox runs. The
+// running sandbox is held for the stop (an exec hold), so that it cannot
+// pause between the look and the stop.
+func TestAttachedStopFailureKeepsRow(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	pp := hostProcessesPerPod(n1, t.TempDir())
+	sb := h.attachable()
+	web := fmt.Sprintf(`"web":{"runtime":"attached","sandbox":%q,"command":["sleep","120"]}`, sb.ID)
+	api := `"api":{"image":"` + testImage + `","ports":[{"name":"http","port":8080}]}`
+
+	// Removed from the spec.
+	dev := h.newEnv("dev")
+	h.waitRelease(dev.ID, h.apply(dev.ID, `{"services":{`+web+`,`+api+`}}`), model.ReleaseRealised, 60*time.Second)
+	a, err := h.st.GetAttached(bg, dev.ID, "web")
+	if err != nil || a.ProcessID == "" {
+		t.Fatalf("attached %+v %v", a, err)
+	}
+	pp.failStops.Store(true)
+	before := pp.stops.Load()
+	r2 := h.apply(dev.ID, `{"services":{`+api+`}}`)
+	eventually(t, 30*time.Second, "a stop tried", func() bool { return pp.stops.Load() > before })
+	never(t, 3*time.Second, "the row went while the stop fails", func() bool {
+		_, err := h.st.GetAttached(bg, dev.ID, "web")
+		return err != nil
+	})
+	if got := h.runningNamed(sb, "ferun-env-dev-web"); !slices.Equal(got, []string{a.ProcessID}) {
+		t.Fatalf("running %v", got)
+	}
+	if r := h.release(dev.ID, r2); r.State == model.ReleaseRealised {
+		t.Fatalf("realised while the service is not removed: %+v", r)
+	}
+	pp.failStops.Store(false)
+	h.waitRelease(dev.ID, r2, model.ReleaseRealised, 60*time.Second)
+	if _, err := h.st.GetAttached(bg, dev.ID, "web"); !errors.Is(err, store.ErrNoRow) {
+		t.Fatalf("the removed service's row: %v", err)
+	}
+	if got := h.runningNamed(sb, "ferun-env-dev-web"); len(got) != 0 {
+		t.Fatalf("the removed service's process runs on: %v", got)
+	}
+	if strings.Contains(hostsOf(n1, sb.ID), "ferun environment dev") {
+		t.Fatalf("the removed service's hosts block stayed:\n%s", hostsOf(n1, sb.ID))
+	}
+
+	// Its environment deleted.
+	stage := h.newEnv("stage")
+	h.waitRelease(stage.ID, h.apply(stage.ID, `{"services":{`+web+`}}`), model.ReleaseRealised, 60*time.Second)
+	b, err := h.st.GetAttached(bg, stage.ID, "web")
+	if err != nil || b.ProcessID == "" {
+		t.Fatalf("attached %+v %v", b, err)
+	}
+	pp.failStops.Store(true)
+	before = pp.stops.Load()
+	h.exec(`UPDATE environments SET deleting = true WHERE id = $1`, stage.ID)
+	h.c.notify(bg, LoopDelete)
+	eventually(t, 30*time.Second, "a stop tried", func() bool { return pp.stops.Load() > before })
+	never(t, 6*time.Second, "the environment or its attached row went while the stop fails", func() bool {
+		_, err := h.st.GetAttached(bg, stage.ID, "web")
+		_, eerr := h.st.GetEnvironment(bg, stage.ID)
+		return err != nil || eerr != nil
+	})
+	if got := h.runningNamed(sb, "ferun-env-stage-web"); !slices.Equal(got, []string{b.ProcessID}) {
+		t.Fatalf("running %v", got)
+	}
+	pp.failStops.Store(false)
+	eventually(t, 60*time.Second, "the environment deleted", func() bool {
+		h.c.notify(bg, LoopDelete)
+		_, err := h.st.GetEnvironment(bg, stage.ID)
+		return errors.Is(err, store.ErrNoRow)
+	})
+	if got := h.runningNamed(sb, "ferun-env-stage-web"); len(got) != 0 {
+		t.Fatalf("the deleted environment's process runs on: %v", got)
+	}
+}
+
+// An attached service moved away from a sandbox that sleeps: the old
+// sandbox is woken, the process stopped there and its name taken out of
+// the old sandbox's hosts block (which keeps the services that stay), and
+// only then does the row move; the service then runs in the new sandbox.
+func TestAttachedMovesFromSleepingSandbox(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	hostProcessesPerPod(n1, t.TempDir())
+	s1, s2 := h.attachable(), h.attachable()
+	attached := func(name string, sb uuid.UUID) string {
+		return fmt.Sprintf(`%q:{"runtime":"attached","sandbox":%q,"command":["sleep","120"]}`, name, sb)
+	}
+	env := h.newEnv("dev")
+	r1 := h.apply(env.ID, `{"services":{`+attached("web", s1.ID)+`,`+attached("worker", s1.ID)+`}}`)
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	a, err := h.st.GetAttached(bg, env.ID, "web")
+	if err != nil || a.ProcessID == "" || a.HostsWritten == "" {
+		t.Fatalf("attached %+v %v", a, err)
+	}
+	if hosts := hostsOf(n1, s1.ID); !strings.Contains(hosts, "127.0.0.1 web\n") || !strings.Contains(hosts, "127.0.0.1 worker\n") {
+		t.Fatalf("the first sandbox's hosts\n%s", hosts)
+	}
+	h.sleepUntilPaused(s1.ID)
+
+	r2 := h.apply(env.ID, `{"services":{`+attached("web", s2.ID)+`,`+attached("worker", s1.ID)+`}}`)
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 60*time.Second)
+	b, err := h.st.GetAttached(bg, env.ID, "web")
+	if err != nil || b.SandboxID != s2.ID || b.ProcessID == "" || b.Phase != model.PhaseReady {
+		t.Fatalf("moved %+v %v", b, err)
+	}
+	cur := h.attachableUp(s1.ID)
+	if got := h.runningNamed(cur, "ferun-env-dev-web"); len(got) != 0 {
+		t.Fatalf("the moved service's process %s runs on in the old sandbox: %v", a.ProcessID, got)
+	}
+	if got := h.runningNamed(cur, "ferun-env-dev-worker"); len(got) != 1 {
+		t.Fatalf("the service that stays: %v", got)
+	}
+	eventually(t, 30*time.Second, "the old sandbox's hosts block without the moved service", func() bool {
+		hosts := hostsOf(n1, s1.ID)
+		return !strings.Contains(hosts, " web\n") && strings.Contains(hosts, "127.0.0.1 worker\n")
+	})
+	if got := h.runningNamed(h.attachableUp(s2.ID), "ferun-env-dev-web"); !slices.Equal(got, []string{b.ProcessID}) {
+		t.Fatalf("the new sandbox runs %v, the row records %s", got, b.ProcessID)
+	}
+}
+
+// A sandbox under an attached service's ID that is a new incarnation, or
+// stopped, holds nothing of the service's to clean: its row may go
+// without a wake (the process went with the old incarnation). The
+// incarnation the process runs in is woken and cleaned when it sleeps.
+func TestAttachedCleanLeavesNewIncarnation(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	pp := hostProcessesPerPod(n1, t.TempDir())
+	sb := h.attachable()
+	h.sleepUntilPaused(sb.ID)
+	env := h.newEnv("dev")
+	v := &view{env: env, target: emptySpec(), latestSpec: emptySpec()}
+	a, err := h.st.InsertAttached(bg, store.EnvAttached{EnvID: env.ID, Service: "web", SandboxID: sb.ID,
+		SandboxIncarnation: uuid.New(), ProcessID: "p1", HostsWritten: "h1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var done atomic.Int64
+	count := func(context.Context, store.EnvAttached) { done.Add(1) }
+	if !h.c.cleanOld(bg, v, a, count) {
+		t.Fatal("a new incarnation is to be cleaned")
+	}
+	never(t, 2*time.Second, "the new incarnation woken", func() bool {
+		s, _ := h.st.GetSandbox(bg, sb.ID)
+		return s.ClientState != model.StatePaused || done.Load() != 0 || pp.stops.Load() != 0
+	})
+	// The incarnation the process runs in, asleep: woken and cleaned in
+	// the pool, which then hands the row on.
+	after := a
+	after.SandboxIncarnation = sb.Incarnation
+	if a, err = h.st.UpdateAttached(bg, a, after); err != nil {
+		t.Fatal(err)
+	}
+	if h.c.cleanOld(bg, v, a, count) {
+		t.Fatal("nothing to clean in the sandbox the process runs in")
+	}
+	eventually(t, 30*time.Second, "cleaned in the woken sandbox", func() bool { return done.Load() == 1 && pp.stops.Load() == 1 })
+	if !leftNothing(env, store.EnvAttached{SandboxID: sb.ID}, store.Sandbox{ID: sb.ID, Owner: env.Owner,
+		ClientState: model.StateStopped}) {
+		t.Error("a stopped sandbox holds something")
+	}
+	if leftNothing(env, store.EnvAttached{SandboxID: sb.ID}, store.Sandbox{ID: sb.ID, Owner: env.Owner,
+		ClientState: model.StatePaused}) {
+		t.Error("a paused sandbox holds nothing")
+	}
+}
+
 // seedRecords writes n records of processes that are over, named name,
 // under dir, as the start script writes them.
 func seedRecords(t *testing.T, dir, prefix, name string, n int) {
@@ -196,5 +388,29 @@ func TestAttachedSupervisedPastManyRecords(t *testing.T) {
 	}
 	if all, err := h.runner.ProcessesDetached(bg, lease(sb), ""); err != nil || len(all) != 304 {
 		t.Fatalf("every record: %d %v", len(all), err)
+	}
+}
+
+// A cleanup that failed waits for the restart backoff before it runs
+// again (a sandbox whose wake keeps failing is not woken every round);
+// one that succeeded forgets its failures.
+func TestCleanBackoff(t *testing.T) {
+	c := &Controller{t: defaultTimings()}
+	c.t.restartUnit, c.t.restartMax = time.Hour, 4*time.Hour
+	const key = "attached-clean/x"
+	if !c.cleanDue(key) {
+		t.Fatal("a cleanup that never failed waits")
+	}
+	c.cleanFailed(key)
+	if c.cleanDue(key) {
+		t.Fatal("a cleanup that failed runs again at once")
+	}
+	c.cleanFailed(key)
+	if w := c.cleanWaits[key]; w.failures != 2 || time.Until(w.next) < time.Hour+50*time.Minute {
+		t.Fatalf("the backoff after two failures %+v", w)
+	}
+	c.cleanOK(key)
+	if !c.cleanDue(key) {
+		t.Fatal("a cleanup that succeeded still waits")
 	}
 }
