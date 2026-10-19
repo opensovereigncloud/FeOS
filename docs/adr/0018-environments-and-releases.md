@@ -91,7 +91,8 @@ not of an environment.
   reference is an error of the write, not a pod that fails at start. An
   addon's output resolves to the address of its instance, so that a
   dependent's pod changes, and is rolled, when that address changes; a
-  service's resolves to its name, which a hosts block resolves (below).
+  service's resolves to its name, which `feosd`'s resolver answers
+  (below).
 
 ### A service may run inside a sandbox
 
@@ -119,11 +120,10 @@ not of an environment.
   another tenant took is never the service's, and the service fails
   rather than start, route or reach there.
 - A service that goes, removed, moved to another sandbox or with its
-  environment deleted, has its process stopped and its names taken out
-  of the sandbox's hosts file first, a sleeping sandbox woken for it; its
-  record goes or moves only then, or once the process is gone with its
-  sandbox for certain, so that no process runs on with the environment's
-  secrets.
+  environment deleted, has its process stopped first, a sleeping sandbox
+  woken for it; its record, and its name in the sandbox with it, goes or
+  moves only then, or once the process is gone with its sandbox for
+  certain, so that no process runs on with the environment's secrets.
 
 ### Every change is a release
 
@@ -227,16 +227,38 @@ not of an environment.
 
 ### The environment's network
 
-- An environment's names are its addons and image services. `ferund`
-  writes them, with their addresses, into a block of `/etc/hosts` in each
-  of the environment's service and job pods and in each sandbox its
-  attached services run in (there with the sandbox's own attached
-  services as loopback), and rewrites the block when an address changes
-  or a pod it names retires. A service and an addon therefore do not
-  share a name, and two environments whose attached services share a
-  sandbox share neither a name of its hosts file nor a port there. An
+- An environment's names are its addons and image services, and
+  `feosd`'s resolver answers them (ADR 0010). `ferund` keeps a name table
+  per environment, `env-<id>`, which names each of them with the
+  addresses of all its live replicas, and one per attachable sandbox,
+  `sbx-<id>`, which names the attached services that run there as
+  loopback and includes the tables of their environments. While a
+  service has no live replica, its name holds the addresses of the best
+  it has, never a retiring one's, so that a name does not go during a
+  roll.
+- The tables reach the nodes as security groups do (ADR 0012): the
+  control plane sends each node the tables of its pods and those they
+  include, whole or as a delta from the version the node has, and
+  `feosd` keeps them on disk. A table's version is a hash of its
+  content, so that a delta means the same on every node. A pod names
+  its tables in its spec, as it names its groups: the environment's
+  service and job pods `env-<id>`, an attachable sandbox its own from
+  its creation, so that a sandbox that gains or loses attached services
+  keeps its pod, and only its table changes.
+- `feosd` answers a name of one label that the pod's tables hold, in any
+  case, with every address the table has for it and a TTL of 5 seconds,
+  and never asks upstream for it; every other name goes upstream as
+  before. The guest takes no part: a pod that was paused, suspended,
+  hibernated or moved resolves its names as soon as it runs again, from
+  the node it runs on.
+- A service and an addon therefore do not share a name, and two
+  environments whose attached services share a sandbox share neither a
+  name there, which the first table would answer, nor a port. An
   attached service reaches by name only the attached services of its
   own sandbox.
+- A node whose `feosd` does not serve the tables yet runs the pods
+  without names, and an incident on each object with pods there says
+  so.
 - Its security group, `env-<id>`, lets its members, the environment's
   pods and the sandboxes of its attached services, reach each other, and
   every pod the internet: an egress table of the global unicast blocks of
@@ -302,8 +324,10 @@ The decision was taken as proposed above; building it changed these:
   container, not a container added to the running pod: nothing is needed
   of the node or of ADR 0004 and ADR 0007.
 - **Names**: an addon's reference resolves to its address, a service's
-  to its name in a hosts block that `ferund` writes, rather than
-  `feosd`'s resolver or a file the guest writes.
+  to its name, which `feosd`'s resolver answers from the tables `ferund`
+  puts on the nodes. They were built first as a block of `/etc/hosts`
+  that `ferund` wrote into every pod, and moved into the resolver before
+  0.6.0 (see the alternatives).
 - **Attachable sandboxes** and the groups `env-` and `sbx-` with the
   egress table: the sandbox API gains `attachable`, which the proposal
   kept unchanged.
@@ -369,9 +393,24 @@ The decision was taken as proposed above; building it changed these:
 - **A container added to the sandbox's pod for an attached service**:
   a node mechanism (ADR 0004, ADR 0007) for what a process in the main
   container, which already sees the working tree, does.
-- **Names from `feosd`'s resolver** (ADR 0010): objects sent to every
-  node like groups, and a resolver per pod. A hosts block needs nothing of
-  the node and is written where `ferund` writes files already.
+- **A block of `/etc/hosts` that `ferund` writes into every pod**, as was
+  built first: it needs nothing of the node, but it holds one address
+  per name, so that one replica takes every connection; a file has no
+  TTL, and a name follows a roll only once the block is written again;
+  every change of an address is an exec into every pod of the
+  environment and every sandbox of its attached services, with a hash
+  per pod of what was written; a sandbox that sleeps keeps a stale block
+  until it runs, and is woken to take a service's name out when the
+  service goes. A table on the node changes once per node, holds every
+  replica, expires in seconds and needs nothing of the guest.
+- **A file the guest writes**, from what the node pushes over vsock: the
+  same file without the exec, and a guest that has to hear of every
+  change while it runs and cannot while it sleeps.
+- **A name table per security group**, without a field in the spec: no
+  change to the pods, and sandboxes made attachable before would resolve
+  at once; but a group says what a pod reaches and a table what it calls
+  by name, and every group would become a table on every node that has
+  it.
 
 ## Consequences
 
@@ -383,13 +422,17 @@ The decision was taken as proposed above; building it changed these:
   environments, their releases, incidents and logs, read only.
 - A service's pods are pods like any other (ADR 0004). The node knows
   nothing of environments or releases; labels carry them, and the node
-  sees only pods, volumes and security groups.
+  sees only pods, volumes, security groups and name tables.
 - The sandbox API gains `attachable`; an environment's pods are no
   tenant's sandboxes and are absent from its routes. A sandbox is not an
   object of an environment; an attached service names one.
-- `ferund` sends security groups and creates volumes on nodes (ADR 0012,
-  ADR 0016) for the first time, and carries application traffic in its
-  front door until an ingress does.
+- `ferund` sends security groups and name tables and creates volumes on
+  nodes (ADR 0012, ADR 0010, ADR 0016) for the first time, and carries
+  application traffic in its front door until an ingress does.
+- A pod's name table is in its template: the first `ferund` with names
+  rolls every image service and gives every job a new template once. A
+  sandbox made attachable before has no table, and resolves no names
+  until it is created again.
 - **Known exposure**: a pod's environment, secrets resolved, reaches
   `feosd`'s record of the pod, `GetPod` and `ListPods`, the node's disk
   and hibernation checkpoints in the clear, and the NATS addon's
