@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
@@ -334,6 +336,57 @@ func TestReadinessPhases(t *testing.T) {
 	})
 	code.Store(0)
 	h.waitRelease(env.ID, r3, model.ReleaseRealised, 30*time.Second)
+}
+
+// An unknown row is ensured only when its service does not idle (§13.7):
+// an idle service's replica may be paused in truth, and the engine finds
+// out without waking it; another service's unknown replica comes back
+// running.
+func TestUnknownIdleNotWoken(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"web":{"image":%q},"idler":{"image":%q,"idle":"15m"}}}`,
+		testImage, testImage))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	web := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
+	idler := h.waitRows(env.ID, spec.KindService, "idler", 1, 10*time.Second, "ready", ready)[0]
+	if err := h.eng.Pause(bg, idler.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 30*time.Second, "paused", func() bool {
+		sb, _ := h.st.GetSandbox(bg, idler.Sandbox.ID)
+		return sb.ClientState == model.StatePaused && sb.Op == ""
+	})
+	// Both rows unknown, as after an op whose outcome was lost; the idle
+	// one's node does not answer for it yet (its syncs fail), so that the
+	// engine does not settle it before a step sees it.
+	time.Sleep(time.Second) // the pause's own syncs land first
+	n1.Script().SetHook(podv1.PodService_GetPod_FullMethodName, func(_ context.Context, _ string, req any) error {
+		if r, ok := req.(*podv1.GetPodRequest); ok && r.GetPodId() == idler.Sandbox.ID.String() {
+			return status.Error(codes.Unavailable, "out of touch")
+		}
+		return nil
+	})
+	h.exec(`UPDATE sandboxes SET client_state = 'unknown' WHERE id = ANY($1)`,
+		[]uuid.UUID{web.Sandbox.ID, idler.Sandbox.ID})
+	h.waitRows(env.ID, spec.KindService, "web", 1, 30*time.Second, "running again", running)
+	never(t, 3*time.Second, "the idle replica was ensured", func() bool {
+		sb, _ := h.st.GetSandbox(bg, idler.Sandbox.ID)
+		return sb.ClientState != model.StateUnknown || sb.Op != "" || h.c.pool.busy(ensureKey(idler.Sandbox.ID))
+	})
+	// The engine's sync (its unknown sweep) finds it paused.
+	n1.Script().SetHook(podv1.PodService_GetPod_FullMethodName, nil)
+	if err := h.eng.Sync(bg, idler.Sandbox.ID); err != nil {
+		t.Fatal(err)
+	}
+	if sb, _ := h.st.GetSandbox(bg, idler.Sandbox.ID); sb.ClientState != model.StatePaused {
+		t.Errorf("the idle replica after a sync: %s", sb.ClientState)
+	}
+	never(t, 3*time.Second, "the paused idle replica was woken", func() bool {
+		sb, _ := h.st.GetSandbox(bg, idler.Sandbox.ID)
+		return sb.ClientState != model.StatePaused
+	})
 }
 
 // crash makes an instance's container exit n times (each once the
