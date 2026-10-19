@@ -74,17 +74,23 @@ type stepState struct {
 	reason string
 	// failed: the step failed R.
 	failed bool
-	// until is when R may roll to at least, beyond its deadline: a
-	// release job that waited for a run that was not R's may take until
-	// that run's end and its own attempts' time (zero: no such run).
-	until time.Time
+	// shift is how long R's release jobs waited for runs that were not
+	// R's (jobWait): R's budgets count from its start moved on by it.
+	shift time.Duration
+	// shiftUnknown: the shift could not be read in this step, so no
+	// budget is judged in it.
+	shiftUnknown bool
 }
 
-// extend lets R roll until at least t.
-func (s *stepState) extend(t time.Time) {
-	if t.After(s.until) {
-		s.until = t
+// start is when R's budgets count from (its deadline, its services'
+// rollout budgets): R's start moved on by the time its release jobs
+// waited for runs that were not R's; false while R has not started or
+// the shift is not known.
+func (s *stepState) start() (time.Time, bool) {
+	if s.v.latest.StartedAt.IsZero() || s.shiftUnknown {
+		return time.Time{}, false
 	}
+	return s.v.latest.StartedAt.Add(s.shift), true
 }
 
 // pending is one thing a rolling release waits for: the object ("" for
@@ -164,20 +170,18 @@ func (c *Controller) deadline(v *view) time.Duration {
 	return d
 }
 
-// within is how long R may roll: its deadline, or longer when a release
-// job waited for a run that was not R's (stepState.until).
+// within is how long R may roll from its own start: its deadline, plus
+// the time its release jobs waited for runs that were not R's
+// (stepState.shift).
 func (c *Controller) within(s *stepState) time.Duration {
-	d := c.deadline(s.v)
-	if !s.until.IsZero() && !s.v.latest.StartedAt.IsZero() {
-		d = max(d, s.until.Sub(s.v.latest.StartedAt))
-	}
-	return d
+	return c.deadline(s.v) + s.shift
 }
 
-// pastDeadline reports whether R has rolled longer than it may (within).
+// pastDeadline reports whether R has rolled longer than its deadline,
+// counted from its shifted start (stepState.start).
 func (c *Controller) pastDeadline(s *stepState) bool {
-	v := s.v
-	return !v.latest.StartedAt.IsZero() && v.now.After(v.latest.StartedAt.Add(c.within(s)))
+	start, ok := s.start()
+	return ok && s.v.now.After(start.Add(c.deadline(s.v)))
 }
 
 // failLate fails a rolling R past its deadline (rollout_failed), naming

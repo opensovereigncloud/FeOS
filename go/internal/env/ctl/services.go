@@ -44,8 +44,9 @@ func byReplica(a, b store.EnvInstanceRow) int {
 // then an old one retires); missing replicas are added, surplus ones
 // retire, the highest first. While R rolls the service waits for the
 // addons and the release jobs, and its rollout budget counts from R's
-// start: past it, or when a new instance exited 3 times, R fails
-// (rollout_failed) and R's new instances retire.
+// start, moved on by the time the release jobs waited for runs that were
+// not R's (stepState.start): past it, or when a new instance exited 3
+// times, R fails (rollout_failed) and R's new instances retire.
 func (c *Controller) stepService(ctx context.Context, s *stepState, name string, svc spec.Service) {
 	v := s.v
 	var cur, old, retiring []store.EnvInstanceRow
@@ -185,7 +186,7 @@ func (c *Controller) rolloutFailed(ctx context.Context, s *stepState, name strin
 		}
 	}
 	budget := rolloutOf(svc)
-	if reason == "" && !v.latest.StartedAt.IsZero() && v.now.After(v.latest.StartedAt.Add(budget)) {
+	if start, ok := s.start(); reason == "" && ok && v.now.After(start.Add(budget)) {
 		ready := 0
 		for _, r := range cur {
 			if live(r, idleOf(svc) > 0) {

@@ -10,7 +10,6 @@ import (
 	"maps"
 	"slices"
 	"strconv"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -27,8 +26,9 @@ import (
 // failed last attempt fails R (job_failed). A job runs once at a time
 // across releases (§13.7): while a run of it that is not R's runs (a
 // superseded release's, a manual one, another template's), R's waits for
-// it to end, never cancelling it; R may then roll until that run ended
-// and its own attempts had their time (stepState.until).
+// it to end, never cancelling it; the time R waited so moves the start
+// its budgets count from (jobWait), on every step, also once the job is
+// done.
 func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 	v := s.v
 	c.stepRuns(ctx, s)
@@ -41,6 +41,7 @@ func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 			continue
 		}
 		p := c.planJob(v, name, j)
+		c.jobWait(ctx, s, name, p)
 		if !p.ok() {
 			s.jobsDone = false
 			s.wait(objectName(spec.KindJob, name), "job %s: %s", name, p.why())
@@ -67,23 +68,14 @@ func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 			continue
 		}
 		var last, other *store.EnvJobRun
-		timeout := jobTimeout(j)
 		for i := range runs {
-			if runs[i].TemplateHash == p.hash && runs[i].Release == v.targetNum {
+			switch {
+			case runs[i].TemplateHash == p.hash && runs[i].Release == v.targetNum:
 				if last == nil {
 					last = &runs[i]
 				}
-				continue
-			}
-			end := runs[i].FinishedAt
-			if runs[i].Phase == model.RunRunning {
-				end = runs[i].StartedAt.Add(timeout)
-				if other == nil {
-					other = &runs[i]
-				}
-			}
-			if end.After(v.latest.StartedAt) {
-				s.extend(end.Add(timeout * time.Duration(max(j.Retries, 0)+1)))
+			case runs[i].Phase == model.RunRunning && other == nil:
+				other = &runs[i]
 			}
 		}
 		switch {
@@ -106,6 +98,34 @@ func (c *Controller) stepJobs(ctx context.Context, s *stepState) {
 			s.failed = true
 			return
 		}
+	}
+}
+
+// jobWait moves R's start, which its budgets count from, on by the time
+// R waited for runs of the job that were not its own (§13.7): until the
+// latest end of such a run that ended after R began (now while one
+// runs), unless a run of R's template had succeeded before R began. It
+// is worked out on every step, whether the job is done, the addons are
+// ready or its template renders, so that R keeps the time once its
+// own run is done; when it cannot be read, no budget is judged in the
+// step.
+func (c *Controller) jobWait(ctx context.Context, s *stepState, name string, p *podPlan) {
+	v := s.v
+	if v.latest.StartedAt.IsZero() {
+		return
+	}
+	hash := ""
+	if p.ok() {
+		hash = p.hash
+	}
+	until, err := c.st.EnvCtlJobWaitedUntil(ctx, v.env.ID, name, hash, v.targetNum, v.latest.StartedAt)
+	if err != nil {
+		s.shiftUnknown = true
+		s.wait(objectName(spec.KindJob, name), "job %s: %v", name, err)
+		return
+	}
+	if d := until.Sub(v.latest.StartedAt); d > s.shift {
+		s.shift = d
 	}
 }
 

@@ -149,6 +149,57 @@ func TestEnvCtlQueries(t *testing.T) {
 		t.Fatalf("runs %v %v", runs, err)
 	}
 
+	// A release's wait for its job: the latest end of the runs of other
+	// releases that ended after its start (now() while one runs).
+	var start time.Time
+	if err := s.Q().QueryRow(bg, "SELECT now() - interval '1 hour'").Scan(&start); err != nil {
+		t.Fatal(err)
+	}
+	waited := func(hash string, release int) time.Time {
+		t.Helper()
+		until, err := s.EnvCtlJobWaitedUntil(bg, env.ID, "w", hash, release, start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return until
+	}
+	if until := waited("h2", 2); !until.IsZero() {
+		t.Fatalf("waited until %v without a run", until)
+	}
+	old, err := s.InsertJobRun(bg, store.EnvJobRun{EnvID: env.ID, Job: "w", TemplateHash: "h1", Release: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if until := waited("h2", 2); until.Before(start.Add(time.Hour)) {
+		t.Fatalf("a running run of release 1: waited until %v", until)
+	}
+	if until := waited("h1", 1); !until.IsZero() {
+		t.Fatalf("its own release's run is waited for: %v", until)
+	}
+	exec(t, s, `UPDATE env_job_runs SET phase = 'failed', finished_at = $2 WHERE id = $1`, old.ID, start.Add(9*time.Second))
+	if until := waited("h2", 2); !until.Equal(start.Add(9 * time.Second)) {
+		t.Fatalf("a run that ended after the start: waited until %v", until)
+	}
+	exec(t, s, `UPDATE env_job_runs SET finished_at = $2 WHERE id = $1`, old.ID, start.Add(-time.Second))
+	if until := waited("h2", 2); !until.IsZero() {
+		t.Fatalf("a run that ended before the start: waited until %v", until)
+	}
+	// A template that had succeeded before the start was never waited
+	// for, unless the hash is not known.
+	exec(t, s, `UPDATE env_job_runs SET finished_at = $2 WHERE id = $1`, old.ID, start.Add(9*time.Second))
+	done, err := s.InsertJobRun(bg, store.EnvJobRun{EnvID: env.ID, Job: "w", TemplateHash: "h2", Release: 1,
+		Phase: model.RunSucceeded})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(t, s, `UPDATE env_job_runs SET finished_at = $2 WHERE id = $1`, done.ID, start.Add(-time.Minute))
+	if until := waited("h2", 2); !until.IsZero() {
+		t.Fatalf("a template that had succeeded: waited until %v", until)
+	}
+	if until := waited("", 2); !until.Equal(start.Add(9 * time.Second)) {
+		t.Fatalf("an unknown hash: waited until %v", until)
+	}
+
 	// Volumes marked deleting.
 	if _, err := s.InsertEnvVolume(bg, store.EnvVolume{EnvID: env.ID, Object: "addon/pg", VolumeID: uuid.New(), SizeMiB: 1024}); err != nil {
 		t.Fatal(err)

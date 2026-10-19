@@ -189,8 +189,9 @@ not of an environment.
   waits for an addon or for capacity never rolls forever. A job runs at
   most once at a time in its environment, across releases: a release
   waits for a run of the job that an older release or a person started,
-  never cancels it, takes its success under the same template as its
-  own, and has that run's time on top of its deadline. While its latest
+  never cancels it, and takes its success under the same template as
+  its own; the time it waited moves the start that its deadline and its
+  services' budgets count from. While its latest
   release has failed, the controller keeps the realised one running and
   healed, and never tries the failed one again. `ferund` writes no
   release of its own. Whether a failed rollout is reverted at once is a
@@ -413,9 +414,11 @@ The decision was taken as proposed above; building it changed these:
   `ferun.revertOf`. A caller that marks its reverts, FeCode's autoRevert,
   applies K's spec through the releases route instead; whether revert
   takes annotations of the caller's.
-- A service's budget counts from the release's start, so that a release
-  job that runs long eats into it while the release's deadline would
-  allow more; whether a service's budget starts when it may move.
+- A service's budget counts from the release's start (moved on only by
+  the time the release waited for another release's run of a job), so
+  that a release job of its own that runs long eats into it while the
+  release's deadline would allow more; whether a service's budget starts
+  when it may move.
 - Restarts and readiness in the guest, as ADR 0004 decides, and what
   `ferund` then keeps of them; attached services have no crash loop yet,
   and are routed by the port of the matched release, not their own.

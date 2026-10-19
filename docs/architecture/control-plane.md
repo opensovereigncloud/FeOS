@@ -1408,15 +1408,18 @@ services wait for, the hosts blocks, and when a crash loop closes. Then:
    are replaced one at a time, surge 1: a new one, ready, then an old one
    retires (`retire_at` 5 s ahead: routes and hosts blocks drop it at
    once) and goes; surplus replicas retire from the highest; a lost row
-   is replaced. The service's `rollout.timeout` counts from R's start:
-   past it, or once one of R's new instances exited 3 times, R fails
+   is replaced. The service's `rollout.timeout` counts from R's start,
+   moved on by the time R's release jobs waited for runs that were not
+   R's (see the release's deadline below): past it, or once one of R's
+   new instances exited 3 times, R fails
    (`rollout_failed`, with the exits, the log tail and the diff since
    the realised release), and R's new instances retire while the old
    serve on. Healing, always: a desired row stopped, failed or pending
    gets Ensure, and one unknown, paused or hibernated too when its
    service does not idle ([the pool](#the-controller)).
 4. **Attached services** ([below](#attached-services-and-hosts-blocks)),
-   ready within 10 minutes of R's start, or R fails (`rollout_failed`).
+   ready within 10 minutes of R's start, moved on in the same way, or R
+   fails (`rollout_failed`).
 5. **Removed objects**: their instances retire and go; an addon neither T
    nor R has loses its volume (marked deleting) and its credentials,
    while an addon of a failed R that T lacks stays, so that a failed
@@ -1435,12 +1438,15 @@ services wait for, the hosts blocks, and when a crash loop closes. Then:
 rolled longer than the longest of T's image services' `rollout.timeout`,
 T's release jobs' timeout × (retries + 1), and 10 minutes, naming the
 first object it still waits for; the evidence lists what it waits for
-and those instances' details, credentials redacted. A release job that
-waited for a run that is not R's, and that ended or would end after R
-started, lets R roll until that run's end (its finish, or its start plus
-the job's timeout while it runs) plus the job's timeout × (retries + 1),
-when that is later; the reason names the time R had. A release without a
-sealer is spared. An instance pending without capacity for 2 minutes
+and those instances' details, credentials redacted. R's budgets, this
+deadline as well as its services' `rollout.timeout` and its attached
+services' 10 minutes, count from R's start moved on by the time its
+release jobs waited for runs that were not R's: to the latest end of a
+run of such a job by another release that ended after R started (the
+present while one runs), unless a run of R's template of the job had
+succeeded before R started. The shift is worked out on every step, so
+that R keeps it once its jobs are done; the reason names the time R had
+from its own start. A release without a sealer is spared. An instance pending without capacity for 2 minutes
 opens `no_capacity`, with the placement's text, which closes once it
 places.
 
