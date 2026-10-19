@@ -44,9 +44,9 @@ const (
 )
 
 // lifecycleMethods are the unary PodService calls that ops make, and the
-// VolumeService and SecurityGroupService calls that prepare a node for
-// them (the environments' prepare hook and loops, ADR 0018); the drain
-// timeout never cuts them.
+// VolumeService, SecurityGroupService and NameService calls that prepare
+// a node for them (the environments' prepare hook and loops, ADR 0018);
+// the drain timeout never cuts them.
 var lifecycleMethods = map[string]bool{
 	podv1.PodService_CreatePod_FullMethodName:    true,
 	podv1.PodService_StartPod_FullMethodName:     true,
@@ -67,6 +67,12 @@ var lifecycleMethods = map[string]bool{
 	networkv1.SecurityGroupService_DeleteSecurityGroup_FullMethodName: true,
 	networkv1.SecurityGroupService_GetSecurityGroup_FullMethodName:    true,
 	networkv1.SecurityGroupService_ListSecurityGroups_FullMethodName:  true,
+
+	networkv1.NameService_PutNameTable_FullMethodName:    true,
+	networkv1.NameService_UpdateNameTable_FullMethodName: true,
+	networkv1.NameService_DeleteNameTable_FullMethodName: true,
+	networkv1.NameService_GetNameTable_FullMethodName:    true,
+	networkv1.NameService_ListNameTables_FullMethodName:  true,
 }
 
 const toolServicePrefix = "/feos.tool.v1.ToolService/"
