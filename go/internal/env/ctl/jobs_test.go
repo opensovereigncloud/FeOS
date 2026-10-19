@@ -4,16 +4,19 @@
 package ctl
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
@@ -321,6 +324,117 @@ func TestReleaseJobWaitKeepsItsTime(t *testing.T) {
 	if err := n1.Script().ExitContainer(own, "main", 0); err != nil {
 		t.Fatal(err)
 	}
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 30*time.Second)
+}
+
+// rollingSince waits for release n to roll and returns its start.
+func rollingSince(t *testing.T, h *harness, envID uuid.UUID, n int) time.Time {
+	t.Helper()
+	var started time.Time
+	eventually(t, 10*time.Second, fmt.Sprintf("release %d rolling", n), func() bool {
+		rel := h.release(envID, n)
+		started = rel.StartedAt
+		return rel.State == model.ReleaseRolling && !started.IsZero()
+	})
+	return started
+}
+
+// webAndMigrate is a spec with a service web (its rollout budget, more
+// fields in extra) and a release job migrate of command (its timeout
+// 15 s).
+func webAndMigrate(command, version, rollout, extra string) string {
+	return fmt.Sprintf(`{"jobs":{"migrate":{"image":%q,"command":["/app","migrate",%q],"timeout":"15s"}},
+		"services":{"web":{"image":%q,"command":["/app"],"env":{"VERSION":%q},"rollout":{"timeout":%q}%s}}}`,
+		testImage, command, testImage, version, rollout, extra)
+}
+
+// The time a release waited for another release's run of its job moves
+// the start its services' rollout budgets count from (§13.7), also once
+// the job is done: a service whose budget passed during the wait still
+// rolls after the release's own run, and after a run under the same
+// template that served the release.
+func TestReleaseJobWaitShiftsTheRolloutBudget(t *testing.T) {
+	h := newHarness(t, options{timings: func(t *timings) { t.releaseDeadline = time.Second }})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	failed := func(n int) func() bool {
+		return func() bool { return h.release(env.ID, n).State == model.ReleaseFailed }
+	}
+	h.apply(env.ID, webAndMigrate("v1", "1", "10s", ""))
+	first := runningJob(t, h, env.ID)
+	// A changed job: release 1's run ends 9 s into release 2, whose own
+	// run then succeeds at once, near web's 10 s from release 2's start.
+	r2 := h.apply(env.ID, webAndMigrate("v2", "2", "10s", ""))
+	started := rollingSince(t, h, env.ID, r2)
+	time.Sleep(time.Until(started.Add(9 * time.Second)))
+	if err := n1.Script().ExitContainer(first, "main", 1); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 10*time.Second, "release 2's own run", func() bool {
+		r, err := h.st.LatestJobRun(bg, env.ID, "migrate")
+		return err == nil && r.Release == r2 && r.Phase == model.RunRunning
+	})
+	finishRun(t, h, n1, env.ID, 0)
+	never(t, 3*time.Second, "release 2 failed right after its own run", failed(r2))
+	h.waitRelease(env.ID, r2, model.ReleaseRealised, 30*time.Second)
+
+	// The same template: release 3's run succeeds 11 s into release 4,
+	// past web's 10 s from release 4's start, and serves it.
+	r3 := h.apply(env.ID, webAndMigrate("v3", "3", "10s", ""))
+	eventually(t, 10*time.Second, "release 3's run", func() bool {
+		r, err := h.st.LatestJobRun(bg, env.ID, "migrate")
+		return err == nil && r.Release == r3 && r.Phase == model.RunRunning
+	})
+	third := runningJob(t, h, env.ID)
+	r4 := h.apply(env.ID, webAndMigrate("v3", "4", "10s", ""))
+	started = rollingSince(t, h, env.ID, r4)
+	time.Sleep(time.Until(started.Add(11 * time.Second)))
+	if err := n1.Script().ExitContainer(third, "main", 0); err != nil {
+		t.Fatal(err)
+	}
+	never(t, 3*time.Second, "release 4 failed once release 3's run served it", failed(r4))
+	h.waitRelease(env.ID, r4, model.ReleaseRealised, 30*time.Second)
+	if r, err := h.st.LatestJobRun(bg, env.ID, "migrate"); err != nil || r.Release != r3 {
+		t.Fatalf("release 4 ran its job again: %+v %v", r, err)
+	}
+}
+
+// The release's deadline counts from the same moved start, also once its
+// jobs are done: a service that is slow to become ready after the wait
+// rolls on past the deadline as counted from the release's own start.
+func TestReleaseJobWaitShiftsTheDeadline(t *testing.T) {
+	h := newHarness(t, options{timings: func(t *timings) { t.releaseDeadline = time.Second }})
+	n1 := h.addNode("n1")
+	var code atomic.Int32
+	code.Store(1)
+	n1.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+		if len(req.Command) > 0 && req.Command[0] == "check" {
+			return code.Load(), true, nil
+		}
+		return 0, false, nil
+	})
+	env := h.newEnv("stage")
+	// Web's budget and the job's timeout are 15 s, and so the deadline.
+	const check = `,"readiness":{"exec":{"command":["check"]},"period":"1s"}`
+	h.apply(env.ID, webAndMigrate("v1", "1", "15s", check))
+	first := runningJob(t, h, env.ID)
+	r2 := h.apply(env.ID, webAndMigrate("v2", "2", "15s", check))
+	started := rollingSince(t, h, env.ID, r2)
+	time.Sleep(time.Until(started.Add(9 * time.Second)))
+	if err := n1.Script().ExitContainer(first, "main", 1); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 10*time.Second, "release 2's own run", func() bool {
+		r, err := h.st.LatestJobRun(bg, env.ID, "migrate")
+		return err == nil && r.Release == r2 && r.Phase == model.RunRunning
+	})
+	finishRun(t, h, n1, env.ID, 0)
+	// Web's check passes 20 s into release 2: past the 15 s from its own
+	// start, within the 15 s from the end of its 9 s wait.
+	never(t, time.Until(started.Add(20*time.Second)), "release 2 failed past its unmoved deadline", func() bool {
+		return h.release(env.ID, r2).State == model.ReleaseFailed
+	})
+	code.Store(0)
 	h.waitRelease(env.ID, r2, model.ReleaseRealised, 30*time.Second)
 }
 

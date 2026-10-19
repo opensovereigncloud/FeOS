@@ -69,7 +69,7 @@ CREATE TABLE env_secrets (                     -- one version of a secret, seale
 ALTER TABLE sandboxes
   ADD COLUMN environment_id uuid REFERENCES environments(id),   -- an instance of the environment; fixed
   ADD COLUMN pod_template jsonb,               -- model.PodTemplate; NULL: the sandbox's own pod; fixed
-  ADD COLUMN pin_node text NOT NULL DEFAULT '',   -- create and start go only to this node; '': any
+  ADD COLUMN pin_node text NOT NULL DEFAULT '',   -- a create goes only to this node; '': any
   ADD COLUMN idle_after_s integer CHECK (idle_after_s >= 0),     -- NULL: --idle-pause; 0: never
   ADD COLUMN address text NOT NULL DEFAULT ''; -- the pod's IPv6 as last observed; '': none
 CREATE INDEX sandboxes_environment ON sandboxes(environment_id) WHERE environment_id IS NOT NULL;

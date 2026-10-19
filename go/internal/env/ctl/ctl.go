@@ -48,6 +48,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
+	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
@@ -352,6 +353,12 @@ func steady(sb store.Sandbox) bool {
 // that run, so nothing else resets it.
 func live(r store.EnvInstanceRow, idles bool) bool {
 	return r.Instance.Phase == model.PhaseReady && liveRow(r.Sandbox, idles)
+}
+
+// Live reports whether an instance of the image service svc counts as
+// ready, by the controller's rule (live): what the status counts.
+func Live(r store.EnvInstanceRow, svc spec.Service) bool {
+	return live(r, idleOf(svc) > 0)
 }
 
 // liveRow is the row's half of live.

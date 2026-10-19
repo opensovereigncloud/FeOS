@@ -543,3 +543,51 @@ func TestExecEnvironment(t *testing.T) {
 		t.Fatalf("environment %v", env)
 	}
 }
+
+// A container log's tail is bounded as the guest's: at most 10000 lines
+// and 4 MiB from the log's end, each line with its newline; a line that
+// starts further back keeps its last whole 64 KiB parts within the bytes,
+// or goes when not one fits.
+func TestTailOf(t *testing.T) {
+	lines := make([]string, 12000)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("%05d", i)
+	}
+	if got := tailOf(lines, 20000); len(got) != maxTailLines || got[0] != "02000" || got[len(got)-1] != "11999" {
+		t.Errorf("a tail of more lines than the cap: %d lines, %q … %q", len(got), got[0], got[len(got)-1])
+	}
+	if got := tailOf(lines, 2); !slices.Equal(got, []string{"11998", "11999"}) {
+		t.Errorf("a tail of 2: %q", got)
+	}
+
+	// Lines of 100 KiB: the last 40 lie within 4 MiB with their newlines;
+	// the 98264 bytes left hold one whole 64 KiB part of the one before.
+	big := make([]string, 50)
+	for i := range big {
+		big[i] = fmt.Sprintf("%02d", i) + strings.Repeat("x", 100<<10-2)
+	}
+	got := tailOf(big, 100)
+	if len(got) != 41 || got[0] != big[9][len(big[9])-maxLinePart:] || got[1] != big[10] || got[40] != big[49] {
+		t.Fatalf("a tail of long lines: %d lines", len(got))
+	}
+	total := 0
+	for _, l := range got {
+		total += len(l) + 1
+	}
+	if total > maxTailBytes {
+		t.Errorf("the tail holds %d bytes", total)
+	}
+	if got := tailOf(big, 3); len(got) != 3 || got[0] != big[47] {
+		t.Errorf("a tail of 3 long lines: %d lines", len(got))
+	}
+	// A line longer than the bytes keeps its last whole parts within them;
+	// one whose part within them is shorter than a part goes.
+	huge := strings.Repeat("y", 5<<20)
+	if got := tailOf([]string{"a", huge}, 10); len(got) != 1 || len(got[0]) != 63*maxLinePart {
+		t.Errorf("a tail of a 5 MiB line: %d lines", len(got))
+	}
+	fill := strings.Repeat("z", maxTailBytes-100)
+	if got := tailOf([]string{huge, fill}, 10); len(got) != 1 || got[0] != fill {
+		t.Errorf("a line with less than a part within the bytes: %d lines", len(got))
+	}
+}

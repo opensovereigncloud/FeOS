@@ -111,11 +111,19 @@ not of an environment.
   services it runs and no ingress, so that it reaches their addons and
   image services and image pods never reach it. A sandbox created before
   cannot reach an addon.
-- An attached service uses its sandbox only while that sandbox is the
-  environment owner's, is no environment's pod and is the incarnation it
-  first used: a sandbox ID deleted and created again, by another tenant
-  or the same, is another sandbox, and the service fails rather than
-  start, route or reach there.
+- An attached service uses its sandbox while that sandbox exists, is the
+  environment owner's and is no environment's pod. The owner's sandbox
+  deleted and created again under the same ID, as FeCode replaces a lost
+  workspace sandbox, is a new incarnation, in which the service starts
+  anew, its restarts and checks counted from zero; a sandbox ID that
+  another tenant took is never the service's, and the service fails
+  rather than start, route or reach there.
+- A service that goes, removed, moved to another sandbox or with its
+  environment deleted, has its process stopped and its names taken out
+  of the sandbox's hosts file first, a sleeping sandbox woken for it; its
+  record goes or moves only then, or once the process is gone with its
+  sandbox for certain, so that no process runs on with the environment's
+  secrets.
 
 ### Every change is a release
 
@@ -178,7 +186,12 @@ not of an environment.
   the release one beyond them: the longest of its services' budgets, its
   release jobs' time with their retries, and 10 minutes, after which the
   release fails naming what it still waits for, so that a release that
-  waits for an addon or for capacity never rolls forever. While its latest
+  waits for an addon or for capacity never rolls forever. A job runs at
+  most once at a time in its environment, across releases: a release
+  waits for a run of the job that an older release or a person started,
+  never cancels it, and takes its success under the same template as
+  its own; the time it waited moves the start that its deadline and its
+  services' budgets count from. While its latest
   release has failed, the controller keeps the realised one running and
   healed, and never tries the failed one again. `ferund` writes no
   release of its own. Whether a failed rollout is reverted at once is a
@@ -192,6 +205,11 @@ not of an environment.
   recreated an addon has failed, the addon stays as that release has it,
   never recreated back onto older software. An addon that only a failed
   first release has keeps its data.
+- An addon whose pod a node that is up has lost is replaced on that
+  node, on its volume, when the node reports the volume free; one lost
+  with a node that is down or removed, or whose volume is missing there
+  or attached to another pod, is not replaced, its data being where it
+  cannot run, and its incident says what the node answered.
 - Until the guest supervises containers as ADR 0004 decides, `ferund`
   runs the readiness checks over the node's connection and restarts a
   service's or addon's exited container by restarting its pod, with a
@@ -200,8 +218,9 @@ not of an environment.
   environment: the object, the condition (a failed rollout, a crash loop,
   a failed job, no capacity, an addon that cannot run on its data, a
   volume that cannot attach), and the evidence `ferund` has: the pod's
-  last exits and restarts, its log tail, the placement's verdict, what
-  the release waited for, the release diff since the last realised one.
+  last exits and restarts, its log tail, redacted of the environment's
+  secrets and bounded in size, the placement's verdict, what the release
+  waited for, the release diff since the last realised one.
   An incident is opened once per object and release and closed when the
   condition clears. Incidents are the hook for whoever operates: a
   person, or FeCode's agent.
@@ -214,7 +233,10 @@ not of an environment.
   attached services run in (there with the sandbox's own attached
   services as loopback), and rewrites the block when an address changes
   or a pod it names retires. A service and an addon therefore do not
-  share a name.
+  share a name, and two environments whose attached services share a
+  sandbox share neither a name of its hosts file nor a port there. An
+  attached service reaches by name only the attached services of its
+  own sandbox.
 - Its security group, `env-<id>`, lets its members, the environment's
   pods and the sandboxes of its attached services, reach each other, and
   every pod the internet: an egress table of the global unicast blocks of
@@ -231,14 +253,20 @@ not of an environment.
   and the request goes on through the port door's machinery. The door
   takes only a **route token** of that environment, minted by its tenant
   and shown once, so that public traffic never travels with a tenant's
-  credential. FeCode serves an environment on a host of its own and
-  forwards to the door with the environment's token.
+  credential. The token travels in a header of its own,
+  `X-FeRun-Route-Token`, which stops at the door, so that the
+  application gets the client's `Authorization` as it was sent, unless
+  that holds a tenant's or a sandbox's token, which the door refuses
+  rather than pass on; a client that sends the route token as its bearer
+  token gets no `Authorization` through. FeCode serves an environment
+  on a host of its own and forwards to the door with the environment's
+  token in that header.
 
 ### An environment is copied from a release
 
-- `clone` makes a new environment from a release of another: the same
-  objects, with the values changed that the caller names, plan sizes,
-  replicas, hosts, or a spec of the caller's. Secrets are copied only
+- `clone` makes a new environment from a release of another: the
+  source release's objects, or a whole spec of the caller's, which is
+  how a copy gets other plan sizes or replicas. Secrets are copied only
   where each is named. Attached services are not copied: they run in a
   sandbox of the source. An addon's data comes along only when asked,
   from the addon's backup, and a volume's from its checkpoint (ADR 0016),
@@ -266,9 +294,10 @@ The decision was taken as proposed above; building it changed these:
   rows of a reconciler beside the sandboxes'; the pods carry no release
   label.
 - **Routes are realised for HTTP** by a route door of `ferund`'s front
-  door with route tokens, where the proposal left them to an ingress
-  outside this ADR and ADR 0015 keeps inbound traffic out of the front
-  doors: previews pass the port door already, and there is no ingress.
+  door with route tokens in a header of their own, where the proposal
+  left them to an ingress outside this ADR and ADR 0015 keeps inbound
+  traffic out of the front doors: previews pass the port door already,
+  and there is no ingress.
 - **An attached service is a supervised process** in the sandbox's main
   container, not a container added to the running pod: nothing is needed
   of the node or of ADR 0004 and ADR 0007.
@@ -283,12 +312,17 @@ The decision was taken as proposed above; building it changed these:
   release, not `FAILED_PRECONDITION`.
 - **Volume data identity** and the **failed-release fallback** for
   addons, and the **release deadline**, beyond the services' budgets.
+- **A job runs once at a time** in its environment, across releases,
+  where the proposal let any job run whenever asked.
+- **Clone takes a whole spec**, not values to change (plan sizes,
+  replicas): a caller that wants other values renders its own spec and
+  passes it, as FeCode does.
 - **Restarts and readiness run in `ferund`** until the guest supervises
   containers (ADR 0004 set that alternative aside; it stands as the
   interim).
 - **Credentials** reach pods as environment variables at start, are
   generated once and never rotated; secrets reach pods as environment
-  variables only.
+  variables only, and the log tails `ferund` keeps are redacted of both.
 - **Later**: MCP tools and grants for environments, an admin's listing,
   volumes for services and their mounts, data copied on a clone, addon
   backups and minor upgrades, a CLI, routes' hosts.
@@ -360,7 +394,11 @@ The decision was taken as proposed above; building it changed these:
   `feosd`'s record of the pod, `GetPod` and `ListPods`, the node's disk
   and hibernation checkpoints in the clear, and the NATS addon's
   password is in its server's arguments inside its pod. The database
-  holds no value. `feosd` sealing the pod record is the follow-up.
+  holds no value: the log tails it keeps are redacted of the
+  environment's secrets and addon credentials before they are stored, as
+  far as matching the values and their escaped form in a URL reaches,
+  while the logs `ferund` reads for a caller from a running pod are not.
+  `feosd` sealing the pod record is the follow-up.
 - This ADR relies on decisions it does not make: images from private
   registries (ADR 0001's open question; the sandboxes pull public images
   alone) and an ingress that realises routes for hosts, TLS and
@@ -378,14 +416,24 @@ The decision was taken as proposed above; building it changed these:
   `ferun.revertOf`. A caller that marks its reverts, FeCode's autoRevert,
   applies K's spec through the releases route instead; whether revert
   takes annotations of the caller's.
-- A service's budget counts from the release's start, so that a release
-  job that runs long eats into it while the release's deadline would
-  allow more; whether a service's budget starts when it may move.
+- A service's budget counts from the release's start (moved on only by
+  the time the release waited for another release's run of a job), so
+  that a release job of its own that runs long eats into it while the
+  release's deadline would allow more; whether a service's budget starts
+  when it may move.
 - Restarts and readiness in the guest, as ADR 0004 decides, and what
   `ferund` then keeps of them; attached services have no crash loop yet,
   and are routed by the port of the matched release, not their own.
 - `feosd` sealing the pod record (the known exposure), and rotating an
   addon's credentials, which today are never changed.
+- The logs answer is read from the pod and not redacted, while the
+  tails `ferund` keeps are, and only of the values as they are and as a
+  URL escapes them: whether the answer is redacted too, at the cost of
+  resolving the environment's secrets for every read, and how far
+  redaction should reach.
+- An addon without a volume (NATS without JetStream) that is lost is
+  never replaced, although no data ties it to a node: whether it is
+  recreated wherever it fits, as a service's lost replica is.
 - Volumes for services; data on a clone, from an addon's backup or a
   volume's checkpoint.
 - Tenancy: a FeRun tenant per FeCode project, for quotas and billing;

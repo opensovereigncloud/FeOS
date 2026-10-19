@@ -177,6 +177,13 @@ func TestStatus(t *testing.T) {
 
 	api0 := h.instance(e.ID, spec.KindService, "api", 0, 1, model.PhaseReady, model.StateRunning, "n1", "fd6b::11")
 	h.instance(e.ID, spec.KindService, "api", 1, 1, model.PhaseExited, model.StateRunning, "n2", "fd6b::12")
+	// Ready counts are of live instances: a ready phase on a row with an
+	// op in flight, or one out of touch, does not count; a paused replica
+	// of a service that idles (web) does.
+	pausing := h.instance(e.ID, spec.KindService, "api", 2, 1, model.PhaseReady, model.StateRunning, "n1", "fd6b::13")
+	h.exec(`UPDATE sandboxes SET op = 'pause', op_id = gen_random_uuid(), op_owner = 'i1',
+		op_deadline = now() + interval '1 minute' WHERE id = $1`, pausing)
+	h.instance(e.ID, spec.KindService, "api", 3, 1, model.PhaseReady, model.StateUnknown, "n2", "fd6b::14")
 	h.instance(e.ID, spec.KindService, "web", 0, 1, model.PhaseReady, model.StatePaused, "n1", "")
 	pg := h.instance(e.ID, spec.KindAddon, "pg", 0, 1, model.PhaseReady, model.StateRunning, "n1", "fd6b::5")
 	h.exec("UPDATE env_instances SET provisioned_hash = 'p', restarts = 2, last_exit = 1, ready_since = now() WHERE sandbox_id = $1", pg)
@@ -220,7 +227,7 @@ func TestStatus(t *testing.T) {
 		t.Fatalf("objects %v", names)
 	}
 	api := got.Objects[0]
-	if api.Runtime != spec.RuntimeImage || api.Desired != 2 || api.Ready != 1 || len(api.Instances) != 2 ||
+	if api.Runtime != spec.RuntimeImage || api.Desired != 2 || api.Ready != 1 || len(api.Instances) != 4 ||
 		api.Instances[0].ID != api0.String() || api.Instances[0].Node != "n1" || api.Instances[0].Address != "fd6b::11" ||
 		api.Instances[0].Detail != "" || api.Instances[1].Phase != model.PhaseExited {
 		t.Fatalf("api %+v", api)
@@ -230,7 +237,7 @@ func TestStatus(t *testing.T) {
 		dev.Detail != "cwd /workspace/app does not exist yet" {
 		t.Fatalf("dev %+v", dev)
 	}
-	if web := got.Objects[2]; web.Ready != 0 || web.Desired != 1 || web.Instances[0].State != model.StatePaused {
+	if web := got.Objects[2]; web.Ready != 1 || web.Desired != 1 || web.Instances[0].State != model.StatePaused {
 		t.Fatalf("web %+v", web)
 	}
 	pgo := got.Objects[3]
@@ -466,6 +473,40 @@ func TestRouteDoor(t *testing.T) {
 	wantPlain(t, withHeader(tenantTok, ""), 401, "route token required\n")
 	wantPlain(t, withHeader(tenantTok, "Bearer "+tok.Token), 401, "route token required\n")
 	wantPlain(t, withHeader("not-a-token", "Bearer "+tok.Token), 401, "route token required\n")
+	// Beside the header, the Authorization that would go on may hold no
+	// FeRun credential: a tenant's or a sandbox's token as its bearer is
+	// refused and nothing forwarded; any other passes, as above.
+	sandboxTok := "sandbox-token"
+	if _, err := h.st.CreateSandboxToken(ctx, store.HashToken(sandboxTok), sb, "s"); err != nil {
+		t.Fatal(err)
+	}
+	forwards := func() int {
+		h.ports.mu.Lock()
+		defer h.ports.mu.Unlock()
+		return len(h.ports.calls)
+	}
+	for _, authz := range []string{"Bearer " + tenantTok, "bearer " + tenantTok, "Bearer " + sandboxTok} {
+		before := forwards()
+		wantPlain(t, withHeader(tok.Token, authz), 401, "route token required\n")
+		if forwards() != before {
+			t.Fatalf("%.12s…: forwarded %+v", authz, h.ports.last(t))
+		}
+	}
+	if w := withHeader(tok.Token, "Bearer client-jwt"); w.Code != 200 || h.ports.last(t).authz != "Bearer client-jwt" {
+		t.Fatalf("a client's own bearer beside the header: %d %s", w.Code, w.Body)
+	}
+	// Nor in a second Authorization behind the client's own.
+	before := forwards()
+	r2 := httptest.NewRequest("GET", "/api/v1/environments/stage/http/api/me", nil)
+	r2.Header.Set(RouteTokenHeader, tok.Token)
+	r2.Header.Add("Authorization", "Bearer client-jwt")
+	r2.Header.Add("Authorization", "Bearer "+tenantTok)
+	w2 := httptest.NewRecorder()
+	mux.ServeHTTP(w2, r2)
+	wantPlain(t, w2, 401, "route token required\n")
+	if forwards() != before {
+		t.Fatalf("a second Authorization: forwarded %+v", h.ports.last(t))
+	}
 	// Segment-aware: /apix is the root's; the root does not strip; a
 	// paused instance is woken by the forward (scale from zero).
 	for _, c := range []struct{ path, up string }{
@@ -566,6 +607,15 @@ func TestRouteDoorFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The lookup of a bearer token beside the route token header.
+	h.exec(`ALTER TABLE tenant_tokens RENAME TO tenant_tokens_away`)
+	r := httptest.NewRequest("GET", "/api/v1/environments/stage/http/api/x", nil)
+	r.Header.Set(RouteTokenHeader, tok.Token)
+	r.Header.Set("Authorization", "Bearer client-jwt")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	wantPlain(t, w, 500, "the route door failed\n")
+	h.exec(`ALTER TABLE tenant_tokens_away RENAME TO tenant_tokens`)
 	// A stored spec that does not parse.
 	h.exec(`UPDATE env_releases SET spec = '{"services": 5}' WHERE env_id = $1`, h.env("stage").ID)
 	wantPlain(t, routeRequest(mux, "GET", "/api/v1/environments/stage/http/api/x", tok.Token), 500,

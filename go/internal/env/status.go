@@ -10,6 +10,7 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/ironcore-dev/feos/go/internal/env/ctl"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/store"
@@ -76,7 +77,8 @@ func (s *Service) status(ctx context.Context, e store.Environment) (EnvStatus, e
 }
 
 // objectsOf are the objects of a target spec: services, addons and jobs,
-// each by name.
+// each by name. An image service's ready count is of its live instances,
+// as the controller counts them (ctl.Live).
 func objectsOf(sp *spec.Spec, instances []store.EnvInstanceRow, attached []store.EnvAttached,
 	runs []store.EnvJobRun) []ObjectStatus {
 	byObject := map[string][]store.EnvInstanceRow{}
@@ -110,7 +112,7 @@ func objectsOf(sp *spec.Spec, instances []store.EnvInstanceRow, attached []store
 			o.Desired = *svc.Replicas
 		}
 		for _, row := range byObject[spec.KindService+"/"+name] {
-			if row.Instance.Phase == model.PhaseReady && row.Sandbox.ClientState == model.StateRunning {
+			if ctl.Live(row, svc) {
 				o.Ready++
 			}
 			o.Instances = append(o.Instances, instanceStatus(row))

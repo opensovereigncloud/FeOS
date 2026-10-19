@@ -57,14 +57,42 @@ func bearer(r *http.Request) string {
 }
 
 // routeToken is a request's route token and the headers that carried
-// it, which stop at the door: RouteTokenHeader's when it is set (the
-// client's Authorization then goes on to the upstream), else
+// it, which stop at the door: RouteTokenHeader's when it is set (header:
+// the client's Authorization then goes on to the upstream), else
 // Authorization's bearer token (old clients; Authorization stops).
-func routeToken(r *http.Request) (string, []string) {
+func routeToken(r *http.Request) (tok string, creds []string, header bool) {
 	if tok := strings.TrimSpace(r.Header.Get(RouteTokenHeader)); tok != "" {
-		return tok, []string{RouteTokenHeader}
+		return tok, []string{RouteTokenHeader}, true
 	}
-	return bearer(r), []string{"Authorization", RouteTokenHeader}
+	return bearer(r), []string{"Authorization", RouteTokenHeader}, false
+}
+
+// ferunBearer reports whether a request's Authorization, any of its
+// values, carries a FeRun credential as its bearer token, a tenant's
+// token or a sandbox's (the scheme in any case): one the door refuses to
+// pass on to an upstream.
+func (s *Service) ferunBearer(ctx context.Context, r *http.Request) (bool, error) {
+	for _, v := range r.Header.Values("Authorization") {
+		scheme, tok, _ := strings.Cut(strings.TrimSpace(v), " ")
+		tok = strings.TrimSpace(tok)
+		if !strings.EqualFold(scheme, "Bearer") || tok == "" {
+			continue
+		}
+		hash := store.HashToken(tok)
+		switch _, err := s.st.ResolveTenantToken(ctx, hash); {
+		case err == nil:
+			return true, nil
+		case !errors.Is(err, model.ErrUnknownToken):
+			return false, err
+		}
+		switch _, _, err := s.st.ResolveSandboxToken(ctx, hash); {
+		case err == nil:
+			return true, nil
+		case !errors.Is(err, model.ErrUnknownToken):
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 // routePath is the path the route door forwards: the request's path
@@ -192,7 +220,9 @@ func rawOf(path, raw string) string {
 // route token of the environment in X-FeRun-Route-Token, else as Bearer
 // (401 "route token required"; a tenant token is refused the same way),
 // which stops here (from X-FeRun-Route-Token, the client's Authorization
-// goes on to the upstream), the longest segment-aware
+// goes on to the upstream, unless its bearer token is a tenant's or a
+// sandbox's: 401 the same way, and nothing is forwarded), the longest
+// segment-aware
 // prefix match over the routes of the realised release (the latest when
 // none is), and the request forwarded through the port door to a ready
 // instance of the route's service, round-robin, or, when none is ready,
@@ -207,7 +237,7 @@ func rawOf(path, raw string) string {
 // and answered 500 "the route door failed", without its cause.
 func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tok, creds := routeToken(r)
+	tok, creds, header := routeToken(r)
 	if tok == "" {
 		http.Error(w, textRouteToken, http.StatusUnauthorized)
 		return
@@ -221,6 +251,18 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.routeFailed(w, r, err)
 		return
+	}
+	// The Authorization that goes on may hold no FeRun credential.
+	if header {
+		refused, err := s.ferunBearer(ctx, r)
+		if err != nil {
+			s.routeFailed(w, r, err)
+			return
+		}
+		if refused {
+			http.Error(w, textRouteToken, http.StatusUnauthorized)
+			return
+		}
 	}
 	e, err := s.st.GetEnvironment(ctx, rt.EnvID)
 	if errors.Is(err, store.ErrNoRow) {

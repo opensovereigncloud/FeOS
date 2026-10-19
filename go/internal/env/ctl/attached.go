@@ -41,11 +41,12 @@ func (c *Controller) stepAttached(ctx context.Context, s *stepState) {
 		if runtimeOf(svc) != spec.RuntimeAttached {
 			continue
 		}
-		if c.stepOneAttached(ctx, s, name, svc) || !rolling(v) || v.latest.StartedAt.IsZero() {
+		if c.stepOneAttached(ctx, s, name, svc) || !rolling(v) {
 			continue
 		}
+		start, ok := s.start()
 		budget := duration("", spec.DefaultRolloutTimeout)
-		if !v.now.After(v.latest.StartedAt.Add(budget)) {
+		if !ok || !v.now.After(start.Add(budget)) {
 			continue
 		}
 		reason := fmt.Sprintf("attached service %s did not become ready within %s", name, budget)

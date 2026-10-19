@@ -210,17 +210,47 @@ A ferund on one machine, with a test node:
 
     ferund init-ca --root-dir /tmp/ferun/root --dir /tmp/ferun/ca \
         --dns-domain feos.test
+    head -c 32 /dev/urandom > /tmp/ferun/secret.key
     ferund serve --database-url "$DB" --ca-dir /tmp/ferun/ca \
-        --admin-users admin:admin --bootstrap-token "$TOKEN"
+        --admin-users admin:admin --bootstrap-token "$TOKEN" \
+        --secret-key-file /tmp/ferun/secret.key
     ferund join-token --database-url "$DB" --ca-dir /tmp/ferun/ca
     ferun-testnode --join-token feos-join-... --addr 127.0.0.1:7443 \
         --server-name ferun.feos.test
 
+Without `--secret-key-file` the sandboxes run, but an environment with
+an addon or a secret stays rolling ("secrets need --secret-key-file").
 The test node fails a pod whose security groups it does not have, as
 feosd does (`--check-security-groups`, on by default), and with
 `--fake-exec` answers every exec into a pod with exit 0 without running
 anything (an exec into an environment's pod does so by default, so that
 addon probes and provisioning pass).
+
+An environment runs end to end on test nodes with these flags beside
+the join's:
+
+    ferun-testnode ... --fake-exec --fake-processes \
+        --exit 'job/*=0@3s' --start-log \
+        --port-addr 8080=127.0.0.1:18080
+
+- `--fake-processes` answers the background-process scripts in memory,
+  without running anything (`process_start`, and an attached service's
+  start, listing, logs and stop); without it attached services never
+  start.
+- `--exit '<object glob>=<code>[@<delay>]'`, repeatable, makes the main
+  container of an environment's pod whose `ferun.object` label matches
+  exit with that code so long after each boot (2 s by default; a
+  negative code: no exit status), the first match counting: with
+  `job/*=0@3s` release jobs finish and a release can be realised,
+  `service/crasher=1` crash-loops a service, `process/<name>` ends a
+  fake process.
+- `--start-log` appends a line to a container's log at each boot and
+  each such exit, so that logs and stored tails have lines.
+- `--port-addr <port>=<host:port>`, repeatable, makes a port forward to
+  a pod's port dial that address: readiness checks and the route door
+  reach a server on the machine, here one on 18080 for the pods' 8080.
+- `kill -USR1` logs the node's pods, volumes and security groups as one
+  JSON line, `kill -HUP` restarts it gracefully.
 
 Go code follows the rules of the Rust code where they apply, and these:
 
