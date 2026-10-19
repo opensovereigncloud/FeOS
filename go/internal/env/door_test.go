@@ -177,6 +177,13 @@ func TestStatus(t *testing.T) {
 
 	api0 := h.instance(e.ID, spec.KindService, "api", 0, 1, model.PhaseReady, model.StateRunning, "n1", "fd6b::11")
 	h.instance(e.ID, spec.KindService, "api", 1, 1, model.PhaseExited, model.StateRunning, "n2", "fd6b::12")
+	// Ready counts are of live instances: a ready phase on a row with an
+	// op in flight, or one out of touch, does not count; a paused replica
+	// of a service that idles (web) does.
+	pausing := h.instance(e.ID, spec.KindService, "api", 2, 1, model.PhaseReady, model.StateRunning, "n1", "fd6b::13")
+	h.exec(`UPDATE sandboxes SET op = 'pause', op_id = gen_random_uuid(), op_owner = 'i1',
+		op_deadline = now() + interval '1 minute' WHERE id = $1`, pausing)
+	h.instance(e.ID, spec.KindService, "api", 3, 1, model.PhaseReady, model.StateUnknown, "n2", "fd6b::14")
 	h.instance(e.ID, spec.KindService, "web", 0, 1, model.PhaseReady, model.StatePaused, "n1", "")
 	pg := h.instance(e.ID, spec.KindAddon, "pg", 0, 1, model.PhaseReady, model.StateRunning, "n1", "fd6b::5")
 	h.exec("UPDATE env_instances SET provisioned_hash = 'p', restarts = 2, last_exit = 1, ready_since = now() WHERE sandbox_id = $1", pg)
@@ -220,7 +227,7 @@ func TestStatus(t *testing.T) {
 		t.Fatalf("objects %v", names)
 	}
 	api := got.Objects[0]
-	if api.Runtime != spec.RuntimeImage || api.Desired != 2 || api.Ready != 1 || len(api.Instances) != 2 ||
+	if api.Runtime != spec.RuntimeImage || api.Desired != 2 || api.Ready != 1 || len(api.Instances) != 4 ||
 		api.Instances[0].ID != api0.String() || api.Instances[0].Node != "n1" || api.Instances[0].Address != "fd6b::11" ||
 		api.Instances[0].Detail != "" || api.Instances[1].Phase != model.PhaseExited {
 		t.Fatalf("api %+v", api)
@@ -230,7 +237,7 @@ func TestStatus(t *testing.T) {
 		dev.Detail != "cwd /workspace/app does not exist yet" {
 		t.Fatalf("dev %+v", dev)
 	}
-	if web := got.Objects[2]; web.Ready != 0 || web.Desired != 1 || web.Instances[0].State != model.StatePaused {
+	if web := got.Objects[2]; web.Ready != 1 || web.Desired != 1 || web.Instances[0].State != model.StatePaused {
 		t.Fatalf("web %+v", web)
 	}
 	pgo := got.Objects[3]

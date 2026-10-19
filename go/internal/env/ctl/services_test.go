@@ -405,6 +405,38 @@ func TestRolloutCountsLiveInstances(t *testing.T) {
 	}
 }
 
+// RestartService waits for a restarted replica to be live before the
+// next, as a rollout counts (§13.7): a ready phase on a row that does not
+// run counts only for a service that idles, and then only while the row
+// is paused or hibernated without an op.
+func TestRestartWaitsForALiveReplica(t *testing.T) {
+	h := newHarness(t, options{timings: func(t *timings) { t.restartReady = 300 * time.Millisecond }})
+	// An environment without a release, whose rows the controller leaves.
+	env := h.newEnv("stage")
+	id := uuid.New()
+	idle := 0
+	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: testTenant, Image: testImage, VCPUs: 1,
+		MemoryMiB: 512, EnvironmentID: env.ID, PodTemplate: &model.PodTemplate{
+			SecurityGroups: []string{model.EnvGroupID(env.ID)}}, IdleAfterS: &idle}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.st.InsertEnvInstance(bg, store.EnvInstance{SandboxID: id, EnvID: env.ID, Kind: spec.KindService,
+		Object: "web", TemplateHash: "h", Release: 1, Phase: model.PhaseReady}); err != nil {
+		t.Fatal(err)
+	}
+	h.exec(`UPDATE sandboxes SET client_state = 'hibernated' WHERE id = $1`, id)
+	if h.c.waitReady(bg, id, false) {
+		t.Error("a hibernated replica of a service that does not idle counted as ready")
+	}
+	if !h.c.waitReady(bg, id, true) {
+		t.Error("a hibernated replica of a service that idles did not count as ready")
+	}
+	h.exec(`UPDATE sandboxes SET client_state = 'unknown' WHERE id = $1`, id)
+	if h.c.waitReady(bg, id, true) {
+		t.Error("an unknown replica counted as ready")
+	}
+}
+
 // An unknown row is ensured only when its service does not idle (§13.7):
 // an idle service's replica may be paused in truth, and the engine finds
 // out without waking it; another service's unknown replica comes back

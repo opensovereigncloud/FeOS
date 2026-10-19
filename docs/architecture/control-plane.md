@@ -1327,9 +1327,11 @@ and its row runs without an op; for a service that idles, a paused or
 hibernated row without an op counts too, so that an idle service still
 realises. A `ready` phase left from a pod that is unknown, stopped,
 failed or lost does not count: the probes look only at rows that run, so
-nothing else resets it. Liveness decides the services' ready counts and
-their rollouts, an addon's readiness, which the release jobs and the
-services wait for, the hosts blocks, and when a crash loop closes. Then:
+nothing else resets it. Liveness decides the services' ready counts (the
+status shows the same) and their rollouts, how long a restart of a
+service waits for each replica before the next, an addon's readiness,
+which the release jobs and the services wait for, the hosts blocks, and
+when a crash loop closes. Then:
 
 1. **Addons**, each by its blueprint ([Addons](#addons)):
    - Credentials: system secrets `addon.<addon>.<key>`, 32 hex
@@ -1767,8 +1769,8 @@ each blueprint against its image in docker, as FeOS would start it.
 
 `GET /api/v1/environments/{env}` answers the environment, its rollout
 (the latest release's state, start and reason), its objects as the
-target release has them (an image service with desired and ready counts
-and its instances, an addon with type, version, plan, phase and
+target release has them (an image service with desired and ready counts,
+the ready ones its live instances, and its instances, an addon with type, version, plan, phase and
 `provisioned`, a job with its last run, an attached service with its
 sandbox, phase, restarts and last exit; `starting` before an object has
 an instance), its routes (of the realised release, else the latest) and
@@ -1800,7 +1802,7 @@ name; one the tenant does not have is 404 "no such environment".
 | `GET …/{env}/secrets`, `PUT`, `DELETE …/secrets/{name}` | the names with their latest versions; `{name, version}`; 204, 409 while pinned |
 | `GET …/{env}/incidents[?open=1]`, `…/incidents/{id}` | newest first; one |
 | `GET …/{env}/objects/{kind}/{name}/logs?lines=200&replica=0` | `{lines, source}`, the source `container` or `process`; 501; 409 "paused", `not_running` (also for a replica without an instance yet, or none at all); 404 for a replica beyond the object's ([Logs](#probes-exits-and-restarts)) |
-| `POST …/{env}/services/{name}/restart` | 202: an image service's replicas one at a time, each waited for up to 5 minutes, or an attached service's process |
+| `POST …/{env}/services/{name}/restart` | 202: an image service's replicas one at a time, each waited for until it is live again, up to 5 minutes, or an attached service's process |
 | `POST …/{env}/jobs/{name}/run` | 202; 409 `busy` "job X runs already (release N, attempt M)" with `Retry-After: 30` while a run of the job runs, of any release; 409 `not_ready` |
 | `POST`, `DELETE …/{env}/route-tokens` | 201 `{token}`; 204 |
 | `ANY …/{env}/http/{path...}` | the route door |

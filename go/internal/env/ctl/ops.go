@@ -192,7 +192,9 @@ func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name s
 		ids[i] = r.Sandbox.ID
 	}
 	// The first restart begins now; the others follow one at a time, each
-	// once the one before is ready again.
+	// once the one before is ready again, by the rule the rollouts count
+	// with (live).
+	idles := idleOf(svc) > 0
 	if err := c.restartReplica(ctx, ids[0]); err != nil {
 		return err
 	}
@@ -200,7 +202,7 @@ func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name s
 	go func() {
 		defer c.wg.Done()
 		for i := 1; i < len(ids); i++ {
-			if !c.waitReady(c.bg, ids[i-1]) {
+			if !c.waitReady(c.bg, ids[i-1], idles) {
 				return
 			}
 			if err := c.restartReplica(c.bg, ids[i]); err != nil && c.bg.Err() == nil {
@@ -272,9 +274,11 @@ func (c *Controller) unrestart(ctx context.Context, before store.EnvInstance) {
 	}
 }
 
-// waitReady waits until an instance is ready again (true), or gone, or
-// restartReady passed (false).
-func (c *Controller) waitReady(ctx context.Context, id uuid.UUID) bool {
+// waitReady waits until an instance is live again (true: its phase ready
+// and its row running without an op, or for a service that idles, idles,
+// paused or hibernated without one), or gone, or restartReady passed
+// (false).
+func (c *Controller) waitReady(ctx context.Context, id uuid.UUID, idles bool) bool {
 	deadline := time.Now().Add(c.t.restartReady)
 	for time.Now().Before(deadline) {
 		inst, err := c.st.GetEnvInstance(ctx, id)
@@ -282,7 +286,13 @@ func (c *Controller) waitReady(ctx context.Context, id uuid.UUID) bool {
 			return false
 		}
 		if inst.Phase == model.PhaseReady {
-			return true
+			sb, err := c.st.GetSandbox(ctx, id)
+			if err != nil {
+				return false
+			}
+			if live(store.EnvInstanceRow{Instance: inst, Sandbox: sb}, idles) {
+				return true
+			}
 		}
 		select {
 		case <-ctx.Done():
