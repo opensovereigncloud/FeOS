@@ -60,6 +60,9 @@ describe('tones', () => {
 describe('objects', () => {
   it('sum up per kind', () => {
     expect(objectSummary(obj(STAGE, 'service', 'expense-service'))).toBe('image · 1 / 2 ready');
+    const idle = { kind: 'service', runtime: 'image', desired: 2, ready: 0,
+      instances: [{ phase: 'ready', state: 'paused' }, { phase: 'ready', state: 'hibernated' }] };
+    expect(objectSummary(idle)).toBe('image · 0 / 2 ready · 2 idle, woken by a request');
     expect(objectSummary(obj(PREVIEW, 'service', 'web'))).toBe('attached · starting');
     expect(objectSummary(obj(STAGE, 'addon', 'postgres'))).toBe('postgres 17 · plan small · provisioned');
     expect(objectSummary({ ...obj(STAGE, 'addon', 'nats'), provisioned: false })).toBe('nats 2 · plan small · not provisioned');
