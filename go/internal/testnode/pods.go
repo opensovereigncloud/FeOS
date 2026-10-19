@@ -266,6 +266,16 @@ func normalize(in *podv1.PodSpec) (*podv1.PodSpec, error) {
 		}
 		groups[g] = true
 	}
+	tables := map[string]bool{}
+	for _, t := range spec.GetNetwork().GetNameTables() {
+		if !validGroupID(t) {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid name table ID %q: 1 to 64 letters, digits, \"-\", \"_\" and \".\"", t)
+		}
+		if tables[t] {
+			return nil, status.Errorf(codes.InvalidArgument, "name table %s is named twice", t)
+		}
+		tables[t] = true
+	}
 	for _, c := range spec.Containers {
 		paths := map[string]bool{}
 		for _, m := range c.VolumeMounts {
@@ -486,8 +496,12 @@ func (p *podService) bringUpPod(ctx context.Context, id string, pd *pod) {
 	if failed == nil {
 		p.mu.Lock()
 		groups := pd.info.GetSpec().GetNetwork().GetSecurityGroups()
+		tables := pd.info.GetSpec().GetNetwork().GetNameTables()
 		p.mu.Unlock()
 		failed = p.n.groups.attachError(groups)
+		if failed == nil {
+			failed = p.n.names.attachError(tables)
+		}
 	}
 	// What the boot schedules runs once p.mu is released.
 	var scheduled func()
@@ -1234,7 +1248,11 @@ func (p *podService) restore(ctx context.Context, id, headKey string, cold bool)
 	}
 	reason := whyCold(cold, c.memory, p.n.script.unrestorableReason())
 	if reason == "" {
-		if err := p.n.groups.attachError(info.GetSpec().GetNetwork().GetSecurityGroups()); err != nil {
+		err := p.n.groups.attachError(info.GetSpec().GetNetwork().GetSecurityGroups())
+		if err == nil {
+			err = p.n.names.attachError(info.GetSpec().GetNetwork().GetNameTables())
+		}
+		if err != nil {
 			p.setState(id, podv1.PodState_POD_STATE_FAILED, err.Error())
 			return nil, status.Error(codes.FailedPrecondition, err.Error())
 		}
@@ -1533,6 +1551,19 @@ func (p *podService) forget(uid uuid.UUID) error {
 	p.n.volumes.release(pd.info.PodId)
 	p.n.procs.deleted(pd.info.PodId)
 	return nil
+}
+
+// namesTable reports whether a pod on the node, in any state, names the
+// name table id.
+func (p *podService) namesTable(id string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, pd := range p.pods {
+		if slices.Contains(pd.info.GetSpec().GetNetwork().GetNameTables(), id) {
+			return true
+		}
+	}
+	return false
 }
 
 // namesGroup reports whether a pod on the node, in any state, names the

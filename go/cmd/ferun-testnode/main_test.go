@@ -33,12 +33,15 @@ func TestParse(t *testing.T) {
 	if !cfg.Mesh || cfg.MeshEndpoint != "10.0.0.9:51820" {
 		t.Fatalf("mesh %v %q", cfg.Mesh, cfg.MeshEndpoint)
 	}
-	if cfg.FakeExec || !cfg.CheckSecurityGroups {
-		t.Fatalf("fake exec %v, security groups checked %v", cfg.FakeExec, cfg.CheckSecurityGroups)
+	if cfg.FakeExec || !cfg.CheckSecurityGroups || !cfg.CheckNameTables || cfg.NoNameService {
+		t.Fatalf("fake exec %v, security groups checked %v, name tables checked %v, no name service %v", cfg.FakeExec,
+			cfg.CheckSecurityGroups, cfg.CheckNameTables, cfg.NoNameService)
 	}
-	cfg, _, err = parse([]string{"--fake-exec", "--check-security-groups=false"}, func(k string) string { return env[k] })
-	if err != nil || !cfg.FakeExec || cfg.CheckSecurityGroups {
-		t.Fatalf("fake exec %v, security groups checked %v, %v", cfg.FakeExec, cfg.CheckSecurityGroups, err)
+	cfg, _, err = parse([]string{"--fake-exec", "--check-security-groups=false", "--check-name-tables=false",
+		"--no-name-service"}, func(k string) string { return env[k] })
+	if err != nil || !cfg.FakeExec || cfg.CheckSecurityGroups || cfg.CheckNameTables || !cfg.NoNameService {
+		t.Fatalf("fake exec %v, security groups checked %v, name tables checked %v, no name service %v, %v", cfg.FakeExec,
+			cfg.CheckSecurityGroups, cfg.CheckNameTables, cfg.NoNameService, err)
 	}
 	cfg, _, err = parse(nil, func(k string) string {
 		if k == "FERUN_TESTNODE_FAKE_EXEC" {
@@ -149,27 +152,31 @@ func TestEnvironmentFlags(t *testing.T) {
 	}
 }
 
-// SIGUSR1's summary names each pod's object, groups and volumes, each
-// volume's holder and each group's version and members.
+// SIGUSR1's summary names each pod's object, groups, name tables and
+// volumes, each volume's holder, each group's version and members and
+// each name table's version and names.
 func TestSummary(t *testing.T) {
 	pods := []*podv1.PodInfo{{PodId: "p1", State: podv1.PodState_POD_STATE_RUNNING, Spec: &podv1.PodSpec{
 		Labels:  map[string]string{"ferun.object": "addon/postgres"},
-		Network: &podv1.PodNetwork{SecurityGroups: []string{"env-1"}},
+		Network: &podv1.PodNetwork{SecurityGroups: []string{"env-1"}, NameTables: []string{"env-1"}},
 		Volumes: []*podv1.PodVolume{{Name: "data", VolumeId: "v1"}},
 	}}}
 	vols := []*volumev1.Volume{{VolumeId: "v1", State: volumev1.VolumeState_VOLUME_STATE_ATTACHED, PodId: "p1", Labels: map[string]string{"ferun.object": "addon/postgres"}}}
 	groups := []*networkv1.SecurityGroup{{Id: "env-1", Version: 3, Members: []string{"fd00::2"}, Rules: []*networkv1.Rule{{}, {}}}}
-	b, err := json.Marshal(summary(pods, vols, groups))
+	tables := []*networkv1.NameTable{{Id: "env-1", Version: 7, Entries: []*networkv1.NameEntry{{Name: "db", Addresses: []string{"fd00::2"}}}}}
+	b, err := json.Marshal(summary(pods, vols, groups, tables))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `{"pods":[{"id":"p1","state":"RUNNING","object":"addon/postgres","groups":["env-1"],"volumes":["v1"]}],` +
+	want := `{"pods":[{"id":"p1","state":"RUNNING","object":"addon/postgres","groups":["env-1"],"nameTables":["env-1"],` +
+		`"volumes":["v1"]}],` +
 		`"volumes":[{"id":"v1","state":"ATTACHED","pod":"p1","object":"addon/postgres"}],` +
-		`"groups":[{"id":"env-1","version":3,"members":["fd00::2"],"rules":2}]}`
+		`"groups":[{"id":"env-1","version":3,"members":["fd00::2"],"rules":2}],` +
+		`"nameTables":[{"id":"env-1","version":7,"names":{"db":["fd00::2"]}}]}`
 	if string(b) != want {
 		t.Fatalf("summary %s", b)
 	}
-	if b, _ := json.Marshal(summary(nil, nil, nil)); string(b) != `{"pods":[],"volumes":[],"groups":[]}` {
+	if b, _ := json.Marshal(summary(nil, nil, nil, nil)); string(b) != `{"pods":[],"volumes":[],"groups":[],"nameTables":[]}` {
 		t.Fatalf("an empty node %s", b)
 	}
 }

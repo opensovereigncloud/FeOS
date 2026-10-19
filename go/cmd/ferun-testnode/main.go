@@ -129,6 +129,8 @@ func parse(args []string, getenv func(string) string) (testnode.Config, slog.Lev
 	meshEndpoint := fs.String("mesh-endpoint", "", "the node's endpoint on the mesh, address:port; empty: 127.0.0.1 and a port from the name")
 	fakeExec := fs.Bool("fake-exec", false, "every exec into a pod exits 0 without running anything (an environment's addon probes and provisioning)")
 	checkGroups := fs.Bool("check-security-groups", true, "a pod that names a security group the node does not have fails, as on feosd")
+	checkTables := fs.Bool("check-name-tables", true, "a pod that names a name table the node does not have fails, as on feosd")
+	noNames := fs.Bool("no-name-service", false, "serve no NameService, as a feosd from before it: pods resolve no names of their environments")
 	var exits list
 	var portAddrs addrs
 	fs.Var(&exits, "exit", "<object glob>=<code>[@<delay>]: the main container of an environment's pod whose ferun.object label matches exits with the code that long after each boot (default 2s; a negative code: no exit status), repeatable, the first match counts: job/*=0@3s, service/crasher=1")
@@ -191,6 +193,8 @@ func parse(args []string, getenv func(string) string) (testnode.Config, slog.Lev
 
 		FakeExec:            *fakeExec,
 		CheckSecurityGroups: *checkGroups,
+		CheckNameTables:     *checkTables,
+		NoNameService:       *noNames,
 		StartLog:            *startLog,
 		FakeProcesses:       *fakeProcesses,
 	}
@@ -252,7 +256,7 @@ func run(args []string, getenv func(string) string) error {
 				log.Info("ferun-testnode: restarting gracefully")
 				n.Restart(true)
 			case <-usr1:
-				b, err := json.Marshal(summary(n.Pods(), n.Volumes(), n.SecurityGroups()))
+				b, err := json.Marshal(summary(n.Pods(), n.Volumes(), n.SecurityGroups(), n.NameTables()))
 				if err != nil {
 					log.Warn("ferun-testnode: state", "err", err)
 					continue
@@ -267,12 +271,13 @@ func run(args []string, getenv func(string) string) error {
 	return n.Run(ctx)
 }
 
-// state is what SIGUSR1 logs of a node: its pods, volumes and security
-// groups, briefly.
+// state is what SIGUSR1 logs of a node: its pods, volumes, security
+// groups and name tables, briefly.
 type state struct {
 	Pods    []podState    `json:"pods"`
 	Volumes []volumeState `json:"volumes"`
 	Groups  []groupState  `json:"groups"`
+	Tables  []tableState  `json:"nameTables"`
 }
 
 type podState struct {
@@ -280,6 +285,7 @@ type podState struct {
 	State   string   `json:"state"`
 	Object  string   `json:"object,omitempty"`
 	Groups  []string `json:"groups,omitempty"`
+	Tables  []string `json:"nameTables,omitempty"`
 	Volumes []string `json:"volumes,omitempty"`
 }
 
@@ -297,11 +303,21 @@ type groupState struct {
 	Rules   int      `json:"rules"`
 }
 
-func summary(pods []*podv1.PodInfo, volumes []*volumev1.Volume, groups []*networkv1.SecurityGroup) state {
-	out := state{Pods: []podState{}, Volumes: []volumeState{}, Groups: []groupState{}}
+// tableState is a name table: its names with their addresses.
+type tableState struct {
+	ID       string              `json:"id"`
+	Version  uint64              `json:"version"`
+	Names    map[string][]string `json:"names"`
+	Includes []string            `json:"includes,omitempty"`
+}
+
+func summary(pods []*podv1.PodInfo, volumes []*volumev1.Volume, groups []*networkv1.SecurityGroup,
+	tables []*networkv1.NameTable) state {
+	out := state{Pods: []podState{}, Volumes: []volumeState{}, Groups: []groupState{}, Tables: []tableState{}}
 	for _, p := range pods {
 		ps := podState{ID: p.GetPodId(), State: strings.TrimPrefix(p.GetState().String(), "POD_STATE_"),
-			Object: p.GetSpec().GetLabels()["ferun.object"], Groups: p.GetSpec().GetNetwork().GetSecurityGroups()}
+			Object: p.GetSpec().GetLabels()["ferun.object"], Groups: p.GetSpec().GetNetwork().GetSecurityGroups(),
+			Tables: p.GetSpec().GetNetwork().GetNameTables()}
 		for _, v := range p.GetSpec().GetVolumes() {
 			ps.Volumes = append(ps.Volumes, v.GetVolumeId())
 		}
@@ -313,6 +329,13 @@ func summary(pods []*podv1.PodInfo, volumes []*volumev1.Volume, groups []*networ
 	}
 	for _, g := range groups {
 		out.Groups = append(out.Groups, groupState{ID: g.GetId(), Version: g.GetVersion(), Members: g.GetMembers(), Rules: len(g.GetRules())})
+	}
+	for _, t := range tables {
+		ts := tableState{ID: t.GetId(), Version: t.GetVersion(), Names: map[string][]string{}, Includes: t.GetIncludes()}
+		for _, e := range t.GetEntries() {
+			ts.Names[e.GetName()] = e.GetAddresses()
+		}
+		out.Tables = append(out.Tables, ts)
 	}
 	return out
 }
