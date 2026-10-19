@@ -72,10 +72,11 @@ type TenantInfo struct {
 }
 
 // ListTenants returns every tenant ordered by name, with its number of
-// sandboxes and its tokens (oldest first).
+// sandboxes (an environment's instance rows are none) and its tokens
+// (oldest first).
 func (s *Store) ListTenants(ctx context.Context) ([]TenantInfo, error) {
 	rows, err := s.q.Query(ctx, `SELECT t.id, t.created_at, t.deleting_at,
-			(SELECT count(*) FROM sandboxes s WHERE s.owner = t.id)
+			(SELECT count(*) FROM sandboxes s WHERE s.owner = t.id AND s.environment_id IS NULL)
 		FROM tenants t ORDER BY t.id`)
 	if err != nil {
 		return nil, err
