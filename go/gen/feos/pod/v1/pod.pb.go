@@ -1049,8 +1049,10 @@ func (x *ContainerStatus) GetExitCode() int32 {
 
 type CreatePodRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// A UUID, chosen by the caller, so that a create delivered twice finds
-	// the pod it made.
+	// The pod's ID, chosen by the caller, so that a create delivered twice
+	// finds the pod it made: 11 characters of lowercase Crockford base32, a
+	// letter first, which also name its TAP device, or a UUID, as pods made
+	// before ADR 0019 have.
 	PodId         string   `protobuf:"bytes,1,opt,name=pod_id,json=podId,proto3" json:"pod_id,omitempty"`
 	Spec          *PodSpec `protobuf:"bytes,2,opt,name=spec,proto3" json:"spec,omitempty"`
 	unknownFields protoimpl.UnknownFields
