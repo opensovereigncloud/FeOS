@@ -17,7 +17,7 @@
 
 use super::diskd_gate::{diskd_gate, GateCall};
 use super::fixtures::{verify_microvm_cleanup, PodGuard};
-use super::pod_tests::{for_pod, get_pod, guest_ping, microvm_metadata, new_pod_id};
+use super::pod_tests::{for_pod, get_pod, guest_ping, legacy_pod_id, microvm_metadata, new_pod_id};
 use super::{
     ensure_server, get_public_clients, installed_guest, OBJECT_STORE, PUBLIC_SERVER_ADDRESS,
 };
@@ -365,7 +365,9 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
         metadata: [("role".to_string(), "hibernated".to_string())].into(),
         ..spec()
     };
-    let pod_id = new_pod_id();
+    // A pod with a UUID, as hibernated pods from before short IDs have:
+    // its snapshot names its TAP device by the UUID's first 8 hex digits.
+    let pod_id = legacy_pod_id();
     pods.create_pod(CreatePodRequest {
         pod_id: pod_id.clone(),
         spec: Some(networked.clone()),

@@ -208,26 +208,10 @@ pub fn routes(address: Ipv6Addr, mtu: u32) -> Vec<PodRoute> {
     }]
 }
 
-/// The pod's TAP device: `pod-` and the first 8 hex digits of its ID.
-pub fn tap_name(pod_id: &str) -> String {
-    format!("pod-{}", id_hex(pod_id))
-}
-
-/// The guest's MAC address: locally administered, with the same digits of
-/// the pod's ID as its TAP device, so that it stays the pod's.
-pub fn mac(pod_id: &str) -> [u8; 6] {
-    let hex = id_hex(pod_id);
-    let byte = |i: usize| {
-        hex.get(2 * i..2 * i + 2)
-            .and_then(|byte| u8::from_str_radix(byte, 16).ok())
-            .unwrap_or(0)
-    };
-    [0x06, 0x00, byte(0), byte(1), byte(2), byte(3)]
-}
-
-fn id_hex(pod_id: &str) -> String {
-    pod_id.chars().filter(|c| *c != '-').take(8).collect()
-}
+/// The pod's TAP device and its guest's MAC address, by its ID: `pod-<ID>`
+/// for a short ID, `pod-` and the first 8 hex digits for a UUID
+/// (ADR 0019).
+pub use feos_utils::pod_id::{mac, tap_name};
 
 pub fn mac_string(mac: [u8; 6]) -> String {
     mac.iter()
@@ -1391,6 +1375,11 @@ mod tests {
         assert_eq!(tap_name(id), "pod-8d99e180");
         assert!(tap_name(id).len() < libc::IFNAMSIZ);
         assert_eq!(mac_string(mac(id)), "06:00:8d:99:e1:80");
+        // A short ID is its TAP device's name (ADR 0019).
+        let id = "k7m2q9x4c1b";
+        assert_eq!(tap_name(id), "pod-k7m2q9x4c1b");
+        assert_eq!(tap_name(id).len(), libc::IFNAMSIZ - 1);
+        assert_eq!(mac(id)[..2], [0x06, 0x00]);
     }
 
     #[test]
@@ -1569,6 +1558,18 @@ mod tests {
         let mut twin = pod("11111111-0000-0000-0000-000000000009", "", "");
         let error = network.allocate(others.iter(), &mut twin).unwrap_err();
         assert_eq!(error.code(), tonic::Code::AlreadyExists);
+        // Short IDs do not: their TAP devices are named by all of them.
+        let others = [
+            pod("a1111111111", "fd00:fe05:1::2", "169.254.16.1"),
+            pod(
+                "a1111111-0000-0000-0000-000000000000",
+                "fd00:fe05:1::3",
+                "169.254.16.2",
+            ),
+        ];
+        let mut info = pod("a1111111112", "", "");
+        network.allocate(others.iter(), &mut info).unwrap();
+        assert_eq!(info.ipv6_address, "fd00:fe05:1::4");
     }
 
     #[test]
@@ -1691,6 +1692,7 @@ mod tests {
                 "169.254.16.1",
             ),
             pod("bbbbbbbb-0000-0000-0000-000000000000", "fd00::3", ""),
+            pod("k7m2q9x4c1b", "fd00::5", "169.254.16.5"),
         ];
         directory.set(&pods.iter().collect::<Vec<_>>());
         let id = |address: &str| directory.by_address(address.parse().unwrap());
@@ -1701,6 +1703,10 @@ mod tests {
         assert_eq!(id("fd00::3"), Some(pods[1].pod_id.clone()));
         assert_eq!(id("169.254.16.2"), None);
         assert_eq!(directory.by_interface("pod-aaaaaaaa"), a);
+        assert_eq!(
+            directory.by_interface("pod-k7m2q9x4c1b"),
+            Some(pods[2].pod_id.clone())
+        );
         assert_eq!(directory.by_interface("eth0"), None);
 
         // A pod that left is known by its addresses for a while: the ends

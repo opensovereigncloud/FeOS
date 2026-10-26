@@ -10,7 +10,7 @@ workspace = true
 [dependencies]
 # Workspace dependencies
 feos-proto = { workspace = true }
-feos-utils = { workspace = true }
+feos-utils = { workspace = true, features = ["pod-id"] }
 tokio = { workspace = true }
 tonic = { workspace = true }
 anyhow = { workspace = true }

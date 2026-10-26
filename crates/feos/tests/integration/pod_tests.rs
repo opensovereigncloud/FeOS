@@ -186,7 +186,14 @@ fn sysctl(path: &str) -> Result<String> {
     )
 }
 
+/// A new pod's ID, a short one, as ferund and feosctl mint them.
 pub(super) fn new_pod_id() -> String {
+    feos_utils::pod_id::mint()
+}
+
+/// A UUID, the ID of a pod made before short IDs (ADR 0019): such pods
+/// keep working, their TAP devices named by the first 8 hex digits.
+pub(super) fn legacy_pod_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -285,6 +292,7 @@ async fn test_pod_lifecycle() -> Result<()> {
     // and one of its IPv4 range, routed to a TAP device of the pod's own.
     let pod_id = new_pod_id();
     let tap_name = network::tap_name(&pod_id);
+    assert_eq!(tap_name, format!("pod-{pod_id}"));
     let spec = PodSpec {
         resources: Some(Resources {
             vcpus: 2,
@@ -670,8 +678,10 @@ async fn test_pod_suspend_and_resume() -> Result<()> {
     let (mut pods, _, _) = get_public_clients().await?;
 
     // The microVM layer hands the pod's TAP device to the pod's user, on
-    // every restore.
-    let pod_id = new_pod_id();
+    // every restore. A pod with a UUID, whose snapshot names its TAP device
+    // as before short IDs.
+    let pod_id = legacy_pod_id();
+    assert_eq!(network::tap_name(&pod_id), format!("pod-{}", &pod_id[..8]));
     let tap_name = network::tap_name(&pod_id);
     pods.create_pod(CreatePodRequest {
         pod_id: pod_id.clone(),

@@ -211,7 +211,16 @@ mod tests {
 
     #[test]
     fn ids_are_short_names() {
-        for id in ["web", "a", "db-1.prod_eu", &"x".repeat(64)] {
+        // A sandbox's group is named by its pod's ID, a short one
+        // (ADR 0019) or a UUID.
+        for id in [
+            "web",
+            "a",
+            "db-1.prod_eu",
+            &"x".repeat(64),
+            "sbx-k7m2q9x4c1b",
+            "sbx-8d99e180-1694-4d94-a42e-097769b89510",
+        ] {
             assert!(check_id(id).is_ok(), "{id}");
         }
         for id in ["", "a/b", "a b", "grüne", &"x".repeat(65)] {

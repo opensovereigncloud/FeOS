@@ -15,11 +15,11 @@ use crate::{
     worker, Command, VmEventWrapper,
 };
 use feos_proto::microvm::{VmState, VmStateChangedEvent};
+use feos_utils::pod_id::PodId;
 use log::{debug, error, info};
 use prost::Message;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use uuid::Uuid;
 
 pub struct VmServiceDispatcher {
     rx: mpsc::Receiver<Command>,
@@ -28,7 +28,7 @@ pub struct VmServiceDispatcher {
     status_channel_tx: broadcast::Sender<VmEventWrapper>,
     hypervisor: Arc<dyn Hypervisor>,
     repository: VmRepository,
-    healthcheck_cancel_bus: broadcast::Sender<Uuid>,
+    healthcheck_cancel_bus: broadcast::Sender<PodId>,
     guests: Arc<Guests>,
 }
 
@@ -36,7 +36,7 @@ impl VmServiceDispatcher {
     pub async fn new(rx: mpsc::Receiver<Command>, db_url: &str) -> Result<Self, VmServiceError> {
         let (event_bus_tx, event_bus_rx_for_dispatcher) = mpsc::channel(32);
         let (status_channel_tx, _) = broadcast::channel(32);
-        let (healthcheck_cancel_bus, _) = broadcast::channel::<Uuid>(32);
+        let (healthcheck_cancel_bus, _) = broadcast::channel::<PodId>(32);
         let hypervisor = Arc::from(factory(VmmType::Firecracker));
         let guests = Guests::new(event_bus_tx.clone());
         info!("VmDispatcher: Connecting to persistence layer at {db_url}...");
@@ -133,11 +133,11 @@ impl VmServiceDispatcher {
             event.data.as_ref().map_or("None", |d| &d.type_url)
         );
 
-        let vm_id_uuid = match Uuid::parse_str(&event.vm_id) {
+        let parsed_id = match PodId::parse(&event.vm_id) {
             Ok(id) => id,
             Err(e) => {
                 error!(
-                    "DatabaseUpdate: Could not parse UUID from event vm_id '{}': {e}",
+                    "DatabaseUpdate: Could not parse the event's vm_id '{}': {e}",
                     event.vm_id
                 );
                 return;
@@ -145,21 +145,16 @@ impl VmServiceDispatcher {
         };
 
         if let Some(pid) = event_wrapper.process_id {
-            info!("DatabaseUpdate: Updating pid for VM {vm_id_uuid} to {pid}");
-            if let Err(e) = self.repository.update_vm_pid(vm_id_uuid, pid).await {
-                error!("DatabaseUpdate: Failed to update pid for VM {vm_id_uuid}: {e}");
+            info!("DatabaseUpdate: Updating pid for VM {parsed_id} to {pid}");
+            if let Err(e) = self.repository.update_vm_pid(parsed_id, pid).await {
+                error!("DatabaseUpdate: Failed to update pid for VM {parsed_id}: {e}");
             }
         }
 
         match &event.data {
             Some(data) if data.type_url.contains("VmStateChangedEvent") => {
-                self.handle_vm_state_changed_event(
-                    data,
-                    vm_id_uuid,
-                    &event.vm_id,
-                    event_to_forward,
-                )
-                .await;
+                self.handle_vm_state_changed_event(data, parsed_id, &event.vm_id, event_to_forward)
+                    .await;
             }
             // Other events change no record.
             _ => {
@@ -171,7 +166,7 @@ impl VmServiceDispatcher {
     async fn handle_vm_state_changed_event(
         &mut self,
         data: &prost_types::Any,
-        vm_id_uuid: Uuid,
+        parsed_id: PodId,
         vm_id: &str,
         event_to_forward: VmEventWrapper,
     ) {
@@ -189,12 +184,12 @@ impl VmServiceDispatcher {
                 };
 
                 info!(
-                    "DatabaseUpdate: Updating status for VM {vm_id_uuid} to {new_state:?} with message: '{}'",
+                    "DatabaseUpdate: Updating status for VM {parsed_id} to {new_state:?} with message: '{}'",
                     state_change.reason
                 );
                 match self
                     .repository
-                    .update_vm_status(vm_id_uuid, new_state, &state_change.reason)
+                    .update_vm_status(parsed_id, new_state, &state_change.reason)
                     .await
                 {
                     Ok(true) => {
@@ -206,12 +201,12 @@ impl VmServiceDispatcher {
                     }
                     Ok(false) => {
                         info!(
-                            "DatabaseUpdate: Update for VM {vm_id_uuid} was a no-op (record likely already deleted). Event not forwarded."
+                            "DatabaseUpdate: Update for VM {parsed_id} was a no-op (record likely already deleted). Event not forwarded."
                         );
                     }
                     Err(e) => {
                         error!(
-                            "DatabaseUpdate: Failed to execute status update for VM {vm_id_uuid}: {e}"
+                            "DatabaseUpdate: Failed to execute status update for VM {parsed_id}: {e}"
                         );
                     }
                 }

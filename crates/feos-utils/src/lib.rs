@@ -9,6 +9,8 @@ pub mod fs;
 pub mod host;
 pub mod listen_fds;
 pub mod nft;
+#[cfg(feature = "pod-id")]
+pub mod pod_id;
 pub mod reaper;
 pub mod resolver;
 pub mod share;

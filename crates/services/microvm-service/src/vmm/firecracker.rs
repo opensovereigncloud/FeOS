@@ -35,6 +35,7 @@ use feos_proto::microvm::{
     CreateVmRequest, DeleteVmRequest, DeleteVmResponse, PingVmRequest, PingVmResponse,
     ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmState, VmStateChangedEvent,
 };
+use feos_utils::pod_id::PodId;
 use log::{info, warn};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::Mode;
@@ -50,7 +51,6 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{broadcast, mpsc, watch};
-use uuid::Uuid;
 
 /// `reboot=k`: a guest that reboots ends Firecracker, which cannot reboot
 /// it. The i8042 options let Ctrl-Alt-Del through without probing for a
@@ -835,10 +835,10 @@ impl Hypervisor for FirecrackerAdapter {
         &self,
         vm_id: String,
         broadcast_tx: mpsc::Sender<VmEventWrapper>,
-        mut cancel_bus: broadcast::Receiver<Uuid>,
+        mut cancel_bus: broadcast::Receiver<PodId>,
     ) {
-        let Ok(vm_uuid) = Uuid::parse_str(&vm_id) else {
-            warn!("FirecrackerAdapter ({vm_id}): Not a UUID; not watching it");
+        let Ok(parsed_id) = PodId::parse(&vm_id) else {
+            warn!("FirecrackerAdapter ({vm_id}): Not a pod ID; not watching it");
             return;
         };
         let mut exit = match self.exit_watch(&vm_id) {
@@ -857,7 +857,7 @@ impl Hypervisor for FirecrackerAdapter {
                     break ended.ok().and_then(|ended| *ended).flatten();
                 }
                 cancelled = cancel_bus.recv() => match cancelled {
-                    Ok(id) if id == vm_uuid => {
+                    Ok(id) if id == parsed_id => {
                         info!("FirecrackerAdapter ({vm_id}): Stopped watching.");
                         return;
                     }
