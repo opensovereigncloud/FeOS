@@ -3,7 +3,8 @@
 # privileged container, and check feosd and diskd under systemd: feosd's
 # group and socket, a pod from the installed guest and Firecracker on a
 # disk from diskd, its cgroup, a
-# restart that keeps the pod, the resolver's sockets in feosd.socket
+# restart that keeps the pod, the VMs a feosd from before --vms-cgroup
+# leaves in its own cgroup handed over, the resolver's sockets in feosd.socket
 # across a stop of feosd, the refused self-upgrade, what autoremove
 # keeps, a pod's disk across a restart of diskd and a stop, no
 # hibernation without an object store, pods on feosd's network (an fd00: prefix and link-local IPv4
@@ -13,6 +14,10 @@
 # power-off through PID 1.
 #
 #   hack/packages/test-packages
+#   TEST_PACKAGES_BASE=debian:sid hack/packages/test-packages
+#
+# TEST_PACKAGES_BASE is the image the node is made from, debian:13 by
+# default: another Debian, such as one with a newer systemd.
 #
 # Needs docker, /dev/kvm, the ublk driver, and IPv4 internet access for
 # the pods' images and checks; IPv6 internet is not needed. The node's
@@ -21,7 +26,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 PACKAGES_DIR="${REPO_ROOT}/target/packages"
-IMAGE="feos-test-packages"
+BASE="${TEST_PACKAGES_BASE:-debian:13}"
+IMAGE="feos-test-packages-${BASE//[^a-z0-9.]/-}"
 # A node of this run's own, so that runs side by side do not remove each
 # other's.
 NAME="feos-test-packages-$$"
@@ -66,9 +72,9 @@ shopt -s nullglob
 debs=("${PACKAGES_DIR}"/*.deb)
 [ ${#debs[@]} -ge 7 ] || { log "missing packages; run make packages"; exit 1; }
 
-log "building ${IMAGE}: Debian 13 with systemd"
-docker build -q -t "${IMAGE}" - >/dev/null <<'EOF'
-FROM debian:13
+log "building ${IMAGE}: ${BASE} with systemd"
+docker build -q -t "${IMAGE}" - >/dev/null <<EOF
+FROM ${BASE}
 RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv \
       iproute2 nftables conntrack ca-certificates && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -124,12 +130,15 @@ export -f microvm_pid
 in_node feosctl pod create --pod-id "${bare}" --memory 256 --wait >/dev/null ||
   fail "no pod from the installed guest"
 pid="$(microvm_pid "${bare}")"
-in_node grep -qx "${pid}" "/sys/fs/cgroup/system.slice/feosd.service/vms/${bare}/cgroup.procs" ||
+vms=/sys/fs/cgroup/system.slice/feos-vms.service/vms
+in_node grep -qx "${pid}" "${vms}/${bare}/cgroup.procs" ||
   fail "Firecracker (pid ${pid}) is not in the pod's cgroup"
 in_node grep -q '"firecracker":"/usr/lib/feos/firecracker/' \
   "/var/lib/feos/vms/firecracker/${bare}/jail.json" || fail "the pod does not run the installed Firecracker"
 in_node test -b "/var/lib/feos/disk/live/${bare}/disk" || fail "the pod has no disk from diskd"
-log "a pod boots the installed guest on a disk from diskd, in system.slice/feosd.service/vms/${bare}"
+in_node grep -qE "cpu|memory" /sys/fs/cgroup/system.slice/feosd.service/cgroup.subtree_control &&
+  fail "feosd.service's cgroup has controllers on for its children"
+log "a pod boots the installed guest on a disk from diskd, in system.slice/feos-vms.service/vms/${bare}"
 
 in_node systemctl restart feosd
 await "feosd did not come back" in_node systemctl is-active feosd
@@ -138,6 +147,33 @@ await "the restarted feosd does not take the pod over" bash -c \
   "[ \"\$(microvm_pid ${bare})\" = ${pid} ]"
 in_node feosctl pod get "${bare}" | contains "State: RUNNING" || fail "the pod is not running"
 log "the pod outlived a restart of feosd, which took it over"
+
+# A feosd from before --vms-cgroup put its VMs below its own cgroup and
+# turned cpu and memory on there, so that systemd 258 and later could not
+# start it again. A restart hands them over to feos-vms.service
+# (ExecStopPost=) and starts feosd.
+unit=/sys/fs/cgroup/system.slice/feosd.service
+in_node sh -c "mkdir -p ${unit}/vms/legacy && echo '+cpu +memory' >${unit}/cgroup.subtree_control &&
+  echo '+cpu +memory' >${unit}/vms/cgroup.subtree_control && echo 300 >${unit}/vms/legacy/cpu.weight"
+docker exec -d "${NAME}" sh -c "echo \$\$ >${unit}/vms/legacy/cgroup.procs && exec sleep 600"
+await "no process in the old VM cgroup" in_node grep -q . "${unit}/vms/legacy/cgroup.procs"
+legacy="$(in_node cat "${unit}/vms/legacy/cgroup.procs")"
+in_node systemctl restart feosd ||
+  fail "feosd does not restart with VMs in its own cgroup"
+await "feosd did not come back" in_node systemctl is-active feosd
+in_node grep -qx "${legacy}" "${vms}/legacy/cgroup.procs" ||
+  fail "the old VM (pid ${legacy}) is not in feos-vms.service: $(in_node cat /proc/"${legacy}"/cgroup)"
+[ "$(in_node cat "${vms}/legacy/cpu.weight")" = 300 ] || fail "the old VM lost its cpu.weight"
+in_node test ! -e "${unit}/vms" || fail "feosd.service still has vms/"
+in_node grep -qE "cpu|memory" "${unit}/cgroup.subtree_control" &&
+  fail "feosd.service's cgroup has controllers on for its children after the hand-over"
+in_node kill "${legacy}"
+await "the old VM's process did not end" in_node sh -c "! grep -q . ${vms}/legacy/cgroup.procs"
+in_node rmdir "${vms}/legacy"
+in_node grep -qx "${pid}" "${vms}/${bare}/cgroup.procs" || fail "the pod left its cgroup"
+in_node systemctl restart feosd
+await "feosd did not come back" in_node systemctl is-active feosd
+log "a restart hands the VMs of a feosd from before over to feos-vms.service, with their cpu.weight"
 
 if in_node feosctl host upgrade http://127.0.0.1/feosd 2>/tmp/upgrade.err; then
   fail "feosd took an upgrade without --self-upgrade"
@@ -160,7 +196,7 @@ pod_address() { in_node feosctl pod get "$1" | sed -n 's/^  IPv6 address: //p'; 
 pod_ipv4() { in_node feosctl pod get "$1" | sed -n 's/^  IPv4 address: //p'; }
 bare_ipv4="$(pod_ipv4 "${bare}")"
 in_node feosctl pod delete "${bare}" >/dev/null
-in_node test ! -e "/sys/fs/cgroup/system.slice/feosd.service/vms/${bare}" ||
+in_node test ! -e "${vms}/${bare}" ||
   fail "the pod's cgroup outlived it"
 in_node grep -q "^freed ${bare_ipv4} " /var/lib/feos/pods/ipv4-addresses ||
   fail "the deleted pod's ${bare_ipv4} is not free: $(in_node cat /var/lib/feos/pods/ipv4-addresses)"

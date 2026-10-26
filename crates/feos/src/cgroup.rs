@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! feosd's place in the cgroup hierarchy. VMs go into `vms/<id>` below the
-//! cgroup feosd is given: the root under feos-host-init, the cgroup systemd
-//! delegates to feosd.service. A cgroup whose children use controllers may
-//! hold no processes itself, so feosd moves into a leaf of its own,
-//! `feosd`, unless it is in the root, which may, or systemd put it there
+//! cgroup feosd is given, the root under feos-host-init, or below the one
+//! `--vms-cgroup` names: under systemd, feos-vms.service's, since a service
+//! whose cgroup has controllers on for its children cannot start from
+//! systemd 258 on. A cgroup whose children use controllers may hold no
+//! processes itself, so feosd moves into a leaf of its own, `feosd`, unless
+//! it is in the root, which may, or systemd put it there
 //! (DelegateSubgroup=feosd).
 
 use std::io;
@@ -13,9 +15,11 @@ use std::path::Path;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const LEAF: &str = "feosd";
+/// Where systemd runs a delegated service's commands besides the main one.
+const CONTROL: &str = ".control";
 
-/// Moves this process into its leaf. Returns the cgroup below which VMs
-/// go, relative to the root of the hierarchy: empty for the root.
+/// Moves this process into its leaf. Returns the cgroup feosd is given,
+/// relative to the root of the hierarchy: empty for the root.
 pub fn enter_leaf() -> io::Result<String> {
     let own = own_cgroup(&std::fs::read_to_string("/proc/self/cgroup")?)
         .ok_or_else(|| io::Error::other("no cgroup v2 entry in /proc/self/cgroup"))?;
@@ -27,6 +31,26 @@ pub fn enter_leaf() -> io::Result<String> {
         std::fs::write(leaf.join("cgroup.procs"), "0")?;
     }
     Ok(base)
+}
+
+/// The cgroup feosd is given, relative to the root of the hierarchy,
+/// without moving: for a feosd in its leaf, or in the subgroup `.control`,
+/// where systemd runs a delegated service's ExecStopPost=, their parent.
+pub fn given() -> io::Result<String> {
+    let own = own_cgroup(&std::fs::read_to_string("/proc/self/cgroup")?)
+        .ok_or_else(|| io::Error::other("no cgroup v2 entry in /proc/self/cgroup"))?;
+    Ok(given_by(&own))
+}
+
+fn given_by(own: &str) -> String {
+    let path = Path::new(own);
+    match path.file_name() {
+        Some(name) if name == LEAF || name == CONTROL => path
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        _ => own.to_string(),
+    }
 }
 
 /// The cgroup v2 path in /proc/self/cgroup, without its leading slash.
@@ -64,6 +88,23 @@ mod tests {
         );
         assert_eq!(own_cgroup("0::/\n").as_deref(), Some(""));
         assert_eq!(own_cgroup("1:name=systemd:/\n"), None);
+    }
+
+    #[test]
+    fn the_given_cgroup_is_the_leafs_parent() {
+        assert_eq!(
+            given_by("system.slice/feosd.service/feosd"),
+            "system.slice/feosd.service"
+        );
+        assert_eq!(
+            given_by("system.slice/feosd.service/.control"),
+            "system.slice/feosd.service"
+        );
+        assert_eq!(
+            given_by("system.slice/feosd.service"),
+            "system.slice/feosd.service"
+        );
+        assert_eq!(given_by(""), "");
     }
 
     #[test]

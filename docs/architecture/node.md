@@ -674,14 +674,28 @@ a mount namespace of its own, as a user of the microVM's own, which owns
 its TAP devices. The layer creates TAP devices that do not exist and
 deletes them with the microVM.
 
-Every microVM has a cgroup of its own, `vms/<id>` below the cgroup `feosd` is
-given, with `cpu.weight` 100 per vCPU and no caps: `/sys/fs/cgroup/vms/<id>`
-under `feos-host-init`, `/sys/fs/cgroup/system.slice/feosd.service/vms/<id>`
-under systemd. A cgroup whose children use controllers may hold no
-processes, so `feosd` moves into the leaf `feosd` of its cgroup, where
-systemd starts it already with `DelegateSubgroup=feosd`. `feosd` creates
-the microVM's cgroup and enables `cpu` and `memory` in its own cgroup and
-in `vms/`, never above; the jailer only moves Firecracker into it.
+Every microVM has a cgroup of its own, `vms/<id>`, with `cpu.weight` 100
+per vCPU and no caps: `/sys/fs/cgroup/vms/<id>` under `feos-host-init`,
+below the cgroup `feosd` is given;
+`/sys/fs/cgroup/system.slice/feos-vms.service/vms/<id>` under systemd,
+below the cgroup `--vms-cgroup` names. `feosd` creates the microVM's
+cgroup and enables `cpu` and `memory` in the cgroup they go below and in
+`vms/`, never above; the jailer only moves Firecracker into it. A cgroup
+whose children use controllers may hold no processes, so `feosd` moves
+into the leaf `feosd` of its cgroup, where systemd starts it already with
+`DelegateSubgroup=feosd`.
+
+Under systemd the microVMs are not below `feosd.service`: from systemd 258
+on, systemd starts a service's main process in the service's cgroup and
+moves it into its subgroup only then, which the kernel refuses while the
+cgroup has controllers on for its children, and `feosd.service` would not
+start again until its microVMs were gone. `feos-vms.service` holds them
+instead: a unit that runs no process, which systemd never has to start one
+in. A `feosd` from before `--vms-cgroup` put its microVMs below its own
+cgroup: `feosd.service`'s `ExecStopPost=` (`feosd --hand-over-vms`), and
+`feosd` when it starts, move their processes to `feos-vms.service`, each
+with its `cpu.weight`, and turn `cpu` and `memory` off in `feosd.service`'s
+cgroup. The memory a microVM was charged before stays with its old cgroup.
 
 ### The guest
 
@@ -718,7 +732,7 @@ packages from https://apt.fecode.dev
 
 | Package | Contents |
 |---|---|
-| `feosd` | `/usr/sbin/feosd`, `feosd.service`, `feosd.socket`, the group `feos` (sysusers), `/etc/default/feosd`, `/etc/apt/apt.conf.d/50feosd` |
+| `feosd` | `/usr/sbin/feosd`, `feosd.service`, `feos-vms.service`, `feosd.socket`, the group `feos` (sysusers), `/etc/default/feosd`, `/etc/apt/apt.conf.d/50feosd` |
 | `feosctl` | `/usr/bin/feosctl` |
 | `diskd` | `/usr/sbin/diskd`, `/usr/sbin/diskctl`, `diskd.service`, `/etc/default/diskd`, `/usr/lib/modules-load.d/diskd.conf` |
 | `feos-firecracker-<version>` | `/usr/lib/feos/firecracker/<version>/{firecracker,jailer}` |
@@ -734,7 +748,10 @@ version from `apt autoremove`; a version nothing uses is removed with
 
 `feosd.service` is `Type=notify`, with `Delegate=yes`,
 `DelegateSubgroup=feosd` and `KillMode=process`: a restart or an upgrade
-stops `feosd` alone, and the next one takes the pods over.
+stops `feosd` alone, and the next one takes the pods over. It wants
+`feos-vms.service`, whose cgroup holds the microVMs' (`--vms-cgroup`):
+a oneshot unit with `RemainAfterExit=yes` and no process, `Delegate=yes`
+and `KillMode=process`; stopping it stops no microVM.
 `StateDirectory=feos` makes `/var/lib/feos` a directory on disk.
 `FEOSD_ARGS` in `/etc/default/feosd` passes options, such as `--tcp`
 and the pods' network's, of which the file has a description; it gives

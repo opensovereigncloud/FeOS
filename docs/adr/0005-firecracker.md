@@ -42,10 +42,12 @@ new line.
   mount namespace of its own, as a user of the VM's own. What it opens by
   path is linked into the chroot; the VM's user owns its disks and TAP
   devices.
-- Every VM has a cgroup of its own, `vms/<id>`, below the cgroup `feosd` is
-  given: the root under `feos-host-init`, the cgroup systemd delegates to
-  `feosd.service` on a distribution (ADR 0009). VMs outlive a restart of
-  `feosd` either way.
+- Every VM has a cgroup of its own, `vms/<id>`: below the root under
+  `feos-host-init`; below the cgroup systemd delegates to
+  `feos-vms.service` on a distribution (ADR 0009), a unit that runs no
+  process, since from systemd 258 on a service whose cgroup has
+  controllers on for its children cannot start again. VMs outlive a
+  restart of `feosd` either way.
 - VMs share the CPU in proportion to their vCPUs (`cpu.weight` 100 per
   vCPU), as their vCPU threads would without a cgroup each. The cgroup
   accounts the VM's memory and caps neither.

@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use main_server::{run_server, run_task_service, ServerOptions};
+use microvm_service::vmm::jail;
 use nix::sys::prctl;
 use pod_service::network;
 use std::net::SocketAddr;
@@ -12,10 +13,11 @@ use std::net::SocketAddr;
 const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix PREFIX]
              [--pod-ipv4-range PREFIX] [--dns-address ADDRESS]
              [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
-             [--diskd-socket PATH]
+             [--diskd-socket PATH] [--vms-cgroup PATH]
              [--control-plane HOST:PORT [--control-plane-name NAME]
               [--trust-domain NAME] [--join-token-file PATH] [--node-dir PATH]
               [--mesh-port PORT] [--mesh-address ADDRESS]]
+       feosd --hand-over-vms --vms-cgroup PATH
        feosd --version
 
   --tcp ADDRESS            also serve the API on TCP, without authentication
@@ -36,6 +38,15 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
                            (repeatable)
   --diskd-socket PATH      diskd's socket, which the pods' disks come from;
                            /var/lib/feos/disk/diskd.sock by default
+  --vms-cgroup PATH        the cgroup the microVMs' cgroups go below, from the
+                           root of the hierarchy, such as
+                           system.slice/feos-vms.service; the cgroup feosd is
+                           given by default. feosd moves the microVMs below
+                           its own cgroup there when it starts
+  --hand-over-vms          move the microVMs below feosd's own cgroup to
+                           --vms-cgroup's and exit: feosd.service's
+                           ExecStopPost=, so that a feosd from before
+                           --vms-cgroup can be restarted
   --control-plane HOST:PORT
                            the control plane's port for nodes, which the node
                            joins and connects to (ADR 0015); without, the node
@@ -62,6 +73,10 @@ struct Args {
     self_upgrade: bool,
     network: network::Config,
     diskd_socket: Option<std::path::PathBuf>,
+    /// The cgroup the VMs' cgroups go below; the one feosd is given by
+    /// default.
+    vms_cgroup: Option<String>,
+    hand_over_vms: bool,
     /// The control plane, and how the node joins it.
     fleet: Option<fleet_client::Config>,
     /// Passed by feosd itself: the task service, and the process an upgrade
@@ -126,6 +141,15 @@ impl Args {
                     network.deny_prefixes.push(prefix);
                 }
                 "--diskd-socket" => parsed.diskd_socket = Some(value("a path")?.into()),
+                "--vms-cgroup" => {
+                    let path = value("a cgroup")?;
+                    let cgroup = path.trim_matches('/');
+                    if cgroup.is_empty() || cgroup.split('/').any(|c| c == "." || c == "..") {
+                        bail!("--vms-cgroup {path}: a cgroup below the root\n{USAGE}");
+                    }
+                    parsed.vms_cgroup = Some(cgroup.to_string());
+                }
+                "--hand-over-vms" => parsed.hand_over_vms = true,
                 "--control-plane" => control_plane = Some(value("HOST:PORT")?),
                 "--control-plane-name" => control_plane_name = Some(value("a name")?),
                 "--trust-domain" => trust_domain = Some(value("a name")?),
@@ -154,6 +178,9 @@ impl Args {
                 "--version" => parsed.version = true,
                 other => bail!("unknown argument {other}\n{USAGE}"),
             }
+        }
+        if parsed.hand_over_vms && parsed.vms_cgroup.is_none() {
+            bail!("--hand-over-vms needs --vms-cgroup\n{USAGE}");
         }
         if !upstreams.is_empty() {
             parsed.network.dns_upstreams = upstreams;
@@ -217,6 +244,10 @@ async fn serve(dns_sockets: Vec<(std::os::fd::OwnedFd, String)>) -> Result<()> {
     if args.task_service {
         return run_task_service().await;
     }
+    if args.hand_over_vms {
+        hand_over_vms(args.vms_cgroup.as_deref().unwrap_or_default());
+        return Ok(());
+    }
     if std::process::id() == 1 {
         bail!("feosd does not run as PID 1; feos-host-init runs it");
     }
@@ -226,8 +257,16 @@ async fn serve(dns_sockets: Vec<(std::os::fd::OwnedFd, String)>) -> Result<()> {
     prctl::set_child_subreaper(true).context("become a subreaper")?;
     feos_utils::reaper::spawn();
     match main_server::cgroup::enter_leaf() {
-        Ok(base) => microvm_service::vmm::jail::set_cgroup_base(&base),
-        Err(e) => eprintln!("feosd: Failed to move into a leaf of its cgroup: {e}"),
+        Ok(given) => {
+            jail::set_cgroup_base(args.vms_cgroup.as_deref().unwrap_or(&given));
+            report(jail::adopt(&given));
+        }
+        Err(e) => {
+            eprintln!("feosd: Failed to move into a leaf of its cgroup: {e}");
+            if let Some(vms) = &args.vms_cgroup {
+                jail::set_cgroup_base(vms);
+            }
+        }
     }
 
     let fleet = args.fleet.map(|config| fleet_client::Config {
@@ -252,6 +291,33 @@ async fn serve(dns_sockets: Vec<(std::os::fd::OwnedFd, String)>) -> Result<()> {
     std::process::exit(0)
 }
 
+/// Moves the VMs below the cgroup feosd is given to `vms`, for a feosd
+/// that starts next: feosd.service's ExecStopPost=. Errors are logged; the
+/// VMs run on either way.
+fn hand_over_vms(vms: &str) {
+    match main_server::cgroup::given() {
+        Ok(given) => {
+            jail::set_cgroup_base(vms);
+            report(jail::adopt(&given));
+        }
+        Err(e) => eprintln!("feosd: Failed to find its cgroup: {e}"),
+    }
+}
+
+fn report(adopted: jail::Adopted) {
+    if !adopted.moved.is_empty() {
+        eprintln!(
+            "feosd: Moved the cgroups of {} VMs to {}: {}",
+            adopted.moved.len(),
+            jail::cgroup("").display(),
+            adopted.moved.join(", ")
+        );
+    }
+    for error in adopted.errors {
+        eprintln!("feosd: Failed to move a VM's cgroup: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +334,25 @@ mod tests {
         let args = parse(&["--diskd-socket", "/run/diskd.sock"]).unwrap();
         assert_eq!(args.diskd_socket, Some("/run/diskd.sock".into()));
         assert_eq!(parse(&[]).unwrap(), Args::default());
+    }
+
+    #[test]
+    fn the_vms_cgroup_is_below_the_root() {
+        let args = parse(&["--vms-cgroup", "/system.slice/feos-vms.service/"]).unwrap();
+        assert_eq!(
+            args.vms_cgroup.as_deref(),
+            Some("system.slice/feos-vms.service")
+        );
+        assert!(!args.hand_over_vms);
+        let args = parse(&["--hand-over-vms", "--vms-cgroup", "feos-vms"]).unwrap();
+        assert!(args.hand_over_vms);
+        for bad in [
+            &["--vms-cgroup", "/"][..],
+            &["--vms-cgroup", "system.slice/../x"],
+            &["--hand-over-vms"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

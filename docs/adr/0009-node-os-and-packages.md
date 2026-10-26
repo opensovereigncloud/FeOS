@@ -63,7 +63,8 @@ lists them. Its nodes are not changed with apt at runtime.
   `$NOTIFY_SOCKET` once its listeners are bound: one datagram, no
   libsystemd.
 - `Delegate=yes` and `KillMode=process`. `feosd` moves itself into a leaf
-  of its cgroup and puts VMs into `vms/<id>` below it (ADR 0005). A
+  of its cgroup and puts VMs into `vms/<id>` below `feos-vms.service`'s,
+  a delegated unit that runs no process (ADR 0005). A
   restart or an upgrade stops `feosd` alone; the pods keep running, and
   the new `feosd` takes them over, as containerd's shims outlive
   containerd.

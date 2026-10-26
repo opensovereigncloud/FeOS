@@ -15,11 +15,11 @@
 //!
 //! The VM's user also owns its TAP devices, which the VM service creates if
 //! they do not exist. The VM service readies a cgroup of the VM's own,
-//! `vms/<id>` below the cgroup feosd is given, and the jailer moves
-//! Firecracker into it. Outside the chroot, `jail.json` records the user, the
-//! VM's share of the CPU, where the files come from and which TAP devices
-//! the VM service created, so that a start can link them again and a
-//! deletion can undo it all.
+//! `vms/<id>` below the cgroup feosd is given or the one `--vms-cgroup`
+//! names, and the jailer moves Firecracker into it. Outside the chroot,
+//! `jail.json` records the user, the VM's share of the CPU, where the files
+//! come from and which TAP devices the VM service created, so that a start
+//! can link them again and a deletion can undo it all.
 
 use crate::{jail_dir, vm_dir, VM_DIR};
 use log::warn;
@@ -37,8 +37,9 @@ use std::sync::OnceLock;
 const UID_BASE: u32 = 1_000_000;
 const MANIFEST: &str = "jail.json";
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-/// The cgroup feosd is given, below which `vms/` holds a cgroup per VM,
-/// relative to the root of the hierarchy. Unset, it is the root.
+/// The cgroup below which `vms/` holds a cgroup per VM, relative to the
+/// root of the hierarchy: the one feosd is given, or `--vms-cgroup`. Unset,
+/// it is the root.
 static CGROUP_BASE: OnceLock<String> = OnceLock::new();
 
 /// A file Firecracker opens: where it comes from, and its name in the
@@ -66,7 +67,8 @@ pub fn cpu_weight(vcpus: u32) -> u64 {
     (100 * u64::from(vcpus)).clamp(1, 10_000)
 }
 
-/// Sets the cgroup feosd is given, once, before the first VM starts.
+/// Sets the cgroup the VMs' cgroups go below, once, before the first VM
+/// starts.
 pub fn set_cgroup_base(base: &str) {
     let _ = CGROUP_BASE.set(base.trim_matches('/').to_string());
 }
@@ -118,6 +120,97 @@ pub fn prepare_cgroup(vm_id: &str, cpu_weight: u64) -> io::Result<()> {
         write(parent.join("cgroup.subtree_control"), "+cpu +memory")?;
     }
     write(vm.join("cpu.weight"), &cpu_weight.to_string())
+}
+
+/// What `adopt` did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Adopted {
+    /// The VMs whose processes moved.
+    pub moved: Vec<String>,
+    /// What failed.
+    pub errors: Vec<String>,
+}
+
+/// Moves the VMs' cgroups from `vms/` below `from`, the cgroup feosd is
+/// given, to `vms/` below the cgroup set with `set_cgroup_base`, and turns
+/// `cpu` and `memory` off in `from` again. Under systemd, `from` is
+/// feosd.service's cgroup, where a feosd before `--vms-cgroup` put its VMs:
+/// from systemd 258 on, a service whose cgroup has controllers on for its
+/// children cannot start, since systemd starts its main process in that
+/// cgroup. Each VM keeps its `cpu.weight`; the memory it was charged stays
+/// behind. Nothing happens where both are the same cgroup, or where `from`
+/// is the root.
+pub fn adopt(from: &str) -> Adopted {
+    let mut adopted = Adopted::default();
+    let from = from.trim_matches('/');
+    let to = CGROUP_BASE.get().map(String::as_str).unwrap_or("");
+    if from.is_empty() || from == to || to.starts_with(&format!("{from}/")) {
+        return adopted;
+    }
+    let base = Path::new(CGROUP_ROOT).join(from);
+    let vms = base.join("vms");
+    match fs::read_dir(&vms) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let Some(vm_id) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                match adopt_vm(&entry.path(), &vm_id) {
+                    Ok(true) => adopted.moved.push(vm_id),
+                    Ok(false) => {}
+                    Err(e) => adopted.errors.push(format!("{vm_id}: {e}")),
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => adopted.errors.push(format!("{}: {e}", vms.display())),
+    }
+    match fs::remove_dir(&vms) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            adopted.errors.push(format!("{}: {e}", vms.display()))
+        }
+        _ => {}
+    }
+    let control = base.join("cgroup.subtree_control");
+    let enabled = fs::read_to_string(&control).unwrap_or_default();
+    if enabled
+        .split_whitespace()
+        .any(|c| c == "cpu" || c == "memory")
+        && let Err(e) = fs::write(&control, "-cpu -memory")
+    {
+        adopted.errors.push(format!("{}: {e}", control.display()));
+    }
+    adopted
+}
+
+/// Moves a VM's processes from its cgroup `old` into its cgroup below the
+/// cgroup set with `set_cgroup_base`, with the same `cpu.weight`, and
+/// removes `old`. Returns whether any process moved.
+fn adopt_vm(old: &Path, vm_id: &str) -> io::Result<bool> {
+    let procs = fs::read_to_string(old.join("cgroup.procs"))?;
+    let pids: Vec<&str> = procs.lines().filter(|pid| !pid.is_empty()).collect();
+    if !pids.is_empty() {
+        // A VM from before cgroups has no weight of its own: 0.
+        let weight = fs::read_to_string(old.join("cpu.weight"))
+            .ok()
+            .and_then(|weight| weight.trim().parse().ok())
+            .unwrap_or(0);
+        prepare_cgroup(vm_id, weight)?;
+        let new = cgroup(vm_id);
+        fs::create_dir_all(&new)?;
+        for pid in &pids {
+            match fs::write(new.join("cgroup.procs"), pid) {
+                // The process is gone.
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
+                result => result?,
+            }
+        }
+    }
+    fs::remove_dir(old)?;
+    Ok(!pids.is_empty())
 }
 
 /// The Firecracker and jailer a boot of the VM runs. A snapshot can only
