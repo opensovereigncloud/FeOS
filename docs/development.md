@@ -111,6 +111,12 @@ Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
 - **`ferun-testnode`** (`go/cmd/ferun-testnode`): a node in memory that
   speaks feosd's side of the wire, for developing ferund and its UI
   without microVMs.
+- **`feos-k8s`** (`go/cmd/feos-k8s`): the controller of FeOS nodes on
+  Kubernetes: join tokens for new nodes, guard pods that hold a node's
+  drain until FeRun has drained it, the removal of nodes that are gone
+  ([ADR 0020](adr/0020-feos-on-kubernetes.md),
+  [architecture/kubernetes.md](architecture/kubernetes.md)). Static,
+  `CGO_ENABLED=0`.
 
 `feosd` and `feos-guest` run the container runtime in a process of their
 own, `--task-service`, and start it again when it exits. See
@@ -184,7 +190,7 @@ tests.
     make go-test         # every Go test, against a throwaway PostgreSQL 17 in
                          # docker, or the one FERUN_TEST_DATABASE_URL names
     make go-test-unit    # the Go tests; those that need a database skip
-    make go-build        # static ferund and ferun-testnode: target/go/
+    make go-build        # static ferund, ferun-testnode and feos-k8s: target/go/
     make go-gen          # go/gen from proto/, after a change of a .proto
     make web             # the UI into go/internal/ui/dist (npm ci, build)
     make ferund-package  # ferund with the UI and its .deb: target/packages/ferund/

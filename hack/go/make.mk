@@ -15,7 +15,7 @@ GO_MODULE := github.com/ironcore-dev/feos/go
 GO_PROTOS := $(sort $(wildcard proto/feos/*/v1/*.proto))
 GO_PROTO_MAP := $(foreach p,$(GO_PROTOS),M$(patsubst proto/%,%,$(p))=$(GO_MODULE)/gen/$(patsubst proto/%/,%,$(dir $(p)));$(word 2,$(subst /, ,$(patsubst proto/%,%,$(p))))v1)
 
-.PHONY: go-gen go-build go-fmt-check go-vet go-lint go-test go-test-unit web
+.PHONY: go-gen go-build feos-k8s go-fmt-check go-vet go-lint go-test go-test-unit web
 
 $(LOCALBIN)/protoc-gen-go: | $(LOCALBIN)
 	GOBIN=$(LOCALBIN) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
@@ -35,10 +35,14 @@ go-gen: $(LOCALBIN)/protoc-gen-go $(LOCALBIN)/protoc-gen-go-grpc ## Generate go/
 		$(foreach m,$(GO_PROTO_MAP),'--go-grpc_opt=$(m)') \
 		$(GO_PROTOS)
 
-go-build: ## Build ferund and ferun-testnode, static, into target/go/.
+go-build: feos-k8s ## Build ferund, ferun-testnode and feos-k8s, static, into target/go/.
 	mkdir -p $(GO_OUT)
 	cd $(GO_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -o ../$(GO_OUT)/ferund ./cmd/ferund
 	cd $(GO_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -o ../$(GO_OUT)/ferun-testnode ./cmd/ferun-testnode
+
+feos-k8s: ## Build feos-k8s, the controller of FeOS on Kubernetes (ADR 0020), static, into target/go/.
+	mkdir -p $(GO_OUT)
+	cd $(GO_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -o ../$(GO_OUT)/feos-k8s ./cmd/feos-k8s
 
 go-fmt-check: ## Check the Go code's formatting.
 	@out=$$(cd $(GO_DIR) && gofmt -l $$(find . -name '*.go' -not -path './gen/*')); \
