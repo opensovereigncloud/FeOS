@@ -8,6 +8,7 @@ import {
 import { Icon } from './Icon.jsx';
 import { Avatar, ThemeToggle, usePoll } from './components.jsx';
 import { TENANT_VIEWS, envPath, parsePath } from './routes.js';
+import { shortId } from './format.js';
 import { SignIn } from './views/SignIn.jsx';
 import { TenantGate } from './views/TenantGate.jsx';
 import { Overview } from './views/Overview.jsx';
@@ -217,7 +218,7 @@ function Topbar({ route, navigate, me, onSignOut }) {
         {(route.view === 'tenants' || t) && crumb('tenants', '/tenants')}
         {t && <>{sep}{crumb(t, `/tenants/${enc(t)}`, true)}</>}
         {route.view === 'sandboxes' && <>{sep}{crumb('sandboxes', `/tenants/${enc(t)}/sandboxes`)}</>}
-        {route.view === 'sandboxes' && route.sel && <>{sep}<span className="crumb mono">{route.sel.slice(0, 8)}</span></>}
+        {route.view === 'sandboxes' && route.sel && <>{sep}<span className="crumb mono">{shortId(route.sel)}</span></>}
         {route.view === 'tools' && <>{sep}<span className="crumb">tools</span></>}
         {route.view === 'environments' && <>{sep}{crumb('environments', envPath(t))}</>}
         {route.view === 'environments' && route.env && <>{sep}{crumb(route.env, envPath(t, route.env))}</>}

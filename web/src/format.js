@@ -132,7 +132,8 @@ export function prettyJson(v) {
   }
 }
 
-// shortId is the first 8 characters of a long ID.
+// shortId is an ID to show where space is short: a long one (a UUID) by
+// its first 8 characters, a short one (a pod's, 11 characters) whole.
 export function shortId(id) {
   if (!id) return '—';
   return id.length > 12 ? id.slice(0, 8) : id;

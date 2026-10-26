@@ -6,7 +6,7 @@ import { api } from '../api.js';
 import { Icon } from '../Icon.jsx';
 import { Ago, ErrBox, LiveBadge, StateDot, useNow, usePoll } from '../components.jsx';
 import { eventDescription, eventTitle, keyOf, levelOf } from '../events.jsx';
-import { fmtNs } from '../format.js';
+import { fmtNs, shortId } from '../format.js';
 import { sandboxCounts } from './fleet.js';
 
 // A tenant at a glance: its sandboxes by state, the most recently active
@@ -87,7 +87,7 @@ export function Overview({ tenant, navigate }) {
               {hotList.map((sb) => (
                 <tr key={sb.sandboxId} className="clickable" onClick={() => navigate(`${base}/${sb.sandboxId}`)}>
                   <td className="col-state"><StateDot state={sb.clientState} /></td>
-                  <td className="mono">{sb.sandboxId.slice(0, 8)}</td>
+                  <td className="mono">{shortId(sb.sandboxId)}</td>
                   <td className="muted trunc">{sb.image || 'default'}</td>
                   <td className="muted mono">{sb.node || '—'}</td>
                   <td className="col-when"><Ago iso={sb.updatedAt} /></td>
@@ -113,7 +113,7 @@ export function Overview({ tenant, navigate }) {
                 title={`${sb.sandboxId}: open its activity`}
                 onClick={() => navigate(`${base}/${sb.sandboxId}/activity`)}>
                 <span className="mono col-time">{fmtNs(ev.tsNs)}</span>
-                <span className="mono sbxref">{sb.sandboxId.slice(0, 8)}</span>
+                <span className="mono sbxref">{shortId(sb.sandboxId)}</span>
                 <span className={'evkind' + (levelOf(ev) === 'error' ? ' errtext' : '')}>{eventTitle(ev)}</span>
                 <span className="evdesc">{eventDescription(ev)}</span>
               </button>

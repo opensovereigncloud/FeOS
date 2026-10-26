@@ -157,6 +157,17 @@ describe('tenant tokens', () => {
     expect(calls[0].init.headers['X-Requested-With']).toBe('ferun');
   });
 
+  it('a create names no sandbox ID: ferund mints it', async () => {
+    setTenantToken('acme', 'tok-1');
+    setActiveTenant('acme');
+    answer(201, { status: { sandboxId: 'abcdefghjkm' }, token: 't', created: true });
+    const res = await api.createSandbox('img:1', 2, 512);
+    expect(calls[0].path).toBe('/api/v1/sandboxes');
+    expect(calls[0].init.method).toBe('POST');
+    expect(JSON.parse(calls[0].init.body)).toEqual({ image: 'img:1', vcpus: 2, memoryMib: 512 });
+    expect(res.status.sandboxId).toBe('abcdefghjkm');
+  });
+
   it('a refused token is forgotten, and the listeners hear it', async () => {
     setTenantToken('acme', 'tok-1');
     setActiveTenant('acme');
