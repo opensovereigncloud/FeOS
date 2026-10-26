@@ -49,6 +49,13 @@ pub struct Args {
     /// can never reach objects in use.
     #[arg(long, env = "DISKD_S3_PREFIX", default_value = "")]
     s3_prefix: String,
+
+    /// On SIGTERM, serve on until no process holds the lock of this file,
+    /// such as feosd's /var/lib/feos/feosd.lock, then exit: for a diskd
+    /// stopped together with a feosd that suspends its pods first, whose
+    /// disks diskd serves (ADR 0020). Without, SIGTERM ends diskd at once.
+    #[arg(long, value_name = "LOCK_FILE")]
+    pub stop_after_lock: Option<PathBuf>,
 }
 
 impl Args {
@@ -92,6 +99,17 @@ mod tests {
         assert_eq!(a.s3_concurrency, 16);
         assert_eq!(a.mem_readahead, 8);
         assert_eq!(a.s3_prefix(), "");
+    }
+
+    #[test]
+    fn stop_after_lock_names_a_file() {
+        let a = Args::parse_from(["diskd"]);
+        assert_eq!(a.stop_after_lock, None);
+        let a = Args::parse_from(["diskd", "--stop-after-lock", "/var/lib/feos/feosd.lock"]);
+        assert_eq!(
+            a.stop_after_lock,
+            Some(PathBuf::from("/var/lib/feos/feosd.lock"))
+        );
     }
 
     #[test]

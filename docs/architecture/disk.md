@@ -24,11 +24,20 @@ so does every volume. The decisions behind it:
   scripts, tests and operators. It prints JSON.
 
 `diskd [--state-dir DIR] [--socket PATH] [--budget-bytes N]
-[--s3-concurrency N] [--mem-readahead N] [--s3-prefix P]`. The state
+[--s3-concurrency N] [--mem-readahead N] [--s3-prefix P]
+[--stop-after-lock FILE]`. The state
 directory defaults to `/var/lib/feos/disk`, the socket to
 `<state-dir>/diskd.sock` (mode 0660, as `feosd`'s), the cache budget to
 8 GiB. Logs are JSON when stdout is not a terminal; `RUST_LOG` filters
 them.
+
+One diskd per state directory: it takes an exclusive `flock(2)` on
+`<state-dir>/diskd.lock` before anything else and holds it until it ends,
+waiting while another process holds it. SIGTERM ends diskd at once; with
+`--stop-after-lock FILE`, diskd serves on after it until no process holds
+`FILE`'s lock, then exits: for a diskd stopped together with a `feosd`
+that suspends its pods first, through diskd's disks
+(`/var/lib/feos/feosd.lock`, [node.md](node.md#on-kubernetes)).
 
 The object store is S3 or compatible, configured from the environment:
 `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
@@ -249,6 +258,7 @@ pod is `RestorePod` with its own checkpoint:
 | Path (in the state directory) | Holds |
 |---|---|
 | `diskd.sock` | the API |
+| `diskd.lock` | the lock of the one diskd on the state directory, with its pid |
 | `diskd.state` | the device table: pod, ublk device id, chain, size |
 | `cache/<hh>/<hash>` | raw chunks, within the budget |
 | `staging/` | chunks and manifests before their rename, a compressed image while it is imported |

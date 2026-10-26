@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 disk-store = { workspace = true }
 feos-proto = { workspace = true }
+feos-utils = { workspace = true }
 libublk = { workspace = true }
 io-uring = { workspace = true }
 clap = { workspace = true }

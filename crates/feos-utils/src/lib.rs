@@ -14,6 +14,7 @@ pub mod pod_id;
 pub mod reaper;
 pub mod resolver;
 pub mod share;
+pub mod state_lock;
 pub mod version;
 pub mod vsock;
 pub mod wireguard;

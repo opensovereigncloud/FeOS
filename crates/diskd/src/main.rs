@@ -75,6 +75,28 @@ async fn main() -> Result<(), String> {
     let socket = args.socket();
     let s3_prefix = args.s3_prefix();
     std::fs::create_dir_all(&args.state_dir).map_err(|e| e.to_string())?;
+    // One diskd per state directory: another one, such as the old pod's of
+    // a rollout, ends first. Held until diskd ends.
+    let lock = args.state_dir.join(STATE_LOCK);
+    let _state = feos_utils::state_lock::take(&lock, |holder| {
+        warn!(
+            lock = %lock.display(),
+            holder = ?holder,
+            "another diskd runs on this state directory: waiting for it to end"
+        )
+    })
+    .await
+    .map_err(|e| format!("lock {}: {e}", lock.display()))?;
+    // Handled from the start, so that a SIGTERM during the recovery waits
+    // too.
+    let terminated = match &args.stop_after_lock {
+        Some(path) => Some((
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| format!("handle SIGTERM: {e}"))?,
+            path.clone(),
+        )),
+        None => None,
+    };
     info!(
         state_dir = %args.state_dir.display(),
         socket = %socket.display(),
@@ -161,9 +183,36 @@ async fn main() -> Result<(), String> {
 
     info!("diskd serving");
     notify_ready();
-    tonic::transport::Server::builder()
+    let server = tonic::transport::Server::builder()
         .add_service(feos_proto::disk_service::disk_service_server::DiskServiceServer::new(svc))
-        .serve_with_incoming(incoming)
-        .await
-        .map_err(|e| e.to_string())
+        .serve_with_incoming(incoming);
+    tokio::select! {
+        served = server => served.map_err(|e| e.to_string()),
+        () = stop_after_lock(terminated) => Ok(()),
+    }
+}
+
+/// The lock diskd holds on its state directory.
+const STATE_LOCK: &str = "diskd.lock";
+/// How often a stopping diskd looks whether the lock it outlives is free.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// With --stop-after-lock: resolves after SIGTERM, once no process holds
+/// the lock; the devices stay for the next diskd to recover. Without, never.
+async fn stop_after_lock(terminated: Option<(tokio::signal::unix::Signal, std::path::PathBuf)>) {
+    let Some((mut signal, path)) = terminated else {
+        return std::future::pending().await;
+    };
+    signal.recv().await;
+    info!(lock = %path.display(), "SIGTERM: diskd stops once nothing holds the lock");
+    loop {
+        match feos_utils::state_lock::is_held(&path) {
+            Ok(false) => break,
+            Ok(true) => {}
+            // Better to serve on than to leave a feosd without its disks.
+            Err(e) => warn!(lock = %path.display(), error = %e, "the lock does not read"),
+        }
+        tokio::time::sleep(STOP_POLL).await;
+    }
+    info!("diskd stops");
 }
