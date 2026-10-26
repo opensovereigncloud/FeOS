@@ -167,7 +167,7 @@ in_node grep -qx "${legacy}" "${vms}/legacy/cgroup.procs" ||
 in_node test ! -e "${unit}/vms" || fail "feosd.service still has vms/"
 in_node grep -qE "cpu|memory" "${unit}/cgroup.subtree_control" &&
   fail "feosd.service's cgroup has controllers on for its children after the hand-over"
-in_node kill "${legacy}"
+in_node sh -c "kill ${legacy}"
 await "the old VM's process did not end" in_node sh -c "! grep -q . ${vms}/legacy/cgroup.procs"
 in_node rmdir "${vms}/legacy"
 in_node grep -qx "${pid}" "${vms}/${bare}/cgroup.procs" || fail "the pod left its cgroup"
