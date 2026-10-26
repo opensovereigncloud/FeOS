@@ -78,8 +78,9 @@ from node to node would need a route per pod, changed with every move.
 
 ### Each pod's TAP is a link of its own
 
-- The pod's TAP device (`pod-<8 hex of its ID>`) is a point-to-point link
-  between the node and the pod; there is no bridge. The pod's addresses
+- The pod's TAP device (`pod-<ID>`, [ADR 0019](0019-pod-ids.md); for a
+  pod with a UUID, made before short IDs, `pod-<8 hex of its ID>`) is a
+  point-to-point link between the node and the pod; there is no bridge. The pod's addresses
   have a /128 and a /32 route on its TAP.
 - The pod's gateways are `fe80::1` and `169.254.0.1`. The node is
   `fe80::1` on every TAP, and answers ARP for `169.254.0.1` on it by

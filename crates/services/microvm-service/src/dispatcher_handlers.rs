@@ -15,6 +15,7 @@ use feos_proto::microvm::{
     StartVmResponse, StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest,
     SuspendVmResponse, VmEvent, VmInfo, VmState, VmStateChangedEvent,
 };
+use feos_utils::pod_id::PodId;
 use log::{error, info, warn};
 use prost::Message;
 use prost_types::Any;
@@ -46,20 +47,20 @@ fn vm_info(record: VmRecord, guests: &Guests) -> VmInfo {
 async fn prepare_vm_creation(
     repository: &VmRepository,
     req: &CreateVmRequest,
-) -> Result<Uuid, VmServiceError> {
-    let vm_id_res: Result<(Uuid, bool), VmServiceError> =
+) -> Result<PodId, VmServiceError> {
+    let vm_id_res: Result<(PodId, bool), VmServiceError> =
         if let Some(id_str) = req.vm_id.as_deref().filter(|s| !s.is_empty()) {
-            match Uuid::parse_str(id_str) {
-                Ok(id) if !id.is_nil() => Ok((id, true)),
-                Ok(_) => Err(VmServiceError::InvalidArgument(
+            match PodId::parse(id_str) {
+                Ok(PodId::Uuid(id)) if id.is_nil() => Err(VmServiceError::InvalidArgument(
                     "Provided vm_id cannot be the nil UUID.".to_string(),
                 )),
+                Ok(id) => Ok((id, true)),
                 Err(_) => Err(VmServiceError::InvalidArgument(
-                    "Provided vm_id is not a valid UUID format.".to_string(),
+                    "Provided vm_id is neither a short pod ID nor a UUID.".to_string(),
                 )),
             }
         } else {
-            Ok((Uuid::new_v4(), false))
+            Ok((PodId::mint(), false))
         };
 
     let (vm_id, is_user_provided) = vm_id_res?;
@@ -113,7 +114,7 @@ async fn get_vm_info(
     req: &GetVmRequest,
     guests: &Guests,
 ) -> Result<VmInfo, VmServiceError> {
-    let vm_id = Uuid::parse_str(&req.vm_id)
+    let vm_id = PodId::parse(&req.vm_id)
         .map_err(|_| VmServiceError::InvalidArgument("Invalid VM ID format.".to_string()))?;
 
     match repository.get_vm(vm_id).await? {
@@ -127,8 +128,8 @@ async fn get_vm_info(
 async fn parse_vm_id_and_get_record(
     vm_id_str: &str,
     repository: &VmRepository,
-) -> Result<(Uuid, VmRecord), VmServiceError> {
-    let vm_id = Uuid::parse_str(vm_id_str)
+) -> Result<(PodId, VmRecord), VmServiceError> {
+    let vm_id = PodId::parse(vm_id_str)
         .map_err(|_| VmServiceError::InvalidArgument("Invalid VM ID format.".to_string()))?;
 
     match repository.get_vm(vm_id).await? {
@@ -191,7 +192,7 @@ pub(crate) async fn handle_stream_vm_events_command(
     status_channel_tx: broadcast::Sender<VmEventWrapper>,
 ) {
     if let Some(vm_id_str) = req.vm_id.clone() {
-        let vm_id = match Uuid::parse_str(&vm_id_str) {
+        let vm_id = match PodId::parse(&vm_id_str) {
             Ok(id) => id,
             Err(_) => {
                 let status = Status::invalid_argument("Invalid VM ID format.");
@@ -319,14 +320,14 @@ pub(crate) async fn handle_stream_vm_events_command(
 
 pub(crate) async fn handle_delete_vm_command(
     repository: &VmRepository,
-    healthcheck_cancel_bus: &broadcast::Sender<Uuid>,
+    healthcheck_cancel_bus: &broadcast::Sender<PodId>,
     req: DeleteVmRequest,
     responder: oneshot::Sender<Result<DeleteVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
     guests: Arc<Guests>,
 ) {
-    let vm_id = match Uuid::parse_str(&req.vm_id) {
+    let vm_id = match PodId::parse(&req.vm_id) {
         Ok(id) => id,
         Err(_) => {
             let _ = responder.send(Err(VmServiceError::InvalidArgument(
@@ -453,7 +454,7 @@ pub(crate) async fn handle_start_vm_command(
     responder: oneshot::Sender<Result<StartVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
-    healthcheck_cancel_bus_tx: &broadcast::Sender<Uuid>,
+    healthcheck_cancel_bus_tx: &broadcast::Sender<PodId>,
     guests: Arc<Guests>,
 ) {
     let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
@@ -525,7 +526,7 @@ pub(crate) async fn handle_resume_vm_command(
     responder: oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
-    healthcheck_cancel_bus_tx: &broadcast::Sender<Uuid>,
+    healthcheck_cancel_bus_tx: &broadcast::Sender<PodId>,
     guests: Arc<Guests>,
 ) {
     let (_vm_id, record) = match parse_vm_id_and_get_record(&req.vm_id, repository).await {
@@ -632,7 +633,7 @@ pub(crate) async fn handle_set_guest_network_command(
 pub(crate) async fn check_and_cleanup_vms(
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
-    healthcheck_cancel_bus: &broadcast::Sender<Uuid>,
+    healthcheck_cancel_bus: &broadcast::Sender<PodId>,
     vms: Vec<VmRecord>,
 ) {
     for vm in vms {
@@ -693,7 +694,7 @@ pub(crate) async fn perform_startup_sanity_check(
     repository: &VmRepository,
     hypervisor: Arc<dyn Hypervisor>,
     event_bus_tx: mpsc::Sender<VmEventWrapper>,
-    healthcheck_cancel_bus: &broadcast::Sender<Uuid>,
+    healthcheck_cancel_bus: &broadcast::Sender<PodId>,
     guests: &Arc<Guests>,
 ) {
     info!("VmDispatcher: Running initial sanity check...");

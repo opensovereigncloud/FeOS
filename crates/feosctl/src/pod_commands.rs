@@ -88,7 +88,10 @@ pub enum PodCommand {
 
 #[derive(Args, Debug)]
 pub struct CreatePodOptions {
-    #[arg(long, help = "The pod's ID, a UUID; a new one when not given")]
+    #[arg(
+        long,
+        help = "The pod's ID, 11 characters of lowercase Crockford base32 (or a UUID); a new one when not given"
+    )]
     pod_id: Option<String>,
 
     #[arg(long, default_value_t = 1)]
@@ -324,9 +327,7 @@ fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
         None
     };
     CreatePodRequest {
-        pod_id: opts
-            .pod_id
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        pod_id: opts.pod_id.unwrap_or_else(feos_utils::pod_id::mint),
         spec: Some(PodSpec {
             resources: Some(Resources {
                 vcpus: opts.vcpus,
@@ -664,7 +665,7 @@ mod tests {
         assert_eq!(spec.containers[0].command, ["sleep", "infinity"]);
         assert_eq!(spec.containers[0].env["A"], "b");
         assert_eq!(spec.network, None, "a pod has a network by default");
-        assert!(uuid::Uuid::parse_str(&request.pod_id).is_ok());
+        assert!(feos_utils::pod_id::is_short(&request.pod_id));
     }
 
     #[test]

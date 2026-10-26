@@ -52,7 +52,7 @@ prost = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-feos-utils = { workspace = true }
+feos-utils = { workspace = true, features = ["pod-id"] }
 pod-service = { workspace = true }
 uuid = { workspace = true }
 microvm-service = { workspace = true }

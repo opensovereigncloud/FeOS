@@ -243,7 +243,8 @@ fn count(pods: &[PodInfo]) -> Counts {
 
 /// The hash of the node's steady pods: the SHA-256 of a line
 /// "<pod id> <state>\n" per running or suspended pod, sorted by ID, which
-/// the control plane computes from its registry too.
+/// the control plane computes from its registry too. A UUID is written
+/// hyphenated in lower case, a short ID (ADR 0019) as it is.
 pub fn inventory_hash(pods: &[PodInfo]) -> String {
     let mut lines: Vec<(String, &str)> = pods
         .iter()
@@ -286,8 +287,12 @@ mod tests {
             pod("11111111-2222-4333-8444-555555555555", PodState::Pending),
             pod("66666666-7777-4888-9999-aaaaaaaaaaaa", PodState::Hibernated),
             pod("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff", PodState::Stopped),
+            // A short ID (ADR 0019) is as it is, beside UUIDs.
+            pod("k7m2q9x4c1b", PodState::Running),
         ];
-        let text = format!("{b} POD_STATE_SUSPENDED\n{a} POD_STATE_RUNNING\n");
+        let text = format!(
+            "{b} POD_STATE_SUSPENDED\n{a} POD_STATE_RUNNING\nk7m2q9x4c1b POD_STATE_RUNNING\n"
+        );
         assert_eq!(inventory_hash(&pods), sha256_hex(text.as_bytes()));
         // The order of the pods does not matter.
         let mut reversed = pods.clone();
@@ -295,14 +300,14 @@ mod tests {
         assert_eq!(inventory_hash(&reversed), inventory_hash(&pods));
         // No steady pods: the hash of nothing.
         assert_eq!(
-            inventory_hash(&pods[2..]),
+            inventory_hash(&pods[2..5]),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
         assert_eq!(
             count(&pods),
             Counts {
                 pending: 1,
-                running: 1,
+                running: 2,
                 suspended: 1,
                 other: 2
             }

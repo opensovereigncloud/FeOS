@@ -102,7 +102,7 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 | `/var/lib/feos/security-groups/<id>.pb` | a security group (a `feos.network.v1.SecurityGroup`) |
 | `/var/lib/feos/name-tables/<id>.pb` | a name table (a `feos.network.v1.NameTable`) |
 | `/var/lib/feos/volumes/<id>.pb` | a volume (a `feos.volume.v1.Volume`); `empty-layer.img`, the image of the volumes' empty L0 |
-| `/var/lib/feos/vms.db` | the microVM records (SQLite) |
+| `/var/lib/feos/vms.db` | the microVM records (SQLite), by the pod's ID: a UUID as its 16 bytes, a short ID as text |
 | `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
 | `/var/lib/feos/disk/` | diskd's state: the pods' disks, the chunk cache ([disk.md](disk.md)) |
 | `/var/lib/feos/images/` | pulled images, a `metadata.json` each |
@@ -184,6 +184,12 @@ names, which the guest runs with the names as their IDs. Its spec gives
 vCPUs and memory, the containers (image, command, environment, the
 volumes they mount), whether it has a network, and its volumes. The
 microVM has a balloon with free page reporting.
+
+A pod's ID is 11 characters of lowercase Crockford base32, a letter
+first, which ferund or `feosctl` mints ([ADR 0019](../adr/0019-pod-ids.md));
+it names the microVM, the pod's paths and its TAP device. A pod made
+before keeps its UUID, and `feosd` takes both (`feos_utils::pod_id`);
+every call with any other ID fails with `INVALID_ARGUMENT`.
 
 - **Create** claims the pod's volumes, records the pod as `PENDING` and
   brings it up in the background: open its disk and its volumes' disks,
@@ -317,7 +323,8 @@ alone. It never holds `169.254.0.1`: where that is the gateway of the
 node's own network, as in some clouds, the node would lose its own.
 
 Before every boot and resume of a pod, `feosd` makes its TAP device,
-`pod-<8 hex digits of the ID>`, a link of its own between the node and
+`pod-<ID>` ([ADR 0019](../adr/0019-pod-ids.md); `pod-<8 hex digits of
+the ID>` for a pod with a UUID), a link of its own between the node and
 the pod:
 
 - no router advertisements, no address autoconfiguration and no
@@ -342,9 +349,10 @@ the pod:
 The guest is pushed its IPv6 address as a /128 with `fe80::1` as its
 gateway, its IPv4 address as a /32 with `169.254.0.1` as its gateway, on
 the link although outside the /32, and the resolver
-([guest.md](guest.md)); its MAC address is `06:00` and the 8 hex digits
-of its ID. A pod whose IPv6 address is a ULA has no default route over
-IPv6 ([ADR 0017](../adr/0017-pod-mesh.md)): it is pushed a route for
+([guest.md](guest.md)); its MAC address is `06:00` and the first four
+bytes of the SHA-256 of its ID, for a pod with a UUID the 8 hex digits
+of its TAP device. A pod whose IPv6 address is a ULA has no default
+route over IPv6 ([ADR 0017](../adr/0017-pod-mesh.md)): it is pushed a route for
 `fc00::/7` via `fe80::1` instead, with the mesh's MTU of 1420 on a mesh,
 so that a name with addresses of both families is reached over IPv4 at
 once (RFC 6724, rule 1) rather than after an unreachable that the node

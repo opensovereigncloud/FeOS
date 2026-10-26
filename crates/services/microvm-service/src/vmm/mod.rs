@@ -7,6 +7,7 @@ use feos_proto::microvm::{
     PingVmResponse, ShutdownVmRequest, ShutdownVmResponse, StartVmRequest, VmConfig, VmEvent,
     VmStateChangedEvent,
 };
+use feos_utils::pod_id::PodId;
 use prost::Message;
 use prost_types::Any;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -109,7 +110,7 @@ pub trait Hypervisor: Send + Sync {
         &self,
         vm_id: String,
         broadcast_tx: mpsc::Sender<VmEventWrapper>,
-        cancel_bus: broadcast::Receiver<Uuid>,
+        cancel_bus: broadcast::Receiver<PodId>,
     );
 
     /// Whether `pid` is the VMM process of the VM, and alive.

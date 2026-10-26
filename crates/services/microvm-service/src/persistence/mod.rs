@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use feos_proto::microvm::{VmConfig, VmState};
+use feos_utils::pod_id::PodId;
 use uuid::Uuid;
 
 pub mod repository;
@@ -33,7 +34,7 @@ pub struct VmStatus {
 
 #[derive(Debug, Clone)]
 pub struct VmRecord {
-    pub vm_id: Uuid,
+    pub vm_id: PodId,
     pub image_uuid: Uuid,
     pub status: VmStatus,
     pub config: VmConfig,

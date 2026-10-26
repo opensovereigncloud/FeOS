@@ -11,9 +11,9 @@ use feos_proto::microvm::{
 };
 use feos_proto::pod_service::{PodSpec, Resources};
 use feos_utils::filesystem::volume as feos_volume;
+use feos_utils::pod_id::PodId;
 use std::collections::{BTreeMap, HashSet};
 use tonic::Status;
-use uuid::Uuid;
 
 const DEFAULT_VCPUS: u32 = 1;
 const DEFAULT_MEMORY_MIB: u64 = 512;
@@ -32,11 +32,12 @@ const MAX_VOLUMES: usize = 8;
 const MAX_METADATA_BYTES: usize = 32 * 1024;
 const MAX_METADATA_KEY: usize = 128;
 
-/// Checks a pod's ID: a UUID, which also names its microVM and its paths.
+/// Checks a pod's ID, which also names its microVM and its paths: a short
+/// one, or the UUID of a pod made before short IDs (ADR 0019).
 pub fn check_id(pod_id: &str) -> Result<(), Status> {
-    Uuid::parse_str(pod_id)
+    PodId::parse(pod_id)
         .map(|_| ())
-        .map_err(|_| Status::invalid_argument(format!("pod ID {pod_id:?} is not a UUID")))
+        .map_err(|e| Status::invalid_argument(e.to_string()))
 }
 
 /// Checks a spec and fills in the defaults, so that two creates of a pod
@@ -356,10 +357,15 @@ mod tests {
     }
 
     #[test]
-    fn pod_ids_are_uuids() {
+    fn pod_ids_are_short_or_uuids() {
+        assert!(check_id("k7m2q9x4c1b").is_ok());
         assert!(check_id("11111111-2222-3333-4444-555555555555").is_ok());
         assert!(check_id("../etc").is_err());
         assert!(check_id("").is_err());
+        // A digit first, a letter Crockford leaves out, upper case.
+        assert!(check_id("07m2q9x4c1b").is_err());
+        assert!(check_id("k7m2q9x4c1u").is_err());
+        assert!(check_id("K7M2Q9X4C1B").is_err());
     }
 
     #[test]

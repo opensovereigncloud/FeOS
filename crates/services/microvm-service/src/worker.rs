@@ -9,6 +9,7 @@ use feos_proto::microvm::{
     StreamVmConsoleResponse, StreamVmEventsRequest, SuspendVmRequest, SuspendVmResponse, VmEvent,
     VmState, VmStateChangedEvent,
 };
+use feos_utils::pod_id::PodId;
 use log::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +19,6 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use tonic::Status;
-use uuid::Uuid;
 
 /// The newest installed guest: the microVM links its files and keeps that
 /// version.
@@ -133,7 +133,7 @@ pub fn start_healthcheck_monitor(
     vm_id: String,
     hypervisor: Arc<dyn Hypervisor>,
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
-    cancel_bus: broadcast::Receiver<Uuid>,
+    cancel_bus: broadcast::Receiver<PodId>,
 ) {
     let health_hypervisor = hypervisor;
     let health_broadcast_tx = broadcast_tx;
@@ -149,7 +149,7 @@ pub async fn handle_start_vm(
     responder: oneshot::Sender<Result<StartVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
-    cancel_bus: Option<broadcast::Receiver<Uuid>>,
+    cancel_bus: Option<broadcast::Receiver<PodId>>,
     guests: Arc<Guests>,
 ) {
     let vm_id = req.vm_id.clone();
@@ -334,7 +334,7 @@ pub async fn handle_restore_vm(
     responder: oneshot::Sender<Result<ResumeVmResponse, VmServiceError>>,
     hypervisor: Arc<dyn Hypervisor>,
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
-    cancel_bus: broadcast::Receiver<Uuid>,
+    cancel_bus: broadcast::Receiver<PodId>,
     guests: Arc<Guests>,
 ) {
     let vm_id = req.vm_id.clone();
