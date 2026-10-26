@@ -167,7 +167,9 @@ replicate synchronously ([Operations](#operations)).
   traffic records ([Nodes](#nodes)); `0005_mesh.sql`, the pods' mesh;
   `0006_environments.sql`, the environments' tables and five columns of
   `sandboxes` ([Environments](#environments)); `0007_names.sql`, the
-  incident `names_unserved` ([Names](#names))) and
+  incident `names_unserved` ([Names](#names)); `0008_pod_ids.sql`, the
+  sandbox IDs' columns from `uuid` to `text` and the drop of `placements`
+  ([Sandbox IDs](#sandbox-ids))) and
   applied under an advisory lock, recorded in `schema_migrations`. The
   same locked section creates the cluster's MCP session key, reconciles
   `--pod-network` with the database's ([The pods'
@@ -204,10 +206,8 @@ partitioned by day; `issued_certs` (pods' certificates); `watches`;
 `env_incidents`, `env_route_tokens` ([Environments](#environments)).
 Tokens are stored as SHA-256 hashes only, and shown once, at their
 creation.
-`placements`, which held the placement decisions, is written and read by
-nothing since `0003` emptied it, and goes in a later migration: the
-previous version, which a rolling deploy runs beside this one, still
-inserts into it in every create's and restore's begin. A placement's
+`placements`, which held the placement decisions and was written and read
+by nothing since `0003` emptied it, was dropped by `0008`. A placement's
 audit is its activity row.
 
 ## Leader and instances
@@ -569,10 +569,48 @@ A sandbox is a row in `sandboxes`; its pod on a node has the sandbox's ID
 as its pod ID. The row is the truth every instance acts on; nothing about
 a sandbox lives in an instance.
 
+### Sandbox IDs
+
+A sandbox's ID, which is its pod's ([ADR 0019](../adr/0019-pod-ids.md)),
+is 11 characters of lowercase Crockford base32, the first a letter
+(`^[a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}$`, `internal/podid`). ferund
+mints every one from the cryptographic random source: a tenant's sandbox
+at its create, an environment's instance at its insert. They are unique
+over all tenants, the primary key of `sandboxes`; an insert whose drawn
+ID is taken draws another (`CreateMintedSandbox`). A client names none:
+`POST /api/v1/sandboxes` refuses a `sandboxId` ([REST](#rest)) and
+answers the new one. feosd names the pod's TAP device `pod-<ID>`, so two
+pods with short IDs never share one.
+
+A sandbox made before keeps its UUID until it is deleted: it may be
+running, paused or hibernated, and its snapshot names its TAP device,
+`pod-` and its first 8 hex digits. ferund stores both formats side by
+side and serves both everywhere an ID goes: paths take either (a UUID in
+either case, shown in lowercase), and only a UUID's pod can share a TAP
+device's name with another UUID's, which the placement's TAP gate keeps
+apart ([Placement](#placement)). Every column that holds a sandbox's or
+a pod's ID (`sandboxes.id` and the `sandbox_id`, `pod_id` and `holder`
+columns that name one) is `text COLLATE "C"`, with a check of the two
+formats in their canonical form: they compare and sort byte by byte, as
+feosd sorts its inventory. Other IDs (tokens, environments, volumes,
+incarnations, ops, watches) stay UUIDs.
+
+`0008_pod_ids.sql` changed those columns in one transaction, the logs
+first: `activity` and `traffic_records` are rewritten with their indexes
+(about a minute for 2 million rows of activity), while the sandboxes'
+tables are locked only for the short rest. The change is not additive:
+an instance of the previous version, which a rolling deploy runs beside
+the new one, fails its writes of the logs during the rewrite, and
+afterwards its queries that cast a sandbox ID to `uuid` and its reads of
+a short ID, until the deploy has replaced it. feosd must accept short IDs
+before ferund mints them (the rollout of ADR 0019).
+
 ### The pod and its incarnation
 
 Every row has an **incarnation**, a UUID set when the row is inserted: a
-sandbox deleted and created again with the same ID is a new incarnation.
+row inserted again under an ID that was deleted would be a new
+incarnation (ferund mints new IDs, so only a drawn ID of a deleted
+sandbox could be).
 The pod's spec is `{resources: {vcpus, memory_mib}, containers: [{name:
 "main", image_ref, command: ["sleep", "infinity"]}], network: {}, labels:
 {ferun.sandbox, ferun.tenant, ferun.incarnation}}`, the same on every
@@ -776,9 +814,11 @@ verdict) show: the node is `ready`; for a create of a row pinned to a
 node (`pin_node`, [Environments](#instances-are-sandbox-rows)), that node
 ("pinned to node <n>: its volume is there"); not draining; not
 forked; connected to this instance; no tombstone of this pod ID on it; not
-avoided after a failed create (a pinned row never is); no other sandbox
-on it whose ID starts with the same 8 hex digits and may hold a TAP
-device (feosd derives the TAP name from them); for a restore, the
+avoided after a failed create (a pinned row never is); for a sandbox with
+a UUID, no other sandbox with a UUID on it whose ID starts with the same 8
+hex digits and may hold a TAP device (feosd names a UUID's TAP device
+after them; a short ID names its own, and passes: [Sandbox
+IDs](#sandbox-ids)); for a restore, the
 checkpoint's object store; slots; CPU, `floor(cores × cpu_overcommit)`,
 not gated when 0; memory, the total less the headroom; free memory, the
 reported available less the headroom; disk, the available against
@@ -879,9 +919,9 @@ and repair do not back off.
 a tombstone for every node a pod of this incarnation may be on (one that a
 live op may still create waits for the op's deadline), and its tokens,
 holds, watches, bindings and booking with it. An op in flight is fenced
-out when it finishes. A create of the same ID right after is a new
-incarnation, which placement keeps off a node until that node's
-tombstone is done.
+out when it finishes. A row under the same ID later (a drawn ID of a
+deleted sandbox) is a new incarnation, which placement keeps off a node
+until that node's tombstone is done.
 
 ## Front doors
 
@@ -904,8 +944,17 @@ A tenant's token is not accepted on a sandbox route, not even for its own
 sandbox (the forward class answers it 401 "forwarding needs a sandbox
 token", [ports](#ports)); whoever names what they may not see gets the
 answer of an absent thing, 404. Every unknown route under `/api/` is 404
-`{"error": "no such route: METHOD PATH"}`, never 405. A sandbox ID must be
-a UUID. The admin API has tenants, each with `sandboxCount` (its
+`{"error": "no such route: METHOD PATH"}`, never 405. A sandbox ID in a
+path is a short ID or a UUID, either case ([Sandbox IDs](#sandbox-ids));
+anything else is 400 "sandboxId must be a sandbox ID: 11 characters of
+lowercase Crockford base32, the first a letter, or a UUID". `POST
+/api/v1/sandboxes` takes `image`, `vcpus`, `memoryMib` and `attachable`
+and no `sandboxId`: one that is neither absent, null nor `""` is 400
+"sandboxId is not accepted: ferund mints a sandbox's ID; leave it out
+and keep status.sandboxId of the answer". Every create makes a new
+sandbox, 201 `{status, token, created: true}`, the ID ferund minted in
+`status.sandboxId`; it is not idempotent, so a client keeps the ID before
+it relies on the sandbox. The admin API has tenants, each with `sandboxCount` (its
 sandboxes, without its environments' instances), `environmentCount` (its
 environments not being deleted) and its tokens (hashed, shown once),
 nodes (with their connections to the serving instance, certificates,
@@ -1159,16 +1208,14 @@ its volumes, mounts, groups and name tables, and the sandbox's labels
 beside the template's `ferun.environment`, `ferun.object`
 (`<kind>/<name>`) and `ferun.template` (the template hash). There is no
 release label: an object a release does not change keeps its pods. Rows
-are inserted with `idle_after_s` always written, random IDs (UUIDv4: the
-placement's TAP gate compares the first 8 hex digits, which two UUIDv7s
-made within a minute share), and at least 256 MiB, the rows' floor,
+are inserted with `idle_after_s` always written, IDs ferund mints ([Sandbox
+IDs](#sandbox-ids)), and at least 256 MiB, the rows' floor,
 which valkey's and nats's `dev` plans are raised to.
 
 Instance rows are no tenant's sandboxes: the tenant's listing and the
 admin listing's `sandboxCount` leave them out, the tenant routes answer
 them 404 `unknown sandbox <id>`, the sandbox-token doors `no such
-sandbox`, a create with an instance's ID 409 `sandbox id <id> already
-exists`, and no sandbox token is minted for one.
+sandbox`, and no sandbox token is minted for one.
 A tenant with environments is not deleted: `DeleteTenantIfEmpty` waits
 for them, `env-delete` marks the environments of a deleting tenant
 deleting, and an environment's create, apply, clone and secret, and the
@@ -1665,14 +1712,15 @@ paused sandbox it is 409 "paused".
 The service may use its sandbox while that exists, is the environment
 owner's and is no instance row. Otherwise the service is `failed`,
 "sandbox <id> is gone or not this tenant's", and is never started,
-checked, routed to or made a group member there: a sandbox ID is free
-again once its sandbox is deleted, and another tenant's sandbox under it
-stays refused. The owner's sandbox deleted and created again under the
-same ID (FeCode replaces a lost workspace sandbox so) is a new
-incarnation, in which the service starts anew: the row records the new
-incarnation and forgets the process, which went with the old one, its
-phase is `starting`, and its restarts, next restart, probe failures and
-detail are reset; a new sandbox that sleeps is woken for the start.
+checked, routed to or made a group member there; another tenant's
+sandbox under its ID stays refused. A new incarnation of the owner's
+sandbox under the same ID is one in which the service starts anew: the
+row records the new incarnation and forgets the process, which went with
+the old one, its phase is `starting`, and its restarts, next restart,
+probe failures and detail are reset; a new sandbox that sleeps is woken
+for the start. (A client cannot make a sandbox under an ID of its choice
+any more, [ADR 0019](../adr/0019-pod-ids.md): a replaced sandbox has a
+new ID, which the environment's spec names in a new release.)
 
 **Cleanup.** A service that goes, removed from T, moved to another
 sandbox or with its environment deleted, has its process stopped before
@@ -1886,11 +1934,12 @@ day and dropped after `--activity-retention` and `--traffic-retention`.
 token after checking the pin, keeps a node connection and an uplink to
 every listed instance, reports telemetry with the inventory hash,
 publishes events with acknowledgements, renews its certificate, and asks
-for pods' credentials. Its pods live in memory under feosd's rules,
-hibernate into an object store in memory or in a directory that several
-test nodes share, and have a fake guest: commands run in a directory per
-pod, the tools work on it, watches answer from a script, ports dial local
-addresses. It can restart, crash and be partitioned, and its mutating pod
+for pods' credentials. Its pods live in memory under feosd's rules (short
+IDs and UUIDs, their TAP devices named as feosd names them, so that two
+pods whose UUIDs begin alike collide), hibernate into an object store in
+memory or in a directory that several test nodes share, and have a fake
+guest: commands run in a directory per pod, the tools work on it, watches
+answer from a script, ports dial local addresses. It can restart, crash and be partitioned, and its mutating pod
 calls can stop where today's feosd stops when their request is cancelled,
 which proves that ferund never cancels them. Its hibernations run as
 feosd's do: in a task of their own, which further calls join and a resume
