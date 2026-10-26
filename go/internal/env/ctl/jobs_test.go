@@ -19,6 +19,7 @@ import (
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -32,7 +33,7 @@ func jobSpec(command string, retries int) string {
 
 // runningJob waits for the one running instance of the job migrate, its
 // container up, and returns its sandbox's ID.
-func runningJob(t *testing.T, h *harness, envID uuid.UUID) uuid.UUID {
+func runningJob(t *testing.T, h *harness, envID uuid.UUID) podid.ID {
 	t.Helper()
 	rows := h.waitRows(envID, spec.KindJob, "migrate", 1, 30*time.Second, "running", func(r store.EnvInstanceRow) bool {
 		if !running(r) {
@@ -46,7 +47,7 @@ func runningJob(t *testing.T, h *harness, envID uuid.UUID) uuid.UUID {
 
 // finishRun waits for the job's running instance, gives its container
 // log lines and makes it exit with code.
-func finishRun(t *testing.T, h *harness, n *testnode.Node, envID uuid.UUID, code int, lines ...string) uuid.UUID {
+func finishRun(t *testing.T, h *harness, n *testnode.Node, envID uuid.UUID, code int, lines ...string) podid.ID {
 	t.Helper()
 	id := runningJob(t, h, envID)
 	for _, l := range lines {
@@ -179,7 +180,7 @@ func TestJobTimeoutAndManual(t *testing.T) {
 		err.Error() != fmt.Sprintf("job backfill runs already (release %d, attempt 1)", r3) {
 		t.Fatalf("a second run while one runs: %v", err)
 	}
-	var id uuid.UUID
+	var id podid.ID
 	eventually(t, 30*time.Second, "the manual run", func() bool {
 		for _, r := range h.rowsOf(env.ID, spec.KindJob, "backfill") {
 			if running(r) {
@@ -407,7 +408,7 @@ func TestReleaseJobWaitShiftsTheDeadline(t *testing.T) {
 	n1 := h.addNode("n1")
 	var code atomic.Int32
 	code.Store(1)
-	n1.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	n1.Script().SetExec(func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		if len(req.Command) > 0 && req.Command[0] == "check" {
 			return code.Load(), true, nil
 		}

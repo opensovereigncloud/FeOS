@@ -5,6 +5,7 @@ package e2e
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/server"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
@@ -451,7 +453,7 @@ func (n *node) ended(t *testing.T, within time.Duration) error {
 }
 
 // pod returns the node's record of the pod; false when it has none.
-func (n *node) pod(id uuid.UUID) (*podv1.PodInfo, bool) {
+func (n *node) pod(id podid.ID) (*podv1.PodInfo, bool) {
 	for _, p := range n.Pods() {
 		if p.GetPodId() == id.String() {
 			return p, true
@@ -521,7 +523,7 @@ func (c *cluster) callErr(ctx context.Context, in *instance, method, path, auth,
 
 // sandbox is a sandbox as a client holds it: its ID and a token.
 type sandbox struct {
-	id    uuid.UUID
+	id    podid.ID
 	token string
 }
 
@@ -530,18 +532,14 @@ func (sb sandbox) path(p string) string {
 	return "/api/v1/sandboxes/" + sb.id.String() + p
 }
 
-// create creates a sandbox with a new ID through in (nil: the balancer).
+// create creates a sandbox through in (nil: the balancer) as FeCode
+// does: ferund mints its ID, a short one (ADR 0019), which the answer
+// carries.
 func (c *cluster) create(in *instance) sandbox {
 	c.t.Helper()
-	return c.createID(in, uuid.New())
-}
-
-// createID creates the sandbox id as FeCode does, and expects it new.
-func (c *cluster) createID(in *instance, id uuid.UUID) sandbox {
-	c.t.Helper()
-	r := c.call(in, "POST", "/api/v1/sandboxes", tenantAuth, `{"sandboxId":"`+id.String()+`"}`)
+	r := c.call(in, "POST", "/api/v1/sandboxes", tenantAuth, "{}")
 	if r.code != http.StatusCreated {
-		c.t.Fatalf("create %s: %d %s", id, r.code, r.body)
+		c.t.Fatalf("create: %d %s", r.code, r.body)
 	}
 	var out struct {
 		Token  string `json:"token"`
@@ -550,10 +548,48 @@ func (c *cluster) createID(in *instance, id uuid.UUID) sandbox {
 			ClientState string `json:"clientState"`
 		} `json:"status"`
 	}
-	if err := json.Unmarshal([]byte(r.body), &out); err != nil || out.Token == "" || out.Status.SandboxID != id.String() {
-		c.t.Fatalf("create %s: %s (%v)", id, r.body, err)
+	if err := json.Unmarshal([]byte(r.body), &out); err != nil || out.Token == "" {
+		c.t.Fatalf("create: %s (%v)", r.body, err)
+	}
+	id, err := podid.Parse(out.Status.SandboxID)
+	if err != nil || id.IsLegacy() {
+		c.t.Fatalf("create: the new ID %q is not a short ID (%v)", out.Status.SandboxID, err)
 	}
 	return sandbox{id: id, token: out.Token}
+}
+
+// createID makes a sandbox under a given ID, which no client can any more
+// (ADR 0019): its row and a token written to the database directly, as
+// for an ID used again (a sandbox with a UUID made before, or a short ID
+// drawn again after its sandbox was deleted). The ID must be new;
+// attachable gives the row the template of an attachable sandbox.
+func (c *cluster) createID(id podid.ID, attachable bool) sandbox {
+	c.t.Helper()
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		c.t.Fatal(err)
+	}
+	token := base64.RawURLEncoding.EncodeToString(b[:])
+	n := store.NewSandbox{ID: id, Owner: tenant, Image: testImage, VCPUs: c.cfg.DefaultVCPUs, MemoryMiB: c.cfg.DefaultMemoryMiB}
+	if attachable {
+		n.PodTemplate = &model.PodTemplate{Command: []string{"sleep", "infinity"},
+			SecurityGroups: []string{model.SandboxGroupID(id)}, NameTables: []string{model.SandboxTableID(id)}}
+	}
+	err := c.st.InTx(bg, func(tx *store.Store) error {
+		_, created, err := tx.CreateSandbox(bg, n)
+		if err != nil {
+			return err
+		}
+		if !created {
+			return fmt.Errorf("sandbox %s exists", id)
+		}
+		_, err = tx.CreateSandboxToken(bg, store.HashToken(token), id, "default")
+		return err
+	})
+	if err != nil {
+		c.t.Fatalf("create %s: %v", id, err)
+	}
+	return sandbox{id: id, token: token}
 }
 
 // execResult is the REST answer of a tool call.
@@ -704,7 +740,7 @@ func callTool(cs *mcp.ClientSession, tool string, args map[string]any) (string, 
 // -------------------------------------------------------------- database --
 
 // row reads a sandbox's row.
-func (c *cluster) row(id uuid.UUID) store.Sandbox {
+func (c *cluster) row(id podid.ID) store.Sandbox {
 	c.t.Helper()
 	sb, err := c.st.GetSandbox(bg, id)
 	if err != nil {
@@ -715,7 +751,7 @@ func (c *cluster) row(id uuid.UUID) store.Sandbox {
 
 // waitState waits until the sandbox's row is in state without an op in
 // flight, and returns it.
-func (c *cluster) waitState(id uuid.UUID, state string, within time.Duration) store.Sandbox {
+func (c *cluster) waitState(id podid.ID, state string, within time.Duration) store.Sandbox {
 	c.t.Helper()
 	var sb store.Sandbox
 	eventually(c.t, within, "sandbox "+id.String()+" "+state, func() bool {

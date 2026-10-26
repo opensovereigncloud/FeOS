@@ -28,6 +28,7 @@ import (
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 const (
@@ -366,7 +367,7 @@ func (u *uplinkStub) IssuePodCredentials(ctx context.Context, req *fleetv1.Issue
 	if _, ok := nodelink.NodeFromContext(ctx); !ok {
 		return nil, errors.New("no peer")
 	}
-	pod, err := uuid.Parse(req.PodId)
+	pod, err := podid.Parse(req.PodId)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -656,7 +657,7 @@ func wantPrefix(t *testing.T, err error, code codes.Code, prefix string) {
 }
 
 // sandboxSpec is the spec ferund gives a sandbox's pod (§9 of the design).
-func sandboxSpec(id uuid.UUID, incarnation string) *podv1.PodSpec {
+func sandboxSpec(id podid.ID, incarnation string) *podv1.PodSpec {
 	return &podv1.PodSpec{
 		Resources:  &podv1.Resources{Vcpus: 2, MemoryMib: 1024},
 		Containers: []*podv1.ContainerSpec{{Name: "main", ImageRef: "ghcr.io/maltej/debian-ai:latest", Command: []string{"sleep", "infinity"}}},
@@ -678,9 +679,9 @@ func waitState(t *testing.T, pc podv1.PodServiceClient, id string, state podv1.P
 }
 
 // createRunning creates a sandbox pod and waits until it runs.
-func createRunning(t *testing.T, pc podv1.PodServiceClient) (uuid.UUID, *podv1.PodInfo) {
+func createRunning(t *testing.T, pc podv1.PodServiceClient) (podid.ID, *podv1.PodInfo) {
 	t.Helper()
-	id := uuid.New()
+	id := podid.Mint()
 	if _, err := pc.CreatePod(context.Background(), &podv1.CreatePodRequest{PodId: id.String(), Spec: sandboxSpec(id, uuid.NewString())}); err != nil {
 		t.Fatal(err)
 	}

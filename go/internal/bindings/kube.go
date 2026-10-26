@@ -21,11 +21,10 @@ import (
 	"strconv"
 	"unicode/utf8"
 
-	"github.com/google/uuid"
-
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -350,7 +349,7 @@ type kubeSecret struct {
 	KeyPEM  string `json:"key_pem,omitempty"`
 }
 
-func (s *Service) sealKube(id uuid.UUID, b kubeBinding) (store.KubeBinding, error) {
+func (s *Service) sealKube(id podid.ID, b kubeBinding) (store.KubeBinding, error) {
 	pt, err := json.Marshal(kubeSecret{Token: b.Auth.Token, CertPEM: b.Auth.CertPEM, KeyPEM: b.Auth.KeyPEM})
 	if err != nil {
 		return store.KubeBinding{}, err
@@ -363,7 +362,7 @@ func (s *Service) sealKube(id uuid.UUID, b kubeBinding) (store.KubeBinding, erro
 		CAPEM: b.CAPEM, AuthType: b.Auth.Type, Sealed: sealed, Fingerprint: kubeFingerprint(b.Auth)}, nil
 }
 
-func (s *Service) openKubeRow(id uuid.UUID, r store.KubeBinding) (kubeBinding, error) {
+func (s *Service) openKubeRow(id podid.ID, r store.KubeBinding) (kubeBinding, error) {
 	pt, err := s.sealer.Open(r.Sealed, sealAAD(tableKube, id, r.Name, r.AuthType))
 	if err != nil {
 		return kubeBinding{}, err
@@ -379,7 +378,7 @@ func (s *Service) openKubeRow(id uuid.UUID, r store.KubeBinding) (kubeBinding, e
 // openKube opens a stored set. The version is recomputed from the opened
 // bindings and has to equal the stored one, which is the version a pod is
 // told it holds: a set that hashed differently is an error here.
-func (s *Service) openKube(id uuid.UUID, version string, rows []store.KubeBinding) ([]kubeBinding, error) {
+func (s *Service) openKube(id podid.ID, version string, rows []store.KubeBinding) ([]kubeBinding, error) {
 	bs := make([]kubeBinding, 0, len(rows))
 	for _, r := range rows {
 		b, err := s.openKubeRow(id, r)
@@ -399,7 +398,7 @@ func (s *Service) openKube(id uuid.UUID, version string, rows []store.KubeBindin
 // PUT answers its own write and never a later one from another instance.
 // The same set again is a no-op, unless what is stored no longer opens (a
 // changed key): then the PUT is the repair.
-func (s *Service) applyKube(ctx context.Context, id uuid.UUID, bs []kubeBinding) (kubeSetOut, error) {
+func (s *Service) applyKube(ctx context.Context, id podid.ID, bs []kubeBinding) (kubeSetOut, error) {
 	v := kubeVersion(bs)
 	var res kubeSetOut
 	err := s.st.InTx(ctx, func(tx *store.Store) error {
@@ -443,7 +442,7 @@ func (s *Service) applyKube(ctx context.Context, id uuid.UUID, bs []kubeBinding)
 
 // kubeSet renders the stored set: names, servers and fingerprints, never
 // the material.
-func (s *Service) kubeSet(ctx context.Context, id uuid.UUID) (kubeSetOut, error) {
+func (s *Service) kubeSet(ctx context.Context, id podid.ID) (kubeSetOut, error) {
 	version, rows, err := s.st.KubeBindings(ctx, id)
 	if errors.Is(err, model.ErrNotFound) {
 		return kubeSetOut{}, noSuchSandbox()
@@ -465,7 +464,7 @@ func kubeSetOf(version string, rows []store.KubeBinding) kubeSetOut {
 	return out
 }
 
-func (s *Service) writeKubeSet(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+func (s *Service) writeKubeSet(w http.ResponseWriter, r *http.Request, id podid.ID) {
 	out, err := s.kubeSet(r.Context(), id)
 	if err != nil {
 		s.fail(w, r, err)

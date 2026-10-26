@@ -20,6 +20,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -313,12 +314,12 @@ func TestAttachedValidation(t *testing.T) {
 	plain := h.sandbox(tenantA, false)
 	h.create("one", nil)
 	h.create("two", nil)
-	attachedAs := func(sandbox uuid.UUID, name, port string) string {
+	attachedAs := func(sandbox podid.ID, name, port string) string {
 		return `{"services": {"` + name + `": {"runtime": "attached", "sandbox": "` + sandbox.String() + `", "command": ["vite"],
 			"ports": [{"name": "http", "port": ` + port + `}]}}, "routes": {"root": {"path": "/", "service": "` + name +
 			`", "port": "http"}}}`
 	}
-	attached := func(sandbox uuid.UUID, port string) string { return attachedAs(sandbox, "vite", port) }
+	attached := func(sandbox podid.ID, port string) string { return attachedAs(sandbox, "vite", port) }
 	h.apply("one", attached(sb, "5173"), 0)
 	// Another environment's attached service holds the port in the
 	// sandbox.
@@ -341,7 +342,7 @@ func TestAttachedValidation(t *testing.T) {
 			"vite is a name in sandbox "+sb.String()+" of environment one's too") {
 		t.Fatalf("attached name %+v", p)
 	}
-	withAPI := func(sandbox uuid.UUID, name, port string) string {
+	withAPI := func(sandbox podid.ID, name, port string) string {
 		return strings.Replace(attachedAs(sandbox, name, port), `"services": {`,
 			`"services": {"api": {"image": "ghcr.io/acme/api:1", "ports": [{"name": "http", "port": 8080}]}, `, 1)
 	}
@@ -358,6 +359,20 @@ func TestAttachedValidation(t *testing.T) {
 	other := h.sandbox(tenantA, true)
 	if p, _ := h.svc.Plan(ctx, tenantA, "four", PlanRequest{Spec: json.RawMessage(withAPI(other, "web4", "5176"))}); !p.Valid {
 		t.Fatalf("separate sandboxes %+v", p)
+	}
+	// A sandbox with a UUID, made before ADR 0019, is a sandbox as a short
+	// ID's is, in either case; a value that is neither is refused.
+	legacy := h.legacySandbox(tenantA, true)
+	for _, id := range []podid.ID{legacy, podid.ID(strings.ToUpper(legacy.String()))} {
+		if p, _ := h.svc.Plan(ctx, tenantA, "four", PlanRequest{Spec: json.RawMessage(withAPI(id, "web4", "5176"))}); !p.Valid {
+			t.Fatalf("legacy sandbox %s: %+v", id, p)
+		}
+	}
+	for _, bad := range []podid.ID{"nope", podid.ID(strings.ToUpper(other.String()))} {
+		if p, _ := h.svc.Plan(ctx, tenantA, "four", PlanRequest{Spec: json.RawMessage(attachedAs(bad, "web4", "5176"))}); p.Valid ||
+			!hasFinding(p.Findings, spec.SeverityError, "services.web4.sandbox", "is not a sandbox ID") {
+			t.Fatalf("sandbox %q: %+v", bad, p)
+		}
 	}
 	// A sandbox that is not attachable warns when there is something to
 	// reach; an instance row is no sandbox.

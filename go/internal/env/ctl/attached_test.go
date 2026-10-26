@@ -22,6 +22,7 @@ import (
 	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 	"github.com/ironcore-dev/feos/go/internal/tools"
@@ -36,7 +37,7 @@ const processRoot = "/var/lib/sandbox-processes"
 // under root and their working directory beneath the pod's directory,
 // which stands in for the container's root.
 func hostProcesses(n *testnode.Node, root string) {
-	n.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	n.Script().SetExec(func(_ context.Context, pod podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		argv := req.Command
 		if len(argv) > 2 && argv[0] == "python3" {
 			start := strings.Contains(argv[2], "no such working directory")
@@ -53,12 +54,12 @@ func hostProcesses(n *testnode.Node, root string) {
 // API gives it) and brings it up.
 func (h *harness) attachable() store.Sandbox {
 	h.t.Helper()
-	return h.attachableAs(testTenant, uuid.New())
+	return h.attachableAs(testTenant, podid.Mint())
 }
 
 // attachableAs makes an attachable sandbox of owner with the ID id and
 // brings it up.
-func (h *harness) attachableAs(owner string, id uuid.UUID) store.Sandbox {
+func (h *harness) attachableAs(owner string, id podid.ID) store.Sandbox {
 	h.t.Helper()
 	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: owner, Image: testImage, ImageRef: testImage,
 		VCPUs: 1, MemoryMiB: 512, PodTemplate: &model.PodTemplate{Command: []string{"sleep", "infinity"},
@@ -77,7 +78,7 @@ func (h *harness) attachableAs(owner string, id uuid.UUID) store.Sandbox {
 	return sb
 }
 
-func attachedSpec(sandbox uuid.UUID, cwd, greeting string, withWeb bool) string {
+func attachedSpec(sandbox podid.ID, cwd, greeting string, withWeb bool) string {
 	web := ""
 	if withWeb {
 		web = fmt.Sprintf(`,"web":{"runtime":"attached","sandbox":%q,"command":["sh","-c","echo started $GREETING $API; exec sleep 60"],
@@ -273,10 +274,10 @@ func TestAttachedWakesPausedSandbox(t *testing.T) {
 // startLog counts the process starts the node ran, per pod.
 type startLog struct {
 	mu     sync.Mutex
-	starts map[uuid.UUID]int
+	starts map[podid.ID]int
 }
 
-func (l *startLog) count(pod uuid.UUID) int {
+func (l *startLog) count(pod podid.ID) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.starts[pod]
@@ -284,8 +285,8 @@ func (l *startLog) count(pod uuid.UUID) int {
 
 // hostProcessesCounting is hostProcesses that also counts the starts.
 func hostProcessesCounting(n *testnode.Node, root string) *startLog {
-	l := &startLog{starts: map[uuid.UUID]int{}}
-	n.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	l := &startLog{starts: map[podid.ID]int{}}
+	n.Script().SetExec(func(_ context.Context, pod podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		argv := req.Command
 		if len(argv) > 2 && argv[0] == "python3" {
 			start := strings.Contains(argv[2], "no such working directory")
@@ -432,7 +433,7 @@ func TestAttachedStrayProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := b
-	before.SandboxID = uuid.New()
+	before.SandboxID = podid.Mint()
 	after := before
 	after.ProcessID = orphan
 	h.c.writeAttached(bg, before, after, lease(sb))
@@ -557,7 +558,7 @@ func TestAttachedGoesFromSleepingSandbox(t *testing.T) {
 
 // attachableUp brings an attachable sandbox up (it may sleep) and reads
 // its row.
-func (h *harness) attachableUp(id uuid.UUID) store.Sandbox {
+func (h *harness) attachableUp(id podid.ID) store.Sandbox {
 	h.t.Helper()
 	ctx, cancel := context.WithTimeout(bg, 60*time.Second)
 	defer cancel()

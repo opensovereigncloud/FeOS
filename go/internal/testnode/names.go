@@ -12,12 +12,12 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // nameService is feosd's NameService over tables in memory, with feosd's
@@ -293,7 +293,7 @@ func (n *Node) NameTables() []*networkv1.NameTable { return n.names.list() }
 // from the name tables the pod's spec names: the name's addresses of both
 // families, and whether the tables hold it (false: feosd would ask
 // upstream). A node without the NameService answers nothing.
-func (n *Node) Resolve(pod uuid.UUID, name string) ([]string, bool) {
+func (n *Node) Resolve(pod podid.ID, name string) ([]string, bool) {
 	info, err := n.pods.get(pod.String())
 	if err != nil || n.cfg.NoNameService {
 		return nil, false

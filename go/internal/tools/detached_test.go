@@ -20,6 +20,7 @@ import (
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
 )
@@ -43,7 +44,7 @@ func detachedLease(t *testing.T, env *toolstest.Env) model.Lease {
 // noBookkeeping checks that the detached calls took no hold, wrote no
 // activity row and asked the engine for nothing beyond the one Acquire of
 // detachedLease.
-func noBookkeeping(t *testing.T, env *toolstest.Env, id uuid.UUID) {
+func noBookkeeping(t *testing.T, env *toolstest.Env, id podid.ID) {
 	t.Helper()
 	if n := env.Engine.Calls("Acquire", id); n != 1 {
 		t.Errorf("%d Acquires", n)
@@ -88,7 +89,7 @@ func TestExecDetached(t *testing.T) {
 		t.Error("an exec without a command ran")
 	}
 	// A pod the lease does not name on the node: the node's answer.
-	other := model.Lease{SandboxID: uuid.New(), Incarnation: uuid.New(), Node: lease.Node}
+	other := model.Lease{SandboxID: podid.Mint(), Incarnation: uuid.New(), Node: lease.Node}
 	_, _, _, err = r.ExecDetached(bg, other, []string{"true"}, nil, "", time.Second)
 	var ne *NodeError
 	if !errors.As(err, &ne) {
@@ -102,7 +103,7 @@ func TestExecDetached(t *testing.T) {
 // which stands in for the container's root (the test node runs commands
 // on the host).
 func detachedRoot(env *toolstest.Env, root string) {
-	env.Node.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	env.Node.Script().SetExec(func(_ context.Context, pod podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		argv := req.Command
 		if len(argv) > 2 && argv[0] == "python3" {
 			argv[2] = strings.ReplaceAll(argv[2], processRoot, root)

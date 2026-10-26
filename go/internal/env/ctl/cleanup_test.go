@@ -21,6 +21,7 @@ import (
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -38,11 +39,11 @@ type podProcesses struct {
 	stops     atomic.Int64
 }
 
-func (pp *podProcesses) dir(pod uuid.UUID) string { return filepath.Join(pp.root, pod.String()) }
+func (pp *podProcesses) dir(pod podid.ID) string { return filepath.Join(pp.root, pod.String()) }
 
 func hostProcessesPerPod(n *testnode.Node, root string) *podProcesses {
 	pp := &podProcesses{root: root}
-	n.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	n.Script().SetExec(func(_ context.Context, pod podid.ID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		argv := req.Command
 		if len(argv) > 2 && argv[0] == "python3" {
 			if strings.Contains(argv[2], stopScriptMark) {
@@ -63,7 +64,7 @@ func hostProcessesPerPod(n *testnode.Node, root string) *podProcesses {
 }
 
 // sleepUntilPaused pauses a sandbox and waits until it is paused.
-func (h *harness) sleepUntilPaused(id uuid.UUID) {
+func (h *harness) sleepUntilPaused(id podid.ID) {
 	h.t.Helper()
 	if err := h.eng.Pause(bg, id); err != nil {
 		h.t.Fatal(err)
@@ -231,7 +232,7 @@ func TestAttachedMovesFromSleepingSandbox(t *testing.T) {
 	n1 := h.addNode("n1")
 	hostProcessesPerPod(n1, t.TempDir())
 	s1, s2 := h.attachable(), h.attachable()
-	attached := func(name string, sb uuid.UUID) string {
+	attached := func(name string, sb podid.ID) string {
 		return fmt.Sprintf(`%q:{"runtime":"attached","sandbox":%q,"command":["sleep","120"]}`, name, sb)
 	}
 	env := h.newEnv("dev")

@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
@@ -21,6 +20,7 @@ import (
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // After a renewal the node keeps its new identity, dials a new node
@@ -178,7 +178,7 @@ func TestGracefulRestart(t *testing.T) {
 
 // waitStarted waits until a command of execOut began: it touches
 // "started" in the pod's directory.
-func waitStarted(t *testing.T, n *Node, uid uuid.UUID) {
+func waitStarted(t *testing.T, n *Node, uid podid.ID) {
 	t.Helper()
 	eventually(t, 10*time.Second, "the command started", func() bool {
 		_, err := os.Stat(filepath.Join(n.PodDir(uid), "started"))
@@ -248,7 +248,7 @@ func TestUnlistedInstanceDrains(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	n.Script().SetExec(func(ctx context.Context, _ uuid.UUID, _ *containerv1.ExecRequest, out ExecOutput) (int32, bool, error) {
+	n.Script().SetExec(func(ctx context.Context, _ podid.ID, _ *containerv1.ExecRequest, out ExecOutput) (int32, bool, error) {
 		started <- struct{}{}
 		select {
 		case <-release:
@@ -372,7 +372,7 @@ func TestRenewKeepsCallsInFlight(t *testing.T) {
 	e.f.mu.Unlock()
 	creds := make(chan error, 1)
 	go func() {
-		_, err := n.IssuePodCredentials(context.Background(), uuid.New())
+		_, err := n.IssuePodCredentials(context.Background(), podid.Mint())
 		creds <- err
 	}()
 	select {
@@ -464,7 +464,7 @@ func TestIssuePodCredentials(t *testing.T) {
 	in := e.instance("i1", caIss)
 	n := e.start("n1", in)
 	eventually(t, 5*time.Second, "an uplink", func() bool { return n.UplinkAddr() != "" })
-	pod := uuid.New()
+	pod := podid.Mint()
 	want := &fleetv1.PodBindings{Kube: []*fleetv1.KubeBinding{{Name: "prod", Port: 6443, Server: "https://k8s.example.test", Credential: &fleetv1.KubeBinding_Token{Token: "secret"}}}}
 	e.f.mu.Lock()
 	e.f.bindings = want

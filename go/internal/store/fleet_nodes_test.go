@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -68,7 +68,7 @@ func TestExpireNodesBatch(t *testing.T) {
 
 func TestLockPodCredentials(t *testing.T) {
 	s, d := newStore(t)
-	pod, other := uuid.New(), uuid.New()
+	pod, other := legacyID(), podid.Mint()
 	locked := make(chan struct{})
 	release := make(chan struct{})
 	first := make(chan error, 1)

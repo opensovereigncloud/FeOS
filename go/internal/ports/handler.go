@@ -18,29 +18,28 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 // Sandboxes is what the door needs of the sandbox engine
 // (*sandbox.Engine).
 type Sandboxes interface {
-	Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error)
-	Acquire(ctx context.Context, id uuid.UUID, kind model.HoldKind) (model.Lease, func(), error)
-	Sync(ctx context.Context, id uuid.UUID) error
-	Touch(id uuid.UUID)
+	Ensure(ctx context.Context, id podid.ID) (model.Lease, error)
+	Acquire(ctx context.Context, id podid.ID, kind model.HoldKind) (model.Lease, func(), error)
+	Sync(ctx context.Context, id podid.ID) error
+	Touch(id podid.ID)
 }
 
 // KubePorts names the loopback ports of a sandbox's Kubernetes bindings,
 // which the door never forwards (*bindings.Service).
 type KubePorts interface {
-	KubePorts(ctx context.Context, id uuid.UUID) ([]int, error)
+	KubePorts(ctx context.Context, id podid.ID) ([]int, error)
 }
 
 // timings are the door's limits and periods; tests shorten them.
@@ -127,10 +126,10 @@ type Handler struct {
 	retired    []*entry
 	// caps are the per-sandbox slots of Forward streams; probes those of
 	// the checks' streams, apart from caps.
-	caps   map[uuid.UUID]*capSem
-	probes map[uuid.UUID]*capSem
+	caps   map[podid.ID]*capSem
+	probes map[podid.ID]*capSem
 	// waking are the sandboxes a wake nobody waits for runs for.
-	waking map[uuid.UUID]bool
+	waking map[podid.ID]bool
 	// upgraded are the upgraded connections; upActive counts their
 	// requests until each has released its hold, and upIdle is closed
 	// when that count returns to 0. upClosing is set by CloseUpgraded.
@@ -153,9 +152,9 @@ func New(s Sandboxes, conns nodelink.Conns, kp KubePorts,
 	h := &Handler{
 		sb: s, conns: conns, kp: kp, resolve: resolve, db: d, log: log, rl: newRateLog(log), t: defaultTimings(),
 		transports: map[tkey]*entry{},
-		caps:       map[uuid.UUID]*capSem{},
-		probes:     map[uuid.UUID]*capSem{},
-		waking:     map[uuid.UUID]bool{},
+		caps:       map[podid.ID]*capSem{},
+		probes:     map[podid.ID]*capSem{},
+		waking:     map[podid.ID]bool{},
 		upgraded:   map[*upgradedConn]struct{}{},
 	}
 	if d != nil {
@@ -279,7 +278,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// The path's sandbox is a claim the token backs; a token of another
 	// sandbox learns nothing about this one.
-	if id, err := uuid.Parse(tg.id); err != nil || id != sb.ID {
+	if id, err := podid.Parse(tg.id); err != nil || id != sb.ID {
 		reply{http.StatusNotFound, textNoSandbox, 0}.write(w)
 		return
 	}
@@ -294,7 +293,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Kubernetes bindings, or to a failed lookup of them; nil when the port
 // may be forwarded. A Kubernetes listener injects the binding's credential
 // for whoever reaches it; the guest refuses it too.
-func (h *Handler) kubeRefusal(ctx context.Context, id uuid.UUID, port int) *reply {
+func (h *Handler) kubeRefusal(ctx context.Context, id podid.ID, port int) *reply {
 	if h.kp == nil {
 		return nil
 	}
@@ -337,7 +336,7 @@ func kubeText(port int) string {
 // says that the pod is not running as the row has it, the row is synced
 // and the sandbox woken; a GET or HEAD without a body then goes once more,
 // anything else is told to try again.
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, id uuid.UUID, tg target) {
+func (h *Handler) forward(w http.ResponseWriter, r *http.Request, id podid.ID, tg target) {
 	ctx := r.Context()
 	repeatable := (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
 		r.ContentLength == 0 && len(r.TransferEncoding) == 0
@@ -362,7 +361,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, id uuid.UUID, 
 // acquire brings the sandbox up and takes a forward hold. The engine's
 // work runs detached from the request: the request only waits for it,
 // and a hold that arrives after the request gave up is released at once.
-func (h *Handler) acquire(ctx context.Context, id uuid.UUID) (model.Lease, func(), error) {
+func (h *Handler) acquire(ctx context.Context, id podid.ID) (model.Lease, func(), error) {
 	type result struct {
 		lease   model.Lease
 		release func()
@@ -416,7 +415,7 @@ func (h *Handler) detached(ctx context.Context, f func(ctx context.Context) erro
 // acquireFailed answers a sandbox that could not be brought up and held:
 // a retry after the time the error asks for (60 s for a hibernation in
 // flight), else after 5 s.
-func (h *Handler) acquireFailed(ctx context.Context, w http.ResponseWriter, id uuid.UUID, err error) {
+func (h *Handler) acquireFailed(ctx context.Context, w http.ResponseWriter, id podid.ID, err error) {
 	switch {
 	case ctx.Err() != nil:
 		// The client is gone; the wake goes on without it.
@@ -432,7 +431,7 @@ func (h *Handler) acquireFailed(ctx context.Context, w http.ResponseWriter, id u
 
 // wake syncs and ensures a sandbox in the background, once at a time per
 // sandbox: the answer to a request that is told to try again.
-func (h *Handler) wake(id uuid.UUID) {
+func (h *Handler) wake(id podid.ID) {
 	h.mu.Lock()
 	if h.waking[id] {
 		h.mu.Unlock()
@@ -482,7 +481,7 @@ func (h *Handler) proxyHeld(w http.ResponseWriter, r *http.Request, lease model.
 }
 
 // pseudoHost names a pod's port in the pools' keys: it is never resolved.
-func pseudoHost(id uuid.UUID, port int) string {
+func pseudoHost(id podid.ID, port int) string {
 	return id.String() + "--" + strconv.Itoa(port) + ".ferun.invalid"
 }
 

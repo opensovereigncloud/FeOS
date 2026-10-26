@@ -9,13 +9,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Tombstone is a row of pod_tombstones: delete the pod PodID from Node if
 // it is of Incarnation (or has no incarnation label). While it exists,
 // placement keeps the pod's ID off the node.
 type Tombstone struct {
-	PodID       uuid.UUID
+	PodID       podid.ID
 	Node        string
 	Incarnation uuid.UUID // uuid.Nil: a pod without the label
 	Reason      string
@@ -30,7 +32,7 @@ type Tombstone struct {
 
 // TombstoneKey names a tombstone.
 type TombstoneKey struct {
-	PodID       uuid.UUID
+	PodID       podid.ID
 	Node        string
 	Incarnation uuid.UUID
 }
@@ -88,13 +90,13 @@ func (s *Store) DeleteTombstone(ctx context.Context, k TombstoneKey) (bool, erro
 }
 
 // TombstonesOfPod returns every tombstone of a pod ID, on any node.
-func (s *Store) TombstonesOfPod(ctx context.Context, podID uuid.UUID) ([]Tombstone, error) {
+func (s *Store) TombstonesOfPod(ctx context.Context, podID podid.ID) ([]Tombstone, error) {
 	return collectTombstones(s.q.Query(ctx, "SELECT "+tombstoneCols+" FROM pod_tombstones WHERE pod_id = $1 ORDER BY node, incarnation", podID))
 }
 
 // TombstonedNodes returns the nodes a tombstone of podID keeps the pod off
 // (placement's tombstone gate).
-func (s *Store) TombstonedNodes(ctx context.Context, podID uuid.UUID) ([]string, error) {
+func (s *Store) TombstonedNodes(ctx context.Context, podID podid.ID) ([]string, error) {
 	rows, err := s.q.Query(ctx, "SELECT DISTINCT node FROM pod_tombstones WHERE pod_id = $1 ORDER BY node", podID)
 	if err != nil {
 		return nil, err
@@ -104,7 +106,7 @@ func (s *Store) TombstonedNodes(ctx context.Context, podID uuid.UUID) ([]string,
 
 // HasTombstone reports whether a tombstone of podID exists on node: the
 // recheck of placement's tombstone gate under the node's lock.
-func (s *Store) HasTombstone(ctx context.Context, podID uuid.UUID, node string) (bool, error) {
+func (s *Store) HasTombstone(ctx context.Context, podID podid.ID, node string) (bool, error) {
 	var exists bool
 	err := s.q.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pod_tombstones WHERE pod_id = $1 AND node = $2)", podID, node).Scan(&exists)
 	return exists, err

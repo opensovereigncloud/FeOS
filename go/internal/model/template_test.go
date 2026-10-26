@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The template of the contract's §2.3, as the controller stores it.
@@ -169,7 +171,11 @@ func TestGroupIDs(t *testing.T) {
 	if g := EnvGroupID(id); g != "env-0193a000-0000-7000-8000-0000000000e1" || len(g) != 40 {
 		t.Fatalf("EnvGroupID %q", g)
 	}
-	if g := SandboxGroupID(id); g != "sbx-0193a000-0000-7000-8000-0000000000e1" || len(g) != 40 {
+	// A sandbox made before ADR 0019 keeps its UUID, and its group.
+	if g := SandboxGroupID(podid.ID(id.String())); g != "sbx-0193a000-0000-7000-8000-0000000000e1" || len(g) != 40 {
+		t.Fatalf("SandboxGroupID %q", g)
+	}
+	if g := SandboxGroupID("abcdefghjkm"); g != "sbx-abcdefghjkm" || len(g) != 15 || SandboxTableID("abcdefghjkm") != g {
 		t.Fatalf("SandboxGroupID %q", g)
 	}
 }

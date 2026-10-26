@@ -16,6 +16,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -172,7 +173,7 @@ func (e *Engine) noteAttempt(bg context.Context, k store.TombstoneKey, cause err
 // booking cascade). owner "" deletes any owner's. It returns the row as
 // read and whether a tombstone was written; the new tombstones are
 // processed at once when this instance can.
-func (e *Engine) Delete(ctx context.Context, owner string, id uuid.UUID) (store.Sandbox, bool, error) {
+func (e *Engine) Delete(ctx context.Context, owner string, id podid.ID) (store.Sandbox, bool, error) {
 	var row store.Sandbox
 	var keys []store.TombstoneKey
 	var events []activity.Event

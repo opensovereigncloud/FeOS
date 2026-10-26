@@ -9,12 +9,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // IssuedCert is a row of issued_certs: a pod certificate (ADR 0014).
 type IssuedCert struct {
 	Serial          string
-	PodID           uuid.UUID
+	PodID           podid.ID
 	Incarnation     uuid.UUID
 	Node            string
 	SPIFFEID        string
@@ -43,7 +45,7 @@ func (s *Store) InsertIssuedCert(ctx context.Context, c IssuedCert) (IssuedCert,
 
 // CountIssuedCerts counts the certificates issued for a pod within the
 // last window: the rate limit of credential requests.
-func (s *Store) CountIssuedCerts(ctx context.Context, podID uuid.UUID, window time.Duration) (int64, error) {
+func (s *Store) CountIssuedCerts(ctx context.Context, podID podid.ID, window time.Duration) (int64, error) {
 	var n int64
 	err := s.q.QueryRow(ctx, "SELECT count(*) FROM issued_certs WHERE pod_id = $1 AND issued_at > now() - $2::interval",
 		podID, interval(window)).Scan(&n)
@@ -52,14 +54,14 @@ func (s *Store) CountIssuedCerts(ctx context.Context, podID uuid.UUID, window ti
 
 // LatestIssuedCert returns the newest certificate of a pod; ErrNoRow if
 // none.
-func (s *Store) LatestIssuedCert(ctx context.Context, podID uuid.UUID) (IssuedCert, error) {
+func (s *Store) LatestIssuedCert(ctx context.Context, podID podid.ID) (IssuedCert, error) {
 	c, err := scanIssuedCert(s.q.QueryRow(ctx, "SELECT "+issuedCertCols+` FROM issued_certs WHERE pod_id = $1
 		ORDER BY issued_at DESC, serial LIMIT 1`, podID))
 	return c, noRow(err, ErrNoRow)
 }
 
 // ListIssuedCerts returns a pod's certificates, newest first.
-func (s *Store) ListIssuedCerts(ctx context.Context, podID uuid.UUID) ([]IssuedCert, error) {
+func (s *Store) ListIssuedCerts(ctx context.Context, podID podid.ID) ([]IssuedCert, error) {
 	rows, err := s.q.Query(ctx, "SELECT "+issuedCertCols+" FROM issued_certs WHERE pod_id = $1 ORDER BY issued_at DESC, serial", podID)
 	if err != nil {
 		return nil, err

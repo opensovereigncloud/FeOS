@@ -22,6 +22,7 @@ import (
 	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -189,7 +190,7 @@ func tableDelta(have, want *networkv1.NameTable) ([]*networkv1.NameEntry, []stri
 // tables it includes. An env table of an environment that has no release
 // or is being deleted holds no names.
 func (c *Controller) buildTable(ctx context.Context, id string) (*networkv1.NameTable, []string, error) {
-	isEnv, u, ok := parseGroup(id)
+	isEnv, u, sbx, ok := parseGroup(id)
 	if !ok {
 		return nil, nil, fmt.Errorf("%s is not a name table of the environments", id)
 	}
@@ -209,12 +210,12 @@ func (c *Controller) buildTable(ctx context.Context, id string) (*networkv1.Name
 		}
 		return newTable(id, names, nil), nil, nil
 	}
-	if _, err := c.st.GetSandbox(ctx, u); errors.Is(err, model.ErrNotFound) {
+	if _, err := c.st.GetSandbox(ctx, sbx); errors.Is(err, model.ErrNotFound) {
 		return nil, nil, errNoGroup
 	} else if err != nil {
 		return nil, nil, err
 	}
-	attached, err := c.st.EnvCtlAttachedIn(ctx, u)
+	attached, err := c.st.EnvCtlAttachedIn(ctx, sbx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -415,16 +416,17 @@ func (c *Controller) syncNodeNames(ctx context.Context, node string, cache map[s
 		}
 	}
 	// Tables of environments and sandboxes that are gone.
-	var envs, sbxs []uuid.UUID
+	var envs []uuid.UUID
+	var sbxs []podid.ID
 	for id := range have {
 		if _, wanted := want[id]; wanted {
 			continue
 		}
-		if isEnv, u, ok := parseGroup(id); ok {
+		if isEnv, u, sbx, ok := parseGroup(id); ok {
 			if isEnv {
 				envs = append(envs, u)
 			} else {
-				sbxs = append(sbxs, u)
+				sbxs = append(sbxs, sbx)
 			}
 		}
 	}
@@ -438,9 +440,9 @@ func (c *Controller) syncNodeNames(ctx context.Context, node string, cache map[s
 			errs = append(errs, err)
 		}
 	}
-	for _, u := range sbxs {
-		if !sbxOK[u] {
-			_, err := c.deleteTable(ctx, node, model.SandboxTableID(u))
+	for _, sbx := range sbxs {
+		if !sbxOK[sbx] {
+			_, err := c.deleteTable(ctx, node, model.SandboxTableID(sbx))
 			errs = append(errs, err)
 		}
 	}

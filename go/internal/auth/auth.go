@@ -11,13 +11,13 @@ package auth
 import (
 	"context"
 
-	"github.com/google/uuid"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Sandbox is a request made with a sandbox's token: the token is the
 // sandbox.
 type Sandbox struct {
-	ID uuid.UUID
+	ID podid.ID
 	// The tenant that owns the sandbox.
 	Owner string
 	// The SHA-256 of the token, hex: what identifies the caller across

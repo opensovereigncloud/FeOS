@@ -13,6 +13,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -90,7 +91,7 @@ func TestActivityRows(t *testing.T) {
 	rows = append(rows,
 		store.ActivityRow{TsNs: 5000, SandboxID: sb.ID, TenantID: "acme", Node: "n1", StartID: start, Seq: 1,
 			Source: store.SourceFeosd, Kind: "pod_state", Detail: json.RawMessage(`{"state":"RUNNING"}`)},
-		store.ActivityRow{TsNs: 5001, PodID: uuid.New(), ForeignPod: true, Node: "n1", StartID: start, Seq: 2,
+		store.ActivityRow{TsNs: 5001, PodID: podid.Mint(), ForeignPod: true, Node: "n1", StartID: start, Seq: 2,
 			Source: store.SourceFeosd, Kind: "pod_state"},
 		store.ActivityRow{TsNs: 5002, Node: "n1", Source: store.SourceFeosd, Kind: "node_started"},
 		store.ActivityRow{TsNs: 5003, SandboxID: sb.ID, Source: store.SourceFerund, Kind: "tool_end", SpanID: "s1",
@@ -143,13 +144,13 @@ func TestActivityRows(t *testing.T) {
 
 func TestTrafficRows(t *testing.T) {
 	s, _ := newStore(t)
-	sb := uuid.New()
+	sb := legacyID()
 	start := uuid.New()
 	must(t, s.InsertTraffic(bg,
 		store.TrafficRow{TsNs: 2, Node: "n1", StartID: start, Seq: 2, PodID: sb, SandboxID: sb, TenantID: "acme", Kind: "dns",
 			Detail: json.RawMessage(`{"dns":{"name":"example.com"}}`)},
 		store.TrafficRow{TsNs: 1, Node: "n1", StartID: start, Seq: 1, PodID: sb, SandboxID: sb, Kind: "flow", Missed: 3},
-		store.TrafficRow{TsNs: 3, Node: "n1", StartID: start, Seq: 3, PodID: uuid.New(), ForeignPod: true, Kind: "drop"},
+		store.TrafficRow{TsNs: 3, Node: "n1", StartID: start, Seq: 3, PodID: podid.Mint(), ForeignPod: true, Kind: "drop"},
 	))
 	must(t, s.InsertTraffic(bg, store.TrafficRow{TsNs: 1, Node: "n1", StartID: start, Seq: 1, Kind: "flow"}))
 	rows, err := s.ListSandboxTraffic(bg, sb, store.ActivityQuery{Limit: 10})
@@ -166,7 +167,7 @@ func TestTrafficRows(t *testing.T) {
 
 	// A node's traffic is the foreign records it sent: never another
 	// node's, never attributed ones.
-	foreign := uuid.New()
+	foreign := podid.Mint()
 	must(t, s.InsertTraffic(bg,
 		store.TrafficRow{TsNs: 4, Node: "n1", StartID: start, Seq: 4, PodID: foreign, ForeignPod: true, Kind: "flow",
 			Detail: json.RawMessage(`{"flow":{}}`)},
@@ -174,7 +175,7 @@ func TestTrafficRows(t *testing.T) {
 	))
 	rows, err = s.ListNodeTraffic(bg, "n1", store.ActivityQuery{Limit: 10})
 	if err != nil || len(rows) != 2 || rows[0].TsNs != 3 || rows[1].TsNs != 4 || !rows[0].ForeignPod ||
-		rows[1].PodID != foreign || rows[1].SandboxID != uuid.Nil || string(rows[1].Detail) != `{"flow": {}}` {
+		rows[1].PodID != foreign || !rows[1].SandboxID.IsZero() || string(rows[1].Detail) != `{"flow": {}}` {
 		t.Fatalf("node traffic %+v %v", rows, err)
 	}
 	if rows, err := s.ListNodeTraffic(bg, "n1", store.ActivityQuery{Limit: 1}); err != nil || len(rows) != 1 || rows[0].TsNs != 4 {
@@ -224,7 +225,7 @@ func TestInsertStatementShape(t *testing.T) {
 
 func TestIssuedCerts(t *testing.T) {
 	s, _ := newStore(t)
-	pod := uuid.New()
+	pod := podid.Mint()
 	for i, serial := range []string{"01", "02", "03"} {
 		c, err := s.InsertIssuedCert(bg, store.IssuedCert{Serial: serial, PodID: pod, Incarnation: uuid.New(), Node: "n1",
 			SPIFFEID: "spiffe://feos.local/tenant/acme/sandbox/" + pod.String(), HPKEPublicKey: []byte{byte(i)},
@@ -243,7 +244,7 @@ func TestIssuedCerts(t *testing.T) {
 	if c, err := s.LatestIssuedCert(bg, pod); err != nil || c.Serial == "01" {
 		t.Fatalf("latest %+v %v", c, err)
 	}
-	if _, err := s.LatestIssuedCert(bg, uuid.New()); !errors.Is(err, store.ErrNoRow) {
+	if _, err := s.LatestIssuedCert(bg, podid.Mint()); !errors.Is(err, store.ErrNoRow) {
 		t.Fatalf("latest of none: %v", err)
 	}
 	if l, err := s.ListIssuedCerts(bg, pod); err != nil || len(l) != 3 || l[2].Serial != "01" {
@@ -266,7 +267,7 @@ func TestWatches(t *testing.T) {
 	if err != nil || w.Container != "main" || w.Gen != 1 || w.Epoch != 1 || w.Owner != "i1" || !w.OwnerLive || w.Result != nil {
 		t.Fatalf("create %+v %v", w, err)
 	}
-	if _, err := s.CreateWatch(bg, store.NewWatch{ID: uuid.New(), SandboxID: uuid.New()}, "i1", time.Minute, time.Minute); !errors.Is(err, model.ErrNotFound) {
+	if _, err := s.CreateWatch(bg, store.NewWatch{ID: uuid.New(), SandboxID: podid.Mint()}, "i1", time.Minute, time.Minute); !errors.Is(err, model.ErrNotFound) {
 		t.Fatalf("watch of a missing sandbox: %v", err)
 	}
 	// A PUT on another instance: new paths, gen + 1, the owner told.
@@ -361,10 +362,10 @@ func TestBindings(t *testing.T) {
 	if get(t, s, sb.ID).Gen != 0 {
 		t.Fatal("a binding write bumped gen")
 	}
-	if _, _, err := s.KubeBindings(bg, uuid.New()); !errors.Is(err, model.ErrNotFound) {
+	if _, _, err := s.KubeBindings(bg, podid.Mint()); !errors.Is(err, model.ErrNotFound) {
 		t.Fatalf("kube of a missing sandbox: %v", err)
 	}
-	if err := s.SetKubeBindings(bg, uuid.New(), "v", nil); !errors.Is(err, model.ErrNotFound) {
+	if err := s.SetKubeBindings(bg, podid.Mint(), "v", nil); !errors.Is(err, model.ErrNotFound) {
 		t.Fatalf("set kube of a missing sandbox: %v", err)
 	}
 	// Delete is the empty set.
@@ -381,7 +382,7 @@ func TestBindings(t *testing.T) {
 	if err != nil || v != "s1" || len(ssh) != 2 || ssh[0].Name != "any" || len(ssh[0].HostKeys) != 0 || ssh[1].HostKeys[0] != "ssh-ed25519 AAAA" {
 		t.Fatalf("ssh set %q %+v %v", v, ssh, err)
 	}
-	if _, _, err := s.SSHBindings(bg, uuid.New()); !errors.Is(err, model.ErrNotFound) {
+	if _, _, err := s.SSHBindings(bg, podid.Mint()); !errors.Is(err, model.ErrNotFound) {
 		t.Fatalf("ssh of a missing sandbox: %v", err)
 	}
 	// The bindings go with the sandbox.

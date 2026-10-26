@@ -18,6 +18,10 @@ const webSandbox = "0193a000-0000-7000-8000-00000000000a"
 // Another attachable sandbox of the tenant.
 const otherSandbox = "0193a000-0000-7000-8000-00000000000b"
 
+// An attachable sandbox of the tenant with a short ID (ADR 0019); the two
+// above have UUIDs, as sandboxes made before do.
+const shortSandbox = "k3x9m2p7q4r"
+
 // fakeBlueprint is an addon type whose versions and keys are listed.
 type fakeBlueprint struct {
 	versions []string
@@ -115,7 +119,7 @@ func pinnedOf(image string) string {
 func defaultVC(mode Mode) fakeVC {
 	return fakeVC{mode: mode,
 		sandboxes: map[string]SandboxInfo{webSandbox: {ID: webSandbox, Attachable: true},
-			otherSandbox: {ID: otherSandbox, Attachable: true}},
+			otherSandbox: {ID: otherSandbox, Attachable: true}, shortSandbox: {ID: shortSandbox, Attachable: true}},
 		secrets: map[string]SecretInfo{"internal-token": {Latest: 3, Versions: []int{2, 3}, Deleted: []int{1}}},
 	}
 }
@@ -315,8 +319,14 @@ func TestValidateRules(t *testing.T) {
 				Sandbox: "0193a000-0000-7000-8000-0000000000ff"}
 			s.Services["web5"] = Service{Runtime: RuntimeAttached, Command: []string{"x"},
 				Sandbox: strings.ToUpper(webSandbox), Ports: []Port{{Name: "http", Port: 5174}}}
-		}, []expect{e("services.web2.sandbox", "needs a sandbox"), e("services.web3.sandbox", "not a UUID"),
-			e("services.web4.sandbox", "no sandbox 0193a000-0000-7000-8000-0000000000ff of yours")}},
+			s.Services["web6"] = Service{Runtime: RuntimeAttached, Command: []string{"x"}, Sandbox: shortSandbox}
+			s.Services["web7"] = Service{Runtime: RuntimeAttached, Command: []string{"x"}, Sandbox: "zzzzzzzzzzz"}
+			s.Services["web8"] = Service{Runtime: RuntimeAttached, Command: []string{"x"},
+				Sandbox: strings.ToUpper(shortSandbox)}
+		}, []expect{e("services.web2.sandbox", "needs a sandbox"), e("services.web3.sandbox", "not a sandbox ID"),
+			e("services.web4.sandbox", "no sandbox 0193a000-0000-7000-8000-0000000000ff of yours"),
+			e("services.web7.sandbox", "no sandbox zzzzzzzzzzz of yours"),
+			e("services.web8.sandbox", "not a sandbox ID")}},
 		{"ports", ModePlan, func(s *Spec) {
 			approval(s)
 			svc(s, "approval-service", func(v *Service) {

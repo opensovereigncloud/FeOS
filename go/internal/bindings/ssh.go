@@ -18,12 +18,12 @@ import (
 	"strconv"
 	"unicode/utf8"
 
-	"github.com/google/uuid"
 	"golang.org/x/crypto/ssh"
 
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -351,7 +351,7 @@ type sshSecret struct {
 	PrivateKey string `json:"private_key"`
 }
 
-func (s *Service) sealSSH(id uuid.UUID, b sshStored) (store.SSHBinding, error) {
+func (s *Service) sealSSH(id podid.ID, b sshStored) (store.SSHBinding, error) {
 	pt, err := json.Marshal(sshSecret{PrivateKey: b.PrivateKey})
 	if err != nil {
 		return store.SSHBinding{}, err
@@ -365,7 +365,7 @@ func (s *Service) sealSSH(id uuid.UUID, b sshStored) (store.SSHBinding, error) {
 		PublicKey: b.facts.publicKey, Sealed: sealed}, nil
 }
 
-func (s *Service) openSSHKey(id uuid.UUID, r store.SSHBinding) (string, error) {
+func (s *Service) openSSHKey(id podid.ID, r store.SSHBinding) (string, error) {
 	pt, err := s.sealer.Open(r.Sealed, sealAAD(tableSSH, id, r.Name, r.AuthType))
 	if err != nil {
 		return "", err
@@ -382,7 +382,7 @@ func (s *Service) openSSHKey(id uuid.UUID, r store.SSHBinding) (string, error) {
 
 // openSSH opens a stored set, rows sorted by name. The version is
 // recomputed from the opened bindings and has to equal the stored one.
-func (s *Service) openSSH(id uuid.UUID, version string, rows []store.SSHBinding) ([]sshStored, error) {
+func (s *Service) openSSH(id podid.ID, version string, rows []store.SSHBinding) ([]sshStored, error) {
 	bs := make([]sshStored, 0, len(rows))
 	for _, r := range rows {
 		key, err := s.openSSHKey(id, r)
@@ -412,7 +412,7 @@ var errSSHStoredKey = errors.New("stored generated key does not open")
 // normalised, a generated one kept from the stored binding of the same
 // name when that one was generate too, or made fresh. existing are the
 // rows stored now. The result is sorted by name, the version's order.
-func (s *Service) resolveSSH(id uuid.UUID, vs []sshValidated, existing []store.SSHBinding) ([]sshStored, error) {
+func (s *Service) resolveSSH(id podid.ID, vs []sshValidated, existing []store.SSHBinding) ([]sshStored, error) {
 	kept := map[string]store.SSHBinding{}
 	for _, r := range existing {
 		if r.AuthType == sshAuthGenerate {
@@ -479,7 +479,7 @@ func sameStored(rows []store.SSHBinding, bs []sshStored) bool {
 // opens is rewritten: the PUT is the repair. It returns the set as stored,
 // read in the same transaction, so a PUT answers its own write and never a
 // later one from another instance.
-func (s *Service) applySSH(ctx context.Context, id uuid.UUID, vs []sshValidated) (sshSetOut, error) {
+func (s *Service) applySSH(ctx context.Context, id podid.ID, vs []sshValidated) (sshSetOut, error) {
 	var res sshSetOut
 	err := s.st.InTx(ctx, func(tx *store.Store) error {
 		if _, err := tx.LockSandbox(ctx, id, store.ForUpdate); err != nil {
@@ -557,7 +557,7 @@ func sshSetOf(version string, rows []store.SSHBinding) sshSetOut {
 	return out
 }
 
-func (s *Service) sshSet(ctx context.Context, id uuid.UUID) (sshSetOut, error) {
+func (s *Service) sshSet(ctx context.Context, id podid.ID) (sshSetOut, error) {
 	version, rows, err := s.st.SSHBindings(ctx, id)
 	if errors.Is(err, model.ErrNotFound) {
 		return sshSetOut{}, noSuchSandbox()
@@ -568,7 +568,7 @@ func (s *Service) sshSet(ctx context.Context, id uuid.UUID) (sshSetOut, error) {
 	return sshSetOf(version, rows), nil
 }
 
-func (s *Service) writeSSHSet(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+func (s *Service) writeSSHSet(w http.ResponseWriter, r *http.Request, id podid.ID) {
 	out, err := s.sshSet(r.Context(), id)
 	if err != nil {
 		s.fail(w, r, err)

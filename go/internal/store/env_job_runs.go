@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // EnvJobRun is a row of env_job_runs: one attempt of a job, written with
@@ -26,9 +27,9 @@ type EnvJobRun struct {
 	TemplateHash string
 	Release      int
 	Attempt      int
-	SandboxID    uuid.UUID // uuid.Nil: NULL
-	Phase        string    // model.Run*
-	ExitCode     *int      // nil: NULL
+	SandboxID    podid.ID // "": NULL
+	Phase        string   // model.Run*
+	ExitCode     *int     // nil: NULL
 	Detail       string
 	LogTail      []string // the last 50 lines, kept when the row goes
 	StartedAt    time.Time
@@ -40,13 +41,13 @@ const jobRunCols = `id, env_id, job, template_hash, release, attempt, sandbox_id
 
 func scanJobRun(row pgx.Row) (EnvJobRun, error) {
 	var r EnvJobRun
-	var sandbox *uuid.UUID
+	var sandbox *podid.ID
 	var finished *time.Time
 	if err := row.Scan(&r.ID, &r.EnvID, &r.Job, &r.TemplateHash, &r.Release, &r.Attempt, &sandbox, &r.Phase,
 		&r.ExitCode, &r.Detail, &r.LogTail, &r.StartedAt, &finished); err != nil {
 		return EnvJobRun{}, err
 	}
-	r.SandboxID, r.FinishedAt, r.LogTail = uuidOf(sandbox), timeOf(finished), nonNil(r.LogTail)
+	r.SandboxID, r.FinishedAt, r.LogTail = idOf(sandbox), timeOf(finished), nonNil(r.LogTail)
 	return r, nil
 }
 
@@ -73,7 +74,7 @@ func (s *Store) InsertJobRun(ctx context.Context, r EnvJobRun) (EnvJobRun, error
 	out, err := scanJobRun(s.q.QueryRow(ctx, `INSERT INTO env_job_runs (env_id, job, template_hash, release, attempt,
 			sandbox_id, phase, exit_code, detail, log_tail, finished_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11) RETURNING `+jobRunCols,
-		r.EnvID, r.Job, r.TemplateHash, r.Release, r.Attempt, nullUUID(r.SandboxID), r.Phase, nullInt(r.ExitCode),
+		r.EnvID, r.Job, r.TemplateHash, r.Release, r.Attempt, nullID(r.SandboxID), r.Phase, nullInt(r.ExitCode),
 		r.Detail, tail, nullTime(r.FinishedAt)))
 	if err != nil {
 		return EnvJobRun{}, insertError("insert a run of job "+r.Job, err)
@@ -98,7 +99,7 @@ func (s *Store) LockJobRun(ctx context.Context, id int64, lock RowLock) (EnvJobR
 
 // JobRunOfSandbox reads the latest run whose instance row is sandboxID and
 // locks it with lock; ErrNoRow if there is none.
-func (s *Store) JobRunOfSandbox(ctx context.Context, sandboxID uuid.UUID, lock RowLock) (EnvJobRun, error) {
+func (s *Store) JobRunOfSandbox(ctx context.Context, sandboxID podid.ID, lock RowLock) (EnvJobRun, error) {
 	r, err := scanJobRun(s.q.QueryRow(ctx, "SELECT "+jobRunCols+` FROM env_job_runs WHERE sandbox_id = $1
 		ORDER BY id DESC LIMIT 1 `+string(lock), sandboxID))
 	if err != nil {
@@ -146,7 +147,7 @@ func (s *Store) UpdateJobRun(ctx context.Context, before, after EnvJobRun) (EnvJ
 		return EnvJobRun{}, err
 	}
 	u := newUpdates(before.ID)
-	u.set("sandbox_id", before.SandboxID != after.SandboxID, nullUUID(after.SandboxID))
+	u.set("sandbox_id", before.SandboxID != after.SandboxID, nullID(after.SandboxID))
 	u.set("phase", before.Phase != after.Phase, after.Phase)
 	u.set("exit_code", !sameIntPtr(before.ExitCode, after.ExitCode), nullInt(after.ExitCode))
 	u.set("detail", before.Detail != after.Detail, after.Detail)

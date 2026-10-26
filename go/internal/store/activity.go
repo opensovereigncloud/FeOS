@@ -13,6 +13,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The sources of activity rows.
@@ -28,8 +30,8 @@ type ActivityRow struct {
 	Day             time.Time // the partition (UTC, DB clock); set by the database
 	ID              int64     // set by the database
 	TsNs            int64     // producer time, ordering
-	SandboxID       uuid.UUID // the attributed sandbox; uuid.Nil: none
-	PodID           uuid.UUID // node records: the pod the record names, as sent
+	SandboxID       podid.ID  // the attributed sandbox; "": none
+	PodID           podid.ID  // node records: the pod the record names, as sent
 	ForeignPod      bool      // a node record about a pod not placed on that node
 	TenantID        string
 	Node            string
@@ -64,7 +66,7 @@ const activityBatch = 500
 // column. Its text is the same for every batch size, so each connection
 // prepares and caches it once.
 const insertActivitySQL = `INSERT INTO activity (` + activityInsertCols + `)
-	SELECT * FROM unnest($1::bigint[], $2::uuid[], $3::uuid[], $4::boolean[], $5::text[], $6::text[],
+	SELECT * FROM unnest($1::bigint[], $2::text[], $3::text[], $4::boolean[], $5::text[], $6::text[],
 		$7::uuid[], $8::bigint[], $9::text[], $10::text[], $11::text[], $12::text[], $13::text[], $14::text[],
 		$15::text[], $16::text[], $17::text[], $18::jsonb[], $19::bigint[], $20::bigint[], $21::text[],
 		$22::boolean[], $23::jsonb[])
@@ -74,6 +76,15 @@ const insertActivitySQL = `INSERT INTO activity (` + activityInsertCols + `)
 // *uuid.UUID cannot be one: pgx calls its Value method, which panics.)
 func uuidOrNull(u uuid.UUID) pgtype.UUID {
 	return pgtype.UUID{Bytes: u, Valid: u != uuid.Nil}
+}
+
+// idOrNull is id, or nil (NULL) for none, as an array element.
+func idOrNull(id podid.ID) *string {
+	if id.IsZero() {
+		return nil
+	}
+	s := string(id)
+	return &s
 }
 
 // seqOrNull is n, or nil (NULL) for 0.
@@ -116,7 +127,8 @@ func (s *Store) InsertActivity(ctx context.Context, rows ...ActivityRow) error {
 		n := len(chunk)
 		var (
 			tsNs, seq                 = make([]int64, n), make([]*int64, n)
-			sandboxID, podID, startID = make([]pgtype.UUID, n), make([]pgtype.UUID, n), make([]pgtype.UUID, n)
+			sandboxID, podID          = make([]*string, n), make([]*string, n)
+			startID                   = make([]pgtype.UUID, n)
 			foreignPod, truncated     = make([]bool, n), make([]bool, n)
 			tenantID, node, instance  = make([]string, n), make([]string, n), make([]string, n)
 			source, kind, category    = make([]string, n), make([]string, n), make([]string, n)
@@ -128,7 +140,7 @@ func (s *Store) InsertActivity(ctx context.Context, rows ...ActivityRow) error {
 		)
 		for i, r := range chunk {
 			tsNs[i], seq[i] = r.TsNs, seqOrNull(r.Seq)
-			sandboxID[i], podID[i], startID[i] = uuidOrNull(r.SandboxID), uuidOrNull(r.PodID), uuidOrNull(r.StartID)
+			sandboxID[i], podID[i], startID[i] = idOrNull(r.SandboxID), idOrNull(r.PodID), uuidOrNull(r.StartID)
 			foreignPod[i], truncated[i] = r.ForeignPod, r.OutputTruncated
 			tenantID[i], node[i], instance[i] = r.TenantID, r.Node, r.InstanceID
 			source[i], kind[i], category[i] = r.Source, r.Kind, r.Category
@@ -149,7 +161,8 @@ func (s *Store) InsertActivity(ctx context.Context, rows ...ActivityRow) error {
 
 func scanActivity(row pgx.Row) (ActivityRow, error) {
 	var r ActivityRow
-	var sandboxID, podID, startID *uuid.UUID
+	var sandboxID, podID *podid.ID
+	var startID *uuid.UUID
 	var seq *int64
 	var params, detail []byte
 	if err := row.Scan(&r.Day, &r.ID, &r.TsNs, &sandboxID, &podID, &r.ForeignPod, &r.TenantID, &r.Node, &startID, &seq,
@@ -157,7 +170,7 @@ func scanActivity(row pgx.Row) (ActivityRow, error) {
 		&params, &r.ExitCode, &r.DurationNs, &r.Output, &r.OutputTruncated, &detail); err != nil {
 		return ActivityRow{}, err
 	}
-	r.SandboxID, r.PodID, r.StartID = uuidOf(sandboxID), uuidOf(podID), uuidOf(startID)
+	r.SandboxID, r.PodID, r.StartID = idOf(sandboxID), idOf(podID), uuidOf(startID)
 	if seq != nil {
 		r.Seq = *seq
 	}
@@ -204,7 +217,7 @@ func (s *Store) listActivity(ctx context.Context, where string, arg any, q Activ
 
 // ListSandboxActivity returns a page of a sandbox's attributed activity,
 // ascending by ts_ns (foreign records are never attributed).
-func (s *Store) ListSandboxActivity(ctx context.Context, sandboxID uuid.UUID, q ActivityQuery) ([]ActivityRow, error) {
+func (s *Store) ListSandboxActivity(ctx context.Context, sandboxID podid.ID, q ActivityQuery) ([]ActivityRow, error) {
 	return s.listActivity(ctx, "sandbox_id = $1", sandboxID, q)
 }
 

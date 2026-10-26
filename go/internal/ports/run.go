@@ -11,10 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Run keeps the pools true to the sandboxes until ctx ends: on
@@ -63,9 +62,9 @@ func (h *Handler) Run(ctx context.Context) error {
 // ("" or "*": every sandbox with pools or upgraded connections), retires
 // their stale pools and closes their stale upgraded connections.
 func (h *Handler) recheck(ctx context.Context, payload string) {
-	var ids []uuid.UUID
+	var ids []podid.ID
 	h.mu.Lock()
-	known := map[uuid.UUID]bool{}
+	known := map[podid.ID]bool{}
 	for k := range h.transports {
 		known[k.id] = true
 	}
@@ -76,7 +75,7 @@ func (h *Handler) recheck(ctx context.Context, payload string) {
 		for id := range known {
 			ids = append(ids, id)
 		}
-	} else if id, err := uuid.Parse(payload); err == nil && known[id] {
+	} else if id, err := podid.Parse(payload); err == nil && known[id] {
 		ids = append(ids, id)
 	}
 	h.mu.Unlock()

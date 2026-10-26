@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"sort"
 
-	"github.com/google/uuid"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The tables whose rows carry a sealed credential (internal/seal); each
@@ -21,7 +21,7 @@ const (
 // sealAAD binds a blob to its row: a blob copied into another binding,
 // another sandbox's row, another auth type or another table does not
 // open.
-func sealAAD(table string, sandboxID uuid.UUID, name, authType string) []byte {
+func sealAAD(table string, sandboxID podid.ID, name, authType string) []byte {
 	return []byte("ferun/" + table + "/v1\x00" + sandboxID.String() + "\x00" + name + "\x00" + authType)
 }
 

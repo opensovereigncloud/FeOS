@@ -14,9 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // readClosed reports whether the peer closed c within d; what the peer
@@ -75,7 +74,7 @@ func TestALPNRouting(t *testing.T) {
 	t.Run("node connection with a pod certificate", func(t *testing.T) {
 		_, key, _ := ed25519.GenerateKey(rand.Reader)
 		csr, _ := pki.CreateCSR(key, "pod")
-		pc, leaf, err := e.iss.IssuePod(csr, pki.SandboxID(testTD, "acme", uuid.New()), nil, time.Hour)
+		pc, leaf, err := e.iss.IssuePod(csr, pki.SandboxID(testTD, "acme", podid.Mint()), nil, time.Hour)
 		if err != nil {
 			t.Fatal(err)
 		}

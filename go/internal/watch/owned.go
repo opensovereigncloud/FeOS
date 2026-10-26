@@ -20,6 +20,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -124,7 +125,7 @@ const (
 type owned struct {
 	s         *Service
 	id        uuid.UUID
-	sandbox   uuid.UUID
+	sandbox   podid.ID
 	container string
 	epoch     int64
 

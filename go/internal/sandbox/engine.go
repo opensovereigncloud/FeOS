@@ -12,14 +12,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/bindings"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -256,14 +255,14 @@ type Engine struct {
 
 	mu          sync.Mutex
 	procs       ProcessLister
-	stopping    bool                   // no work of the instance's own initiative any more
-	deferred    map[uuid.UUID]struct{} // syncs waiting for another instance's op
-	notified    map[string]time.Time   // node → last ferun_reconcile sent for it
-	touched     map[uuid.UUID]time.Time
-	unreachable map[uuid.UUID]*reach // sandboxes this instance marked unreachable
+	stopping    bool                  // no work of the instance's own initiative any more
+	deferred    map[podid.ID]struct{} // syncs waiting for another instance's op
+	notified    map[string]time.Time  // node → last ferun_reconcile sent for it
+	touched     map[podid.ID]time.Time
+	unreachable map[podid.ID]*reach // sandboxes this instance marked unreachable
 	// evacuations are the drain's workers in flight, sandbox → node, and
 	// evacuatingOn their number per node (at most drainPerNode).
-	evacuations  map[uuid.UUID]string
+	evacuations  map[podid.ID]string
 	evacuatingOn map[string]int
 
 	holdsMu sync.Mutex
@@ -277,19 +276,19 @@ type Engine struct {
 	// preBeginHook, when set, runs in Start right before the begin's
 	// transaction, after Before begin: tests let another instance act
 	// between a caller's read and its begin there.
-	preBeginHook func(ctx context.Context, id uuid.UUID, kind OpKind)
+	preBeginHook func(ctx context.Context, id podid.ID, kind OpKind)
 	// beginHook, when set, runs inside a fresh begin's transaction after
 	// the row is locked, before its rechecks: tests inject delays there.
-	beginHook func(ctx context.Context, id uuid.UUID, kind OpKind)
+	beginHook func(ctx context.Context, id podid.ID, kind OpKind)
 	// admitHook, when set, runs inside Acquire's transaction after the
 	// row is locked: tests inject delays there.
-	admitHook func(ctx context.Context, id uuid.UUID)
+	admitHook func(ctx context.Context, id podid.ID)
 	// connHook, when set, runs where an op gets its connection; an error
 	// is taken for a connection that could not be had: tests inject it.
 	connHook func(h *OpHandle) error
 	// beginTxHook, when set, replaces the error of a begin's transaction:
 	// tests make a COMMIT's answer get lost.
-	beginTxHook func(id uuid.UUID, err error) error
+	beginTxHook func(id podid.ID, err error) error
 }
 
 // New returns the engine of an instance.
@@ -334,8 +333,8 @@ func New(cfg Config, deps Deps) (*Engine, error) {
 	e := &Engine{
 		cfg: cfg, id: cfg.InstanceID, d: deps.DB, st: st, conns: deps.Conns, el: deps.Elector,
 		act: deps.Activity, log: log, t: defaultTimings(cfg.HibernateTimeout), procs: deps.Processes,
-		deferred: map[uuid.UUID]struct{}{}, notified: map[string]time.Time{}, touched: map[uuid.UUID]time.Time{},
-		unreachable: map[uuid.UUID]*reach{}, evacuations: map[uuid.UUID]string{}, evacuatingOn: map[string]int{},
+		deferred: map[podid.ID]struct{}{}, notified: map[string]time.Time{}, touched: map[podid.ID]time.Time{},
+		unreachable: map[podid.ID]*reach{}, evacuations: map[podid.ID]string{}, evacuatingOn: map[string]int{},
 		holds: map[holdKey]*holdState{}, tombs: map[store.TombstoneKey]*tombRun{}, rl: newRateLog(log),
 	}
 	if e.act == nil {
@@ -348,7 +347,7 @@ func New(cfg Config, deps Deps) (*Engine, error) {
 	}
 	e.resolveImage = newResolver(deny).resolve
 	e.runner = newRunner(e)
-	e.syncs.m = map[uuid.UUID]*syncEntry{}
+	e.syncs.m = map[podid.ID]*syncEntry{}
 	e.bg, e.bgCancel = context.WithCancel(context.Background())
 	return e, nil
 }
@@ -462,7 +461,7 @@ func (e *Engine) detached(ctx context.Context, deadline time.Time) (context.Cont
 }
 
 // State reads a sandbox's client state and node; it never wakes it.
-func (e *Engine) State(ctx context.Context, id uuid.UUID) (state, node string, err error) {
+func (e *Engine) State(ctx context.Context, id podid.ID) (state, node string, err error) {
 	sb, err := e.st.GetSandbox(ctx, id)
 	if err != nil {
 		return "", "", err
@@ -473,7 +472,7 @@ func (e *Engine) State(ctx context.Context, id uuid.UUID) (state, node string, e
 // Touch records activity of the sandbox (last_active_at = now()), at most
 // once a second per sandbox on this instance: a forwarded request that
 // ends while a hold remains, an explicit resume.
-func (e *Engine) Touch(id uuid.UUID) {
+func (e *Engine) Touch(id podid.ID) {
 	now := time.Now()
 	e.mu.Lock()
 	if last, ok := e.touched[id]; ok && now.Sub(last) < e.t.touchEvery {
@@ -501,12 +500,12 @@ func (e *Engine) Touch(id uuid.UUID) {
 // Unreachable records that the guest of a running sandbox did not answer
 // (unreachable_since = coalesce(unreachable_since, now()), which the repair
 // loop acts on). The next healthy call clears it (Reachable).
-func (e *Engine) Unreachable(id uuid.UUID) { e.setReach(id, true) }
+func (e *Engine) Unreachable(id podid.ID) { e.setReach(id, true) }
 
 // Reachable records a successful call into the sandbox's guest: it clears
 // what Unreachable recorded, and writes nothing when this instance did not
 // mark the sandbox.
-func (e *Engine) Reachable(id uuid.UUID) { e.setReach(id, false) }
+func (e *Engine) Reachable(id podid.ID) { e.setReach(id, false) }
 
 // reach is what this instance last wished recorded of a sandbox's guest.
 // One worker at a time writes the wishes of a sandbox, in order, so that a
@@ -519,7 +518,7 @@ type reach struct {
 
 // setReach records a wish and starts the sandbox's worker unless it runs;
 // a running worker writes the wish after its current write.
-func (e *Engine) setReach(id uuid.UUID, marked bool) {
+func (e *Engine) setReach(id podid.ID, marked bool) {
 	e.mu.Lock()
 	r := e.unreachable[id]
 	if r == nil {
@@ -548,7 +547,7 @@ func (e *Engine) setReach(id uuid.UUID, marked bool) {
 // a write. It forgets the sandbox when nothing of this instance's is
 // recorded any more (cleared, or a mark that found it not running); a
 // failed write keeps it marked, so that the next healthy call clears.
-func (e *Engine) writeReach(ctx context.Context, id uuid.UUID, r *reach) {
+func (e *Engine) writeReach(ctx context.Context, id podid.ID, r *reach) {
 	for {
 		e.mu.Lock()
 		marked := r.marked

@@ -32,7 +32,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
@@ -44,6 +43,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -51,13 +51,13 @@ import (
 // IssuePodCredentials seals to the run's key (*bindings.Service). No
 // bindings, or bindings switched off: nil.
 type BindingsSource interface {
-	PodBindings(ctx context.Context, podID uuid.UUID) (*fleetv1.PodBindings, string, error)
+	PodBindings(ctx context.Context, podID podid.ID) (*fleetv1.PodBindings, string, error)
 }
 
 // SandboxHooks is what fleet hands to the sandbox engine (*sandbox.Engine):
 // pod events, inventory reconciles and the registry's inventory hash.
 type SandboxHooks interface {
-	PodChanged(node string, podID uuid.UUID)
+	PodChanged(node string, podID podid.ID)
 	ReconcileNode(ctx context.Context, node string) error
 	RegistryHash(ctx context.Context, node string) (string, error)
 }

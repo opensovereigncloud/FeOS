@@ -50,18 +50,19 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/tools"
 )
 
 // Engine is what the API needs of the sandbox engine (*sandbox.Engine).
 type Engine interface {
-	Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error)
-	Pause(ctx context.Context, id uuid.UUID) error
-	Resume(ctx context.Context, id uuid.UUID) error
-	Delete(ctx context.Context, owner string, id uuid.UUID) (store.Sandbox, bool, error)
+	Ensure(ctx context.Context, id podid.ID) (model.Lease, error)
+	Pause(ctx context.Context, id podid.ID) error
+	Resume(ctx context.Context, id podid.ID) error
+	Delete(ctx context.Context, owner string, id podid.ID) (store.Sandbox, bool, error)
 	DeleteTenant(ctx context.Context, tenant string) (bool, error)
-	Touch(id uuid.UUID)
+	Touch(id podid.ID)
 }
 
 // Watches are the watch handlers (*watch.Service), sandbox class.

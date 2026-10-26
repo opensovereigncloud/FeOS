@@ -12,13 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/ports"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
@@ -448,7 +447,7 @@ func (c *Controller) writeInstance(ctx context.Context, before, after store.EnvI
 
 // exitRunOf is the microVM pid at the instance's last recorded exit (0:
 // none known).
-func (c *Controller) exitRunOf(id uuid.UUID) int64 {
+func (c *Controller) exitRunOf(id podid.ID) int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.exitRun[id]

@@ -56,19 +56,24 @@ func dumpSchema(ctx context.Context, t *testing.T, q db.Querier) string {
 		}
 		b.WriteString("\n")
 		rows, err := q.Query(ctx, `SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,
-				coalesce(pg_get_expr(d.adbin, d.adrelid), ''), a.attidentity::text
+				coalesce(pg_get_expr(d.adbin, d.adrelid), ''), a.attidentity::text,
+				coalesce((SELECT quote_ident(c.collname) FROM pg_collation c
+					WHERE c.oid = a.attcollation AND c.oid <> 'default'::regcollation), '')
 			FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 			WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum`, tb.oid)
 		if err != nil {
 			t.Fatal(err)
 		}
 		cols, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (string, error) {
-			var name, typ, def, identity string
+			var name, typ, def, identity, collation string
 			var notNull bool
-			if err := r.Scan(&name, &typ, &notNull, &def, &identity); err != nil {
+			if err := r.Scan(&name, &typ, &notNull, &def, &identity, &collation); err != nil {
 				return "", err
 			}
 			s := "  COLUMN " + name + " " + typ
+			if collation != "" {
+				s += " COLLATE " + collation
+			}
 			if notNull {
 				s += " NOT NULL"
 			}
@@ -168,7 +173,7 @@ func TestMigrationSchema(t *testing.T) {
 		"env_instances", "env_job_runs", "env_releases", "env_route_tokens", "env_secrets", "env_tags", "env_volumes",
 		"environments", "event_gaps", "instances",
 		"issued_certs", "join_tokens", "kube_bindings", "leases", "node_certs", "node_starts", "node_telemetry",
-		"nodes", "placements", "pod_network", "pod_tombstones", "sandbox_holds", "sandbox_tokens", "sandboxes",
+		"nodes", "pod_network", "pod_tombstones", "sandbox_holds", "sandbox_tokens", "sandboxes",
 		"schema_migrations", "ssh_bindings", "tenant_tokens", "tenants", "traffic_records", "ui_sessions",
 		"watches"}
 	if strings.Join(tables, ",") != strings.Join(wantTables, ",") {

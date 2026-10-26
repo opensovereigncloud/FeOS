@@ -10,10 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 func TestParseExitRule(t *testing.T) {
@@ -51,9 +50,9 @@ func TestContainerExitRules(t *testing.T) {
 		c.StartLog = true
 	})
 	pc := pods(t, in, "n1")
-	podOf := func(object string) uuid.UUID {
+	podOf := func(object string) podid.ID {
 		t.Helper()
-		id := uuid.New()
+		id := podid.Mint()
 		spec := envSpec(id, "")
 		spec.Labels[objectLabel] = object
 		if _, err := create(t, pc, id.String(), spec); err != nil {
@@ -62,7 +61,7 @@ func TestContainerExitRules(t *testing.T) {
 		waitState(t, pc, id.String(), podv1.PodState_POD_STATE_RUNNING)
 		return id
 	}
-	exited := func(id uuid.UUID) *podv1.ContainerStatus {
+	exited := func(id podid.ID) *podv1.ContainerStatus {
 		t.Helper()
 		var st *podv1.ContainerStatus
 		eventually(t, 5*time.Second, "pod "+id.String()+" exited", func() bool {
@@ -101,7 +100,7 @@ func TestContainerExitRules(t *testing.T) {
 	exited(crasher)
 
 	cc := containerv1.NewContainerServiceClient(conn(t, in, "n1"))
-	logs := func(id uuid.UUID) []string {
+	logs := func(id podid.ID) []string {
 		t.Helper()
 		s, err := cc.StreamContainerLogs(podCtx(id.String()), &containerv1.StreamContainerLogsRequest{TailLines: 100})
 		if err != nil {
@@ -137,10 +136,10 @@ func TestConfigPortAddrs(t *testing.T) {
 	e := newEnv(t)
 	in := e.instance("i1", caIss)
 	n := e.start("n1", in, func(c *Config) { c.PortAddrs = map[uint32]string{8080: "127.0.0.1:18080"} })
-	if got := n.Script().portAddr(uuid.New(), 8080); got != "127.0.0.1:18080" {
+	if got := n.Script().portAddr(podid.Mint(), 8080); got != "127.0.0.1:18080" {
 		t.Fatalf("port 8080 dials %s", got)
 	}
-	if got := n.Script().portAddr(uuid.New(), 8081); got != "127.0.0.1:8081" {
+	if got := n.Script().portAddr(podid.Mint(), 8081); got != "127.0.0.1:8081" {
 		t.Fatalf("port 8081 dials %s", got)
 	}
 }

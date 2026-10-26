@@ -7,17 +7,17 @@ import (
 	"context"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Booking is a row of bookings: a pod's size on a node, what it uses
 // there. Bookings follow resource use; a pod that runs is booked even past
 // the gates (Gated false).
 type Booking struct {
-	PodID     uuid.UUID
+	PodID     podid.ID
 	Node      string
 	VCPUs     int
 	MemoryMiB int
@@ -34,7 +34,7 @@ func scanBooking(row pgx.Row) (Booking, error) {
 }
 
 // GetBooking reads a pod's booking; ErrNoRow if it has none.
-func (s *Store) GetBooking(ctx context.Context, podID uuid.UUID) (Booking, error) {
+func (s *Store) GetBooking(ctx context.Context, podID podid.ID) (Booking, error) {
 	b, err := scanBooking(s.q.QueryRow(ctx, "SELECT "+bookingCols+" FROM bookings WHERE pod_id = $1", podID))
 	return b, noRow(err, ErrNoRow)
 }
@@ -54,7 +54,7 @@ func (s *Store) UpsertBooking(ctx context.Context, b Booking) error {
 }
 
 // DeleteBooking frees a pod's booking. It reports whether there was one.
-func (s *Store) DeleteBooking(ctx context.Context, podID uuid.UUID) (bool, error) {
+func (s *Store) DeleteBooking(ctx context.Context, podID podid.ID) (bool, error) {
 	tag, err := s.q.Exec(ctx, "DELETE FROM bookings WHERE pod_id = $1", podID)
 	return tag.RowsAffected() > 0, err
 }
@@ -75,10 +75,10 @@ type BookingSums struct {
 	MemoryMiB int64
 }
 
-// SumBookings sums the bookings on node, without the pod exclude (uuid.Nil
+// SumBookings sums the bookings on node, without the pod exclude (""
 // excludes nothing): what an admission of exclude rechecks the gates
 // against, under the node's row lock.
-func (s *Store) SumBookings(ctx context.Context, node string, exclude uuid.UUID) (BookingSums, error) {
+func (s *Store) SumBookings(ctx context.Context, node string, exclude podid.ID) (BookingSums, error) {
 	var b BookingSums
 	err := s.q.QueryRow(ctx, `SELECT count(*), coalesce(sum(vcpus), 0), coalesce(sum(memory_mib), 0)
 		FROM bookings WHERE node = $1 AND pod_id <> $2`, node, exclude).Scan(&b.Count, &b.VCPUs, &b.MemoryMiB)
@@ -86,8 +86,8 @@ func (s *Store) SumBookings(ctx context.Context, node string, exclude uuid.UUID)
 }
 
 // SumAllBookings sums the bookings of every node, without the pod exclude
-// (uuid.Nil excludes nothing).
-func (s *Store) SumAllBookings(ctx context.Context, exclude uuid.UUID) (map[string]BookingSums, error) {
+// ("" excludes nothing).
+func (s *Store) SumAllBookings(ctx context.Context, exclude podid.ID) (map[string]BookingSums, error) {
 	rows, err := s.q.Query(ctx, `SELECT node, count(*), sum(vcpus), sum(memory_mib) FROM bookings
 		WHERE pod_id <> $1 GROUP BY node`, exclude)
 	if err != nil {
@@ -115,26 +115,27 @@ type NodeSnapshot struct {
 	Booked       BookingSums
 	// Tombstoned: a tombstone for this pod exists on the node.
 	Tombstoned bool
-	// TAPConflict is a sandbox on the node with the same first 8 hex
-	// digits whose pod may hold a TAP device; uuid.Nil if none.
-	TAPConflict uuid.UUID
+	// TAPConflict is a sandbox on the node whose pod's TAP device has the
+	// pod's name and may exist ("" if none): only a pod with a UUID has
+	// one (ADR 0019).
+	TAPConflict podid.ID
 }
 
 // PlacementSnapshot reads every node that is not removed, ordered by name,
 // as placement of podID scores it, in one statement without locks.
-func (s *Store) PlacementSnapshot(ctx context.Context, podID uuid.UUID) ([]NodeSnapshot, error) {
+func (s *Store) PlacementSnapshot(ctx context.Context, podID podid.ID) ([]NodeSnapshot, error) {
 	rows, err := s.q.Query(ctx, "SELECT "+nodeColumns("n")+`,
 			t.node IS NOT NULL, coalesce(t.last_seen, 'epoch'::timestamptz), coalesce(t.load1, 0),
 			coalesce(t.memory_available_bytes, 0), coalesce(t.disk_available_bytes, 0),
 			coalesce(t.inventory_hash, ''),
 			coalesce(b.cnt, 0), coalesce(b.vcpus, 0), coalesce(b.mem, 0),
-			EXISTS (SELECT 1 FROM pod_tombstones pt WHERE pt.pod_id = $1::uuid AND pt.node = n.name),
-			(SELECT s.id FROM sandboxes s WHERE s.node = n.name AND left(s.id::text, 8) = left($1::uuid::text, 8)
-				AND s.id <> $1::uuid AND `+tapHolds+` ORDER BY s.id LIMIT 1)
+			EXISTS (SELECT 1 FROM pod_tombstones pt WHERE pt.pod_id = $1::text AND pt.node = n.name),
+			(SELECT s.id FROM sandboxes s WHERE s.node = n.name AND `+tapShares(1)+`
+				AND `+tapHolds+` ORDER BY s.id LIMIT 1)
 		FROM nodes n
 		LEFT JOIN node_telemetry t ON t.node = n.name
 		LEFT JOIN (SELECT node, count(*) AS cnt, sum(vcpus) AS vcpus, sum(memory_mib) AS mem
-			FROM bookings WHERE pod_id <> $1::uuid GROUP BY node) b ON b.node = n.name
+			FROM bookings WHERE pod_id <> $1::text GROUP BY node) b ON b.node = n.name
 		WHERE n.status <> 'removed' ORDER BY n.name`, podID)
 	if err != nil {
 		return nil, err
@@ -143,7 +144,7 @@ func (s *Store) PlacementSnapshot(ctx context.Context, podID uuid.UUID) ([]NodeS
 		var ns NodeSnapshot
 		targets, finish := nodeScanTargets(&ns.Node)
 		var load1 float32
-		var tap *uuid.UUID
+		var tap *podid.ID
 		targets = append(targets, &ns.HasTelemetry, &ns.Telemetry.LastSeen, &load1,
 			&ns.Telemetry.MemoryAvailableBytes, &ns.Telemetry.DiskAvailableBytes, &ns.Telemetry.InventoryHash,
 			&ns.Booked.Count, &ns.Booked.VCPUs, &ns.Booked.MemoryMiB, &ns.Tombstoned, &tap)
@@ -156,7 +157,7 @@ func (s *Store) PlacementSnapshot(ctx context.Context, podID uuid.UUID) ([]NodeS
 		if !ns.HasTelemetry {
 			ns.Telemetry = Telemetry{}
 		}
-		ns.TAPConflict = uuidOf(tap)
+		ns.TAPConflict = idOf(tap)
 		return ns, nil
 	})
 }

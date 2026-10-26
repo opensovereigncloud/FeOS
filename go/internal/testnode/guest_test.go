@@ -30,6 +30,7 @@ import (
 	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
 	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
 	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // guestEnv is a node with a running pod.
@@ -38,7 +39,7 @@ type guestEnv struct {
 	in  *instance
 	n   *Node
 	pc  podv1.PodServiceClient
-	uid uuid.UUID
+	uid podid.ID
 	id  string
 }
 
@@ -75,7 +76,7 @@ func TestGuestRouting(t *testing.T) {
 	_, err = execOut(t, g.in, "n1", unknown, "true")
 	wantCode(t, err, codes.NotFound, "no pod "+unknown)
 	_, err = execOut(t, g.in, "n1", "nope", "true")
-	wantCode(t, err, codes.InvalidArgument, `pod ID "nope" is not a UUID`)
+	wantCode(t, err, codes.InvalidArgument, `pod ID "nope" is neither a short pod ID nor a UUID`)
 
 	g.n.Script().SetGuestUnreachable(g.uid, true)
 	_, err = execOut(t, g.in, "n1", g.id, "true")
@@ -135,7 +136,7 @@ func TestExecCancelKillsTheGroup(t *testing.T) {
 
 func TestScriptedExec(t *testing.T) {
 	g := newGuestEnv(t)
-	g.n.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, out ExecOutput) (int32, bool, error) {
+	g.n.Script().SetExec(func(_ context.Context, pod podid.ID, req *containerv1.ExecRequest, out ExecOutput) (int32, bool, error) {
 		if req.Command[0] != "scripted" {
 			return 0, false, nil
 		}
@@ -259,7 +260,7 @@ func TestTools(t *testing.T) {
 		t.Fatalf("fd --glob: %v", fd)
 	}
 
-	g.n.Script().SetTool(func(_ context.Context, _ uuid.UUID, method string, _ proto.Message) (proto.Message, bool, error) {
+	g.n.Script().SetTool(func(_ context.Context, _ podid.ID, method string, _ proto.Message) (proto.Message, bool, error) {
 		if method != toolv1.ToolService_Ls_FullMethodName {
 			return nil, false, nil
 		}
@@ -502,7 +503,7 @@ func TestExecEnvironment(t *testing.T) {
 	in := e.instance("i1", caIss)
 	n := e.start("n1", in)
 	pc := pods(t, in, "n1")
-	uid := uuid.New()
+	uid := podid.Mint()
 	spec := sandboxSpec(uid, "1")
 	spec.Containers[0].Env = map[string]string{"FROM_SPEC": "spec", "SHARED": "spec"}
 	if _, err := create(t, pc, uid.String(), spec); err != nil {

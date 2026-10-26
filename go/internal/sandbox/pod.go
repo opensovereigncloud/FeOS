@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/codes"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The labels of a sandbox's pod (§2, §9). A pod belongs to ferund when it
@@ -94,7 +95,7 @@ func (e *Engine) podClient(ctx context.Context, node string) (podv1.PodServiceCl
 
 // getPod asks node for the pod: NOT_FOUND is an answer (an observation
 // without info); any other error is not.
-func (e *Engine) getPod(ctx context.Context, node string, id uuid.UUID) (observation, error) {
+func (e *Engine) getPod(ctx context.Context, node string, id podid.ID) (observation, error) {
 	pc, err := e.podClient(ctx, node)
 	if err != nil {
 		return observation{}, err
@@ -118,7 +119,7 @@ type podEvents struct {
 
 // openPodEvents opens StreamPodEvents{pod_id} on node; its events arrive
 // on ch until the stream ends (ended is closed) or cancel is called.
-func (e *Engine) openPodEvents(ctx context.Context, node string, id uuid.UUID) (*podEvents, error) {
+func (e *Engine) openPodEvents(ctx context.Context, node string, id podid.ID) (*podEvents, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	pc, err := e.podClient(sctx, node)
 	if err != nil {
@@ -161,7 +162,7 @@ func (e *Engine) openPodEvents(ctx context.Context, node string, id uuid.UUID) (
 // (UNAVAILABLE, DATA_LOSS) and polling when one cannot be opened
 // (RESOURCE_EXHAUSTED). onPending, if set, runs at the first observation
 // of the pod of inc PENDING. It returns the last observation.
-func (e *Engine) watchPod(ctx context.Context, node string, id, inc uuid.UUID, onPending func()) observation {
+func (e *Engine) watchPod(ctx context.Context, node string, id podid.ID, inc uuid.UUID, onPending func()) observation {
 	var last observation
 	var events *podEvents
 	defer func() {

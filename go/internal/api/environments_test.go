@@ -19,13 +19,12 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	envs "github.com/ironcore-dev/feos/go/internal/env"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/seal"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
@@ -500,21 +499,21 @@ func TestRouteDoorClass(t *testing.T) {
 // envEngine is what the real environments service needs of the engine.
 type envEngine struct{}
 
-func (envEngine) Ensure(context.Context, uuid.UUID) (model.Lease, error) { return model.Lease{}, nil }
-func (envEngine) Delete(context.Context, string, uuid.UUID) (store.Sandbox, bool, error) {
+func (envEngine) Ensure(context.Context, podid.ID) (model.Lease, error) { return model.Lease{}, nil }
+func (envEngine) Delete(context.Context, string, podid.ID) (store.Sandbox, bool, error) {
 	return store.Sandbox{}, false, nil
 }
-func (envEngine) Restart(context.Context, uuid.UUID, string) error { return nil }
+func (envEngine) Restart(context.Context, podid.ID, string) error { return nil }
 func (envEngine) ResolveImage(_ context.Context, image string) (string, error) {
 	repo, _, _ := strings.Cut(image, ":")
 	return repo + "@sha256:" + strings.Repeat("ab", 32), nil
 }
-func (envEngine) Acquire(_ context.Context, id uuid.UUID, _ model.HoldKind) (model.Lease, func(), error) {
+func (envEngine) Acquire(_ context.Context, id podid.ID, _ model.HoldKind) (model.Lease, func(), error) {
 	return model.Lease{SandboxID: id}, func() {}, nil
 }
-func (envEngine) Touch(uuid.UUID)                       {}
-func (envEngine) Sync(context.Context, uuid.UUID) error { return nil }
-func (envEngine) State(context.Context, uuid.UUID) (string, string, error) {
+func (envEngine) Touch(podid.ID)                       {}
+func (envEngine) Sync(context.Context, podid.ID) error { return nil }
+func (envEngine) State(context.Context, podid.ID) (string, string, error) {
 	return model.StateRunning, "", nil
 }
 
@@ -527,7 +526,7 @@ func (envPorts) Probe(context.Context, model.Lease, int, string) (int, error) {
 func (envPorts) DialPod(context.Context, model.Lease, int) (net.Conn, error) {
 	return nil, errors.New("no")
 }
-func (envPorts) ForwardTo(w http.ResponseWriter, r *http.Request, id uuid.UUID, port int, path, rawPath string,
+func (envPorts) ForwardTo(w http.ResponseWriter, r *http.Request, id podid.ID, port int, path, rawPath string,
 	credentials []string) {
 	_, _ = fmt.Fprintf(w, "forwarded %d %s %s auth=%q strip=%q", port, path, r.URL.RawQuery, r.Header.Get("Authorization"),
 		credentials)

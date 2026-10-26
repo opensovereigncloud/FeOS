@@ -9,9 +9,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -53,10 +52,12 @@ type gateInput struct {
 	hasTelemetry bool
 	booked       store.BookingSums // without the pod itself
 	tombstoned   bool
-	tap          uuid.UUID
-	connected    bool
+	// tap is the sandbox whose pod's TAP device has the pod's name on the
+	// node (only a pod with a UUID can share one: ADR 0019); "": none.
+	tap       podid.ID
+	connected bool
 
-	pod             uuid.UUID
+	pod             podid.ID
 	vcpus, memMiB   int64
 	pin             string // the only node a create may go to; "": any
 	avoid           []string
@@ -113,7 +114,7 @@ func (in *gateInput) gate(g int) string {
 			return "a create failed here"
 		}
 	case gateTAP:
-		if in.tap != uuid.Nil {
+		if !in.tap.IsZero() {
 			return "TAP prefix taken by sandbox " + in.tap.String()
 		}
 	case gateStore:
@@ -320,7 +321,7 @@ func capacityRefusal(n store.Node, sb store.Sandbox, booked store.BookingSums) s
 // admissionError is the error of a refused admission on a pinned node: a
 // capacity or draining gate is ErrNoCapacity, a node that is not ready,
 // forked or not connected is ErrNodeUnavailable.
-func admissionError(r *refusal, id uuid.UUID) error {
+func admissionError(r *refusal, id podid.ID) error {
 	switch r.gate {
 	case gateStatus, gateForked, gateConnected:
 		return &admission{refusal: r, err: errorf(model.ErrNodeUnavailable, "node %s is unavailable: %s", r.node, r.text)}

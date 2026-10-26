@@ -15,6 +15,7 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -104,7 +105,7 @@ type OpHandle struct {
 	done chan struct{}
 	res  OpResult
 
-	id       uuid.UUID
+	id       podid.ID
 	opID     uuid.UUID
 	inc      uuid.UUID
 	kind     OpKind
@@ -194,7 +195,7 @@ func (h *OpHandle) settle() bool {
 type opRunner interface {
 	// Start waits (ctx) only in Before begin; single flight per sandbox;
 	// ErrStopping, ErrBusy, ErrPrecondition, ErrNodeUnavailable.
-	Start(ctx context.Context, id uuid.UUID, in OpIntent) (*OpHandle, error)
+	Start(ctx context.Context, id podid.ID, in OpIntent) (*OpHandle, error)
 	Stop(ctx context.Context) error
 }
 
@@ -205,8 +206,8 @@ type runner struct {
 	e *Engine
 
 	mu       sync.Mutex
-	ops      map[uuid.UUID]*OpHandle // the op in flight per sandbox
-	begins   map[uuid.UUID]*beginLock
+	ops      map[podid.ID]*OpHandle // the op in flight per sandbox
+	begins   map[podid.ID]*beginLock
 	refusing bool
 	// beginning counts the begins in progress: registered under mu while
 	// the runner still accepts ops, so that Stop waits for a begin that
@@ -228,7 +229,7 @@ type beginLock struct {
 }
 
 func newRunner(e *Engine) *runner {
-	return &runner{e: e, ops: map[uuid.UUID]*OpHandle{}, begins: map[uuid.UUID]*beginLock{}}
+	return &runner{e: e, ops: map[podid.ID]*OpHandle{}, begins: map[podid.ID]*beginLock{}}
 }
 
 // Start returns the op in flight for the sandbox on this instance (of the
@@ -236,12 +237,12 @@ func newRunner(e *Engine) *runner {
 // goroutine of its own. Ops of a pinned target whose trigger waits first
 // wait (ctx) until this instance is connected to the target; those of the
 // loops' triggers only check it.
-func (r *runner) Start(ctx context.Context, id uuid.UUID, in OpIntent) (*OpHandle, error) {
+func (r *runner) Start(ctx context.Context, id podid.ID, in OpIntent) (*OpHandle, error) {
 	return r.start(ctx, id, in, in.Trigger.waits())
 }
 
 // Running returns the op in flight for the sandbox on this instance.
-func (r *runner) Running(id uuid.UUID) *OpHandle {
+func (r *runner) Running(id podid.ID) *OpHandle {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.ops[id]
@@ -275,7 +276,7 @@ func (r *runner) isRefusing() bool {
 	return r.refusing
 }
 
-func (r *runner) start(ctx context.Context, id uuid.UUID, in OpIntent, wait bool) (*OpHandle, error) {
+func (r *runner) start(ctx context.Context, id podid.ID, in OpIntent, wait bool) (*OpHandle, error) {
 	if r.isRefusing() {
 		return nil, r.stoppingError()
 	}
@@ -325,7 +326,7 @@ func (r *runner) start(ctx context.Context, id uuid.UUID, in OpIntent, wait bool
 // never waits for its old row's op), for a takeover the op it means to
 // take over, and for a preempt any op but the hibernate it means to
 // preempt (a resume another caller began in its place is joined).
-func (r *runner) joinable(id uuid.UUID, in OpIntent) *OpHandle {
+func (r *runner) joinable(id podid.ID, in OpIntent) *OpHandle {
 	h := r.Running(id)
 	if h == nil {
 		return nil
@@ -357,7 +358,7 @@ func (r *runner) enterBegin() bool {
 
 // leaveBegin ends a begin in progress; h, the op it began (nil when it
 // failed), is in flight from now on.
-func (r *runner) leaveBegin(id uuid.UUID, h *OpHandle) {
+func (r *runner) leaveBegin(id podid.ID, h *OpHandle) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.beginning--
@@ -405,7 +406,7 @@ func pinnedTarget(in OpIntent) string {
 }
 
 // lockBegin takes the sandbox's begin lock, waiting at most for ctx.
-func (r *runner) lockBegin(ctx context.Context, id uuid.UUID) (func(), error) {
+func (r *runner) lockBegin(ctx context.Context, id podid.ID) (func(), error) {
 	r.mu.Lock()
 	bl := r.begins[id]
 	if bl == nil {
@@ -458,7 +459,7 @@ func (r *runner) Stop(ctx context.Context) error {
 	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
-	var ids []uuid.UUID
+	var ids []podid.ID
 	err := r.e.st.InTx(rctx, func(tx *store.Store) error {
 		var err error
 		ids, err = tx.ReleaseOpsOf(rctx, r.e.id)

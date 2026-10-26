@@ -24,6 +24,7 @@ import (
 
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // feosd's limits of a pod spec (spec.rs).
@@ -59,7 +60,7 @@ type podService struct {
 
 // pod is a pod's record and what the fake knows of its microVM.
 type pod struct {
-	uid  uuid.UUID
+	uid  podid.ID
 	info *podv1.PodInfo
 	// lock serialises the pod's mutating calls and its bring-up.
 	lock chan struct{}
@@ -170,9 +171,11 @@ func newPodService(n *Node) *podService {
 
 func notFound(id string) error { return status.Errorf(codes.NotFound, "no pod %s", id) }
 
+// checkID refuses an ID that is neither a short pod ID nor a UUID (ADR
+// 0019), as feosd does.
 func checkID(id string) error {
-	if _, err := uuid.Parse(id); err != nil {
-		return status.Errorf(codes.InvalidArgument, "pod ID %q is not a UUID", id)
+	if _, err := podid.Parse(id); err != nil {
+		return status.Errorf(codes.InvalidArgument, "pod ID %q is neither a short pod ID nor a UUID", id)
 	}
 	return nil
 }
@@ -297,9 +300,13 @@ func hasNetwork(spec *podv1.PodSpec) bool {
 	return !spec.GetNetwork().GetNone()
 }
 
-// tapName is a pod's TAP device: "pod-" and the first 8 hex digits of its
-// ID as given, so that two pods whose IDs begin alike collide.
+// tapName is a pod's TAP device, as feosd names it (ADR 0019): "pod-" and
+// a short ID, or the first 8 hex digits of a UUID, so that two pods with
+// UUIDs that begin alike collide.
 func tapName(id string) string {
+	if pid, err := podid.Parse(id); err == nil {
+		return pid.TAP()
+	}
 	hex := strings.ReplaceAll(id, "-", "")
 	if len(hex) > 8 {
 		hex = hex[:8]
@@ -381,7 +388,7 @@ func (p *podService) dirOf(id string) string {
 	if pd := p.pods[id]; pd != nil {
 		return p.n.podDir(pd.uid)
 	}
-	u, _ := uuid.Parse(id)
+	u, _ := podid.Parse(id)
 	return p.n.podDir(u)
 }
 
@@ -542,7 +549,7 @@ func (p *podService) allocateLocked(info *podv1.PodInfo) error {
 			continue
 		}
 		if tapName(o.info.PodId) == tap {
-			return status.Errorf(codes.AlreadyExists, "pod %s has the TAP device %s already: the first 8 digits of a pod's ID tell it", o.info.PodId, tap)
+			return status.Errorf(codes.AlreadyExists, "pod %s has the TAP device %s already: a short ID names its own, a UUID's first 8 hex digits name it", o.info.PodId, tap)
 		}
 		for _, s := range []string{o.info.Ipv6Address, o.info.Ipv4Address} {
 			if a, err := netip.ParseAddr(s); err == nil {
@@ -638,7 +645,7 @@ func (p *podService) create(ctx context.Context, id string, spec *podv1.PodSpec)
 	if err != nil {
 		return nil, err
 	}
-	uid, _ := uuid.Parse(id)
+	uid, _ := podid.Parse(id)
 	p.mu.Lock()
 	if pd := p.pods[id]; pd != nil {
 		info := clonePod(pd.info)
@@ -1305,7 +1312,7 @@ func (p *podService) adopt(id, headKey string) error {
 	if err != nil {
 		return err
 	}
-	uid, _ := uuid.Parse(id)
+	uid, _ := podid.Parse(id)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.pods[id] != nil {
@@ -1454,7 +1461,7 @@ func (p *podService) reachable(id string) (*pod, error) {
 // guest is a pod's guest, as a forwarded call reaches it.
 type guest struct {
 	id         string
-	uid        uuid.UUID
+	uid        podid.ID
 	dir        string
 	containers map[string]bool
 	env        map[string]map[string]string // the containers' environments by name, from the spec
@@ -1493,7 +1500,7 @@ func (p *podService) reach(id string) (*guest, error) {
 }
 
 // fail fails a pod as a crashed microVM does.
-func (p *podService) fail(uid uuid.UUID, reason string) error {
+func (p *podService) fail(uid podid.ID, reason string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, pd := range p.pods {
@@ -1512,7 +1519,8 @@ func (p *podService) fail(uid uuid.UUID, reason string) error {
 // InventoryHash is the inventory hash of fleet.proto over pods: the
 // lowercase hex SHA-256 of one line "<pod id> <state>\n" per pod that is
 // POD_STATE_RUNNING or POD_STATE_SUSPENDED, sorted by pod ID, with the ID
-// in lowercase hyphenated form and the state as its enum name.
+// in its canonical form (a UUID in lowercase hyphenated form) and the
+// state as its enum name.
 func InventoryHash(pods []*podv1.PodInfo) string {
 	var lines []string
 	for _, pd := range pods {
@@ -1522,7 +1530,7 @@ func InventoryHash(pods []*podv1.PodInfo) string {
 			continue
 		}
 		id := strings.ToLower(pd.GetPodId())
-		if u, err := uuid.Parse(pd.GetPodId()); err == nil {
+		if u, err := podid.Parse(pd.GetPodId()); err == nil {
 			id = u.String()
 		}
 		lines = append(lines, id+" "+pd.GetState().String()+"\n")
@@ -1536,7 +1544,7 @@ func InventoryHash(pods []*podv1.PodInfo) string {
 }
 
 // forget drops a pod's record without an event (Script.ForgetPod).
-func (p *podService) forget(uid uuid.UUID) error {
+func (p *podService) forget(uid podid.ID) error {
 	p.mu.Lock()
 	pd := p.byUIDLocked(uid)
 	if pd == nil {
@@ -1580,7 +1588,7 @@ func (p *podService) namesGroup(id string) bool {
 }
 
 // byUID returns the pod whose ID is uid; p.mu held.
-func (p *podService) byUIDLocked(uid uuid.UUID) *pod {
+func (p *podService) byUIDLocked(uid podid.ID) *pod {
 	for _, pd := range p.pods {
 		if pd.uid == uid {
 			return pd
@@ -1591,7 +1599,7 @@ func (p *podService) byUIDLocked(uid uuid.UUID) *pod {
 
 // exitContainer makes the process of a running pod's container exit
 // (Script.ExitContainer).
-func (p *podService) exitContainer(uid uuid.UUID, container string, e containerExit) error {
+func (p *podService) exitContainer(uid podid.ID, container string, e containerExit) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pd := p.byUIDLocked(uid)
@@ -1612,7 +1620,7 @@ func (p *podService) exitContainer(uid uuid.UUID, container string, e containerE
 }
 
 // appendLog adds a line to a container's log.
-func (p *podService) appendLog(uid uuid.UUID, container, line string) error {
+func (p *podService) appendLog(uid podid.ID, container, line string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pd := p.byUIDLocked(uid)

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/uuid"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // routeClasses is every route of the table with its auth class: the
@@ -145,7 +145,7 @@ func concrete(pattern string, id string) (string, string) {
 // route of class c.
 func classAnswer(t *testing.T, e *env, pattern string, c class) {
 	t.Helper()
-	method, path := concrete(pattern, uuid.NewString())
+	method, path := concrete(pattern, podid.Mint().String())
 	w := e.do(method, path, "", nil)
 	switch c {
 	case classAdmin:
@@ -223,7 +223,7 @@ func TestRouteTable(t *testing.T) {
 			classAnswer(t, e, p, c)
 		}
 		if !on {
-			sandboxID, sbToken := e.createSandbox("")
+			sandboxID, sbToken := e.createSandbox()
 			for p := range bindingRoutes {
 				method, path := concrete(p, sandboxID)
 				authz := bearerOf(sbToken)
@@ -267,7 +267,7 @@ func TestNoSuchRoute(t *testing.T) {
 func TestMounts(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{mcp: marker("mcp"), ports: marker("ports")})
-	id := uuid.NewString()
+	id := podid.Mint().String()
 	for _, c := range []struct{ path, want string }{
 		{"/fwd/" + id + "/3000/a/b?q=1", "ports " + id + " 3000 a/b"},
 		{"/fwd/" + id + "/3000", "ports " + id + " 3000 "},
@@ -284,7 +284,7 @@ func TestMounts(t *testing.T) {
 		w := bare.do("GET", path, "", nil)
 		expect(t, w, http.StatusServiceUnavailable, "not available on this instance\n")
 	}
-	sbID, tok := bare.createSandbox("")
+	sbID, tok := bare.createSandbox()
 	for _, c := range []struct{ method, path string }{
 		{"POST", "/api/v1/sandboxes/" + sbID + "/watches"},
 		{"PUT", "/api/v1/sandboxes/" + sbID + "/watches/w1"},
@@ -297,7 +297,7 @@ func TestMounts(t *testing.T) {
 
 	// With the watch service, its handlers answer.
 	ws := newEnv(t, envOptions{watches: fakeWatches{}})
-	sbID, tok = ws.createSandbox("")
+	sbID, tok = ws.createSandbox()
 	w := ws.do("GET", "/api/v1/sandboxes/"+sbID+"/watches/w1/events", bearerOf(tok), nil)
 	expect(t, w, http.StatusOK, "Events")
 }
@@ -308,7 +308,7 @@ func TestMounts(t *testing.T) {
 func TestBindingRoutes(t *testing.T) {
 	t.Parallel()
 	off := newEnv(t, envOptions{bindings: &fakeBindings{on: false}})
-	id, tok := off.createSandbox("")
+	id, tok := off.createSandbox()
 	w := off.do("GET", "/api/v1/sandboxes/"+id+"/access", bearerOf(off.tenantToken), nil)
 	expect(t, w, http.StatusOK, `{"kube":null,"ssh":null,"denies":[]}`+"\n")
 	w = off.do("GET", "/api/v1/sandboxes/"+id+"/access", bearerOf(tok), nil)
@@ -318,12 +318,12 @@ func TestBindingRoutes(t *testing.T) {
 	expect(t, w, http.StatusNotFound, errBody("unknown sandbox "+id))
 
 	none := newEnv(t, envOptions{})
-	id2, _ := none.createSandbox("")
+	id2, _ := none.createSandbox()
 	w = none.do("GET", "/api/v1/sandboxes/"+id2+"/access", bearerOf(none.tenantToken), nil)
 	expect(t, w, http.StatusOK, `{"kube":null,"ssh":null,"denies":[]}`+"\n")
 
 	on := newEnv(t, envOptions{bindings: &fakeBindings{on: true}})
-	id3, tok3 := on.createSandbox("")
+	id3, tok3 := on.createSandbox()
 	for _, c := range []struct{ method, path, authz, want string }{
 		{"PUT", "/api/v1/sandboxes/" + id3 + "/kube", bearerOf(tok3), "PutKube"},
 		{"GET", "/api/v1/sandboxes/" + id3 + "/kube", bearerOf(tok3), "GetKube"},

@@ -11,12 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -109,7 +108,7 @@ func (e *Engine) fence(ctx context.Context, tx *store.Store) error {
 // node's expiry and the sweep leaves nothing behind).
 func (e *Engine) downSweep(ctx context.Context) error {
 	for {
-		var ids []uuid.UUID
+		var ids []podid.ID
 		err := e.fenced(ctx, func(tx *store.Store) error {
 			var err error
 			ids, err = tx.DownSweep(ctx, fencedBatch)
@@ -141,7 +140,7 @@ func (e *Engine) lostGrace(ctx context.Context) error {
 			if lost, err = tx.LostGrace(ctx, e.cfg.LostGrace, fencedBatch); err != nil {
 				return err
 			}
-			var runs []uuid.UUID
+			var runs []podid.ID
 			for _, l := range lost {
 				if l.RunID != "" {
 					runs = append(runs, l.ID)
@@ -304,7 +303,7 @@ func (e *Engine) drainNode(ctx context.Context, dn store.DrainingNode) error {
 }
 
 // evacuating reports whether a drain worker moves the sandbox.
-func (e *Engine) evacuating(id uuid.UUID) bool {
+func (e *Engine) evacuating(id podid.ID) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	_, ok := e.evacuations[id]
@@ -391,7 +390,7 @@ func (e *Engine) evacuate(ctx context.Context, row store.Sandbox, trigger OpTrig
 // call would: the calls that waited for the move go on there, and its pod
 // is not left cold. Without room elsewhere it stays hibernated until it
 // is used.
-func (e *Engine) restoreElsewhere(ctx context.Context, id uuid.UUID) {
+func (e *Engine) restoreElsewhere(ctx context.Context, id podid.ID) {
 	ctx, cancel := context.WithTimeout(ctx, restoreTimeout)
 	defer cancel()
 	lease, err := e.Ensure(ctx, id)
@@ -406,7 +405,7 @@ func (e *Engine) restoreElsewhere(ctx context.Context, id uuid.UUID) {
 
 // cancelExecs tells every instance to cancel the execs of a sandbox
 // (ferun_cancel), past the drain timeout.
-func (e *Engine) cancelExecs(ctx context.Context, id uuid.UUID) {
+func (e *Engine) cancelExecs(ctx context.Context, id podid.ID) {
 	payload, _ := json.Marshal(map[string]string{"kind": "exec", "sandbox": id.String()})
 	if err := db.Notify(ctx, e.d.Pool, db.ChanCancel, string(payload)); err != nil {
 		e.rl.warn("drain", "cannot cancel a draining sandbox's execs", "sandbox", id, "err", err)

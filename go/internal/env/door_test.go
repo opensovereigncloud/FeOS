@@ -18,11 +18,12 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 // previewSpec has an attached service in sb beside stageSpec's objects.
-func previewSpec(sb uuid.UUID) string {
+func previewSpec(sb podid.ID) string {
 	return strings.Replace(stageSpec, `"services": {`, `"services": {
     "dev": {"runtime": "attached", "sandbox": "`+sb.String()+`", "command": ["npm", "run", "dev"], "cwd": "/workspace/app",
       "ports": [{"name": "http", "port": 5173}], "env": {"API": {"service": "api", "port": "http", "key": "url"}}},`, 1)
@@ -388,7 +389,9 @@ func TestRouteDoor(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	ctx := h.ctx()
 	mux := doorMux(h.svc)
-	sb := h.sandbox(tenantA, true)
+	// A sandbox made before ADR 0019, with a UUID: its attached service
+	// is routed to as a short ID's is.
+	sb := h.legacySandbox(tenantA, true)
 	st := h.create("stage", nil)
 	e := h.env("stage")
 	h.create("prod", nil)
@@ -429,7 +432,7 @@ func TestRouteDoor(t *testing.T) {
 
 	// /api strips its prefix; ready instances take turns; the query and
 	// the Host stay, the bearer goes to the door, which strips it.
-	seen := map[uuid.UUID]int{}
+	seen := map[podid.ID]int{}
 	for range 4 {
 		w := routeRequest(mux, "GET", "/api/v1/environments/stage/http/api/reports/2026?month=10", tok.Token)
 		if w.Code != 200 {

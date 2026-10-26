@@ -11,7 +11,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -20,6 +19,7 @@ import (
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -40,7 +40,7 @@ func (c *Controller) connected(node string) bool {
 }
 
 // getPod reads a pod from its node.
-func (c *Controller) getPod(ctx context.Context, node string, id uuid.UUID) (*podv1.PodInfo, error) {
+func (c *Controller) getPod(ctx context.Context, node string, id podid.ID) (*podv1.PodInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.t.nodeCall)
 	defer cancel()
 	cc, err := c.conn(ctx, node)

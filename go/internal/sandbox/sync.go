@@ -9,11 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -27,7 +26,7 @@ const (
 // after it, which every one of them waits for.
 type syncer struct {
 	mu sync.Mutex
-	m  map[uuid.UUID]*syncEntry
+	m  map[podid.ID]*syncEntry
 }
 
 type syncEntry struct {
@@ -41,7 +40,7 @@ type syncRun struct {
 
 // requestSync asks for a sync of the sandbox and returns the run that
 // covers the request; nil once the engine stopped.
-func (e *Engine) requestSync(id uuid.UUID) *syncRun {
+func (e *Engine) requestSync(id podid.ID) *syncRun {
 	s := &e.syncs
 	s.mu.Lock()
 	ent := s.m[id]
@@ -103,7 +102,7 @@ func (e *Engine) requestSync(id uuid.UUID) *syncRun {
 // its finish when the op is this instance's, else when the op's end is
 // seen on ferun_sandbox (or every 5 s). Without a connection to the node,
 // the instances that have one are asked to reconcile it (ferun_reconcile).
-func (e *Engine) Sync(ctx context.Context, id uuid.UUID) error {
+func (e *Engine) Sync(ctx context.Context, id podid.ID) error {
 	r := e.requestSync(id)
 	select {
 	case <-r.done:
@@ -117,7 +116,7 @@ func (e *Engine) Sync(ctx context.Context, id uuid.UUID) error {
 // sandbox, asynchronous and coalesced, deferred while an op runs. (A pod
 // event for a row on another node makes fleet request a reconcile of the
 // event's node.)
-func (e *Engine) PodChanged(node string, podID uuid.UUID) {
+func (e *Engine) PodChanged(node string, podID podid.ID) {
 	e.requestSync(podID)
 }
 
@@ -125,7 +124,7 @@ func (e *Engine) PodChanged(node string, podID uuid.UUID) {
 // observation when the row is unchanged since the read (gen, op,
 // incarnation); when it changed, it reads and observes once more, then
 // gives up (a later event or the sweeps catch up).
-func (e *Engine) syncOnce(ctx context.Context, id uuid.UUID) error {
+func (e *Engine) syncOnce(ctx context.Context, id podid.ID) error {
 	for range 2 {
 		row, err := e.st.GetSandbox(ctx, id)
 		if errors.Is(err, model.ErrNotFound) {
@@ -239,7 +238,7 @@ func (e *Engine) followSandboxes(ctx context.Context) {
 				e.checkDeferred(ctx, nil)
 				continue
 			}
-			id, err := uuid.Parse(p)
+			id, err := podid.Parse(p)
 			if err != nil {
 				continue
 			}
@@ -247,7 +246,7 @@ func (e *Engine) followSandboxes(ctx context.Context) {
 			_, ok := e.deferred[id]
 			e.mu.Unlock()
 			if ok {
-				e.checkDeferred(ctx, []uuid.UUID{id})
+				e.checkDeferred(ctx, []podid.ID{id})
 			}
 		case <-tick.C:
 			e.checkDeferred(ctx, nil)
@@ -257,7 +256,7 @@ func (e *Engine) followSandboxes(ctx context.Context) {
 
 // checkDeferred syncs those of ids (every deferred sandbox for nil) whose
 // op ended.
-func (e *Engine) checkDeferred(ctx context.Context, ids []uuid.UUID) {
+func (e *Engine) checkDeferred(ctx context.Context, ids []podid.ID) {
 	if ids == nil {
 		e.mu.Lock()
 		for id := range e.deferred {

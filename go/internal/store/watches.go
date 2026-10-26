@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Watch is a row of watches: a filesystem watch's path set, its lease, its
@@ -19,7 +20,7 @@ import (
 // the owner's last acknowledgement.
 type Watch struct {
 	ID        uuid.UUID
-	SandboxID uuid.UUID
+	SandboxID podid.ID
 	Container string
 	Paths     []string
 	Gen       int64     // the path set's generation
@@ -65,7 +66,7 @@ func collectWatches(rows pgx.Rows, err error) ([]Watch, error) {
 // NewWatch is what a POST of a watch sets.
 type NewWatch struct {
 	ID        uuid.UUID
-	SandboxID uuid.UUID
+	SandboxID podid.ID
 	Container string // "" = main
 	Paths     []string
 }
@@ -100,7 +101,7 @@ func (s *Store) LockWatch(ctx context.Context, id uuid.UUID, lock RowLock) (Watc
 }
 
 // ListWatchesOfSandbox returns a sandbox's watches, oldest first.
-func (s *Store) ListWatchesOfSandbox(ctx context.Context, sandboxID uuid.UUID) ([]Watch, error) {
+func (s *Store) ListWatchesOfSandbox(ctx context.Context, sandboxID podid.ID) ([]Watch, error) {
 	return collectWatches(s.q.Query(ctx, "SELECT "+watchCols+" FROM watches WHERE sandbox_id = $1 ORDER BY created_at, id", sandboxID))
 }
 
@@ -194,7 +195,7 @@ func (s *Store) DeleteExpiredWatches(ctx context.Context, limit int) ([]uuid.UUI
 }
 
 // CountWatches counts a sandbox's watches.
-func (s *Store) CountWatches(ctx context.Context, sandboxID uuid.UUID) (int64, error) {
+func (s *Store) CountWatches(ctx context.Context, sandboxID podid.ID) (int64, error) {
 	var n int64
 	err := s.q.QueryRow(ctx, "SELECT count(*) FROM watches WHERE sandbox_id = $1", sandboxID).Scan(&n)
 	return n, err

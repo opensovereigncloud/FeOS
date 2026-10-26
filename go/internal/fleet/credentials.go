@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -20,6 +19,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -40,7 +40,7 @@ func (s *Service) issuePodCredentials(ctx context.Context, req *fleetv1.IssuePod
 	if err != nil {
 		return nil, err
 	}
-	podID, err := uuid.Parse(req.GetPodId())
+	podID, err := podid.Parse(req.GetPodId())
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "no pod %s", activity.Clean(req.GetPodId()))
 	}

@@ -8,13 +8,13 @@ import (
 	"os"
 	"sync"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // watchLimit is the guest's cap on inotify watches, which acks report.
@@ -35,7 +35,7 @@ type watchService struct {
 
 // watchStream is one open Watch stream.
 type watchStream struct {
-	pod      uuid.UUID
+	pod      podid.ID
 	batches  chan []*watchv1.Event
 	overflow bool // a batch did not fit: the next one is a stale event
 }
@@ -45,7 +45,7 @@ func newWatchService(n *Node) *watchService {
 }
 
 // deliver queues events for every stream of the pod.
-func (w *watchService) deliver(pod uuid.UUID, events []*watchv1.Event) int {
+func (w *watchService) deliver(pod podid.ID, events []*watchv1.Event) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	n := 0
@@ -67,7 +67,7 @@ func (w *watchService) deliver(pod uuid.UUID, events []*watchv1.Event) int {
 	return n
 }
 
-func (w *watchService) count(pod uuid.UUID) int {
+func (w *watchService) count(pod podid.ID) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	n := 0

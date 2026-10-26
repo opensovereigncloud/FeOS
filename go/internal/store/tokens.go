@@ -8,10 +8,10 @@ import (
 	"errors"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // tokenTouchInterval is how often a token's last_used_at is written at
@@ -92,7 +92,7 @@ func (s *Store) TouchTenantToken(ctx context.Context, hash string) error {
 // SandboxToken is a row of sandbox_tokens. Only the hash is stored.
 type SandboxToken struct {
 	Hash       string
-	SandboxID  uuid.UUID
+	SandboxID  podid.ID
 	Label      string
 	CreatedAt  time.Time
 	LastUsedAt time.Time // zero: never used
@@ -110,7 +110,7 @@ func scanSandboxToken(row pgx.Row) (SandboxToken, error) {
 
 // CreateSandboxToken stores a sandbox token by its hash;
 // model.ErrNotFound when the sandbox does not exist.
-func (s *Store) CreateSandboxToken(ctx context.Context, hash string, sandboxID uuid.UUID, label string) (SandboxToken, error) {
+func (s *Store) CreateSandboxToken(ctx context.Context, hash string, sandboxID podid.ID, label string) (SandboxToken, error) {
 	t, err := scanSandboxToken(s.q.QueryRow(ctx, `INSERT INTO sandbox_tokens (hash, sandbox_id, label) VALUES ($1, $2, $3)
 		RETURNING hash, sandbox_id, label, created_at, last_used_at`, hash, sandboxID, label))
 	if isForeignKeyViolation(err) {
@@ -120,7 +120,7 @@ func (s *Store) CreateSandboxToken(ctx context.Context, hash string, sandboxID u
 }
 
 // ListSandboxTokens returns a sandbox's tokens, oldest first.
-func (s *Store) ListSandboxTokens(ctx context.Context, sandboxID uuid.UUID) ([]SandboxToken, error) {
+func (s *Store) ListSandboxTokens(ctx context.Context, sandboxID podid.ID) ([]SandboxToken, error) {
 	rows, err := s.q.Query(ctx, `SELECT hash, sandbox_id, label, created_at, last_used_at FROM sandbox_tokens
 		WHERE sandbox_id = $1 ORDER BY created_at, hash`, sandboxID)
 	if err != nil {
@@ -138,7 +138,7 @@ func (s *Store) GetSandboxToken(ctx context.Context, hash string) (SandboxToken,
 
 // DeleteSandboxToken revokes a sandbox's token by its hash. It reports
 // whether the sandbox had it.
-func (s *Store) DeleteSandboxToken(ctx context.Context, sandboxID uuid.UUID, hash string) (bool, error) {
+func (s *Store) DeleteSandboxToken(ctx context.Context, sandboxID podid.ID, hash string) (bool, error) {
 	tag, err := s.q.Exec(ctx, "DELETE FROM sandbox_tokens WHERE sandbox_id = $1 AND hash = $2", sandboxID, hash)
 	return tag.RowsAffected() > 0, err
 }
@@ -147,14 +147,14 @@ func (s *Store) DeleteSandboxToken(ctx context.Context, sandboxID uuid.UUID, has
 // ignoring a tenant being deleted and an environment's instance row (the
 // sandbox doors treat it as absent; it has no token of its own);
 // model.ErrUnknownToken when there is none.
-func (s *Store) ResolveSandboxToken(ctx context.Context, hash string) (uuid.UUID, string, error) {
-	var id uuid.UUID
+func (s *Store) ResolveSandboxToken(ctx context.Context, hash string) (podid.ID, string, error) {
+	var id podid.ID
 	var owner string
 	err := s.q.QueryRow(ctx, `SELECT t.sandbox_id, s.owner FROM sandbox_tokens t
 		JOIN sandboxes s ON s.id = t.sandbox_id JOIN tenants n ON n.id = s.owner
 		WHERE t.hash = $1 AND n.deleting_at IS NULL AND s.environment_id IS NULL`, hash).Scan(&id, &owner)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, "", model.ErrUnknownToken
+		return "", "", model.ErrUnknownToken
 	}
 	return id, owner, err
 }

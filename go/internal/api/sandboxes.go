@@ -10,13 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-
-	"github.com/google/uuid"
+	"strings"
 
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -65,10 +65,10 @@ func (s *server) owned(r *http.Request) (store.Sandbox, error) {
 	return sb, nil
 }
 
-// createSandboxRequest is POST /api/v1/sandboxes.
+// createSandboxRequest is POST /api/v1/sandboxes. It has no sandboxId:
+// ferund mints every sandbox's ID (ADR 0019), and refuses a request that
+// names one (errClientID).
 type createSandboxRequest struct {
-	// SandboxID is chosen by the caller (a UUID) or minted when empty.
-	SandboxID string `json:"sandboxId"`
 	// Image empty: the default image.
 	Image string `json:"image"`
 	// The size, fixed for the sandbox's life; 0: the default.
@@ -98,16 +98,39 @@ func viewOf(sb store.Sandbox) sandboxView {
 // serves let reach their addons, and its own name table, which names its
 // attached services and the addons and image services of their
 // environments.
-func attachableTemplate(id uuid.UUID) *model.PodTemplate {
+func attachableTemplate(id podid.ID) *model.PodTemplate {
 	return &model.PodTemplate{Command: []string{"sleep", "infinity"}, SecurityGroups: []string{model.SandboxGroupID(id)},
 		NameTables: []string{model.SandboxTableID(id)}}
 }
 
 type createSandboxResponse struct {
+	// Status carries the new sandbox's ID, status.sandboxId, which the
+	// client keeps.
 	Status sandboxView `json:"status"`
-	// Token is the first token, only when this call created the sandbox.
-	Token   string `json:"token,omitempty"`
-	Created bool   `json:"created"`
+	// Token is the first token.
+	Token string `json:"token,omitempty"`
+	// Created is always true: every create makes a new sandbox.
+	Created bool `json:"created"`
+}
+
+// errClientID is the answer to a create that names its sandbox's ID.
+func errClientID() error {
+	return apierr.New(http.StatusBadRequest,
+		"sandboxId is not accepted: ferund mints a sandbox's ID; leave it out and keep status.sandboxId of the answer")
+}
+
+// namesID reports whether a create's body names a sandbox ID: a sandboxId
+// that is neither null nor "".
+func namesID(sent map[string]json.RawMessage) bool {
+	raw, ok := sent["sandboxId"]
+	if !ok {
+		return false
+	}
+	switch strings.TrimSpace(string(raw)) {
+	case "null", `""`:
+		return false
+	}
+	return true
 }
 
 // size validates a create's size; zeros take the defaults.
@@ -131,25 +154,23 @@ func (s *server) size(req createSandboxRequest) (vcpus, memoryMiB int, err error
 }
 
 // createSandbox is POST /api/v1/sandboxes: in one transaction, the tenant
-// (refused while it is being deleted), the row unless the ID exists, and
-// the first token. Nothing reaches a node: the sandbox materialises at its
-// first tool call. A repeat for an existing sandbox of the caller is a 200
-// without a token (an attachable one stays as it was created); an ID of
-// another tenant's sandbox, or of an environment's instance, is a 409.
+// (refused while it is being deleted), a new row under an ID ferund mints
+// (ADR 0019), and the first token. Nothing reaches a node: the sandbox
+// materialises at its first tool call. The answer, a 201, carries the
+// sandbox's ID (status.sandboxId) and its token. A create is not
+// idempotent: a request that names an ID is a 400 (errClientID).
 func (s *server) createSandbox(w http.ResponseWriter, r *http.Request) error {
 	var req createSandboxRequest
-	if _, err := decodeJSON(r, &req); err != nil {
+	sent, err := decodeJSON(r, &req)
+	if err != nil {
 		return err
+	}
+	if namesID(sent) {
+		return errClientID()
 	}
 	vcpus, memoryMiB, err := s.size(req)
 	if err != nil {
 		return err
-	}
-	id := uuid.New()
-	if req.SandboxID != "" {
-		if id, err = parseSandboxID(req.SandboxID); err != nil {
-			return err
-		}
 	}
 	image := req.Image
 	if image == "" {
@@ -158,10 +179,9 @@ func (s *server) createSandbox(w http.ResponseWriter, r *http.Request) error {
 	tenant := tenantOf(r)
 	token, hash, err := mintSandboxToken()
 	if err != nil {
-		return fmt.Errorf("create %s: %w", id, err)
+		return fmt.Errorf("create: %w", err)
 	}
 	var row store.Sandbox
-	var created bool
 	err = s.st.InTx(r.Context(), func(tx *store.Store) error {
 		t, err := tx.LockTenant(r.Context(), tenant, store.ForShare)
 		if isNoRow(err) {
@@ -173,28 +193,21 @@ func (s *server) createSandbox(w http.ResponseWriter, r *http.Request) error {
 		if t.Deleting() {
 			return apierr.New(http.StatusConflict, "tenant %s is being deleted", tenant)
 		}
-		n := store.NewSandbox{ID: id, Owner: tenant, Image: image, VCPUs: vcpus, MemoryMiB: memoryMiB}
-		if req.Attachable {
-			n.PodTemplate = attachableTemplate(id)
-		}
-		row, created, err = tx.CreateSandbox(r.Context(), n)
+		row, err = tx.CreateMintedSandbox(r.Context(), func(id podid.ID) store.NewSandbox {
+			n := store.NewSandbox{ID: id, Owner: tenant, Image: image, VCPUs: vcpus, MemoryMiB: memoryMiB}
+			if req.Attachable {
+				n.PodTemplate = attachableTemplate(id)
+			}
+			return n
+		})
 		if err != nil {
 			return err
 		}
-		if !created {
-			if row.Owner != tenant || row.IsInstance() {
-				return apierr.New(http.StatusConflict, "sandbox id %s already exists", id)
-			}
-			return nil
-		}
-		_, err = tx.CreateSandboxToken(r.Context(), hash, id, firstTokenLabel)
+		_, err = tx.CreateSandboxToken(r.Context(), hash, row.ID, firstTokenLabel)
 		return err
 	})
 	if err != nil {
-		return passOr(err, "create "+id.String())
-	}
-	if !created {
-		return writeJSON(w, http.StatusOK, createSandboxResponse{Status: viewOf(row)})
+		return passOr(err, "create")
 	}
 	return writeJSON(w, http.StatusCreated, createSandboxResponse{Status: viewOf(row), Token: token, Created: true})
 }

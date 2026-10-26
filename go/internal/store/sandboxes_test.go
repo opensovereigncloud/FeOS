@@ -14,6 +14,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -24,7 +25,7 @@ func TestSandboxCreateAndDelete(t *testing.T) {
 	ch, unsubscribe := d.Subscribe(db.ChanSandbox)
 	defer unsubscribe()
 
-	id := uuid.New()
+	id := podid.Mint()
 	sb := mkSandboxID(t, s, "acme", id)
 	expectPayload(t, ch, id.String())
 	if sb.ClientState != model.StatePending || sb.StatusDescription != "awaiting first tool call" ||
@@ -219,16 +220,23 @@ func TestTAPConflict(t *testing.T) {
 	mkTenant(t, s, "acme")
 	mkNode(t, s, "n1")
 	mkNode(t, s, "n2")
-	a := uuid.MustParse("abcdef01-0000-4000-8000-000000000001")
-	b := uuid.MustParse("abcdef01-1111-4000-8000-000000000002")
-	c := uuid.MustParse("12345678-0000-4000-8000-000000000003")
+	// Only UUIDs, the IDs of sandboxes made before ADR 0019, share a TAP
+	// device's name: pod- and their first 8 hex digits.
+	a := podid.ID("abcdef01-0000-4000-8000-000000000001")
+	b := podid.ID("abcdef01-1111-4000-8000-000000000002")
+	c := podid.ID("12345678-0000-4000-8000-000000000003")
+	// A short ID whose first 8 characters are a's first 8 hex digits
+	// names its TAP device whole: it shares a's no more than any other.
+	short := podid.ID("abcdef01xyz")
 	mkSandboxID(t, s, "acme", a)
 	mkSandboxID(t, s, "acme", b)
 	mkSandboxID(t, s, "acme", c)
+	mkSandboxID(t, s, "acme", short)
 	place(t, s, b, "n1", model.StateRunning)
 	place(t, s, c, "n1", model.StateRunning)
+	place(t, s, short, "n1", model.StateRunning)
 
-	check := func(node string, want uuid.UUID) {
+	check := func(node string, want podid.ID) {
 		t.Helper()
 		got, err := s.TAPConflict(bg, node, a)
 		if err != nil || got != want {
@@ -236,14 +244,14 @@ func TestTAPConflict(t *testing.T) {
 		}
 	}
 	check("n1", b)
-	check("n2", uuid.Nil)
+	check("n2", "")
 	if m, err := s.TAPConflicts(bg, a); err != nil || len(m) != 1 || m["n1"] != b {
 		t.Fatalf("TAPConflicts %v %v", m, err)
 	}
 	// Hibernated, pending or lost pods hold no TAP device...
 	for _, st := range []string{model.StateHibernated, model.StatePending, model.StateLost} {
 		place(t, s, b, "n1", st)
-		check("n1", uuid.Nil)
+		check("n1", "")
 	}
 	// ...unless an op is in flight for them.
 	startOp(t, s, b, "restore", "i1", "n1", time.Minute)
@@ -252,6 +260,23 @@ func TestTAPConflict(t *testing.T) {
 	place(t, s, a, "n1", model.StateRunning)
 	if got, _ := s.TAPConflict(bg, "n1", b); got != a {
 		t.Fatalf("conflict of b: %v", got)
+	}
+	// A short ID conflicts with nothing, and nothing with it.
+	if got, err := s.TAPConflict(bg, "n1", short); err != nil || got != "" {
+		t.Fatalf("conflict of a short ID: %v %v", got, err)
+	}
+	if m, err := s.TAPConflicts(bg, short); err != nil || len(m) != 0 {
+		t.Fatalf("TAPConflicts of a short ID: %v %v", m, err)
+	}
+	other := mkSandbox(t, s, "acme")
+	if got, err := s.TAPConflict(bg, "n1", other.ID); err != nil || got != "" {
+		t.Fatalf("conflict of a minted ID: %v %v", got, err)
+	}
+	place(t, s, b, "n1", model.StateHibernated)
+	exec(t, s, "UPDATE sandboxes SET op = '', op_id = NULL, op_owner = '', op_target = '', op_deadline = NULL WHERE id = $1", b)
+	place(t, s, a, "n2", model.StateHibernated)
+	if got, err := s.TAPConflict(bg, "n1", a); err != nil || got != "" {
+		t.Fatalf("a UUID beside a short ID with its first 8 characters: %v %v", got, err)
 	}
 }
 
@@ -277,7 +302,7 @@ func TestAttributePod(t *testing.T) {
 	if _, ok, err := s.AttributePod(bg, sb.ID, "n6"); err != nil || ok {
 		t.Fatalf("n6: %v %v", ok, err)
 	}
-	if _, ok, err := s.AttributePod(bg, uuid.New(), "n1"); err != nil || ok {
+	if _, ok, err := s.AttributePod(bg, podid.Mint(), "n1"); err != nil || ok {
 		t.Fatalf("unknown pod: %v %v", ok, err)
 	}
 	// A certificate older than a day no longer attributes.
@@ -292,11 +317,11 @@ func TestSteadyPodsAndNodeSandboxes(t *testing.T) {
 	mkTenant(t, s, "acme")
 	mkNode(t, s, "n1")
 	mkNode(t, s, "n2")
-	ids := []uuid.UUID{
-		uuid.MustParse("00000000-0000-4000-8000-000000000003"),
-		uuid.MustParse("00000000-0000-4000-8000-000000000001"),
-		uuid.MustParse("00000000-0000-4000-8000-000000000002"),
-		uuid.MustParse("00000000-0000-4000-8000-000000000004"),
+	ids := []podid.ID{
+		"00000000-0000-4000-8000-000000000003",
+		"00000000-0000-4000-8000-000000000001",
+		"00000000-0000-4000-8000-000000000002",
+		"00000000-0000-4000-8000-000000000004",
 	}
 	for _, id := range ids {
 		mkSandboxID(t, s, "acme", id)

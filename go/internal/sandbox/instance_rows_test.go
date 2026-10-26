@@ -19,6 +19,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -349,7 +350,7 @@ func TestPrepareHookFailureInRepair(t *testing.T) {
 	h.recordCalls("n1", seq)
 	// An attachable sandbox: a tenant's row with a template, held by its
 	// background processes.
-	id := uuid.New()
+	id := podid.Mint()
 	sb := h.instance(uuid.Nil, &model.PodTemplate{Command: []string{"/bin/sh"},
 		SecurityGroups: []string{model.SandboxGroupID(id)}}, func(n *store.NewSandbox) { n.ID = id })
 	h.ensure(sb.ID)
@@ -432,7 +433,7 @@ func TestRestart(t *testing.T) {
 	// Not running: refused.
 	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
 	wantErr(t, h.eng().Restart(bg, sb.ID, "x"), model.ErrPrecondition, "is paused")
-	wantErr(t, h.eng().Restart(bg, uuid.New(), "x"), model.ErrNotFound, "")
+	wantErr(t, h.eng().Restart(bg, podid.Mint(), "x"), model.ErrNotFound, "")
 }
 
 // The pin gate: a create and a start go only to the pinned node; a restore
@@ -509,10 +510,10 @@ func TestIdleAfterPerRow(t *testing.T) {
 		forever := h.instance(env, plainTemplate(env), func(n *store.NewSandbox) { n.IdleAfterS = &zero })
 		soon := h.instance(env, plainTemplate(env), func(n *store.NewSandbox) { n.IdleAfterS = &one })
 		global := h.running(512)
-		for _, id := range []uuid.UUID{forever.ID, soon.ID} {
+		for _, id := range []podid.ID{forever.ID, soon.ID} {
 			h.ensure(id)
 		}
-		for _, id := range []uuid.UUID{forever.ID, soon.ID, global.ID} {
+		for _, id := range []podid.ID{forever.ID, soon.ID, global.ID} {
 			h.settle(id)
 			h.idleSince(id)
 		}
@@ -537,7 +538,7 @@ func TestIdleAfterPerRow(t *testing.T) {
 		short := h.instance(env, plainTemplate(env), func(n *store.NewSandbox) { n.IdleAfterS = &minute })
 		h.ensure(short.ID)
 		global := h.running(512)
-		for _, id := range []uuid.UUID{short.ID, global.ID} {
+		for _, id := range []podid.ID{short.ID, global.ID} {
 			h.settle(id)
 			h.exec("UPDATE sandboxes SET last_active_at = now() - interval '10 minutes' WHERE id = $1", id)
 		}
@@ -567,7 +568,7 @@ func TestAddressAndGroupsHint(t *testing.T) {
 
 	// Hold the bring-up: the pod stays PENDING, the create's op waits.
 	release := make(chan struct{})
-	h.node("n1").Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	h.node("n1").Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		select {
 		case <-release:
 		case <-ctx.Done():

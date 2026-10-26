@@ -25,6 +25,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -33,10 +34,10 @@ import (
 type execLog struct {
 	mu    sync.Mutex
 	calls []*containerv1.ExecRequest
-	pods  []uuid.UUID
+	pods  []podid.ID
 }
 
-func (l *execLog) fn(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+func (l *execLog) fn(_ context.Context, pod podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.calls = append(l.calls, req)
@@ -692,7 +693,7 @@ func TestFailedReleaseKeepsAddon(t *testing.T) {
 	})
 	// The new web instance crashes: R fails.
 	for i := 1; i <= 3; i++ {
-		var id uuid.UUID
+		var id podid.ID
 		eventually(t, 60*time.Second, "the new web instance running", func() bool {
 			for _, r := range h.rowsOf(env.ID, spec.KindService, "web") {
 				if r.Sandbox.ID == web.Sandbox.ID || !running(r) || r.Instance.Phase == model.PhaseExited {
@@ -838,7 +839,7 @@ func TestAddonRefusedOnItsData(t *testing.T) {
 // 0). It returns how many provisioning steps ran.
 func failingProvisioning(n *testnode.Node, code *atomic.Int32) *atomic.Int32 {
 	var runs atomic.Int32
-	n.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	n.Script().SetExec(func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		if len(req.Command) == 0 || req.Command[0] != "sh" {
 			return 0, false, nil
 		}

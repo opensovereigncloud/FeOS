@@ -14,6 +14,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -90,7 +91,7 @@ func TestClaimReleasesAsAStop(t *testing.T) {
 	s, d := newStore(t)
 	mkTenant(t, s, "acme")
 	mkNode(t, s, "n1")
-	ids := map[string]uuid.UUID{}
+	ids := map[string]podid.ID{}
 	for _, owner := range []string{"stopping", "ended"} {
 		sb := mkSandbox(t, s, "acme")
 		place(t, s, sb.ID, "n1", model.StatePausing)
@@ -98,7 +99,7 @@ func TestClaimReleasesAsAStop(t *testing.T) {
 		exec(t, s, "UPDATE sandboxes SET op_from_state = 'running' WHERE id = $1", sb.ID)
 		ids[owner] = sb.ID
 	}
-	row := func(id uuid.UUID) map[string]any {
+	row := func(id podid.ID) map[string]any {
 		t.Helper()
 		var m map[string]any
 		if err := s.Q().QueryRow(bg, "SELECT to_jsonb(s) FROM sandboxes s WHERE s.id = $1", id).Scan(&m); err != nil {

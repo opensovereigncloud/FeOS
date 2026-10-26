@@ -15,13 +15,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/fleet"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -91,7 +90,7 @@ func TestTenants(t *testing.T) {
 		expect(t, w, c.status, errBody(c.msg))
 	}
 
-	e.createSandbox("")
+	e.createSandbox()
 	w = e.do("GET", "/api/v1/admin/tenants", adminAuth(), nil)
 	expect(t, w, http.StatusOK, "")
 	list := decode[struct {
@@ -197,7 +196,7 @@ func TestDeleteTenantInBatches(t *testing.T) {
 	e := newEnv(t, envOptions{realEngine: true})
 	ctx := context.Background()
 	for range 300 {
-		if _, _, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: uuid.New(), Owner: testTenant, Image: "img",
+		if _, _, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: podid.Mint(), Owner: testTenant, Image: "img",
 			VCPUs: 1, MemoryMiB: 256}); err != nil {
 			t.Fatal(err)
 		}
@@ -252,7 +251,7 @@ func TestNodes(t *testing.T) {
 	if _, err := e.st.MarkNodeReady(ctx, "n1"); err != nil {
 		t.Fatal(err)
 	}
-	sb, _, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: uuid.New(), Owner: testTenant, Image: "img", VCPUs: 2, MemoryMiB: 512})
+	sb, _, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: podid.Mint(), Owner: testTenant, Image: "img", VCPUs: 2, MemoryMiB: 512})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +393,7 @@ func TestNodeChanges(t *testing.T) {
 	expect(t, e.do("GET", "/api/v1/admin/nodes/nope/certs", adminAuth(), nil), http.StatusNotFound, errBody("unknown node nope"))
 
 	// Removal: refused while sandboxes are on it, unless forced.
-	sb, _, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: uuid.New(), Owner: testTenant, Image: "img", VCPUs: 1, MemoryMiB: 256})
+	sb, _, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: podid.Mint(), Owner: testTenant, Image: "img", VCPUs: 1, MemoryMiB: 256})
 	if err != nil {
 		t.Fatal(err)
 	}

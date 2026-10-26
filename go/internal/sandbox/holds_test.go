@@ -14,12 +14,13 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 // begin begins an op on the first instance without waiting for its node
 // (as the loops do) and returns the handle or the begin's error.
-func (h *harness) begin(id uuid.UUID, in OpIntent) (*OpHandle, error) {
+func (h *harness) begin(id podid.ID, in OpIntent) (*OpHandle, error) {
 	h.t.Helper()
 	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
 	defer cancel()
@@ -29,7 +30,7 @@ func (h *harness) begin(id uuid.UUID, in OpIntent) (*OpHandle, error) {
 	return h.eng().runner.start(ctx, id, in, false)
 }
 
-func (h *harness) holds(id uuid.UUID) []store.Hold {
+func (h *harness) holds(id podid.ID) []store.Hold {
 	h.t.Helper()
 	hs, err := h.st.ListHolds(bg, id)
 	if err != nil {
@@ -39,7 +40,7 @@ func (h *harness) holds(id uuid.UUID) []store.Hold {
 }
 
 // idleSince makes the sandbox's last activity an hour old.
-func (h *harness) idleSince(id uuid.UUID) {
+func (h *harness) idleSince(id podid.ID) {
 	h.exec("UPDATE sandboxes SET last_active_at = now() - interval '1 hour' WHERE id = $1", id)
 }
 
@@ -135,7 +136,7 @@ func TestIdlePauseAdmissionInterleaved(t *testing.T) {
 	h.idleSince(sb.ID)
 	gate := make(chan struct{})
 	locked := make(chan struct{}, 1)
-	e.admitHook = func(context.Context, uuid.UUID) {
+	e.admitHook = func(context.Context, podid.ID) {
 		select {
 		case locked <- struct{}{}:
 		default:
@@ -177,7 +178,7 @@ func TestIdlePauseAdmissionInterleaved(t *testing.T) {
 	h.idleSince(sb2.ID)
 	gate2 := make(chan struct{})
 	inBegin := make(chan struct{}, 1)
-	e.beginHook = func(_ context.Context, id uuid.UUID, kind OpKind) {
+	e.beginHook = func(_ context.Context, id podid.ID, kind OpKind) {
 		if id != sb2.ID || kind != OpPause {
 			return
 		}
@@ -283,7 +284,7 @@ func TestHoldCounting(t *testing.T) {
 	}
 
 	// Acquire of a sandbox that is gone.
-	_, _, err = e.Acquire(bg, uuid.New(), model.HoldExec)
+	_, _, err = e.Acquire(bg, podid.Mint(), model.HoldExec)
 	wantErr(t, err, model.ErrNotFound, "")
 }
 
@@ -402,7 +403,7 @@ func TestProcessHolds(t *testing.T) {
 		t.Fatalf("expired holds kept %+v", hs)
 	}
 	// A hold for a sandbox that is gone.
-	err := e.HoldProcess(bg, uuid.New(), "x", 0)
+	err := e.HoldProcess(bg, podid.Mint(), "x", 0)
 	if !errors.Is(err, model.ErrNotFound) {
 		t.Fatalf("hold of a missing sandbox: %v", err)
 	}

@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -79,7 +79,7 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 	h.startOp(withCheckpoint.ID, OpIntent{Kind: OpHibernate, Trigger: TriggerExplicit, Target: "n1"})
 	h.ensure(withCheckpoint.ID)
 	pending := h.sandbox(512)
-	for _, id := range []uuid.UUID{running.ID, paused.ID, withCheckpoint.ID} {
+	for _, id := range []podid.ID{running.ID, paused.ID, withCheckpoint.ID} {
 		h.settle(id)
 	}
 	// The node expired (fleet's node expiry), and the leader crashed
@@ -90,7 +90,7 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 	if err := e.downSweep(bg); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []uuid.UUID{running.ID, paused.ID, withCheckpoint.ID} {
+	for _, id := range []podid.ID{running.ID, paused.ID, withCheckpoint.ID} {
 		row := h.row(id)
 		wantState(t, row, model.StateUnknown)
 		if !strings.HasPrefix(row.StatusDescription, "node n1 down since ") || row.Node != "n1" {
@@ -242,7 +242,7 @@ func TestHibernateAfterLoop(t *testing.T) {
 	}
 	time.Sleep(200 * time.Millisecond)
 	wantState(t, h.row(sb.ID), model.StatePaused)
-	h.exec("UPDATE sandboxes SET paused_at = now() - interval '2 minutes' WHERE id = ANY($1)", []uuid.UUID{sb.ID, other.ID})
+	h.exec("UPDATE sandboxes SET paused_at = now() - interval '2 minutes' WHERE id = ANY($1)", []podid.ID{sb.ID, other.ID})
 	if err := e.hibernateAfter(bg); err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ func TestDrainLoop(t *testing.T) {
 	// process holds do not keep a drain away); the one whose exec runs
 	// stays, within the drain timeout. Without another node, what ran
 	// stays hibernated.
-	unheld := []uuid.UUID{free.ID, viewed.ID, stopped.ID, paused.ID}
+	unheld := []podid.ID{free.ID, viewed.ID, stopped.ID, paused.ID}
 	h.drainUntil("the sandboxes without an exec hibernated", func() bool {
 		for _, id := range unheld {
 			if row := h.row(id); row.ClientState != model.StateHibernated || row.Op != "" {
@@ -478,7 +478,7 @@ func TestDrainRestoresWhatRan(t *testing.T) {
 	h.exec("UPDATE nodes SET draining = true, drain_started_at = now() WHERE name = 'n1'")
 	h.addNode("n2")
 	h.startOp(met.ID, OpIntent{Kind: OpPause, Trigger: TriggerEnsure, Target: "n1"})
-	for _, id := range []uuid.UUID{met.ID, busy.ID} {
+	for _, id := range []podid.ID{met.ID, busy.ID} {
 		h.drainUntil("a sandbox that ran restored on n2", func() bool {
 			row := h.row(id)
 			return row.ClientState == model.StateRunning && row.Node == "n2" && row.Op == ""
@@ -517,7 +517,7 @@ func TestDrainPassDoesNotWait(t *testing.T) {
 	h := newHarness(t)
 	n := h.addNode("n1")
 	e := h.eng()
-	var ids []uuid.UUID
+	var ids []podid.ID
 	for range 3 {
 		sb := h.running(512)
 		h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: "n1"})
@@ -599,7 +599,7 @@ func TestRepairLoop(t *testing.T) {
 	// A pod stuck PENDING: its bring-up never ends (a cut create).
 	stuck := h.sandbox(512)
 	hang := make(chan struct{})
-	n.Script().SetBringUp(func(ctx context.Context, id uuid.UUID) error {
+	n.Script().SetBringUp(func(ctx context.Context, id podid.ID) error {
 		if id != stuck.ID {
 			return nil
 		}

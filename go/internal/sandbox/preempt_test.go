@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -26,7 +26,7 @@ import (
 
 // abandoned is feosd's answer to the HibernatePod of a hibernation a
 // resume abandoned.
-func abandoned(id uuid.UUID) string {
+func abandoned(id podid.ID) string {
 	return "pod " + id.String() + " is resumed: its hibernation was abandoned"
 }
 
@@ -259,7 +259,7 @@ func TestEnsurePreemptRefused(t *testing.T) {
 			e.t.preemptRecheck = 100 * time.Millisecond
 			sb, hd, upload := h.hibernatingAtUpload("n1")
 			var begins, gets atomic.Int64
-			e.preBeginHook = func(_ context.Context, id uuid.UUID, kind OpKind) {
+			e.preBeginHook = func(_ context.Context, id podid.ID, kind OpKind) {
 				if id == sb.ID && kind == OpResume {
 					begins.Add(1)
 				}
@@ -347,7 +347,7 @@ func TestEnsurePreemptTooLate(t *testing.T) {
 	head := h.watchCalls("n1", testnode.HibernateHead, true)
 	resumes := h.watchCalls("n1", podv1.PodService_ResumePod_FullMethodName, false)
 	var once sync.Once
-	e.preBeginHook = func(_ context.Context, id uuid.UUID, kind OpKind) {
+	e.preBeginHook = func(_ context.Context, id podid.ID, kind OpKind) {
 		if id != sb.ID || kind != OpResume {
 			return
 		}

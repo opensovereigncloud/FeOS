@@ -17,6 +17,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -88,7 +89,7 @@ type addonPlan struct {
 // attachedPlan is an attached service's process as the target renders it.
 type attachedPlan struct {
 	name    string
-	sandbox uuid.UUID
+	sandbox podid.ID
 	argv    []string
 	cwd     string
 	env     map[string]model.TemplateValue
@@ -254,9 +255,9 @@ func (c *Controller) planJob(v *view, name string, j spec.Job) *podPlan {
 // planAttached renders an attached service of the target: its process.
 func (c *Controller) planAttached(v *view, name string, s spec.Service) *attachedPlan {
 	p := &attachedPlan{name: name, argv: slices.Clone(s.Command), cwd: s.Cwd, check: checkOf(s)}
-	id, err := uuid.Parse(s.Sandbox)
+	id, err := podid.Parse(s.Sandbox)
 	if err != nil {
-		p.err = fmt.Errorf("service %s: sandbox %q is not a UUID", name, s.Sandbox)
+		p.err = fmt.Errorf("service %s: sandbox %q is not a sandbox ID", name, s.Sandbox)
 		return p
 	}
 	p.sandbox = id
@@ -269,7 +270,7 @@ func (c *Controller) planAttached(v *view, name string, s spec.Service) *attache
 	}
 	p.hash = hashJSON(struct {
 		Scheme  int                            `json:"scheme"`
-		Sandbox uuid.UUID                      `json:"sandbox"`
+		Sandbox podid.ID                       `json:"sandbox"`
 		Command []string                       `json:"command"`
 		Cwd     string                         `json:"cwd"`
 		Env     map[string]model.TemplateValue `json:"env"`

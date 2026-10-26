@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -24,6 +23,7 @@ import (
 	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
 )
@@ -36,7 +36,7 @@ func newRunner(env *toolstest.Env) *Runner {
 
 // scriptTool makes the node answer the ToolService method with resp.
 func scriptTool(env *toolstest.Env, method string, resp proto.Message) {
-	env.Node.Script().SetTool(func(_ context.Context, _ uuid.UUID, m string, _ proto.Message) (proto.Message, bool, error) {
+	env.Node.Script().SetTool(func(_ context.Context, _ podid.ID, m string, _ proto.Message) (proto.Message, bool, error) {
 		if m == method {
 			return resp, true, nil
 		}
@@ -47,7 +47,7 @@ func scriptTool(env *toolstest.Env, method string, resp proto.Message) {
 // scriptExec makes the node answer every Exec with the frames f writes and
 // its exit code.
 func scriptExec(env *toolstest.Env, f func(req *containerv1.ExecRequest, out testnode.ExecOutput) int32) {
-	env.Node.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	env.Node.Script().SetExec(func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		return f(req, out), true, nil
 	})
 }
@@ -185,7 +185,7 @@ func TestToolServiceRequests(t *testing.T) {
 	sb := env.NewSandbox()
 	var got []proto.Message
 	var pods []string
-	env.Node.Script().SetTool(func(ctx context.Context, pod uuid.UUID, _ string, req proto.Message) (proto.Message, bool, error) {
+	env.Node.Script().SetTool(func(ctx context.Context, pod podid.ID, _ string, req proto.Message) (proto.Message, bool, error) {
 		got = append(got, req)
 		md, _ := metadata.FromIncomingContext(ctx)
 		pods = append(pods, strings.Join(md.Get(nodelink.PodIDMetadata), ","))
@@ -356,10 +356,10 @@ func (s *fakeStream) RecvMsg(m any) error {
 // fakeEngine leases every sandbox on node n1.
 type fakeEngine struct{ Sandboxes }
 
-func (fakeEngine) Acquire(_ context.Context, id uuid.UUID, _ model.HoldKind) (model.Lease, func(), error) {
+func (fakeEngine) Acquire(_ context.Context, id podid.ID, _ model.HoldKind) (model.Lease, func(), error) {
 	return model.Lease{SandboxID: id, Node: "n1"}, func() {}, nil
 }
-func (fakeEngine) Reachable(uuid.UUID) {}
+func (fakeEngine) Reachable(podid.ID) {}
 
 // A stream that ends without the exit code is an error, not exit 0; a
 // stream that breaks after output keeps the output and is not made again.
@@ -393,7 +393,7 @@ func TestTimeouts(t *testing.T) {
 	sb := env.NewSandbox()
 
 	killed := make(chan struct{})
-	env.Node.Script().SetExec(func(ctx context.Context, _ uuid.UUID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	env.Node.Script().SetExec(func(ctx context.Context, _ podid.ID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		if d, ok := ctx.Deadline(); ok {
 			t.Errorf("the node got the deadline %v", d)
 		}

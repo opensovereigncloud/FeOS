@@ -22,6 +22,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -46,7 +47,7 @@ type rig struct {
 	svc           *Service
 	srv           *httptest.Server
 	key           []byte
-	sb1, sb2, sb3 uuid.UUID
+	sb1, sb2, sb3 podid.ID
 }
 
 var bg = context.Background()
@@ -93,13 +94,13 @@ func newRigWith(t *testing.T, enabled bool) *rig {
 	t.Helper()
 	d := dbtest.New(t)
 	st := store.New(d)
-	r := &rig{t: t, d: d, st: st, key: newKey(t), sb1: uuid.New(), sb2: uuid.New(), sb3: uuid.New()}
+	r := &rig{t: t, d: d, st: st, key: newKey(t), sb1: podid.Mint(), sb2: podid.Mint(), sb3: podid.ID(uuid.NewString())}
 	for _, tn := range []string{"acme", "other"} {
 		if _, _, err := st.CreateTenant(bg, tn); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, id := range []uuid.UUID{r.sb1, r.sb2, r.sb3} {
+	for _, id := range []podid.ID{r.sb1, r.sb2, r.sb3} {
 		if _, _, err := st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: "acme", Image: "img", VCPUs: 2, MemoryMiB: 512}); err != nil {
 			t.Fatal(err)
 		}
@@ -129,7 +130,7 @@ func (r *rig) on(svc *Service) *rig {
 
 // mux mounts the Service as api does.
 func (r *rig) mux() http.Handler {
-	sandboxes := map[string]uuid.UUID{sb1Token: r.sb1, sb2Token: r.sb2, sb3Token: r.sb3}
+	sandboxes := map[string]podid.ID{sb1Token: r.sb1, sb2Token: r.sb2, sb3Token: r.sb3}
 	tenants := map[string]string{tenantToken: "acme", otherToken: "other"}
 	sandbox := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, req *http.Request) {

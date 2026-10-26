@@ -23,6 +23,7 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // ObjectStore is a fake of the object storage that diskd hibernates pods
@@ -193,7 +194,7 @@ func validHeadKey(key string) bool {
 	if len(parts) != 4 || parts[0] != "snapshots" || parts[3] != "head.json" {
 		return false
 	}
-	if _, err := uuid.Parse(parts[1]); err != nil {
+	if _, err := podid.Parse(parts[1]); err != nil {
 		return false
 	}
 	_, err := strconv.ParseUint(parts[2], 10, 64)

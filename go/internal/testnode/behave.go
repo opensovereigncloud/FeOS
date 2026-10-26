@@ -11,9 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // objectLabel is the label naming an environment's object of a pod
@@ -128,7 +127,7 @@ func (p *podService) bootedLocked(pd *pod, cold bool) func() {
 
 // exitBoot makes a container of a pod exit, if the pod still runs the
 // boot pid (a restart or restore since then schedules its own exit).
-func (p *podService) exitBoot(uid uuid.UUID, pid int64, container string, code int) {
+func (p *podService) exitBoot(uid podid.ID, pid int64, container string, code int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	pd := p.byUIDLocked(uid)

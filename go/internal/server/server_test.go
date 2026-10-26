@@ -17,13 +17,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -447,7 +447,7 @@ func TestShutdown(t *testing.T) {
 	if code, body := call(t, i, "POST", "/api/v1/sandboxes/"+id+"/pause", bearer(bootstrapToken), ""); code != 200 {
 		t.Fatalf("pause %d %s", code, body)
 	}
-	row, err := i.Store.GetSandbox(ctx, uuidOf(t, id))
+	row, err := i.Store.GetSandbox(ctx, idOf(t, id))
 	if err != nil || row.ClientState != model.StatePaused {
 		t.Fatalf("paused? %+v %v", row.ClientState, err)
 	}
@@ -475,7 +475,7 @@ func TestShutdown(t *testing.T) {
 	i.afterStop = func() {
 		// The sandbox runs again (the readiness window's exec resumed it):
 		// a pause needs an op.
-		afterStopErr = i.Engine.Pause(ctx, uuidOf(t, id))
+		afterStopErr = i.Engine.Pause(ctx, idOf(t, id))
 		rec.add("after step 4")
 	}
 	stopped := make(chan error, 1)
@@ -552,9 +552,9 @@ func TestShutdown(t *testing.T) {
 	}
 }
 
-func uuidOf(t *testing.T, s string) uuid.UUID {
+func idOf(t *testing.T, s string) podid.ID {
 	t.Helper()
-	id, err := uuid.Parse(s)
+	id, err := podid.Parse(s)
 	if err != nil {
 		t.Fatal(err)
 	}

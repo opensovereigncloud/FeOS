@@ -45,8 +45,8 @@ type Service struct {
 	// ImageAsWritten is the image as the client wrote it, kept by
 	// Normalise when it pins Image; informational on input.
 	ImageAsWritten string `json:"imageAsWritten,omitempty"`
-	// Sandbox is the attached runtime's sandbox: the UUID of a sandbox of
-	// the tenant (not an instance row).
+	// Sandbox is the attached runtime's sandbox: the ID of a sandbox of
+	// the tenant (not an instance row), short or a UUID.
 	Sandbox string `json:"sandbox,omitempty"`
 	// Command replaces the image's entrypoint and cmd (empty: they run);
 	// the attached runtime's process (required there).

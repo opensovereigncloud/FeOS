@@ -11,13 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 // authnRow is an attributed audit record of sb's feos-authn.
-func authnRow(sb uuid.UUID, ts int64, kind, name, detail string) store.ActivityRow {
+func authnRow(sb podid.ID, ts int64, kind, name, detail string) store.ActivityRow {
 	return store.ActivityRow{TsNs: ts, SandboxID: sb, PodID: sb, TenantID: "acme", Node: "n1",
 		Source: store.SourceAuthn, Kind: kind, Category: "credential", Name: name, Detail: json.RawMessage(detail)}
 }
@@ -33,7 +32,7 @@ func (r *rig) record(rows ...store.ActivityRow) {
 	}
 }
 
-func (r *rig) access(id uuid.UUID) accessOut {
+func (r *rig) access(id podid.ID) accessOut {
 	r.t.Helper()
 	code, raw := r.tenantCall(http.MethodGet, "/api/v1/sandboxes/"+id.String()+"/access", "")
 	if code != http.StatusOK {
@@ -158,7 +157,7 @@ func TestAccessAuth(t *testing.T) {
 	}{
 		{"sandbox token", "/api/v1/sandboxes/" + r.sb1.String() + "/access", "Bearer " + sb1Token, http.StatusUnauthorized},
 		{"no token", "/api/v1/sandboxes/" + r.sb1.String() + "/access", "", http.StatusUnauthorized},
-		{"unknown sandbox", "/api/v1/sandboxes/" + uuid.NewString() + "/access", "Bearer " + tenantToken, http.StatusNotFound},
+		{"unknown sandbox", "/api/v1/sandboxes/" + podid.Mint().String() + "/access", "Bearer " + tenantToken, http.StatusNotFound},
 		{"another tenant", "/api/v1/sandboxes/" + r.sb1.String() + "/access", "Bearer " + otherToken, http.StatusNotFound},
 		{"not a uuid", "/api/v1/sandboxes/sb-9/access", "Bearer " + tenantToken, http.StatusBadRequest},
 	} {

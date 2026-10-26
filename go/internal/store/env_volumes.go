@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // EnvVolume is a row of env_volumes: an addon's volume, created once on a
@@ -22,8 +24,8 @@ type EnvVolume struct {
 	Node     string // the node that has it; "": none yet
 	// Provisioned: created on Node; never CreateVolume again.
 	Provisioned bool
-	// Holder is the instance row that last held it; uuid.Nil: NULL.
-	Holder uuid.UUID
+	// Holder is the instance row that last held it; "": NULL.
+	Holder podid.ID
 	// AddonType is the addon type whose data the volume holds; fixed. A
 	// target addon of another type never mounts it.
 	AddonType string
@@ -40,12 +42,12 @@ const envVolumeCols = "env_id, object, volume_id, size_mib, node, provisioned, h
 
 func scanEnvVolume(row pgx.Row) (EnvVolume, error) {
 	var v EnvVolume
-	var holder *uuid.UUID
+	var holder *podid.ID
 	if err := row.Scan(&v.EnvID, &v.Object, &v.VolumeID, &v.SizeMiB, &v.Node, &v.Provisioned, &holder, &v.AddonType, &v.DataVersion, &v.Deleting,
 		&v.CreatedAt, &v.UpdatedAt); err != nil {
 		return EnvVolume{}, err
 	}
-	v.Holder = uuidOf(holder)
+	v.Holder = idOf(holder)
 	return v, nil
 }
 
@@ -62,7 +64,7 @@ func (s *Store) InsertEnvVolume(ctx context.Context, v EnvVolume) (EnvVolume, er
 	out, err := scanEnvVolume(s.q.QueryRow(ctx, `INSERT INTO env_volumes (env_id, object, volume_id, size_mib, node,
 			provisioned, holder, addon_type, data_version, deleting)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING `+envVolumeCols,
-		v.EnvID, v.Object, v.VolumeID, v.SizeMiB, v.Node, v.Provisioned, nullUUID(v.Holder), v.AddonType, v.DataVersion,
+		v.EnvID, v.Object, v.VolumeID, v.SizeMiB, v.Node, v.Provisioned, nullID(v.Holder), v.AddonType, v.DataVersion,
 		v.Deleting))
 	if err != nil {
 		return EnvVolume{}, insertError("insert volume of "+v.Object, err)
@@ -123,7 +125,7 @@ func (s *Store) UpdateEnvVolume(ctx context.Context, before, after EnvVolume) (E
 	u := newUpdates(before.EnvID, before.Object)
 	u.set("node", before.Node != after.Node, after.Node)
 	u.set("provisioned", before.Provisioned != after.Provisioned, after.Provisioned)
-	u.set("holder", before.Holder != after.Holder, nullUUID(after.Holder))
+	u.set("holder", before.Holder != after.Holder, nullID(after.Holder))
 	u.set("data_version", before.DataVersion != after.DataVersion, after.DataVersion)
 	u.set("deleting", before.Deleting != after.Deleting, after.Deleting)
 	if u.empty() {

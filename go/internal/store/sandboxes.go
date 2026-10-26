@@ -17,12 +17,13 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Sandbox is a row of sandboxes: every column, Go-typed. A sandbox's row
 // exists exactly while the sandbox exists.
 type Sandbox struct {
-	ID          uuid.UUID // = the pod's ID on feosd
+	ID          podid.ID  // = the pod's ID on feosd
 	Incarnation uuid.UUID // the pod label ferun.incarnation
 	Owner       string    // the tenant
 	Image       string    // as the client gave it
@@ -208,13 +209,13 @@ const (
 
 // GetSandbox reads a sandbox without a lock; model.ErrNotFound if it does
 // not exist.
-func (s *Store) GetSandbox(ctx context.Context, id uuid.UUID) (Sandbox, error) {
+func (s *Store) GetSandbox(ctx context.Context, id podid.ID) (Sandbox, error) {
 	return s.LockSandbox(ctx, id, NoLock)
 }
 
 // LockSandbox reads a sandbox and locks its row with lock (inside a
 // transaction); model.ErrNotFound if it does not exist.
-func (s *Store) LockSandbox(ctx context.Context, id uuid.UUID, lock RowLock) (Sandbox, error) {
+func (s *Store) LockSandbox(ctx context.Context, id podid.ID, lock RowLock) (Sandbox, error) {
 	sb, err := scanSandbox(s.q.QueryRow(ctx, "SELECT "+sandboxCols+" FROM sandboxes WHERE id = $1 "+string(lock), id))
 	if err != nil {
 		return Sandbox{}, noRow(err, model.ErrNotFound)
@@ -225,7 +226,7 @@ func (s *Store) LockSandbox(ctx context.Context, id uuid.UUID, lock RowLock) (Sa
 // NewSandbox is what a create request sets; every other column takes its
 // default (a new incarnation, client_state pending).
 type NewSandbox struct {
-	ID        uuid.UUID
+	ID        podid.ID
 	Owner     string
 	Image     string
 	VCPUs     int
@@ -246,8 +247,9 @@ type NewSandbox struct {
 }
 
 // CreateSandbox inserts the sandbox unless its ID exists. It returns the
-// new row and true, or the existing row (of whatever owner) and false. An
-// insert sends ferun_sandbox.
+// new row and true, or the existing row (of whatever owner) and false: a
+// caller that minted the ID draws another (podid.Mint). An insert sends
+// ferun_sandbox.
 func (s *Store) CreateSandbox(ctx context.Context, n NewSandbox) (Sandbox, bool, error) {
 	template, err := templateJSON(n.PodTemplate)
 	if err != nil {
@@ -277,10 +279,36 @@ func (s *Store) CreateSandbox(ctx context.Context, n NewSandbox) (Sandbox, bool,
 	return Sandbox{}, false, fmt.Errorf("create sandbox %s: the id keeps being deleted and re-created", n.ID)
 }
 
+// mintAttempts bounds the IDs CreateMintedSandbox draws: of about 2^54,
+// a second draw is rare already.
+const mintAttempts = 8
+
+// CreateMintedSandbox inserts a sandbox under a new short ID
+// (podid.Mint), unique over all tenants: an ID that is taken is drawn
+// again. of makes the row of an ID drawn (its ID set to it; a template
+// may name it). It returns the new row; the insert sends ferun_sandbox.
+func (s *Store) CreateMintedSandbox(ctx context.Context, of func(id podid.ID) NewSandbox) (Sandbox, error) {
+	for range mintAttempts {
+		id := podid.Mint()
+		n := of(id)
+		if n.ID != id {
+			return Sandbox{}, fmt.Errorf("create sandbox %s: the new row names %s", id, n.ID)
+		}
+		sb, created, err := s.CreateSandbox(ctx, n)
+		if err != nil {
+			return Sandbox{}, err
+		}
+		if created {
+			return sb, nil
+		}
+	}
+	return Sandbox{}, fmt.Errorf("create sandbox: %d new IDs in a row were taken", mintAttempts)
+}
+
 // DeleteSandbox removes the row (its tokens, holds, watches, bindings and
 // booking cascade) and sends ferun_sandbox. It reports whether a row was
 // there.
-func (s *Store) DeleteSandbox(ctx context.Context, id uuid.UUID) (bool, error) {
+func (s *Store) DeleteSandbox(ctx context.Context, id podid.ID) (bool, error) {
 	tag, err := s.q.Exec(ctx, "DELETE FROM sandboxes WHERE id = $1", id)
 	if err != nil {
 		return false, err
@@ -352,12 +380,12 @@ func (s *Store) SandboxStateCounts(ctx context.Context) (map[string]map[string]i
 // SteadyPod is a sandbox the registry holds as RUNNING or SUSPENDED on a
 // node: running or paused, without an op.
 type SteadyPod struct {
-	ID    uuid.UUID
+	ID    podid.ID
 	State string // model.StateRunning or model.StatePaused
 }
 
-// SteadyPods returns the steady sandboxes of node ordered by ID (the
-// lowercase hyphenated form sorts the same): the lines of the registry's
+// SteadyPods returns the steady sandboxes of node ordered by ID, byte by
+// byte (the column's collation is C): the lines of the registry's
 // inventory hash.
 func (s *Store) SteadyPods(ctx context.Context, node string) ([]SteadyPod, error) {
 	rows, err := s.q.Query(ctx, `SELECT id, client_state FROM sandboxes
@@ -377,33 +405,50 @@ func (s *Store) SteadyPods(ctx context.Context, node string) ([]SteadyPod, error
 // flight.
 const tapHolds = "(s.client_state NOT IN ('hibernated', 'pending', 'lost') OR s.op <> '')"
 
-// TAPConflict returns another sandbox on node whose ID shares id's first 8
-// hex digits and whose pod may hold a TAP device there (placement's TAP
-// prefix gate: feosd names a pod's TAP device after them);
-// uuid.Nil when there is none.
-func (s *Store) TAPConflict(ctx context.Context, node string, id uuid.UUID) (uuid.UUID, error) {
-	var other uuid.UUID
+// tapShares is the condition on a sandbox row s under which its pod's TAP
+// device has the name of the pod with the ID $<n>: both are UUIDs, and
+// they differ but share their first 8 hex digits (podid.TAPConflict). A
+// short ID shares no TAP device's name, also not when its first 8
+// characters are hex digits. The index sandboxes_tap serves it.
+func tapShares(n int) string {
+	return fmt.Sprintf("length($%d::text) = 36 AND length(s.id) = 36 AND left(s.id, 8) = left($%d::text, 8) AND s.id <> $%d::text",
+		n, n, n)
+}
+
+// TAPConflict returns another sandbox on node whose pod's TAP device has
+// the name of id's and may exist there (placement's TAP prefix gate:
+// feosd names a UUID's TAP device after its first 8 hex digits); "" when
+// there is none, always for a short ID, whose TAP device's name is its
+// own (ADR 0019).
+func (s *Store) TAPConflict(ctx context.Context, node string, id podid.ID) (podid.ID, error) {
+	if !id.IsLegacy() {
+		return "", nil
+	}
+	var other podid.ID
 	err := s.q.QueryRow(ctx, `SELECT s.id FROM sandboxes s
-		WHERE s.node = $1 AND left(s.id::text, 8) = left($2::uuid::text, 8) AND s.id <> $2::uuid AND `+tapHolds+`
+		WHERE s.node = $1 AND `+tapShares(2)+` AND `+tapHolds+`
 		ORDER BY s.id LIMIT 1`, node, id).Scan(&other)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return uuid.Nil, nil
+		return "", nil
 	}
 	return other, err
 }
 
 // TAPConflicts returns, per node, a sandbox that blocks id there as
 // TAPConflict does.
-func (s *Store) TAPConflicts(ctx context.Context, id uuid.UUID) (map[string]uuid.UUID, error) {
+func (s *Store) TAPConflicts(ctx context.Context, id podid.ID) (map[string]podid.ID, error) {
+	out := map[string]podid.ID{}
+	if !id.IsLegacy() {
+		return out, nil
+	}
 	rows, err := s.q.Query(ctx, `SELECT DISTINCT ON (s.node) s.node, s.id FROM sandboxes s
-		WHERE s.node IS NOT NULL AND left(s.id::text, 8) = left($1::uuid::text, 8) AND s.id <> $1::uuid AND `+tapHolds+`
+		WHERE s.node IS NOT NULL AND `+tapShares(1)+` AND `+tapHolds+`
 		ORDER BY s.node, s.id`, id)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]uuid.UUID{}
 	var node string
-	var other uuid.UUID
+	var other podid.ID
 	_, err = pgx.ForEachRow(rows, []any{&node, &other}, func() error {
 		out[node] = other
 		return nil
@@ -413,7 +458,7 @@ func (s *Store) TAPConflicts(ctx context.Context, id uuid.UUID) (map[string]uuid
 
 // Attribution is the sandbox a node's record about a pod belongs to.
 type Attribution struct {
-	SandboxID uuid.UUID
+	SandboxID podid.ID
 	TenantID  string
 }
 
@@ -422,7 +467,7 @@ type Attribution struct {
 // op_target or lost_from is node, a tombstone (podID, node) exists, or a
 // pod certificate for it on node was issued within a day). ok is false for
 // a foreign record.
-func (s *Store) AttributePod(ctx context.Context, podID uuid.UUID, node string) (a Attribution, ok bool, err error) {
+func (s *Store) AttributePod(ctx context.Context, podID podid.ID, node string) (a Attribution, ok bool, err error) {
 	err = s.q.QueryRow(ctx, `SELECT s.id, s.owner FROM sandboxes s WHERE s.id = $1 AND (
 			s.node = $2 OR s.op_target = $2 OR s.lost_from = $2
 			OR EXISTS (SELECT 1 FROM pod_tombstones t WHERE t.pod_id = $1 AND t.node = $2)
@@ -592,7 +637,7 @@ const groupMember = "(s.environment_id IS NOT NULL OR coalesce(jsonb_array_lengt
 // sends ferun_leader HintEnvGroups when the row is a group member
 // (IsInstance, HasGroups). Inside a transaction, as the hint goes with
 // the write. It reports whether it wrote.
-func (s *Store) SetSandboxAddress(ctx context.Context, id, incarnation uuid.UUID, address string) (bool, error) {
+func (s *Store) SetSandboxAddress(ctx context.Context, id podid.ID, incarnation uuid.UUID, address string) (bool, error) {
 	var member bool
 	err := s.q.QueryRow(ctx, `UPDATE sandboxes s SET address = $3 WHERE s.id = $1 AND s.incarnation = $2 AND s.address <> $3
 		RETURNING `+groupMember, id, incarnation, address).Scan(&member)
@@ -611,7 +656,7 @@ func (s *Store) SetSandboxAddress(ctx context.Context, id, incarnation uuid.UUID
 }
 
 // TouchSandbox sets last_active_at = now(): activity, no lifecycle write.
-func (s *Store) TouchSandbox(ctx context.Context, id uuid.UUID) error {
+func (s *Store) TouchSandbox(ctx context.Context, id podid.ID) error {
 	_, err := s.q.Exec(ctx, "UPDATE sandboxes SET last_active_at = now() WHERE id = $1", id)
 	return err
 }
@@ -619,14 +664,14 @@ func (s *Store) TouchSandbox(ctx context.Context, id uuid.UUID) error {
 // MarkUnreachable records that the guest of a running sandbox did not
 // answer: unreachable_since = coalesce(unreachable_since, now()). It
 // reports whether the row is running.
-func (s *Store) MarkUnreachable(ctx context.Context, id uuid.UUID) (bool, error) {
+func (s *Store) MarkUnreachable(ctx context.Context, id podid.ID) (bool, error) {
 	tag, err := s.q.Exec(ctx, `UPDATE sandboxes SET unreachable_since = coalesce(unreachable_since, now())
 		WHERE id = $1 AND client_state = 'running'`, id)
 	return tag.RowsAffected() > 0, err
 }
 
 // ClearUnreachable clears unreachable_since: the guest answered.
-func (s *Store) ClearUnreachable(ctx context.Context, id uuid.UUID) error {
+func (s *Store) ClearUnreachable(ctx context.Context, id podid.ID) error {
 	_, err := s.q.Exec(ctx, "UPDATE sandboxes SET unreachable_since = NULL WHERE id = $1 AND unreachable_since IS NOT NULL", id)
 	return err
 }
@@ -635,7 +680,7 @@ func (s *Store) ClearUnreachable(ctx context.Context, id uuid.UUID) error {
 // incarnation) as PENDING: pending_since = coalesce(pending_since, now()),
 // a write of its own that bumps no gen. It reports whether the row of that
 // incarnation exists.
-func (s *Store) MarkPending(ctx context.Context, id, incarnation uuid.UUID) (bool, error) {
+func (s *Store) MarkPending(ctx context.Context, id podid.ID, incarnation uuid.UUID) (bool, error) {
 	tag, err := s.q.Exec(ctx, `UPDATE sandboxes SET pending_since = coalesce(pending_since, now())
 		WHERE id = $1 AND incarnation = $2`, id, incarnation)
 	return tag.RowsAffected() > 0, err
@@ -643,7 +688,7 @@ func (s *Store) MarkPending(ctx context.Context, id, incarnation uuid.UUID) (boo
 
 // SetStatusDescription writes only the status description (no gen bump,
 // no notification), when the row is still of incarnation.
-func (s *Store) SetStatusDescription(ctx context.Context, id, incarnation uuid.UUID, description string) error {
+func (s *Store) SetStatusDescription(ctx context.Context, id podid.ID, incarnation uuid.UUID, description string) error {
 	_, err := s.q.Exec(ctx, `UPDATE sandboxes SET status_description = $3, updated_at = now()
 		WHERE id = $1 AND incarnation = $2 AND status_description <> $3`, id, incarnation, description)
 	return err
@@ -653,7 +698,7 @@ func (s *Store) SetStatusDescription(ctx context.Context, id, incarnation uuid.U
 // columns cleared, client_state unknown with the description "op <op> of
 // stopping instance <id> was released", node and booking kept, gen + 1.
 // It returns the ids and notifies them.
-func (s *Store) ReleaseOpsOf(ctx context.Context, instanceID string) ([]uuid.UUID, error) {
+func (s *Store) ReleaseOpsOf(ctx context.Context, instanceID string) ([]podid.ID, error) {
 	rows, err := s.q.Query(ctx, `UPDATE sandboxes SET op = '', op_id = NULL, op_owner = '', op_deadline = NULL,
 			op_target = '', op_from_state = '', client_state = 'unknown',
 			status_description = 'op ' || op || ' of stopping instance ' || $1 || ' was released',
@@ -662,11 +707,11 @@ func (s *Store) ReleaseOpsOf(ctx context.Context, instanceID string) ([]uuid.UUI
 	return s.notifyReturned(ctx, rows, err)
 }
 
-func (s *Store) notifyReturned(ctx context.Context, rows pgx.Rows, err error) ([]uuid.UUID, error) {
+func (s *Store) notifyReturned(ctx context.Context, rows pgx.Rows, err error) ([]podid.ID, error) {
 	if err != nil {
 		return nil, err
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[podid.ID])
 	if err != nil {
 		return nil, err
 	}
@@ -689,7 +734,7 @@ var nodeDownSince = rfc3339("coalesce(n.down_since, n.removed_at, now())")
 // to unknown ("node <n> down since <t>; it was <state>"), gen + 1, booking
 // unchanged. Rows locked by others are skipped. It returns the ids and
 // notifies them.
-func (s *Store) DownSweep(ctx context.Context, limit int) ([]uuid.UUID, error) {
+func (s *Store) DownSweep(ctx context.Context, limit int) ([]podid.ID, error) {
 	rows, err := s.q.Query(ctx, `WITH c AS (
 			SELECT s.id FROM sandboxes s
 			WHERE s.node IN (SELECT name FROM nodes WHERE status IN ('down', 'removed')) AND s.op = ''
@@ -705,7 +750,7 @@ func (s *Store) DownSweep(ctx context.Context, limit int) ([]uuid.UUID, error) {
 
 // LostRow is a sandbox lost grace resolved.
 type LostRow struct {
-	ID       uuid.UUID
+	ID       podid.ID
 	Owner    string
 	Node     string // the node that went down
 	State    string // model.StateHibernated, model.StateLost or model.StatePending
@@ -770,7 +815,7 @@ func (s *Store) LostGrace(ctx context.Context, grace time.Duration, limit int) (
 			return nil, err
 		}
 	}
-	ids := make([]uuid.UUID, len(lost))
+	ids := make([]podid.ID, len(lost))
 	for i, l := range lost {
 		ids[i] = l.ID
 	}

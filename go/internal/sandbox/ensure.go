@@ -16,6 +16,7 @@ import (
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -39,7 +40,7 @@ import (
 // object store and takes minutes, longer than a caller should wait. One
 // that has not ended by then is ErrBusy, "sandbox <id> is hibernating;
 // retry in a minute", and goes on; a later Ensure restores the sandbox.
-func (e *Engine) Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error) {
+func (e *Engine) Ensure(ctx context.Context, id podid.ID) (model.Lease, error) {
 	ctx, cancel := context.WithTimeout(ctx, e.t.prepBudget)
 	defer cancel()
 	en := &ensurer{e: e, id: id, ops: map[string]OpResult{}, tombTried: map[store.TombstoneKey]bool{},
@@ -53,7 +54,7 @@ func (e *Engine) Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error) 
 // ensurer is one call of Ensure.
 type ensurer struct {
 	e       *Engine
-	id      uuid.UUID
+	id      podid.ID
 	changes <-chan string
 	// ops are the results of the ops this call started or joined, by
 	// "<kind>@<node>".
@@ -812,7 +813,7 @@ func opGoal(kind OpKind) string {
 // finds the row changed is ErrPrecondition. An op that began after the
 // read (an idle pause, a resume of another instance) is waited for, and
 // the sandbox looked at again.
-func (e *Engine) Pause(ctx context.Context, id uuid.UUID) error {
+func (e *Engine) Pause(ctx context.Context, id podid.ID) error {
 	ctx, cancel := context.WithTimeout(ctx, e.t.pauseWait)
 	defer cancel()
 	for {
@@ -876,7 +877,7 @@ func (e *Engine) waitOpEnd(ctx context.Context, read store.Sandbox) error {
 }
 
 // Resume is the REST resume (§11): Ensure, then activity (Touch).
-func (e *Engine) Resume(ctx context.Context, id uuid.UUID) error {
+func (e *Engine) Resume(ctx context.Context, id podid.ID) error {
 	if _, err := e.Ensure(ctx, id); err != nil {
 		return err
 	}
@@ -887,7 +888,7 @@ func (e *Engine) Resume(ctx context.Context, id uuid.UUID) error {
 // WaitRunning waits for a sandbox whose pod is PENDING (a call into its
 // guest found it still starting) until the pod leaves PENDING, syncs it,
 // and returns its lease as Ensure does.
-func (e *Engine) WaitRunning(ctx context.Context, id uuid.UUID) (model.Lease, error) {
+func (e *Engine) WaitRunning(ctx context.Context, id podid.ID) (model.Lease, error) {
 	row, err := e.st.GetSandbox(ctx, id)
 	if err != nil {
 		return model.Lease{}, err

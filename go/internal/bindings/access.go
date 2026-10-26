@@ -9,11 +9,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -83,9 +82,9 @@ func (s *Service) Access(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw := r.PathValue("id")
-	id, err := uuid.Parse(raw)
+	id, err := podid.Parse(raw)
 	if err != nil {
-		apierr.Write(w, apierr.New(http.StatusBadRequest, "sandboxId must be a UUID"))
+		apierr.Write(w, apierr.New(http.StatusBadRequest, apierr.MsgSandboxID))
 		return
 	}
 	sb, err := s.st.GetSandbox(r.Context(), id)

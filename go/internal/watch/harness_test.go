@@ -29,6 +29,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
 )
@@ -36,10 +37,10 @@ import (
 // sandboxes is the engine's state reads in the tests: what the tests say.
 type sandboxes struct {
 	mu     sync.Mutex
-	states map[uuid.UUID][2]string
+	states map[podid.ID][2]string
 }
 
-func (f *sandboxes) State(_ context.Context, id uuid.UUID) (string, string, error) {
+func (f *sandboxes) State(_ context.Context, id podid.ID) (string, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	st, ok := f.states[id]
@@ -49,7 +50,7 @@ func (f *sandboxes) State(_ context.Context, id uuid.UUID) (string, string, erro
 	return st[0], st[1], nil
 }
 
-func (f *sandboxes) set(id uuid.UUID, state, node string) {
+func (f *sandboxes) set(id podid.ID, state, node string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.states[id] = [2]string{state, node}
@@ -87,7 +88,7 @@ type world struct {
 func newWorld(t *testing.T) *world {
 	t.Helper()
 	env := toolstest.New(t, toolstest.Options{PendingDelay: 20 * time.Millisecond})
-	w := &world{t: t, env: env, sbs: &sandboxes{states: map[uuid.UUID][2]string{}}, tokens: map[string]auth.Sandbox{}}
+	w := &world{t: t, env: env, sbs: &sandboxes{states: map[podid.ID][2]string{}}, tokens: map[string]auth.Sandbox{}}
 	w.sb = w.newSandbox()
 	w.token = w.tokenOf(w.sb)
 	return w

@@ -15,12 +15,13 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
 // tombstone writes a tombstone directly.
-func (h *harness) tombstone(id uuid.UUID, node string, inc uuid.UUID, notBefore time.Time) store.TombstoneKey {
+func (h *harness) tombstone(id podid.ID, node string, inc uuid.UUID, notBefore time.Time) store.TombstoneKey {
 	h.t.Helper()
 	t, err := h.st.UpsertTombstone(bg, store.Tombstone{PodID: id, Node: node, Incarnation: inc, Reason: "test", NotBefore: notBefore})
 	if err != nil {
@@ -34,8 +35,8 @@ func TestTombstoneIncarnationChecks(t *testing.T) {
 	h.addNode("n1")
 	e := h.eng()
 	pc := h.pods("n1")
-	create := func(spec *podv1.PodSpec) uuid.UUID {
-		id := uuid.New()
+	create := func(spec *podv1.PodSpec) podid.ID {
+		id := podid.Mint()
 		if _, err := pc.CreatePod(bg, &podv1.CreatePodRequest{PodId: id.String(), Spec: spec}); err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +54,7 @@ func TestTombstoneIncarnationChecks(t *testing.T) {
 
 	// The tombstone's incarnation: the pod is deleted, then the tombstone.
 	inc := uuid.New()
-	id := uuid.New()
+	id := podid.Mint()
 	if _, err := pc.CreatePod(bg, &podv1.CreatePodRequest{PodId: id.String(), Spec: labelled(id, inc)}); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestTombstoneIncarnationChecks(t *testing.T) {
 
 	// Another incarnation: the pod stays, only the tombstone goes.
 	other := uuid.New()
-	id2 := uuid.New()
+	id2 := podid.Mint()
 	if _, err := pc.CreatePod(bg, &podv1.CreatePodRequest{PodId: id2.String(), Spec: labelled(id2, other)}); err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +77,7 @@ func TestTombstoneIncarnationChecks(t *testing.T) {
 	h.podState("n1", id2, podv1.PodState_POD_STATE_RUNNING)
 
 	// A pod of ferund's without an incarnation label is deleted.
-	id3 := uuid.New()
+	id3 := podid.Mint()
 	spec := labelled(id3, uuid.New())
 	delete(spec.Labels, LabelIncarnation)
 	if _, err := pc.CreatePod(bg, &podv1.CreatePodRequest{PodId: id3.String(), Spec: spec}); err != nil {
@@ -98,13 +99,13 @@ func TestTombstoneIncarnationChecks(t *testing.T) {
 	h.podState("n1", id4, podv1.PodState_POD_STATE_RUNNING)
 
 	// No pod: the tombstone goes.
-	k = h.tombstone(uuid.New(), "n1", uuid.New(), time.Time{})
+	k = h.tombstone(podid.Mint(), "n1", uuid.New(), time.Time{})
 	if err := process(k); err != nil || exists(k) {
 		t.Fatalf("process: %v", err)
 	}
 
 	// Not due: nothing happens.
-	id5 := uuid.New()
+	id5 := podid.Mint()
 	if _, err := pc.CreatePod(bg, &podv1.CreatePodRequest{PodId: id5.String(), Spec: labelled(id5, inc)}); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +141,7 @@ func TestTombstoneProcessingIsDetached(t *testing.T) {
 	n := h.addNode("n1", func(c *testnode.Config) { c.AbortOnCancel = true })
 	e := h.eng()
 	inc := uuid.New()
-	id := uuid.New()
+	id := podid.Mint()
 	if _, err := h.pods("n1").CreatePod(bg, &podv1.CreatePodRequest{PodId: id.String(), Spec: labelled(id, inc)}); err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +169,7 @@ func TestTombstonesOfRemovedNodes(t *testing.T) {
 	h.addNode("n1")
 	e := h.eng()
 	h.exec("INSERT INTO nodes (name, status, removed_at) VALUES ('old', 'removed', now())")
-	id := uuid.New()
+	id := podid.Mint()
 	h.tombstone(id, "old", uuid.New(), time.Time{})
 	if err := e.tombstones(bg); err != nil {
 		t.Fatal(err)
@@ -214,7 +215,7 @@ func TestDeleteThenCreateSameID(t *testing.T) {
 		t.Fatalf("tombstones %+v", ts)
 	}
 	// An unknown sandbox is not found.
-	_, _, err = e.Delete(bg, testTenant, uuid.New())
+	_, _, err = e.Delete(bg, testTenant, podid.Mint())
 	wantErr(t, err, model.ErrNotFound, "unknown sandbox")
 
 	// Created again at once: a new incarnation, kept off n1 until the
@@ -262,7 +263,7 @@ func TestDeleteTenant(t *testing.T) {
 	if err != nil || !existed {
 		t.Fatalf("delete tenant: %v %v", existed, err)
 	}
-	for _, id := range []uuid.UUID{a.ID, b.ID} {
+	for _, id := range []podid.ID{a.ID, b.ID} {
 		if _, err := h.st.GetSandbox(bg, id); !errors.Is(err, model.ErrNotFound) {
 			t.Fatalf("sandbox %s stayed: %v", id, err)
 		}
@@ -280,7 +281,7 @@ func TestDeleteTenant(t *testing.T) {
 	if _, _, err := h.st.CreateTenant(bg, "t2"); err != nil {
 		t.Fatal(err)
 	}
-	c, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: uuid.New(), Owner: "t2", Image: testImage, VCPUs: 1, MemoryMiB: 512})
+	c, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: podid.Mint(), Owner: "t2", Image: testImage, VCPUs: 1, MemoryMiB: 512})
 	if err != nil {
 		t.Fatal(err)
 	}

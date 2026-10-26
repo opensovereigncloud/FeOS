@@ -14,6 +14,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -40,7 +41,7 @@ func admits(k OpKind) bool {
 // candidates, on the first candidate whose claim passes under its lock
 // (each candidate in a transaction of its own, so that the transaction
 // never holds more than one node row); otherwise on the target.
-func (r *runner) begin(ctx context.Context, id uuid.UUID, in OpIntent) (*OpHandle, error) {
+func (r *runner) begin(ctx context.Context, id podid.ID, in OpIntent) (*OpHandle, error) {
 	if pinnedTarget(in) == "" {
 		var refused []string
 		for _, c := range in.Candidates {
@@ -92,7 +93,7 @@ const beginTimeout = 30 * time.Second
 // outcome unknown, and the row in an op of this instance that nobody runs.
 // A COMMIT whose answer was lost all the same (the connection broke) is
 // judged by the row: an op that committed is this begin's, and runs.
-func (r *runner) beginOn(ctx context.Context, id uuid.UUID, in OpIntent, target string) (*OpHandle, error) {
+func (r *runner) beginOn(ctx context.Context, id podid.ID, in OpIntent, target string) (*OpHandle, error) {
 	e := r.e
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), beginTimeout)
 	defer cancel()
@@ -374,7 +375,7 @@ func (r *runner) preemptHibernate(ctx context.Context, tx *store.Store, row stor
 
 // preemptEnded is the begin's answer when the hibernate a resume was to
 // preempt is no longer the row's op.
-func preemptEnded(id uuid.UUID) error {
+func preemptEnded(id podid.ID) error {
 	return errorf(model.ErrPrecondition, "sandbox %s: the hibernate to preempt ended", id)
 }
 
@@ -498,7 +499,7 @@ func (r *runner) drainHibernate(ctx context.Context, tx *store.Store, trigger Op
 	return false, nil
 }
 
-func recheckFailed(id uuid.UUID, why string, err error) error {
+func recheckFailed(id podid.ID, why string, err error) error {
 	if err != nil {
 		return err
 	}

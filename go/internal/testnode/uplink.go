@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	grpcbackoff "google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
@@ -27,6 +26,7 @@ import (
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Version is what the test node reports as its feosd version.
@@ -603,7 +603,7 @@ type Credentials struct {
 // as the pod's feos-authn does at every start: a new Ed25519 key and HPKE
 // key, the signing request, and the sealed bindings opened with
 // pki.Open.
-func (n *Node) IssuePodCredentials(ctx context.Context, pod uuid.UUID) (*Credentials, error) {
+func (n *Node) IssuePodCredentials(ctx context.Context, pod podid.ID) (*Credentials, error) {
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
@@ -617,7 +617,7 @@ func (n *Node) IssuePodCredentials(ctx context.Context, pod uuid.UUID) (*Credent
 
 // IssuePodCredentialsWith asks for a pod's credentials with given keys, as
 // feos-authn repeats a request whose answer it lost.
-func (n *Node) IssuePodCredentialsWith(ctx context.Context, pod uuid.UUID, key ed25519.PrivateKey, hk hpke.PrivateKey) (*Credentials, error) {
+func (n *Node) IssuePodCredentialsWith(ctx context.Context, pod podid.ID, key ed25519.PrivateKey, hk hpke.PrivateKey) (*Credentials, error) {
 	client, done, err := n.useUplink()
 	if err != nil {
 		return nil, err

@@ -9,10 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -105,11 +104,11 @@ func TestTakeoverAcrossInstances(t *testing.T) {
 // before its transaction, until release: another instance acts between
 // the caller's read and its begin. entered is closed when it waits. It is
 // set before the goroutines that begin run.
-func holdBegin(e *Engine, id uuid.UUID, kind OpKind) (entered <-chan struct{}, release func()) {
+func holdBegin(e *Engine, id podid.ID, kind OpKind) (entered <-chan struct{}, release func()) {
 	in := make(chan struct{})
 	out := make(chan struct{})
 	var first, once sync.Once
-	e.preBeginHook = func(_ context.Context, bid uuid.UUID, k OpKind) {
+	e.preBeginHook = func(_ context.Context, bid podid.ID, k OpKind) {
 		if bid != id || k != kind {
 			return
 		}
@@ -134,7 +133,7 @@ func TestEnsureRacesAnotherInstance(t *testing.T) {
 	i2 := h.addInstance("i2")
 	h.addNode("n1")
 	e := h.eng()
-	race := func(id uuid.UUID, kind OpKind) {
+	race := func(id podid.ID, kind OpKind) {
 		t.Helper()
 		entered, release := holdBegin(e, id, kind)
 		defer release()
@@ -210,7 +209,7 @@ func TestStopWaitsForBegins(t *testing.T) {
 	var once, opened sync.Once
 	open := func() { opened.Do(func() { close(gate) }) }
 	defer open()
-	e.beginHook = func(ctx context.Context, id uuid.UUID, kind OpKind) {
+	e.beginHook = func(ctx context.Context, id podid.ID, kind OpKind) {
 		if id != sb.ID || kind != OpPause {
 			return
 		}

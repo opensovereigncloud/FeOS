@@ -245,8 +245,8 @@ func TestBindingsOffAndLostSandbox(t *testing.T) {
 	if r.code != http.StatusBadGateway || r.body != `{"error":"bash: ensure sandbox: sandbox lost"}`+"\n" {
 		t.Errorf("REST into the lost sandbox: %d %s", r.code, r.body)
 	}
-	// FeCode then reads the state, deletes the lost sandbox and creates it
-	// again under the same ID at once; with no node left, its first call
+	// FeCode then reads the state, deletes the lost sandbox and creates a
+	// new one at once; with no node left, its first call
 	// is refused for capacity, and nothing is placed.
 	r = c.call(nil, "GET", sb.path(""), tenantAuth, "")
 	if !strings.Contains(r.body, `"clientState":"lost"`) {
@@ -255,7 +255,7 @@ func TestBindingsOffAndLostSandbox(t *testing.T) {
 	if r := c.call(nil, "DELETE", sb.path(""), tenantAuth, ""); r.code != http.StatusOK {
 		t.Fatalf("delete: %d %s", r.code, r.body)
 	}
-	again := c.createID(nil, sb.id)
+	again := c.create(nil)
 	ctx, cancel := context.WithTimeout(bg, time.Minute)
 	defer cancel()
 	r, err := c.execErr(ctx, nil, again, "true")

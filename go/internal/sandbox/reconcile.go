@@ -10,11 +10,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/google/uuid"
-
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -37,7 +36,7 @@ func (e *Engine) ReconcileNode(ctx context.Context, node string) error {
 	if err != nil {
 		return fmt.Errorf("reconcile %s: snapshot: %w", node, err)
 	}
-	snap := make(map[uuid.UUID]store.Sandbox, len(rows))
+	snap := make(map[podid.ID]store.Sandbox, len(rows))
 	for _, r := range rows {
 		snap[r.ID] = r
 	}
@@ -55,13 +54,13 @@ func (e *Engine) ReconcileNode(ctx context.Context, node string) error {
 	if err != nil {
 		return fmt.Errorf("reconcile %s: list pods: %w", node, err)
 	}
-	listed := map[uuid.UUID]bool{}
+	listed := map[podid.ID]bool{}
 	var errs []error
 	for _, p := range list.GetPods() {
 		if !isFerunPod(p) {
 			continue
 		}
-		id, err := uuid.Parse(p.GetPodId())
+		id, err := podid.Parse(p.GetPodId())
 		if err != nil {
 			continue
 		}
@@ -88,7 +87,7 @@ func (e *Engine) ReconcileNode(ctx context.Context, node string) error {
 }
 
 // reconcilePod decides about one of ferund's pods the node listed.
-func (e *Engine) reconcilePod(ctx context.Context, node string, id uuid.UUID, p *podv1.PodInfo, snap map[uuid.UUID]store.Sandbox) error {
+func (e *Engine) reconcilePod(ctx context.Context, node string, id podid.ID, p *podv1.PodInfo, snap map[podid.ID]store.Sandbox) error {
 	inc := podIncarnation(p)
 	var events []activity.Event
 	var keys []store.TombstoneKey

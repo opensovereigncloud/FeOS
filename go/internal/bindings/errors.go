@@ -11,10 +11,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/auth"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The stable error codes of both surfaces, sent as "code" next to
@@ -85,10 +84,10 @@ func decodeJSON(r *http.Request, v any) (map[string]json.RawMessage, error) {
 
 // sandboxOf returns the sandbox a sandbox-class request was made as; api
 // has checked that its token names the path's sandbox.
-func sandboxOf(r *http.Request) (uuid.UUID, *apierr.Error) {
+func sandboxOf(r *http.Request) (podid.ID, *apierr.Error) {
 	sb, ok := auth.SandboxFrom(r.Context())
-	if !ok || sb.ID == uuid.Nil {
-		return uuid.Nil, apierr.New(http.StatusUnauthorized, "sandbox token required")
+	if !ok || sb.ID.IsZero() {
+		return "", apierr.New(http.StatusUnauthorized, "sandbox token required")
 	}
 	return sb.ID, nil
 }

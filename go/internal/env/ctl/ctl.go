@@ -54,6 +54,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -257,7 +258,7 @@ type Controller struct {
 	locks map[string]*sync.Mutex
 	// provisionFailed holds when an addon instance's provisioning failed
 	// last, for provisionRetry.
-	provisionFailed map[uuid.UUID]time.Time
+	provisionFailed map[podid.ID]time.Time
 	// lastPending is what each rolling release waited for at its last
 	// step, for logPending.
 	lastPending map[string]string
@@ -265,7 +266,7 @@ type Controller struct {
 	// a restart boots a new microVM, so the same pid with the container
 	// still exited is the same run, whose restart did not happen (a leader
 	// change forgets it: at most one exit too many).
-	exitRun map[uuid.UUID]int64
+	exitRun map[podid.ID]int64
 	// cleanWaits is the backoff of the attached services' cleanups that
 	// failed, by pool key (made when first needed).
 	cleanWaits map[string]cleanWait
@@ -292,7 +293,7 @@ func New(deps Deps) (*Controller, error) {
 	log := deps.Log.With("component", "env-ctl")
 	c := &Controller{d: deps, st: st, log: log, rl: newRateLog(log), t: defaultTimings(),
 		specs: newSpecCache(), seen: map[string]*seenState{}, locks: map[string]*sync.Mutex{},
-		provisionFailed: map[uuid.UUID]time.Time{}, lastPending: map[string]string{}, exitRun: map[uuid.UUID]int64{}}
+		provisionFailed: map[podid.ID]time.Time{}, lastPending: map[string]string{}, exitRun: map[podid.ID]int64{}}
 	c.pool = newPool(poolWorkers, log)
 	c.bg, c.cancelBg = context.WithCancel(context.Background())
 	return c, nil

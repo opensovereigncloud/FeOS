@@ -20,6 +20,7 @@ import (
 	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -333,30 +334,36 @@ func TestPublishEventsAttribution(t *testing.T) {
 	if _, _, err := h.st.CreateTenant(bg, "acme"); err != nil {
 		t.Fatal(err)
 	}
-	mk := func() uuid.UUID {
-		id := uuid.New()
+	// Short IDs and, made before ADR 0019, UUIDs.
+	mkWith := func(id podid.ID) podid.ID {
 		if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: "acme", Image: "alpine", VCPUs: 1, MemoryMiB: 512}); err != nil {
 			t.Fatal(err)
 		}
 		return id
 	}
-	onNode, elsewhere, target, lost, tomb, cert, oldCert := mk(), mk(), mk(), mk(), mk(), mk(), mk()
+	mk := func() podid.ID { return mkWith(podid.Mint()) }
+	legacy := func() podid.ID { return mkWith(podid.ID(uuid.NewString())) }
+	onNode, elsewhere, target, lost, tomb, cert, oldCert := mk(), mk(), mk(), legacy(), legacy(), mk(), legacy()
+	legacyOnNode, legacyElsewhere := legacy(), legacy()
 	h.exec("UPDATE sandboxes SET node = 'n1', client_state = 'running' WHERE id = $1", onNode)
+	h.exec("UPDATE sandboxes SET node = 'n1', client_state = 'running' WHERE id = $1", legacyOnNode)
+	h.exec("UPDATE sandboxes SET node = 'n2', client_state = 'running' WHERE id = $1", legacyElsewhere)
 	h.exec("UPDATE sandboxes SET node = 'n2', client_state = 'running' WHERE id = $1", elsewhere)
 	h.exec(`UPDATE sandboxes SET node = 'n2', op = 'create', op_id = gen_random_uuid(), op_owner = 'i1',
 		op_deadline = now() + interval '1 minute', op_target = 'n1', client_state = 'creating' WHERE id = $1`, target)
 	h.exec("UPDATE sandboxes SET lost_from = 'n1', client_state = 'lost' WHERE id = $1", lost)
 	h.exec("INSERT INTO pod_tombstones (pod_id, node, incarnation) VALUES ($1, 'n1', gen_random_uuid())", tomb)
-	for id, age := range map[uuid.UUID]string{cert: "1 hour", oldCert: "2 days"} {
+	for id, age := range map[podid.ID]string{cert: "1 hour", oldCert: "2 days"} {
 		h.exec(`INSERT INTO issued_certs (serial, pod_id, incarnation, node, spiffe_id, hpke_public_key, not_after, issued_at)
 			VALUES ($1, $2, gen_random_uuid(), 'n1', 'spiffe://feos.test/x', '\x00', now(), now() - $3::interval)`,
 			id.String(), id, age)
 	}
 	start := uuid.New()
-	unknown := uuid.New()
+	unknown, unknownLegacy := podid.Mint(), uuid.New()
 	var events []*fleetv1.Event
 	pods := []string{onNode.String(), elsewhere.String(), target.String(), lost.String(), tomb.String(),
-		cert.String(), oldCert.String(), unknown.String(), "not-a-uuid"}
+		cert.String(), oldCert.String(), unknown.String(), "not-a-uuid", legacyOnNode.String(),
+		strings.ToUpper(legacyOnNode.String()), legacyElsewhere.String(), unknownLegacy.String(), "Abcdefghjkm"}
 	for i, p := range pods {
 		events = append(events, podEvent(uint64(i+1), p, podv1.PodState_POD_STATE_RUNNING, ""))
 	}
@@ -371,16 +378,16 @@ func TestPublishEventsAttribution(t *testing.T) {
 	if err != nil || len(acks) != 1 {
 		t.Fatalf("acks %v, %v", acks, err)
 	}
-	attributed := map[uuid.UUID]bool{onNode: true, target: true, lost: true, tomb: true, cert: true}
+	attributed := map[podid.ID]bool{onNode: true, target: true, lost: true, tomb: true, cert: true, legacyOnNode: true}
 	for i, p := range pods {
-		var sandbox *uuid.UUID
+		var sandbox *podid.ID
 		var tenant string
 		var foreign bool
 		if err := h.d.Pool.QueryRow(bg, "SELECT sandbox_id, tenant_id, foreign_pod FROM activity WHERE start_id = $1 AND seq = $2",
 			start, i+1).Scan(&sandbox, &tenant, &foreign); err != nil {
 			t.Fatal(err)
 		}
-		id, _ := uuid.Parse(p)
+		id, _ := podid.Parse(p)
 		if attributed[id] {
 			if sandbox == nil || *sandbox != id || tenant != "acme" || foreign {
 				t.Fatalf("pod %s: sandbox %v tenant %q foreign %v; want attributed", p, sandbox, tenant, foreign)
@@ -389,7 +396,7 @@ func TestPublishEventsAttribution(t *testing.T) {
 			t.Fatalf("pod %s: sandbox %v tenant %q foreign %v; want a foreign record", p, sandbox, tenant, foreign)
 		}
 	}
-	var sb *uuid.UUID
+	var sb *podid.ID
 	var foreign bool
 	h.scalar(&foreign, "SELECT foreign_pod FROM traffic_records WHERE seq = 20")
 	if err := h.d.Pool.QueryRow(bg, "SELECT sandbox_id, foreign_pod FROM traffic_records WHERE seq = 20").Scan(&sb, &foreign); err != nil ||
@@ -406,8 +413,8 @@ func TestPublishEventsAttribution(t *testing.T) {
 	// A pod event about a row placed elsewhere asks for a reconcile of
 	// the reporting node.
 	h.expectReconcile("n1")
-	if got := len(h.hooks.changes()); got != 8 {
-		t.Fatalf("%d PodChanged calls; want one per pod event with a UUID", got)
+	if got := len(h.hooks.changes()); got != 12 {
+		t.Fatalf("%d PodChanged calls; want one per pod event with a pod ID", got)
 	}
 }
 
@@ -418,7 +425,7 @@ func TestPublishEventsReconcileOnlyForRowsElsewhere(t *testing.T) {
 	if _, _, err := h.st.CreateTenant(bg, "acme"); err != nil {
 		t.Fatal(err)
 	}
-	onNode := uuid.New()
+	onNode := podid.Mint()
 	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: onNode, Owner: "acme", Image: "alpine", VCPUs: 1, MemoryMiB: 512}); err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +470,7 @@ func TestPublishEventsAckLost(t *testing.T) {
 	if _, _, err := h.st.CreateTenant(bg, "acme"); err != nil {
 		t.Fatal(err)
 	}
-	pod := uuid.New()
+	pod := podid.Mint()
 	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: pod, Owner: "acme", Image: "alpine", VCPUs: 1, MemoryMiB: 512}); err != nil {
 		t.Fatal(err)
 	}

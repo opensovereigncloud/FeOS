@@ -13,6 +13,8 @@ import (
 	"slices"
 
 	"github.com/google/uuid"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The labels an environment's instance pods carry beside the sandbox
@@ -33,8 +35,8 @@ const (
 func EnvGroupID(envID uuid.UUID) string { return "env-" + envID.String() }
 
 // SandboxGroupID is the security group of an attachable sandbox:
-// "sbx-<sandbox UUID>", 40 characters.
-func SandboxGroupID(id uuid.UUID) string { return "sbx-" + id.String() }
+// "sbx-<sandbox ID>", 15 characters (40 for a sandbox with a UUID).
+func SandboxGroupID(id podid.ID) string { return "sbx-" + id.String() }
 
 // EnvTableID is the name table of an environment's pods (feosd's
 // NameService): its addons and image services. It is the ID of the
@@ -44,7 +46,7 @@ func EnvTableID(envID uuid.UUID) string { return EnvGroupID(envID) }
 // SandboxTableID is the name table of an attachable sandbox: its own
 // attached services, and the env tables of the environments they belong
 // to. It is the ID of the sandbox's security group.
-func SandboxTableID(id uuid.UUID) string { return SandboxGroupID(id) }
+func SandboxTableID(id podid.ID) string { return SandboxGroupID(id) }
 
 // The escapes of a secret in a template value.
 const (

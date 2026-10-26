@@ -9,6 +9,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The environment controller's queries (internal/env/ctl) beyond the
@@ -65,7 +68,7 @@ func (s *Store) EnvCtlCloseObjectIncidents(ctx context.Context, envID uuid.UUID,
 
 // EnvCtlSetPin writes a row's pin_node (not a lifecycle column: its gen
 // stays) and reports whether the row was there.
-func (s *Store) EnvCtlSetPin(ctx context.Context, id uuid.UUID, node string) (bool, error) {
+func (s *Store) EnvCtlSetPin(ctx context.Context, id podid.ID, node string) (bool, error) {
 	ct, err := s.q.Exec(ctx, `UPDATE sandboxes SET pin_node = $2, updated_at = now() WHERE id = $1 AND pin_node <> $2`,
 		id, node)
 	if err != nil {
@@ -76,7 +79,7 @@ func (s *Store) EnvCtlSetPin(ctx context.Context, id uuid.UUID, node string) (bo
 
 // EnvCtlSetIdle writes a row's idle_after_s (not a lifecycle column) and
 // reports whether it changed.
-func (s *Store) EnvCtlSetIdle(ctx context.Context, id uuid.UUID, idleAfterS int) (bool, error) {
+func (s *Store) EnvCtlSetIdle(ctx context.Context, id podid.ID, idleAfterS int) (bool, error) {
 	ct, err := s.q.Exec(ctx, `UPDATE sandboxes SET idle_after_s = $2, updated_at = now()
 		WHERE id = $1 AND idle_after_s IS DISTINCT FROM $2`, id, idleAfterS)
 	if err != nil {
@@ -142,7 +145,7 @@ func (s *Store) EnvCtlTouchEnvironment(ctx context.Context, id uuid.UUID) error 
 // been pending without capacity (a description beginning "no capacity")
 // for at least after, by the database's clock: their ids and
 // descriptions.
-func (s *Store) EnvCtlStarved(ctx context.Context, envID uuid.UUID, after time.Duration) (map[uuid.UUID]string, error) {
+func (s *Store) EnvCtlStarved(ctx context.Context, envID uuid.UUID, after time.Duration) (map[podid.ID]string, error) {
 	rows, err := s.q.Query(ctx, `SELECT id, status_description FROM sandboxes
 		WHERE environment_id = $1 AND client_state = 'pending' AND op = '' AND status_description LIKE 'no capacity%'
 			AND coalesce(pending_since, created_at) <= now() - make_interval(secs => $2)`, envID, after.Seconds())
@@ -150,9 +153,9 @@ func (s *Store) EnvCtlStarved(ctx context.Context, envID uuid.UUID, after time.D
 		return nil, err
 	}
 	defer rows.Close()
-	out := map[uuid.UUID]string{}
+	out := map[podid.ID]string{}
 	for rows.Next() {
-		var id uuid.UUID
+		var id podid.ID
 		var desc string
 		if err := rows.Scan(&id, &desc); err != nil {
 			return nil, err
@@ -188,7 +191,7 @@ func (s *Store) EnvCtlJobWaitedUntil(ctx context.Context, envID uuid.UUID, job, 
 
 // EnvCtlWithAttached returns the IDs of the environments whose attached
 // services run in the sandbox and may use it (attachedUsable), sorted.
-func (s *Store) EnvCtlWithAttached(ctx context.Context, sandboxID uuid.UUID) ([]uuid.UUID, error) {
+func (s *Store) EnvCtlWithAttached(ctx context.Context, sandboxID podid.ID) ([]uuid.UUID, error) {
 	rows, err := s.q.Query(ctx, `SELECT DISTINCT a.env_id FROM env_attached a JOIN environments e ON e.id = a.env_id
 			JOIN sandboxes s ON s.id = a.sandbox_id
 		WHERE a.sandbox_id = $1 AND `+attachedUsable+` ORDER BY a.env_id`, sandboxID)
@@ -207,7 +210,7 @@ type AttachedName struct {
 // EnvCtlAttachedIn returns the attached services that run in the sandbox
 // and may use it (attachedUsable), by environment and name: the names of
 // its name table.
-func (s *Store) EnvCtlAttachedIn(ctx context.Context, sandboxID uuid.UUID) ([]AttachedName, error) {
+func (s *Store) EnvCtlAttachedIn(ctx context.Context, sandboxID podid.ID) ([]AttachedName, error) {
 	rows, err := s.q.Query(ctx, `SELECT a.env_id, a.service FROM env_attached a JOIN environments e ON e.id = a.env_id
 			JOIN sandboxes s ON s.id = a.sandbox_id
 		WHERE a.sandbox_id = $1 AND `+attachedUsable+` ORDER BY a.env_id, a.service`, sandboxID)
@@ -227,32 +230,36 @@ func (s *Store) EnvCtlTemplatedOnNode(ctx context.Context, node string) ([]Sandb
 
 // EnvCtlExisting returns which of the ids are environments (exists) and
 // which are sandboxes (sandboxes).
-func (s *Store) EnvCtlExisting(ctx context.Context, envs, sandboxes []uuid.UUID) (map[uuid.UUID]bool, map[uuid.UUID]bool, error) {
-	collect := func(sql string, ids []uuid.UUID) (map[uuid.UUID]bool, error) {
-		out := map[uuid.UUID]bool{}
-		if len(ids) == 0 {
-			return out, nil
-		}
-		rows, err := s.q.Query(ctx, sql, ids)
-		if err != nil {
-			return nil, err
-		}
-		found, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
-		if err != nil {
-			return nil, err
-		}
-		for _, id := range found {
-			out[id] = true
-		}
-		return out, nil
-	}
-	e, err := collect("SELECT id FROM environments WHERE id = ANY($1)", envs)
+func (s *Store) EnvCtlExisting(ctx context.Context, envs []uuid.UUID, sandboxes []podid.ID) (map[uuid.UUID]bool,
+	map[podid.ID]bool, error) {
+	e, err := existing(ctx, s.q, "SELECT id FROM environments WHERE id = ANY($1)", envs)
 	if err != nil {
 		return nil, nil, err
 	}
-	sb, err := collect("SELECT id FROM sandboxes WHERE id = ANY($1)", sandboxes)
+	sb, err := existing(ctx, s.q, "SELECT id FROM sandboxes WHERE id = ANY($1)", sandboxes)
 	if err != nil {
 		return nil, nil, err
 	}
 	return e, sb, nil
+}
+
+// existing runs sql, which selects those of the ids ($1) that have a row,
+// and returns them as a set.
+func existing[T comparable](ctx context.Context, q db.Querier, sql string, ids []T) (map[T]bool, error) {
+	out := map[T]bool{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := q.Query(ctx, sql, ids)
+	if err != nil {
+		return nil, err
+	}
+	found, err := pgx.CollectRows(rows, pgx.RowTo[T])
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range found {
+		out[id] = true
+	}
+	return out, nil
 }
