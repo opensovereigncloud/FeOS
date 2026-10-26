@@ -24,7 +24,8 @@
 // Now returns the time every statement of the transaction compares with.
 //
 // Nullable columns map to zero values: "" for a NULL text, uuid.Nil for a
-// NULL uuid, the zero time.Time for a NULL timestamptz.
+// NULL uuid, "" for a NULL pod ID, the zero time.Time for a NULL
+// timestamptz.
 package store
 
 import (
@@ -40,6 +41,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // ErrNoRow is returned by the lookups of rows other than sandboxes when the
@@ -155,7 +157,7 @@ func (s *Store) Notify(ctx context.Context, channel, payload string) error {
 
 // notifySandboxes sends ferun_sandbox for each id, or "*" for more than
 // notifyBatch ids.
-func (s *Store) notifySandboxes(ctx context.Context, ids []uuid.UUID) error {
+func (s *Store) notifySandboxes(ctx context.Context, ids []podid.ID) error {
 	if len(ids) == 0 {
 		return nil
 	}
@@ -198,6 +200,13 @@ func nullUUID(u uuid.UUID) any {
 	return u
 }
 
+func nullID(id podid.ID) any {
+	if id.IsZero() {
+		return nil
+	}
+	return string(id)
+}
+
 func timeOf(p *time.Time) time.Time {
 	if p == nil {
 		return time.Time{}
@@ -215,6 +224,13 @@ func stringOf(p *string) string {
 func uuidOf(p *uuid.UUID) uuid.UUID {
 	if p == nil {
 		return uuid.Nil
+	}
+	return *p
+}
+
+func idOf(p *podid.ID) podid.ID {
+	if p == nil {
+		return ""
 	}
 	return *p
 }

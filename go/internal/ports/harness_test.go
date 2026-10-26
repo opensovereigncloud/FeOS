@@ -19,11 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
 )
 
@@ -44,7 +43,7 @@ type engine struct {
 	gate func(ctx context.Context)
 }
 
-func (e *engine) Acquire(ctx context.Context, id uuid.UUID, kind model.HoldKind) (model.Lease, func(), error) {
+func (e *engine) Acquire(ctx context.Context, id podid.ID, kind model.HoldKind) (model.Lease, func(), error) {
 	e.mu.Lock()
 	gate := e.gate
 	e.mu.Unlock()
@@ -57,7 +56,7 @@ func (e *engine) Acquire(ctx context.Context, id uuid.UUID, kind model.HoldKind)
 	return e.Engine.Acquire(ctx, id, kind)
 }
 
-func (e *engine) Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error) {
+func (e *engine) Ensure(ctx context.Context, id podid.ID) (model.Lease, error) {
 	e.mu.Lock()
 	e.ensures++
 	e.mu.Unlock()
@@ -68,7 +67,7 @@ func (e *engine) Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error) 
 	return lease, err
 }
 
-func (e *engine) Touch(uuid.UUID) {
+func (e *engine) Touch(podid.ID) {
 	e.mu.Lock()
 	e.touches++
 	e.mu.Unlock()
@@ -87,7 +86,7 @@ type kubePorts struct {
 	err   error
 }
 
-func (k *kubePorts) KubePorts(context.Context, uuid.UUID) ([]int, error) {
+func (k *kubePorts) KubePorts(context.Context, podid.ID) ([]int, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	return k.ports, k.err

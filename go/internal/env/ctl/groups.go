@@ -21,6 +21,7 @@ import (
 
 	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -122,18 +123,26 @@ func hashVersion(g *networkv1.SecurityGroup) uint64 {
 	return binary.BigEndian.Uint64(sum[:8]) >> 1
 }
 
-// parseGroup reads a group ID of the controller's: env (true) or sbx, and
-// the UUID; ok false for any other group.
-func parseGroup(id string) (env bool, u uuid.UUID, ok bool) {
+// parseGroup reads a group ID of the controller's: env-<environment UUID>
+// (env true, its environment's ID) or sbx-<sandbox ID> (env false, its
+// sandbox's ID, short or a UUID), each in its canonical form; ok false for
+// any other group.
+func parseGroup(id string) (env bool, envID uuid.UUID, sbx podid.ID, ok bool) {
 	kind, rest, found := strings.Cut(id, "-")
-	if !found || (kind != "env" && kind != "sbx") {
-		return false, uuid.Nil, false
+	switch {
+	case found && kind == "env":
+		u, err := uuid.Parse(rest)
+		if err != nil || u.String() != rest {
+			return false, uuid.Nil, "", false
+		}
+		return true, u, "", true
+	case found && kind == "sbx":
+		if !podid.Valid(rest) {
+			return false, uuid.Nil, "", false
+		}
+		return false, uuid.Nil, podid.ID(rest), true
 	}
-	u, err := uuid.Parse(rest)
-	if err != nil || u.String() != rest {
-		return false, uuid.Nil, false
-	}
-	return kind == "env", u, true
+	return false, uuid.Nil, "", false
 }
 
 // errNoGroup: the group's environment or sandbox does not exist.
@@ -143,7 +152,7 @@ var errNoGroup = errors.New("the group's environment or sandbox does not exist")
 // version (an env group's gen, an sbx group's hash), and the groups its
 // rules name.
 func (c *Controller) buildGroup(ctx context.Context, id string) (*networkv1.SecurityGroup, []string, error) {
-	isEnv, u, ok := parseGroup(id)
+	isEnv, u, sbx, ok := parseGroup(id)
 	if !ok {
 		return nil, nil, fmt.Errorf("%s is not a group of the environments", id)
 	}
@@ -162,14 +171,14 @@ func (c *Controller) buildGroup(ctx context.Context, id string) (*networkv1.Secu
 		return &networkv1.SecurityGroup{Id: id, Version: uint64(max(env.Gen, 0)), Rules: envRules(id), Members: members(addrs)},
 			[]string{id}, nil
 	}
-	sb, err := c.st.GetSandbox(ctx, u)
+	sb, err := c.st.GetSandbox(ctx, sbx)
 	if errors.Is(err, model.ErrNotFound) {
 		return nil, nil, errNoGroup
 	}
 	if err != nil {
 		return nil, nil, err
 	}
-	envs, err := c.st.EnvCtlWithAttached(ctx, u)
+	envs, err := c.st.EnvCtlWithAttached(ctx, sbx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -237,7 +246,7 @@ func (c *Controller) syncGroup(ctx context.Context, node string, want, have *net
 		return want, nil
 	}
 	if have != nil && have.GetVersion() == want.GetVersion() {
-		if isEnv, u, _ := parseGroup(want.Id); isEnv {
+		if isEnv, u, _, _ := parseGroup(want.Id); isEnv {
 			gen, err := c.st.BumpEnvironmentGen(ctx, u)
 			if err != nil {
 				return nil, err
@@ -356,16 +365,17 @@ func (c *Controller) syncNodeGroups(ctx context.Context, node string, cache map[
 		cache[id].g = put
 	}
 	// Groups of environments and sandboxes that are gone.
-	var envs, sbxs []uuid.UUID
+	var envs []uuid.UUID
+	var sbxs []podid.ID
 	for id := range have {
 		if _, wanted := want[id]; wanted {
 			continue
 		}
-		if isEnv, u, ok := parseGroup(id); ok {
+		if isEnv, u, sbx, ok := parseGroup(id); ok {
 			if isEnv {
 				envs = append(envs, u)
 			} else {
-				sbxs = append(sbxs, u)
+				sbxs = append(sbxs, sbx)
 			}
 		}
 	}
@@ -379,9 +389,9 @@ func (c *Controller) syncNodeGroups(ctx context.Context, node string, cache map[
 			errs = append(errs, err)
 		}
 	}
-	for _, u := range sbxs {
-		if !sbxOK[u] {
-			_, err := c.deleteGroup(ctx, node, model.SandboxGroupID(u))
+	for _, sbx := range sbxs {
+		if !sbxOK[sbx] {
+			_, err := c.deleteGroup(ctx, node, model.SandboxGroupID(sbx))
 			errs = append(errs, err)
 		}
 	}

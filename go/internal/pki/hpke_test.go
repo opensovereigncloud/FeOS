@@ -8,10 +8,10 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 func TestSealOpen(t *testing.T) {
@@ -23,7 +23,7 @@ func TestSealOpen(t *testing.T) {
 	if len(pub) != 32 {
 		t.Fatalf("public key of %d bytes", len(pub))
 	}
-	pod := uuid.New()
+	pod := podid.Mint()
 	b := &fleetv1.PodBindings{
 		Kube: []*fleetv1.KubeBinding{{Name: "prod", Port: 6443, Server: "https://k8s.example.com",
 			Credential: &fleetv1.KubeBinding_Token{Token: "secret"}}},
@@ -51,7 +51,7 @@ func TestSealOpen(t *testing.T) {
 		t.Error("opened with a changed version")
 	}
 	// So is the pod.
-	if _, err := Open(priv, uuid.New(), sealed); err == nil {
+	if _, err := Open(priv, podid.Mint(), sealed); err == nil {
 		t.Error("opened for another pod")
 	}
 	// Another run's key cannot open it.

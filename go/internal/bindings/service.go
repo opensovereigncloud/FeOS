@@ -12,13 +12,13 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/seal"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
@@ -106,7 +106,7 @@ func (s *Service) Enabled() bool { return s.enabled }
 // surfaces off: nil and "". Both sets and their versions are read in one
 // REPEATABLE READ snapshot, so the version names exactly the bindings
 // returned.
-func (s *Service) PodBindings(ctx context.Context, podID uuid.UUID) (*fleetv1.PodBindings, string, error) {
+func (s *Service) PodBindings(ctx context.Context, podID podid.ID) (*fleetv1.PodBindings, string, error) {
 	if !s.enabled {
 		return nil, "", nil
 	}
@@ -143,7 +143,7 @@ func (s *Service) PodBindings(ctx context.Context, podID uuid.UUID) (*fleetv1.Po
 // whether the surfaces are on or off: bindings are delivered per run, so a
 // pod started while they were on keeps its Kubernetes listeners after an
 // instance restarts with them off, and reading the ports needs no key.
-func (s *Service) KubePorts(ctx context.Context, id uuid.UUID) ([]int, error) {
+func (s *Service) KubePorts(ctx context.Context, id podid.ID) ([]int, error) {
 	ports, err := s.st.KubePorts(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("kube ports of %s: %w", id, err)
@@ -183,7 +183,7 @@ type podSnapshot struct {
 
 // snapshot reads both sets of a sandbox in one REPEATABLE READ, read-only
 // transaction; errNoSandbox when the sandbox does not exist.
-func (s *Service) snapshot(ctx context.Context, id uuid.UUID) (podSnapshot, error) {
+func (s *Service) snapshot(ctx context.Context, id podid.ID) (podSnapshot, error) {
 	var snap podSnapshot
 	tx, err := s.d.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {

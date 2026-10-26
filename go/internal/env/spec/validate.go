@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Mode is what a validation is for: it decides which checks run and how
@@ -44,8 +44,8 @@ const (
 type ValidateContext interface {
 	// Mode is what the validation is for.
 	Mode() Mode
-	// Sandbox reports the tenant's sandbox of id (a UUID string, as the
-	// spec names it); ok false when the tenant has no sandbox of that ID,
+	// Sandbox reports the tenant's sandbox of id (its canonical form: a
+	// short ID, or a UUID in lowercase); ok false when the tenant has no sandbox of that ID,
 	// or it is an environment's instance row.
 	Sandbox(id string) (info SandboxInfo, ok bool)
 	// Secret reports a tenant secret of the environment (never a system
@@ -72,7 +72,7 @@ type ValidateContext interface {
 
 // SandboxInfo is a sandbox an attached service may run in.
 type SandboxInfo struct {
-	// ID is the sandbox's UUID, in lowercase.
+	// ID is the sandbox's ID in its canonical form (podid).
 	ID string
 	// Attachable: the sandbox was created attachable (its pod has the
 	// sbx- security group). One that is not cannot reach the
@@ -364,11 +364,12 @@ func (v *validator) sandbox(path, id string) {
 		v.errorf(path, "set sandbox to the ID of one of your sandboxes", "an attached service needs a sandbox")
 		return
 	}
-	if _, err := uuid.Parse(id); err != nil || len(id) != 36 {
-		v.errorf(path, "set sandbox to the ID of one of your sandboxes", "sandbox %q is not a UUID", id)
+	sid, err := podid.Parse(id)
+	if err != nil {
+		v.errorf(path, "set sandbox to the ID of one of your sandboxes", "sandbox %q is not a sandbox ID", id)
 		return
 	}
-	info, ok := v.vc.Sandbox(strings.ToLower(id))
+	info, ok := v.vc.Sandbox(sid.String())
 	if !ok {
 		v.errorf(path, "create the sandbox first (POST /api/v1/sandboxes with attachable: true), or name one of yours",
 			"no sandbox %s of yours", id)

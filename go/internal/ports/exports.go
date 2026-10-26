@@ -14,9 +14,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // What the environments (ADR 0018) use of the door (envdeps.Ports): the
@@ -129,7 +128,7 @@ const textDotDot = "the path has a .. segment"
 // the query is kept. A path with a ".." segment, also one
 // percent-encoded, is refused with 400. Every answer of the door's own is
 // plain text.
-func (h *Handler) ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID uuid.UUID, port int, upstreamPath, rawPath string,
+func (h *Handler) ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID podid.ID, port int, upstreamPath, rawPath string,
 	credentials []string) {
 	if port < 1 || port > 65535 {
 		reply{http.StatusBadGateway, fmt.Sprintf("port %d is out of range", port), 0}.write(w)

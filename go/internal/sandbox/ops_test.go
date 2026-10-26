@@ -18,11 +18,12 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 // startOp begins an op on the first instance and waits for its end.
-func (h *harness) startOp(id uuid.UUID, in OpIntent) OpResult {
+func (h *harness) startOp(id podid.ID, in OpIntent) OpResult {
 	h.t.Helper()
 	ctx, cancel := context.WithTimeout(bg, 60*time.Second)
 	defer cancel()
@@ -127,7 +128,7 @@ func TestOutcomePendingAtDeadline(t *testing.T) {
 	h := newHarness(t)
 	n := h.addNode("n1")
 	release := make(chan struct{})
-	n.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	n.Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		select {
 		case <-release:
 		case <-ctx.Done():
@@ -162,7 +163,7 @@ func TestPendingSinceAtFirstObservation(t *testing.T) {
 	h := newHarness(t)
 	n := h.addNode("n1")
 	release := make(chan struct{})
-	n.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	n.Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		select {
 		case <-release:
 		case <-ctx.Done():
@@ -196,7 +197,7 @@ func TestPendingSinceAtFirstObservation(t *testing.T) {
 func TestOutcomeFailedEnsureReturns(t *testing.T) {
 	h := newHarness(t)
 	n := h.addNode("n1")
-	n.Script().SetBringUp(func(context.Context, uuid.UUID) error { return errors.New("image pull failed") })
+	n.Script().SetBringUp(func(context.Context, podid.ID) error { return errors.New("image pull failed") })
 	sb := h.sandbox(512)
 	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
 	defer cancel()
@@ -311,9 +312,10 @@ func TestOutcomeTAPCollisionPlacesElsewhere(t *testing.T) {
 	if filler.Node != "n1" {
 		h.t.Skipf("filler placed on %s", filler.Node)
 	}
-	sb := h.sandbox(512)
+	// Only pods with UUIDs (made before ADR 0019) share TAP prefixes.
+	sb := h.sandboxWithID(legacyID(), 512)
 	// A pod that ferund does not know holds the TAP prefix on n1.
-	other, _ := uuid.Parse(sb.ID.String()[:8] + "-0000-4000-8000-000000000000")
+	other := podid.ID(sb.ID.String()[:8] + "-0000-4000-8000-000000000000")
 	if other == sb.ID {
 		t.Skip("collision with itself")
 	}
@@ -344,7 +346,7 @@ func TestOutcomeNotFound(t *testing.T) {
 	// A materialised sandbox whose pod is gone: lost.
 	sb := h.running(512)
 	// The pod goes while the pause is under way.
-	vanish := func(id uuid.UUID) func(context.Context, string, any) error {
+	vanish := func(id podid.ID) func(context.Context, string, any) error {
 		return func(context.Context, string, any) error {
 			_, err := h.pods("n1").DeletePod(bg, &podv1.DeletePodRequest{PodId: id.String()})
 			return err
@@ -581,7 +583,7 @@ func TestHibernateDeadline(t *testing.T) {
 	}
 
 	// The row's op_deadline, as begin and takeover write it.
-	opLeft := func(id uuid.UUID) time.Duration {
+	opLeft := func(id podid.ID) time.Duration {
 		t.Helper()
 		var secs float64
 		h.scalar(&secs, "SELECT extract(epoch FROM op_deadline - now()) FROM sandboxes WHERE id = $1", id)
@@ -634,7 +636,7 @@ func TestHibernateDeadline(t *testing.T) {
 	}
 }
 
-func podReq(id uuid.UUID) *podv1.GetPodRequest { return &podv1.GetPodRequest{PodId: id.String()} }
+func podReq(id podid.ID) *podv1.GetPodRequest { return &podv1.GetPodRequest{PodId: id.String()} }
 
 // TestCreateFailsWithInternal: a create whose call fails with INTERNAL
 // (an error that may pass) does not keep the sandbox off its node, and

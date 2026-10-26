@@ -14,12 +14,13 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
 // labelled is a pod spec of ferund's for id of incarnation inc.
-func labelled(id, inc uuid.UUID) *podv1.PodSpec {
+func labelled(id podid.ID, inc uuid.UUID) *podv1.PodSpec {
 	return podSpec(store.Sandbox{ID: id, Owner: testTenant, Incarnation: inc, VCPUs: 1, MemoryMiB: 256, ImageRef: testImage})
 }
 
@@ -40,13 +41,14 @@ func TestReconcileOrphansAndIgnored(t *testing.T) {
 	})
 	pc := h.pods("n1")
 	// An orphan: ferund's label, no row.
-	orphan := uuid.New()
+	// A pod made before ADR 0019, with a UUID.
+	orphan := legacyID()
 	orphanInc := uuid.New()
 	if _, err := pc.CreatePod(bg, &podv1.CreatePodRequest{PodId: orphan.String(), Spec: labelled(orphan, orphanInc)}); err != nil {
 		t.Fatal(err)
 	}
 	// A pod not of ferund's: never touched.
-	foreign := uuid.New()
+	foreign := podid.Mint()
 	if _, err := pc.CreatePod(bg, &podv1.CreatePodRequest{PodId: foreign.String(), Spec: &podv1.PodSpec{
 		Containers: []*podv1.ContainerSpec{{Name: "main", ImageRef: testImage}}, Network: &podv1.PodNetwork{None: true},
 	}}); err != nil {
@@ -67,7 +69,7 @@ func TestReconcileOrphansAndIgnored(t *testing.T) {
 	if err := e.ReconcileNode(bg, "n1"); err != nil {
 		t.Fatal(err)
 	}
-	want := map[uuid.UUID]uuid.UUID{orphan: orphanInc, stale.ID: stale.Incarnation, elsewhere.ID: elsewhere.Incarnation}
+	want := map[podid.ID]uuid.UUID{orphan: orphanInc, stale.ID: stale.Incarnation, elsewhere.ID: elsewhere.Incarnation}
 	for id, inc := range want {
 		ts := h.tombstones(id)
 		if len(ts) != 1 || ts[0].Node != "n1" || ts[0].Incarnation != inc {

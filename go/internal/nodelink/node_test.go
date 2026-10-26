@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 func pods(t *testing.T, e *env, node string) podv1.PodServiceClient {
@@ -83,7 +83,7 @@ func TestNodeConnection(t *testing.T) {
 	}
 
 	// PodContext reaches the node as feos-pod-id.
-	id := uuid.New()
+	id := podid.Mint()
 	cc, err := e.srv.Conn(context.Background(), "n1")
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +96,7 @@ func TestNodeConnection(t *testing.T) {
 		t.Errorf("GetPod %v", info)
 	}
 	// Setting it twice keeps one value.
-	ctx := PodContext(PodContext(context.Background(), uuid.New()), id)
+	ctx := PodContext(PodContext(context.Background(), podid.Mint()), id)
 	if info, err := podv1.NewPodServiceClient(cc).GetPod(ctx, &podv1.GetPodRequest{}); err != nil || info.PodId != id.String() {
 		t.Errorf("GetPod with PodContext twice: %v %v", info, err)
 	}
@@ -658,7 +658,7 @@ func TestForwardCapIsTheConsumers(t *testing.T) {
 	e.dialNode(e.node("n1", time.Hour), "a")
 	eventually(t, 3*time.Second, "connected", func() bool { return e.srv.Connected("n1") })
 	cc, _ := e.srv.Conn(context.Background(), "n1")
-	ctx, cancel := context.WithCancel(PodContext(context.Background(), uuid.New()))
+	ctx, cancel := context.WithCancel(PodContext(context.Background(), podid.Mint()))
 	defer cancel()
 	// 40 forward streams of one pod: beyond the consumer's cap of 32, which
 	// nodelink does not enforce; only the stream budget applies.

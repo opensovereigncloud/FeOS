@@ -20,6 +20,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -353,7 +354,7 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 		s.routeFailed(w, r, err)
 		return
 	}
-	if inst.id == uuid.Nil {
+	if inst.id.IsZero() {
 		w.Header().Set("Retry-After", "5")
 		http.Error(w, "no ready instance of "+route.Service, http.StatusServiceUnavailable)
 		return
@@ -388,27 +389,27 @@ func (s *Service) ServeRoute(w http.ResponseWriter, r *http.Request) {
 // not: a sandbox ID is free again once its sandbox is deleted, and
 // another tenant may take it, which the spec validated at apply never
 // sees.
-func (s *Service) attachedSandbox(ctx context.Context, e store.Environment, service string) (uuid.UUID, string, error) {
+func (s *Service) attachedSandbox(ctx context.Context, e store.Environment, service string) (podid.ID, string, error) {
 	a, err := s.st.GetAttached(ctx, e.ID, service)
 	if errors.Is(err, store.ErrNoRow) {
-		return uuid.Nil, "no ready instance of " + service, nil
+		return "", "no ready instance of " + service, nil
 	}
 	if err != nil {
-		return uuid.Nil, "", fmt.Errorf("attached service %s: %w", service, err)
+		return "", "", fmt.Errorf("attached service %s: %w", service, err)
 	}
 	sb, err := s.st.GetSandbox(ctx, a.SandboxID)
 	if err != nil && !errors.Is(err, model.ErrNotFound) {
-		return uuid.Nil, "", fmt.Errorf("sandbox %s: %w", a.SandboxID, err)
+		return "", "", fmt.Errorf("sandbox %s: %w", a.SandboxID, err)
 	}
 	if err != nil || sb.Owner != e.Owner || sb.IsInstance() {
-		return uuid.Nil, fmt.Sprintf("sandbox %s of service %s is gone or not this tenant's", a.SandboxID, service), nil
+		return "", fmt.Sprintf("sandbox %s of service %s is gone or not this tenant's", a.SandboxID, service), nil
 	}
 	return sb.ID, "", nil
 }
 
 // picked is the instance a request goes to: its sandbox and its release.
 type picked struct {
-	id      uuid.UUID
+	id      podid.ID
 	release int
 }
 

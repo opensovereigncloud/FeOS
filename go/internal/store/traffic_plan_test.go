@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // planNode is a node of EXPLAIN (ANALYZE, FORMAT JSON)'s plan.
@@ -46,7 +47,7 @@ func TestNodeTrafficPageUsesItsIndex(t *testing.T) {
 	const records, foreignEvery = 20000, 100
 	var rows []TrafficRow
 	for seq := int64(1); seq <= records; seq++ {
-		r := TrafficRow{TsNs: seq, Node: "n1", StartID: start, Seq: seq, PodID: uuid.New(), Kind: "flow"}
+		r := TrafficRow{TsNs: seq, Node: "n1", StartID: start, Seq: seq, PodID: podid.Mint(), Kind: "flow"}
 		if seq%foreignEvery == 0 {
 			r.ForeignPod = true // attributed to no sandbox
 		} else {

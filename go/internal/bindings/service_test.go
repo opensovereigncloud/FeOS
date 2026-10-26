@@ -13,13 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -71,7 +71,7 @@ func TestPodBindings(t *testing.T) {
 	if b, v, err := r.svc.PodBindings(bg, r.sb1); err != nil || b != nil || v != "" {
 		t.Fatalf("no bindings: %v %q %v", b, v, err)
 	}
-	if b, v, err := r.svc.PodBindings(bg, uuid.New()); err != nil || b != nil || v != "" {
+	if b, v, err := r.svc.PodBindings(bg, podid.Mint()); err != nil || b != nil || v != "" {
 		t.Fatalf("no sandbox: %v %q %v", b, v, err)
 	}
 
@@ -409,7 +409,7 @@ func TestPodBindingsSnapshot(t *testing.T) {
 		v == podVersion(old.Version, "", nil) {
 		t.Fatalf("after the PUT: %v %q %v", b, v, err)
 	}
-	if _, err := r.svc.snapshot(bg, uuid.New()); !errors.Is(err, errNoSandbox) {
+	if _, err := r.svc.snapshot(bg, podid.Mint()); !errors.Is(err, errNoSandbox) {
 		t.Fatalf("snapshot of no sandbox: %v", err)
 	}
 }

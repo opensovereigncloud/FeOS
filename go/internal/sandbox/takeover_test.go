@@ -12,13 +12,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -553,7 +553,7 @@ func TestBeginOutlivesItsCaller(t *testing.T) {
 	h.settle(sb.ID)
 	ctx, cancel := context.WithCancel(bg)
 	defer cancel()
-	e.beginHook = func(_ context.Context, id uuid.UUID, kind OpKind) {
+	e.beginHook = func(_ context.Context, id podid.ID, kind OpKind) {
 		if id == sb.ID && kind == OpPause {
 			cancel()
 		}
@@ -580,7 +580,7 @@ func TestBeginAdoptsALostCommit(t *testing.T) {
 	sb := h.running(512)
 	h.settle(sb.ID)
 	var once sync.Once
-	e.beginTxHook = func(id uuid.UUID, err error) error {
+	e.beginTxHook = func(id podid.ID, err error) error {
 		if id == sb.ID && err == nil {
 			once.Do(func() { err = errors.New("unexpected EOF") })
 		}

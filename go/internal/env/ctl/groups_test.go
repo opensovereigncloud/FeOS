@@ -22,6 +22,7 @@ import (
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -105,7 +106,7 @@ func TestEnvDeletion(t *testing.T) {
 	r1 := h.apply(env.ID, `{"addons":{"cache":{"type":"valkey","version":"8","plan":"dev"}},
 		"services":{"api":{"image":"`+testImage+`","replicas":2}}}`)
 	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
-	var pods []uuid.UUID
+	var pods []podid.ID
 	for _, r := range h.rows(env.ID) {
 		pods = append(pods, r.Sandbox.ID)
 	}
@@ -235,7 +236,7 @@ func TestLogsAndRestart(t *testing.T) {
 	if err := h.c.RunJob(bg, env.ID, "once"); err != nil {
 		t.Fatal(err)
 	}
-	var job uuid.UUID
+	var job podid.ID
 	eventually(t, 30*time.Second, "the job running", func() bool {
 		for _, r := range h.rowsOf(env.ID, spec.KindJob, "once") {
 			if running(r) && h.pod("n1", r.Sandbox.ID) != nil {

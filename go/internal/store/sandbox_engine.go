@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // This file holds the typed queries of the sandbox engine (internal/sandbox)
@@ -20,7 +22,7 @@ import (
 // op, idles at all and was last active more than its idle interval ago
 // (its idle_after_s, else idle; 0 never), and no failed idle pause backs
 // it off. A sandbox that does not exist fails it.
-func (s *Store) IdleRecheck(ctx context.Context, id uuid.UUID, idle time.Duration) (bool, error) {
+func (s *Store) IdleRecheck(ctx context.Context, id podid.ID, idle time.Duration) (bool, error) {
 	var ok bool
 	err := s.q.QueryRow(ctx, `SELECT client_state = 'running' AND op = '' AND `+idleOn(2)+`
 			AND last_active_at < now() - `+idleAfter(2)+` AND `+policyDue(PolicyIdle)+`
@@ -34,7 +36,7 @@ func (s *Store) IdleRecheck(ctx context.Context, id uuid.UUID, idle time.Duratio
 // HibernateAfterRecheck is the recheck of a hibernate-after begin: the
 // sandbox is paused without an op since more than after ago, and no
 // failed hibernate-after backs it off.
-func (s *Store) HibernateAfterRecheck(ctx context.Context, id uuid.UUID, after time.Duration) (bool, error) {
+func (s *Store) HibernateAfterRecheck(ctx context.Context, id podid.ID, after time.Duration) (bool, error) {
 	var ok bool
 	err := s.q.QueryRow(ctx, `SELECT client_state = 'paused' AND op = '' AND paused_at IS NOT NULL
 			AND paused_at < now() - $2::interval AND `+policyDue(PolicyHibernateAfter)+`
@@ -50,7 +52,7 @@ func (s *Store) HibernateAfterRecheck(ctx context.Context, id uuid.UUID, after t
 // sandbox, without an op, is still stuck, creating with its pod PENDING
 // since more than pendingAfter, or running with its guest unreachable
 // since more than unreachableAfter. A sandbox that does not exist fails it.
-func (s *Store) RepairRecheck(ctx context.Context, id uuid.UUID, pendingAfter, unreachableAfter time.Duration) (bool, error) {
+func (s *Store) RepairRecheck(ctx context.Context, id podid.ID, pendingAfter, unreachableAfter time.Duration) (bool, error) {
 	var ok bool
 	err := s.q.QueryRow(ctx, `SELECT op = '' AND coalesce(
 			(client_state = 'creating' AND pending_since < now() - $2::interval)
@@ -66,7 +68,7 @@ func (s *Store) RepairRecheck(ctx context.Context, id uuid.UUID, pendingAfter, u
 // ID, whose deadline is Deadline. The zero OpCursor is the start.
 type OpCursor struct {
 	Deadline time.Time
-	ID       uuid.UUID
+	ID       podid.ID
 }
 
 // Next is the cursor past the last of a page of OpsOf.
@@ -84,7 +86,7 @@ func (s *Store) OpsOf(ctx context.Context, instanceID string, except []uuid.UUID
 	limit int) ([]Sandbox, error) {
 	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxCols+` FROM sandboxes
 		WHERE op_owner = $1 AND op <> '' AND op_id <> ALL($2)
-			AND ($3::timestamptz IS NULL OR (op_deadline, id) > ($3::timestamptz, $4::uuid))
+			AND ($3::timestamptz IS NULL OR (op_deadline, id) > ($3::timestamptz, $4::text))
 		ORDER BY op_deadline, id LIMIT $5`,
 		instanceID, nonNil(except), nullTime(after.Deadline), after.ID, limit))
 }
@@ -115,7 +117,7 @@ func (s *Store) DueTombstone(ctx context.Context, k TombstoneKey) (Tombstone, bo
 // ClearRunIDs ends the open runs of the given sandboxes in the registry
 // (an empty run_id): a write of the run span bookkeeping, no lifecycle
 // write.
-func (s *Store) ClearRunIDs(ctx context.Context, ids []uuid.UUID) error {
+func (s *Store) ClearRunIDs(ctx context.Context, ids []podid.ID) error {
 	if len(ids) == 0 {
 		return nil
 	}

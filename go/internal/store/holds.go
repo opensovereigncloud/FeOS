@@ -8,17 +8,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Hold is a row of sandbox_holds: something that keeps a sandbox awake,
 // across instances.
 type Hold struct {
-	SandboxID  uuid.UUID
+	SandboxID  podid.ID
 	Holder     string // InstanceHolder or ProcessHolder
 	Kind       model.HoldKind
 	InstanceID string    // exec, forward: the instance that renews it
@@ -62,7 +62,7 @@ func (s *Store) upsertHold(ctx context.Context, h Hold, lease time.Duration) err
 // sandbox for lease and sets last_active_at = now(): a hold count going
 // from 0 to 1. The caller locked the row FOR NO KEY UPDATE and checked it
 // runs without an op.
-func (s *Store) AdmitHold(ctx context.Context, id uuid.UUID, kind model.HoldKind, instanceID string, lease time.Duration) error {
+func (s *Store) AdmitHold(ctx context.Context, id podid.ID, kind model.HoldKind, instanceID string, lease time.Duration) error {
 	if err := s.RenewHold(ctx, id, kind, instanceID, lease); err != nil {
 		return err
 	}
@@ -71,7 +71,7 @@ func (s *Store) AdmitHold(ctx context.Context, id uuid.UUID, kind model.HoldKind
 
 // RenewHold rewrites the instance's hold of kind with a lease from now: an
 // upsert, so that it re-inserts a hold the leader already expired.
-func (s *Store) RenewHold(ctx context.Context, id uuid.UUID, kind model.HoldKind, instanceID string, lease time.Duration) error {
+func (s *Store) RenewHold(ctx context.Context, id podid.ID, kind model.HoldKind, instanceID string, lease time.Duration) error {
 	return s.upsertHold(ctx, Hold{SandboxID: id, Holder: InstanceHolder(instanceID, kind), Kind: kind, InstanceID: instanceID}, lease)
 }
 
@@ -79,7 +79,7 @@ func (s *Store) RenewHold(ctx context.Context, id uuid.UUID, kind model.HoldKind
 // = now(): a hold count going from 1 to 0. Run both in one transaction, so
 // that the idle loop never sees the sandbox without its hold and with an
 // old last_active_at.
-func (s *Store) ReleaseHold(ctx context.Context, id uuid.UUID, kind model.HoldKind, instanceID string) error {
+func (s *Store) ReleaseHold(ctx context.Context, id podid.ID, kind model.HoldKind, instanceID string) error {
 	if _, err := s.q.Exec(ctx, "DELETE FROM sandbox_holds WHERE sandbox_id = $1 AND holder = $2",
 		id, InstanceHolder(instanceID, kind)); err != nil {
 		return err
@@ -89,27 +89,27 @@ func (s *Store) ReleaseHold(ctx context.Context, id uuid.UUID, kind model.HoldKi
 
 // HoldProcess writes the hold of a background process: lease from now, or
 // without a limit for lease <= 0 (a process started with timeout 0).
-func (s *Store) HoldProcess(ctx context.Context, id uuid.UUID, processID string, lease time.Duration) error {
+func (s *Store) HoldProcess(ctx context.Context, id podid.ID, processID string, lease time.Duration) error {
 	return s.upsertHold(ctx, Hold{SandboxID: id, Holder: ProcessHolder(processID), Kind: model.HoldProcess}, lease)
 }
 
 // ReleaseProcessHold deletes the hold of a background process. It reports
 // whether there was one.
-func (s *Store) ReleaseProcessHold(ctx context.Context, id uuid.UUID, processID string) (bool, error) {
+func (s *Store) ReleaseProcessHold(ctx context.Context, id podid.ID, processID string) (bool, error) {
 	tag, err := s.q.Exec(ctx, "DELETE FROM sandbox_holds WHERE sandbox_id = $1 AND holder = $2", id, ProcessHolder(processID))
 	return tag.RowsAffected() > 0, err
 }
 
 // DeleteProcessHolds deletes every process hold of a sandbox: a
 // transition that ends its processes. It returns how many.
-func (s *Store) DeleteProcessHolds(ctx context.Context, id uuid.UUID) (int64, error) {
+func (s *Store) DeleteProcessHolds(ctx context.Context, id podid.ID) (int64, error) {
 	tag, err := s.q.Exec(ctx, "DELETE FROM sandbox_holds WHERE sandbox_id = $1 AND kind = 'process'", id)
 	return tag.RowsAffected(), err
 }
 
 // HasLiveHold reports whether the sandbox has a hold whose lease lies
 // ahead, of one of kinds (any kind when none is given).
-func (s *Store) HasLiveHold(ctx context.Context, id uuid.UUID, kinds ...model.HoldKind) (bool, error) {
+func (s *Store) HasLiveHold(ctx context.Context, id podid.ID, kinds ...model.HoldKind) (bool, error) {
 	ks := make([]string, len(kinds))
 	for i, k := range kinds {
 		ks[i] = string(k)
@@ -133,7 +133,7 @@ func scanHold(row pgx.Row) (Hold, error) {
 }
 
 // ListHolds returns a sandbox's holds, live or not, ordered by holder.
-func (s *Store) ListHolds(ctx context.Context, id uuid.UUID) ([]Hold, error) {
+func (s *Store) ListHolds(ctx context.Context, id podid.ID) ([]Hold, error) {
 	rows, err := s.q.Query(ctx, `SELECT sandbox_id, holder, kind, instance_id, lease_until FROM sandbox_holds
 		WHERE sandbox_id = $1 ORDER BY holder`, id)
 	if err != nil {

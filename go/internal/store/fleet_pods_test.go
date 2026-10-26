@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 func TestSandboxesElsewhere(t *testing.T) {
@@ -15,18 +15,19 @@ func TestSandboxesElsewhere(t *testing.T) {
 	mkTenant(t, s, "acme")
 	mkNode(t, s, "n1")
 	mkNode(t, s, "n2")
-	onNode, elsewhere, target, nowhere := mkSandbox(t, s, "acme"), mkSandbox(t, s, "acme"), mkSandbox(t, s, "acme"), mkSandbox(t, s, "acme")
+	onNode, elsewhere, target := mkSandbox(t, s, "acme"), mkSandbox(t, s, "acme"), mkSandbox(t, s, "acme")
+	nowhere := mkSandboxID(t, s, "acme", legacyID()) // a sandbox made before ADR 0019
 	place(t, s, onNode.ID, "n1", "running")
 	place(t, s, elsewhere.ID, "n2", "running")
 	place(t, s, target.ID, "n2", "creating")
 	startOp(t, s, target.ID, "create", "i1", "n1", time.Minute)
-	missing := uuid.New()
+	missing := podid.Mint()
 
-	got, err := s.SandboxesElsewhere(bg, "n1", []uuid.UUID{onNode.ID, elsewhere.ID, target.ID, nowhere.ID, missing})
+	got, err := s.SandboxesElsewhere(bg, "n1", []podid.ID{onNode.ID, elsewhere.ID, target.ID, nowhere.ID, missing})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[uuid.UUID]bool{elsewhere.ID: true, nowhere.ID: true}
+	want := map[podid.ID]bool{elsewhere.ID: true, nowhere.ID: true}
 	if len(got) != len(want) {
 		t.Fatalf("got %v; want %v", got, want)
 	}

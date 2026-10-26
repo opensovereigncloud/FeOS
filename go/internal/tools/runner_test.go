@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -25,6 +24,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
 )
@@ -83,7 +83,7 @@ func TestEnsureSandboxWrapping(t *testing.T) {
 // hibernating is the engine's answer for a sandbox whose hibernation did
 // not end within Ensure's wait: a text of its own that is model.ErrBusy,
 // and a retry after a minute.
-type hibernating struct{ id uuid.UUID }
+type hibernating struct{ id podid.ID }
 
 func (e hibernating) Error() string {
 	return "sandbox " + e.id.String() + " is hibernating; retry in a minute"
@@ -96,8 +96,8 @@ func (e hibernating) RetryAfter() time.Duration { return time.Minute }
 // An op in flight that Ensure does not wait for (a hibernation) is worth
 // a retry, however it is wrapped.
 func TestRetryableBusy(t *testing.T) {
-	for _, err := range []error{model.ErrBusy, hibernating{uuid.New()},
-		fmt.Errorf("ensure sandbox: %w", hibernating{uuid.New()})} {
+	for _, err := range []error{model.ErrBusy, hibernating{podid.Mint()},
+		fmt.Errorf("ensure sandbox: %w", hibernating{podid.Mint()})} {
 		if !Retryable(err) {
 			t.Errorf("%v is not retryable", err)
 		}
@@ -192,7 +192,7 @@ func TestGuestUnreachable(t *testing.T) {
 
 	// A pod whose bring-up waits for the test.
 	up := make(chan struct{})
-	env.Node.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	env.Node.Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		select {
 		case <-up:
 			return nil
@@ -246,7 +246,7 @@ func TestGuestUnreachable(t *testing.T) {
 
 	// A guest that drops a running exec after output: the call is not
 	// made again, and the running pod is reported.
-	env.Node.Script().SetExec(func(ctx context.Context, _ uuid.UUID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	env.Node.Script().SetExec(func(ctx context.Context, _ podid.ID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		_ = out.Stdout([]byte("partial\n"))
 		return 0, true, status.Errorf(codes.Unavailable, "the guest of pod %s: connection reset by peer", sb.ID)
 	})
@@ -266,7 +266,7 @@ func TestGuestUnreachable(t *testing.T) {
 	// fails, and the running pod is reported.
 	other := env.NewSandbox()
 	up = make(chan struct{})
-	env.Node.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	env.Node.Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		select {
 		case <-up:
 			return nil
@@ -304,7 +304,7 @@ func TestGuestUnreachable(t *testing.T) {
 // counts the ones begun on started.
 func blockExec(env *toolstest.Env) (started chan struct{}, release chan struct{}) {
 	started, release = make(chan struct{}, 1000), make(chan struct{})
-	env.Node.Script().SetExec(func(ctx context.Context, _ uuid.UUID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	env.Node.Script().SetExec(func(ctx context.Context, _ podid.ID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		started <- struct{}{}
 		select {
 		case <-release:
@@ -446,7 +446,7 @@ func TestCancellation(t *testing.T) {
 	}
 	waitN(t, started, 2)
 	// Another sandbox's cancel and a malformed payload change nothing.
-	for _, p := range []string{`{"kind":"exec","sandbox":"` + uuid.NewString() + `"}`, `{"kind":"mcp","key":"x"}`, `nonsense`} {
+	for _, p := range []string{`{"kind":"exec","sandbox":"` + podid.Mint().String() + `"}`, `{"kind":"mcp","key":"x"}`, `nonsense`} {
 		if err := db.Notify(bg, env.DB.Pool, db.ChanCancel, p); err != nil {
 			t.Fatal(err)
 		}
@@ -473,7 +473,7 @@ func TestCancellation(t *testing.T) {
 	// A call still waiting for its sandbox is cancelled too.
 	waiting := env.NewSandbox()
 	entered := make(chan struct{}, 1)
-	env.Node.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	env.Node.Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		entered <- struct{}{}
 		<-ctx.Done()
 		return ctx.Err()
@@ -596,7 +596,7 @@ func TestActivityRows(t *testing.T) {
 // pythonRoot makes the node run the process scripts with their records
 // under root, a directory of the test, instead of the container's.
 func pythonRoot(env *toolstest.Env, root string) {
-	env.Node.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	env.Node.Script().SetExec(func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		if len(req.Command) > 2 && req.Command[0] == "python3" {
 			req.Command[2] = strings.ReplaceAll(req.Command[2], processRoot, root)
 		}

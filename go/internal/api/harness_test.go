@@ -26,6 +26,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/tools"
@@ -234,14 +235,10 @@ func decode[T any](t *testing.T, w *httptest.ResponseRecorder) T {
 }
 
 // createSandbox creates a sandbox of the env's tenant over REST and returns
-// its ID and token.
-func (e *env) createSandbox(id string) (string, string) {
+// the ID ferund minted and the token.
+func (e *env) createSandbox() (string, string) {
 	e.t.Helper()
-	body := map[string]any{}
-	if id != "" {
-		body["sandboxId"] = id
-	}
-	w := e.do("POST", "/api/v1/sandboxes", bearerOf(e.tenantToken), body)
+	w := e.do("POST", "/api/v1/sandboxes", bearerOf(e.tenantToken), map[string]any{})
 	expect(e.t, w, http.StatusCreated, "")
 	out := decode[struct {
 		Status struct {
@@ -259,29 +256,29 @@ type fakeEngine struct {
 	mu        sync.Mutex
 	pauseErr  error
 	resumeErr error
-	paused    []uuid.UUID
-	resumed   []uuid.UUID
+	paused    []podid.ID
+	resumed   []podid.ID
 }
 
-func (f *fakeEngine) Ensure(context.Context, uuid.UUID) (model.Lease, error) {
+func (f *fakeEngine) Ensure(context.Context, podid.ID) (model.Lease, error) {
 	return model.Lease{}, nil
 }
 
-func (f *fakeEngine) Pause(_ context.Context, id uuid.UUID) error {
+func (f *fakeEngine) Pause(_ context.Context, id podid.ID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.paused = append(f.paused, id)
 	return f.pauseErr
 }
 
-func (f *fakeEngine) Resume(_ context.Context, id uuid.UUID) error {
+func (f *fakeEngine) Resume(_ context.Context, id podid.ID) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resumed = append(f.resumed, id)
 	return f.resumeErr
 }
 
-func (f *fakeEngine) Delete(ctx context.Context, owner string, id uuid.UUID) (store.Sandbox, bool, error) {
+func (f *fakeEngine) Delete(ctx context.Context, owner string, id podid.ID) (store.Sandbox, bool, error) {
 	var row store.Sandbox
 	err := f.st.InTx(ctx, func(tx *store.Store) error {
 		var err error
@@ -304,7 +301,7 @@ func (f *fakeEngine) DeleteTenant(ctx context.Context, tenant string) (bool, err
 	return true, err
 }
 
-func (f *fakeEngine) Touch(uuid.UUID) {}
+func (f *fakeEngine) Touch(podid.ID) {}
 
 // fakeSandboxes is tools.Sandboxes failing every Acquire with err.
 type fakeSandboxes struct {
@@ -312,7 +309,7 @@ type fakeSandboxes struct {
 	lease model.Lease
 }
 
-func (f *fakeSandboxes) Acquire(_ context.Context, id uuid.UUID, _ model.HoldKind) (model.Lease, func(), error) {
+func (f *fakeSandboxes) Acquire(_ context.Context, id podid.ID, _ model.HoldKind) (model.Lease, func(), error) {
 	if f.err != nil {
 		return model.Lease{}, nil, f.err
 	}
@@ -320,16 +317,16 @@ func (f *fakeSandboxes) Acquire(_ context.Context, id uuid.UUID, _ model.HoldKin
 	l.SandboxID = id
 	return l, func() {}, nil
 }
-func (f *fakeSandboxes) Sync(context.Context, uuid.UUID) error { return nil }
-func (f *fakeSandboxes) WaitRunning(context.Context, uuid.UUID) (model.Lease, error) {
+func (f *fakeSandboxes) Sync(context.Context, podid.ID) error { return nil }
+func (f *fakeSandboxes) WaitRunning(context.Context, podid.ID) (model.Lease, error) {
 	return model.Lease{}, model.ErrNotRunning
 }
-func (f *fakeSandboxes) Unreachable(uuid.UUID) {}
-func (f *fakeSandboxes) Reachable(uuid.UUID)   {}
-func (f *fakeSandboxes) HoldProcess(context.Context, uuid.UUID, string, time.Duration) error {
+func (f *fakeSandboxes) Unreachable(podid.ID) {}
+func (f *fakeSandboxes) Reachable(podid.ID)   {}
+func (f *fakeSandboxes) HoldProcess(context.Context, podid.ID, string, time.Duration) error {
 	return nil
 }
-func (f *fakeSandboxes) ReleaseProcess(context.Context, uuid.UUID, string) error { return nil }
+func (f *fakeSandboxes) ReleaseProcess(context.Context, podid.ID, string) error { return nil }
 
 // fakeConns is nodelink.Conns with settable connections; Conn fails with
 // connErr (Unavailable when nil).

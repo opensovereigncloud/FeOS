@@ -19,6 +19,7 @@ import (
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -40,7 +41,7 @@ func TestAttachedReplacedSandbox(t *testing.T) {
 	// Each pod's process records in a directory of its own, as each
 	// container has its own disk (the test node runs the commands on the
 	// host).
-	n1.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	n1.Script().SetExec(func(_ context.Context, pod podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		if argv := req.Command; len(argv) > 2 && argv[0] == "python3" {
 			argv[2] = strings.ReplaceAll(argv[2], processRoot, filepath.Join(root, pod.String()))
 		}
@@ -49,15 +50,22 @@ func TestAttachedReplacedSandbox(t *testing.T) {
 	app := newGuestApp(t)
 	n1.Script().SetPortAddr(5173, app.srv.Listener.Addr().String())
 
-	id := uuid.New()
-	create := func() {
-		t.Helper()
-		r := c.call(a, "POST", "/api/v1/sandboxes", tenantAuth, `{"sandboxId":"`+id.String()+`","attachable":true}`)
-		if r.code != http.StatusCreated {
-			t.Fatalf("create the workspace sandbox: %d %s", r.code, r.body)
-		}
+	r := c.call(a, "POST", "/api/v1/sandboxes", tenantAuth, `{"attachable":true}`)
+	if r.code != http.StatusCreated {
+		t.Fatalf("create the workspace sandbox: %d %s", r.code, r.body)
 	}
-	create()
+	var created struct {
+		Status struct {
+			SandboxID string `json:"sandboxId"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(r.body), &created); err != nil {
+		t.Fatal(err)
+	}
+	id, err := podid.Parse(created.Status.SandboxID)
+	if err != nil || id.IsLegacy() {
+		t.Fatalf("the workspace sandbox's ID %q: %v", created.Status.SandboxID, err)
+	}
 	env, err := c.st.InsertEnvironment(bg, store.NewEnvironment{ID: uuid.New(), Owner: tenant, Name: "preview"})
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +79,7 @@ func TestAttachedReplacedSandbox(t *testing.T) {
 		t.Fatalf("attached %+v %v", first, err)
 	}
 
-	r := c.call(a, "POST", "/api/v1/environments/preview/route-tokens", tenantAuth, "")
+	r = c.call(a, "POST", "/api/v1/environments/preview/route-tokens", tenantAuth, "")
 	var tok struct {
 		Token string `json:"token"`
 	}
@@ -98,11 +106,12 @@ func TestAttachedReplacedSandbox(t *testing.T) {
 		t.Fatalf("the route door: %d %q", code, body)
 	}
 
-	// Lost and replaced under the same ID.
+	// Lost and replaced under the same ID (no client can since ADR 0019;
+	// a lost sandbox comes back as a new incarnation under its ID too).
 	if r := c.call(a, "DELETE", "/api/v1/sandboxes/"+id.String(), tenantAuth, ""); r.code != http.StatusOK {
 		t.Fatalf("delete: %d %s", r.code, r.body)
 	}
-	create()
+	c.createID(id, true)
 	again := c.row(id)
 	if again.Incarnation == first.SandboxIncarnation {
 		t.Fatal("the same incarnation")

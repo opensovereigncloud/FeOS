@@ -195,7 +195,6 @@ export function Sandboxes({ tenant, sel, tab, navigate }) {
 // view's), as they name the bounds ferund accepts.
 export function CreatePanel({ act, busy, defaults, onDone, onCancel }) {
   const hints = createHints(fleetDefaults(defaults));
-  const [newId, setNewId] = useState('');
   const [newImage, setNewImage] = useState('');
   const [vcpus, setVcpus] = useState('');
   const [memMiB, setMemMiB] = useState('');
@@ -203,15 +202,13 @@ export function CreatePanel({ act, busy, defaults, onDone, onCancel }) {
     <form className="createpanel" onSubmit={(e) => {
       e.preventDefault();
       act('create', async () => {
-        const res = await api.createSandbox(newId.trim(), newImage.trim(), Number(vcpus) || 0, Number(memMiB) || 0);
-        setNewId(''); setNewImage(''); setVcpus(''); setMemMiB('');
+        const res = await api.createSandbox(newImage.trim(), Number(vcpus) || 0, Number(memMiB) || 0);
+        setNewImage(''); setVcpus(''); setMemMiB('');
         if (res.token) onDone({ token: res.token, sandboxId: res.status?.sandboxId });
       });
     }}>
-      <input placeholder="sandbox ID (a UUID; empty: ferund makes one)" value={newId}
-        onChange={(e) => setNewId(e.target.value)} autoFocus />
       <input placeholder={hints.image} title={hints.image} value={newImage}
-        onChange={(e) => setNewImage(e.target.value)} />
+        onChange={(e) => setNewImage(e.target.value)} autoFocus />
       <input className="num" type="number" min={hints.vcpus.min} max={hints.vcpus.max} placeholder={hints.vcpus.placeholder}
         value={vcpus} onChange={(e) => setVcpus(e.target.value)} title={hints.vcpus.title} />
       <input className="num" type="number" min={hints.memory.min} max={hints.memory.max} step="256"

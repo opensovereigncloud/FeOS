@@ -13,7 +13,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/google/uuid"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The SPIFFE layout (provisional; ADR 0014 leaves it open): a node is
@@ -33,7 +33,7 @@ func NodeID(td, name string) string {
 }
 
 // SandboxID is the SPIFFE ID of a sandbox's pod.
-func SandboxID(td, tenant string, id uuid.UUID) string {
+func SandboxID(td, tenant string, id podid.ID) string {
 	return spiffeScheme + td + "/tenant/" + tenant + "/sandbox/" + id.String()
 }
 

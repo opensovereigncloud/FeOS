@@ -15,6 +15,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -30,7 +31,7 @@ func mkEnv(t *testing.T, s *store.Store, owner, name string) store.Environment {
 
 func mkInstance(t *testing.T, s *store.Store, env store.Environment, mod ...func(*store.NewSandbox)) store.Sandbox {
 	t.Helper()
-	n := store.NewSandbox{ID: uuid.New(), Owner: env.Owner, Image: "alpine", VCPUs: 1, MemoryMiB: 256, EnvironmentID: env.ID,
+	n := store.NewSandbox{ID: podid.Mint(), Owner: env.Owner, Image: "alpine", VCPUs: 1, MemoryMiB: 256, EnvironmentID: env.ID,
 		PodTemplate: &model.PodTemplate{SecurityGroups: []string{model.EnvGroupID(env.ID)}}}
 	for _, m := range mod {
 		m(&n)
@@ -214,33 +215,33 @@ func TestIdleAfterPerRow(t *testing.T) {
 	never := mkInstance(t, s, env, func(n *store.NewSandbox) { n.IdleAfterS = &zero })
 	short := mkInstance(t, s, env, func(n *store.NewSandbox) { n.IdleAfterS = &minute })
 	global := mkSandbox(t, s, "acme")
-	for _, id := range []uuid.UUID{never.ID, short.ID, global.ID} {
+	for _, id := range []podid.ID{never.ID, short.ID, global.ID} {
 		place(t, s, id, "n1", model.StateRunning)
 		exec(t, s, "UPDATE sandboxes SET last_active_at = now() - interval '10 minutes' WHERE id = $1", id)
 	}
-	ids := func(idle time.Duration) []uuid.UUID {
+	ids := func(idle time.Duration) []podid.ID {
 		t.Helper()
 		rows, err := s.IdleSandboxes(bg, idle, []string{"n1"}, 10)
 		must(t, err)
-		var out []uuid.UUID
+		var out []podid.ID
 		for _, r := range rows {
 			out = append(out, r.ID)
 		}
 		return out
 	}
-	recheck := func(id uuid.UUID, idle time.Duration) bool {
+	recheck := func(id podid.ID, idle time.Duration) bool {
 		t.Helper()
 		ok, err := s.IdleRecheck(bg, id, idle)
 		must(t, err)
 		return ok
 	}
 	// Global off: only the row with its own minute.
-	if got := ids(0); !slices.Equal(got, []uuid.UUID{short.ID}) {
+	if got := ids(0); !slices.Equal(got, []podid.ID{short.ID}) {
 		t.Fatalf("global 0: %v", got)
 	}
 	// Global an hour: still only the minute row; at 5 minutes the global
 	// row too; never the 0 row.
-	if got := ids(time.Hour); !slices.Equal(got, []uuid.UUID{short.ID}) {
+	if got := ids(time.Hour); !slices.Equal(got, []podid.ID{short.ID}) {
 		t.Fatalf("global 1h: %v", got)
 	}
 	if got := ids(5 * time.Minute); len(got) != 2 || slices.Contains(got, never.ID) {
@@ -549,7 +550,7 @@ func TestEnvInstancesAndJobRuns(t *testing.T) {
 		TemplateHash: "h1", Release: 3}); !errors.Is(err, store.ErrExists) {
 		t.Fatalf("instance twice: %v", err)
 	}
-	if _, err := s.InsertEnvInstance(bg, store.EnvInstance{SandboxID: uuid.New(), EnvID: e.ID, Kind: "service", Object: "web",
+	if _, err := s.InsertEnvInstance(bg, store.EnvInstance{SandboxID: podid.Mint(), EnvID: e.ID, Kind: "service", Object: "web",
 		TemplateHash: "h1", Release: 3}); !errors.Is(err, store.ErrNoRow) {
 		t.Fatalf("instance of no row: %v", err)
 	}
@@ -603,9 +604,9 @@ func TestEnvInstancesAndJobRuns(t *testing.T) {
 	zero := 0
 	afterRun := run
 	afterRun.Phase, afterRun.ExitCode, afterRun.LogTail, afterRun.FinishedAt = model.RunSucceeded, &zero, []string{"a", "b"}, now
-	afterRun.SandboxID = uuid.Nil
+	afterRun.SandboxID = ""
 	if run, err = s.UpdateJobRun(bg, run, afterRun); err != nil || run.Phase != model.RunSucceeded || *run.ExitCode != 0 ||
-		!slices.Equal(run.LogTail, []string{"a", "b"}) || run.SandboxID != uuid.Nil {
+		!slices.Equal(run.LogTail, []string{"a", "b"}) || !run.SandboxID.IsZero() {
 		t.Fatalf("finished %+v %v", run, err)
 	}
 	if ok, err := s.JobSucceeded(bg, e.ID, "migrate", "j1"); err != nil || !ok {
@@ -679,13 +680,13 @@ func TestEnvAttachedVolumesIncidents(t *testing.T) {
 	// Volumes.
 	vid := uuid.New()
 	v, err := s.InsertEnvVolume(bg, store.EnvVolume{EnvID: e.ID, Object: "addon/pg", VolumeID: vid, SizeMiB: 1024})
-	if err != nil || v.Provisioned || v.Node != "" || v.Holder != uuid.Nil {
+	if err != nil || v.Provisioned || v.Node != "" || !v.Holder.IsZero() {
 		t.Fatalf("volume %+v %v", v, err)
 	}
 	if _, err := s.InsertEnvVolume(bg, store.EnvVolume{EnvID: e.ID, Object: "addon/other", VolumeID: vid, SizeMiB: 1}); !errors.Is(err, store.ErrExists) {
 		t.Fatalf("volume id taken: %v", err)
 	}
-	holder := uuid.New()
+	holder := podid.Mint()
 	afterV := v
 	afterV.Node, afterV.Provisioned, afterV.Holder = "n1", true, holder
 	if v, err = s.UpdateEnvVolume(bg, v, afterV); err != nil || v.Node != "n1" || !v.Provisioned || v.Holder != holder {

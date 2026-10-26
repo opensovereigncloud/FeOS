@@ -21,6 +21,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -341,7 +342,7 @@ func (c *Controller) newAddon(ctx context.Context, s *stepState, p *addonPlan, v
 	}
 	pin := ""
 	if vol != nil {
-		if vol.Holder != uuid.Nil {
+		if !vol.Holder.IsZero() {
 			if held, err := c.stillHolds(ctx, vol.Holder); err != nil || held {
 				s.wait(p.object(), "addon %s: its old pod still holds its volume", p.name)
 				return
@@ -370,7 +371,7 @@ func (c *Controller) newAddon(ctx context.Context, s *stepState, p *addonPlan, v
 
 // stillHolds reports whether a row, or a tombstone of its pod, is left:
 // its pod may still hold a volume.
-func (c *Controller) stillHolds(ctx context.Context, id uuid.UUID) (bool, error) {
+func (c *Controller) stillHolds(ctx context.Context, id podid.ID) (bool, error) {
 	_, err := c.st.GetSandbox(ctx, id)
 	switch {
 	case err == nil:
@@ -549,7 +550,7 @@ var errNotLost = errors.New("no longer lost as read")
 // volume is (not provisioned anywhere yet, or on the node with no pod or
 // this pod, AVAILABLE or CHECKPOINTED); else why not ("" when the node
 // still has the pod: Ensure syncs it back, it is not replaced).
-func (c *Controller) lostPodFree(ctx context.Context, node string, pod uuid.UUID, vol store.EnvVolume) (bool, string, error) {
+func (c *Controller) lostPodFree(ctx context.Context, node string, pod podid.ID, vol store.EnvVolume) (bool, string, error) {
 	_, err := c.getPod(ctx, node, pod)
 	switch {
 	case err == nil:
@@ -607,7 +608,7 @@ func (c *Controller) moveVolume(ctx context.Context, v *view, vol store.EnvVolum
 }
 
 // provisionKey is the pool's key of an instance's provisioning.
-func provisionKey(id uuid.UUID) string { return "provision/" + id.String() }
+func provisionKey(id podid.ID) string { return "provision/" + id.String() }
 
 // provision runs an addon's provisioning steps in its container, off the
 // loop: hold-free, the env carrying its credentials; on success the steps'
@@ -654,7 +655,7 @@ func (c *Controller) provision(ctx context.Context, v *view, p *addonPlan, r sto
 
 // provisionDone stores a provisioning's outcome: the steps' hash, or why
 // it failed.
-func (c *Controller) provisionDone(ctx context.Context, id uuid.UUID, hash, detail string) {
+func (c *Controller) provisionDone(ctx context.Context, id podid.ID, hash, detail string) {
 	c.mu.Lock()
 	if hash == "" {
 		c.provisionFailed[id] = c.dbNow(ctx)
@@ -683,7 +684,7 @@ func (c *Controller) provisionDone(ctx context.Context, id uuid.UUID, hash, deta
 }
 
 // setDetail writes an instance's detail.
-func (c *Controller) setDetail(ctx context.Context, id uuid.UUID, detail string) {
+func (c *Controller) setDetail(ctx context.Context, id podid.ID, detail string) {
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		inst, err := tx.LockEnvInstance(ctx, id, store.ForUpdate)
 		if err != nil {

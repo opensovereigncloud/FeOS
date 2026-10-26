@@ -256,7 +256,7 @@ func eventOfActivity(a store.ActivityRow) activityEvent {
 		v := i64(*a.DurationNs)
 		ev.DurationNs = &v
 	}
-	if a.PodID != uuid.Nil {
+	if !a.PodID.IsZero() {
 		ev.PodID = a.PodID.String()
 	}
 	if a.StartID != uuid.Nil && a.Node != "" {
@@ -276,7 +276,7 @@ func eventOfTraffic(t store.TrafficRow) activityEvent {
 	if len(t.Detail) > 0 && json.Valid(t.Detail) {
 		ev.DetailJSON = string(t.Detail)
 	}
-	if t.PodID != uuid.Nil {
+	if !t.PodID.IsZero() {
 		ev.PodID = t.PodID.String()
 	}
 	return ev

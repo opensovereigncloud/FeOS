@@ -12,8 +12,10 @@ import (
 
 	"github.com/google/uuid"
 
+	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -42,7 +44,7 @@ func TestGates(t *testing.T) {
 		{"not connected", func(g *gateInput) { g.connected = false }, "not connected to this instance"},
 		{"tombstone", func(g *gateInput) { g.tombstoned = true }, "deleting an earlier pod of this ID"},
 		{"avoided", func(g *gateInput) { g.avoid = []string{"x", "n"} }, "a create failed here"},
-		{"tap", func(g *gateInput) { g.tap = uuid.MustParse("11111111-0000-4000-8000-000000000000") },
+		{"tap", func(g *gateInput) { g.tap = "11111111-0000-4000-8000-000000000000" },
 			"TAP prefix taken by sandbox 11111111-0000-4000-8000-000000000000"},
 		{"store elsewhere", func(g *gateInput) { g.restore, g.checkpointStore = true, "s2" }, "another object store"},
 		{"store same", func(g *gateInput) { g.restore, g.checkpointStore = true, "s1" }, ""},
@@ -81,7 +83,7 @@ func TestGates(t *testing.T) {
 	// Admission on a pinned node looks at no tombstone, TAP or live
 	// figure.
 	in = readyNode("n")
-	in.tombstoned, in.tap, in.telemetry = true, uuid.New(), store.Telemetry{}
+	in.tombstoned, in.tap, in.telemetry = true, legacyID(), store.Telemetry{}
 	if r := in.check(admitGates); r != nil {
 		t.Fatalf("admission refused %+v", r)
 	}
@@ -147,9 +149,12 @@ func TestPlacementGatesIntegrated(t *testing.T) {
 		t.Fatalf("tombstone-only nodes %v", p.tombstoneOnly)
 	}
 
-	// A TAP prefix another sandbox holds on a node.
-	a := h.running(512)
-	twin := uuid.MustParse(a.ID.String()[:8] + "-0000-4000-8000-000000000001")
+	// A TAP prefix another sandbox holds on a node: both have UUIDs (made
+	// before ADR 0019), which share it.
+	a := h.sandboxWithID(legacyID(), 512)
+	h.ensure(a.ID)
+	a = h.row(a.ID)
+	twin := podid.ID(a.ID.String()[:8] + "-0000-4000-8000-000000000001")
 	if twin != a.ID {
 		b := h.sandboxWithID(twin, 512)
 		p, err := e.place(bg, b, OpCreate)
@@ -183,6 +188,42 @@ func TestPlacementGatesIntegrated(t *testing.T) {
 		if v.Node != c.Node && v.Reason != "another object store" {
 			t.Fatalf("verdict %+v", v)
 		}
+	}
+}
+
+// TestShortIDsShareNoTAP: a short ID names its TAP device whole (ADR
+// 0019), so the TAP gate refuses none, also not beside a UUID whose first
+// 8 hex digits begin the short ID; two UUIDs that share them still do.
+func TestShortIDsShareNoTAP(t *testing.T) {
+	h := newHarness(t)
+	h.addNode("n1")
+	e := h.eng()
+	legacy := h.sandboxWithID("abcdef12-0000-4000-8000-000000000000", 512)
+	h.ensure(legacy.ID)
+	for _, id := range []podid.ID{"abcdef12xyz", "abcdef12xyy", podid.Mint()} {
+		sb := h.sandboxWithID(id, 512)
+		p, err := e.place(bg, sb, OpCreate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(p.candidates) != 1 || p.candidates[0] != "n1" {
+			t.Fatalf("%s: candidates %v (%+v)", id, p.candidates, p.verdicts)
+		}
+		if lease := h.ensure(sb.ID); lease.Node != "n1" {
+			t.Fatalf("%s placed on %s", id, lease.Node)
+		}
+		h.podState("n1", id, podv1.PodState_POD_STATE_RUNNING)
+	}
+	h.podState("n1", legacy.ID, podv1.PodState_POD_STATE_RUNNING)
+	// A second UUID with the legacy one's first 8 hex digits finds no node.
+	twin := h.sandboxWithID("abcdef12-0000-4000-8000-000000000001", 512)
+	p, err := e.place(bg, twin, OpCreate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.candidates) != 0 || p.noCapacity() !=
+		"no capacity (retryable): no feasible node; n1: TAP prefix taken by sandbox "+legacy.ID.String() {
+		t.Fatalf("twin placement %+v: %s", p, p.noCapacity())
 	}
 }
 

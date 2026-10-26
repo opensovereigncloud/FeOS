@@ -16,6 +16,7 @@ import (
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -48,7 +49,7 @@ func (c *cluster) downFor(name string) time.Duration {
 
 // waitGone waits, waking the leader's loops, until every sandbox of ids
 // has left its node: lost, or hibernated when it has a checkpoint.
-func (c *cluster) waitGone(within time.Duration, ids ...uuid.UUID) {
+func (c *cluster) waitGone(within time.Duration, ids ...podid.ID) {
 	c.t.Helper()
 	eventually(c.t, within, "the sandboxes past the lost grace", func() bool {
 		c.wake("sandbox-down-sweep", "sandbox-lost-grace")
@@ -92,7 +93,7 @@ func TestNodeCrash(t *testing.T) {
 	}
 	s2 := c.create(nil)
 	c.run(nil, s2, "true")
-	for _, id := range []uuid.UUID{s1.id, s2.id} {
+	for _, id := range []podid.ID{s1.id, s2.id} {
 		if row := c.row(id); row.Node != "n1" || row.ClientState != model.StateRunning {
 			t.Fatalf("row %+v", row)
 		}
@@ -105,14 +106,14 @@ func TestNodeCrash(t *testing.T) {
 	// lost or hibernated only once the lost grace has passed since the
 	// node went down. The lost grace loop is woken only once both were
 	// seen unknown.
-	unknown := map[uuid.UUID]bool{}
+	unknown := map[podid.ID]bool{}
 	eventually(t, 90*time.Second, "the sandboxes unknown, then past the lost grace", func() bool {
 		c.wake("sandbox-down-sweep")
 		if len(unknown) == 2 {
 			c.wake("sandbox-lost-grace")
 		}
 		done := true
-		for _, id := range []uuid.UUID{s1.id, s2.id} {
+		for _, id := range []podid.ID{s1.id, s2.id} {
 			row := c.row(id)
 			switch {
 			case row.Op != "":
@@ -144,7 +145,7 @@ func TestNodeCrash(t *testing.T) {
 	if r2.ClientState != model.StateLost || r2.LostFrom != "n1" {
 		t.Errorf("the sandbox without one %+v", r2)
 	}
-	if n := c.count("SELECT count(*) FROM bookings WHERE pod_id = ANY($1)", []uuid.UUID{s1.id, s2.id}); n != 0 {
+	if n := c.count("SELECT count(*) FROM bookings WHERE pod_id = ANY($1)", []podid.ID{s1.id, s2.id}); n != 0 {
 		t.Errorf("%d bookings left on the crashed node", n)
 	}
 	if out := c.run(nil, s1, "cat keep"); out != "data\n" {
@@ -245,7 +246,8 @@ func (c *cluster) checkRecreated(n *node, sb sandbox, old uuid.UUID) {
 }
 
 // Scenario 7: a sandbox lost with its partitioned node is deleted and
-// created again with the same ID while the node returns: the new sandbox
+// created again with the same ID (as no client can since ADR 0019, but a
+// drawn ID may be one used before) while the node returns: the new sandbox
 // never gets the old disk, and the tombstone of the old pod never deletes
 // the new one.
 func TestLostDeleteRecreate(t *testing.T) {
@@ -271,7 +273,7 @@ func TestLostDeleteRecreate(t *testing.T) {
 	}
 
 	n1.Partition(false)
-	again := c.createID(nil, sb.id)
+	again := c.createID(sb.id, false)
 	if out := c.retryRun(again, "cat marker 2>/dev/null || echo none", 90*time.Second); out != "none\n" {
 		t.Fatalf("the new sandbox sees %q", out)
 	}
@@ -291,9 +293,61 @@ func TestDeleteRecreateSingleNode(t *testing.T) {
 	if r := c.call(nil, "DELETE", sb.path(""), tenantAuth, ""); r.code != http.StatusOK {
 		t.Fatalf("delete: %d %s", r.code, r.body)
 	}
-	again := c.createID(nil, sb.id)
+	again := c.createID(sb.id, false)
 	if out := c.run(nil, again, "cat marker 2>/dev/null || echo none"); out != "none\n" {
 		t.Fatalf("the new sandbox sees %q", out)
 	}
 	c.checkRecreated(n1, again, old)
+}
+
+// ADR 0019: a sandbox made before with a UUID keeps working beside the
+// short IDs, and only UUIDs share a TAP device's name: a second UUID with
+// the same first 8 hex digits finds no room on the only node, a short ID
+// that begins with the same 8 characters does.
+func TestLegacyUUIDSandboxes(t *testing.T) {
+	t.Parallel()
+	c := newCluster(t, nil)
+	c.start("a")
+	n1 := c.join("n1")
+	legacy := c.createID(podid.ID("abcdef12-0000-4000-8000-"+uuid.NewString()[24:]), false)
+	short := c.createID("abcdef12xyz", false)
+	minted := c.create(nil)
+	for _, sb := range []sandbox{legacy, short, minted} {
+		if out := c.run(nil, sb, "echo hi"); out != "hi\n" {
+			t.Fatalf("exec in %s: %q", sb.id, out)
+		}
+		if p, ok := n1.pod(sb.id); !ok || p.GetState() != podv1.PodState_POD_STATE_RUNNING {
+			t.Fatalf("the pod of %s: %v %v", sb.id, p, ok)
+		}
+		if r := c.call(nil, "GET", sb.path(""), tenantAuth, ""); r.code != http.StatusOK ||
+			!strings.Contains(r.body, `"sandboxId":"`+sb.id.String()+`"`) {
+			t.Fatalf("GET %s: %d %s", sb.id, r.code, r.body)
+		}
+	}
+	// An uppercase UUID in the path names the same sandbox.
+	if r := c.call(nil, "GET", "/api/v1/sandboxes/"+strings.ToUpper(legacy.id.String()), tenantAuth, ""); r.code != http.StatusOK {
+		t.Fatalf("GET of the uppercase UUID: %d %s", r.code, r.body)
+	}
+	twin := c.createID(podid.ID("abcdef12-1111-4000-8000-"+uuid.NewString()[24:]), false)
+	ctx, cancel := context.WithTimeout(bg, time.Minute)
+	defer cancel()
+	r, err := c.execErr(ctx, nil, twin, "true")
+	if err != nil || r.code != http.StatusBadGateway || !strings.Contains(r.body, "no capacity") {
+		t.Fatalf("the UUID twin: %v %d %s", err, r.code, r.body)
+	}
+	if row := c.row(twin.id); row.Node != "" {
+		t.Fatalf("the UUID twin was placed: %+v", row)
+	}
+	// Deleted, the legacy sandbox frees the name.
+	if r := c.call(nil, "DELETE", legacy.path(""), tenantAuth, ""); r.code != http.StatusOK {
+		t.Fatalf("delete: %d %s", r.code, r.body)
+	}
+	eventually(t, 60*time.Second, "the legacy pod deleted", func() bool {
+		c.wake("sandbox-tombstones")
+		_, ok := n1.pod(legacy.id)
+		return !ok && c.count("SELECT count(*) FROM pod_tombstones WHERE pod_id = $1", legacy.id) == 0
+	})
+	if out := c.retryRun(twin, "echo twin", 90*time.Second); out != "twin\n" {
+		t.Fatalf("the UUID twin after the delete: %q", out)
+	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -175,8 +176,8 @@ func (s *Service) loadContext(ctx context.Context, tenant string, env *store.Env
 		if svc.Runtime != spec.RuntimeAttached {
 			continue
 		}
-		id, ok := parseUUID(svc.Sandbox)
-		if !ok || vc.sandboxes[id.String()].ID != "" {
+		id, err := podid.Parse(svc.Sandbox)
+		if err != nil || vc.sandboxes[id.String()].ID != "" {
 			continue
 		}
 		sb, err := s.st.GetSandbox(ctx, id)

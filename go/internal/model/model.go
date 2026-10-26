@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package model holds the value types and sentinel errors that several of
-// ferund's packages share. It depends on nothing of ferund, so that every
-// package can name them without importing another's implementation.
+// ferund's packages share. It depends on nothing of ferund but podid, the
+// IDs of pods, so that every package can name them without importing
+// another's implementation.
 package model
 
 import (
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // HoldKind is what keeps a sandbox awake (the sandbox_holds.kind column).
@@ -31,8 +34,9 @@ const (
 // Lease names a running sandbox that a caller holds: the node its pod runs
 // on and the incarnation of that pod.
 type Lease struct {
-	SandboxID, Incarnation uuid.UUID
-	Node                   string
+	SandboxID   podid.ID
+	Incarnation uuid.UUID
+	Node        string
 }
 
 // Loop is a job the leader runs on its interval and when woken. Run is

@@ -6,8 +6,9 @@ package store
 import (
 	"context"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // The audit records of a pod's feos-authn that the access route reads
@@ -49,7 +50,7 @@ type BindingDeny struct {
 // authn rows name (bindings never used do not appear) and the newest
 // denyLimit denies, newest first. Foreign records carry no sandbox and
 // never count.
-func (s *Store) BindingUsage(ctx context.Context, sandboxID uuid.UUID, denyLimit int) ([]BindingUse, []BindingDeny, error) {
+func (s *Store) BindingUsage(ctx context.Context, sandboxID podid.ID, denyLimit int) ([]BindingUse, []BindingDeny, error) {
 	rows, err := s.q.Query(ctx, `SELECT DISTINCT ON (kind, binding) kind, binding, uses, errors, ts_ns, name FROM (
 			SELECT kind, coalesce(detail->>'binding', '') AS binding, ts_ns, name, id,
 				count(*) OVER w AS uses,

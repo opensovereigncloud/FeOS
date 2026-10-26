@@ -6,24 +6,25 @@ package store
 import (
 	"context"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // SandboxesElsewhere returns those of ids whose sandbox row exists but
 // names neither node as its node nor as its op's target: pods a node
 // reported in its events that the registry places on another node, or on
 // none. Fleet requests a reconcile of the reporting node for them (§8).
-func (s *Store) SandboxesElsewhere(ctx context.Context, node string, ids []uuid.UUID) ([]uuid.UUID, error) {
+func (s *Store) SandboxesElsewhere(ctx context.Context, node string, ids []podid.ID) ([]podid.ID, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	rows, err := s.q.Query(ctx, `SELECT id FROM sandboxes WHERE id = ANY($1::uuid[])
+	rows, err := s.q.Query(ctx, `SELECT id FROM sandboxes WHERE id = ANY($1::text[])
 		AND node IS DISTINCT FROM $2 AND op_target <> $2 ORDER BY id`, ids, node)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	return pgx.CollectRows(rows, pgx.RowTo[podid.ID])
 }
 
 // podCredentialsLock is the first key of the advisory locks that
@@ -38,7 +39,7 @@ const podCredentialsLock int32 = 0x46455243
 // exceed the limit. It takes a transaction-scoped advisory lock instead of
 // a stronger lock on the sandbox row, which the request only reads FOR
 // SHARE, so that it never holds up the row's other readers.
-func (s *Store) LockPodCredentials(ctx context.Context, podID uuid.UUID) error {
-	_, err := s.q.Exec(ctx, "SELECT pg_advisory_xact_lock($1, hashtext($2::uuid::text))", podCredentialsLock, podID)
+func (s *Store) LockPodCredentials(ctx context.Context, podID podid.ID) error {
+	_, err := s.q.Exec(ctx, "SELECT pg_advisory_xact_lock($1, hashtext($2::text))", podCredentialsLock, podID)
 	return err
 }

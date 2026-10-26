@@ -20,13 +20,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
 )
@@ -48,7 +48,7 @@ func restMux(h *REST, sb auth.Sandbox) http.Handler {
 	mux.HandleFunc("GET "+p+"/processes/{pid}/logs", h.ProcessLogs)
 	mux.HandleFunc("DELETE "+p+"/processes/{pid}", h.StopProcess)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if sb.ID != uuid.Nil {
+		if !sb.ID.IsZero() {
 			r = r.WithContext(auth.WithSandbox(r.Context(), sb))
 		}
 		mux.ServeHTTP(w, r)
@@ -133,7 +133,7 @@ func TestRESTRoutes(t *testing.T) {
 
 	// Tools that ran: 200, whatever their exit code.
 	var seen []proto.Message
-	env.Node.Script().SetTool(func(_ context.Context, _ uuid.UUID, method string, req proto.Message) (proto.Message, bool, error) {
+	env.Node.Script().SetTool(func(_ context.Context, _ podid.ID, method string, req proto.Message) (proto.Message, bool, error) {
 		seen = append(seen, req)
 		switch method {
 		case toolv1.ToolService_Rg_FullMethodName:
@@ -352,7 +352,7 @@ func TestRESTWriteBytes(t *testing.T) {
 	base := "/api/v1/sandboxes/" + sb.ID.String()
 	var mu sync.Mutex
 	var got [][]byte
-	env.Node.Script().SetTool(func(_ context.Context, _ uuid.UUID, _ string, req proto.Message) (proto.Message, bool, error) {
+	env.Node.Script().SetTool(func(_ context.Context, _ podid.ID, _ string, req proto.Message) (proto.Message, bool, error) {
 		if w, ok := req.(*toolv1.WriteRequest); ok {
 			mu.Lock()
 			got = append(got, w.GetContent())
@@ -405,7 +405,7 @@ func TestRESTGuestLimit(t *testing.T) {
 	base := "/api/v1/sandboxes/" + sb.ID.String()
 	var mu sync.Mutex
 	var sizes []int
-	env.Node.Script().SetTool(func(_ context.Context, _ uuid.UUID, _ string, req proto.Message) (proto.Message, bool, error) {
+	env.Node.Script().SetTool(func(_ context.Context, _ podid.ID, _ string, req proto.Message) (proto.Message, bool, error) {
 		mu.Lock()
 		sizes = append(sizes, proto.Size(req))
 		mu.Unlock()

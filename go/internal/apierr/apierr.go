@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+// MsgSandboxID is the message of a 400 for a sandbox ID that is neither
+// a short ID nor a UUID (ADR 0019), in a path, a body or a query.
+const MsgSandboxID = "sandboxId must be a sandbox ID: 11 characters of lowercase Crockford base32, " +
+	"the first a letter, or a UUID"
+
 // Error is an error the API answers with its own status and body
 // {"error": Msg, "code": Code}; Code is left out when empty.
 type Error struct {

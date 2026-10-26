@@ -24,6 +24,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/ctl"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -81,7 +82,7 @@ func nodeTable(n *node, id string) *networkv1.NameTable {
 
 // resolves reports whether the pod resolves name on its test node, as
 // feosd's resolver would, to exactly addrs (none: not a name of the pod's).
-func resolves(n *node, pod uuid.UUID, name string, addrs ...string) bool {
+func resolves(n *node, pod podid.ID, name string, addrs ...string) bool {
 	got, ok := n.Resolve(pod, name)
 	return ok == (len(addrs) > 0) && slices.Equal(got, addrs)
 }
@@ -116,7 +117,7 @@ func TestEnvironments(t *testing.T) {
 	// The process scripts' records go to a directory of the test, and an
 	// attached service's working directory beneath the pod's directory:
 	// the test node runs the commands on the host.
-	n1.Script().SetExec(func(_ context.Context, pod uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	n1.Script().SetExec(func(_ context.Context, pod podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		if argv := req.Command; len(argv) > 2 && argv[0] == "python3" {
 			start := strings.Contains(argv[2], "no such working directory")
 			argv[2] = strings.ReplaceAll(argv[2], processRoot, root)
@@ -141,7 +142,7 @@ func TestEnvironments(t *testing.T) {
 	if err := json.Unmarshal([]byte(r.body), &created); err != nil || !created.Status.Attachable {
 		t.Fatalf("create: %s (%v)", r.body, err)
 	}
-	sb := sandbox{id: uuid.MustParse(created.Status.SandboxID), token: created.Token}
+	sb := sandbox{id: podid.ID(created.Status.SandboxID), token: created.Token}
 	c.run(a, sb, "mkdir -p app")
 	if g := nodeGroup(n1, model.SandboxGroupID(sb.id)); g == nil {
 		t.Fatal("the attachable sandbox runs without its group on the node")

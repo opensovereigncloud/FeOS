@@ -22,6 +22,7 @@ import (
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // Defaults of what a test node reports of itself.
@@ -478,9 +479,9 @@ func (n *Node) Script() *Script { return n.script }
 
 // PodDir is the directory of the pod's fake guest: where its commands run
 // and what its tools see as every container's root.
-func (n *Node) PodDir(pod uuid.UUID) string { return n.podDir(pod) }
+func (n *Node) PodDir(pod podid.ID) string { return n.podDir(pod) }
 
-func (n *Node) podDir(pod uuid.UUID) string { return filepath.Join(n.podsDir, pod.String()) }
+func (n *Node) podDir(pod podid.ID) string { return filepath.Join(n.podsDir, pod.String()) }
 
 // Name is the node's name once it joined, or took its identity; "" before.
 func (n *Node) Name() string {

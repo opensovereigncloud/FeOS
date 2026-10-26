@@ -16,6 +16,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -170,7 +171,7 @@ func (c *Controller) stepRuns(ctx context.Context, s *stepState) {
 		s.wait("", "job runs: %v", err)
 		return
 	}
-	rows := map[uuid.UUID]store.EnvInstanceRow{}
+	rows := map[podid.ID]store.EnvInstanceRow{}
 	for _, r := range v.rows {
 		if r.Instance.Kind == spec.KindJob {
 			rows[r.Sandbox.ID] = r

@@ -22,6 +22,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/addons"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
@@ -107,17 +108,24 @@ func TestGroupRules(t *testing.T) {
 			t.Errorf("an sbx group lets in %v", r)
 		}
 	}
-	if len(env) != 40 || len(model.SandboxGroupID(uuid.New())) != 40 {
-		t.Error("group IDs are not 40 characters")
+	short := podid.Mint()
+	legacy := podid.ID(uuid.NewString())
+	if len(env) != 40 || len(model.SandboxGroupID(short)) != 15 || len(model.SandboxGroupID(legacy)) != 40 {
+		t.Error("group IDs are not 40 characters, an sbx group of a short ID not 15")
 	}
-	if isEnv, u, ok := parseGroup(env); !ok || !isEnv || u.String() != env[4:] {
+	if isEnv, u, sbx, ok := parseGroup(env); !ok || !isEnv || u.String() != env[4:] || sbx != "" {
 		t.Error("parse env group")
 	}
-	if isEnv, _, ok := parseGroup(model.SandboxGroupID(uuid.New())); !ok || isEnv {
-		t.Error("parse sbx group")
+	// An sbx group names a sandbox with a short ID, or one made before
+	// ADR 0019 with a UUID.
+	for _, id := range []podid.ID{short, legacy} {
+		if isEnv, u, sbx, ok := parseGroup(model.SandboxGroupID(id)); !ok || isEnv || sbx != id || u != uuid.Nil {
+			t.Errorf("parse sbx group of %s: %v %v %q %v", id, isEnv, u, sbx, ok)
+		}
 	}
-	for _, bad := range []string{"default", "env-x", "sbx-0193E3A0-0000-7000-8000-000000000001", "foo-" + uuid.NewString()} {
-		if _, _, ok := parseGroup(bad); ok {
+	for _, bad := range []string{"default", "env-x", "sbx-0193E3A0-0000-7000-8000-000000000001", "foo-" + uuid.NewString(),
+		"sbx-" + strings.ToUpper(short.String()), "sbx-x", "sbx-" + short.String() + "0", "sbx-", "env-" + short.String()} {
+		if _, _, _, ok := parseGroup(bad); ok {
 			t.Errorf("%s parsed", bad)
 		}
 	}
@@ -154,7 +162,7 @@ func TestNameTable(t *testing.T) {
 	envID := uuid.New()
 	row := func(kind, name string, replica int, phase, addr string) store.EnvInstanceRow {
 		return store.EnvInstanceRow{
-			Instance: store.EnvInstance{SandboxID: uuid.New(), Kind: kind, Object: name, Replica: replica, Phase: phase},
+			Instance: store.EnvInstance{SandboxID: podid.Mint(), Kind: kind, Object: name, Replica: replica, Phase: phase},
 			Sandbox:  store.Sandbox{Address: addr, ClientState: model.StateRunning, Node: "n1"},
 		}
 	}
@@ -226,7 +234,7 @@ func TestNameTable(t *testing.T) {
 // or hibernated replica of an idle service is.
 func TestLiveReadiness(t *testing.T) {
 	row := func(replica int, phase, state, addr string) store.EnvInstanceRow {
-		id := uuid.New()
+		id := podid.Mint()
 		return store.EnvInstanceRow{
 			Instance: store.EnvInstance{SandboxID: id, Kind: spec.KindService, Object: "web", Replica: replica, Phase: phase},
 			Sandbox:  store.Sandbox{ID: id, ClientState: state, Node: "n1", Address: addr},
@@ -648,10 +656,31 @@ func TestRender(t *testing.T) {
 		t.Error("labels are in the hash")
 	}
 
-	att := c.planAttached(v, "web", spec.Service{Runtime: spec.RuntimeAttached, Sandbox: uuid.NewString(),
+	att := c.planAttached(v, "web", spec.Service{Runtime: spec.RuntimeAttached, Sandbox: podid.Mint().String(),
 		Command: []string{"npm", "run", "dev"}, Cwd: "/workspace/web"})
 	if !att.ok() || att.hash == "" {
 		t.Fatal(att.why())
+	}
+	// A sandbox made before ADR 0019, named by its UUID in either case,
+	// renders the same.
+	legacy := uuid.NewString()
+	lower := c.planAttached(v, "web", spec.Service{Runtime: spec.RuntimeAttached, Sandbox: legacy,
+		Command: []string{"npm", "run", "dev"}, Cwd: "/workspace/web"})
+	upper := c.planAttached(v, "web", spec.Service{Runtime: spec.RuntimeAttached, Sandbox: strings.ToUpper(legacy),
+		Command: []string{"npm", "run", "dev"}, Cwd: "/workspace/web"})
+	if !lower.ok() || !upper.ok() || lower.sandbox.String() != legacy || upper.hash != lower.hash {
+		t.Fatalf("legacy sandbox: %v %v %s", lower.why(), upper.why(), lower.sandbox)
+	}
+	// Its hash is the one the sandbox's service had when the ID was a
+	// uuid.UUID: the service is not started anew by the change of type.
+	if old := hashJSON(struct {
+		Scheme  int                            `json:"scheme"`
+		Sandbox uuid.UUID                      `json:"sandbox"`
+		Command []string                       `json:"command"`
+		Cwd     string                         `json:"cwd"`
+		Env     map[string]model.TemplateValue `json:"env"`
+	}{1, uuid.MustParse(legacy), lower.argv, lower.cwd, map[string]model.TemplateValue{}}); old != lower.hash {
+		t.Errorf("the hash of a legacy sandbox's service changed: %s, was %s", lower.hash, old)
 	}
 	if bad := c.planAttached(v, "web", spec.Service{Runtime: spec.RuntimeAttached, Sandbox: "x", Command: []string{"a"}}); bad.ok() {
 		t.Error("an attached service with a bad sandbox rendered")

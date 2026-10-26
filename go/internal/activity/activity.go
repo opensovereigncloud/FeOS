@@ -32,6 +32,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -251,8 +252,8 @@ func detailJSON(d map[string]any) json.RawMessage {
 
 // Event is one row ferund records.
 type Event struct {
-	TsNs      int64     // producer time; 0: now
-	SandboxID uuid.UUID // uuid.Nil: none (a node-scoped row)
+	TsNs      int64    // producer time; 0: now
+	SandboxID podid.ID // "": none (a node-scoped row)
 	TenantID  string
 	Node      string
 

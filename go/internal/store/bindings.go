@@ -7,10 +7,10 @@ import (
 	"context"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // KubeBinding is a row of kube_bindings: a Kubernetes API a sandbox
@@ -30,7 +30,7 @@ type KubeBinding struct {
 // KubeBindings returns a sandbox's Kubernetes set: its version and its
 // bindings by port, read in one statement; model.ErrNotFound when the
 // sandbox does not exist.
-func (s *Store) KubeBindings(ctx context.Context, sandboxID uuid.UUID) (string, []KubeBinding, error) {
+func (s *Store) KubeBindings(ctx context.Context, sandboxID podid.ID) (string, []KubeBinding, error) {
 	rows, err := s.q.Query(ctx, `SELECT s.kube_version, b.name, b.port, b.server, b.server_name, b.ca_pem, b.auth_type,
 			b.sealed, b.fingerprint, b.created_at
 		FROM sandboxes s LEFT JOIN kube_bindings b ON b.sandbox_id = s.id WHERE s.id = $1 ORDER BY b.port`, sandboxID)
@@ -68,7 +68,7 @@ func (s *Store) KubeBindings(ctx context.Context, sandboxID uuid.UUID) (string, 
 // SetKubeBindings replaces a sandbox's Kubernetes set with bs and version
 // ("" and none to delete it); model.ErrNotFound when the sandbox does not
 // exist. The caller holds the sandbox's row FOR UPDATE.
-func (s *Store) SetKubeBindings(ctx context.Context, sandboxID uuid.UUID, version string, bs []KubeBinding) error {
+func (s *Store) SetKubeBindings(ctx context.Context, sandboxID podid.ID, version string, bs []KubeBinding) error {
 	tag, err := s.q.Exec(ctx, "UPDATE sandboxes SET kube_version = $2 WHERE id = $1", sandboxID, version)
 	if err != nil {
 		return err
@@ -91,7 +91,7 @@ func (s *Store) SetKubeBindings(ctx context.Context, sandboxID uuid.UUID, versio
 
 // KubePorts returns the ports of a sandbox's Kubernetes bindings, which are
 // never forwarded.
-func (s *Store) KubePorts(ctx context.Context, sandboxID uuid.UUID) ([]int, error) {
+func (s *Store) KubePorts(ctx context.Context, sandboxID podid.ID) ([]int, error) {
 	rows, err := s.q.Query(ctx, "SELECT port FROM kube_bindings WHERE sandbox_id = $1 ORDER BY port", sandboxID)
 	if err != nil {
 		return nil, err
@@ -125,7 +125,7 @@ type SSHBinding struct {
 // SSHBindings returns a sandbox's SSH set: its version and its bindings by
 // name, read in one statement; model.ErrNotFound when the sandbox does not
 // exist.
-func (s *Store) SSHBindings(ctx context.Context, sandboxID uuid.UUID) (string, []SSHBinding, error) {
+func (s *Store) SSHBindings(ctx context.Context, sandboxID podid.ID) (string, []SSHBinding, error) {
 	rows, err := s.q.Query(ctx, `SELECT s.ssh_version, b.name, b.server, b.ssh_user, b.host_keys, b.auth_type, b.key_type,
 			b.fingerprint, b.public_key, b.sealed, b.created_at
 		FROM sandboxes s LEFT JOIN ssh_bindings b ON b.sandbox_id = s.id WHERE s.id = $1 ORDER BY b.name`, sandboxID)
@@ -165,7 +165,7 @@ func (s *Store) SSHBindings(ctx context.Context, sandboxID uuid.UUID) (string, [
 // SetSSHBindings replaces a sandbox's SSH set with bs and version ("" and
 // none to delete it); model.ErrNotFound when the sandbox does not exist.
 // The caller holds the sandbox's row FOR UPDATE.
-func (s *Store) SetSSHBindings(ctx context.Context, sandboxID uuid.UUID, version string, bs []SSHBinding) error {
+func (s *Store) SetSSHBindings(ctx context.Context, sandboxID podid.ID, version string, bs []SSHBinding) error {
 	tag, err := s.q.Exec(ctx, "UPDATE sandboxes SET ssh_version = $2 WHERE id = $1", sandboxID, version)
 	if err != nil {
 		return err

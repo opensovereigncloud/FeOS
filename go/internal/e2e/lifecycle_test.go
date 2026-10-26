@@ -15,17 +15,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
 // podState waits until the node's record of the pod is in state.
-func podState(t *testing.T, n *node, id uuid.UUID, state podv1.PodState, within time.Duration) *podv1.PodInfo {
+func podState(t *testing.T, n *node, id podid.ID, state podv1.PodState, within time.Duration) *podv1.PodInfo {
 	t.Helper()
 	var p *podv1.PodInfo
 	eventually(t, within, "pod "+id.String()+" "+state.String()+" on "+n.name, func() bool {
@@ -94,7 +93,7 @@ const slowPrefix = "e2e-slow "
 
 func newGuard(n *node) *guard {
 	g := &guard{inflight: map[string]int{}, suspends: map[string]int{}, lastSuspend: map[string]time.Time{}}
-	n.Script().SetExec(func(ctx context.Context, pod uuid.UUID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	n.Script().SetExec(func(ctx context.Context, pod podid.ID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		argv := req.GetCommand()
 		cmd := argv[len(argv)-1]
 		if !strings.HasPrefix(cmd, slowPrefix) {
@@ -135,7 +134,7 @@ func newGuard(n *node) *guard {
 
 // suspended is the number of suspends of the pod, and the time of the
 // last.
-func (g *guard) suspended(id uuid.UUID) (int, time.Time) {
+func (g *guard) suspended(id podid.ID) (int, time.Time) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.suspends[id.String()], g.lastSuspend[id.String()]
@@ -273,7 +272,7 @@ func TestProcessHold(t *testing.T) {
 	root := t.TempDir()
 	// The process tools' records go to a directory of the test: the test
 	// node runs the commands on the host.
-	n1.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	n1.Script().SetExec(func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		if argv := req.Command; len(argv) > 2 && argv[0] == "python3" {
 			argv[2] = strings.ReplaceAll(argv[2], processRoot, root)
 		}

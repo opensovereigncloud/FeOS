@@ -19,13 +19,14 @@ import (
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
 	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 var bgctx = context.Background()
 
 // envSpec is the spec of an environment's pod: the env label, a volume
 // and security groups as given.
-func envSpec(id uuid.UUID, volume string, groups ...string) *podv1.PodSpec {
+func envSpec(id podid.ID, volume string, groups ...string) *podv1.PodSpec {
 	s := sandboxSpec(id, "inc-1")
 	s.Labels["ferun.environment"] = "0193e3a0-0000-7000-8000-000000000001"
 	s.Network = &podv1.PodNetwork{SecurityGroups: groups}
@@ -86,10 +87,10 @@ func TestVolumes(t *testing.T) {
 
 	// A pod with a volume the node does not have.
 	missing := uuid.NewString()
-	_, err = create(t, pc1, uuid.NewString(), envSpec(uuid.New(), missing))
+	_, err = create(t, pc1, uuid.NewString(), envSpec(podid.Mint(), missing))
 	wantCode(t, err, codes.FailedPrecondition, "no volume "+missing+" on this node")
 
-	a := uuid.New()
+	a := podid.Mint()
 	if _, err := create(t, pc1, a.String(), envSpec(a, vol)); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +99,7 @@ func TestVolumes(t *testing.T) {
 	if _, err := create(t, pc1, a.String(), envSpec(a, vol)); err != nil {
 		t.Fatalf("a repeated create: %v", err)
 	}
-	b := uuid.New()
+	b := podid.Mint()
 	_, err = create(t, pc1, b.String(), envSpec(b, vol))
 	wantCode(t, err, codes.FailedPrecondition, "volume "+vol+" is attached to pod "+a.String())
 	_, err = vc1.DeleteVolume(bgctx, &volumev1.DeleteVolumeRequest{VolumeId: vol})
@@ -158,7 +159,7 @@ func TestVolumes(t *testing.T) {
 	}
 	wantVolume(t, getVolume(t, vc1, vol), volumev1.VolumeState_VOLUME_STATE_CHECKPOINTED, "")
 	// Such a record may go, and a pod may boot on it (from its checkpoint).
-	c := uuid.New()
+	c := podid.Mint()
 	if _, err := create(t, pc1, c.String(), envSpec(c, vol)); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +227,7 @@ func TestSecurityGroups(t *testing.T) {
 
 	// A pod naming a group the node does not have: created, then failed.
 	const other = "sbx-0193e3a0-0000-7000-8000-000000000002"
-	p := uuid.New()
+	p := podid.Mint()
 	if _, err := create(t, pc, p.String(), envSpec(p, "", id, other)); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +238,7 @@ func TestSecurityGroups(t *testing.T) {
 	// Another list of groups is another spec.
 	_, err = create(t, pc, p.String(), envSpec(p, "", id))
 	wantCode(t, err, codes.AlreadyExists, "pod "+p.String()+" exists with another spec")
-	_, err = create(t, pc, uuid.NewString(), envSpec(uuid.New(), "", "no spaces"))
+	_, err = create(t, pc, uuid.NewString(), envSpec(podid.Mint(), "", "no spaces"))
 	wantPrefix(t, err, codes.InvalidArgument, "invalid security group ID")
 	if _, err := gc.PutSecurityGroup(bgctx, &networkv1.PutSecurityGroupRequest{Group: &networkv1.SecurityGroup{Id: other, Version: 1}}); err != nil {
 		t.Fatal(err)
@@ -265,7 +266,7 @@ func TestSecurityGroups(t *testing.T) {
 	// Without the check the groups a pod names are not looked at.
 	n2 := e.start("n2", in)
 	pc2 := pods(t, in, "n2")
-	q := uuid.New()
+	q := podid.Mint()
 	if _, err := create(t, pc2, q.String(), envSpec(q, "", "env-unknown")); err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +281,7 @@ func TestContainerExitAndLogs(t *testing.T) {
 	in := e.instance("i1", caIss)
 	n := e.start("n1", in)
 	pc := pods(t, in, "n1")
-	id := uuid.New()
+	id := podid.Mint()
 	if _, err := create(t, pc, id.String(), envSpec(id, "")); err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +371,7 @@ func TestEnvPodExecAndPorts(t *testing.T) {
 	n := e.start("n1", in)
 	pc := pods(t, in, "n1")
 	cc := containerv1.NewContainerServiceClient(conn(t, in, "n1"))
-	exec := func(pod uuid.UUID, argv ...string) int32 {
+	exec := func(pod podid.ID, argv ...string) int32 {
 		t.Helper()
 		s, err := cc.Exec(podCtx(pod.String()), &containerv1.ExecRequest{Command: argv})
 		if err != nil {
@@ -386,7 +387,7 @@ func TestEnvPodExecAndPorts(t *testing.T) {
 			}
 		}
 	}
-	envPod := uuid.New()
+	envPod := podid.Mint()
 	if _, err := create(t, pc, envPod.String(), envSpec(envPod, "")); err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +399,7 @@ func TestEnvPodExecAndPorts(t *testing.T) {
 	if code := exec(plain, "sh", "-c", "exit 4"); code != 4 {
 		t.Errorf("an ordinary pod's exec exited %d", code)
 	}
-	n.Script().SetPodExec(envPod, func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ ExecOutput) (int32, bool, error) {
+	n.Script().SetPodExec(envPod, func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, _ ExecOutput) (int32, bool, error) {
 		return 2, true, nil
 	})
 	if code := exec(envPod, "pg_isready"); code != 2 {
@@ -442,7 +443,7 @@ func TestEnvPodExecAndPorts(t *testing.T) {
 	}()
 	n.Script().SetPodPortAddr(envPod, 5432, ln.Addr().String())
 	fc := portforwardv1.NewPortForwardServiceClient(conn(t, in, "n1"))
-	open := func(pod uuid.UUID) (string, error) {
+	open := func(pod podid.ID) (string, error) {
 		st, err := fc.Forward(podCtx(pod.String()))
 		if err != nil {
 			return "", err

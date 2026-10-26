@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -25,7 +26,7 @@ func (e *env) instanceRow() (store.Sandbox, string) {
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	sb, created, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: uuid.New(), Owner: testTenant, Image: "img",
+	sb, created, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: podid.Mint(), Owner: testTenant, Image: "img",
 		VCPUs: 1, MemoryMiB: 512, EnvironmentID: envRow.ID,
 		PodTemplate: &model.PodTemplate{SecurityGroups: []string{model.EnvGroupID(envRow.ID)}}})
 	if err != nil || !created {
@@ -48,7 +49,7 @@ func (e *env) instanceRow() (store.Sandbox, string) {
 func TestInstanceRowsAreNoSandboxes(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
-	own, _ := e.createSandbox("")
+	own, _ := e.createSandbox()
 	inst, instToken := e.instanceRow()
 	id := inst.ID.String()
 	for _, c := range []struct{ method, path string }{
@@ -75,12 +76,8 @@ func TestInstanceRowsAreNoSandboxes(t *testing.T) {
 		t.Fatalf("a token was minted: %v %v", toks, err)
 	}
 
-	// Its ID is taken.
-	w := e.do("POST", "/api/v1/sandboxes", bearerOf(e.tenantToken), map[string]any{"sandboxId": id})
-	expect(t, w, http.StatusConflict, errBody("sandbox id "+id+" already exists"))
-
 	// The listing has the tenant's own sandbox only.
-	w = e.do("GET", "/api/v1/sandboxes", bearerOf(e.tenantToken), nil)
+	w := e.do("GET", "/api/v1/sandboxes", bearerOf(e.tenantToken), nil)
 	list := decode[struct {
 		Sandboxes []map[string]any `json:"sandboxes"`
 	}](t, w)
@@ -100,7 +97,7 @@ func TestInstanceRowsAreNoSandboxes(t *testing.T) {
 }
 
 // POST /api/v1/sandboxes with attachable: the row has the attachable
-// template, and the status says so; a repeat keeps it as created.
+// template, named after the minted ID, and the status says so.
 func TestCreateAttachableSandbox(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
@@ -116,7 +113,10 @@ func TestCreateAttachableSandbox(t *testing.T) {
 	if !a.Status.Attachable {
 		t.Fatalf("status %+v", a.Status)
 	}
-	id := uuid.MustParse(a.Status.SandboxID)
+	id, err := podid.Parse(a.Status.SandboxID)
+	if err != nil || id.IsLegacy() {
+		t.Fatalf("minted %q: %v", a.Status.SandboxID, err)
+	}
 	row, err := e.st.GetSandbox(context.Background(), id)
 	if err != nil {
 		t.Fatal(err)
@@ -127,12 +127,6 @@ func TestCreateAttachableSandbox(t *testing.T) {
 		row.IsInstance() {
 		t.Fatalf("row %+v template %+v", row, tpl)
 	}
-	// A repeat without the flag: the sandbox as it is.
-	w = e.do("POST", "/api/v1/sandboxes", bearerOf(e.tenantToken), map[string]any{"sandboxId": id.String()})
-	expect(t, w, http.StatusOK, "")
-	if a := decode[answer](t, w); !a.Status.Attachable {
-		t.Fatal("the repeat lost attachable")
-	}
 	for _, path := range []string{"/api/v1/sandboxes/" + id.String()} {
 		w = e.do("GET", path, bearerOf(e.tenantToken), nil)
 		if st := decode[map[string]any](t, w); st["attachable"] != true {
@@ -140,12 +134,12 @@ func TestCreateAttachableSandbox(t *testing.T) {
 		}
 	}
 	// An ordinary sandbox is not attachable.
-	plain, _ := e.createSandbox("")
+	plain, _ := e.createSandbox()
 	w = e.do("GET", "/api/v1/sandboxes/"+plain, bearerOf(e.tenantToken), nil)
 	if st := decode[map[string]any](t, w); st["attachable"] != false {
 		t.Fatalf("plain %v", st)
 	}
-	if row, _ := e.st.GetSandbox(context.Background(), uuid.MustParse(plain)); row.PodTemplate != nil {
+	if row, _ := e.st.GetSandbox(context.Background(), podid.ID(plain)); row.PodTemplate != nil {
 		t.Fatalf("plain template %+v", row.PodTemplate)
 	}
 }

@@ -14,12 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -296,7 +295,7 @@ func (s *server) sandbox(h apiHandler) http.Handler {
 		if err != nil {
 			return fmt.Errorf("token lookup: %w", err)
 		}
-		if id, err := uuid.Parse(r.PathValue("id")); err != nil || id != sb.ID {
+		if id, err := podid.Parse(r.PathValue("id")); err != nil || id != sb.ID {
 			return apierr.New(http.StatusNotFound, "no such sandbox")
 		}
 		if s.touches.due("s:" + sb.TokenHash) {

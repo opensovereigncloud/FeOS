@@ -11,10 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -42,7 +41,7 @@ func TestFixedInstanceIDRestart(t *testing.T) {
 	if _, err := st.InsertNode(ctx, "n1"); err != nil {
 		t.Fatal(err)
 	}
-	sb, _, err := st.CreateSandbox(ctx, store.NewSandbox{ID: uuid.New(), Owner: "acme", Image: "alpine", VCPUs: 2, MemoryMiB: 512})
+	sb, _, err := st.CreateSandbox(ctx, store.NewSandbox{ID: podid.Mint(), Owner: "acme", Image: "alpine", VCPUs: 2, MemoryMiB: 512})
 	if err != nil {
 		t.Fatal(err)
 	}

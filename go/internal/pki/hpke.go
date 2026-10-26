@@ -9,10 +9,10 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // bindingsInfo is the HPKE info of fleet.proto's SealedBindings.
@@ -22,10 +22,10 @@ const bindingsInfo = "feos bindings v1"
 // run's HPKE key pair is made with (HPKEKEM().GenerateKey()).
 func HPKEKEM() hpke.KEM { return hpke.DHKEM(ecdh.X25519()) }
 
-// bindingsAAD is the additional data of a sealed box: the pod's ID in
-// lowercase hyphenated form, a zero byte and the version, so that the
-// version is authenticated too.
-func bindingsAAD(podID uuid.UUID, version string) []byte {
+// bindingsAAD is the additional data of a sealed box: the pod's ID as it
+// is written (a short ID, or a UUID in lowercase hyphenated form), a zero
+// byte and the version, so that the version is authenticated too.
+func bindingsAAD(podID podid.ID, version string) []byte {
 	return append(append([]byte(podID.String()), 0), version...)
 }
 
@@ -33,7 +33,7 @@ func bindingsAAD(podID uuid.UUID, version string) []byte {
 // bytes) in base mode: suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
 // ChaCha20-Poly1305, info "feos bindings v1", aad bound to the pod and the
 // version.
-func Seal(pub []byte, podID uuid.UUID, b *fleetv1.PodBindings, version string) (*fleetv1.SealedBindings, error) {
+func Seal(pub []byte, podID podid.ID, b *fleetv1.PodBindings, version string) (*fleetv1.SealedBindings, error) {
 	pk, err := HPKEKEM().NewPublicKey(pub)
 	if err != nil {
 		return nil, fmt.Errorf("HPKE public key: %w", err)
@@ -55,7 +55,7 @@ func Seal(pub []byte, podID uuid.UUID, b *fleetv1.PodBindings, version string) (
 
 // Open opens a sealed box with the run's HPKE private key: what a pod's
 // feos-authn does, and the test node.
-func Open(priv hpke.PrivateKey, podID uuid.UUID, s *fleetv1.SealedBindings) (*fleetv1.PodBindings, error) {
+func Open(priv hpke.PrivateKey, podID podid.ID, s *fleetv1.SealedBindings) (*fleetv1.PodBindings, error) {
 	if s == nil {
 		return nil, errors.New("no sealed bindings")
 	}

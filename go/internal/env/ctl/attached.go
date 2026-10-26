@@ -16,6 +16,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/tools"
 )
@@ -120,7 +121,7 @@ func (c *Controller) stepOneAttached(ctx context.Context, s *stepState, name str
 
 // goneDetail is the detail of an attached service whose sandbox it may
 // not use (§13.5).
-func goneDetail(id uuid.UUID) string {
+func goneDetail(id podid.ID) string {
 	return fmt.Sprintf("sandbox %s is gone or not this tenant's", id)
 }
 
@@ -533,7 +534,7 @@ func (c *Controller) attachedDetail(ctx context.Context, envID uuid.UUID, servic
 // wakeAttached wakes a sandbox for the (re)start of an attached service's
 // process, off the loop: Acquire with an exec hold, supervise until the
 // process is ready (or attachedReady passed), release.
-func (c *Controller) wakeAttached(ctx context.Context, envID uuid.UUID, service string, sandboxID uuid.UUID) {
+func (c *Controller) wakeAttached(ctx context.Context, envID uuid.UUID, service string, sandboxID podid.ID) {
 	if c.d.Runner == nil {
 		return
 	}

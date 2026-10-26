@@ -380,7 +380,7 @@ func (s *server) listNodes(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
-	booked, err := s.st.SumAllBookings(ctx, uuid.Nil)
+	booked, err := s.st.SumAllBookings(ctx, "")
 	if err != nil {
 		return fmt.Errorf("list nodes: %w", err)
 	}
@@ -446,7 +446,7 @@ func (s *server) nodeAnswer(ctx context.Context, w http.ResponseWriter, n store.
 	if err != nil && !isNoRow(err) {
 		return err
 	}
-	b, err := s.st.SumBookings(ctx, n.Name, uuid.Nil)
+	b, err := s.st.SumBookings(ctx, n.Name, "")
 	if err != nil {
 		return err
 	}

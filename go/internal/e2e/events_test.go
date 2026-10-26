@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // auditEvent is an event with an audit record of kind for pod.
@@ -165,7 +166,7 @@ func TestPoisonedEvents(t *testing.T) {
 	type row struct {
 		kind, name, source string
 		detail             map[string]any
-		sandbox            *uuid.UUID
+		sandbox            *podid.ID
 	}
 	rows, err := c.db.Pool.Query(bg, `SELECT kind, name, source, detail, sandbox_id FROM activity
 		WHERE node = 'n1' AND start_id = $1 AND kind IN ('e2epoison', 'node_event', 'e2e_after') ORDER BY seq`,

@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -17,6 +16,7 @@ import (
 	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // PodIDMetadata is the gRPC metadata key that routes a call to a pod's
@@ -24,9 +24,8 @@ import (
 const PodIDMetadata = "feos-pod-id"
 
 // PodContext returns ctx with the outgoing metadata feos-pod-id set to
-// podID in lowercase hyphenated form: every call into a pod's guest
-// carries it.
-func PodContext(ctx context.Context, podID uuid.UUID) context.Context {
+// podID: every call into a pod's guest carries it.
+func PodContext(ctx context.Context, podID podid.ID) context.Context {
 	md, _ := metadata.FromOutgoingContext(ctx)
 	md = md.Copy()
 	md.Set(PodIDMetadata, podID.String())

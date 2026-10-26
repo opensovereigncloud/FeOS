@@ -15,6 +15,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -184,7 +185,7 @@ func TestJobLogTailRedacted(t *testing.T) {
 
 // exitRunning makes the service's running container exit with code once
 // its row runs and its container is up, its log given lines first.
-func exitRunning(t *testing.T, h *harness, n *testnode.Node, envID, id uuid.UUID, code int, lines ...string) {
+func exitRunning(t *testing.T, h *harness, n *testnode.Node, envID uuid.UUID, id podid.ID, code int, lines ...string) {
 	t.Helper()
 	eventually(t, 30*time.Second, "the container running", func() bool {
 		p := h.pod("n1", id)
@@ -249,7 +250,7 @@ func TestServiceTailsRedacted(t *testing.T) {
 	// A new instance that never gets ready fails the release at its
 	// rollout budget; the evidence has its tail, redacted.
 	r2 := h.apply(env.ID, webSpec("2", `,"readiness":{"tcp":{"port":8080},"period":"1s"},"rollout":{"timeout":"5s"}`))
-	var fresh uuid.UUID
+	var fresh podid.ID
 	eventually(t, 30*time.Second, "the new instance running", func() bool {
 		for _, r := range h.rowsOf(env.ID, spec.KindService, "web") {
 			if r.Sandbox.ID != id && running(r) && h.pod("n1", r.Sandbox.ID) != nil {

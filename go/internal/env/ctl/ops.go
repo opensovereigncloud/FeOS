@@ -15,6 +15,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/tools"
 )
@@ -117,7 +118,7 @@ func (c *Controller) jobLog(ctx context.Context, v *view, name string, lines int
 	if err != nil {
 		return nil, "", err
 	}
-	if run.SandboxID != uuid.Nil && run.Phase == model.RunRunning {
+	if !run.SandboxID.IsZero() && run.Phase == model.RunRunning {
 		if sb, err := c.st.GetSandbox(ctx, run.SandboxID); err == nil && sb.ClientState == model.StateRunning {
 			out, err := c.instanceLog(ctx, sb, lines)
 			return out, SourceContainer, err
@@ -187,7 +188,7 @@ func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name s
 	if len(rows) == 0 {
 		return nil
 	}
-	ids := make([]uuid.UUID, len(rows))
+	ids := make([]podid.ID, len(rows))
 	for i, r := range rows {
 		ids[i] = r.Sandbox.ID
 	}
@@ -220,7 +221,7 @@ func (c *Controller) RestartService(ctx context.Context, envID uuid.UUID, name s
 // an op in flight is model.ErrBusy, and its instance stays as it was (a
 // restart the engine refuses puts it back), so that a refused restart
 // takes no traffic away.
-func (c *Controller) restartReplica(ctx context.Context, id uuid.UUID) error {
+func (c *Controller) restartReplica(ctx context.Context, id podid.ID) error {
 	sb, err := c.st.GetSandbox(ctx, id)
 	switch {
 	case err != nil:
@@ -278,7 +279,7 @@ func (c *Controller) unrestart(ctx context.Context, before store.EnvInstance) {
 // and its row running without an op, or, for a service that idles
 // (idles), paused or hibernated without one), or gone, or restartReady
 // passed (false).
-func (c *Controller) waitReady(ctx context.Context, id uuid.UUID, idles bool) bool {
+func (c *Controller) waitReady(ctx context.Context, id podid.ID, idles bool) bool {
 	deadline := time.Now().Add(c.t.restartReady)
 	for time.Now().Before(deadline) {
 		inst, err := c.st.GetEnvInstance(ctx, id)

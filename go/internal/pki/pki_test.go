@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 var quiet = slog.New(slog.DiscardHandler)
@@ -557,7 +559,7 @@ func checkBackdated(t *testing.T, leaf *x509.Certificate, before time.Time, ttl 
 
 func TestIssuePod(t *testing.T) {
 	iss, _ := newCA(t)
-	id := SandboxID(testTD, "acme", uuid.MustParse("3f2c0000-0000-4000-8000-000000000001"))
+	id := SandboxID(testTD, "acme", podid.ID("3f2c0000-0000-4000-8000-000000000001"))
 	if id != "spiffe://"+testTD+"/tenant/acme/sandbox/3f2c0000-0000-4000-8000-000000000001" {
 		t.Errorf("SandboxID = %s", id)
 	}
@@ -581,7 +583,7 @@ func TestIssuePod(t *testing.T) {
 	if want := (testTD + "/tenant/acme/sandbox/3f2c0000-0000-4000-8000-000000000001")[:47] + "-" + hex.EncodeToString(sum[:8]); leaf.Subject.CommonName != want {
 		t.Errorf("CN %q, want %q", leaf.Subject.CommonName, want)
 	}
-	short := SandboxID(testTD, "a", uuid.MustParse("3f2c0000-0000-4000-8000-000000000001"))
+	short := SandboxID(testTD, "a", podid.ID("3f2c0000-0000-4000-8000-000000000001"))
 	if cn := podCommonName(short); cn != testTD+"/tenant/a/sandbox/3f2c0000-0000-4000-8000-000000000001" {
 		t.Errorf("short CN %q", cn)
 	}
@@ -630,7 +632,7 @@ func TestIssuePod(t *testing.T) {
 		t.Error("ECDSA pod key accepted")
 	}
 
-	long := SandboxID(testTD, strings.Repeat("t", 60), uuid.New())
+	long := SandboxID(testTD, strings.Repeat("t", 60), podid.ID(uuid.NewString()))
 	_, leaf, err = iss.IssuePod(csr, long, nil, time.Hour)
 	if err != nil {
 		t.Fatal(err)
@@ -680,7 +682,7 @@ func TestIssueServer(t *testing.T) {
 	// Only IssueServer writes the control plane's URI.
 	csr, _ := ed25519CSR(t, nil)
 	_, n, _ := iss.IssueNode(csr, "ferun", time.Hour)
-	_, p, _ := iss.IssuePod(csr, SandboxID(testTD, "ferun", uuid.New()), nil, time.Hour)
+	_, p, _ := iss.IssuePod(csr, SandboxID(testTD, "ferun", podid.Mint()), nil, time.Hour)
 	for _, c := range []*x509.Certificate{n, p} {
 		for _, u := range c.URIs {
 			if u.String() == ControlPlaneID(testTD) {
@@ -769,7 +771,7 @@ func TestVerifyServer(t *testing.T) {
 	// control plane.
 	csr, _ := ed25519CSR(t, nil)
 	podName := "svc." + testDomain
-	_, podLeaf, err := iss.IssuePod(csr, SandboxID(testTD, "acme", uuid.New()), []string{podName}, time.Hour)
+	_, podLeaf, err := iss.IssuePod(csr, SandboxID(testTD, "acme", podid.Mint()), []string{podName}, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

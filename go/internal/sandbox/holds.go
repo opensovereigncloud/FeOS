@@ -8,15 +8,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 // holdKey names this instance's hold of one kind on one sandbox.
 type holdKey struct {
-	id   uuid.UUID
+	id   podid.ID
 	kind model.HoldKind
 }
 
@@ -58,7 +57,7 @@ func (e *Engine) holdUnref(k holdKey, hs *holdState) {
 // the hold and last_active_at in that transaction; its last one deletes
 // the hold and sets last_active_at in one transaction, so that the idle
 // loop never sees the sandbox without its hold and with an old activity.
-func (e *Engine) Acquire(ctx context.Context, id uuid.UUID, kind model.HoldKind) (model.Lease, func(), error) {
+func (e *Engine) Acquire(ctx context.Context, id podid.ID, kind model.HoldKind) (model.Lease, func(), error) {
 	k := holdKey{id, kind}
 	for {
 		if _, err := e.Ensure(ctx, id); err != nil {
@@ -178,7 +177,7 @@ func (e *Engine) renewHoldsOnce(ctx context.Context) {
 // process_start started: until timeout plus a slack has passed, or, for
 // timeout 0, without a limit until the process ends, is stopped or a
 // transition ends the sandbox's processes.
-func (e *Engine) HoldProcess(ctx context.Context, id uuid.UUID, processID string, timeout time.Duration) error {
+func (e *Engine) HoldProcess(ctx context.Context, id podid.ID, processID string, timeout time.Duration) error {
 	lease := time.Duration(0)
 	if timeout > 0 {
 		lease = timeout + e.t.processSlack
@@ -188,7 +187,7 @@ func (e *Engine) HoldProcess(ctx context.Context, id uuid.UUID, processID string
 
 // ReleaseProcess ends a background process's hold: it was stopped, or a
 // listing showed it not running.
-func (e *Engine) ReleaseProcess(ctx context.Context, id uuid.UUID, processID string) error {
+func (e *Engine) ReleaseProcess(ctx context.Context, id podid.ID, processID string) error {
 	_, err := e.st.ReleaseProcessHold(ctx, id, processID)
 	return err
 }

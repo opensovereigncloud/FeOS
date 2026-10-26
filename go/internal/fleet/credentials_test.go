@@ -19,13 +19,14 @@ import (
 
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
 type credsFixture struct {
 	*harness
 	serial string
-	pod    uuid.UUID
+	pod    podid.ID
 	priv   hpke.PrivateKey
 	pub    []byte
 }
@@ -37,7 +38,7 @@ func newCredsFixture(t *testing.T) *credsFixture {
 	if _, _, err := h.st.CreateTenant(bg, "acme"); err != nil {
 		t.Fatal(err)
 	}
-	f.pod = uuid.New()
+	f.pod = podid.Mint()
 	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: f.pod, Owner: "acme", Image: "alpine", VCPUs: 1, MemoryMiB: 512}); err != nil {
 		t.Fatal(err)
 	}

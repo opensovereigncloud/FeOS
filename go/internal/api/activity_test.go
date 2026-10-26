@@ -14,6 +14,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/ironcore-dev/feos/go/internal/apierr"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -37,7 +39,7 @@ func TestSandboxActivity(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
 	ctx := context.Background()
-	sb := uuid.New()
+	sb := podid.Mint()
 	start := uuid.New()
 	base := time.Now().Add(-time.Minute).UnixNano()
 	exit, dur := int64(3), int64(1500)
@@ -136,9 +138,9 @@ func TestSandboxActivity(t *testing.T) {
 		expect(t, e.do("GET", path+c.query, adminAuth(), nil), http.StatusBadRequest, errBody(c.msg))
 	}
 	expect(t, e.do("GET", "/api/v1/admin/sandboxes/x/activity", adminAuth(), nil), http.StatusBadRequest,
-		errBody("sandboxId must be a UUID"))
+		errBody(apierr.MsgSandboxID))
 	// A sandbox with nothing: an empty list, never null.
-	expect(t, e.do("GET", "/api/v1/admin/sandboxes/"+uuid.NewString()+"/activity", adminAuth(), nil), http.StatusOK,
+	expect(t, e.do("GET", "/api/v1/admin/sandboxes/"+podid.Mint().String()+"/activity", adminAuth(), nil), http.StatusOK,
 		`{"events":[]}`+"\n")
 }
 
@@ -149,7 +151,7 @@ func TestActivityGapsOfThePage(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
 	ctx := context.Background()
-	sb := uuid.New()
+	sb := podid.Mint()
 	start1, start2 := uuid.New(), uuid.New()
 	base := time.Now().Add(-time.Minute).UnixNano()
 	if err := e.st.InsertTraffic(ctx, store.TrafficRow{TsNs: base + 1, Node: "n2", StartID: start2, Seq: 1, PodID: sb,
@@ -195,7 +197,7 @@ func TestNodeActivity(t *testing.T) {
 	e := newEnv(t, envOptions{})
 	ctx := context.Background()
 	start := uuid.New()
-	pod := uuid.New()
+	pod := podid.Mint()
 	base := time.Now().Add(-time.Minute).UnixNano()
 	if err := e.st.InsertActivity(ctx,
 		store.ActivityRow{TsNs: base + 1, Node: "n1", StartID: start, InstanceID: "i1", Source: store.SourceFerund,

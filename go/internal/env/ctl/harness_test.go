@@ -31,6 +31,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/ports"
 	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/seal"
@@ -299,7 +300,7 @@ func (h *harness) conn(node string) grpc.ClientConnInterface {
 }
 
 // pod reads a pod from its node; nil when the node does not have it.
-func (h *harness) pod(node string, id uuid.UUID) *podv1.PodInfo {
+func (h *harness) pod(node string, id podid.ID) *podv1.PodInfo {
 	h.t.Helper()
 	info, err := podv1.NewPodServiceClient(h.conn(node)).GetPod(bg, &podv1.GetPodRequest{PodId: id.String()})
 	if err != nil {
@@ -330,7 +331,7 @@ func (h *harness) table(node, id string) *networkv1.NameTable {
 
 // resolves reports whether the pod resolves name, on its node as feosd's
 // resolver would, to exactly addrs (none: the name is not the pod's).
-func resolves(n *testnode.Node, pod uuid.UUID, name string, addrs ...string) bool {
+func resolves(n *testnode.Node, pod podid.ID, name string, addrs ...string) bool {
 	got, ok := n.Resolve(pod, name)
 	return ok == (len(addrs) > 0) && slices.Equal(got, addrs)
 }

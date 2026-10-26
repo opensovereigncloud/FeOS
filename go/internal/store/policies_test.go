@@ -15,11 +15,12 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
-func ids(sbs []store.Sandbox) []uuid.UUID {
-	out := make([]uuid.UUID, len(sbs))
+func ids(sbs []store.Sandbox) []podid.ID {
+	out := make([]podid.ID, len(sbs))
 	for i, sb := range sbs {
 		out[i] = sb.ID
 	}
@@ -73,13 +74,13 @@ func TestDownSweepAndLostGrace(t *testing.T) {
 	ch, unsubscribe := d.Subscribe(db.ChanSandbox)
 	defer unsubscribe()
 
-	var swept []uuid.UUID
+	var swept []podid.ID
 	tx(t, s, func(tx *store.Store) (err error) {
 		swept, err = tx.DownSweep(bg, 256)
 		return err
 	})
-	want := []uuid.UUID{running.ID, paused.ID, onRemoved.ID, onDownRemoved.ID, neverSeen.ID}
-	slices.SortFunc(want, func(a, b uuid.UUID) int { return strings.Compare(a.String(), b.String()) })
+	want := []podid.ID{running.ID, paused.ID, onRemoved.ID, onDownRemoved.ID, neverSeen.ID}
+	slices.SortFunc(want, func(a, b podid.ID) int { return strings.Compare(a.String(), b.String()) })
 	if !slices.Equal(swept, want) {
 		t.Fatalf("swept %v, want %v", swept, want)
 	}
@@ -228,17 +229,17 @@ func TestOpsOfInstances(t *testing.T) {
 	// An instance's ops, by deadline and ID, a page at a time, without
 	// those it names (the ones it runs).
 	startOp(t, s, c.ID, "pause", "live", "n1", 2*time.Minute)
-	opID := func(id uuid.UUID) uuid.UUID { return get(t, s, id).OpID }
+	opID := func(id podid.ID) uuid.UUID { return get(t, s, id).OpID }
 	page, err := s.OpsOf(bg, "live", nil, store.OpCursor{}, 2)
-	if err != nil || !slices.Equal(ids(page), []uuid.UUID{e.ID, a.ID}) {
+	if err != nil || !slices.Equal(ids(page), []podid.ID{e.ID, a.ID}) {
 		t.Fatalf("first page %v %v", ids(page), err)
 	}
 	next := store.OpCursor{}.Next(page)
-	if page, err := s.OpsOf(bg, "live", nil, next, 2); err != nil || !slices.Equal(ids(page), []uuid.UUID{c.ID}) {
+	if page, err := s.OpsOf(bg, "live", nil, next, 2); err != nil || !slices.Equal(ids(page), []podid.ID{c.ID}) {
 		t.Fatalf("second page %v %v", ids(page), err)
 	}
 	if page, err := s.OpsOf(bg, "live", []uuid.UUID{opID(e.ID), opID(a.ID)}, store.OpCursor{}, 2); err != nil ||
-		!slices.Equal(ids(page), []uuid.UUID{c.ID}) {
+		!slices.Equal(ids(page), []podid.ID{c.ID}) {
 		t.Fatalf("without the ops it runs %v %v", ids(page), err)
 	}
 }
@@ -258,11 +259,11 @@ func TestLoopCandidates(t *testing.T) {
 	}
 	place(t, s, other.ID, "n2", model.StateRunning)
 	exec(t, s, "UPDATE sandboxes SET last_active_at = now() - interval '1 minute' WHERE id = ANY($1)",
-		[]uuid.UUID{idle.ID, busy.ID, other.ID})
+		[]podid.ID{idle.ID, busy.ID, other.ID})
 	must(t, s.RenewHold(bg, busy.ID, model.HoldExec, "i1", time.Minute))
 
 	got, err := s.IdleSandboxes(bg, 10*time.Second, []string{"n1"}, 64)
-	if err != nil || !slices.Equal(ids(got), []uuid.UUID{idle.ID}) {
+	if err != nil || !slices.Equal(ids(got), []podid.ID{idle.ID}) {
 		t.Fatalf("idle %v %v", ids(got), err)
 	}
 	// An expired hold does not keep a sandbox awake.
@@ -302,9 +303,9 @@ func TestLoopCandidates(t *testing.T) {
 	// Hibernate-after: paused long enough, on a node with an object store.
 	place(t, s, idle.ID, "n1", model.StatePaused)
 	place(t, s, other.ID, "n2", model.StatePaused)
-	exec(t, s, "UPDATE sandboxes SET paused_at = now() - interval '1 hour' WHERE id = ANY($1)", []uuid.UUID{idle.ID, other.ID})
+	exec(t, s, "UPDATE sandboxes SET paused_at = now() - interval '1 hour' WHERE id = ANY($1)", []podid.ID{idle.ID, other.ID})
 	got, err = s.HibernateCandidates(bg, 30*time.Minute, []string{"n1", "n2"}, 10)
-	if err != nil || !slices.Equal(ids(got), []uuid.UUID{idle.ID}) {
+	if err != nil || !slices.Equal(ids(got), []podid.ID{idle.ID}) {
 		t.Fatalf("hibernate %v %v", ids(got), err)
 	}
 	if ok, err := s.HibernateAfterRecheck(bg, idle.ID, 30*time.Minute); !ok || err != nil {
@@ -337,7 +338,7 @@ func TestLoopCandidates(t *testing.T) {
 	place(t, s, other.ID, "n2", model.StateUnknown)
 	exec(t, s, "UPDATE nodes SET status = 'down' WHERE name = 'n2'")
 	got, err = s.UnknownSandboxes(bg, []string{"n1", "n2"}, 128)
-	if err != nil || !slices.Equal(ids(got), []uuid.UUID{busy.ID}) {
+	if err != nil || !slices.Equal(ids(got), []podid.ID{busy.ID}) {
 		t.Fatalf("unknown %v %v", ids(got), err)
 	}
 
@@ -347,7 +348,7 @@ func TestLoopCandidates(t *testing.T) {
 	place(t, s, busy.ID, "n1", model.StateRunning)
 	exec(t, s, "UPDATE sandboxes SET unreachable_since = now() - interval '1 minute' WHERE id = $1", busy.ID)
 	got, err = s.RepairCandidates(bg, 10*time.Minute, 2*time.Minute, []string{"n1"}, 10)
-	if err != nil || !slices.Equal(ids(got), []uuid.UUID{fresh.ID}) {
+	if err != nil || !slices.Equal(ids(got), []podid.ID{fresh.ID}) {
 		t.Fatalf("repair %v %v", ids(got), err)
 	}
 	exec(t, s, "UPDATE sandboxes SET unreachable_since = now() - interval '5 minutes' WHERE id = $1", busy.ID)
@@ -358,7 +359,7 @@ func TestLoopCandidates(t *testing.T) {
 	// Pending re-description.
 	p := mkSandbox(t, s, "acme")
 	exec(t, s, "UPDATE sandboxes SET status_description = 'no capacity (retryable): no feasible node' WHERE id = $1", p.ID)
-	if got, err := s.PendingWithoutCapacity(bg, 10); err != nil || !slices.Equal(ids(got), []uuid.UUID{p.ID}) {
+	if got, err := s.PendingWithoutCapacity(bg, 10); err != nil || !slices.Equal(ids(got), []podid.ID{p.ID}) {
 		t.Fatalf("pending without capacity %v %v", ids(got), err)
 	}
 }
@@ -367,7 +368,7 @@ func TestInTx(t *testing.T) {
 	s, d := newStore(t)
 	mkTenant(t, s, "acme")
 	boom := errors.New("boom")
-	var id uuid.UUID
+	var id podid.ID
 	err := s.InTx(bg, func(tx *store.Store) error {
 		sb := mkSandbox(t, tx, "acme")
 		id = sb.ID

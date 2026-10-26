@@ -19,6 +19,7 @@ import (
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -69,7 +70,7 @@ func (h *harness) environment() uuid.UUID {
 // instance inserts an instance row of env with the template.
 func (h *harness) instance(env uuid.UUID, t *model.PodTemplate, mod ...func(*store.NewSandbox)) store.Sandbox {
 	h.t.Helper()
-	n := store.NewSandbox{ID: uuid.New(), Owner: testTenant, Image: testImage, VCPUs: 1, MemoryMiB: 512,
+	n := store.NewSandbox{ID: podid.Mint(), Owner: testTenant, Image: testImage, VCPUs: 1, MemoryMiB: 512,
 		EnvironmentID: env, PodTemplate: t}
 	for _, m := range mod {
 		m(&n)
@@ -247,7 +248,7 @@ func TestEscapeUserinfo(t *testing.T) {
 
 func TestBuildPodSpec(t *testing.T) {
 	env := uuid.New()
-	sb := store.Sandbox{ID: uuid.New(), Incarnation: uuid.New(), Owner: testTenant, ImageRef: testImage, VCPUs: 2,
+	sb := store.Sandbox{ID: podid.Mint(), Incarnation: uuid.New(), Owner: testTenant, ImageRef: testImage, VCPUs: 2,
 		MemoryMiB: 1024, EnvironmentID: env}
 
 	// No template: the sandbox's own pod.

@@ -19,6 +19,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -392,23 +393,21 @@ type insert struct {
 // SHARE and refuses a deleting tenant or environment, then queues its
 // Ensure. The image is pinned first (outside the transaction): every row
 // gets the digest its image has now.
-func (c *Controller) insertInstance(ctx context.Context, v *view, in insert) (uuid.UUID, error) {
+func (c *Controller) insertInstance(ctx context.Context, v *view, in insert) (podid.ID, error) {
 	return c.insertFrom(ctx, v, in, true)
 }
 
 // insertFrom is insertInstance on the leader (fenced, then Ensure), or,
 // for a call of the API on any instance, in a plain transaction that
 // wakes env-reconcile, whose step brings the row up.
-func (c *Controller) insertFrom(ctx context.Context, v *view, in insert, leaderSide bool) (uuid.UUID, error) {
+func (c *Controller) insertFrom(ctx context.Context, v *view, in insert, leaderSide bool) (podid.ID, error) {
 	p := in.plan
 	ref, err := c.d.Engine.ResolveImage(ctx, p.image)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("pin image %s: %w", p.image, err)
+		return "", fmt.Errorf("pin image %s: %w", p.image, err)
 	}
-	// A random ID, not a time-ordered one: a pod's TAP device is named by
-	// the first 8 hex digits of its ID, which two UUIDv7 made within a
-	// minute share (the placement's TAP gate would refuse the second).
-	id := uuid.New()
+	// The row's ID is minted by the insert: a short ID (ADR 0019).
+	var id podid.ID
 	tmpl := p.template
 	tmpl.Labels = maps.Clone(p.template.Labels)
 	idle := p.idle
@@ -436,15 +435,14 @@ func (c *Controller) insertFrom(ctx context.Context, v *view, in insert, leaderS
 				return err
 			}
 		}
-		_, created, err := tx.CreateSandbox(ctx, store.NewSandbox{ID: id, Owner: v.env.Owner, Image: p.image,
-			VCPUs: p.vcpus, MemoryMiB: p.memoryMB, ImageRef: ref, EnvironmentID: v.env.ID, PodTemplate: &tmpl,
-			PinNode: in.pin, IdleAfterS: &idle})
+		row, err := tx.CreateMintedSandbox(ctx, func(id podid.ID) store.NewSandbox {
+			return store.NewSandbox{ID: id, Owner: v.env.Owner, Image: p.image, VCPUs: p.vcpus, MemoryMiB: p.memoryMB,
+				ImageRef: ref, EnvironmentID: v.env.ID, PodTemplate: &tmpl, PinNode: in.pin, IdleAfterS: &idle}
+		})
 		if err != nil {
 			return err
 		}
-		if !created {
-			return fmt.Errorf("instance id %s is taken", id)
-		}
+		id = row.ID
 		if _, err := tx.InsertEnvInstance(ctx, store.EnvInstance{SandboxID: id, EnvID: v.env.ID, Kind: p.kind,
 			Object: p.name, Replica: in.replica, TemplateHash: p.hash, Release: in.release,
 			Phase: model.PhaseStarting}); err != nil {
@@ -468,7 +466,7 @@ func (c *Controller) insertFrom(ctx context.Context, v *view, in insert, leaderS
 		err = c.st.InTx(ctx, write)
 	}
 	if err != nil {
-		return uuid.Nil, err
+		return "", err
 	}
 	c.log.Info("instance inserted", "environment", v.env.ID, "object", p.object(), "replica", in.replica,
 		"sandbox", id, "release", in.release)

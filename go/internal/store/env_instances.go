@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // EnvExit is one exit of an instance's main container, as env_instances
@@ -28,7 +29,7 @@ type EnvExit struct {
 // Its sandbox, environment, kind, object, replica and template hash are
 // fixed: a changed template is a new instance.
 type EnvInstance struct {
-	SandboxID    uuid.UUID
+	SandboxID    podid.ID
 	EnvID        uuid.UUID
 	Kind         string // "service", "addon", "job"
 	Object       string // the object's name in the spec
@@ -128,13 +129,13 @@ func (s *Store) InsertEnvInstance(ctx context.Context, i EnvInstance) (EnvInstan
 
 // GetEnvInstance reads the controller's row of an instance; ErrNoRow if
 // there is none.
-func (s *Store) GetEnvInstance(ctx context.Context, sandboxID uuid.UUID) (EnvInstance, error) {
+func (s *Store) GetEnvInstance(ctx context.Context, sandboxID podid.ID) (EnvInstance, error) {
 	return s.LockEnvInstance(ctx, sandboxID, NoLock)
 }
 
 // LockEnvInstance reads the controller's row of an instance and locks it
 // with lock; ErrNoRow if there is none.
-func (s *Store) LockEnvInstance(ctx context.Context, sandboxID uuid.UUID, lock RowLock) (EnvInstance, error) {
+func (s *Store) LockEnvInstance(ctx context.Context, sandboxID podid.ID, lock RowLock) (EnvInstance, error) {
 	i, err := scanEnvInstance(s.q.QueryRow(ctx, "SELECT "+envInstanceCols+" FROM env_instances WHERE sandbox_id = $1 "+
 		string(lock), sandboxID))
 	if err != nil {
@@ -221,7 +222,7 @@ func sameExits(a, b []EnvExit) bool {
 
 // DeleteEnvInstance removes the controller's row of an instance (the
 // sandbox row's deletion does so too) and reports whether it was there.
-func (s *Store) DeleteEnvInstance(ctx context.Context, sandboxID uuid.UUID) (bool, error) {
+func (s *Store) DeleteEnvInstance(ctx context.Context, sandboxID podid.ID) (bool, error) {
 	ct, err := s.q.Exec(ctx, "DELETE FROM env_instances WHERE sandbox_id = $1", sandboxID)
 	return ct.RowsAffected() > 0, err
 }

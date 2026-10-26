@@ -24,6 +24,7 @@ import (
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 	"github.com/ironcore-dev/feos/go/internal/tools"
@@ -221,7 +222,7 @@ func TestRendering(t *testing.T) {
 	h := newHarness(t, toolstest.Options{}, Config{})
 	cs := h.session(nil)
 
-	h.env.Node.Script().SetExec(func(_ context.Context, _ uuid.UUID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	h.env.Node.Script().SetExec(func(_ context.Context, _ podid.ID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		_ = out.Stdout([]byte(strings.Repeat("a", 40000)))
 		_ = out.Stderr([]byte(strings.Repeat("b", 40000)))
 		return 0, true, nil
@@ -233,7 +234,7 @@ func TestRendering(t *testing.T) {
 	h.env.Node.Script().SetExec(nil)
 
 	png := []byte("\x89PNG not really")
-	h.env.Node.Script().SetTool(func(_ context.Context, _ uuid.UUID, method string, _ proto.Message) (proto.Message, bool, error) {
+	h.env.Node.Script().SetTool(func(_ context.Context, _ podid.ID, method string, _ proto.Message) (proto.Message, bool, error) {
 		if method == toolv1.ToolService_Read_FullMethodName {
 			return &toolv1.ReadResponse{Image: png, MediaType: "image/png", Width: 640, Height: 480}, true, nil
 		}
@@ -581,7 +582,7 @@ func waitHolds(t *testing.T, h *harness, n int) {
 // events, which clients ignore.
 func TestKeepalive(t *testing.T) {
 	h := newHarness(t, toolstest.Options{}, Config{KeepaliveInterval: 100 * time.Millisecond})
-	h.env.Node.Script().SetExec(func(ctx context.Context, _ uuid.UUID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	h.env.Node.Script().SetExec(func(ctx context.Context, _ podid.ID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		time.Sleep(450 * time.Millisecond)
 		_ = out.Stdout([]byte("late\n"))
 		return 0, true, nil
@@ -638,7 +639,7 @@ func TestProgress(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		h.env.Node.Script().SetExec(func(ctx context.Context, _ uuid.UUID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+		h.env.Node.Script().SetExec(func(ctx context.Context, _ podid.ID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 			for i := range 3 {
 				_ = out.Stdout([]byte(fmt.Sprintf("%d\n", i)))
 				time.Sleep(150 * time.Millisecond)
@@ -724,7 +725,7 @@ func TestTokenTouch(t *testing.T) {
 
 // hibernating is the engine's answer for a sandbox whose hibernation did
 // not end within Ensure's wait: a text of its own that is model.ErrBusy.
-type hibernating struct{ id uuid.UUID }
+type hibernating struct{ id podid.ID }
 
 func (e hibernating) Error() string {
 	return "sandbox " + e.id.String() + " is hibernating; retry in a minute"

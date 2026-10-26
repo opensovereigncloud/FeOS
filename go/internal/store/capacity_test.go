@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -26,20 +27,20 @@ func TestBookingSums(t *testing.T) {
 	must(t, s.UpsertBooking(bg, store.Booking{PodID: b.ID, Node: "n1", VCPUs: 4, MemoryMiB: 1024, Gated: true}))
 	must(t, s.UpsertBooking(bg, store.Booking{PodID: c.ID, Node: "n2", VCPUs: 1, MemoryMiB: 256, Gated: false}))
 
-	sums := func(node string, exclude uuid.UUID) store.BookingSums {
+	sums := func(node string, exclude podid.ID) store.BookingSums {
 		t.Helper()
 		got, err := s.SumBookings(bg, node, exclude)
 		must(t, err)
 		return got
 	}
-	if got := sums("n1", uuid.Nil); got != (store.BookingSums{Count: 2, VCPUs: 6, MemoryMiB: 1536}) {
+	if got := sums("n1", ""); got != (store.BookingSums{Count: 2, VCPUs: 6, MemoryMiB: 1536}) {
 		t.Fatalf("n1: %+v", got)
 	}
 	// An admission of a rechecks against the others' bookings only.
 	if got := sums("n1", a.ID); got != (store.BookingSums{Count: 1, VCPUs: 4, MemoryMiB: 1024}) {
 		t.Fatalf("n1 without a: %+v", got)
 	}
-	if got := sums("n3", uuid.Nil); got != (store.BookingSums{}) {
+	if got := sums("n3", ""); got != (store.BookingSums{}) {
 		t.Fatalf("empty node: %+v", got)
 	}
 	all, err := s.SumAllBookings(bg, b.ID)
@@ -50,7 +51,7 @@ func TestBookingSums(t *testing.T) {
 
 	// A booking moves with its pod and replaces the old one.
 	must(t, s.UpsertBooking(bg, store.Booking{PodID: b.ID, Node: "n2", VCPUs: 4, MemoryMiB: 1024, Gated: false}))
-	if got := sums("n1", uuid.Nil); got.Count != 1 {
+	if got := sums("n1", ""); got.Count != 1 {
 		t.Fatalf("n1 after the move: %+v", got)
 	}
 	bk, err := s.GetBooking(bg, b.ID)
@@ -82,8 +83,8 @@ func TestPlacementSnapshot(t *testing.T) {
 	mkNode(t, s, "n3")
 	_, err := s.RemoveNode(bg, "n3")
 	must(t, err)
-	pod := mkSandboxID(t, s, "acme", uuid.MustParse("abcdef01-0000-4000-8000-000000000001"))
-	tap := mkSandboxID(t, s, "acme", uuid.MustParse("abcdef01-2222-4000-8000-000000000002"))
+	pod := mkSandboxID(t, s, "acme", "abcdef01-0000-4000-8000-000000000001")
+	tap := mkSandboxID(t, s, "acme", "abcdef01-2222-4000-8000-000000000002")
 	other := mkSandbox(t, s, "acme")
 	place(t, s, tap.ID, "n1", model.StateRunning)
 	must(t, s.UpsertBooking(bg, store.Booking{PodID: tap.ID, Node: "n1", VCPUs: 2, MemoryMiB: 512, Gated: true}))
@@ -105,7 +106,7 @@ func TestPlacementSnapshot(t *testing.T) {
 		n1.Booked != (store.BookingSums{Count: 2, VCPUs: 6, MemoryMiB: 2560}) || n1.Tombstoned || n1.TAPConflict != tap.ID {
 		t.Fatalf("n1 %+v", n1)
 	}
-	if n2.HasTelemetry || n2.Booked.Count != 0 || !n2.Tombstoned || n2.TAPConflict != uuid.Nil {
+	if n2.HasTelemetry || n2.Booked.Count != 0 || !n2.Tombstoned || !n2.TAPConflict.IsZero() {
 		t.Fatalf("n2 %+v", n2)
 	}
 	if n1.Node.VCPUCapacity() != 128 || n1.Node.MemoryCapacityMiB() != 31*1024 {
@@ -117,7 +118,7 @@ func TestTombstones(t *testing.T) {
 	s, _ := newStore(t)
 	mkNode(t, s, "n1")
 	mkNode(t, s, "n2")
-	pod := uuid.New()
+	pod := podid.Mint()
 	inc := uuid.New()
 	ts, err := s.UpsertTombstone(bg, store.Tombstone{PodID: pod, Node: "n1", Incarnation: inc, Reason: "deleted"})
 	must(t, err)
@@ -138,7 +139,7 @@ func TestTombstones(t *testing.T) {
 	if ok, err := s.HasTombstone(bg, pod, "n2"); err != nil || !ok {
 		t.Fatalf("HasTombstone n2: %v %v", ok, err)
 	}
-	if ok, _ := s.HasTombstone(bg, uuid.New(), "n1"); ok {
+	if ok, _ := s.HasTombstone(bg, podid.Mint(), "n1"); ok {
 		t.Fatal("HasTombstone of another pod")
 	}
 	// Only the one past its not_before is due.
@@ -269,7 +270,7 @@ func TestHolds(t *testing.T) {
 	if n, err := s.DeleteProcessHolds(bg, sb.ID); err != nil || n != 1 {
 		t.Fatalf("delete process holds: %d %v", n, err)
 	}
-	if err := s.AdmitHold(bg, uuid.New(), model.HoldExec, "i1", time.Minute); !errors.Is(err, model.ErrNotFound) {
+	if err := s.AdmitHold(bg, podid.Mint(), model.HoldExec, "i1", time.Minute); !errors.Is(err, model.ErrNotFound) {
 		t.Fatalf("hold of a missing sandbox: %v", err)
 	}
 }

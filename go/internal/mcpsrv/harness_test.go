@@ -19,13 +19,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/grpc/status"
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	"github.com/ironcore-dev/feos/go/internal/auth"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 	"github.com/ironcore-dev/feos/go/internal/tools"
@@ -285,7 +285,7 @@ func sseData(s string) []string {
 // started when one begins and ended when its context ended.
 func blockExec(env *toolstest.Env) (started, ended chan struct{}) {
 	started, ended = make(chan struct{}, 100), make(chan struct{}, 100)
-	env.Node.Script().SetExec(func(ctx context.Context, _ uuid.UUID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+	env.Node.Script().SetExec(func(ctx context.Context, _ podid.ID, _ *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
 		_ = out.Stdout([]byte("begun\n"))
 		started <- struct{}{}
 		<-ctx.Done()

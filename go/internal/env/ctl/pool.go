@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/google/uuid"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // poolWorkers is how many tasks the pool runs at once (§4.2: 8 per
@@ -98,12 +98,12 @@ func (p *pool) work() {
 func (p *pool) wait() { p.wg.Wait() }
 
 // ensureKey is the pool's key of a row's Ensure.
-func ensureKey(id uuid.UUID) string { return "ensure/" + id.String() }
+func ensureKey(id podid.ID) string { return "ensure/" + id.String() }
 
 // ensure queues Engine.Ensure of the row: it brings the row's pod up
 // (create, start, resume, restore). Its failure is logged; the next pass
 // sees the row as it is.
-func (c *Controller) ensure(ctx context.Context, id uuid.UUID) {
+func (c *Controller) ensure(ctx context.Context, id podid.ID) {
 	c.pool.run(ctx, ensureKey(id), func(ctx context.Context) {
 		if _, err := c.d.Engine.Ensure(ctx, id); err != nil && ctx.Err() == nil {
 			c.log.Debug("an instance did not come up", "sandbox", id, "err", err)

@@ -25,6 +25,7 @@ import (
 	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
 	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
 	"github.com/ironcore-dev/feos/go/internal/activity"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -145,7 +146,7 @@ func (s *Service) ingest(ctx context.Context, node string, startID uuid.UUID, b 
 		}
 		dropped := clampInt64(b.GetDropped())
 		budget := max(0, dropped-ns.Dropped)
-		in := ingestion{s: s, tx: tx, node: node, startID: startID, attr: map[uuid.UUID]attribution{}}
+		in := ingestion{s: s, tx: tx, node: node, startID: startID, attr: map[podid.ID]attribution{}}
 		prev := ns.LastSeq
 		for _, ev := range b.GetEvents() {
 			seq := int64(ev.GetSeq())
@@ -190,7 +191,7 @@ type ingestion struct {
 	tx       *store.Store
 	node     string
 	startID  uuid.UUID
-	attr     map[uuid.UUID]attribution
+	attr     map[podid.ID]attribution
 	acts     []store.ActivityRow
 	traffic  []store.TrafficRow
 	gaps     [][2]int64
@@ -204,17 +205,17 @@ type ingestion struct {
 // podID is its sandbox's (§8 "Attribution"): the row exists and the pod is
 // or was on this node. Otherwise the record is foreign: kept for the
 // node's audit, never shown on a sandbox.
-func (in *ingestion) attribute(ctx context.Context, podID string) (uuid.UUID, attribution, error) {
-	id, err := uuid.Parse(podID)
+func (in *ingestion) attribute(ctx context.Context, podID string) (podid.ID, attribution, error) {
+	id, err := podid.Parse(podID)
 	if err != nil {
-		return uuid.Nil, attribution{}, nil
+		return "", attribution{}, nil
 	}
 	if a, ok := in.attr[id]; ok {
 		return id, a, nil
 	}
 	a, ok, err := in.tx.AttributePod(ctx, id, in.node)
 	if err != nil {
-		return uuid.Nil, attribution{}, err
+		return "", attribution{}, err
 	}
 	in.attr[id] = attribution{Attribution: a, ok: ok}
 	return id, in.attr[id], nil
@@ -228,7 +229,7 @@ func (in *ingestion) row(ev *fleetv1.Event, source, kind, category, name string,
 	}
 }
 
-func (r *attribution) apply(row *store.ActivityRow, podID uuid.UUID) {
+func (r *attribution) apply(row *store.ActivityRow, podID podid.ID) {
 	row.PodID = podID
 	if r.ok {
 		row.SandboxID, row.TenantID = r.SandboxID, activity.Clean(r.TenantID)
@@ -367,14 +368,14 @@ func (in *ingestion) store(ctx context.Context) error {
 // nor an op targeting it. Events about pods without a row request
 // nothing: the inventory hash and the sweep catch ferund's orphans.
 func (s *Service) afterIngest(ctx context.Context, node string, b *fleetv1.EventBatch) {
-	var ids []uuid.UUID
-	seen := map[uuid.UUID]bool{}
+	var ids []podid.ID
+	seen := map[podid.ID]bool{}
 	for _, ev := range b.GetEvents() {
 		pe := ev.GetPod()
 		if pe == nil {
 			continue
 		}
-		id, err := uuid.Parse(pe.GetPodId())
+		id, err := podid.Parse(pe.GetPodId())
 		if err != nil {
 			continue
 		}

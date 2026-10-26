@@ -282,8 +282,10 @@ export const api = {
   // As the tenant.
   listSandboxes: () => tenantCall('GET', '/sandboxes'),
   // vcpus and memoryMib 0: the platform's default size.
-  createSandbox: (sandboxId, image, vcpus = 0, memoryMib = 0) =>
-    tenantCall('POST', '/sandboxes', { sandboxId, image, vcpus, memoryMib }),
+  // ferund mints the new sandbox's ID (ADR 0019): the answer's
+  // status.sandboxId.
+  createSandbox: (image, vcpus = 0, memoryMib = 0) =>
+    tenantCall('POST', '/sandboxes', { image, vcpus, memoryMib }),
   deleteSandbox: (sandboxId) => tenantCall('DELETE', `/sandboxes/${enc(sandboxId)}`),
   pauseSandbox: (sandboxId) => tenantCall('POST', `/sandboxes/${enc(sandboxId)}/pause`),
   resumeSandbox: (sandboxId) => tenantCall('POST', `/sandboxes/${enc(sandboxId)}/resume`),

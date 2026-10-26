@@ -13,9 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/ironcore-dev/feos/go/internal/apierr"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -136,24 +135,19 @@ func queryBool(r *http.Request, name string) (bool, error) {
 	return b, nil
 }
 
-// errNotUUID is the answer to a sandbox ID that is not a UUID.
-func errNotUUID() error { return apierr.New(http.StatusBadRequest, "sandboxId must be a UUID") }
-
-// parseSandboxID parses a sandbox ID: a UUID in its hyphenated form, in
-// either case (rendered in lowercase from then on).
-func parseSandboxID(s string) (uuid.UUID, error) {
-	if len(s) != 36 {
-		return uuid.Nil, errNotUUID()
-	}
-	id, err := uuid.Parse(s)
+// parseSandboxID parses a sandbox ID (ADR 0019): a short ID, or the UUID
+// of a sandbox made before, in its hyphenated form in either case
+// (rendered in lowercase from then on).
+func parseSandboxID(s string) (podid.ID, error) {
+	id, err := podid.Parse(s)
 	if err != nil {
-		return uuid.Nil, errNotUUID()
+		return "", apierr.New(http.StatusBadRequest, apierr.MsgSandboxID)
 	}
 	return id, nil
 }
 
 // pathSandboxID is the {id} of the path as a sandbox ID.
-func pathSandboxID(r *http.Request) (uuid.UUID, error) {
+func pathSandboxID(r *http.Request) (podid.ID, error) {
 	return parseSandboxID(r.PathValue("id"))
 }
 

@@ -27,6 +27,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/ports"
 	"github.com/ironcore-dev/feos/go/internal/sandbox"
 	"github.com/ironcore-dev/feos/go/internal/store"
@@ -53,6 +54,12 @@ func TestImageServiceRollingAndScale(t *testing.T) {
 	if v1[0].Instance.Replica != 0 || v1[1].Instance.Replica != 1 || v1[0].Sandbox.IdleAfterS == nil ||
 		*v1[0].Sandbox.IdleAfterS != 0 || v1[0].Sandbox.MemoryMiB != 512 || v1[0].Sandbox.VCPUs != 1 {
 		t.Fatalf("v1 rows %+v", v1)
+	}
+	// The controller mints its replicas' IDs short (ADR 0019).
+	for _, r := range v1 {
+		if id := r.Sandbox.ID; !podid.Valid(id.String()) || id.IsLegacy() || r.Instance.SandboxID != id {
+			t.Fatalf("replica %d has the ID %q", r.Instance.Replica, id)
+		}
 	}
 	oldHash := v1[0].Instance.TemplateHash
 
@@ -212,7 +219,7 @@ func TestCrashLoopAndRolloutFailure(t *testing.T) {
 
 	// A release whose new instance crashes fails; the old one serves on.
 	r2 := h.apply(env.ID, serviceSpec(1, "2", ""))
-	var newID uuid.UUID
+	var newID podid.ID
 	for i := 1; i <= 3; i++ {
 		eventually(t, 30*time.Second, "the new instance running", func() bool {
 			for _, r := range h.rowsOf(env.ID, spec.KindService, "web") {
@@ -319,7 +326,7 @@ func TestReadinessPhases(t *testing.T) {
 	// exec: exit 1, then 0.
 	var code atomic.Int32
 	code.Store(1)
-	n1.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	n1.Script().SetExec(func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		if len(req.Command) > 0 && req.Command[0] == "check" {
 			return code.Load(), true, nil
 		}
@@ -348,7 +355,7 @@ func TestRolloutCountsLiveInstances(t *testing.T) {
 	n1 := h.addNode("n1")
 	var code atomic.Int32
 	code.Store(1)
-	n1.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	n1.Script().SetExec(func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		if len(req.Command) > 0 && req.Command[0] == "check" {
 			return code.Load(), true, nil
 		}
@@ -413,7 +420,8 @@ func TestRestartWaitsForALiveReplica(t *testing.T) {
 	h := newHarness(t, options{timings: func(t *timings) { t.restartReady = 300 * time.Millisecond }})
 	// An environment without a release, whose rows the controller leaves.
 	env := h.newEnv("stage")
-	id := uuid.New()
+	// A row made before ADR 0019, with a UUID.
+	id := podid.ID(uuid.NewString())
 	idle := 0
 	if _, _, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: testTenant, Image: testImage, VCPUs: 1,
 		MemoryMiB: 512, EnvironmentID: env.ID, PodTemplate: &model.PodTemplate{
@@ -468,7 +476,7 @@ func TestUnknownIdleNotWoken(t *testing.T) {
 		return nil
 	})
 	h.exec(`UPDATE sandboxes SET client_state = 'unknown' WHERE id = ANY($1)`,
-		[]uuid.UUID{web.Sandbox.ID, idler.Sandbox.ID})
+		[]podid.ID{web.Sandbox.ID, idler.Sandbox.ID})
 	h.waitRows(env.ID, spec.KindService, "web", 1, 30*time.Second, "running again", running)
 	never(t, 3*time.Second, "the idle replica was ensured", func() bool {
 		sb, _ := h.st.GetSandbox(bg, idler.Sandbox.ID)
@@ -490,7 +498,7 @@ func TestUnknownIdleNotWoken(t *testing.T) {
 
 // crash makes an instance's container exit n times (each once the
 // container runs again), its restarts counting from restarts.
-func crash(t *testing.T, h *harness, n *testnode.Node, envID, id uuid.UUID, restarts, times int) {
+func crash(t *testing.T, h *harness, n *testnode.Node, envID uuid.UUID, id podid.ID, restarts, times int) {
 	t.Helper()
 	for i := 1; i <= times; i++ {
 		eventually(t, 30*time.Second, "the container running", func() bool {

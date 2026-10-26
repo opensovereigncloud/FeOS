@@ -2,8 +2,8 @@ TABLE activity PARTITION BY RANGE (day)
   COLUMN day date NOT NULL DEFAULT ((now() AT TIME ZONE 'utc'::text))::date
   COLUMN id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
   COLUMN ts_ns bigint NOT NULL
-  COLUMN sandbox_id uuid
-  COLUMN pod_id uuid
+  COLUMN sandbox_id text COLLATE "C"
+  COLUMN pod_id text COLLATE "C"
   COLUMN foreign_pod boolean NOT NULL DEFAULT false
   COLUMN tenant_id text NOT NULL DEFAULT ''::text
   COLUMN node text NOT NULL DEFAULT ''::text
@@ -24,6 +24,8 @@ TABLE activity PARTITION BY RANGE (day)
   COLUMN output text NOT NULL DEFAULT ''::text
   COLUMN output_truncated boolean NOT NULL DEFAULT false
   COLUMN detail jsonb NOT NULL DEFAULT '{}'::jsonb
+  CONSTRAINT CHECK ((pod_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
+  CONSTRAINT CHECK ((sandbox_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT CHECK ((source = ANY (ARRAY['ferund'::text, 'feosd'::text, 'authn'::text])))
   CONSTRAINT PRIMARY KEY (day, id)
   CREATE INDEX activity_authn ON ONLY public.activity USING btree (sandbox_id, kind, ts_ns) WHERE (source = 'authn'::text)
@@ -43,7 +45,7 @@ TABLE auth_logins
   CONSTRAINT PRIMARY KEY (state_hash)
   CREATE UNIQUE INDEX auth_logins_pkey ON public.auth_logins USING btree (state_hash)
 TABLE bookings
-  COLUMN pod_id uuid NOT NULL
+  COLUMN pod_id text COLLATE "C" NOT NULL
   COLUMN node text NOT NULL
   COLUMN vcpus integer NOT NULL
   COLUMN memory_mib integer NOT NULL
@@ -64,7 +66,7 @@ TABLE cluster_secrets
 TABLE env_attached
   COLUMN env_id uuid NOT NULL
   COLUMN service text NOT NULL
-  COLUMN sandbox_id uuid NOT NULL
+  COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN sandbox_incarnation uuid
   COLUMN template_hash text NOT NULL DEFAULT ''::text
   COLUMN process_id text NOT NULL DEFAULT ''::text
@@ -79,6 +81,7 @@ TABLE env_attached
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
   CONSTRAINT CHECK ((phase = ANY (ARRAY['starting'::text, 'ready'::text, 'unready'::text, 'exited'::text, 'failed'::text])))
+  CONSTRAINT CHECK ((sandbox_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
   CONSTRAINT PRIMARY KEY (env_id, service)
   CREATE INDEX env_attached_sandbox ON public.env_attached USING btree (sandbox_id)
@@ -100,7 +103,7 @@ TABLE env_incidents
   CREATE UNIQUE INDEX env_incidents_open ON public.env_incidents USING btree (env_id, object, release, condition) WHERE (closed_at IS NULL)
   CREATE UNIQUE INDEX env_incidents_pkey ON public.env_incidents USING btree (id)
 TABLE env_instances
-  COLUMN sandbox_id uuid NOT NULL
+  COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN env_id uuid NOT NULL
   COLUMN kind text NOT NULL
   COLUMN object text NOT NULL
@@ -135,7 +138,7 @@ TABLE env_job_runs
   COLUMN template_hash text NOT NULL
   COLUMN release integer NOT NULL
   COLUMN attempt integer NOT NULL DEFAULT 1
-  COLUMN sandbox_id uuid
+  COLUMN sandbox_id text COLLATE "C"
   COLUMN phase text NOT NULL DEFAULT 'running'::text
   COLUMN exit_code integer
   COLUMN detail text NOT NULL DEFAULT ''::text
@@ -144,6 +147,7 @@ TABLE env_job_runs
   COLUMN finished_at timestamp with time zone
   CONSTRAINT CHECK ((attempt >= 1))
   CONSTRAINT CHECK ((phase = ANY (ARRAY['running'::text, 'succeeded'::text, 'failed'::text])))
+  CONSTRAINT CHECK ((sandbox_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
   CONSTRAINT PRIMARY KEY (id)
   CREATE INDEX env_job_runs_job ON public.env_job_runs USING btree (env_id, job, id)
@@ -216,12 +220,13 @@ TABLE env_volumes
   COLUMN size_mib integer NOT NULL
   COLUMN node text NOT NULL DEFAULT ''::text
   COLUMN provisioned boolean NOT NULL DEFAULT false
-  COLUMN holder uuid
+  COLUMN holder text COLLATE "C"
   COLUMN addon_type text NOT NULL DEFAULT ''::text
   COLUMN data_version text NOT NULL DEFAULT ''::text
   COLUMN deleting boolean NOT NULL DEFAULT false
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK ((holder ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT CHECK ((size_mib > 0))
   CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id)
   CONSTRAINT PRIMARY KEY (env_id, object)
@@ -270,7 +275,7 @@ TABLE instances
   CREATE UNIQUE INDEX instances_pkey ON public.instances USING btree (id)
 TABLE issued_certs
   COLUMN serial text NOT NULL
-  COLUMN pod_id uuid NOT NULL
+  COLUMN pod_id text COLLATE "C" NOT NULL
   COLUMN incarnation uuid NOT NULL
   COLUMN node text NOT NULL
   COLUMN spiffe_id text NOT NULL
@@ -278,6 +283,7 @@ TABLE issued_certs
   COLUMN bindings_version text NOT NULL DEFAULT ''::text
   COLUMN not_after timestamp with time zone NOT NULL
   COLUMN issued_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK ((pod_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT PRIMARY KEY (serial)
   CREATE INDEX issued_certs_pod ON public.issued_certs USING btree (pod_id, issued_at)
   CREATE UNIQUE INDEX issued_certs_pkey ON public.issued_certs USING btree (serial)
@@ -299,7 +305,7 @@ TABLE join_tokens
   CREATE UNIQUE INDEX join_tokens_id_key ON public.join_tokens USING btree (id)
   CREATE UNIQUE INDEX join_tokens_pkey ON public.join_tokens USING btree (hash)
 TABLE kube_bindings
-  COLUMN sandbox_id uuid NOT NULL
+  COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN name text NOT NULL
   COLUMN port integer NOT NULL
   COLUMN server text NOT NULL
@@ -415,17 +421,6 @@ TABLE nodes
   CONSTRAINT UNIQUE (mesh_subnet)
   CREATE UNIQUE INDEX nodes_mesh_subnet_key ON public.nodes USING btree (mesh_subnet)
   CREATE UNIQUE INDEX nodes_pkey ON public.nodes USING btree (name)
-TABLE placements
-  COLUMN id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
-  COLUMN pod_id uuid NOT NULL
-  COLUMN chosen_node text NOT NULL
-  COLUMN candidates jsonb NOT NULL
-  COLUMN trigger text NOT NULL DEFAULT ''::text
-  COLUMN instance_id text NOT NULL
-  COLUMN at timestamp with time zone NOT NULL DEFAULT now()
-  CONSTRAINT PRIMARY KEY (id)
-  CREATE INDEX placements_pod ON public.placements USING btree (pod_id, at)
-  CREATE UNIQUE INDEX placements_pkey ON public.placements USING btree (id)
 TABLE pod_network
   COLUMN id boolean NOT NULL DEFAULT true
   COLUMN ula cidr NOT NULL
@@ -437,7 +432,7 @@ TABLE pod_network
   CONSTRAINT PRIMARY KEY (id)
   CREATE UNIQUE INDEX pod_network_pkey ON public.pod_network USING btree (id)
 TABLE pod_tombstones
-  COLUMN pod_id uuid NOT NULL
+  COLUMN pod_id text COLLATE "C" NOT NULL
   COLUMN node text NOT NULL
   COLUMN incarnation uuid NOT NULL
   COLUMN reason text NOT NULL DEFAULT ''::text
@@ -446,12 +441,13 @@ TABLE pod_tombstones
   COLUMN attempts integer NOT NULL DEFAULT 0
   COLUMN last_error text NOT NULL DEFAULT ''::text
   COLUMN last_attempt_at timestamp with time zone
+  CONSTRAINT CHECK ((pod_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT FOREIGN KEY (node) REFERENCES nodes(name)
   CONSTRAINT PRIMARY KEY (pod_id, node, incarnation)
   CREATE INDEX pod_tombstones_node ON public.pod_tombstones USING btree (node, not_before)
   CREATE UNIQUE INDEX pod_tombstones_pkey ON public.pod_tombstones USING btree (pod_id, node, incarnation)
 TABLE sandbox_holds
-  COLUMN sandbox_id uuid NOT NULL
+  COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN holder text NOT NULL
   COLUMN kind text NOT NULL
   COLUMN instance_id text NOT NULL DEFAULT ''::text
@@ -463,7 +459,7 @@ TABLE sandbox_holds
   CREATE UNIQUE INDEX sandbox_holds_pkey ON public.sandbox_holds USING btree (sandbox_id, holder)
 TABLE sandbox_tokens
   COLUMN hash text NOT NULL
-  COLUMN sandbox_id uuid NOT NULL
+  COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN label text NOT NULL DEFAULT ''::text
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN last_used_at timestamp with time zone
@@ -472,7 +468,7 @@ TABLE sandbox_tokens
   CREATE INDEX sandbox_tokens_sandbox ON public.sandbox_tokens USING btree (sandbox_id, created_at)
   CREATE UNIQUE INDEX sandbox_tokens_pkey ON public.sandbox_tokens USING btree (hash)
 TABLE sandboxes
-  COLUMN id uuid NOT NULL
+  COLUMN id text COLLATE "C" NOT NULL
   COLUMN incarnation uuid NOT NULL DEFAULT gen_random_uuid()
   COLUMN owner text NOT NULL
   COLUMN image text NOT NULL
@@ -518,6 +514,7 @@ TABLE sandboxes
   CONSTRAINT CHECK (((op = ''::text) = (op_id IS NULL)))
   CONSTRAINT CHECK (((vcpus >= 1) AND (vcpus <= 32)))
   CONSTRAINT CHECK ((client_state = ANY (ARRAY['pending'::text, 'creating'::text, 'running'::text, 'pausing'::text, 'paused'::text, 'resuming'::text, 'hibernating'::text, 'hibernated'::text, 'stopped'::text, 'failed'::text, 'unknown'::text, 'lost'::text])))
+  CONSTRAINT CHECK ((id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT CHECK ((idle_after_s >= 0))
   CONSTRAINT CHECK ((op = ANY (ARRAY[''::text, 'create'::text, 'start'::text, 'resume'::text, 'restore'::text, 'pause'::text, 'hibernate'::text, 'repair'::text])))
   CONSTRAINT FOREIGN KEY (environment_id) REFERENCES environments(id)
@@ -533,7 +530,7 @@ TABLE sandboxes
   CREATE INDEX sandboxes_op ON public.sandboxes USING btree (op_owner, op_deadline) WHERE (op <> ''::text)
   CREATE INDEX sandboxes_owner ON public.sandboxes USING btree (owner, created_at)
   CREATE INDEX sandboxes_paused ON public.sandboxes USING btree (paused_at) WHERE ((client_state = 'paused'::text) AND (op = ''::text))
-  CREATE INDEX sandboxes_tap ON public.sandboxes USING btree (node, "left"((id)::text, 8)) WHERE (node IS NOT NULL)
+  CREATE INDEX sandboxes_tap ON public.sandboxes USING btree (node, "left"(id, 8)) WHERE ((node IS NOT NULL) AND (length(id) = 36))
   CREATE UNIQUE INDEX sandboxes_pkey ON public.sandboxes USING btree (id)
 TABLE schema_migrations
   COLUMN version integer NOT NULL
@@ -541,7 +538,7 @@ TABLE schema_migrations
   CONSTRAINT PRIMARY KEY (version)
   CREATE UNIQUE INDEX schema_migrations_pkey ON public.schema_migrations USING btree (version)
 TABLE ssh_bindings
-  COLUMN sandbox_id uuid NOT NULL
+  COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN name text NOT NULL
   COLUMN server text NOT NULL
   COLUMN ssh_user text NOT NULL
@@ -580,14 +577,16 @@ TABLE traffic_records PARTITION BY RANGE (day)
   COLUMN node text NOT NULL
   COLUMN start_id uuid NOT NULL
   COLUMN seq bigint NOT NULL
-  COLUMN pod_id uuid
-  COLUMN sandbox_id uuid
+  COLUMN pod_id text COLLATE "C"
+  COLUMN sandbox_id text COLLATE "C"
   COLUMN foreign_pod boolean NOT NULL DEFAULT false
   COLUMN tenant_id text NOT NULL DEFAULT ''::text
   COLUMN kind text NOT NULL
   COLUMN missed bigint NOT NULL DEFAULT 0
   COLUMN detail jsonb NOT NULL
   CONSTRAINT CHECK ((kind = ANY (ARRAY['flow'::text, 'drop'::text, 'dns'::text, 'server_name'::text])))
+  CONSTRAINT CHECK ((pod_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
+  CONSTRAINT CHECK ((sandbox_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT PRIMARY KEY (day, id)
   CREATE INDEX traffic_node_foreign ON ONLY public.traffic_records USING btree (node, ts_ns, id) WHERE (sandbox_id IS NULL)
   CREATE INDEX traffic_sandbox ON ONLY public.traffic_records USING btree (sandbox_id, ts_ns) WHERE (sandbox_id IS NOT NULL)
@@ -612,7 +611,7 @@ TABLE ui_sessions
   CREATE UNIQUE INDEX ui_sessions_pkey ON public.ui_sessions USING btree (id_hash)
 TABLE watches
   COLUMN id uuid NOT NULL
-  COLUMN sandbox_id uuid NOT NULL
+  COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN container text NOT NULL DEFAULT 'main'::text
   COLUMN paths text[] NOT NULL DEFAULT '{}'::text[]
   COLUMN gen bigint NOT NULL DEFAULT 0

@@ -13,6 +13,7 @@ import (
 
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -59,10 +60,14 @@ func mkNode(t *testing.T, s *store.Store, name string) {
 
 func mkSandbox(t *testing.T, s *store.Store, owner string) store.Sandbox {
 	t.Helper()
-	return mkSandboxID(t, s, owner, uuid.New())
+	return mkSandboxID(t, s, owner, podid.Mint())
 }
 
-func mkSandboxID(t *testing.T, s *store.Store, owner string, id uuid.UUID) store.Sandbox {
+// legacyID is a new sandbox ID in the format of a sandbox made before ADR
+// 0019: a UUID in lowercase.
+func legacyID() podid.ID { return podid.ID(uuid.NewString()) }
+
+func mkSandboxID(t *testing.T, s *store.Store, owner string, id podid.ID) store.Sandbox {
 	t.Helper()
 	sb, created, err := s.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: owner, Image: "alpine", VCPUs: 2, MemoryMiB: 512})
 	if err != nil || !created {
@@ -72,19 +77,19 @@ func mkSandboxID(t *testing.T, s *store.Store, owner string, id uuid.UUID) store
 }
 
 // place puts a sandbox on node in state, without an op.
-func place(t *testing.T, s *store.Store, id uuid.UUID, node, state string) {
+func place(t *testing.T, s *store.Store, id podid.ID, node, state string) {
 	t.Helper()
 	exec(t, s, "UPDATE sandboxes SET node = $2, client_state = $3 WHERE id = $1", id, node, state)
 }
 
 // startOp puts an op in flight on a sandbox, owned by owner.
-func startOp(t *testing.T, s *store.Store, id uuid.UUID, op, owner, target string, deadline time.Duration) {
+func startOp(t *testing.T, s *store.Store, id podid.ID, op, owner, target string, deadline time.Duration) {
 	t.Helper()
 	exec(t, s, `UPDATE sandboxes SET op = $2, op_id = gen_random_uuid(), op_owner = $3, op_target = $4,
 		op_deadline = now() + $5::interval WHERE id = $1`, id, op, owner, target, fmt.Sprintf("%d microseconds", deadline.Microseconds()))
 }
 
-func get(t *testing.T, s *store.Store, id uuid.UUID) store.Sandbox {
+func get(t *testing.T, s *store.Store, id podid.ID) store.Sandbox {
 	t.Helper()
 	sb, err := s.GetSandbox(bg, id)
 	if err != nil {

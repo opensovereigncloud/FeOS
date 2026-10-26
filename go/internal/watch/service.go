@@ -14,6 +14,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -21,7 +22,7 @@ import (
 // (*sandbox.Engine): a read of a sandbox's state and node that never wakes
 // it.
 type Sandboxes interface {
-	State(ctx context.Context, id uuid.UUID) (state, node string, err error)
+	State(ctx context.Context, id podid.ID) (state, node string, err error)
 }
 
 // timings are the watches' limits and periods; tests shorten them.
@@ -92,7 +93,7 @@ type Service struct {
 	// owned are the watches this instance owns, by id.
 	owned map[uuid.UUID]*owned
 	// links counts the guest streams per sandbox (the cap).
-	links map[uuid.UUID]int
+	links map[podid.ID]int
 	// ending is closed by EndStreams.
 	ending  chan struct{}
 	endOnce sync.Once
@@ -108,7 +109,7 @@ func New(s Sandboxes, conns nodelink.Conns, d *db.DB, instanceID string, log *sl
 		sb: s, conns: conns, db: d, st: store.New(d), id: instanceID, log: log, rl: newRateLog(log),
 		t:      defaultTimings(),
 		owned:  map[uuid.UUID]*owned{},
-		links:  map[uuid.UUID]int{},
+		links:  map[podid.ID]int{},
 		ending: make(chan struct{}),
 	}
 	svc.base, svc.cancelBase = context.WithCancel(context.Background())
@@ -315,7 +316,7 @@ func (s *Service) ownedAs(row store.Watch) *owned {
 
 // takeLinkSlot takes one of the sandbox's guest-stream slots on this
 // instance; false when they are all taken.
-func (s *Service) takeLinkSlot(sandbox uuid.UUID) bool {
+func (s *Service) takeLinkSlot(sandbox podid.ID) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.links[sandbox] >= s.t.perSandbox {
@@ -325,7 +326,7 @@ func (s *Service) takeLinkSlot(sandbox uuid.UUID) bool {
 	return true
 }
 
-func (s *Service) releaseLinkSlot(sandbox uuid.UUID) {
+func (s *Service) releaseLinkSlot(sandbox podid.ID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.links[sandbox] <= 1 {

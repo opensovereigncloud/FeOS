@@ -23,11 +23,12 @@ import (
 	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // tkey names a pool: a sandbox's pod and one of its ports.
 type tkey struct {
-	id   uuid.UUID
+	id   podid.ID
 	port int
 }
 
@@ -141,7 +142,7 @@ func (h *Handler) retireWhere(match func(e *entry) bool) {
 // closeIdleOf closes the idle connections of every pool of a sandbox,
 // retired ones included: their Forward streams hold slots of the
 // sandbox's cap.
-func (h *Handler) closeIdleOf(id uuid.UUID) {
+func (h *Handler) closeIdleOf(id podid.ID) {
 	var idle []*http.Transport
 	h.mu.Lock()
 	for _, e := range h.transports {
@@ -320,7 +321,7 @@ var errCapFull = errors.New("too many forwarded connections into the sandbox on 
 
 // takeSlot takes one of the sandbox's slots, waiting up to capWait (or
 // ctx) for one, and returns its release.
-func (h *Handler) takeSlot(ctx context.Context, id uuid.UUID) (func(), error) {
+func (h *Handler) takeSlot(ctx context.Context, id podid.ID) (func(), error) {
 	h.mu.Lock()
 	c := h.caps[id]
 	if c == nil {
@@ -375,7 +376,7 @@ func (h *Handler) takeSlot(ctx context.Context, id uuid.UUID) (func(), error) {
 // taken. The probe slots are apart from the stream cap: a check neither
 // takes nor waits for a slot of the cap, nor closes pooled connections
 // for one.
-func (h *Handler) tryProbeSlot(id uuid.UUID) (func(), bool) {
+func (h *Handler) tryProbeSlot(id podid.ID) (func(), bool) {
 	h.mu.Lock()
 	c := h.probes[id]
 	if c == nil {

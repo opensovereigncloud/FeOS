@@ -29,6 +29,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -213,7 +214,7 @@ func (h *harness) failNextOp(before func()) {
 // settle waits until the nodes' events are acknowledged and their syncs
 // ran, and syncs the sandbox once more: nothing from earlier ops arrives
 // after it.
-func (h *harness) settle(id uuid.UUID) {
+func (h *harness) settle(id podid.ID) {
 	h.t.Helper()
 	eventually(h.t, 10*time.Second, "events acknowledged", func() bool {
 		h.mu.Lock()
@@ -327,10 +328,14 @@ const testImage = "docker.io/library/alpine@sha256:4bcff63911fcb4448bd4fdacec207
 
 // sandbox inserts a sandbox of the test tenant.
 func (h *harness) sandbox(memoryMiB int) store.Sandbox {
-	return h.sandboxWithID(uuid.New(), memoryMiB)
+	return h.sandboxWithID(podid.Mint(), memoryMiB)
 }
 
-func (h *harness) sandboxWithID(id uuid.UUID, memoryMiB int) store.Sandbox {
+// legacyID is a new UUID as a pod ID: the ID of a sandbox made before ADR
+// 0019, which keeps it.
+func legacyID() podid.ID { return podid.ID(uuid.NewString()) }
+
+func (h *harness) sandboxWithID(id podid.ID, memoryMiB int) store.Sandbox {
 	h.t.Helper()
 	sb, created, err := h.st.CreateSandbox(bg, store.NewSandbox{ID: id, Owner: testTenant, Image: testImage, VCPUs: 1,
 		MemoryMiB: memoryMiB})
@@ -340,7 +345,7 @@ func (h *harness) sandboxWithID(id uuid.UUID, memoryMiB int) store.Sandbox {
 	return sb
 }
 
-func (h *harness) row(id uuid.UUID) store.Sandbox {
+func (h *harness) row(id podid.ID) store.Sandbox {
 	h.t.Helper()
 	sb, err := h.st.GetSandbox(bg, id)
 	if err != nil {
@@ -351,7 +356,7 @@ func (h *harness) row(id uuid.UUID) store.Sandbox {
 
 // ensure runs Ensure on the first instance and fails the test on an
 // error.
-func (h *harness) ensure(id uuid.UUID) model.Lease {
+func (h *harness) ensure(id podid.ID) model.Lease {
 	h.t.Helper()
 	ctx, cancel := context.WithTimeout(bg, 60*time.Second)
 	defer cancel()
@@ -385,7 +390,7 @@ func (h *harness) scalar(dst any, sql string, args ...any) {
 }
 
 // waitState waits until the sandbox is in state without an op.
-func (h *harness) waitState(id uuid.UUID, state string, within time.Duration) store.Sandbox {
+func (h *harness) waitState(id podid.ID, state string, within time.Duration) store.Sandbox {
 	h.t.Helper()
 	var sb store.Sandbox
 	eventually(h.t, within, fmt.Sprintf("sandbox %s %s", id, state), func() bool {
@@ -397,7 +402,7 @@ func (h *harness) waitState(id uuid.UUID, state string, within time.Duration) st
 }
 
 // podState waits until node holds the pod in state.
-func (h *harness) podState(node string, id uuid.UUID, state podv1.PodState) *podv1.PodInfo {
+func (h *harness) podState(node string, id podid.ID, state podv1.PodState) *podv1.PodInfo {
 	h.t.Helper()
 	var info *podv1.PodInfo
 	eventually(h.t, 15*time.Second, fmt.Sprintf("pod %s %s on %s", id, state, node), func() bool {
@@ -409,7 +414,7 @@ func (h *harness) podState(node string, id uuid.UUID, state podv1.PodState) *pod
 }
 
 // noPod waits until node does not hold the pod.
-func (h *harness) noPod(node string, id uuid.UUID) {
+func (h *harness) noPod(node string, id podid.ID) {
 	h.t.Helper()
 	eventually(h.t, 15*time.Second, fmt.Sprintf("pod %s gone from %s", id, node), func() bool {
 		_, err := h.pods(node).GetPod(bg, &podv1.GetPodRequest{PodId: id.String()})
@@ -418,7 +423,7 @@ func (h *harness) noPod(node string, id uuid.UUID) {
 }
 
 // booking returns the sandbox's booking, and false without one.
-func (h *harness) booking(id uuid.UUID) (store.Booking, bool) {
+func (h *harness) booking(id podid.ID) (store.Booking, bool) {
 	h.t.Helper()
 	b, err := h.st.GetBooking(bg, id)
 	if errors.Is(err, store.ErrNoRow) {
@@ -430,7 +435,7 @@ func (h *harness) booking(id uuid.UUID) (store.Booking, bool) {
 	return b, true
 }
 
-func (h *harness) tombstones(id uuid.UUID) []store.Tombstone {
+func (h *harness) tombstones(id podid.ID) []store.Tombstone {
 	h.t.Helper()
 	ts, err := h.st.TombstonesOfPod(bg, id)
 	if err != nil {
@@ -611,7 +616,7 @@ func (h *harness) hibernatingAtUpload(node string) (sb store.Sandbox, hd *OpHand
 
 // hibernation is the hibernation in flight that node reports of the pod;
 // nil without one.
-func (h *harness) hibernation(node string, id uuid.UUID) *podv1.Hibernation {
+func (h *harness) hibernation(node string, id podid.ID) *podv1.Hibernation {
 	h.t.Helper()
 	info, err := h.pods(node).GetPod(bg, &podv1.GetPodRequest{PodId: id.String()})
 	if err != nil {
@@ -622,7 +627,7 @@ func (h *harness) hibernation(node string, id uuid.UUID) *podv1.Hibernation {
 
 // wantHibernation checks the hibernation in flight that node reports of
 // the pod.
-func (h *harness) wantHibernation(node string, id uuid.UUID, phase podv1.HibernationPhase, abandonable bool, requestIDs ...string) {
+func (h *harness) wantHibernation(node string, id podid.ID, phase podv1.HibernationPhase, abandonable bool, requestIDs ...string) {
 	h.t.Helper()
 	hb := h.hibernation(node, id)
 	if hb == nil || hb.GetPhase() != phase || hb.GetAbandonable() != abandonable {
@@ -637,7 +642,7 @@ func (h *harness) wantHibernation(node string, id uuid.UUID, phase podv1.Hiberna
 
 // runOrigin waits for the start of the sandbox's open run in the activity
 // log and returns its origin.
-func (h *harness) runOrigin(id uuid.UUID) string {
+func (h *harness) runOrigin(id podid.ID) string {
 	h.t.Helper()
 	run := h.row(id).RunID
 	if run == "" {
@@ -654,7 +659,7 @@ func (h *harness) runOrigin(id uuid.UUID) string {
 
 // placements waits until the sandbox's activity has want rows of kind
 // placement written by instance ("": by any), the audit of its placements.
-func (h *harness) placements(id uuid.UUID, instance string, want int) {
+func (h *harness) placements(id podid.ID, instance string, want int) {
 	h.t.Helper()
 	got := -1
 	eventually(h.t, 10*time.Second, fmt.Sprintf("%d placements of sandbox %s", want, id), func() bool {
@@ -666,7 +671,7 @@ func (h *harness) placements(id uuid.UUID, instance string, want int) {
 
 // activityNamed waits until the sandbox's activity has a row of kind named
 // name, and returns its detail.
-func (h *harness) activityNamed(id uuid.UUID, kind, name string) map[string]any {
+func (h *harness) activityNamed(id podid.ID, kind, name string) map[string]any {
 	h.t.Helper()
 	var detail map[string]any
 	eventually(h.t, 10*time.Second, fmt.Sprintf("activity %s %q", kind, name), func() bool {

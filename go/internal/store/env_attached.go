@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // EnvAttached is a row of env_attached: an attached service, a supervised
@@ -19,7 +20,7 @@ import (
 type EnvAttached struct {
 	EnvID     uuid.UUID
 	Service   string
-	SandboxID uuid.UUID // the tenant's sandbox it runs in (no foreign key)
+	SandboxID podid.ID // the tenant's sandbox it runs in (no foreign key)
 	// SandboxIncarnation is the incarnation of the sandbox the service
 	// last used (its process started in, or recorded with); a new one
 	// under the same ID starts the service anew (§13.6). uuid.Nil: NULL.
@@ -99,7 +100,7 @@ func (s *Store) ListAttached(ctx context.Context, envID uuid.UUID) ([]EnvAttache
 
 // AttachedOfSandbox returns the attached services running in the sandbox,
 // of every environment, by environment and name.
-func (s *Store) AttachedOfSandbox(ctx context.Context, sandboxID uuid.UUID) ([]EnvAttached, error) {
+func (s *Store) AttachedOfSandbox(ctx context.Context, sandboxID podid.ID) ([]EnvAttached, error) {
 	return collectAttached(s.q.Query(ctx, "SELECT "+attachedCols+` FROM env_attached
 		WHERE sandbox_id = $1 ORDER BY env_id, service`, sandboxID))
 }

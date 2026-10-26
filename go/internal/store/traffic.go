@@ -12,7 +12,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // TrafficRow is a row of traffic_records: a pod's traffic record from a
@@ -24,8 +25,8 @@ type TrafficRow struct {
 	Node       string
 	StartID    uuid.UUID
 	Seq        int64
-	PodID      uuid.UUID // as sent
-	SandboxID  uuid.UUID // the attributed sandbox; uuid.Nil for a foreign record
+	PodID      podid.ID // as sent
+	SandboxID  podid.ID // the attributed sandbox; "" for a foreign record
 	ForeignPod bool
 	TenantID   string
 	Kind       string // flow, drop, dns, server_name
@@ -41,7 +42,7 @@ const trafficCols = "day, id, " + trafficInsertCols
 // column. Its text is the same for every batch size, so each connection
 // prepares and caches it once.
 const insertTrafficSQL = `INSERT INTO traffic_records (` + trafficInsertCols + `)
-	SELECT * FROM unnest($1::bigint[], $2::text[], $3::uuid[], $4::bigint[], $5::uuid[], $6::uuid[],
+	SELECT * FROM unnest($1::bigint[], $2::text[], $3::uuid[], $4::bigint[], $5::text[], $6::text[],
 		$7::boolean[], $8::text[], $9::text[], $10::bigint[], $11::jsonb[])
 	ON CONFLICT DO NOTHING`
 
@@ -56,13 +57,13 @@ func (s *Store) InsertTraffic(ctx context.Context, rows ...TrafficRow) error {
 			node, tenantID    = make([]string, n), make([]string, n)
 			kind, detail      = make([]string, n), make([]string, n)
 			startID           = make([]uuid.UUID, n)
-			podID, sandboxID  = make([]pgtype.UUID, n), make([]pgtype.UUID, n)
+			podID, sandboxID  = make([]*string, n), make([]*string, n)
 			foreignPod        = make([]bool, n)
 		)
 		for i, r := range chunk {
 			tsNs[i], seq[i], missed[i] = r.TsNs, r.Seq, r.Missed
 			node[i], tenantID[i], kind[i], detail[i] = r.Node, r.TenantID, r.Kind, jsonObject(r.Detail)
-			startID[i], podID[i], sandboxID[i] = r.StartID, uuidOrNull(r.PodID), uuidOrNull(r.SandboxID)
+			startID[i], podID[i], sandboxID[i] = r.StartID, idOrNull(r.PodID), idOrNull(r.SandboxID)
 			foreignPod[i] = r.ForeignPod
 		}
 		if _, err := s.q.Exec(ctx, insertTrafficSQL, tsNs, node, startID, seq, podID, sandboxID, foreignPod,
@@ -75,13 +76,13 @@ func (s *Store) InsertTraffic(ctx context.Context, rows ...TrafficRow) error {
 
 func scanTraffic(row pgx.Row) (TrafficRow, error) {
 	var r TrafficRow
-	var podID, sandboxID *uuid.UUID
+	var podID, sandboxID *podid.ID
 	var detail []byte
 	if err := row.Scan(&r.Day, &r.ID, &r.TsNs, &r.Node, &r.StartID, &r.Seq, &podID, &sandboxID, &r.ForeignPod,
 		&r.TenantID, &r.Kind, &r.Missed, &detail); err != nil {
 		return TrafficRow{}, err
 	}
-	r.PodID, r.SandboxID = uuidOf(podID), uuidOf(sandboxID)
+	r.PodID, r.SandboxID = idOf(podID), idOf(sandboxID)
 	r.Detail = json.RawMessage(detail)
 	return r, nil
 }
@@ -125,7 +126,7 @@ const (
 
 // ListSandboxTraffic returns a page of a sandbox's attributed traffic
 // records (Source of q is ignored), ascending by ts_ns.
-func (s *Store) ListSandboxTraffic(ctx context.Context, sandboxID uuid.UUID, q ActivityQuery) ([]TrafficRow, error) {
+func (s *Store) ListSandboxTraffic(ctx context.Context, sandboxID podid.ID, q ActivityQuery) ([]TrafficRow, error) {
 	return s.listTraffic(ctx, sandboxTrafficWhere, sandboxID, q)
 }
 

@@ -14,6 +14,7 @@ import (
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -94,7 +95,7 @@ func (e *Engine) prepareHook() PrepareHook {
 // never takes the DeletePod and RestorePod branch). reason is the op's
 // description. It returns once the op began; the op's outcome arrives as
 // the row's state.
-func (e *Engine) Restart(ctx context.Context, id uuid.UUID, reason string) error {
+func (e *Engine) Restart(ctx context.Context, id podid.ID, reason string) error {
 	row, err := e.st.GetSandbox(ctx, id)
 	if err != nil {
 		return err

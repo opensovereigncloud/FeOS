@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -262,9 +263,9 @@ func TestEnvCtlQueries(t *testing.T) {
 	}
 
 	// Which environments and sandboxes exist.
-	gone := uuid.New()
-	envs, sbs, err := s.EnvCtlExisting(bg, []uuid.UUID{env.ID, gone}, []uuid.UUID{sbx.ID, gone})
-	if err != nil || !envs[env.ID] || envs[gone] || !sbs[sbx.ID] || sbs[gone] {
+	gone, goneSbx, goneLegacy := uuid.New(), podid.Mint(), legacyID()
+	envs, sbs, err := s.EnvCtlExisting(bg, []uuid.UUID{env.ID, gone}, []podid.ID{sbx.ID, goneSbx, goneLegacy})
+	if err != nil || !envs[env.ID] || envs[gone] || !sbs[sbx.ID] || sbs[goneSbx] || sbs[goneLegacy] {
 		t.Fatalf("existing %v %v %v", envs, sbs, err)
 	}
 	if envs, sbs, err := s.EnvCtlExisting(bg, nil, nil); err != nil || len(envs) != 0 || len(sbs) != 0 {

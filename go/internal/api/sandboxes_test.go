@@ -14,11 +14,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -51,15 +52,14 @@ func keysInOrder(t *testing.T, raw []byte) []string {
 
 var rfc3339Seconds = regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$`)
 
-// A create inserts the row and its first token in one go: 201 with the
-// whole status and the token once; a repeat by the owner is a 200 without
-// a token and keeps the size; another tenant's ID is a 409.
+// A create inserts the row under an ID ferund mints (ADR 0019) and its
+// first token in one go: 201 with the whole status, which carries the ID,
+// and the token once. Every create makes a new sandbox.
 func TestCreateSandbox(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
-	id := strings.ToUpper("0199f0a2-7b1c-7d3e-8f00-1234567890ab")
 	w := e.do("POST", "/api/v1/sandboxes", bearerOf(e.tenantToken),
-		map[string]any{"sandboxId": id, "image": "img:1", "vcpus": 4, "memoryMib": 1024})
+		map[string]any{"image": "img:1", "vcpus": 4, "memoryMib": 1024})
 	expect(t, w, http.StatusCreated, "")
 	var created struct {
 		Status  json.RawMessage `json:"status"`
@@ -81,8 +81,11 @@ func TestCreateSandbox(t *testing.T) {
 	if err := json.Unmarshal(created.Status, &st); err != nil {
 		t.Fatal(err)
 	}
-	lower := strings.ToLower(id)
-	want := map[string]any{"sandboxId": lower, "state": "pending", "image": "img:1", "node": "", "owner": testTenant,
+	id, _ := st["sandboxId"].(string)
+	if pid, err := podid.Parse(id); err != nil || pid.IsLegacy() || pid.String() != id {
+		t.Fatalf("sandboxId %q is not a short ID: %v", id, err)
+	}
+	want := map[string]any{"sandboxId": id, "state": "pending", "image": "img:1", "node": "", "owner": testTenant,
 		"desiredState": "active", "clientState": "pending", "statusDescription": "awaiting first tool call",
 		"checkpointEpoch": "0", "checkpointHead": "", "checkpointAt": "", "vcpus": 4.0, "memoryMib": 1024.0}
 	for k, v := range want {
@@ -100,7 +103,7 @@ func TestCreateSandbox(t *testing.T) {
 	}
 	// The token works at once on a sandbox route.
 	sb, err := ResolveSandboxToken(context.Background(), e.st.Q(), created.Token)
-	if err != nil || sb.ID.String() != lower || sb.Owner != testTenant {
+	if err != nil || sb.ID.String() != id || sb.Owner != testTenant {
 		t.Fatalf("resolve: %+v %v", sb, err)
 	}
 	toks, err := e.st.ListSandboxTokens(context.Background(), sb.ID)
@@ -108,56 +111,51 @@ func TestCreateSandbox(t *testing.T) {
 		t.Fatalf("tokens %+v %v", toks, err)
 	}
 
-	// A repeat: 200, no token, the size kept.
-	w = e.do("POST", "/api/v1/sandboxes", bearerOf(e.tenantToken), map[string]any{"sandboxId": lower, "vcpus": 8})
-	expect(t, w, http.StatusOK, "")
-	if got := keysInOrder(t, w.Body.Bytes()); strings.Join(got, ",") != "status,created" {
-		t.Fatalf("repeat keys %v", got)
-	}
-	again := decode[struct {
-		Status struct {
-			Vcpus int `json:"vcpus"`
-		} `json:"status"`
-		Created bool `json:"created"`
-	}](t, w)
-	if again.Created || again.Status.Vcpus != 4 {
-		t.Fatalf("repeat %+v", again)
-	}
-
-	// Another tenant's ID.
-	other := e.mintTenantToken(mustTenant(t, e, "other"))
-	w = e.do("POST", "/api/v1/sandboxes", bearerOf(other), map[string]any{"sandboxId": lower})
-	expect(t, w, http.StatusConflict, errBody("sandbox id "+lower+" already exists"))
-
-	// A minted ID is a version 4 UUID; the defaults fill in.
-	w = e.do("POST", "/api/v1/sandboxes", bearerOf(e.tenantToken), "")
-	expect(t, w, http.StatusCreated, "")
-	minted := decode[struct {
-		Status struct {
-			SandboxID string `json:"sandboxId"`
-			Image     string `json:"image"`
-			Vcpus     int    `json:"vcpus"`
-			MemoryMib int    `json:"memoryMib"`
-		} `json:"status"`
-	}](t, w)
-	u, err := uuid.Parse(minted.Status.SandboxID)
-	if err != nil || u.Version() != 4 || minted.Status.Image != "ghcr.io/maltej/debian-ai:latest" ||
-		minted.Status.Vcpus != 2 || minted.Status.MemoryMib != 512 {
-		t.Fatalf("minted %+v", minted.Status)
+	// Another create, without a body: a new sandbox with a new ID and
+	// token; the defaults fill in. A sandboxId of null or "" names none.
+	seen := map[string]bool{id: true}
+	for _, body := range []any{"", map[string]any{"sandboxId": nil}, map[string]any{"sandboxId": ""}} {
+		w = e.do("POST", "/api/v1/sandboxes", bearerOf(e.tenantToken), body)
+		expect(t, w, http.StatusCreated, "")
+		minted := decode[struct {
+			Status struct {
+				SandboxID string `json:"sandboxId"`
+				Image     string `json:"image"`
+				Vcpus     int    `json:"vcpus"`
+				MemoryMib int    `json:"memoryMib"`
+			} `json:"status"`
+			Token   string `json:"token"`
+			Created bool   `json:"created"`
+		}](t, w)
+		pid, err := podid.Parse(minted.Status.SandboxID)
+		if err != nil || pid.IsLegacy() || seen[minted.Status.SandboxID] || !minted.Created || minted.Token == "" ||
+			minted.Status.Image != "ghcr.io/maltej/debian-ai:latest" || minted.Status.Vcpus != 2 || minted.Status.MemoryMib != 512 {
+			t.Fatalf("minted %+v", minted)
+		}
+		seen[minted.Status.SandboxID] = true
 	}
 }
+
+// clientIDMsg is the refusal of a create that names an ID.
+const clientIDMsg = "sandboxId is not accepted: ferund mints a sandbox's ID; leave it out and keep status.sandboxId of the answer"
 
 // The texts of a create's refusals.
 func TestCreateSandboxRefusals(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
+	existing, _ := e.createSandbox()
 	for _, c := range []struct {
 		body   any
 		status int
 		msg    string
 	}{
-		{map[string]any{"sandboxId": "sb-1"}, 400, "sandboxId must be a UUID"},
-		{map[string]any{"sandboxId": "0199f0a27b1c7d3e8f001234567890ab"}, 400, "sandboxId must be a UUID"},
+		// A client names no ID (ADR 0019): any sandboxId is refused, also
+		// one that is valid, or one that exists.
+		{map[string]any{"sandboxId": "sb-1"}, 400, clientIDMsg},
+		{map[string]any{"sandboxId": "0199f0a2-7b1c-7d3e-8f00-1234567890ab"}, 400, clientIDMsg},
+		{map[string]any{"sandboxId": "abcdefghjkm", "image": "img"}, 400, clientIDMsg},
+		{map[string]any{"sandboxId": 7}, 400, clientIDMsg},
+		{map[string]any{"sandboxId": existing}, 400, clientIDMsg},
 		{map[string]any{"vcpus": 33}, 400, "vcpus must be between 1 and 32 (0 = default 2)"},
 		{map[string]any{"vcpus": -1}, 400, "vcpus must be between 1 and 32 (0 = default 2)"},
 		{map[string]any{"memoryMib": 128}, 400, "memoryMib must be between 256 and 65536 (0 = default 512)"},
@@ -176,7 +174,7 @@ func TestCreateSandboxRefusals(t *testing.T) {
 func TestTenantScoping(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
-	id, tok := e.createSandbox("")
+	id, tok := e.createSandbox()
 	other := e.mintTenantToken(mustTenant(t, e, "other"))
 	for _, c := range []struct{ method, path string }{
 		{"GET", "/api/v1/sandboxes/" + id},
@@ -194,8 +192,8 @@ func TestTenantScoping(t *testing.T) {
 		expect(t, w, http.StatusUnauthorized, errBody("unknown tenant token"))
 	}
 	w := e.do("GET", "/api/v1/sandboxes/sb-1", bearerOf(e.tenantToken), nil)
-	expect(t, w, http.StatusBadRequest, errBody("sandboxId must be a UUID"))
-	w = e.do("GET", "/api/v1/sandboxes/"+uuid.NewString(), "Basic eDp5", nil)
+	expect(t, w, http.StatusBadRequest, errBody(apierr.MsgSandboxID))
+	w = e.do("GET", "/api/v1/sandboxes/"+podid.Mint().String(), "Basic eDp5", nil)
 	expect(t, w, http.StatusUnauthorized, errBody("tenant bearer required"))
 
 	// The list holds only the tenant's.
@@ -210,7 +208,7 @@ func TestTenantScoping(t *testing.T) {
 	}
 
 	// Sandbox routes: the token must be the path's sandbox's.
-	id2, tok2 := e.createSandbox("")
+	id2, tok2 := e.createSandbox()
 	for _, c := range []struct {
 		authz  string
 		status int
@@ -233,8 +231,8 @@ func TestTenantScoping(t *testing.T) {
 func TestSandboxTokens(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
-	id, first := e.createSandbox("")
-	id2, other := e.createSandbox("")
+	id, first := e.createSandbox()
+	id2, other := e.createSandbox()
 	w := e.do("POST", "/api/v1/sandboxes/"+id+"/tokens", bearerOf(e.tenantToken), map[string]any{"label": "fecode-backend"})
 	expect(t, w, http.StatusCreated, "")
 	if got := keysInOrder(t, w.Body.Bytes()); strings.Join(got, ",") != "token,hashPrefix,createdAt" {
@@ -282,7 +280,7 @@ func TestSandboxTokens(t *testing.T) {
 	if _, err := ResolveSandboxToken(context.Background(), e.st.Q(), other); err != nil {
 		t.Fatal(err)
 	}
-	w = e.do("POST", "/api/v1/sandboxes/"+uuid.NewString()+"/tokens", bearerOf(e.tenantToken), nil)
+	w = e.do("POST", "/api/v1/sandboxes/"+podid.Mint().String()+"/tokens", bearerOf(e.tenantToken), nil)
 	expect(t, w, http.StatusNotFound, "")
 	_ = id2
 }
@@ -293,7 +291,7 @@ func TestStatusRendering(t *testing.T) {
 	t.Parallel()
 	created := time.Date(2026, 1, 2, 3, 4, 5, 600, time.UTC)
 	row := store.Sandbox{
-		ID: uuid.MustParse("0199f0a2-7b1c-7d3e-8f00-1234567890ab"), Owner: "acme", Image: "img", ClientState: "hibernated",
+		ID: podid.ID("0199f0a2-7b1c-7d3e-8f00-1234567890ab"), Owner: "acme", Image: "img", ClientState: "hibernated",
 		StatusDescription: "x", Node: "n1", CheckpointEpoch: 1 << 40, CheckpointHead: "h", VCPUs: 3, MemoryMiB: 768,
 		CreatedAt: created, UpdatedAt: created.Add(time.Minute), LastActiveAt: created.Add(time.Hour),
 		CheckpointAt: created.Add(2 * time.Hour),
@@ -321,7 +319,7 @@ func TestStatusRendering(t *testing.T) {
 func TestPauseResume(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{})
-	id, _ := e.createSandbox("")
+	id, _ := e.createSandbox()
 	w := e.do("POST", "/api/v1/sandboxes/"+id+"/pause", bearerOf(e.tenantToken), nil)
 	expect(t, w, http.StatusOK, "")
 	if st := decode[sandboxStatus](t, w); st.ClientState != "pending" || st.SandboxID != id {
@@ -406,7 +404,7 @@ func TestToolRouteErrors(t *testing.T) {
 			t.Parallel()
 			e := newEnv(t, envOptions{sandboxes: &fakeSandboxes{err: c.acquireErr, lease: model.Lease{Node: "n1"}}})
 			e.conns.connErr = c.connErr
-			id, tok := e.createSandbox("")
+			id, tok := e.createSandbox()
 			w := e.do("POST", "/api/v1/sandboxes/"+id+"/exec", bearerOf(tok), map[string]any{"command": "true"})
 			expect(t, w, http.StatusBadGateway, c.body)
 			if got := w.Header().Get("Retry-After"); got != c.retryAfter {
@@ -443,12 +441,12 @@ func TestListTools(t *testing.T) {
 }
 
 // Delete removes the row at once: the answer is the status read with
-// desiredState deleted; a create of the same ID right after is a new
-// sandbox with a token that resolves.
+// desiredState deleted; a create right after is a new sandbox under a new
+// ID with a token that resolves.
 func TestDeleteRecreate(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOptions{realEngine: true})
-	id, tok := e.createSandbox("")
+	id, tok := e.createSandbox()
 	w := e.do("DELETE", "/api/v1/sandboxes/"+id, bearerOf(e.tenantToken), nil)
 	expect(t, w, http.StatusOK, "")
 	st := decode[sandboxStatus](t, w)
@@ -463,8 +461,8 @@ func TestDeleteRecreate(t *testing.T) {
 		t.Fatalf("old token: %v", err)
 	}
 
-	again, tok2 := e.createSandbox(id)
-	if again != id || tok2 == tok {
+	again, tok2 := e.createSandbox()
+	if again == id || tok2 == tok {
 		t.Fatalf("re-create %s %s", again, tok2)
 	}
 	if _, err := ResolveSandboxToken(context.Background(), e.st.Q(), tok2); err != nil {
@@ -476,7 +474,7 @@ func TestDeleteRecreate(t *testing.T) {
 	if _, err := e.st.InsertNode(context.Background(), "n1"); err != nil {
 		t.Fatal(err)
 	}
-	row, err := e.st.GetSandbox(context.Background(), uuid.MustParse(id))
+	row, err := e.st.GetSandbox(context.Background(), podid.ID(again))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,10 +486,83 @@ func TestDeleteRecreate(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	w = e.do("DELETE", "/api/v1/sandboxes/"+id, bearerOf(e.tenantToken), nil)
+	w = e.do("DELETE", "/api/v1/sandboxes/"+again, bearerOf(e.tenantToken), nil)
 	expect(t, w, http.StatusOK, "")
 	st = decode[sandboxStatus](t, w)
 	if st.ClientState != "absent" || st.State != "absent" || st.Node != "n1" || st.DesiredState != "deleted" {
 		t.Fatalf("delete answer %+v", st)
+	}
+}
+
+// A sandbox made before ADR 0019 keeps its UUID until it is deleted: the
+// routes serve it beside sandboxes with short IDs, by its ID in either
+// case, and its token opens its sandbox routes.
+func TestLegacySandboxID(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, envOptions{})
+	ctx := context.Background()
+	legacy := podid.ID("0199f0a2-7b1c-7d3e-8f00-1234567890ab")
+	if _, created, err := e.st.CreateSandbox(ctx, store.NewSandbox{ID: legacy, Owner: testTenant, Image: "img",
+		VCPUs: 1, MemoryMiB: 512}); err != nil || !created {
+		t.Fatalf("legacy row: %v %v", created, err)
+	}
+	tok, hash, err := mintSandboxToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.st.CreateSandboxToken(ctx, hash, legacy, firstTokenLabel); err != nil {
+		t.Fatal(err)
+	}
+	short, _ := e.createSandbox()
+
+	for _, path := range []string{legacy.String(), strings.ToUpper(legacy.String())} {
+		w := e.do("GET", "/api/v1/sandboxes/"+path, bearerOf(e.tenantToken), nil)
+		expect(t, w, http.StatusOK, "")
+		if st := decode[sandboxStatus](t, w); st.SandboxID != legacy.String() {
+			t.Fatalf("GET %s: %+v", path, st)
+		}
+	}
+	w := e.do("GET", "/api/v1/sandboxes", bearerOf(e.tenantToken), nil)
+	list := decode[struct {
+		Sandboxes []map[string]any `json:"sandboxes"`
+	}](t, w)
+	if len(list.Sandboxes) != 2 || list.Sandboxes[0]["sandboxId"] != legacy.String() || list.Sandboxes[1]["sandboxId"] != short {
+		t.Fatalf("list %+v", list)
+	}
+	w = e.do("GET", "/api/v1/sandboxes/"+legacy.String()+"/tokens", bearerOf(e.tenantToken), nil)
+	expect(t, w, http.StatusOK, "")
+
+	// Its token is its sandbox's, whatever the case of the path's ID; the
+	// exec gets past the class to the engine, which has no sandbox here.
+	sb, err := ResolveSandboxToken(ctx, e.st.Q(), tok)
+	if err != nil || sb.ID != legacy {
+		t.Fatalf("resolve: %+v %v", sb, err)
+	}
+	for _, path := range []string{legacy.String(), strings.ToUpper(legacy.String())} {
+		w = e.do("POST", "/api/v1/sandboxes/"+path+"/exec", bearerOf(tok), map[string]any{"command": "true"})
+		if w.Code == http.StatusNotFound || w.Code == http.StatusBadRequest {
+			t.Fatalf("exec on %s: %d %s", path, w.Code, w.Body)
+		}
+	}
+	w = e.do("POST", "/api/v1/sandboxes/"+short+"/exec", bearerOf(tok), map[string]any{"command": "true"})
+	expect(t, w, http.StatusNotFound, errBody("no such sandbox"))
+
+	w = e.do("DELETE", "/api/v1/sandboxes/"+legacy.String(), bearerOf(e.tenantToken), nil)
+	expect(t, w, http.StatusOK, "")
+	w = e.do("GET", "/api/v1/sandboxes/"+legacy.String(), bearerOf(e.tenantToken), nil)
+	expect(t, w, http.StatusNotFound, errBody("unknown sandbox "+legacy.String()))
+}
+
+// A path's sandbox ID is a short ID or a UUID; anything else is a 400.
+func TestSandboxIDFormats(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, envOptions{})
+	for _, bad := range []string{"sb-1", "ABCDEFGHJKM", "0bcdefghjkm", "abcdefghjkl", "0199f0a27b1c7d3e8f001234567890ab"} {
+		w := e.do("GET", "/api/v1/sandboxes/"+bad, bearerOf(e.tenantToken), nil)
+		expect(t, w, http.StatusBadRequest, errBody(apierr.MsgSandboxID))
+	}
+	for _, unknown := range []string{"abcdefghjkm", "0199f0a2-7b1c-7d3e-8f00-1234567890ab"} {
+		w := e.do("GET", "/api/v1/sandboxes/"+unknown, bearerOf(e.tenantToken), nil)
+		expect(t, w, http.StatusNotFound, errBody("unknown sandbox "+unknown))
 	}
 }

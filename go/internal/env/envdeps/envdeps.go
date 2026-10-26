@@ -19,6 +19,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/tools"
 )
@@ -30,26 +31,26 @@ import (
 type Engine interface {
 	// Ensure brings the row's pod up (create, start, resume, restore) and
 	// returns its lease; it may take the preparation budget (7 m 5 s).
-	Ensure(ctx context.Context, id uuid.UUID) (model.Lease, error)
+	Ensure(ctx context.Context, id podid.ID) (model.Lease, error)
 	// Delete deletes the row of owner and its pod (through tombstones): the
 	// row as it was, and whether there was one.
-	Delete(ctx context.Context, owner string, id uuid.UUID) (store.Sandbox, bool, error)
+	Delete(ctx context.Context, owner string, id podid.ID) (store.Sandbox, bool, error)
 	// Restart restarts a running row's pod (a repair op with the trigger
 	// restart: StopPod and StartPod), for an instance whose container
 	// exited; reason becomes the op's description.
-	Restart(ctx context.Context, id uuid.UUID, reason string) error
+	Restart(ctx context.Context, id podid.ID, reason string) error
 	// ResolveImage pins an image to its digest
 	// ("<registry>/<repo>@sha256:…").
 	ResolveImage(ctx context.Context, image string) (string, error)
 	// Acquire ensures the row runs and holds it awake with a hold of kind
 	// until release is called (it wakes a paused or hibernated row).
-	Acquire(ctx context.Context, id uuid.UUID, kind model.HoldKind) (lease model.Lease, release func(), err error)
+	Acquire(ctx context.Context, id podid.ID, kind model.HoldKind) (lease model.Lease, release func(), err error)
 	// Touch counts as activity of the row (it postpones its idle pause).
-	Touch(id uuid.UUID)
+	Touch(id podid.ID)
 	// Sync reads the row's pod from its node and records what it finds.
-	Sync(ctx context.Context, id uuid.UUID) error
+	Sync(ctx context.Context, id podid.ID) error
 	// State reads the row's client state and node; it never wakes it.
-	State(ctx context.Context, id uuid.UUID) (state, node string, err error)
+	State(ctx context.Context, id podid.ID) (state, node string, err error)
 }
 
 // Runner is what the environments run in a pod's main container
@@ -97,7 +98,7 @@ type Ports interface {
 	// refused. upstreamPath and rawPath are the path the pod sees (rawPath
 	// its escaped form, "" when it needs none); the query is kept. It
 	// writes the answer, errors too (plain text).
-	ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID uuid.UUID, port int, upstreamPath, rawPath string,
+	ForwardTo(w http.ResponseWriter, r *http.Request, sandboxID podid.ID, port int, upstreamPath, rawPath string,
 		credentials []string)
 }
 

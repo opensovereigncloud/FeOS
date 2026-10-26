@@ -33,6 +33,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
@@ -186,14 +187,14 @@ func New(t testing.TB, o Options) *Env {
 // none of.
 type hooks struct{}
 
-func (hooks) PodChanged(string, uuid.UUID)                         {}
+func (hooks) PodChanged(string, podid.ID)                          {}
 func (hooks) ReconcileNode(context.Context, string) error          { return nil }
 func (hooks) RegistryHash(context.Context, string) (string, error) { return "", nil }
 
 // Sandbox is a request's sandbox that no database knows: for tests that
 // need none.
 func Sandbox() auth.Sandbox {
-	id := uuid.New()
+	id := podid.Mint()
 	return auth.Sandbox{ID: id, Owner: Tenant, TokenHash: store.HashToken(id.String())}
 }
 
@@ -201,7 +202,7 @@ func Sandbox() auth.Sandbox {
 // how a request with its token names it.
 func (e *Env) NewSandbox() auth.Sandbox {
 	e.t.Helper()
-	id := uuid.New()
+	id := podid.Mint()
 	if _, _, err := e.Store.CreateSandbox(context.Background(), store.NewSandbox{
 		ID: id, Owner: Tenant, Image: "test", VCPUs: 1, MemoryMiB: 512,
 	}); err != nil {
@@ -220,7 +221,7 @@ func (e *Env) Pods(ctx context.Context) (podv1.PodServiceClient, error) {
 }
 
 // PodState is the state of the sandbox's pod on the node.
-func (e *Env) PodState(ctx context.Context, id uuid.UUID) (podv1.PodState, error) {
+func (e *Env) PodState(ctx context.Context, id podid.ID) (podv1.PodState, error) {
 	pods, err := e.Pods(ctx)
 	if err != nil {
 		return 0, err
@@ -234,7 +235,7 @@ func (e *Env) PodState(ctx context.Context, id uuid.UUID) (podv1.PodState, error
 
 // Activity returns the sandbox's activity rows once at least n are stored,
 // waiting up to 10 s for the recorder to write them.
-func (e *Env) Activity(id uuid.UUID, n int) []store.ActivityRow {
+func (e *Env) Activity(id podid.ID, n int) []store.ActivityRow {
 	e.t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -257,41 +258,41 @@ type Engine struct {
 	env *Env
 
 	mu           sync.Mutex
-	acquireErrs  map[uuid.UUID][]error
-	stale        map[uuid.UUID]int
-	incarnations map[uuid.UUID]uuid.UUID
-	holds        map[uuid.UUID]int
-	calls        map[string]map[uuid.UUID]int
-	processes    map[uuid.UUID]map[string]time.Duration
-	released     map[uuid.UUID][]string
+	acquireErrs  map[podid.ID][]error
+	stale        map[podid.ID]int
+	incarnations map[podid.ID]uuid.UUID
+	holds        map[podid.ID]int
+	calls        map[string]map[podid.ID]int
+	processes    map[podid.ID]map[string]time.Duration
+	released     map[podid.ID][]string
 	syncErr      error
 }
 
 func newEngine(env *Env) *Engine {
 	return &Engine{
 		env:          env,
-		acquireErrs:  map[uuid.UUID][]error{},
-		stale:        map[uuid.UUID]int{},
-		incarnations: map[uuid.UUID]uuid.UUID{},
-		holds:        map[uuid.UUID]int{},
-		calls:        map[string]map[uuid.UUID]int{},
-		processes:    map[uuid.UUID]map[string]time.Duration{},
-		released:     map[uuid.UUID][]string{},
+		acquireErrs:  map[podid.ID][]error{},
+		stale:        map[podid.ID]int{},
+		incarnations: map[podid.ID]uuid.UUID{},
+		holds:        map[podid.ID]int{},
+		calls:        map[string]map[podid.ID]int{},
+		processes:    map[podid.ID]map[string]time.Duration{},
+		released:     map[podid.ID][]string{},
 	}
 }
 
-func (g *Engine) count(what string, id uuid.UUID) {
+func (g *Engine) count(what string, id podid.ID) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.calls[what] == nil {
-		g.calls[what] = map[uuid.UUID]int{}
+		g.calls[what] = map[podid.ID]int{}
 	}
 	g.calls[what][id]++
 }
 
 // Calls is how often the engine's method what ("Acquire", "Sync",
 // "WaitRunning", "Unreachable", "Reachable") was called for the sandbox.
-func (g *Engine) Calls(what string, id uuid.UUID) int {
+func (g *Engine) Calls(what string, id podid.ID) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.calls[what][id]
@@ -299,7 +300,7 @@ func (g *Engine) Calls(what string, id uuid.UUID) int {
 
 // FailAcquire makes the next Acquires of the sandbox fail with errs, in
 // turn; a nil error lets its Acquire succeed.
-func (g *Engine) FailAcquire(id uuid.UUID, errs ...error) {
+func (g *Engine) FailAcquire(id podid.ID, errs ...error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.acquireErrs[id] = append(g.acquireErrs[id], errs...)
@@ -307,7 +308,7 @@ func (g *Engine) FailAcquire(id uuid.UUID, errs ...error) {
 
 // Stale makes the next n Acquires of the sandbox hand out a lease without
 // looking at its pod: a lease that was true when the engine read it.
-func (g *Engine) Stale(id uuid.UUID, n int) {
+func (g *Engine) Stale(id podid.ID, n int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.stale[id] += n
@@ -321,14 +322,14 @@ func (g *Engine) FailSync(err error) {
 }
 
 // Holds is the number of the sandbox's exec holds not yet released.
-func (g *Engine) Holds(id uuid.UUID) int {
+func (g *Engine) Holds(id podid.ID) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.holds[id]
 }
 
 // Processes are the sandbox's process holds and their timeouts.
-func (g *Engine) Processes(id uuid.UUID) map[string]time.Duration {
+func (g *Engine) Processes(id podid.ID) map[string]time.Duration {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	out := map[string]time.Duration{}
@@ -340,13 +341,13 @@ func (g *Engine) Processes(id uuid.UUID) map[string]time.Duration {
 
 // Released are the process ids whose holds ReleaseProcess was asked to
 // end, in order.
-func (g *Engine) Released(id uuid.UUID) []string {
+func (g *Engine) Released(id podid.ID) []string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return append([]string(nil), g.released[id]...)
 }
 
-func (g *Engine) lease(id uuid.UUID) model.Lease {
+func (g *Engine) lease(id podid.ID) model.Lease {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	inc, ok := g.incarnations[id]
@@ -357,7 +358,7 @@ func (g *Engine) lease(id uuid.UUID) model.Lease {
 	return model.Lease{SandboxID: id, Incarnation: inc, Node: NodeName}
 }
 
-func (g *Engine) Acquire(ctx context.Context, id uuid.UUID, kind model.HoldKind) (model.Lease, func(), error) {
+func (g *Engine) Acquire(ctx context.Context, id podid.ID, kind model.HoldKind) (model.Lease, func(), error) {
 	g.count("Acquire", id)
 	g.mu.Lock()
 	var scripted error
@@ -391,7 +392,7 @@ func (g *Engine) Acquire(ctx context.Context, id uuid.UUID, kind model.HoldKind)
 }
 
 // bringUp makes the sandbox's pod run on the node.
-func (g *Engine) bringUp(ctx context.Context, id uuid.UUID) error {
+func (g *Engine) bringUp(ctx context.Context, id podid.ID) error {
 	pods, err := g.env.Pods(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: %v", model.ErrNodeUnavailable, err)
@@ -416,7 +417,7 @@ func (g *Engine) bringUp(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-func (g *Engine) waitRunning(ctx context.Context, id uuid.UUID) (model.Lease, error) {
+func (g *Engine) waitRunning(ctx context.Context, id podid.ID) (model.Lease, error) {
 	for {
 		state, err := g.env.PodState(ctx, id)
 		if err != nil {
@@ -433,7 +434,7 @@ func (g *Engine) waitRunning(ctx context.Context, id uuid.UUID) (model.Lease, er
 	}
 }
 
-func (g *Engine) Sync(ctx context.Context, id uuid.UUID) error {
+func (g *Engine) Sync(ctx context.Context, id podid.ID) error {
 	g.count("Sync", id)
 	g.mu.Lock()
 	err := g.syncErr
@@ -441,15 +442,15 @@ func (g *Engine) Sync(ctx context.Context, id uuid.UUID) error {
 	return err
 }
 
-func (g *Engine) WaitRunning(ctx context.Context, id uuid.UUID) (model.Lease, error) {
+func (g *Engine) WaitRunning(ctx context.Context, id podid.ID) (model.Lease, error) {
 	g.count("WaitRunning", id)
 	return g.waitRunning(ctx, id)
 }
 
-func (g *Engine) Unreachable(id uuid.UUID) { g.count("Unreachable", id) }
-func (g *Engine) Reachable(id uuid.UUID)   { g.count("Reachable", id) }
+func (g *Engine) Unreachable(id podid.ID) { g.count("Unreachable", id) }
+func (g *Engine) Reachable(id podid.ID)   { g.count("Reachable", id) }
 
-func (g *Engine) HoldProcess(ctx context.Context, id uuid.UUID, processID string, timeout time.Duration) error {
+func (g *Engine) HoldProcess(ctx context.Context, id podid.ID, processID string, timeout time.Duration) error {
 	if processID == "" {
 		return errors.New("no process id")
 	}
@@ -462,7 +463,7 @@ func (g *Engine) HoldProcess(ctx context.Context, id uuid.UUID, processID string
 	return nil
 }
 
-func (g *Engine) ReleaseProcess(ctx context.Context, id uuid.UUID, processID string) error {
+func (g *Engine) ReleaseProcess(ctx context.Context, id podid.ID, processID string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.processes[id], processID)

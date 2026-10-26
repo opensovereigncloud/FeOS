@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/peer"
@@ -30,6 +29,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
 	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -186,7 +186,7 @@ func newFakeHooks() *fakeHooks {
 	return &fakeHooks{hashes: map[string]string{}, reconciles: make(chan string, 100)}
 }
 
-func (f *fakeHooks) PodChanged(node string, podID uuid.UUID) {
+func (f *fakeHooks) PodChanged(node string, podID podid.ID) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.changed = append(f.changed, node+" "+podID.String())
@@ -231,7 +231,7 @@ type fakeBindings struct {
 	err     error
 }
 
-func (f *fakeBindings) PodBindings(context.Context, uuid.UUID) (*fleetv1.PodBindings, string, error) {
+func (f *fakeBindings) PodBindings(context.Context, podid.ID) (*fleetv1.PodBindings, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.b, f.version, f.err

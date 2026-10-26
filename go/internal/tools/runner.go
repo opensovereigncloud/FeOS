@@ -27,6 +27,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
 	"github.com/ironcore-dev/feos/go/internal/nodelink"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -36,19 +37,19 @@ import (
 type Sandboxes interface {
 	// Acquire ensures the sandbox runs and holds it awake with a hold of
 	// kind until release is called.
-	Acquire(ctx context.Context, id uuid.UUID, kind model.HoldKind) (model.Lease, func(), error)
+	Acquire(ctx context.Context, id podid.ID, kind model.HoldKind) (model.Lease, func(), error)
 	// Sync reads the sandbox's pod from its node and records what it finds.
-	Sync(ctx context.Context, id uuid.UUID) error
+	Sync(ctx context.Context, id podid.ID) error
 	// WaitRunning waits until the sandbox's PENDING pod runs.
-	WaitRunning(ctx context.Context, id uuid.UUID) (model.Lease, error)
+	WaitRunning(ctx context.Context, id podid.ID) (model.Lease, error)
 	// Unreachable reports a running pod whose guest does not answer;
 	// Reachable one whose guest did.
-	Unreachable(id uuid.UUID)
-	Reachable(id uuid.UUID)
+	Unreachable(id podid.ID)
+	Reachable(id podid.ID)
 	// HoldProcess holds the sandbox awake for a background process, for
 	// timeout (0: without a limit); ReleaseProcess ends that hold.
-	HoldProcess(ctx context.Context, id uuid.UUID, processID string, timeout time.Duration) error
-	ReleaseProcess(ctx context.Context, id uuid.UUID, processID string) error
+	HoldProcess(ctx context.Context, id podid.ID, processID string, timeout time.Duration) error
+	ReleaseProcess(ctx context.Context, id podid.ID, processID string) error
 }
 
 // Fixed bounds of the Runner (§4, §10).
@@ -86,8 +87,8 @@ type Runner struct {
 	execCap        int
 
 	mu    sync.Mutex
-	calls map[uuid.UUID]map[*running]struct{} // the calls in flight on this instance, by sandbox
-	execs map[uuid.UUID]int                   // the exec streams open on this instance, by sandbox
+	calls map[podid.ID]map[*running]struct{} // the calls in flight on this instance, by sandbox
+	execs map[podid.ID]int                   // the exec streams open on this instance, by sandbox
 }
 
 // running is a call in flight, cancelled with ErrCancelled by a
@@ -106,8 +107,8 @@ func NewRunner(s Sandboxes, conns nodelink.Conns, rec *activity.Recorder, d *db.
 		sb: s, conns: conns, rec: rec, d: d, instanceID: instanceID, log: log, rl: newRateLog(log),
 		defaultTimeout: DefaultTimeout,
 		execCap:        execCap,
-		calls:          map[uuid.UUID]map[*running]struct{}{},
-		execs:          map[uuid.UUID]int{},
+		calls:          map[podid.ID]map[*running]struct{}{},
+		execs:          map[podid.ID]int{},
 	}
 	if d != nil {
 		r.st = store.New(d)
@@ -143,7 +144,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			if payload == "" || json.Unmarshal([]byte(payload), &p) != nil || p.Kind != "exec" {
 				continue
 			}
-			id, err := uuid.Parse(p.Sandbox)
+			id, err := podid.Parse(p.Sandbox)
 			if err != nil {
 				continue
 			}
@@ -156,7 +157,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 // cancelSandbox cancels the sandbox's calls in flight on this instance and
 // returns how many.
-func (r *Runner) cancelSandbox(id uuid.UUID) int {
+func (r *Runner) cancelSandbox(id podid.ID) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for c := range r.calls[id] {
@@ -166,7 +167,7 @@ func (r *Runner) cancelSandbox(id uuid.UUID) int {
 }
 
 // track registers a call in flight; the returned function removes it.
-func (r *Runner) track(id uuid.UUID, cancel context.CancelCauseFunc) func() {
+func (r *Runner) track(id podid.ID, cancel context.CancelCauseFunc) func() {
 	c := &running{cancel: cancel}
 	r.mu.Lock()
 	set := r.calls[id]
@@ -187,7 +188,7 @@ func (r *Runner) track(id uuid.UUID, cancel context.CancelCauseFunc) func() {
 }
 
 // takeExec takes one of the sandbox's exec slots on this instance.
-func (r *Runner) takeExec(id uuid.UUID) error {
+func (r *Runner) takeExec(id podid.ID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.execs[id] >= r.execCap {
@@ -197,7 +198,7 @@ func (r *Runner) takeExec(id uuid.UUID) error {
 	return nil
 }
 
-func (r *Runner) giveExec(id uuid.UUID) {
+func (r *Runner) giveExec(id podid.ID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.execs[id]--; r.execs[id] <= 0 {
@@ -289,7 +290,7 @@ func (r *Runner) callPrepared(ctx context.Context, sb auth.Sandbox, c *call, arg
 // attempts makes the call into the guest, and once more when the first
 // attempt found the pod elsewhere, not running or still starting. lease
 // and release follow a new Acquire.
-func (r *Runner) attempts(cctx context.Context, id uuid.UUID, lease *model.Lease, release *func(), c *call, o *output) (int, error) {
+func (r *Runner) attempts(cctx context.Context, id podid.ID, lease *model.Lease, release *func(), c *call, o *output) (int, error) {
 	for attempt := 0; ; attempt++ {
 		code, received, err := r.invoke(cctx, *lease, c, o)
 		if err == nil {
@@ -341,7 +342,7 @@ func (r *Runner) attempts(cctx context.Context, id uuid.UUID, lease *model.Lease
 
 // reacquire syncs the sandbox and acquires it anew, then releases the old
 // hold: the sandbox stays held throughout.
-func (r *Runner) reacquire(ctx context.Context, id uuid.UUID, lease *model.Lease, release *func()) error {
+func (r *Runner) reacquire(ctx context.Context, id podid.ID, lease *model.Lease, release *func()) error {
 	if err := r.sb.Sync(ctx, id); err != nil {
 		return fmt.Errorf("ensure sandbox: %w", err)
 	}
@@ -466,7 +467,7 @@ var errCallTimeout = errors.New("the call's deadline passed")
 // reset the stream before this side's timer fires, so that the call fails
 // as cancelled instead of as a timeout. Here only the control plane ends
 // the call, and its cause says why.
-func withLimit(ctx context.Context, podID uuid.UUID, timeout time.Duration) (actx context.Context, stop func()) {
+func withLimit(ctx context.Context, podID podid.ID, timeout time.Duration) (actx context.Context, stop func()) {
 	actx, cancel := context.WithCancelCause(nodelink.PodContext(ctx, podID))
 	t := time.AfterFunc(timeout, func() { cancel(errCallTimeout) })
 	return actx, func() {
@@ -489,7 +490,7 @@ func deadline(ctx, actx context.Context, timeout time.Duration, err error) error
 // one released, and so is one that process_list shows as not running or
 // process_logs does not know. The writes outlive the caller's request: the
 // process has been started or stopped whatever the client does now.
-func (r *Runner) processHolds(ctx context.Context, id uuid.UUID, c *call, res Result) {
+func (r *Runner) processHolds(ctx context.Context, id podid.ID, c *call, res Result) {
 	if c.tool != ToolProcessStart && c.tool != ToolProcessStop && c.tool != ToolProcessList && c.tool != ToolProcessLogs {
 		return
 	}
@@ -611,7 +612,7 @@ func (r *Runner) toolEnd(ctx context.Context, sb auth.Sandbox, lease model.Lease
 
 // runID is the sandbox's open run span, or "" when it has none or the row
 // cannot be read.
-func (r *Runner) runID(ctx context.Context, id uuid.UUID) string {
+func (r *Runner) runID(ctx context.Context, id podid.ID) string {
 	if r.st == nil {
 		return ""
 	}

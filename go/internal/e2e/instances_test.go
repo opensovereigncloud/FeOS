@@ -12,13 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/config"
 	"github.com/ironcore-dev/feos/go/internal/leader"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -58,7 +57,7 @@ func expectOutput(t *testing.T, what string, res timedReply, want string) {
 // exec whose command contains marker; the command then runs.
 func markExecs(n *node, marker string) <-chan struct{} {
 	ch := make(chan struct{}, 16)
-	n.Script().SetExec(func(_ context.Context, _ uuid.UUID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+	n.Script().SetExec(func(_ context.Context, _ podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
 		if argv := req.GetCommand(); strings.Contains(argv[len(argv)-1], marker) {
 			select {
 			case ch <- struct{}{}:

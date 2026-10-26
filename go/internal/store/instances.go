@@ -9,8 +9,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 // InstanceTTL is how long an instance counts as alive after its last
@@ -79,8 +80,8 @@ func (e *InstanceInUseError) Error() string {
 // with *InstanceInUseError: a process still runs under the ID, or stops
 // (its last steps release the ops the ID owns and delete the row), or one
 // ended without deleting it less than the TTL ago.
-func (s *Store) ClaimInstance(ctx context.Context, in InstanceInfo) ([]uuid.UUID, error) {
-	var released []uuid.UUID
+func (s *Store) ClaimInstance(ctx context.Context, in InstanceInfo) ([]podid.ID, error) {
+	var released []podid.ID
 	err := s.InTx(ctx, func(tx *Store) error {
 		released = nil
 		var claimed bool

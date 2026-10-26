@@ -9,11 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -67,7 +66,7 @@ func TestSyncAppliesObservations(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A Sync of a sandbox that is gone does nothing.
-	if err := e.Sync(bg, uuid.New()); err != nil {
+	if err := e.Sync(bg, podid.Mint()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -188,7 +187,7 @@ func TestEnsureWaitsForPendingPod(t *testing.T) {
 	// The pod restarts outside ferund and takes its time: PENDING without
 	// an op; Ensure waits for it and syncs.
 	release := make(chan struct{})
-	n.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	n.Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		select {
 		case <-release:
 		case <-ctx.Done():
@@ -229,7 +228,7 @@ func TestEnsureWaitsForPendingPod(t *testing.T) {
 	// WaitRunning does the same for a caller whose guest call found the
 	// pod still starting.
 	release2 := make(chan struct{})
-	n.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	n.Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		select {
 		case <-release2:
 		case <-ctx.Done():

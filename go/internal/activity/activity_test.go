@@ -18,6 +18,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/activity"
 	"github.com/ironcore-dev/feos/go/internal/db"
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
 
@@ -76,7 +77,7 @@ func TestRecorderBatches(t *testing.T) {
 	d := dbtest.New(t)
 	r := activity.NewRecorder(store.New(d), "i1", dbtest.Logger(t))
 	run(t, r)
-	sb := uuid.New()
+	sb := podid.Mint()
 	var wg sync.WaitGroup
 	for g := range 10 {
 		wg.Add(1)
@@ -168,7 +169,7 @@ func TestRecordTx(t *testing.T) {
 	t.Parallel()
 	d := dbtest.New(t)
 	r := activity.NewRecorder(store.New(d), "i1", dbtest.Logger(t))
-	sb := uuid.New()
+	sb := podid.Mint()
 	tx, err := d.Pool.Begin(bg)
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +289,7 @@ func TestRecordRefusedJSON(t *testing.T) {
 	d := dbtest.New(t)
 	r := activity.NewRecorder(store.New(d), "i1", dbtest.Logger(t))
 	run(t, r)
-	sb := uuid.New()
+	sb := podid.Mint()
 	for i := range 20 {
 		params := json.RawMessage(`{"command":"ls"}`)
 		if i == 7 {
@@ -301,7 +302,7 @@ func TestRecordRefusedJSON(t *testing.T) {
 		t.Fatalf("dropped %d", r.Dropped())
 	}
 
-	other := uuid.New()
+	other := podid.Mint()
 	if err := d.Tx(bg, func(tx pgx.Tx) error {
 		if err := r.RecordTx(bg, tx, activity.Event{SandboxID: other, Kind: activity.KindToolEnd,
 			Params: json.RawMessage(`{"a":"\ud800"}`)}); err != nil {

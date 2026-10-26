@@ -27,6 +27,7 @@ import (
 
 	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 )
 
 func create(t *testing.T, pc podv1.PodServiceClient, id string, spec *podv1.PodSpec) (*podv1.PodInfo, error) {
@@ -41,7 +42,7 @@ func TestCreateIsIdempotentBySpec(t *testing.T) {
 	e.start("n1", in)
 	pc := pods(t, in, "n1")
 
-	id := uuid.New()
+	id := podid.Mint()
 	spec := sandboxSpec(id, "inc-1")
 	first, err := create(t, pc, id.String(), spec)
 	if err != nil {
@@ -65,7 +66,7 @@ func TestCreateIsIdempotentBySpec(t *testing.T) {
 	}
 
 	// The defaults are part of the normalised spec.
-	id2 := uuid.New()
+	id2 := podid.Mint()
 	bare := &podv1.PodSpec{Containers: []*podv1.ContainerSpec{{Name: "main", ImageRef: "alpine"}}}
 	if _, err := create(t, pc, id2.String(), bare); err != nil {
 		t.Fatal(err)
@@ -77,7 +78,7 @@ func TestCreateIsIdempotentBySpec(t *testing.T) {
 	}
 
 	_, err = create(t, pc, "not-a-uuid", spec)
-	wantCode(t, err, codes.InvalidArgument, `pod ID "not-a-uuid" is not a UUID`)
+	wantCode(t, err, codes.InvalidArgument, `pod ID "not-a-uuid" is neither a short pod ID nor a UUID`)
 	big := sandboxSpec(id, "x")
 	big.Resources.Vcpus = 33
 	_, err = create(t, pc, uuid.NewString(), big)
@@ -95,20 +96,34 @@ func TestTAPPrefixCollision(t *testing.T) {
 	pc := pods(t, in, "n1")
 	a := "abcdef12-0000-4000-8000-000000000001"
 	b := "abcdef12-1111-4000-8000-000000000002"
-	if _, err := create(t, pc, a, sandboxSpec(uuid.MustParse(a), "1")); err != nil {
+	if _, err := create(t, pc, a, sandboxSpec(podid.ID(a), "1")); err != nil {
 		t.Fatal(err)
 	}
-	_, err := create(t, pc, b, sandboxSpec(uuid.MustParse(b), "1"))
-	wantCode(t, err, codes.AlreadyExists, "pod "+a+" has the TAP device pod-abcdef12 already: the first 8 digits of a pod's ID tell it")
+	_, err := create(t, pc, b, sandboxSpec(podid.ID(b), "1"))
+	wantCode(t, err, codes.AlreadyExists, "pod "+a+" has the TAP device pod-abcdef12 already: a short ID names its own, a UUID's first 8 hex digits name it")
 	if _, err := pc.GetPod(context.Background(), &podv1.GetPodRequest{PodId: b}); status.Code(err) != codes.NotFound {
 		t.Fatalf("the colliding pod was recorded: %v", err)
 	}
 	// Without a network there is no TAP device.
-	none := sandboxSpec(uuid.MustParse(b), "1")
+	none := sandboxSpec(podid.ID(b), "1")
 	none.Network = &podv1.PodNetwork{None: true}
 	info, err := create(t, pc, b, none)
 	if err != nil || info.Ipv6Address != "" {
 		t.Fatalf("a pod without a network: %v, %v", info, err)
+	}
+	// A short ID names its TAP device whole (ADR 0019): short IDs never
+	// collide, also not one whose first 8 characters are a UUID's first 8
+	// hex digits.
+	for _, id := range []string{"abcdef12xyz", "abcdef12xyw", "abcdef12000"} {
+		info, err := create(t, pc, id, sandboxSpec(podid.ID(id), "1"))
+		if err != nil || info.Ipv6Address == "" {
+			t.Fatalf("short ID %s: %v, %v", id, info, err)
+		}
+	}
+	// An ID that is neither a short ID nor a UUID is refused.
+	for _, id := range []string{"Abcdef12xyz", "abcdef12xyi", "1bcdef12xyz", "abcdef12xy"} {
+		_, err := create(t, pc, id, sandboxSpec(podid.ID(id), "1"))
+		wantCode(t, err, codes.InvalidArgument, fmt.Sprintf("pod ID %q is neither a short pod ID nor a UUID", id))
 	}
 }
 
@@ -183,7 +198,7 @@ func TestSuspendWaitsBehindBringUp(t *testing.T) {
 	in := e.instance("i1", caIss)
 	e.start("n1", in, func(c *Config) { c.PendingDelay = 300 * time.Millisecond })
 	pc := pods(t, in, "n1")
-	id := uuid.New()
+	id := podid.Mint()
 	if _, err := create(t, pc, id.String(), sandboxSpec(id, "1")); err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +531,7 @@ func TestAbortOnCancel(t *testing.T) {
 				// CreatePod cut after the pod is recorded: PENDING without a
 				// bring-up, which a repeated create does not change.
 				n.Script().SetDelay(podv1.PodService_CreatePod_FullMethodName, time.Second)
-				fresh := uuid.New()
+				fresh := podid.Mint()
 				ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
 				_, err = pc.CreatePod(ctx, &podv1.CreatePodRequest{PodId: fresh.String(), Spec: sandboxSpec(fresh, "1")})
 				cancel()
@@ -585,7 +600,7 @@ func TestStreamPodEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	other := uuid.New()
+	other := podid.Mint()
 	only, err := pc.StreamPodEvents(ctx, &podv1.StreamPodEventsRequest{PodId: other.String()})
 	if err != nil {
 		t.Fatal(err)
@@ -637,15 +652,15 @@ func TestScriptedBringUp(t *testing.T) {
 	n := e.start("n1", in)
 	pc := pods(t, in, "n1")
 	ctx := context.Background()
-	stuck := uuid.New()
-	n.Script().SetBringUp(func(ctx context.Context, pod uuid.UUID) error {
+	stuck := podid.Mint()
+	n.Script().SetBringUp(func(ctx context.Context, pod podid.ID) error {
 		if pod == stuck {
 			<-ctx.Done()
 			return ctx.Err()
 		}
 		return status.Error(codes.Internal, "container main: image not found")
 	})
-	failed := uuid.New()
+	failed := podid.Mint()
 	if _, err := create(t, pc, failed.String(), sandboxSpec(failed, "1")); err != nil {
 		t.Fatal(err)
 	}
@@ -673,7 +688,7 @@ func TestScriptedBringUp(t *testing.T) {
 	n.Script().SetHook(podv1.PodService_CreatePod_FullMethodName, func(context.Context, string, any) error {
 		return status.Error(codes.ResourceExhausted, "no address: the range is used up")
 	})
-	_, err := create(t, pc, uuid.NewString(), sandboxSpec(uuid.New(), "1"))
+	_, err := create(t, pc, uuid.NewString(), sandboxSpec(podid.Mint(), "1"))
 	wantCode(t, err, codes.ResourceExhausted, "no address: the range is used up")
 	n.Script().SetHook(podv1.PodService_CreatePod_FullMethodName, nil)
 }
@@ -1147,7 +1162,7 @@ func TestHibernationNoMemoryIgnoresAbandon(t *testing.T) {
 	// A bring-up holds the pod's lock, and fails the pod when let go.
 	inBringUp, letGo := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	n.Script().SetBringUp(func(ctx context.Context, _ uuid.UUID) error {
+	n.Script().SetBringUp(func(ctx context.Context, _ podid.ID) error {
 		once.Do(func() { close(inBringUp) })
 		select {
 		case <-letGo:

@@ -24,6 +24,7 @@ import (
 	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
 	"github.com/ironcore-dev/feos/go/internal/env/spec"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/seal"
 	"github.com/ironcore-dev/feos/go/internal/store"
 )
@@ -70,13 +71,13 @@ func digestOf(image string) string {
 	return repo + "@sha256:" + hex.EncodeToString(sum[:])
 }
 
-func (f *fakeEngine) Ensure(context.Context, uuid.UUID) (model.Lease, error) {
+func (f *fakeEngine) Ensure(context.Context, podid.ID) (model.Lease, error) {
 	return model.Lease{}, nil
 }
-func (f *fakeEngine) Delete(context.Context, string, uuid.UUID) (store.Sandbox, bool, error) {
+func (f *fakeEngine) Delete(context.Context, string, podid.ID) (store.Sandbox, bool, error) {
 	return store.Sandbox{}, false, nil
 }
-func (f *fakeEngine) Restart(context.Context, uuid.UUID, string) error {
+func (f *fakeEngine) Restart(context.Context, podid.ID, string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.restartErr
@@ -90,12 +91,12 @@ func (f *fakeEngine) ResolveImage(_ context.Context, image string) (string, erro
 	}
 	return digestOf(image), nil
 }
-func (f *fakeEngine) Acquire(_ context.Context, id uuid.UUID, _ model.HoldKind) (model.Lease, func(), error) {
+func (f *fakeEngine) Acquire(_ context.Context, id podid.ID, _ model.HoldKind) (model.Lease, func(), error) {
 	return model.Lease{SandboxID: id}, func() {}, nil
 }
-func (f *fakeEngine) Touch(uuid.UUID)                       {}
-func (f *fakeEngine) Sync(context.Context, uuid.UUID) error { return nil }
-func (f *fakeEngine) State(context.Context, uuid.UUID) (string, string, error) {
+func (f *fakeEngine) Touch(podid.ID)                       {}
+func (f *fakeEngine) Sync(context.Context, podid.ID) error { return nil }
+func (f *fakeEngine) State(context.Context, podid.ID) (string, string, error) {
 	return model.StateRunning, "n1", nil
 }
 
@@ -103,7 +104,7 @@ var _ Engine = (*fakeEngine)(nil)
 
 // forward is a request the fake port door forwarded.
 type forward struct {
-	sandbox       uuid.UUID
+	sandbox       podid.ID
 	port          int
 	path, rawPath string
 	query         string
@@ -125,7 +126,7 @@ func (f *fakePorts) Probe(context.Context, model.Lease, int, string) (int, error
 func (f *fakePorts) DialPod(context.Context, model.Lease, int) (net.Conn, error) {
 	return nil, errors.New("no dials here")
 }
-func (f *fakePorts) ForwardTo(w http.ResponseWriter, r *http.Request, id uuid.UUID, port int, path, rawPath string,
+func (f *fakePorts) ForwardTo(w http.ResponseWriter, r *http.Request, id podid.ID, port int, path, rawPath string,
 	credentials []string) {
 	f.mu.Lock()
 	f.calls = append(f.calls, forward{id, port, path, rawPath, r.URL.RawQuery, r.Header.Get("Authorization"), r.Host,
@@ -265,9 +266,9 @@ func (h *harness) exec(sql string, args ...any) {
 
 // instance inserts an instance row of an environment with its
 // controller's row: a sandbox in state on node with address.
-func (h *harness) instance(envID uuid.UUID, kind, object string, replica, release int, phase, state, node, address string) uuid.UUID {
+func (h *harness) instance(envID uuid.UUID, kind, object string, replica, release int, phase, state, node, address string) podid.ID {
 	h.t.Helper()
-	id := uuid.New()
+	id := podid.Mint()
 	zero := 0
 	if _, _, err := h.st.CreateSandbox(h.ctx(), store.NewSandbox{ID: id, Owner: tenantA, Image: "img", VCPUs: 1, MemoryMiB: 512,
 		EnvironmentID: envID, PodTemplate: &model.PodTemplate{SecurityGroups: []string{model.EnvGroupID(envID)}},
@@ -286,10 +287,22 @@ func (h *harness) instance(envID uuid.UUID, kind, object string, replica, releas
 	return id
 }
 
-// sandbox inserts an ordinary sandbox of tenant, attachable or not.
-func (h *harness) sandbox(tenant string, attachable bool) uuid.UUID {
+// sandbox inserts an ordinary sandbox of tenant, attachable or not, under
+// a short ID.
+func (h *harness) sandbox(tenant string, attachable bool) podid.ID {
 	h.t.Helper()
-	id := uuid.New()
+	return h.sandboxWithID(tenant, attachable, podid.Mint())
+}
+
+// legacySandbox inserts a sandbox as sandbox does under a UUID: one made
+// before ADR 0019.
+func (h *harness) legacySandbox(tenant string, attachable bool) podid.ID {
+	h.t.Helper()
+	return h.sandboxWithID(tenant, attachable, podid.ID(uuid.NewString()))
+}
+
+func (h *harness) sandboxWithID(tenant string, attachable bool, id podid.ID) podid.ID {
+	h.t.Helper()
 	n := store.NewSandbox{ID: id, Owner: tenant, Image: "img", VCPUs: 1, MemoryMiB: 512}
 	if attachable {
 		n.PodTemplate = &model.PodTemplate{Command: []string{"sleep", "infinity"},

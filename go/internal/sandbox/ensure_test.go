@@ -12,13 +12,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
 	"github.com/ironcore-dev/feos/go/internal/apierr"
 	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/ironcore-dev/feos/go/internal/podid"
 	"github.com/ironcore-dev/feos/go/internal/testnode"
 )
 
@@ -53,14 +53,14 @@ func TestEnsureErrorsByState(t *testing.T) {
 	h := newHarness(t)
 	n := h.addNode("n1")
 	e := h.eng()
-	ensure := func(id uuid.UUID) error {
+	ensure := func(id podid.ID) error {
 		ctx, cancel := context.WithTimeout(bg, 10*time.Second)
 		defer cancel()
 		_, err := e.Ensure(ctx, id)
 		return err
 	}
 	// Unknown sandbox.
-	wantErr(t, ensure(uuid.New()), model.ErrNotFound, "")
+	wantErr(t, ensure(podid.Mint()), model.ErrNotFound, "")
 
 	// A stopped sandbox whose node is down.
 	sb := h.running(512)
@@ -145,7 +145,7 @@ func TestPauseAndResumeREST(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.waitState(sb.ID, model.StatePaused, 10*time.Second)
-	if _, _, err := e.State(bg, uuid.New()); !errors.Is(err, model.ErrNotFound) {
+	if _, _, err := e.State(bg, podid.Mint()); !errors.Is(err, model.ErrNotFound) {
 		t.Fatalf("state of an unknown sandbox: %v", err)
 	}
 	if st, node, err := e.State(bg, sb.ID); err != nil || st != model.StatePaused || node != "n1" {
@@ -207,7 +207,7 @@ func TestRecreateWhileOldOpRuns(t *testing.T) {
 	h.addNode("n1")
 	h.addNode("n2")
 	e := h.eng()
-	id := uuid.New()
+	id := podid.Mint()
 	old := h.sandboxWithID(id, 512)
 	arrived := make(chan string, 2)
 	held := make(chan struct{})
@@ -264,7 +264,7 @@ func TestRecreateWhileOldOpRuns(t *testing.T) {
 }
 
 // ensureFor runs Ensure on e within d and reports how long it took.
-func ensureFor(e *Engine, id uuid.UUID, d time.Duration) (model.Lease, time.Duration, error) {
+func ensureFor(e *Engine, id podid.ID, d time.Duration) (model.Lease, time.Duration, error) {
 	ctx, cancel := context.WithTimeout(bg, d)
 	defer cancel()
 	start := time.Now()
@@ -275,7 +275,7 @@ func ensureFor(e *Engine, id uuid.UUID, d time.Duration) (model.Lease, time.Dura
 // wantHibernating checks the answer of an Ensure that met a hibernate it
 // did not wait for: ErrBusy with the exact text, after the hibernate wait
 // and well before the budget.
-func wantHibernating(t *testing.T, id uuid.UUID, took time.Duration, err error) {
+func wantHibernating(t *testing.T, id podid.ID, took time.Duration, err error) {
 	t.Helper()
 	want := "sandbox " + id.String() + " is hibernating; retry in a minute"
 	if err == nil || err.Error() != want || !errors.Is(err, model.ErrBusy) {
@@ -405,7 +405,7 @@ func TestEnsureHibernateEndsAtTheBound(t *testing.T) {
 		for _, budget := range []bool{false, true} {
 			h := &OpHandle{done: make(chan struct{}), kind: OpHibernate, target: "n1",
 				res: OpResult{State: model.StateHibernated}}
-			en := &ensurer{e: e, id: uuid.New(), ops: map[string]OpResult{}}
+			en := &ensurer{e: e, id: podid.Mint(), ops: map[string]OpResult{}}
 			ctx := &endingCtx{Context: bg, h: h}
 			if budget {
 				ctx.done = make(chan struct{})
