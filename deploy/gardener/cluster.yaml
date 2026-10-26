@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# The shoot's issuer under the name the k3s manifests use, letsencrypt-prod,
+# so that ferund's, FeChat's and FeCode ID's apply here unchanged. It
+# answers DNS-01 at Cloudflare rather than HTTP-01: certificates exist
+# before DNS points at the shoot. The secret cert-manager/cloudflare-api-token
+# (key api-token) edits the zone fecode.dev; FeCode's deploy/fecode
+# created it, with its own issuer letsencrypt-dns.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - dns01:
+          cloudflare:
+            apiTokenSecretRef:
+              name: cloudflare-api-token
+              key: api-token
+        selector:
+          dnsZones:
+            - fecode.dev
+            - fecore.dev

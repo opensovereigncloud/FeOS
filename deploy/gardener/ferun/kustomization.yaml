@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ferund and its PostgreSQL on the Gardener shoot: the k3s lab's manifests
+# (deploy/k3s/ferun), with the nodes' port at an address of the shoot's
+# service network, 100.72.0.0/13. They live outside this directory, so:
+#
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/gardener/ferun | kubectl apply -f -
+#
+# (make -C deploy/gardener apply-ferun.)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../k3s/ferun/namespace.yaml
+  - ../../k3s/ferun/postgres.yaml
+  - ../../k3s/ferun/ferund.yaml
+  - ../../k3s/ferun/ingress.yaml
+patches:
+  # feos-node's CONTROL_PLANE (deploy/gardener/feos/feos.yaml).
+  - target:
+      kind: Service
+      name: ferund-nodes
+    patch: |-
+      - op: replace
+        path: /spec/clusterIP
+        value: 100.72.70.70

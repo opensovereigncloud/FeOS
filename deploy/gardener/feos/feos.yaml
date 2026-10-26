@@ -1,0 +1,169 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# FeOS on the Gardener shoot's workers (deploy/gardener/README.md): a
+# DaemonSet that lays feosd, diskd and the rest over every labelled
+# node's /usr as a systemd system extension (install) and has systemd run
+# them. feosd dials ferund itself (ADR 0015); nothing here listens.
+#
+#   kubectl label node <node> feos.fecode.dev/node=true
+#   kubectl -n feos create secret generic diskd-s3 --from-env-file=<s3.env> \
+#     --from-literal=DISKD_S3_PREFIX=gardener/
+#   kubectl -n feos create secret generic feosd-join \
+#     --from-literal=<node>=feos-join-…   (one key per node, ferund join-token)
+#   kubectl apply -f deploy/gardener/feos/feos.yaml
+#
+# Removing the DaemonSet leaves FeOS installed and running on the nodes;
+# Gardener's next node roll removes it with the machine.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: feos
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feos-node
+  namespace: feos
+data:
+  # The workers' network (10.250/16) and the shoot's pods and services
+  # (100.64/13, 100.72/13, in CGNAT's 100.64/10); the rest of RFC 1918 too.
+  DENY_PREFIXES: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
+  # The chunk cache, 12 GiB of the worker's 50 GiB root, which holds the
+  # pods' disks too. 64 streams to R2: see deploy/k3s/feos/feos.yaml.
+  DISKD_ARGS: "--budget-bytes 12884901888 --s3-concurrency 64"
+  # ferund's nodes' port: the fixed ClusterIP of service ferund-nodes
+  # (deploy/gardener/ferun), which the hosts reach through kube-proxy
+  # without the cluster's DNS, and the name its certificate carries.
+  CONTROL_PLANE: "100.72.70.70:7443"
+  CONTROL_PLANE_NAME: "ferun.run.fecode.dev"
+  TRUST_DOMAIN: "run.fecode.dev"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: feos-node
+  namespace: feos
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: feos-node
+  template:
+    metadata:
+      labels:
+        app: feos-node
+    spec:
+      nodeSelector:
+        feos.fecode.dev/node: "true"
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Never evicted before the workloads it carries.
+      priorityClassName: system-node-critical
+      imagePullSecrets:
+        - name: oci-pull
+      initContainers:
+        - name: install
+          image: oci.fecore.dev/feos-node-gardenlinux:dev
+          imagePullPolicy: Always
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          envFrom:
+            - configMapRef:
+                name: feos-node
+            - secretRef:
+                name: diskd-s3
+          securityContext:
+            privileged: true
+          volumeMounts:
+            # One mount for the extensions, their workshop and feosd's
+            # state: hard links and renames between them stay on it.
+            - name: var-lib
+              mountPath: /host/var/lib
+            - name: etc-default
+              mountPath: /host/etc/default
+            - name: etc-feos
+              mountPath: /host/etc/feos
+            - name: modules-load
+              mountPath: /host/etc/modules-load.d
+            - name: join
+              mountPath: /join
+              readOnly: true
+      containers:
+        # The services' journal, for kubectl logs; it is ready while both
+        # run.
+        - name: journal
+          image: oci.fecore.dev/feos-node-gardenlinux:dev
+          imagePullPolicy: Always
+          command:
+            - nsenter
+            - -t
+            - "1"
+            - -m
+            - -u
+            - -i
+            - -n
+            - -p
+            - --
+            - journalctl
+            - -f
+            - -n
+            - "100"
+            - -o
+            - short-iso
+            - -u
+            - diskd.service
+            - -u
+            - feosd.service
+          securityContext:
+            privileged: true
+          readinessProbe:
+            exec:
+              command:
+                - nsenter
+                - -t
+                - "1"
+                - -m
+                - --
+                - systemctl
+                - is-active
+                - --quiet
+                - diskd.service
+                - feosd.service
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 5m, memory: 16Mi }
+            limits: { memory: 64Mi }
+      volumes:
+        - name: var-lib
+          hostPath:
+            path: /var/lib
+            type: Directory
+        - name: etc-default
+          hostPath:
+            path: /etc/default
+            type: Directory
+        - name: etc-feos
+          hostPath:
+            path: /etc/feos
+            type: DirectoryOrCreate
+        - name: modules-load
+          hostPath:
+            path: /etc/modules-load.d
+            type: DirectoryOrCreate
+        - name: join
+          secret:
+            secretName: feosd-join
+            optional: true
+            defaultMode: 0400
