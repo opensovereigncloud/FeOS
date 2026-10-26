@@ -416,6 +416,10 @@ pub enum CtKey {
     /// kernel turns on for this key.
     Packets = 14,
     Bytes = 15,
+    /// A direction's destination address, IPv4: 4 bytes, network order.
+    DstIp = 20,
+    /// A direction's destination address, IPv6: 16 bytes, network order.
+    DstIp6 = 22,
 }
 
 /// A connection's direction.
@@ -878,6 +882,37 @@ pub mod matches {
                 data: packets.to_be_bytes().to_vec(),
             },
         ]
+    }
+
+    /// The destination the connection's initiator chose, in a set of
+    /// IPv4 addresses: before a DNAT on the way, such as kube-proxy's to a
+    /// service's endpoints, which the packet's own header no longer shows.
+    /// A packet without a connection does not match.
+    pub fn ct_original_ipv4_daddr_in(set: &str) -> Vec<Expr> {
+        let mut exprs = ipv4();
+        exprs.push(Expr::Ct {
+            key: CtKey::DstIp,
+            direction: Some(Direction::Original),
+        });
+        exprs.push(Expr::Lookup {
+            set: set.to_string(),
+            invert: false,
+        });
+        exprs
+    }
+
+    /// [`ct_original_ipv4_daddr_in`] for IPv6.
+    pub fn ct_original_ipv6_daddr_in(set: &str) -> Vec<Expr> {
+        let mut exprs = ipv6();
+        exprs.push(Expr::Ct {
+            key: CtKey::DstIp6,
+            direction: Some(Direction::Original),
+        });
+        exprs.push(Expr::Lookup {
+            set: set.to_string(),
+            invert: false,
+        });
+        exprs
     }
 
     /// No route back to the source address leaves through the interface

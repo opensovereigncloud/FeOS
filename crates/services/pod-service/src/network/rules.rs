@@ -220,13 +220,19 @@ enum End {
     Destination,
 }
 
-/// The address at `end` in a set of `family`.
+/// The address at `end` in a set of `family`. A destination is the one the
+/// pod chose: the connection's original one. A DNAT before the forward
+/// hook, such as kube-proxy's of a LoadBalancer's address to its
+/// endpoints on a node of a Kubernetes cluster, would otherwise turn a
+/// public address the pod may reach into a cluster address it may not.
+/// Only new connections come here (forward accepts established ones), and
+/// every packet of a pod has one (forward drops the untracked).
 fn peer(family: AddressFamily, end: End, set: &str) -> Vec<Expr> {
     match (family, end) {
         (AddressFamily::V4, End::Source) => ipv4_saddr_in(set),
-        (AddressFamily::V4, End::Destination) => ipv4_daddr_in(set),
+        (AddressFamily::V4, End::Destination) => ct_original_ipv4_daddr_in(set),
         (AddressFamily::V6, End::Source) => ipv6_saddr_in(set),
-        (AddressFamily::V6, End::Destination) => ipv6_daddr_in(set),
+        (AddressFamily::V6, End::Destination) => ct_original_ipv6_daddr_in(set),
     }
 }
 
@@ -378,6 +384,10 @@ fn forward() -> Vec<Rule> {
         .concat(),
         [from_pods(), ct_state(ct::INVALID), verdict(Verdict::Drop)].concat(),
         [to_pods(), ct_state(ct::INVALID), verdict(Verdict::Drop)].concat(),
+        // The pods' chains check destinations by their connections; a
+        // packet without one, which another table's notrack would make,
+        // has nothing for them to check.
+        [from_pods(), ct_state(ct::UNTRACKED), verdict(Verdict::Drop)].concat(),
         [from_pods(), verdict(Verdict::Jump(FROM_PODS.to_string()))].concat(),
         [to_pods(), verdict(Verdict::Jump(TO_PODS.to_string()))].concat(),
     ]
@@ -588,8 +598,8 @@ mod tests {
         let egress = &chain(&table, "out-pod-11111111").rules;
         // Denied prefixes first, of both families, logged, then dropped.
         for (rules, denied) in [
-            (&egress[0..2], ipv6_daddr_in(DENY6)),
-            (&egress[2..4], ipv4_daddr_in(DENY4)),
+            (&egress[0..2], ct_original_ipv6_daddr_in(DENY6)),
+            (&egress[2..4], ct_original_ipv4_daddr_in(DENY4)),
         ] {
             assert!(logs(&rules[0], DROP_GROUP, "deny"));
             assert!(has(&rules[0], &denied) && has(&rules[1], &denied));
@@ -600,18 +610,26 @@ mod tests {
         assert_eq!(
             egress[4..8],
             [
-                [ipv4_daddr_in(INTERNET4), verdict(Verdict::Return)].concat(),
-                [ipv6_daddr_in(INTERNET6), verdict(Verdict::Return)].concat(),
+                [
+                    ct_original_ipv4_daddr_in(INTERNET4),
+                    verdict(Verdict::Return)
+                ]
+                .concat(),
+                [
+                    ct_original_ipv6_daddr_in(INTERNET6),
+                    verdict(Verdict::Return)
+                ]
+                .concat(),
                 [
                     l4proto(UDP),
                     th_dport(CmpOp::Eq, 53),
-                    ipv4_daddr_in("b-v4"),
+                    ct_original_ipv4_daddr_in("b-v4"),
                     verdict(Verdict::Return)
                 ]
                 .concat(),
                 [
                     l4proto(ICMP),
-                    ipv4_daddr_in("b-v4"),
+                    ct_original_ipv4_daddr_in("b-v4"),
                     verdict(Verdict::Return)
                 ]
                 .concat(),
@@ -676,13 +694,19 @@ mod tests {
             ]
             .concat()
         );
-        assert_eq!(rules.len(), 6);
+        assert_eq!(rules.len(), 7);
+        // The pods' chains check destinations by the connection: what has
+        // none from a pod is dropped before them.
         assert_eq!(
             rules[4],
-            [from_pods(), verdict(Verdict::Jump(FROM_PODS.to_string()))].concat()
+            [from_pods(), ct_state(ct::UNTRACKED), verdict(Verdict::Drop)].concat()
         );
         assert_eq!(
             rules[5],
+            [from_pods(), verdict(Verdict::Jump(FROM_PODS.to_string()))].concat()
+        );
+        assert_eq!(
+            rules[6],
             [to_pods(), verdict(Verdict::Jump(TO_PODS.to_string()))].concat()
         );
         // A TAP the maps do not have is dropped, not passed.
