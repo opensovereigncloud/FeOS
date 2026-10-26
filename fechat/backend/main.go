@@ -4,7 +4,8 @@
 // FeChat's backend: a chat proxy to an OpenAI-compatible LLM with tool
 // calling, the tools running in a sandbox over FeRun's MCP endpoint, and
 // SSE streaming to the frontend. Sandboxes are provisioned through
-// ferund's REST API; the conversation ID is the sandbox ID.
+// ferund's REST API, which mints their IDs; the browser keeps a
+// conversation's sandbox as a signed sandbox reference (sandboxref.go).
 //
 // Configuration from the environment (Kubernetes Secret and ConfigMap):
 //
@@ -20,6 +21,7 @@
 //	OIDC_CLIENT_SECRET (Secret)
 //	PUBLIC_URL         FeChat's own URL, https://chat.fecode.dev
 //	SESSION_SECRET     (Secret)    at least 32 bytes; signs the session cookies
+//	                   and the sandbox references
 //	PORT               listen port, default 8080
 package main
 
@@ -109,9 +111,9 @@ const maxChatBody = 32 << 20 // request limit of /api/v1/chat
 // sb is the client of ferund (nil when the sandbox tools are disabled).
 var sb *sandboxClient
 
-func executeTool(ts *toolset, convID, image, name, argsJSON string) string {
+func executeTool(ts *toolset, b *chatSandbox, name, argsJSON string) string {
 	if ts.has(name) {
-		return sb.executeSandboxTool(ts, convID, image, name, argsJSON)
+		return sb.executeSandboxTool(ts, b, name, argsJSON)
 	}
 	return `{"error":"unknown tool"}`
 }
@@ -258,6 +260,9 @@ func handleChat(cfg config) http.HandlerFunc {
 			// The conversation's sandbox image. Only the value at the
 			// sandbox's creation counts; empty means ferund's default.
 			Image string `json:"image"`
+			// The conversation's sandbox reference, as the last "sandbox"
+			// event handed it out; empty for a new conversation.
+			SandboxRef string `json:"sandbox_ref"`
 		}
 		// The history carries the tool outputs (each up to maxToolOutput),
 		// so it is much larger than the text of the conversation.
@@ -281,7 +286,27 @@ func handleChat(cfg config) http.HandlerFunc {
 		if req.ConversationID == "" {
 			req.ConversationID = r.Header.Get("X-Conversation-Id")
 		}
+		if req.ConversationID == "" {
+			req.ConversationID = newUUID()
+			log.Printf("no conversation_id -> anonymous conversation %s", req.ConversationID)
+		}
 		log.Printf("chat request conversation=%s messages=%d", req.ConversationID, len(req.Messages))
+		// sseMu writes SSE frames to the stream one at a time, while tool
+		// calls run in parallel.
+		var sseMu sync.Mutex
+		u, _ := userFrom(r.Context()) // no sign-in (development): no subject
+		box := &chatSandbox{
+			key:   convKey{subject: u.Subject, conv: req.ConversationID},
+			ref:   req.SandboxRef,
+			image: req.Image,
+			// The browser keeps the reference with the conversation and
+			// sends it back with the next request.
+			onRef: func(ref string) {
+				sseMu.Lock()
+				defer sseMu.Unlock()
+				sseEvent(w, map[string]string{"type": "sandbox", "conversation_id": req.ConversationID, "ref": ref})
+			},
+		}
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -347,12 +372,11 @@ func handleChat(cfg config) http.HandlerFunc {
 			// into the history in call order (tool_call_id).
 			outputs := make([]string, len(res.ToolCalls))
 			var wg sync.WaitGroup
-			var sseMu sync.Mutex // write SSE frames to the stream one at a time
 			for i, tc := range res.ToolCalls {
 				wg.Add(1)
 				go func(i int, tc ToolCall) {
 					defer wg.Done()
-					output := executeTool(ts, req.ConversationID, req.Image, tc.Function.Name, tc.Function.Arguments)
+					output := executeTool(ts, box, tc.Function.Name, tc.Function.Arguments)
 					outputs[i] = output
 					sseMu.Lock()
 					sseEvent(w, map[string]any{
@@ -396,7 +420,7 @@ func main() {
 		log.Fatal("MODEL is not set")
 	}
 	if cfg.FeRunURL != "" {
-		c, err := newSandboxClient(cfg.FeRunURL, cfg.FeRunToken)
+		c, err := newSandboxClient(cfg.FeRunURL, cfg.FeRunToken, newRefKey(cfg.SessionSecret))
 		if err != nil {
 			log.Fatalf("ferund: %v", err)
 		}

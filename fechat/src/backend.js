@@ -3,8 +3,9 @@
 
 // The backend's client: streams chat replies from POST /api/v1/chat (SSE).
 // Interface: streamReply(messages) -> AsyncGenerator of
-// delta | tool_start | tool | history items. `messages` is the OpenAI wire
-// history (see wireHistory in App.jsx), not the UI message model.
+// delta | tool_start | tool | history | sandbox items. `messages` is the
+// OpenAI wire history (see wireHistory in App.jsx), not the UI message
+// model.
 
 import { signIn } from './auth.js'
 
@@ -20,14 +21,24 @@ function signedOut(resp) {
   return true
 }
 
-export async function* streamReply(messages, { signal, conversationId, image } = {}) {
+// sandboxRef is the conversation's sandbox reference, as the last
+// sandbox item handed it out; empty for a new conversation.
+export async function* streamReply(
+  messages,
+  { signal, conversationId, sandboxRef, image } = {},
+) {
   const resp = await fetch('/api/v1/chat', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'X-Conversation-Id': conversationId,
     },
-    body: JSON.stringify({ messages, conversation_id: conversationId, image }),
+    body: JSON.stringify({
+      messages,
+      conversation_id: conversationId,
+      sandbox_ref: sandboxRef,
+      image,
+    }),
     signal,
   })
   if (signedOut(resp)) {
@@ -79,6 +90,11 @@ export async function* streamReply(messages, { signal, conversationId, image } =
         // The exact wire messages (assistant tool_calls + tool results, or
         // the final assistant text) the backend appended for this round.
         yield { type: 'history', messages: event.messages }
+      } else if (event.type === 'sandbox') {
+        // The conversation's sandbox, signed by the backend: ferund mints
+        // sandbox IDs and the backend keeps no database, so the
+        // conversation keeps it and sends it back with every request.
+        yield { type: 'sandbox', conversationId: event.conversation_id, ref: event.ref }
       } else if (event.type === 'error') {
         throw new Error(event.content)
       } else if (event.type === 'done') {
