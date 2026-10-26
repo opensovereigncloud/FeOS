@@ -22,7 +22,7 @@ spec:
         - name: oci-pull
       containers:
         - name: fechat-app
-          image: oci.fecore.dev/fechat-app:0.6.0
+          image: oci.fecode.dev/fechat-app:0.6.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

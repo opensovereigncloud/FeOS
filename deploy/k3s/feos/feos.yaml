@@ -70,7 +70,7 @@ spec:
         - name: oci-pull
       initContainers:
         - name: install
-          image: oci.fecore.dev/feos-node:dev
+          image: oci.fecode.dev/feos-node:dev
           imagePullPolicy: Always
           env:
             - name: NODE_NAME
@@ -102,7 +102,7 @@ spec:
         # The services' journal, for kubectl logs; it is ready while both
         # run.
         - name: journal
-          image: oci.fecore.dev/feos-node:dev
+          image: oci.fecode.dev/feos-node:dev
           imagePullPolicy: Always
           command:
             - nsenter

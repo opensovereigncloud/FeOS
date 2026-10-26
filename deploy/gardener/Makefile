@@ -3,11 +3,11 @@
 
 # Images and rollouts of the Gardener shoot's deployment (README.md). Run
 # from the repository's root: make -C deploy/gardener <target>, with
-# KUBECONFIG at the shoot. Pushing needs `docker login oci.fecore.dev`.
+# KUBECONFIG at the shoot. Pushing needs `docker login oci.fecode.dev`.
 # ferund's image is the k3s lab's: make -C deploy/k3s push-ferund.
 
 REPO_ROOT := $(abspath ../..)
-REGISTRY ?= oci.fecore.dev
+REGISTRY ?= oci.fecode.dev
 DOCKER ?= docker
 TAG ?= dev
 PACKAGES_DIR ?= $(REPO_ROOT)/target/packages

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# The platform's image registry, oci.fecore.dev (and oci.fecode.dev), on
+# The platform's image registry, oci.fecode.dev, on
 # the Gardener shoot (deploy/gardener/README.md): CNCF distribution v3 with
 # its blobs in the object store, so the replicas and wherever it ran before
 # share the same images.
@@ -101,16 +101,6 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-    - host: oci.fecore.dev
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: registry
-                port:
-                  number: 5000
     - host: oci.fecode.dev
       http:
         paths:
@@ -123,6 +113,5 @@ spec:
                   number: 5000
   tls:
     - hosts:
-        - oci.fecore.dev
         - oci.fecode.dev
       secretName: registry-tls

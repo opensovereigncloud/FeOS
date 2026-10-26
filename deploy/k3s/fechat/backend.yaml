@@ -27,7 +27,7 @@ spec:
         - name: oci-pull
       containers:
         - name: fechat-backend
-          image: oci.fecore.dev/fechat-backend:0.6.0
+          image: oci.fecode.dev/fechat-backend:0.6.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

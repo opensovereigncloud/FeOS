@@ -2,7 +2,7 @@ FeOS and FeRun on the lab's k3s
 ===============================
 
 The lab cluster (three Debian 13 VMs with nested virtualization, k3s,
-traefik, cert-manager, the registry oci.fecore.dev) runs the whole platform:
+traefik, cert-manager, the registry oci.fecode.dev) runs the whole platform:
 
 | Part | Where | What |
 |---|---|---|
@@ -72,7 +72,7 @@ instances' certificates on the nodes' port carry and the nodes check
 
 ### Once: the secrets
 
-    kubectl -n ferun create secret docker-registry oci-pull --docker-server=oci.fecore.dev \
+    kubectl -n ferun create secret docker-registry oci-pull --docker-server=oci.fecode.dev \
       --docker-username='<registry user>' --docker-password='<registry password>'
     kubectl -n ferun create secret generic ferund-postgres --from-literal=password=$(openssl rand -hex 24)
     kubectl -n ferun create secret generic ferund \

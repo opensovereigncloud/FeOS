@@ -3,8 +3,8 @@ FeOS and FeRun on Gardener (IronCore)
 
 The platform runs on the Gardener shoot `fecode-dev` (project `feos`,
 IronCore region wdf4), beside FeCode (`~/fecode/deploy/fecode`; its git
-gateway is https://git.fecode.dev). Every name of the zone fecode.dev, and
-oci.fecore.dev, points at the shoot's one public address, the LoadBalancer
+gateway is https://git.fecode.dev). Every name of the zone fecode.dev points
+at the shoot's one public address, the LoadBalancer
 of Traefik (`traefik/traefik`), 194.11.242.33. The k3s lab
 ([`../k3s`](../k3s)) is off.
 
@@ -14,7 +14,7 @@ of Traefik (`traefik/traefik`), 194.11.242.33. The k3s lab
 | [`ferun/`](ferun/) | namespace `ferun` | ferund and its PostgreSQL: the k3s lab's manifests ([`../k3s/ferun`](../k3s/ferun)) with the nodes' port at a shoot address; https://run.fecode.dev |
 | [`../k3s/fechat`](../k3s/fechat) | namespace `fechat` | FeChat, unchanged; https://chat.fecode.dev |
 | `~/idp/k8s/idp.yaml` | namespace `idp` | FeCode ID, unchanged; https://id.fecode.dev |
-| [`registry/`](registry/) | namespace `registry` | the image registry, https://oci.fecore.dev and https://oci.fecode.dev: distribution with its blobs in the bucket `fecore-oci`; every image here comes from it |
+| [`registry/`](registry/) | namespace `registry` | the image registry, https://oci.fecode.dev: distribution with its blobs in the bucket `fecore-oci`; every image here comes from it |
 | [`cluster.yaml`](cluster.yaml) | | the issuer `letsencrypt-prod` the manifests name, answering DNS-01 |
 
 ```

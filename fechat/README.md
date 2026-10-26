@@ -40,7 +40,7 @@ ferund's public API, the same one any other agent uses:
 - `Dockerfile`, `nginx.conf`: the SPA's image, served by nginx on port
   8080. `backend/Dockerfile`: the backend's image, a static binary
   (`CGO_ENABLED=0`).
-- `deploy.sh [tag]`: builds both images, pushes them to oci.fecore.dev and
+- `deploy.sh [tag]`: builds both images, pushes them to oci.fecode.dev and
   rolls both deployments to the tag.
 - [`/deploy/k3s/fechat/`](../deploy/k3s/fechat/): the manifests for k3s,
   namespace `fechat`: the deployments and services `fechat-app` and
@@ -86,11 +86,11 @@ None of them is in the repository. Create them once, in the namespace
 the local files below outside the repository, or at least out of git
 (`fechat/.gitignore` ignores `*.env`).
 
-**`oci-pull`**, for pulling the images from oci.fecore.dev:
+**`oci-pull`**, for pulling the images from oci.fecode.dev:
 
 ```sh
 kubectl -n fechat create secret docker-registry oci-pull \
-  --docker-server=oci.fecore.dev \
+  --docker-server=oci.fecode.dev \
   --docker-username='<registry user>' --docker-password='<registry password>'
 ```
 
@@ -143,7 +143,7 @@ fechat/deploy.sh 0.5.0
 ```
 
 From then on, `fechat/deploy.sh <tag>` builds and pushes both images and
-rolls the deployments to them. It needs `docker login oci.fecore.dev`;
+rolls the deployments to them. It needs `docker login oci.fecode.dev`;
 `DOCKER` selects another client (`DOCKER="sudo docker"`, `DOCKER=podman`).
 Give every deploy a new tag: the nodes keep an image they have
 (`imagePullPolicy: IfNotPresent`). Applying `app.yaml` or `backend.yaml`

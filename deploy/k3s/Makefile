@@ -3,10 +3,10 @@
 
 # Images and rollouts of the lab's k3s deployment (README.md). Run from the
 # repository's root: make -C deploy/k3s <target>. Pushing needs
-# `docker login oci.fecore.dev`.
+# `docker login oci.fecode.dev`.
 
 REPO_ROOT := $(abspath ../..)
-REGISTRY ?= oci.fecore.dev
+REGISTRY ?= oci.fecode.dev
 DOCKER ?= docker
 TAG ?= dev
 PACKAGES_DIR ?= $(REPO_ROOT)/target/packages

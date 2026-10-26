@@ -32,7 +32,7 @@ spec:
       terminationGracePeriodSeconds: 150
       containers:
         - name: ferund
-          image: oci.fecore.dev/ferund:dev
+          image: oci.fecode.dev/ferund:dev
           imagePullPolicy: Always
           args: ["serve"]
           envFrom:

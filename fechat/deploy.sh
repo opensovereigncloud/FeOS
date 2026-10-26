@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Build FeChat's two images, push them to oci.fecore.dev and roll both
+# Build FeChat's two images, push them to oci.fecode.dev and roll both
 # deployments in the namespace fechat to the new tag. Pushing needs a
-# `docker login oci.fecore.dev`; kubectl must point at the cluster.
+# `docker login oci.fecode.dev`; kubectl must point at the cluster.
 #
 # Usage: fechat/deploy.sh [tag]    (default: 0.6.0)
 #
@@ -15,7 +15,7 @@
 set -eu
 cd "$(dirname "$0")"
 TAG=${1:-0.6.0}
-REG=oci.fecore.dev
+REG=oci.fecode.dev
 DOCKER=${DOCKER:-docker}
 
 $DOCKER build -q -t "$REG/fechat-app:$TAG" .
