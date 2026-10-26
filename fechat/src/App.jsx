@@ -285,6 +285,9 @@ export default function App({ user }) {
   }, [input])
   const abortRef = useRef(null)
   const conversationIdRef = useRef(crypto.randomUUID())
+  // The conversation's sandbox reference: the backend hands it out with
+  // the first tool call, and every later request sends it back.
+  const sandboxRefRef = useRef('')
   const atBottomRef = useRef(true)
 
   // Auto-scroll: follow while the user is at the bottom. Any scrolling up
@@ -464,13 +467,23 @@ export default function App({ user }) {
     const controller = new AbortController()
     abortRef.current = controller
 
+    const conversationId = conversationIdRef.current
     try {
       for await (const item of streamReply(wireHistory(history), {
         signal: controller.signal,
-        conversationId: conversationIdRef.current,
+        conversationId,
+        sandboxRef: sandboxRefRef.current,
         image: image.trim(),
       })) {
-        if (item.type === 'tool_start') {
+        if (item.type === 'sandbox') {
+          // only for the conversation still open (not after "new chat")
+          if (
+            item.conversationId === conversationId &&
+            conversationIdRef.current === conversationId
+          ) {
+            sandboxRefRef.current = item.ref
+          }
+        } else if (item.type === 'tool_start') {
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantMsg.id
@@ -564,6 +577,7 @@ export default function App({ user }) {
     abortRef.current?.abort()
     abortRef.current = null
     conversationIdRef.current = crypto.randomUUID()
+    sandboxRefRef.current = ''
     setStreaming(false)
     setMessages([])
     setChatEpoch((e) => e + 1)

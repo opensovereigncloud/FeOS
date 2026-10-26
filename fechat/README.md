@@ -11,9 +11,22 @@ control plane `ferund` provides. The backend is an ordinary client of
 ferund's public API, the same one any other agent uses:
 
 - **Provisioning**, with a FeRun tenant token: `POST /api/v1/sandboxes`
-  with `{"sandboxId", "image"}`, the conversation's UUID as the sandbox
-  ID; a fresh sandbox returns its first `token`, an existing one gets a new
-  one from `POST /api/v1/sandboxes/{id}/tokens` with `{"label"}`.
+  with `{"image"}` and no `sandboxId`: ferund mints the ID (ADR 0019) and
+  answers it (`status.sandboxId`) with the sandbox's first `token`. A
+  sandbox the backend has no session for (after a restart) gets a new
+  token from `POST /api/v1/sandboxes/{id}/tokens` with `{"label"}`.
+- **Sandbox references**: the backend keeps no database, so the browser
+  keeps each conversation's sandbox ID, as a reference the backend signs
+  (`backend/sandboxref.go`): `v1.<sandbox ID>.<MAC>`, the MAC an
+  HMAC-SHA256 under a key derived from `SESSION_SECRET`, over the signed-in
+  user's subject, the conversation ID and the sandbox ID. The chat stream
+  hands it out in a `sandbox` event, and the SPA sends it back as
+  `sandbox_ref` with every request of the conversation. A reference of
+  another user or conversation, or a forged one, is ignored; one whose
+  sandbox is gone (404) gets a new sandbox and a new reference. A
+  conversation from before ADR 0019 has its UUID as its sandbox ID and no
+  reference: without one, the backend looks for a sandbox of that ID and
+  keeps the conversation in it.
 - **Tools**: `GET /api/v1/tools` gives the tool schemas the LLM is
   offered, and `preparationWaitMs`, how long bringing a sandbox up may
   take, which sizes every tool call's timeout.
@@ -27,7 +40,7 @@ ferund's public API, the same one any other agent uses:
   call chips, a field for the sandbox image). `src/backend.js` is the SSE
   client of `POST /api/v1/chat`.
 - `backend/`: the Go backend. It streams SSE events to the SPA (`delta`,
-  `tool_start`, `tool`, `history`, `done`, `error`). Because it is
+  `tool_start`, `tool`, `history`, `sandbox`, `done`, `error`). Because it is
   stateless, the client carries the history: `history` events deliver, per
   completed round, the exact OpenAI messages (the assistant's `tool_calls`
   and the `tool` results, or the final answer), and the client sends them
@@ -74,7 +87,7 @@ The backend reads its environment:
 | `OIDC_CLIENT_ID`     | Secret `oidc-client-fechat`   | FeChat's client there |
 | `OIDC_CLIENT_SECRET` | Secret `oidc-client-fechat`   | |
 | `PUBLIC_URL`         | the deployment                | `https://chat.fecode.dev`: the callback is `PUBLIC_URL/api/v1/auth/callback` |
-| `SESSION_SECRET`     | Secret `fechat-backend`       | at least 32 bytes; signs the session cookies (24 h) |
+| `SESSION_SECRET`     | Secret `fechat-backend`       | at least 32 bytes; signs the session cookies (24 h) and the sandbox references; a new one gives open conversations new sandboxes |
 | `MODEL`              | ConfigMap, key `model`        | the model, `kimi-k3-sovereign` |
 | `SYSTEM_PROMPT_FILE` | ConfigMap, mounted at `/etc/fechat` | default `/etc/fechat/system-prompt.txt` |
 | `PORT`               |                               | listen port, default 8080 |
