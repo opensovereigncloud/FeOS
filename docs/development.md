@@ -69,7 +69,8 @@ docs/                   documentation and ADRs
 Each binary is named after where it runs ([ADR 0003](adr/0003-programs.md)):
 
 - **`feosd`** (`crates/feos`, feature `host`, the default): the node agent,
-  under systemd or `feos-host-init`, never PID 1. It runs pods and serves
+  under systemd, `feos-host-init` or in a Kubernetes pod (ADR 0020), never
+  PID 1. It runs pods and serves
   the public API on `/run/feos/api.sock`, and on TCP with `--tcp`. A pod's
   microVM runs in Firecracker, in its jailer
   ([ADR 0005](adr/0005-firecracker.md),

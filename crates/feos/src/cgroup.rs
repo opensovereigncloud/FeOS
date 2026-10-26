@@ -7,8 +7,14 @@
 //! whose cgroup has controllers on for its children cannot start from
 //! systemd 258 on. A cgroup whose children use controllers may hold no
 //! processes itself, so feosd moves into a leaf of its own, `feosd`, unless
-//! it is in the root, which may, or systemd put it there
-//! (DelegateSubgroup=feosd).
+//! it is in the real root of the hierarchy, which may, or systemd put it
+//! there (DelegateSubgroup=feosd).
+//!
+//! In a container with a cgroup namespace of its own (ADR 0020), the root
+//! feosd sees is the container's cgroup, which is no real root: feosd moves
+//! into `feosd` below it, and the VMs go into `vms/<id>` beside it. The
+//! kernel tells the two apart by `cgroup.type`, which every cgroup but the
+//! real root has.
 
 use std::io;
 use std::path::Path;
@@ -23,7 +29,7 @@ const CONTROL: &str = ".control";
 pub fn enter_leaf() -> io::Result<String> {
     let own = own_cgroup(&std::fs::read_to_string("/proc/self/cgroup")?)
         .ok_or_else(|| io::Error::other("no cgroup v2 entry in /proc/self/cgroup"))?;
-    let (base, leaf) = place(&own);
+    let (base, leaf) = place(&own, at_real_root());
     if let Some(leaf) = leaf {
         let leaf = Path::new(CGROUP_ROOT).join(leaf);
         std::fs::create_dir_all(&leaf)?;
@@ -61,11 +67,20 @@ fn own_cgroup(proc_cgroup: &str) -> Option<String> {
         .map(|path| path.trim_start_matches('/').to_string())
 }
 
+/// Whether the root of the hierarchy, as this process sees it, is the real
+/// one, which may hold processes beside children that use controllers.
+/// The root of a cgroup namespace, a container's cgroup, has a
+/// `cgroup.type`; the real root has none.
+fn at_real_root() -> bool {
+    !Path::new(CGROUP_ROOT).join("cgroup.type").exists()
+}
+
 /// For a process in `own`: the cgroup VMs go below, and the leaf it has to
-/// move into, if any.
-fn place(own: &str) -> (String, Option<String>) {
+/// move into, if any. `real_root`: the root of the hierarchy is the real
+/// one, not a cgroup namespace's.
+fn place(own: &str, real_root: bool) -> (String, Option<String>) {
     if own.is_empty() {
-        return (String::new(), None);
+        return (String::new(), (!real_root).then(|| LEAF.to_string()));
     }
     let path = Path::new(own);
     if path.file_name().is_some_and(|name| name == LEAF) {
@@ -110,18 +125,35 @@ mod tests {
     #[test]
     fn vms_go_below_the_cgroup_feosd_is_given() {
         // Under feos-host-init.
-        assert_eq!(place(""), (String::new(), None));
+        assert_eq!(place("", true), (String::new(), None));
         // Under systemd with DelegateSubgroup=feosd.
         assert_eq!(
-            place("system.slice/feosd.service/feosd"),
+            place("system.slice/feosd.service/feosd", true),
             ("system.slice/feosd.service".to_string(), None)
         );
         // Anywhere else, feosd moves into a leaf first.
         assert_eq!(
-            place("system.slice/feosd.service"),
+            place("system.slice/feosd.service", true),
             (
                 "system.slice/feosd.service".to_string(),
                 Some("system.slice/feosd.service/feosd".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn in_a_cgroup_namespace_feosd_leaves_its_root() {
+        // A container's cgroup, the root of its namespace, may not hold
+        // feosd once the VMs' cgroups use controllers.
+        assert_eq!(place("", false), (String::new(), Some("feosd".to_string())));
+        // Moved already, by a feosd that exec'd this one.
+        assert_eq!(place("feosd", false), (String::new(), None));
+        // Without a namespace of its own, the container's cgroup is a path.
+        assert_eq!(
+            place("kubepods.slice/cri-containerd-1.scope", true),
+            (
+                "kubepods.slice/cri-containerd-1.scope".to_string(),
+                Some("kubepods.slice/cri-containerd-1.scope/feosd".to_string())
             )
         );
     }

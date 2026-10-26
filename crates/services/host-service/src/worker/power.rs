@@ -31,6 +31,28 @@ fn reboot() -> Result<(), nix::Error> {
     signal_pid1(5)
 }
 
+/// Why the node's power is not feosd's, if it is not: in a container
+/// (ADR 0020), PID 1 is the container's, which ignores the signals, and the
+/// node is Kubernetes's to restart.
+#[cfg(not(feature = "guest"))]
+fn refused() -> Option<HostError> {
+    match feos_utils::host::power::in_pid_namespace() {
+        Ok(false) => None,
+        Ok(true) => Some(HostError::FailedPrecondition(
+            "feosd runs in a container: the node's power is not feosd's".into(),
+        )),
+        Err(e) => Some(HostError::Failed(format!(
+            "whether feosd runs in a container: {e}"
+        ))),
+    }
+}
+
+/// A guest powers its own VM.
+#[cfg(feature = "guest")]
+fn refused() -> Option<HostError> {
+    None
+}
+
 #[cfg(not(feature = "guest"))]
 fn signal_pid1(rtmin_offset: i32) -> Result<(), nix::Error> {
     // nix's Signal has no real-time signals.
@@ -48,6 +70,10 @@ pub async fn handle_shutdown(
     responder: oneshot::Sender<Result<ShutdownResponse, HostError>>,
 ) {
     info!("HostWorker: Processing Shutdown request.");
+    if let Some(refused) = refused() {
+        let _ = responder.send(Err(refused));
+        return;
+    }
 
     if responder.send(Ok(ShutdownResponse {})).is_err() {
         error!(
@@ -68,6 +94,10 @@ pub async fn handle_reboot(
     responder: oneshot::Sender<Result<RebootResponse, HostError>>,
 ) {
     info!("HostWorker: Processing Reboot request.");
+    if let Some(refused) = refused() {
+        let _ = responder.send(Err(refused));
+        return;
+    }
 
     if responder.send(Ok(RebootResponse {})).is_err() {
         error!("HostWorker: Failed to send response for Reboot. The client may have disconnected.");

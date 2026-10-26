@@ -20,8 +20,8 @@ Parts that are decided but not built are marked as such.
   sets the machine up, starts `diskd` and `feosd` and starts each again
   when it ends.
 - **`feosd`**: the node agent: the API, the pod and microVM services, the container and
-  image services. It runs under systemd or `feos-host-init`, never as
-  PID 1.
+  image services. It runs under systemd, `feos-host-init` or in a
+  Kubernetes pod ([On Kubernetes](#on-kubernetes)), never as PID 1.
 - **`feosd --task-service`**: the container runtime (libcontainer) in a
   process of its own, started and restarted by `feosd`. Its pid is in
   `/run/feos/task-service.pid`.
@@ -85,12 +85,26 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 - Once its listeners are bound, it sends `READY=1` to `$NOTIFY_SOCKET` if
   systemd set one.
 - `HostService.Reboot` and `Shutdown` send PID 1 `SIGRTMIN+5` and
-  `SIGRTMIN+4`. `UpgradeFeosBinary` replaces the binary and runs it with
+  `SIGRTMIN+4`; in a PID namespace of its own, as in a container, they
+  fail with `FAILED_PRECONDITION`. `UpgradeFeosBinary` replaces the binary and runs it with
   the same pid, and the resolver's sockets, only with `--self-upgrade`;
   without, the call fails with `FAILED_PRECONDITION`.
 - It is the subreaper of its children. Pods and the task service outlive
   it: a `feosd` that starts again takes the running pods over and keeps the
-  running task service.
+  running task service. In a container they end with it
+  ([On Kubernetes](#on-kubernetes)).
+- One `feosd` per node: before it touches anything, it takes an exclusive
+  `flock(2)` on `/var/lib/feos/feosd.lock`, writes its pid into it and
+  holds it until it ends. While another process holds it, `feosd` says so
+  and tries again every second, as long as it takes, rather than exit: a
+  `feosd` that stops, such as a rollout's old pod that suspends its pods,
+  ends in its own time, and an exit would only meet systemd's start limit
+  or Kubernetes's back-off. The file is open close-on-exec: a
+  self-upgrade's exec takes the lock again, and nothing `feosd` runs holds
+  it. `diskd` holds `/var/lib/feos/disk/diskd.lock` alike.
+- With `--suspend-on-stop`, SIGTERM suspends the pods for the next `feosd`
+  ([On Kubernetes](#on-kubernetes)); without, with a control plane, it
+  tells the control plane that `feosd` stops, and ends.
 
 ## Directories
 
@@ -102,9 +116,11 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 | `/var/lib/feos/security-groups/<id>.pb` | a security group (a `feos.network.v1.SecurityGroup`) |
 | `/var/lib/feos/name-tables/<id>.pb` | a name table (a `feos.network.v1.NameTable`) |
 | `/var/lib/feos/volumes/<id>.pb` | a volume (a `feos.volume.v1.Volume`); `empty-layer.img`, the image of the volumes' empty L0 |
+| `/var/lib/feos/feosd.lock` | the lock of the one `feosd` on the node, with its pid |
+| `/var/lib/feos/suspended-for-stop.json` | the pods a stop of `feosd` suspended, for the next `feosd` to resume ([On Kubernetes](#on-kubernetes)) |
 | `/var/lib/feos/vms.db` | the microVM records (SQLite), by the pod's ID: a UUID as its 16 bytes, a short ID as text |
 | `/var/lib/feos/vms/firecracker/<id>/` | a microVM's jail: `jail.json` and the chroot `root/` |
-| `/var/lib/feos/disk/` | diskd's state: the pods' disks, the chunk cache ([disk.md](disk.md)) |
+| `/var/lib/feos/disk/` | diskd's state: the pods' disks, the chunk cache ([disk.md](disk.md)), the lock `diskd.lock` |
 | `/var/lib/feos/images/` | pulled images, a `metadata.json` each |
 | `/var/lib/feos/containers/` | the host's containers, a `container.json` each |
 | `/var/lib/feos/upgrade/` | a downloaded binary before an upgrade |
@@ -678,12 +694,18 @@ Every microVM has a cgroup of its own, `vms/<id>`, with `cpu.weight` 100
 per vCPU and no caps: `/sys/fs/cgroup/vms/<id>` under `feos-host-init`,
 below the cgroup `feosd` is given;
 `/sys/fs/cgroup/system.slice/feos-vms.service/vms/<id>` under systemd,
-below the cgroup `--vms-cgroup` names. `feosd` creates the microVM's
+below the cgroup `--vms-cgroup` names; in a container with a cgroup
+namespace of its own, `/sys/fs/cgroup/vms/<id>` as the container sees it,
+below the container's cgroup. `feosd` creates the microVM's
 cgroup and enables `cpu` and `memory` in the cgroup they go below and in
 `vms/`, never above; the jailer only moves Firecracker into it. A cgroup
 whose children use controllers may hold no processes, so `feosd` moves
 into the leaf `feosd` of its cgroup, where systemd starts it already with
-`DelegateSubgroup=feosd`.
+`DelegateSubgroup=feosd`. Only the real root of the hierarchy may hold
+processes beside such children, and there `feosd` stays; the root of a
+cgroup namespace, which `/proc/self/cgroup` shows as `/` too, is a
+container's cgroup and may not. The kernel tells them apart:
+`cgroup.type` is in every cgroup but the real root.
 
 Under systemd the microVMs are not below `feosd.service`: from systemd 258
 on, systemd starts a service's main process in the service's cgroup and
@@ -723,6 +745,98 @@ the ones in `PATH`; `jail.json` records which. A restore runs what the
 snapshot's boot ran, and fails with `FAILED_PRECONDITION` if that is not
 installed any more. The tests download Firecracker v1.17.0, pinned by
 sha256.
+
+## On Kubernetes
+
+On Kubernetes ([ADR 0020](../adr/0020-feos-on-kubernetes.md)) `feosd`
+and `diskd` run in a privileged pod per node, from a DaemonSet, the same
+binaries as the packages', and the microVMs live and end in `feosd`'s
+container. What the pod needs:
+
+- **Process namespace**: `shareProcessNamespace: true`, so that the
+  pod's pause process is PID 1, which `feosd` refuses to be. Its
+  container's command execs `feosd` (a wrapper that stays would hold the
+  container's cgroup, which `feosd` leaves). `feosd` is the subreaper of
+  its children either way.
+- **Cgroups**: the container's own cgroup namespace (containerd's default
+  on cgroup v2), mounted read-write, as a privileged container has it.
+  `feosd` moves into `feosd/` of the container's cgroup and puts the
+  microVMs into `vms/<id>` beside it ([Jail, user and
+  cgroup](#jail-user-and-cgroup)); `kubectl exec` and exec probes land in
+  `feosd/` too. When the container ends, the microVMs end with it.
+- **Host**: `hostNetwork` (TAP devices, nftables, the mesh's WireGuard
+  device, the resolver's address, which `feosd` binds itself, without
+  `feosd.socket`), the host's `/dev` (KVM, TUN, ublk), `hostPath`
+  `/var/lib/feos` (a directory on disk, never shared with a `feosd` or
+  `diskd` of the host's: their locks keep a second one waiting) and
+  `/usr/lib/feos` with every Firecracker and guest version the pods'
+  snapshots pin; `/run/feos` may be the pod's own. `$NOTIFY_SOCKET` is not
+  set, and nothing waits for it.
+- **diskd stops after `feosd`**: the pods' disks and the memory of pods
+  restored from a checkpoint are `diskd`'s, and a suspend writes through
+  them. `diskd --stop-after-lock /var/lib/feos/feosd.lock` serves on after
+  SIGTERM until no process holds `feosd`'s lock, then exits; better still,
+  `diskd` is a sidecar (an init container with `restartPolicy: Always`),
+  which Kubernetes starts before `feosd` and stops after it.
+
+### Suspend on stop
+
+`feosd --suspend-on-stop` is for a `feosd` whose microVMs end with it. On
+SIGTERM it
+
+1. refuses every call that changes a pod (`CreatePod`, `StartPod`,
+   `StopPod`, `DeletePod`, `SuspendPod`, `ResumePod`, `HibernatePod`,
+   `RestorePod`) with `UNAVAILABLE`, "feosd stops";
+2. with a control plane, tells it that `feosd` stops (`stopping`, waiting
+   up to 3 s for the acknowledgement) and then lets go of it for good: the
+   node connections close and the reports end;
+3. suspends every running pod into its directory as `SuspendPod` does
+   ([ADR 0008](../adr/0008-suspend-and-restore.md)), four at a time, and
+   records each in `/var/lib/feos/suspended-for-stop.json` (the pods and
+   the time of the stop, written whole and synced) as soon as it is
+   suspended, so that a stop that is killed keeps what it did. It waits for
+   the hibernations in flight, whose pods are not running on the node
+   then. A pod whose suspend fails ends with `feosd`, as on a crash;
+4. exits 0.
+
+The next `feosd` on the node resumes the recorded pods that are still
+suspended, four at a time, once `diskd` answers (it waits up to two
+minutes), and removes the record. A pod whose resume fails stays suspended
+and is logged; `feosd` serves on. A stop during the resumes keeps the pods
+not resumed yet in the record. Without `--suspend-on-stop` a record is
+honoured all the same, so a rollback leaves no pod behind.
+
+**With the control plane** `feosd` resumes before it connects: it starts
+the join, the node connections and the reports only once the resumes are
+done, or after two minutes, while the rest go on. FeRun so never sees the
+pods suspended. Its rows stay `running` while the node is away: calls to
+the node wait for its rollout deadline ([control-plane.md](control-plane.md),
+`--rollout-grace`), the node is marked down when its reports stay away
+past its TTL, and its sandboxes become `unknown`, which no repair and no
+tombstone acts on. The new start requests a reconcile, which finds the
+pods running as the rows say. A pod event or an inventory hash with the
+pods suspended, a call into a suspended guest that marks it unreachable
+for the repair, or a `ResumePod` racing `feosd`'s own resume cannot
+happen, since the node connections close before the first suspend and
+open after the resumes. An op of FeRun's that the stop cut off reads the
+pod again once the node is back, as after any lost answer.
+
+A stop longer ago than five minutes is not resumed when a control plane
+is configured: FeRun counts the sandboxes of a node that is down past its
+`--lost-grace` (10 minutes) as lost or hibernated and may restore them
+elsewhere. The pods stay suspended, FeRun's reconcile finds them so, and
+it resumes them on their next use, or deletes them where their sandbox
+moved on.
+
+**The budget.** A suspend writes the guest's memory at the disk's speed:
+the snapshot is as large as the guest's memory, less what free page
+reporting gave back, which is written as zeroes and punched out. The pod's
+`terminationGracePeriodSeconds` covers about 60 s plus 4 s per GiB of the
+memory the node gives microVMs, as FeRun's own pause deadline counts it
+(2 min + 4 s/GiB), and FeRun's `--rollout-grace` covers that grace plus
+the start of the new pod and its resumes, so that calls wait rather than
+fail. A crash, a kill past the grace or the OOM killer ends the microVMs
+that are not suspended yet: FeRun treats them as on a lost node.
 
 ## Packages
 

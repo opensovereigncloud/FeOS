@@ -31,6 +31,10 @@
 //! deletion. After a boot, the guest mounts them before the containers
 //! are created, and formats those the node knows to be new.
 
+mod stop;
+
+pub use stop::{read_record, StopRecord, Stopped, STOP_RECORD};
+
 use crate::disk::{volume_disk, Disks};
 use crate::network::{Attachment, Network};
 use crate::spec;
@@ -70,6 +74,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
@@ -115,6 +120,10 @@ struct Inner {
     volumes: Volumes,
     pods: Mutex<HashMap<String, Pod>>,
     events: broadcast::Sender<PodEvent>,
+    /// feosd stops: calls that change pods are refused.
+    stopping: AtomicBool,
+    /// Held while the record of a stop is written or removed.
+    stop_record: tokio::sync::Mutex<()>,
 }
 
 struct Pod {
@@ -267,6 +276,8 @@ impl Pods {
                 volumes,
                 pods: Mutex::new(HashMap::new()),
                 events,
+                stopping: AtomicBool::new(false),
+                stop_record: tokio::sync::Mutex::new(()),
             }),
         };
         let mut pending = Vec::new();

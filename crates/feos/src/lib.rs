@@ -36,13 +36,17 @@ use log::{error, info, warn};
 use network_service::{NameTables, SecurityGroups};
 use nix::unistd::{chown, Group, Uid};
 #[cfg(feature = "host")]
-use pod_service::{forward::ForwardLayer, Pods, Volumes};
+use pod_service::{forward::ForwardLayer, Pods, Volumes, STOP_RECORD};
 use setup::*;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{SocketAddr, UnixDatagram};
 use std::path::Path;
+#[cfg(feature = "host")]
+use std::sync::{Arc, OnceLock};
+#[cfg(feature = "host")]
+use std::time::Duration;
 use task_service::TASK_SERVICE_SOCKET;
 use tokio::{fs, net::UnixListener, sync::mpsc};
 use tokio_stream::wrappers::UnixListenerStream;
@@ -59,6 +63,16 @@ pub const API_SOCKET: &str = "/run/feos/api.sock";
 /// The group that may use the API socket, if it exists. The feosd package
 /// creates it.
 const API_GROUP: &str = "feos";
+/// How long the pods of a stop may take to resume before feosd connects to
+/// the control plane all the same; those still resuming go on.
+#[cfg(feature = "host")]
+const RESUME_WAIT: Duration = Duration::from_secs(120);
+/// With a control plane, the pods of a stop longer ago than this stay
+/// suspended: the control plane counts a node's sandboxes as lost after
+/// its `--lost-grace`, 10 minutes by default, and may bring them back
+/// elsewhere.
+#[cfg(feature = "host")]
+const RESUME_WITHIN: Duration = Duration::from_secs(300);
 
 /// How feosd or feos-guest serves.
 #[derive(Debug, Default)]
@@ -85,6 +99,10 @@ pub struct ServerOptions {
     /// The control plane (ADR 0015); none for a node of its own.
     #[cfg(feature = "host")]
     pub fleet: Option<fleet_client::Config>,
+    /// SIGTERM suspends the running pods, for the next feosd to resume:
+    /// for a feosd whose microVMs end with it (ADR 0020).
+    #[cfg(feature = "host")]
+    pub suspend_on_stop: bool,
 }
 
 impl ServerOptions {
@@ -103,6 +121,8 @@ impl ServerOptions {
             diskd_socket: None,
             #[cfg(feature = "host")]
             fleet: None,
+            #[cfg(feature = "host")]
+            suspend_on_stop: false,
         }
     }
 }
@@ -226,52 +246,90 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     #[cfg(feature = "guest")]
     tokio::spawn(guest::run_uplink());
 
-    // The control plane's connections, once the listeners serve: the node
-    // connections serve the same services.
+    // The pods a stop of feosd suspended are resumed first, for a while,
+    // then the control plane's connections come up, once the listeners
+    // serve: the node connections serve the same services. The control
+    // plane thus finds the pods running as it left them (node.md, "On
+    // Kubernetes").
     #[cfg(feature = "host")]
-    let (fleet, node_server) = {
-        let started = options.fleet.and_then(|config| {
-            fleet::start(config, services.pods.clone())
-                .map_err(|e| error!("Fleet: Not connecting to the control plane: {e}"))
-                .ok()
-        });
-        let (fleet, incoming) = started.unzip();
+    let fleet_slot: Arc<OnceLock<fleet_client::Fleet>> = Arc::default();
+    #[cfg(feature = "host")]
+    let node_server = {
+        let pods = services.pods.clone();
         let router = services.router_with(fleet_client::server());
-        let server = async move {
-            match incoming {
+        let slot = fleet_slot.clone();
+        let config = options.fleet.clone();
+        async move {
+            // A record older than that is the control plane's to act on.
+            let within = config.is_some().then_some(RESUME_WITHIN);
+            let resuming = {
+                let pods = pods.clone();
+                tokio::spawn(
+                    async move { pods.resume_after_stop(Path::new(STOP_RECORD), within).await },
+                )
+            };
+            if tokio::time::timeout(RESUME_WAIT, resuming).await.is_err() {
+                warn!(
+                    "Main: The pods are still resuming after {}s; connecting to the control \
+                     plane all the same",
+                    RESUME_WAIT.as_secs()
+                );
+            }
+            // A stop that came meanwhile: nothing more to connect.
+            let started = match config {
+                Some(config) if !pods.stopping() => fleet::start(config, pods.clone())
+                    .map_err(|e| error!("Fleet: Not connecting to the control plane: {e}"))
+                    .ok(),
+                _ => None,
+            };
+            match started {
                 // Never ends, whatever becomes of the dialers.
-                Some(incoming) => {
+                Some((fleet, incoming)) => {
+                    let _ = slot.set(fleet);
                     let incoming =
                         tokio_stream::StreamExt::chain(incoming, tokio_stream::pending());
                     router.serve_with_incoming(incoming).await
                 }
                 None => std::future::pending().await,
             }
-        };
-        (fleet, server)
+        }
     };
     #[cfg(not(feature = "host"))]
     let node_server = std::future::pending::<Result<(), tonic::transport::Error>>();
     let mut node_serving = true;
 
-    // With a control plane, SIGTERM tells it that feosd stops before feosd
-    // ends; without, feosd ends as the signal ends it.
+    // SIGTERM: with --suspend-on-stop, feosd refuses calls that change
+    // pods, tells the control plane that it stops and lets go of it, and
+    // suspends the running pods for the next feosd to resume. Without it,
+    // with a control plane, it tells the control plane that it stops
+    // before it ends; without either, it ends as the signal ends it.
     #[cfg(feature = "host")]
     let terminated = {
-        let fleet = fleet.clone();
-        let signal = fleet.is_some().then(|| {
+        let slot = fleet_slot.clone();
+        let pods = services.pods.clone();
+        let suspend = options.suspend_on_stop;
+        let signal = (suspend || options.fleet.is_some()).then(|| {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .map_err(|e| warn!("Main: Failed to handle SIGTERM: {e}"))
                 .ok()
         });
         async move {
-            match (fleet, signal.flatten()) {
-                (Some(fleet), Some(mut signal)) => {
-                    signal.recv().await;
-                    info!("Main: SIGTERM: feosd stops");
-                    fleet.stopping("feosd stops").await;
+            let Some(mut signal) = signal.flatten() else {
+                return std::future::pending().await;
+            };
+            signal.recv().await;
+            info!("Main: SIGTERM: feosd stops");
+            if suspend {
+                pods.begin_stop();
+            }
+            if let Some(fleet) = slot.get() {
+                fleet.stopping("feosd stops").await;
+                if suspend {
+                    fleet.disconnect();
                 }
-                _ => std::future::pending().await,
+            }
+            if suspend {
+                pods.suspend_for_stop(Path::new(STOP_RECORD)).await;
             }
         }
     };
@@ -323,7 +381,7 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             () = &mut terminated => return Ok(()),
             Some(RestartSignal(new_binary_path)) = restart_rx.recv() => {
                 #[cfg(feature = "host")]
-                if let Some(fleet) = &fleet {
+                if let Some(fleet) = fleet_slot.get() {
                     fleet.stopping("feosd restarts for an upgrade").await;
                 }
                 if let Err(e) = handle_upgrade(&new_binary_path) {

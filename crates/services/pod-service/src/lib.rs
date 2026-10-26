@@ -31,7 +31,7 @@ use feos_proto::volume_service::{
     CreateVolumeRequest, DeleteVolumeRequest, DeleteVolumeResponse, GetVolumeRequest,
     ListVolumesRequest, ListVolumesResponse, Volume,
 };
-pub use pods::Pods;
+pub use pods::{read_record, Pods, StopRecord, Stopped, STOP_RECORD};
 use std::pin::Pin;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -76,6 +76,7 @@ impl PodService for Pods {
         &self,
         request: Request<CreatePodRequest>,
     ) -> Result<Response<CreatePodResponse>, Status> {
+        self.check_serving()?;
         let request = request.into_inner();
         let pod = self
             .create(request.pod_id, request.spec.unwrap_or_default())
@@ -87,6 +88,7 @@ impl PodService for Pods {
         &self,
         request: Request<StartPodRequest>,
     ) -> Result<Response<StartPodResponse>, Status> {
+        self.check_serving()?;
         self.start(&request.into_inner().pod_id).await?;
         Ok(Response::new(StartPodResponse {}))
     }
@@ -95,6 +97,7 @@ impl PodService for Pods {
         &self,
         request: Request<StopPodRequest>,
     ) -> Result<Response<StopPodResponse>, Status> {
+        self.check_serving()?;
         self.stop(&request.into_inner().pod_id).await?;
         Ok(Response::new(StopPodResponse {}))
     }
@@ -103,6 +106,7 @@ impl PodService for Pods {
         &self,
         request: Request<DeletePodRequest>,
     ) -> Result<Response<DeletePodResponse>, Status> {
+        self.check_serving()?;
         self.delete(&request.into_inner().pod_id).await?;
         Ok(Response::new(DeletePodResponse {}))
     }
@@ -154,6 +158,7 @@ impl PodService for Pods {
         &self,
         request: Request<SuspendPodRequest>,
     ) -> Result<Response<SuspendPodResponse>, Status> {
+        self.check_serving()?;
         let memory_bytes = self.suspend(&request.into_inner().pod_id).await?;
         Ok(Response::new(SuspendPodResponse { memory_bytes }))
     }
@@ -170,6 +175,7 @@ impl PodService for Pods {
         &self,
         request: Request<ResumePodRequest>,
     ) -> Result<Response<ResumePodResponse>, Status> {
+        self.check_serving()?;
         self.resume(&request.into_inner().pod_id).await?;
         Ok(Response::new(ResumePodResponse {}))
     }
@@ -178,6 +184,7 @@ impl PodService for Pods {
         &self,
         request: Request<HibernatePodRequest>,
     ) -> Result<Response<HibernatePodResponse>, Status> {
+        self.check_serving()?;
         let request = request.into_inner();
         Ok(Response::new(
             self.hibernate(&request.pod_id, &request.request_id, request.no_abandon)
@@ -189,6 +196,7 @@ impl PodService for Pods {
         &self,
         request: Request<RestorePodRequest>,
     ) -> Result<Response<RestorePodResponse>, Status> {
+        self.check_serving()?;
         let request = request.into_inner();
         Ok(Response::new(
             self.restore(&request.pod_id, &request.head_key, request.cold)

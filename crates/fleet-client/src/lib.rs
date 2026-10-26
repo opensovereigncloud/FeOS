@@ -152,6 +152,8 @@ impl Config {
 #[derive(Clone)]
 pub struct Fleet {
     events: Events,
+    /// What joins, reports and holds the node connections.
+    runner: tokio::task::AbortHandle,
 }
 
 impl Fleet {
@@ -168,6 +170,17 @@ impl Fleet {
         if !self.events.flush(STOPPING_WAIT).await {
             warn!("Fleet: The control plane did not acknowledge that feosd stops");
         }
+    }
+
+    /// Lets go of the control plane for the rest of this feosd's life: the
+    /// node connections close and the reports end, so that the control
+    /// plane neither calls the node nor sees its pods until the next
+    /// feosd connects. For a stop that suspends the pods: the control plane
+    /// waits for the node it announced the restart of, and finds the pods
+    /// as it left them.
+    pub fn disconnect(&self) {
+        self.runner.abort();
+        info!("Fleet: Disconnected from the control plane");
     }
 }
 
@@ -199,8 +212,8 @@ pub fn start<I: Inventory>(config: Config, inventory: I) -> Result<(Fleet, Incom
             &start_id,
         ) as usize,
     };
-    tokio::spawn(runner.run());
-    Ok((Fleet { events }, incoming))
+    let runner = tokio::spawn(runner.run()).abort_handle();
+    Ok((Fleet { events, runner }, incoming))
 }
 
 struct Runner<I> {

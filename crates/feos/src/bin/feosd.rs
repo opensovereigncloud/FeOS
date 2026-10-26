@@ -1,19 +1,25 @@
 // SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
-//! feosd: the node agent, under systemd or feos-host-init, never PID 1.
+//! feosd: the node agent, under systemd, feos-host-init or in a Kubernetes
+//! pod, never PID 1.
 
 use anyhow::{anyhow, bail, Context, Result};
+use feos_utils::filesystem::DATA_ROOT;
 use main_server::{run_server, run_task_service, ServerOptions};
 use microvm_service::vmm::jail;
 use nix::sys::prctl;
 use pod_service::network;
 use std::net::SocketAddr;
+use std::path::Path;
+
+/// The lock that one feosd per node holds on its state.
+const STATE_LOCK: &str = "/var/lib/feos/feosd.lock";
 
 const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix PREFIX]
              [--pod-ipv4-range PREFIX] [--dns-address ADDRESS]
              [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
-             [--diskd-socket PATH] [--vms-cgroup PATH]
+             [--diskd-socket PATH] [--vms-cgroup PATH] [--suspend-on-stop]
              [--control-plane HOST:PORT [--control-plane-name NAME]
               [--trust-domain NAME] [--join-token-file PATH] [--node-dir PATH]
               [--mesh-port PORT] [--mesh-address ADDRESS]]
@@ -43,6 +49,13 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
                            system.slice/feos-vms.service; the cgroup feosd is
                            given by default. feosd moves the microVMs below
                            its own cgroup there when it starts
+  --suspend-on-stop        for a feosd whose microVMs end with it, as in a
+                           container (ADR 0020): SIGTERM suspends every running
+                           pod into its directory and records them in
+                           /var/lib/feos/suspended-for-stop.json, after telling
+                           the control plane that feosd stops and letting go
+                           of it; then feosd exits. The next feosd resumes them
+                           before it connects to the control plane
   --hand-over-vms          move the microVMs below feosd's own cgroup to
                            --vms-cgroup's and exit: feosd.service's
                            ExecStopPost=, so that a feosd from before
@@ -77,6 +90,7 @@ struct Args {
     /// default.
     vms_cgroup: Option<String>,
     hand_over_vms: bool,
+    suspend_on_stop: bool,
     /// The control plane, and how the node joins it.
     fleet: Option<fleet_client::Config>,
     /// Passed by feosd itself: the task service, and the process an upgrade
@@ -150,6 +164,7 @@ impl Args {
                     parsed.vms_cgroup = Some(cgroup.to_string());
                 }
                 "--hand-over-vms" => parsed.hand_over_vms = true,
+                "--suspend-on-stop" => parsed.suspend_on_stop = true,
                 "--control-plane" => control_plane = Some(value("HOST:PORT")?),
                 "--control-plane-name" => control_plane_name = Some(value("a name")?),
                 "--trust-domain" => trust_domain = Some(value("a name")?),
@@ -249,8 +264,24 @@ async fn serve(dns_sockets: Vec<(std::os::fd::OwnedFd, String)>) -> Result<()> {
         return Ok(());
     }
     if std::process::id() == 1 {
-        bail!("feosd does not run as PID 1; feos-host-init runs it");
+        bail!(
+            "feosd does not run as PID 1: feos-host-init runs it, or in a Kubernetes pod the \
+             pod's shared process namespace (shareProcessNamespace)"
+        );
     }
+
+    // One feosd per node: another one, such as the old pod of a rollout
+    // that still suspends its pods, has to end first. Held until feosd
+    // ends; a self-upgrade's exec takes it again.
+    let _state = feos_utils::state_lock::take(Path::new(STATE_LOCK), |holder| match holder {
+        Some(pid) => eprintln!(
+            "feosd: Another feosd runs on {DATA_ROOT} (pid {pid} in its namespace): waiting \
+             for it to end"
+        ),
+        None => eprintln!("feosd: Another feosd runs on {DATA_ROOT}: waiting for it to end"),
+    })
+    .await
+    .with_context(|| format!("lock {STATE_LOCK}"))?;
 
     // feosd inherits the orphans of its children, such as the processes
     // of a task service that died, and reaps them.
@@ -284,6 +315,7 @@ async fn serve(dns_sockets: Vec<(std::os::fd::OwnedFd, String)>) -> Result<()> {
         dns_sockets,
         diskd_socket: args.diskd_socket,
         fleet,
+        suspend_on_stop: args.suspend_on_stop,
         ..ServerOptions::new(args.restarted_after_upgrade, args.self_upgrade)
     })
     .await?;
@@ -333,6 +365,8 @@ mod tests {
         assert!(args.self_upgrade && !args.task_service);
         let args = parse(&["--diskd-socket", "/run/diskd.sock"]).unwrap();
         assert_eq!(args.diskd_socket, Some("/run/diskd.sock".into()));
+        assert!(!args.suspend_on_stop);
+        assert!(parse(&["--suspend-on-stop"]).unwrap().suspend_on_stop);
         assert_eq!(parse(&[]).unwrap(), Args::default());
     }
 

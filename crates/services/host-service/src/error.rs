@@ -28,6 +28,9 @@ pub enum HostError {
     NotFound(String),
 
     #[error("{0}")]
+    FailedPrecondition(String),
+
+    #[error("{0}")]
     Failed(String),
 }
 
@@ -44,6 +47,7 @@ impl From<HostError> for Status {
             HostError::LogReader(msg) | HostError::Failed(msg) => Status::internal(msg),
             HostError::InvalidArgument(msg) => Status::invalid_argument(msg),
             HostError::NotFound(msg) => Status::not_found(msg),
+            HostError::FailedPrecondition(msg) => Status::failed_precondition(msg),
         }
     }
 }
