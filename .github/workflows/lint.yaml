@@ -1,9 +1,15 @@
 name: FeOS Lint
 
-on: [push]
+on:
+  push:
+  pull_request:
+
+# A pull request from a branch of this repository is tested by the push
+# of that branch already; pull requests run the jobs for forks only.
 
 jobs:
   lint:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
 
     steps:
