@@ -107,3 +107,45 @@ jobs:
       - name: Build
         # Into go/internal/ui/dist, which ferund embeds.
         run: npm run build
+
+  fechat:
+    # FeChat, FeRun's reference client: its Go backend and its SPA.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: fechat
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: fechat/backend/go.mod
+          cache-dependency-path: fechat/backend/go.sum
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: fechat/package-lock.json
+
+      - name: Lint the Backend
+        working-directory: fechat/backend
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt: $out"; exit 1; fi
+          go vet ./...
+
+      - name: Test the Backend
+        working-directory: fechat/backend
+        run: go test -race ./...
+
+      - name: Build the SPA
+        run: |
+          npm ci
+          npm run build
