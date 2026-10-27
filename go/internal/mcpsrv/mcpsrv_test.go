@@ -182,7 +182,7 @@ func TestClients(t *testing.T) {
 				{"bash", map[string]any{"command": "exit 3"}, "(no output)\n(exit code 3)", true},
 				{"bash", map[string]any{"command": "printf '  \\n'"}, "(no output)", false},
 				{"write", map[string]any{"path": "/w/a.txt", "content": "alpha\n"}, "wrote /w/a.txt\n", false},
-				{"read", map[string]any{"path": "/w/a.txt"}, "alpha\n", false},
+				{"read", map[string]any{"path": "/w/a.txt"}, "     1\talpha\n", false},
 				{"rg", map[string]any{"pattern": "zzz", "path": "/w"}, "(no output)\n(exit code 1)", false},
 				{"rg", map[string]any{"pattern": "("}, "regex parse error: (\n            ^\nerror: unclosed group\n\n(exit code 2)", true},
 				{"fd", map[string]any{"pattern": "zzz", "path": "/w"}, "(no output)\n(exit code 1)", false},
