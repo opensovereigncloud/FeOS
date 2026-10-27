@@ -36,22 +36,29 @@ jobs:
       - name: Set up cargo cache
         uses: actions/cache@v4
         with:
+          # Not target/guest/: its kernel is the kernel cache's, and cargo's
+          # would bring back one of an older config. target/* and not
+          # target/: an exclusion does not reach into a directory the cache
+          # takes whole.
           path: |
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
+            target/*
+            !target/guest
           key: ${{ runner.os }}-guest-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-guest-cargo-
 
       - name: Set up guest kernel cache
+        id: guest-kernel
         uses: actions/cache@v4
         with:
           path: target/guest/vmlinuz
           key: ${{ runner.os }}-guest-kernel-${{ hashFiles('hack/guest/kernel/**') }}
 
       - name: Build Guest Kernel
-        run: test -f target/guest/vmlinuz || make guest-kernel
+        if: steps.guest-kernel.outputs.cache-hit != 'true'
+        run: make guest-kernel
 
       - name: Build Guest Initramfs
         run: make guest-rootfs
