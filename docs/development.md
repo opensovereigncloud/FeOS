@@ -132,7 +132,8 @@ useful for development.
 ## Building, linting, testing
 
 You need the toolchain from `rust-toolchain.toml` (rustup installs it on first
-use) and `protoc`; for the guest also `musl-gcc` and the kernel's headers
+use) and `protoc` with its well-known types (Debian: `protobuf-compiler`,
+`libprotobuf-dev`); for the guest also `musl-gcc` and the kernel's headers
 (Debian: `musl-tools`, `linux-libc-dev`), which build its `mke2fs`.
 
     make clippy          # lint feosd's and feos-guest's features, -D warnings
