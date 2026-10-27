@@ -25,7 +25,7 @@ cache=/var/cache/feos-k3s/$version
 mkdir -p "/host$cache"
 cp /feos/debs/*.deb "/host$cache/"
 
-# The pods' IPv6 prefix: this lab's network routes none to the nodes. With
+# The pods' IPv6 prefix, for a network that routes none to the nodes. With
 # the control plane, each node gets a /64 of the cluster's ULA from it and
 # reaches the others' pods through the mesh (ADR 0017); without, a ULA per
 # node, from the last octet of its address, which no other node reaches.

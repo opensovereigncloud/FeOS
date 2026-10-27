@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# https://chat.fecode.dev: /api to the backend, the rest to the SPA, which is
-# static. The backend signs people in with their FeCode ID and answers its
-# API to nobody else (backend/auth.go). The certificate comes from
-# cert-manager.
+# https://chat.<DOMAIN>: /api to the backend, the rest to the SPA, which
+# is static. The backend signs people in at the OpenID Connect provider
+# and answers its API to nobody else (backend/auth.go). The certificate
+# comes from cert-manager.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -15,7 +15,7 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-    - host: chat.fecode.dev
+    - host: chat.${DOMAIN}
       http:
         paths:
           # the more specific route first: the API to the backend
@@ -35,5 +35,5 @@ spec:
                   number: 8080
   tls:
     - hosts:
-        - chat.fecode.dev
+        - chat.${DOMAIN}
       secretName: fechat-tls

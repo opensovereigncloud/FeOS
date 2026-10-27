@@ -1,17 +1,21 @@
 # SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# The platform's image registry, oci.fecode.dev, on
-# the Gardener shoot (deploy/gardener/README.md): CNCF distribution v3 with
-# its blobs in the object store, so the replicas and wherever it ran before
-# share the same images.
+# The platform's image registry, oci.<DOMAIN>, on the Gardener shoot
+# (deploy/gardener/README.md): CNCF distribution v3 with its blobs in an
+# object store, so that the replicas share the same images. The ${...} are
+# the deployment's parameters (config.env.example):
 #
-# The secrets are not here; they moved with it from the k3s lab:
-#   registry-config  config.yml: distribution's configuration, with the
-#                    bucket's credentials and http.secret, which must be
-#                    the same for every replica (an upload's state is
-#                    signed with it)
-#   registry-auth    htpasswd: the users who pull and push
+#   make -C deploy/gardener apply-registry
+#
+# The secrets are not here:
+#   registry-config  config.yml: distribution's configuration, with
+#                    storage.s3 (the bucket and its credentials),
+#                    http.secret, which must be the same for every replica
+#                    (an upload's state is signed with it), http.debug.addr
+#                    :5001 (the probes' /debug/health) and auth.htpasswd
+#                    with the path /auth/htpasswd
+#   registry-auth    htpasswd: the users who pull and push, bcrypt
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -101,7 +105,7 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-    - host: oci.fecode.dev
+    - host: oci.${DOMAIN}
       http:
         paths:
           - path: /
@@ -113,5 +117,5 @@ spec:
                   number: 5000
   tls:
     - hosts:
-        - oci.fecode.dev
+        - oci.${DOMAIN}
       secretName: registry-tls

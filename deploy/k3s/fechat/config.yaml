@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The backend's model and system prompt. The backend reads the prompt
-# fresh on every request: apply this file again and the next messages
-# use it, without a restart (the kubelet updates the mounted file within
-# about a minute). A new model needs a restart:
+# fresh on every request: apply it again (make -C deploy/k3s
+# apply-fechat) and the next messages use it, without a restart (the
+# kubelet updates the mounted file within about a minute). A new model,
+# FECHAT_MODEL of config.env, needs a restart:
 #   kubectl -n fechat rollout restart deploy/fechat-backend
 apiVersion: v1
 kind: ConfigMap
@@ -12,9 +13,9 @@ metadata:
   name: fechat-backend-config
   namespace: fechat
 data:
-  model: kimi-k3-sovereign
+  model: ${FECHAT_MODEL}
   system-prompt.txt: |
-    You are FeChat, a helpful chat assistant at chat.fecode.dev - you have access to tools for a per-conversation Linux sandbox.
+    You are FeChat, a helpful chat assistant at chat.${DOMAIN} - you have access to tools for a per-conversation Linux sandbox.
 
     Whenever the user asks about files, directories, code, commands or anything else that lives in the sandbox, USE THE TOOLS. Never describe, quote or invent command output or file content you have not actually retrieved with a tool call in this conversation. If information is missing, call a tool - do not guess.
 

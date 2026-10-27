@@ -6,7 +6,8 @@
 #
 # The Secrets are not in the repository; fechat/README.md says how to make
 # them: fechat-backend (OPENAI_API_KEY, OPENAI_BASE_URL, FERUN_TOKEN,
-# SESSION_SECRET) and oidc-client-fechat (FeChat's client at id.fecode.dev).
+# SESSION_SECRET) and oidc-client-fechat (FeChat's client at the OpenID
+# Connect provider).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,7 +28,7 @@ spec:
         - name: oci-pull
       containers:
         - name: fechat-backend
-          image: oci.fecode.dev/fechat-backend:0.6.0
+          image: ${REGISTRY}/fechat-backend:0.6.0
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -44,11 +45,11 @@ spec:
               value: /etc/fechat/system-prompt.txt
             - name: FERUN_URL
               value: http://ferund.ferun.svc.cluster.local:8100
-            # Sign-in with a FeCode ID (backend/auth.go).
+            # Sign-in at the OpenID Connect provider (backend/auth.go).
             - name: OIDC_ISSUER
-              value: https://id.fecode.dev/
+              value: ${OIDC_ISSUER}
             - name: PUBLIC_URL
-              value: https://chat.fecode.dev
+              value: https://chat.${DOMAIN}
             - name: OIDC_CLIENT_ID
               valueFrom:
                 secretKeyRef:

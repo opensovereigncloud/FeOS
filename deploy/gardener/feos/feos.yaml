@@ -6,11 +6,13 @@
 # live in the feosd container and end with it; a planned stop suspends
 # them, and the next feosd resumes them. feosd dials ferund itself (ADR
 # 0015); nothing here listens. feos-k8s (feos-k8s.yaml) puts the join
-# tokens into feosd-join and drains a cordoned worker in FeRun.
+# tokens into feosd-join and drains a cordoned worker in FeRun. The ${...}
+# are the deployment's parameters (config.env.example), which make fills
+# in:
 #
+#   make -C deploy/gardener apply-feos
 #   kubectl -n feos create secret generic diskd-s3 --from-env-file=<s3.env> \
-#     --from-literal=DISKD_S3_PREFIX=gardener/
-#   kubectl apply -f deploy/gardener/feos/feos.yaml
+#     --from-literal=DISKD_S3_PREFIX=<prefix>/
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -22,17 +24,18 @@ metadata:
   name: feos-node
   namespace: feos
 data:
-  # The workers' network (10.250/16) and the shoot's pods and services
-  # (100.64/13, 100.72/13, in CGNAT's 100.64/10); the rest of RFC 1918 too.
+  # What pods may not reach: RFC 1918 and CGNAT (100.64/10), which hold
+  # the shoot's networks, its nodes', pods' and services'
+  # (spec.networking). Add a prefix for one that is elsewhere.
   DENY_PREFIXES: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
-  # The chunk cache, 12 GiB of the worker's 50 GiB root, which holds the
-  # pods' disks too. 64 streams to the object store.
+  # The chunk cache, 12 GiB, for workers with a 50 GiB root, which holds
+  # the pods' disks too. 64 streams to the object store.
   DISKD_ARGS: "--budget-bytes 12884901888 --s3-concurrency 64"
   # ferund's nodes' port: the fixed ClusterIP of service ferund-nodes
   # (deploy/gardener/ferun), and the name its certificate carries.
-  CONTROL_PLANE: "100.72.70.70:7443"
-  CONTROL_PLANE_NAME: "ferun.run.fecode.dev"
-  TRUST_DOMAIN: "run.fecode.dev"
+  CONTROL_PLANE: "${FERUN_NODES_IP}:7443"
+  CONTROL_PLANE_NAME: "ferun.run.${DOMAIN}"
+  TRUST_DOMAIN: "run.${DOMAIN}"
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -55,7 +58,7 @@ spec:
     spec:
       # Every worker of the pool, the ones Gardener replaces them with too.
       nodeSelector:
-        worker.gardener.cloud/pool: worker-w1pmo
+        worker.gardener.cloud/pool: ${WORKER_POOL}
       tolerations:
         - operator: Exists
       hostNetwork: true
@@ -70,7 +73,7 @@ spec:
         - name: oci-pull
       initContainers:
         - name: prepare
-          image: oci.fecode.dev/feos-node:dev
+          image: ${REGISTRY}/feos-node:dev
           imagePullPolicy: Always
           args: [prepare]
           securityContext:
@@ -82,7 +85,7 @@ spec:
         # after feosd, whose suspend on stop writes through its disks.
         # --stop-after-lock keeps it serving while feosd still runs.
         - name: diskd
-          image: oci.fecode.dev/feos-node:dev
+          image: ${REGISTRY}/feos-node:dev
           imagePullPolicy: Always
           restartPolicy: Always
           args: [diskd]
@@ -106,7 +109,7 @@ spec:
             - { name: dev, mountPath: /dev }
       containers:
         - name: feosd
-          image: oci.fecode.dev/feos-node:dev
+          image: ${REGISTRY}/feos-node:dev
           imagePullPolicy: Always
           args: [feosd]
           env:
@@ -121,8 +124,9 @@ spec:
             privileged: true
           resources:
             # The microVMs live in this container: what the node gives
-            # them, which the scheduler keeps free of other pods. No
-            # limits: a cap would kill microVMs.
+            # them, which the scheduler keeps free of other pods; 40 GiB
+            # for workers of 64 GiB. No limits: a cap would kill
+            # microVMs.
             requests: { cpu: "4", memory: 40Gi }
           volumeMounts:
             - { name: feos, mountPath: /var/lib/feos }

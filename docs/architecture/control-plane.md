@@ -2038,8 +2038,8 @@ that dial the instances.
   distroless, non-root, ports 8100 and 7443) or the package: an HTTPS
   balancer in front of the front doors, a TCP passthrough or DNS in front
   of the nodes' port, and every instance with a `--node-advertise-address`
-  at which nodes reach that very instance. `deploy/k3s/ferun/` is the
-  lab's deployment on k3s.
+  at which nodes reach that very instance. `deploy/k3s/ferun/` is an
+  example deployment on k3s.
 
 ### Requirements
 

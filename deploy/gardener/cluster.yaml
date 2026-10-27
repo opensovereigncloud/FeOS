@@ -2,11 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # The shoot's issuer under the name the k3s manifests use, letsencrypt-prod,
-# so that ferund's, FeChat's and FeCode ID's apply here unchanged. It
-# answers DNS-01 at Cloudflare rather than HTTP-01: certificates exist
-# before DNS points at the shoot. The secret cert-manager/cloudflare-api-token
-# (key api-token) edits the zone fecode.dev; FeCode's deploy/fecode
-# created it, with its own issuer letsencrypt-dns.
+# so that ferund's and FeChat's apply here unchanged. It answers DNS-01 at
+# Cloudflare rather than HTTP-01: certificates exist before DNS points at
+# the shoot. The secret cert-manager/cloudflare-api-token (key api-token)
+# is a Cloudflare API token that edits the zone of DOMAIN:
+#
+#   kubectl -n cert-manager create secret generic cloudflare-api-token \
+#     --from-literal=api-token=<token>
+#   kubectl apply -f deploy/gardener/cluster.yaml
+#
+# For another DNS provider, its solver goes here instead.
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -22,7 +27,3 @@ spec:
             apiTokenSecretRef:
               name: cloudflare-api-token
               key: api-token
-        selector:
-          dnsZones:
-            - fecode.dev
-            - fecore.dev

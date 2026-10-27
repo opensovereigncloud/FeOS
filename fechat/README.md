@@ -53,12 +53,13 @@ ferund's public API, the same one any other agent uses:
 - `Dockerfile`, `nginx.conf`: the SPA's image, served by nginx on port
   8080. `backend/Dockerfile`: the backend's image, a static binary
   (`CGO_ENABLED=0`).
-- `deploy.sh [tag]`: builds both images, pushes them to oci.fecode.dev and
-  rolls both deployments to the tag.
+- `deploy.sh [tag]`: builds both images, pushes them to `REGISTRY`
+  (default oci.fecode.dev) and rolls both deployments to the tag.
 - [`/deploy/k3s/fechat/`](../deploy/k3s/fechat/): the manifests for k3s,
   namespace `fechat`: the deployments and services `fechat-app` and
   `fechat-backend`, the ConfigMap `fechat-backend-config` (model and system
-  prompt) and the ingress for chat.fecode.dev.
+  prompt) and the ingress, with the deployment's parameters
+  ([`deploy/k3s/README.md`](../deploy/k3s/README.md#parameters)).
 
 Sign-in: the backend is an OpenID Connect client of id.fecode.dev (code
 flow with PKCE and a nonce, `backend/auth.go`), and keeps the session in a
@@ -88,7 +89,7 @@ The backend reads its environment:
 | `OIDC_CLIENT_SECRET` | Secret `oidc-client-fechat`   | |
 | `PUBLIC_URL`         | the deployment                | `https://chat.fecode.dev`: the callback is `PUBLIC_URL/api/v1/auth/callback` |
 | `SESSION_SECRET`     | Secret `fechat-backend`       | at least 32 bytes; signs the session cookies (24 h) and the sandbox references; a new one gives open conversations new sandboxes |
-| `MODEL`              | ConfigMap, key `model`        | the model, `kimi-k3-sovereign` |
+| `MODEL`              | ConfigMap, key `model`        | the model, the deployment's `FECHAT_MODEL` |
 | `SYSTEM_PROMPT_FILE` | ConfigMap, mounted at `/etc/fechat` | default `/etc/fechat/system-prompt.txt` |
 | `PORT`               |                               | listen port, default 8080 |
 
@@ -117,8 +118,8 @@ FERUN_TOKEN=<FeRun tenant token>
 SESSION_SECRET=<32 random bytes or more, e.g. openssl rand -hex 32>
 ```
 
-On the lab cluster the tenant token is ferund's bootstrap token
-(`FERUN_BOOTSTRAP_TOKEN`, see [`deploy/k3s/README.md`](../deploy/k3s/README.md)).
+With the deployments of `deploy/`, the tenant token is ferund's bootstrap
+token (`FERUN_BOOTSTRAP_TOKEN`, see [`deploy/k3s/README.md`](../deploy/k3s/README.md)).
 Create the secret from the file:
 
 ```sh
@@ -126,12 +127,13 @@ kubectl -n fechat create secret generic fechat-backend \
   --from-env-file=fechat-backend.env
 ```
 
-**`oidc-client-fechat`**, FeChat's client at id.fecode.dev, made with the
-IdP's script (`~/idp`), which registers it in Hydra (redirect URI
-`https://chat.fecode.dev/api/v1/auth/callback`) and writes the secret:
+**`oidc-client-fechat`**, FeChat's client at the IdP (`OIDC_ISSUER`),
+registered with the redirect URI `PUBLIC_URL/api/v1/auth/callback`
+(`https://chat.fecode.dev/api/v1/auth/callback`):
 
 ```sh
-./create-client.sh fechat fechat
+kubectl -n fechat create secret generic oidc-client-fechat \
+  --from-literal=client_id='<client ID>' --from-literal=client_secret='<client secret>'
 ```
 
 Who may sign in is decided at id.fecode.dev: an admin invites people at
@@ -146,22 +148,25 @@ backend for a new environment
 
 The cluster needs traefik (k3s's default ingress), cert-manager with the
 ClusterIssuer `letsencrypt-prod`, DNS for chat.fecode.dev pointing at it,
-and ferund at `FERUN_URL`. The first time, from the repository's root:
+and ferund at `FERUN_URL`. The manifests take the deployment's
+parameters, which `make` fills in (`make -C deploy/gardener apply-fechat`
+on the Gardener shoot). The first time, from the repository's root:
 
 ```sh
 kubectl apply -f deploy/k3s/fechat/namespace.yaml
 # create the three secrets above
-kubectl apply -f deploy/k3s/fechat/
+make -C deploy/k3s apply-fechat
 fechat/deploy.sh 0.5.0
 ```
 
 From then on, `fechat/deploy.sh <tag>` builds and pushes both images and
 rolls the deployments to them. It needs `docker login oci.fecode.dev`;
-`DOCKER` selects another client (`DOCKER="sudo docker"`, `DOCKER=podman`).
+`REGISTRY` selects another registry (the deployment's), `DOCKER` another
+client (`DOCKER="sudo docker"`, `DOCKER=podman`).
 Give every deploy a new tag: the nodes keep an image they have
 (`imagePullPolicy: IfNotPresent`). Applying `app.yaml` or `backend.yaml`
-again sets the tag written there, so raise it there too, or run
-`deploy.sh` afterwards.
+again (`make apply-fechat`) sets the tag written there, so raise it there
+too, or run `deploy.sh` afterwards.
 
 ## Changing the system prompt
 
@@ -169,7 +174,7 @@ Edit `system-prompt.txt` in
 [`deploy/k3s/fechat/config.yaml`](../deploy/k3s/fechat/config.yaml), then:
 
 ```sh
-kubectl apply -f deploy/k3s/fechat/config.yaml
+make -C deploy/k3s apply-fechat
 ```
 
 The backend reads the prompt on every request, so it needs no restart; the

@@ -58,8 +58,8 @@ go/                     the Go module github.com/ironcore-dev/feos/go: ferund
 web/                    ferund's management UI (React, Vite), built into
                         go/internal/ui/dist
 fechat/                 FeChat, FeRun's reference client, at chat.fecode.dev
-deploy/k3s/             the lab's k3s deployment: FeOS on the nodes, FeRun,
-                        FeChat
+deploy/                 example deployments of FeOS, FeRun and FeChat on
+                        k3s and on Gardener
 hack/                   kernel, initramfs, UKI, guest image and VM tooling
 docs/                   documentation and ADRs
 ```

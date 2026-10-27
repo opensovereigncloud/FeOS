@@ -1,16 +1,17 @@
 # SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# FeOS on the lab's k3s nodes (deploy/k3s/README.md): a DaemonSet that
-# installs feosd, diskd and the rest from the image's packages on every node
+# FeOS on k3s nodes (deploy/k3s/README.md): a DaemonSet that installs
+# feosd, diskd and the rest from the image's packages on every node
 # labelled feos.fecode.dev/node=true, and has systemd run them. feosd dials
-# ferund itself (ADR 0015); nothing here listens.
+# ferund itself (ADR 0015); nothing here listens. The ${...} are the
+# deployment's parameters (config.env.example), which make fills in:
 #
-#   kubectl label node <node> feos.fecode.dev/node=true
+#   make -C deploy/k3s apply-feos
 #   kubectl -n feos create secret generic diskd-s3 --from-env-file=<s3.env>
 #   kubectl -n feos create secret generic feosd-join \
 #     --from-literal=<node>=feos-join-…   (one key per node, ferund join-token)
-#   kubectl apply -f deploy/k3s/feos/feos.yaml
+#   kubectl label node <node> feos.fecode.dev/node=true
 #
 # Removing the DaemonSet leaves FeOS installed and running on the nodes:
 # `apt-get remove feosd diskd` there, after deleting the pods.
@@ -25,19 +26,21 @@ metadata:
   name: feos-node
   namespace: feos
 data:
-  # The nodes' network, 10.0.0.0/24, and the cluster's pods and services
-  # (10.42/16, 10.43/16) are in 10/8; the rest of RFC 1918 and CGNAT too.
+  # What pods may not reach: RFC 1918, which holds k3s's pods and
+  # services (10.42/16, 10.43/16), and CGNAT. Add the nodes' network if it
+  # is elsewhere.
   DENY_PREFIXES: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
   # The chunk cache, 16 GiB. A hibernation puts its disk's 64 KiB chunks
-  # one by one, and R2 answers about 6 PUTs a second per stream: 16 streams
-  # (the default) take over ten minutes for a pod with a 2 GB image.
+  # one by one, and an object store such as R2 answers about 6 PUTs a
+  # second per stream: 16 streams (the default) take over ten minutes for
+  # a pod with a 2 GB image.
   DISKD_ARGS: "--budget-bytes 17179869184 --s3-concurrency 64"
   # ferund's nodes' port: the fixed ClusterIP of service ferund-nodes
   # (deploy/k3s/ferun), which the hosts reach without the cluster's DNS,
   # and the name its certificate carries. Empty: no control plane.
-  CONTROL_PLANE: "10.43.70.70:7443"
-  CONTROL_PLANE_NAME: "ferun.run.fecode.dev"
-  TRUST_DOMAIN: "run.fecode.dev"
+  CONTROL_PLANE: "${FERUN_NODES_IP}:7443"
+  CONTROL_PLANE_NAME: "ferun.run.${DOMAIN}"
+  TRUST_DOMAIN: "run.${DOMAIN}"
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -70,7 +73,7 @@ spec:
         - name: oci-pull
       initContainers:
         - name: install
-          image: oci.fecode.dev/feos-node:dev
+          image: ${REGISTRY}/feos-node:dev
           imagePullPolicy: Always
           env:
             - name: NODE_NAME
@@ -102,7 +105,7 @@ spec:
         # The services' journal, for kubectl logs; it is ready while both
         # run.
         - name: journal
-          image: oci.fecode.dev/feos-node:dev
+          image: ${REGISTRY}/feos-node:dev
           imagePullPolicy: Always
           command:
             - nsenter

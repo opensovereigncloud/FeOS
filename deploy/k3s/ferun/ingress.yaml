@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# https://run.fecode.dev: ferund's front doors through traefik, the
+# https://run.<DOMAIN>: ferund's front doors through traefik, the
 # certificate from cert-manager. The nodes' port never goes through here.
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -11,7 +11,7 @@ metadata:
 spec:
   secretName: ferun-tls
   dnsNames:
-    - run.fecode.dev
+    - run.${DOMAIN}
   issuerRef:
     name: letsencrypt-prod
     kind: ClusterIssuer
@@ -24,7 +24,7 @@ metadata:
 spec:
   ingressClassName: traefik
   rules:
-    - host: run.fecode.dev
+    - host: run.${DOMAIN}
       http:
         paths:
           - path: /
@@ -36,5 +36,5 @@ spec:
                   number: 8100
   tls:
     - hosts:
-        - run.fecode.dev
+        - run.${DOMAIN}
       secretName: ferun-tls

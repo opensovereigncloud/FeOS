@@ -11,7 +11,10 @@
 #   # restart ferund, then
 #   kubectl -n feos create secret generic feos-k8s-ferun \
 #     --from-literal=credentials="feos-k8s:$pw"
-#   kubectl apply -f deploy/gardener/feos/feos-k8s.yaml
+#   make -C deploy/gardener deploy-feos-k8s
+#
+# The ${...} are the deployment's parameters (config.env.example), which
+# make fills in.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -109,13 +112,13 @@ spec:
         - name: oci-pull
       containers:
         - name: feos-k8s
-          image: oci.fecode.dev/feos-k8s:dev
+          image: ${REGISTRY}/feos-k8s:dev
           imagePullPolicy: Always
           args:
             - --ferun-url=http://ferund.ferun.svc.cluster.local:8100
             - --ferun-credentials-file=/ferun/credentials
-            - --node-selector=worker.gardener.cloud/pool=worker-w1pmo
-            - --node-name-prefix=shoot--feos--fecode-dev-worker-
+            - --node-selector=worker.gardener.cloud/pool=${WORKER_POOL}
+            - --node-name-prefix=${NODE_NAME_PREFIX}
             - --namespace=feos
           ports:
             - name: health
