@@ -22,7 +22,9 @@ var update = flag.Bool("update", false, "rewrite testdata/schema.golden from the
 // dumpSchema describes the public schema of q's database: every table that
 // is not a partition, with its columns (type, nullability, default,
 // identity), its constraints, its indexes and its partitioning, in a stable
-// order and in PostgreSQL's own rendering.
+// order and in PostgreSQL's own rendering. The order is bytewise (COLLATE
+// "C"), whatever the database's collation: en_US.utf8 ignores punctuation
+// and puts "CHECK ((b" before "CHECK (((a".
 func dumpSchema(ctx context.Context, t *testing.T, q db.Querier) string {
 	t.Helper()
 	var b strings.Builder
@@ -95,7 +97,7 @@ func dumpSchema(ctx context.Context, t *testing.T, q db.Querier) string {
 			b.WriteString(c + "\n")
 		}
 		rows, err = q.Query(ctx, `SELECT pg_get_constraintdef(oid) FROM pg_constraint
-			WHERE conrelid = $1 ORDER BY contype, pg_get_constraintdef(oid)`, tb.oid)
+			WHERE conrelid = $1 ORDER BY contype, pg_get_constraintdef(oid) COLLATE "C"`, tb.oid)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,7 +109,7 @@ func dumpSchema(ctx context.Context, t *testing.T, q db.Querier) string {
 			b.WriteString("  CONSTRAINT " + c + "\n")
 		}
 		rows, err = q.Query(ctx, `SELECT pg_get_indexdef(i.indexrelid) FROM pg_index i
-			WHERE i.indrelid = $1 ORDER BY 1`, tb.oid)
+			WHERE i.indrelid = $1 ORDER BY pg_get_indexdef(i.indexrelid) COLLATE "C"`, tb.oid)
 		if err != nil {
 			t.Fatal(err)
 		}
