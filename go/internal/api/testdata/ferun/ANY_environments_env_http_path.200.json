@@ -1,0 +1,19 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/http/api/expense/reports",
+  "query": {
+    "month": [
+      "2026-10"
+    ]
+  },
+  "status": 200,
+  "request": null,
+  "response": {
+    "reports": []
+  },
+  "headers": {
+    "Authorization": "Bearer <route token>",
+    "Host": "expensa-stage.boxed.fecode.dev"
+  },
+  "note": "the route door: forwarded to a ready expense-service replica as GET /api/expense/reports?month=2026-10 (route api-expense, strip false), Host kept, Authorization stripped (an old client's form: see .header.json); the body is the service's"
+}

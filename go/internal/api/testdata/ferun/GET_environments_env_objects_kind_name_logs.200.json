@@ -1,0 +1,22 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/objects/service/expense-service/logs",
+  "query": {
+    "lines": [
+      "200"
+    ],
+    "replica": [
+      "1"
+    ]
+  },
+  "status": 200,
+  "request": null,
+  "response": {
+    "lines": [
+      "2026/10/18 14:07:11 expense-service 1.4 starting on [::]:8080",
+      "2026/10/18 14:07:11 connect to nats: nats: authorization violation",
+      "2026/10/18 14:07:12 exit status 1"
+    ],
+    "source": "container"
+  }
+}

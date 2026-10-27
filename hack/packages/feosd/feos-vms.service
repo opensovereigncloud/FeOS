@@ -1,0 +1,19 @@
+[Unit]
+Description=FeOS microVMs
+Documentation=https://github.com/gardenlinux/FeOS
+# The cgroup of feosd's microVMs: feosd puts each into vms/<id> below this
+# unit's cgroup, and turns cpu and memory on in it (ADR 0005). The unit
+# runs nothing itself, so that systemd never has to start a process in a
+# cgroup whose children use controllers, which it cannot: feosd.service
+# restarts, and this unit, which feosd.service wants, stays. Stopping it
+# stops no microVM (KillMode=process); delete the pods first.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# systemd takes a oneshot service without ExecStart= only with ExecStop=.
+# Like every command but the main one of a delegated unit, it runs in the
+# subgroup .control.
+ExecStop=true
+Delegate=yes
+KillMode=process

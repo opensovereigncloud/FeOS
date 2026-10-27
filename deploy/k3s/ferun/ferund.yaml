@@ -1,0 +1,168 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ferund (ADR 0015) and its services: the front doors on :8100, the
+# nodes' port on :7443 (deploy/k3s/README.md).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferund
+  namespace: ferun
+spec:
+  # Instances are identical; one to start with.
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: ferund
+  template:
+    metadata:
+      labels:
+        app: ferund
+    spec:
+      imagePullSecrets:
+        - name: oci-pull
+      # The image runs as distroless's nonroot (65532); the group makes the
+      # secrets' files below readable to it.
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 65532
+      # The shutdown grace below and 30 s: a stopping instance lets its tool
+      # calls and operations finish.
+      terminationGracePeriodSeconds: 150
+      containers:
+        - name: ferund
+          image: ${REGISTRY}/ferund:dev
+          imagePullPolicy: Always
+          args: ["serve"]
+          envFrom:
+            - secretRef:
+                name: ferund
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: FERUN_LISTEN
+              value: ":8100"
+            - name: FERUN_NODE_LISTEN
+              value: ":7443"
+            # What the nodes dial to reach this instance: its pod's address,
+            # which the hosts reach over the cluster's network.
+            - name: FERUN_NODE_ADVERTISE_ADDRESS
+              value: "$(POD_IP):7443"
+            - name: FERUN_TRUST_DOMAIN
+              value: run.${DOMAIN}
+            - name: FERUN_CA_DIR
+              value: /etc/ferun/ca
+            # Paused after 10 s without a tool call, the default; into the
+            # object store after another half hour. A paused sandbox costs
+            # the node disk only and resumes in a second; a hibernation
+            # uploads its disk, minutes for a big image.
+            - name: FERUN_HIBERNATE_AFTER
+              value: 30m
+            - name: FERUN_SHUTDOWN_GRACE
+              value: 2m
+            # For a network that routes no prefix to the nodes: the pods
+            # are on a mesh of a ULA /48 that ferund draws once (ADR 0017).
+            - name: FERUN_POD_NETWORK
+              value: mesh
+            # People sign in to the UI and the admin API at the OpenID
+            # Connect provider; its group admins gets the admin surface.
+            - name: FERUN_PUBLIC_URL
+              value: https://run.${DOMAIN}
+            - name: FERUN_OIDC_ISSUER
+              value: ${OIDC_ISSUER}
+            - name: FERUN_OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oidc-client-ferun
+                  key: client_id
+            - name: FERUN_OIDC_CLIENT_SECRET_FILE
+              value: /etc/ferun/oidc/secret
+            - name: FERUN_OIDC_ADMIN_GROUP
+              value: admins
+            - name: FERUN_SESSION_TTL
+              value: 12h
+            # Seals environments' secrets and addons' credentials at rest.
+            - name: FERUN_SECRET_KEY_FILE
+              value: /etc/ferun/secret-key/key
+          ports:
+            - name: http
+              containerPort: 8100
+            - name: nodes
+              containerPort: 7443
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            # /readyz waits up to 30 s for the nodes after a start.
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: ca
+              mountPath: /etc/ferun/ca
+              readOnly: true
+            - name: oidc
+              mountPath: /etc/ferun/oidc
+              readOnly: true
+            - name: secret-key
+              mountPath: /etc/ferun/secret-key
+              readOnly: true
+      volumes:
+        - name: ca
+          secret:
+            secretName: ferun-ca
+            defaultMode: 0440
+        # ferund's client at the provider (README.md).
+        - name: oidc
+          secret:
+            secretName: oidc-client-ferun
+            defaultMode: 0440
+            items:
+              - key: client_secret
+                path: secret
+        - name: secret-key
+          secret:
+            secretName: ferund-secret-key
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferund
+  namespace: ferun
+spec:
+  selector:
+    app: ferund
+  ports:
+    - name: http
+      port: 8100
+      targetPort: http
+---
+# The nodes' port. feosd runs on the hosts, which do not resolve the
+# cluster's names, so the service has a fixed address that the feos
+# DaemonSet configures (deploy/k3s/feos): feosd joins and bootstraps there,
+# then dials every instance at the address it advertises.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferund-nodes
+  namespace: ferun
+spec:
+  clusterIP: ${FERUN_NODES_IP}
+  selector:
+    app: ferund
+  ports:
+    - name: nodes
+      port: 7443
+      targetPort: nodes

@@ -1,0 +1,3 @@
+# ferund runs as ferun; the group may read /etc/ferun/ferund.env and the
+# issuer's key in /etc/ferun/ca.
+u ferun - "FeRun control plane" /nonexistent

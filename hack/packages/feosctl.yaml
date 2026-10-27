@@ -1,0 +1,21 @@
+# nfpm configuration of the feosctl package (ADR 0009).
+name: feosctl
+arch: amd64
+platform: linux
+version: ${FEOS_VERSION}
+section: admin
+priority: optional
+maintainer: IronCore authors <ospo@sap.com>
+vendor: SAP SE
+homepage: https://github.com/gardenlinux/FeOS
+license: Apache-2.0
+description: |-
+  FeOS command-line client
+  feosctl talks to feosd on /run/feos/api.sock, to feosd on TCP, and to a
+  guest behind a VM's vsock socket.
+contents:
+  - src: ${MUSL_RELEASE}/feosctl
+    dst: /usr/bin/feosctl
+    expand: true
+    file_info:
+      mode: 0755

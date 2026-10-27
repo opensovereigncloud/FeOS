@@ -1,0 +1,104 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Installs FeOS on the node this pod runs on, as the init container of the
+# feos DaemonSet: the packages of the image (feosd, diskd, feosctl,
+# Firecracker, the guest) go onto the host with its apt, their
+# configuration into /etc/default, and systemd runs them, as on any Debian
+# node (ADR 0009). The pod only installs: feosd and diskd are the host's
+# services, and their pods and disks outlive this pod, a rollout and the
+# DaemonSet itself.
+#
+# The host is reached through PID 1's namespaces (hostPID), and its files
+# through the hostPath mounts under /host.
+set -eu
+
+log() { echo "install: $*"; }
+on_host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }
+
+: "${NODE_NAME:?}" "${NODE_IP:?}"
+version=$(cat /feos/version)
+
+# The packages, where the host's apt reads them.
+cache=/var/cache/feos-k3s/$version
+mkdir -p "/host$cache"
+cp /feos/debs/*.deb "/host$cache/"
+
+# The pods' IPv6 prefix, for a network that routes none to the nodes. With
+# the control plane, each node gets a /64 of the cluster's ULA from it and
+# reaches the others' pods through the mesh (ADR 0017); without, a ULA per
+# node, from the last octet of its address, which no other node reaches.
+# Either way its pods leave over IPv4 alone.
+octet=${NODE_IP##*.}
+pod_prefix="--pod-prefix $(printf 'fd00:fe05:%x::/64' "$octet")"
+
+# What pods may not reach: the nodes' and the cluster's networks.
+deny=""
+for p in ${DENY_PREFIXES:-}; do
+	deny="$deny --deny-prefix $p"
+done
+
+control_plane=""
+if [ -n "${CONTROL_PLANE:-}" ]; then
+	control_plane="--control-plane $CONTROL_PLANE --control-plane-name $CONTROL_PLANE_NAME --trust-domain $TRUST_DOMAIN"
+	pod_prefix=""
+fi
+
+umask 077
+mkdir -p /host/etc/feos
+# A node joins with the token of its name, once: afterwards its key and
+# certificate are in /var/lib/feos/node, and the token is used up.
+if [ -s "/join/$NODE_NAME" ]; then
+	cp "/join/$NODE_NAME" /host/etc/feos/join-token.new
+	mv /host/etc/feos/join-token.new /host/etc/feos/join-token
+fi
+
+changed=false
+# Writes a file on the host if its content changed.
+put() {
+	if ! cmp -s "$2" "/host$1" 2>/dev/null; then
+		mv "$2" "/host$1"
+		changed=true
+		log "wrote $1"
+	else
+		rm -f "$2"
+	fi
+}
+
+cat >/tmp/feosd <<EOF
+# Written by the feos DaemonSet (deploy/k3s/feos); edits are overwritten.
+FEOSD_ARGS="$pod_prefix$deny $control_plane"
+EOF
+put /etc/default/feosd /tmp/feosd
+
+cat >/tmp/diskd <<EOF
+# Written by the feos DaemonSet (deploy/k3s/feos); edits are overwritten.
+DISKD_ARGS="${DISKD_ARGS:-}"
+S3_BUCKET="${S3_BUCKET:-}"
+AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
+AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
+AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-}"
+AWS_REGION="${AWS_REGION:-}"
+DISKD_S3_PREFIX="${DISKD_S3_PREFIX:-}"
+EOF
+put /etc/default/diskd /tmp/diskd
+
+# Our configuration stays: the packages' /etc/default files are conffiles.
+before=$(on_host dpkg-query -W -f '${Version} ' feosd diskd 2>/dev/null || true)
+log "installing $version"
+on_host env DEBIAN_FRONTEND=noninteractive apt-get install -y -q --allow-downgrades \
+	-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+	$(cd "/host$cache" && for f in *.deb; do printf '%s/%s ' "$cache" "$f"; done)
+after=$(on_host dpkg-query -W -f '${Version} ' feosd diskd)
+
+# An upgrade restarts them in the packages' scripts; a change of the
+# configuration alone needs a restart here. Neither stops a pod: their
+# units keep the VMs and the disks (KillMode=process).
+if [ "$changed" = true ] && [ "$before" = "$after" ]; then
+	log "restarting diskd and feosd for their configuration"
+	on_host systemctl restart diskd.service
+	on_host systemctl restart feosd.service
+fi
+on_host systemctl is-active --quiet diskd.service feosd.service
+log "feosd and diskd run: $after"

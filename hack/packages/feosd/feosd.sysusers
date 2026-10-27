@@ -1,0 +1,3 @@
+# Members may use feosd's API on /run/feos/api.sock, and so do on the node
+# what root can.
+g feos -

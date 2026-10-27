@@ -1,0 +1,33 @@
+{
+  "method": "POST",
+  "path": "/api/v1/environments",
+  "query": {},
+  "status": 200,
+  "request": {
+    "name": "expensa-demo",
+    "id": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b04",
+    "labels": {
+      "fecode.class": "demo",
+      "fecode.env": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b04",
+      "fecode.project": "0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01"
+    }
+  },
+  "response": {
+    "id": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b04",
+    "name": "expensa-demo",
+    "labels": {
+      "fecode.class": "demo",
+      "fecode.env": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b04",
+      "fecode.project": "0193a1b2-7c3d-7e4f-8a5b-6c7d8e9f0a01"
+    },
+    "release": 0,
+    "realised": 0,
+    "deleting": false,
+    "rollout": null,
+    "objects": [],
+    "routes": [],
+    "openIncidents": 0,
+    "createdAt": "2026-10-18T14:09:30Z"
+  },
+  "note": "the same id and name again (a retry): the existing environment"
+}

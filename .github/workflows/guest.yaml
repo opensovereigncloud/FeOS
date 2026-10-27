@@ -1,0 +1,70 @@
+name: FeOS Guest
+
+on:
+  push:
+  pull_request:
+
+# A pull request from a branch of this repository is tested by the push
+# of that branch already; pull requests run the jobs for forks only.
+
+jobs:
+  guest:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler musl-tools cpio zstd file \
+            flex bison bc libelf-dev libssl-dev e2fsprogs
+
+      - name: Install Rust Toolchain
+        # Installs the toolchain rust-toolchain.toml pins.
+        run: rustup toolchain install
+
+      - name: Allow KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Set up cargo cache
+        uses: actions/cache@v4
+        with:
+          # Not target/guest/: its kernel is the kernel cache's, and cargo's
+          # would bring back one of an older config. target/* and not
+          # target/: an exclusion does not reach into a directory the cache
+          # takes whole.
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/*
+            !target/guest
+          key: ${{ runner.os }}-guest-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-guest-cargo-
+
+      - name: Set up guest kernel cache
+        id: guest-kernel
+        uses: actions/cache@v4
+        with:
+          path: target/guest/vmlinuz
+          key: ${{ runner.os }}-guest-kernel-${{ hashFiles('hack/guest/kernel/**') }}
+
+      - name: Build Guest Kernel
+        if: steps.guest-kernel.outputs.cache-hit != 'true'
+        run: make guest-kernel
+
+      - name: Build Guest Initramfs
+        run: make guest-rootfs
+
+      - name: Boot the Guest
+        run: make test-guest
+
+      - name: Run Containers in the Guest
+        run: make test-guest-container

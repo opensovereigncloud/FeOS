@@ -1,0 +1,57 @@
+# nfpm configuration of the feosd package (ADR 0009). make packages sets the
+# variables.
+name: feosd
+arch: amd64
+platform: linux
+version: ${FEOS_VERSION}
+section: admin
+priority: optional
+maintainer: IronCore authors <ospo@sap.com>
+vendor: SAP SE
+homepage: https://github.com/gardenlinux/FeOS
+license: Apache-2.0
+description: |-
+  FeOS node agent
+  feosd runs microVMs in Firecracker's jailer, with snapshots and
+  restores, and serves FeOS's API on /run/feos/api.sock. It boots the
+  newest Firecracker and guest installed side by side in /usr/lib/feos.
+depends:
+  - diskd
+  - feos-firecracker
+  - feos-guest
+contents:
+  - src: ${MUSL_RELEASE}/feosd
+    dst: /usr/sbin/feosd
+    expand: true
+    file_info:
+      mode: 0755
+  - src: hack/packages/feosd/feosd.service
+    dst: /usr/lib/systemd/system/feosd.service
+    file_info:
+      mode: 0644
+  - src: hack/packages/feosd/feos-vms.service
+    dst: /usr/lib/systemd/system/feos-vms.service
+    file_info:
+      mode: 0644
+  - src: hack/packages/feosd/feosd.socket
+    dst: /usr/lib/systemd/system/feosd.socket
+    file_info:
+      mode: 0644
+  - src: hack/packages/feosd/feosd.sysusers
+    dst: /usr/lib/sysusers.d/feosd.conf
+    file_info:
+      mode: 0644
+  - src: hack/packages/feosd/default
+    dst: /etc/default/feosd
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  - src: hack/packages/feosd/apt.conf
+    dst: /etc/apt/apt.conf.d/50feosd
+    type: config
+    file_info:
+      mode: 0644
+scripts:
+  postinstall: hack/packages/feosd/postinst
+  preremove: hack/packages/feosd/prerm
+  postremove: hack/packages/feosd/postrm

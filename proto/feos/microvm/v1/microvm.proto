@@ -1,0 +1,358 @@
+syntax = "proto3";
+
+package feos.microvm.v1;
+
+import "google/protobuf/any.proto";
+
+// The microVM layer of feosd: internal, between the pod service and the
+// pods' microVMs, in one process, and served on no socket (ADR 0004).
+// Clients run pods with feos.pod.v1. Each microVM runs in a Firecracker
+// process of its own, jailed; the layer hides the processes and their API
+// sockets.
+service MicroVmService {
+  // Creates a microVM from the newest installed guest, but does not boot
+  // it. The returned 'vm_id' names it in all other calls.
+  rpc CreateVm(CreateVmRequest) returns (CreateVmResponse);
+  // Boots a created or stopped Virtual Machine in a new Firecracker process.
+  // Booting a suspended VM discards its snapshot.
+  rpc StartVm(StartVmRequest) returns (StartVmResponse);
+  // Retrieves detailed information about a specific Virtual Machine.
+  rpc GetVm(GetVmRequest) returns (VmInfo);
+  // Retrieves the events stream for a specific Virtual Machine.
+  rpc StreamVmEvents(StreamVmEventsRequest) returns (stream VmEvent);
+  // Deletes an existing Virtual Machine and frees up its resources.
+  rpc DeleteVm(DeleteVmRequest) returns (DeleteVmResponse);
+  // Provides an interactive console to a running VM.
+  // This is a bidirectional stream. The client first sends an 'attach' message
+  // with the VM ID, then streams user input. The server streams back the
+  // VM's console output.
+  rpc StreamVmConsole (stream StreamVmConsoleRequest) returns (stream StreamVmConsoleResponse);
+  // Pings the VMM process for a specific VM to check for liveness.
+  rpc PingVm(PingVmRequest) returns (PingVmResponse);
+  // Shuts down a running Virtual Machine: sends the guest Ctrl-Alt-Del and
+  // waits until it has rebooted, which ends its Firecracker process. The
+  // guest needs an i8042 keyboard driver and has to treat Ctrl-Alt-Del as
+  // a request to shut down; FeOS does.
+  rpc ShutdownVm(ShutdownVmRequest) returns (ShutdownVmResponse);
+  // Restores a suspended microVM from its snapshot in a new Firecracker
+  // process, or a created one that never booted from a snapshot written
+  // elsewhere. A FeOS guest is pushed the time and its network
+  // configuration before this returns.
+  rpc ResumeVm(ResumeVmRequest) returns (ResumeVmResponse);
+  // Writes the state and the memory of a running or paused Virtual Machine
+  // to a snapshot in its directory and ends its Firecracker process. The
+  // suspended VM holds no memory until ResumeVm restores it.
+  rpc SuspendVm(SuspendVmRequest) returns (SuspendVmResponse);
+}
+
+// Request stream from client to server for StreamVmConsole
+message StreamVmConsoleRequest {
+  // The first message from the client MUST be an 'attach' message.
+  // All subsequent messages MUST be 'data' messages.
+  oneof payload {
+    AttachConsoleMessage attach = 1;
+    ConsoleData data = 2;
+  }
+}
+
+// Initial message to specify which VM to connect to.
+message AttachConsoleMessage {
+  string vm_id = 1;
+}
+
+// Subsequent messages carrying user input.
+message ConsoleData {
+  bytes input = 1;
+}
+
+// Response stream from server to client for StreamVmConsole
+message StreamVmConsoleResponse {
+  bytes output = 1;
+}
+
+message VmStateChangedEvent {
+  VmState new_state = 1;
+  // An optional human-readable reason for the state change.
+  // e.g., "VM booted successfully" or "Shutdown signal received"
+  string reason = 2;
+}
+
+message StreamVmEventsRequest {
+  // The ID of the Virtual Machine for which to retrieve events.
+  // If not provided, the stream will start by sending the current state
+  // of all existing VMs, and then continue to stream all subsequent events
+  // from all VMs.
+  optional string vm_id = 1;
+  // Filter the stream to only include events from a specific "component" in VM
+  string with_component_id = 5;
+
+  oneof streaming_mode {
+    // 1. Get the last N events
+    int32 tail_events = 2;
+    // 2. Get all events that have occurred since a specific event ID
+    string tail_id = 3;
+    // 3. Get all events from the last N seconds
+    int32 tail_seconds = 4;
+  }
+}
+
+message VmEvent {
+  string vm_id = 1;
+  google.protobuf.Any data = 2;
+  // A unique identifier for the event within the VM context.
+  string id = 3;
+  // The ID of the component that generated this event.
+  string component_id = 4;
+}
+
+message CreateVmRequest {
+    VmConfig config = 1;
+    optional string vm_id = 2;
+}
+
+message CreateVmResponse {
+    string vm_id = 1;
+}
+
+message GetVmRequest {
+    string vm_id = 1;
+}
+
+message VmConfig {
+  CpuConfig cpus = 1;
+  MemoryConfig memory = 2;
+  // A microVM boots the newest guest installed on the node
+  // (/usr/lib/feos/guest/<version>/), and keeps that version. OCI images
+  // with a kernel of their own and data disks were for VMs; the records
+  // in vms.db may still carry them.
+  reserved 3, 4;
+  reserved "image_ref", "disks";
+  repeated NetConfig net = 5;
+  // Ignition was passed in SMBIOS OEM strings, which Firecracker lacks.
+  reserved 6;
+  reserved "ignition";
+  // The network configuration of a FeOS guest, which has no DHCP. The VM
+  // service pushes it into the guest, with the wall time, whenever the
+  // guest attaches to its lifecycle uplink and after every resume. Without
+  // it, only the time is pushed.
+  GuestNetworkConfig guest_network = 7;
+  // The guest's data volume, which it mounts at /var/lib/feos: a pod's
+  // disk from diskd. Unset, the guest keeps its data in memory.
+  DataDiskConfig data_disk = 8;
+  // The pod's volumes (ADR 0016), each a disk from diskd, attached after
+  // the data disk in this order: Firecracker's drives volume0, volume1,
+  // ..., which the guest tells apart by their order.
+  repeated DataDiskConfig volumes = 9;
+  // A JSON object, the microVM's metadata: Firecracker serves it to the
+  // guest at 169.254.169.254 on the first network interface (MMDS,
+  // version 2, which wants a session token first). A snapshot does not
+  // hold it: the VM service puts it in again after every load. Empty: no
+  // metadata service.
+  string metadata_json = 10;
+}
+
+message DataDiskConfig {
+  // A block device or a file on the node, or a link to one, as diskd's
+  // <state>/live/<pod>/disk is: it is resolved again at every boot and
+  // restore, since a device's number changes when it is started anew.
+  // Firecracker opens it in its jail, as /data or /volume<N>, with a
+  // writeback cache, so that the guest's flushes reach it.
+  string path = 1;
+}
+
+message GuestNetworkConfig {
+  // Interface in the guest, e.g. "eth0".
+  string interface = 1;
+  // IPv4 address with prefix length, e.g. "169.254.16.2/32"; empty for a
+  // guest with IPv6 only.
+  string ipv4_cidr = 2;
+  // IPv4 default gateway, on the interface's link, e.g. "169.254.0.1";
+  // empty with ipv4_cidr.
+  string gateway = 3;
+  // Resolvers, in order.
+  repeated string dns = 4;
+  // Kernel hostname. Left alone when empty.
+  string hostname = 5;
+  // IPv6 address with prefix length, e.g. "fd00:fe05::2/128"; empty for a
+  // guest with IPv4 only.
+  string ipv6_cidr = 6;
+  // IPv6 default gateway, on the interface's link, e.g. "fe80::1".
+  string ipv6_gateway = 7;
+  // Routes via gateways on the interface's link, such as "fc00::/7" via
+  // "fe80::1" for a pod whose IPv6 address is a ULA (ADR 0017). A family's
+  // routes replace its default route: a family without any gets the
+  // default route via its gateway. A guest of before routes ignores them.
+  repeated GuestRoute routes = 8;
+}
+
+message GuestRoute {
+  // A prefix of either family, e.g. "fc00::/7".
+  string destination = 1;
+  // On the interface's link, of the destination's family, e.g. "fe80::1".
+  string gateway = 2;
+  // The route's MTU, e.g. 1420 over a mesh; 0 is the interface's.
+  uint32 mtu = 3;
+}
+
+message CpuConfig {
+  uint32 vcpu_count = 1;
+  // Firecracker cannot add vCPUs to a running VM.
+  reserved 2;
+  reserved "max_vcpus";
+}
+
+message MemoryConfig {
+  uint64 size_mib = 1; // Memory size in Megabytes (MiB).
+  // Firecracker backs neither an initramfs nor a balloon with huge pages.
+  reserved 2;
+  reserved "hugepages";
+  // A virtio balloon, through which the guest gives memory back to the
+  // host. Firecracker adds it at boot only.
+  BalloonConfig balloon = 3;
+}
+
+message BalloonConfig {
+  // How much memory the balloon takes from the guest at boot.
+  uint32 amount_mib = 1;
+  // Whether the balloon deflates when the guest runs out of memory.
+  bool deflate_on_oom = 2;
+  // The guest reports the memory it frees to the host, which drops it: the
+  // VMM shrinks, and so does a snapshot of the VM.
+  bool free_page_reporting = 3;
+  // Seconds between updates of the guest's memory statistics; 0 disables
+  // them. Statistics cannot be enabled after boot.
+  uint32 stats_interval_s = 4;
+}
+
+message NetConfig {
+  // Firecracker's interface ID: letters, digits and "_". Defaults to "eth<n>".
+  string device_id = 1;
+  TapConfig tap = 2;
+  // Firecracker has no PCI passthrough (VFIO).
+  reserved 3;
+  reserved "vfio_pci";
+  string mac_address = 4;
+}
+
+message TapConfig {
+  string tap_name = 1;
+}
+
+enum VmState {
+  VM_STATE_UNSPECIFIED = 0;
+  VM_STATE_CREATING = 1;
+  VM_STATE_CREATED = 2;
+  VM_STATE_RUNNING = 3;
+  VM_STATE_PAUSED = 4;
+  VM_STATE_STOPPED = 5;
+  VM_STATE_CRASHED = 6;
+  // In a snapshot on disk, without a Firecracker process.
+  VM_STATE_SUSPENDED = 7;
+}
+
+message VmInfo {
+  string vm_id = 1;
+  VmState state = 2;
+  VmConfig config = 3;
+  // The host end of the VM's vsock device, a Unix socket (Firecracker's
+  // hybrid vsock). To reach port P in the guest, connect and send
+  // "CONNECT P\n". The guest reaches the host at CID 2, port P, through
+  // the Unix socket <vsock_path>_P.
+  string vsock_path = 4;
+  // The FeOS guest, as its lifecycle uplink reports it. Unset until a guest
+  // has attached in the VM's current boot.
+  GuestInfo guest = 5;
+}
+
+// A FeOS guest dials its host on vsock port 10001 and holds a
+// feos.lifecycle.v1.LifecycleService call open for as long as it runs.
+message GuestInfo {
+  // Whether the guest holds its call open now.
+  bool attached = 1;
+  // /proc/sys/kernel/random/boot_id of the guest; a new boot changes it.
+  string boot_id = 2;
+  // Attaches within this boot: 0 is the boot's first.
+  uint64 attach_seq = 3;
+  string feos_version = 4;
+  // Why the last push of the time or the network configuration failed;
+  // empty when it worked.
+  string push_error = 5;
+}
+
+// VmEvent data: a FeOS guest attached and was pushed the time and its
+// network configuration. After a cold boot this is when the guest serves.
+message GuestAttachedEvent {
+  GuestInfo guest = 1;
+}
+
+// VmEvent data: the guest's call ended. The guest is gone, or lost its
+// call and attaches again.
+message GuestDetachedEvent {}
+
+message PingVmRequest {
+  string vm_id = 1;
+}
+
+message PingVmResponse {
+  string build_version = 1;
+  string version = 2;
+  int64 pid = 3;
+  repeated string features = 4;
+}
+
+message DeleteVmRequest {
+  string vm_id = 1;
+}
+
+message StartVmRequest {
+  string vm_id = 1;
+}
+
+message ShutdownVmRequest {
+  string vm_id = 1;
+}
+
+message ResumeVmRequest {
+  string vm_id = 1;
+  // A snapshot from elsewhere, for a microVM that was created and never
+  // booted: one that went to object storage, on this node or another.
+  RemoteSnapshot remote = 2;
+}
+
+// A snapshot written elsewhere. Its memory is not a file: a userfaultfd
+// handler serves it, listening on the socket memory.sock in the VM's
+// directory, such as diskd's (OpenMemory), and the guest runs while it
+// arrives.
+message RemoteSnapshot {
+  // Its vmstate, a file on the node, which the VM service takes into the
+  // VM's directory.
+  string vmstate_path = 1;
+  // What it was written with. It is restored only with the same: the
+  // Firecracker version installed, on the same CPU model and kernel.
+  string firecracker_version = 2;
+  string cpu_model = 3;
+  string kernel_release = 4;
+}
+
+message SuspendVmRequest {
+  string vm_id = 1;
+  // Before the snapshot, a FeOS guest empties its memory as far as it can
+  // (sync, drop caches, compact; feos.host.v1.HostService.PreparePause),
+  // and with free page reporting the VM service waits until the guest has
+  // handed the freed memory back. The snapshot gets smaller.
+  bool purge_guest = 2;
+}
+
+message SuspendVmResponse {
+  // What the snapshot's memory takes on disk.
+  uint64 memory_bytes = 1;
+}
+
+message StartVmResponse {}
+
+message DeleteVmResponse {}
+
+message ShutdownVmResponse {}
+
+message ResumeVmResponse {}
+

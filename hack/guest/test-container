@@ -1,0 +1,534 @@
+#!/bin/bash
+# Boot the FeOS guest with a network and a data volume, push it a pod's
+# network as feosd does, pull an image in the guest, and run a container:
+# exec, resolvers, toolbox, exit codes, logs. Then check the network: both
+# families, the same push again, other addresses as after a resume on
+# another node, each family alone, and the network of this version over
+# one of an earlier one. Run Postgres and Valkey on volumes of their own,
+# as FeRun's addons do. Then reboot and adopt the containers, and check
+# that the writable layer and the volumes' data survived.
+#
+#   hack/guest/test-container [image]
+#
+# The guest's TAP is in a network namespace that stands for the node: the
+# guest's gateways on the link, 169.254.0.1 and fe80::1, may be those of
+# this machine's own network, as in clouds. As feosd does, the namespace
+# holds fe80::1 on the TAP and answers ARP for 169.254.0.1 by proxy,
+# without holding it, routes the guest's addresses to the TAP, passes DNS
+# for 169.254.0.53 on to a public resolver, and NATs to this machine over
+# a veth pair; this machine NATs again. Needs sudo for the namespace and
+# for this machine's NAT (the veth pair and iptables rules, all removed on
+# exit), /dev/kvm, Firecracker (make firecracker), the guest (make guest)
+# and internet access for the pull.
+set -euo pipefail
+export PATH="$PATH:/sbin:/usr/sbin"
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+GUEST_DIR="${REPO_ROOT}/target/guest"
+RUN_DIR="${GUEST_DIR}/run-container"
+FC="${FC:-${REPO_ROOT}/target/firecracker/firecracker}"
+KERNEL="${KERNEL:-${GUEST_DIR}/vmlinuz}"
+INITRD="${INITRD:-${GUEST_DIR}/initramfs.cpio.zst}"
+VSOCK="${RUN_DIR}/v.sock"
+DATA_IMG="${RUN_DIR}/data.img"
+# Two volumes of the pod, drives 1 and 2, which the guest formats.
+PG_IMG="${RUN_DIR}/pgdata.img"
+KV_IMG="${RUN_DIR}/kvdata.img"
+VOLUME_SIZE=$((512 << 20))
+PG_IMAGE=docker.io/library/postgres:17-alpine
+KV_IMAGE=docker.io/valkey/valkey:8-alpine
+FEOSCTL="${REPO_ROOT}/target/debug/feosctl"
+IMAGE="${1:-docker.io/library/busybox:1.36}"
+TIMEOUT=60
+
+# Names and a /30 of this run's own, so that runs side by side do not
+# remove each other's.
+NS=feos-guest-test-$$
+# This machine's end of the veth pair; the namespace's is "uplink".
+UPLINK=feos-gt$$
+# A /30 of 192.168.102.0/24 that holds no address of this machine, looked
+# for from one that the pid picks.
+for i in $(seq 0 63); do
+  base=$(((i + $$) % 64 * 4))
+  ip -4 -o addr show | grep -q " 192\.168\.102\.$((base + 1))/" || break
+done
+UPLINK_NET=192.168.102.${base}/30
+UPLINK_IP=192.168.102.$((base + 1))
+NS_UPLINK_IP=192.168.102.$((base + 2))
+UPSTREAM_DNS=1.1.1.1
+# The TAP is a link of its own, as feosd sets a pod's up (ADR 0010): the
+# node is fe80::1 on it and answers ARP for 169.254.0.1, and the guest's
+# addresses have a /32 and a /128 route to it. NODE_IP6 is the source the
+# guest answers through its default route.
+TAP=feos-tap0
+NODE_IP=169.254.0.1
+NODE_IP6=fd00:fe05:ffff::1
+POD_RANGE=169.254.16.0/20
+GUEST_IP=169.254.16.2
+GUEST_IP_MOVED=169.254.16.3
+GUEST_IP6=fd00:fe05:ffff::2
+GUEST_IP6_MOVED=fd00:fe05:ffff::3
+DNS=169.254.0.53
+# A resolver of an earlier network.
+OLD_DNS=2001:db8::53
+
+log() { printf '[test-container] %s\n' "$*"; }
+fail() { log "FAIL: $*"; tail -40 "${SERIAL_LOG:-/dev/null}" >&2 || true; exit 1; }
+
+for f in "${FC}" "${KERNEL}" "${INITRD}"; do
+  [ -e "$f" ] || { log "missing $f"; exit 1; }
+done
+log "building feosctl"
+cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" -p feosctl
+
+mkdir -p "${RUN_DIR}"
+rm -f "${DATA_IMG}" "${PG_IMG}" "${KV_IMG}"
+truncate -s 2G "${DATA_IMG}"
+mkfs.ext4 -q -F "${DATA_IMG}"
+truncate -s "${VOLUME_SIZE}" "${PG_IMG}" "${KV_IMG}"
+PG_VOLUME_ID="$(cat /proc/sys/kernel/random/uuid)"
+KV_VOLUME_ID="$(cat /proc/sys/kernel/random/uuid)"
+
+egress_if() { ip route show default | awk '/default/ {print $5; exit}'; }
+EGRESS="$(egress_if)"
+# Runs a command in the node's namespace.
+node() { sudo ip netns exec "${NS}" "$@"; }
+cleanup_net() {
+  sudo iptables -t nat -D POSTROUTING -s "${UPLINK_NET}" -o "${EGRESS}" -j MASQUERADE 2>/dev/null || true
+  sudo iptables -D FORWARD -i "${UPLINK}" -o "${EGRESS}" -j ACCEPT 2>/dev/null || true
+  sudo iptables -D FORWARD -i "${EGRESS}" -o "${UPLINK}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  # The TAP and the veth pair go with the namespace.
+  sudo ip netns del "${NS}" 2>/dev/null || true
+  sudo ip link del "${UPLINK}" 2>/dev/null || true
+}
+FC_PID=""
+stop_vm() {
+  [ -n "${FC_PID}" ] || return 0
+  sudo kill "${FC_PID}" 2>/dev/null || true
+  wait "${FC_PID}" 2>/dev/null || true
+  FC_PID=""
+}
+trap 'stop_vm; cleanup_net' EXIT
+
+cleanup_net
+log "node namespace ${NS}: ${TAP}, NAT via ${UPLINK} and ${EGRESS}"
+sudo ip netns add "${NS}"
+sudo ip link add "${UPLINK}" type veth peer name uplink netns "${NS}"
+sudo ip addr add "${UPLINK_IP}/30" dev "${UPLINK}"
+sudo ip link set "${UPLINK}" up
+sudo sysctl -qw net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -s "${UPLINK_NET}" -o "${EGRESS}" -j MASQUERADE
+# Docker sets the FORWARD policy to DROP where it runs, as on GitHub's
+# runners.
+sudo iptables -I FORWARD -i "${UPLINK}" -o "${EGRESS}" -j ACCEPT
+sudo iptables -I FORWARD -i "${EGRESS}" -o "${UPLINK}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+node ip link set lo up
+node ip addr add "${NS_UPLINK_IP}/30" dev uplink
+node ip link set uplink up
+node ip route add default via "${UPLINK_IP}"
+node sysctl -qw net.ipv4.ip_forward=1
+# As feosd sets a pod's TAP up: the resolver's address its one IPv4
+# address, which its ARP asks from, and ARP answered for 169.254.0.1 by
+# proxy and at once, while the namespace's route there leaves through the
+# uplink.
+node ip tuntap add dev "${TAP}" mode tap
+node sysctl -qw "net.ipv4.conf.${TAP}.arp_ignore=1" "net.ipv4.conf.${TAP}.arp_announce=2" \
+  "net.ipv4.neigh.${TAP}.proxy_delay=0"
+node ip addr add "${DNS}/32" dev "${TAP}"
+node ip neigh add proxy "${NODE_IP}" dev "${TAP}"
+node ip -6 addr add fe80::1/64 dev "${TAP}" nodad
+node ip -6 addr add "${NODE_IP6}/128" dev "${TAP}" nodad
+node ip link set "${TAP}" up
+for ip in "${GUEST_IP}" "${GUEST_IP_MOVED}"; do
+  node ip route add "${ip}/32" dev "${TAP}"
+done
+for ip in "${GUEST_IP6}" "${GUEST_IP6_MOVED}"; do
+  node ip -6 route add "${ip}/128" dev "${TAP}"
+done
+for proto in udp tcp; do
+  node iptables -t nat -A PREROUTING -i "${TAP}" -d "${DNS}" -p "${proto}" --dport 53 \
+    -j DNAT --to-destination "${UPSTREAM_DNS}"
+done
+node iptables -t nat -A POSTROUTING -s "${POD_RANGE}" -o uplink -j MASQUERADE
+
+cat > "${RUN_DIR}/config.json" <<JSON
+{
+  "boot-source": {
+    "kernel_image_path": "${KERNEL}",
+    "initrd_path": "${INITRD}",
+    "boot_args": "console=ttyS0 reboot=k panic=1 quiet"
+  },
+  "drives": [
+    {"drive_id": "data", "path_on_host": "${DATA_IMG}", "is_root_device": false, "is_read_only": false},
+    {"drive_id": "pgdata", "path_on_host": "${PG_IMG}", "is_root_device": false, "is_read_only": false},
+    {"drive_id": "kvdata", "path_on_host": "${KV_IMG}", "is_root_device": false, "is_read_only": false}
+  ],
+  "network-interfaces": [{"iface_id": "eth0", "guest_mac": "06:00:AC:CB:02:0A", "host_dev_name": "${TAP}"}],
+  "machine-config": {"vcpu_count": 2, "mem_size_mib": 512},
+  "vsock": {"guest_cid": 3, "uds_path": "${VSOCK}"}
+}
+JSON
+
+boot() {
+  SERIAL_LOG="${RUN_DIR}/serial-$1.log"
+  rm -f "${VSOCK}" "${SERIAL_LOG}"
+  # Not through node(): FC_PID has to be sudo's, which passes the kill on.
+  sudo ip netns exec "${NS}" "${FC}" --no-api --config-file "${RUN_DIR}/config.json" \
+    >"${SERIAL_LOG}" 2>&1 &
+  FC_PID=$!
+  local end=$((SECONDS + TIMEOUT))
+  until grep -q "listening on vsock port" "${SERIAL_LOG}" 2>/dev/null; do
+    [ ${SECONDS} -lt ${end} ] || fail "API not up within ${TIMEOUT}s"
+    # Not kill -0: sudo is root's for a moment while it opens its session.
+    [ -d "/proc/${FC_PID}" ] || fail "Firecracker exited"
+    sleep 0.2
+  done
+  sudo chmod 0666 "${VSOCK}"
+  push "${GUEST_IP}" "${GUEST_IP6}"
+  log "booted ($1), network pushed"
+}
+
+ctl() { "${FEOSCTL}" "$1" --address "vsock:${VSOCK}" "${@:2}"; }
+cexec() { ctl container exec main -- "$@"; }
+# Pushes a pod's network as feosd does: an IPv4 /32 ($1) and an IPv6 /128
+# ($2), each via the node's address on the link, and the node's resolver,
+# or another one ($3). An empty address leaves its family out.
+push() {
+  local args=()
+  [ -z "$1" ] || args+=(--ipv4 "$1/32" --gateway "${NODE_IP}")
+  [ -z "$2" ] || args+=(--ipv6 "$2/128" --ipv6-gateway fe80::1)
+  ctl host set-network --interface eth0 "${args[@]}" --dns "${3:-${DNS}}" --hostname feos-test >/dev/null
+}
+# Whether the guest answers on an address, from the node's.
+answers() {
+  local _
+  for _ in 1 2 3; do
+    node ping -c1 -W1 "$1" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+# The guest's global addresses on eth0 and its routes of both families but
+# the kernel's for multicast, sorted, without metrics, MTUs and protocols:
+# busybox's ip shows no MTU, which the guest's own tests check.
+guest_network() {
+  cexec sh -c 'ip addr show dev eth0; ip -4 route show; ip -6 route show' |
+    sed -E 's/ (metric|proto|pref|mtu) [^ ]+//g; s/ +/ /g; s/^ //; s/ $//' |
+    awk '/^inet6? .* scope global/ {print $1, $2; next} / dev eth0/ && !/^multicast /' | sort
+}
+# Checks the guest's addresses and routes after a push of $1 and $2: the
+# addresses, the default routes via the node, and a route to the node's IPv4
+# address on the link, outside the /32; the rest the kernel's.
+expect_network() {
+  local want=("fe80::/64 dev eth0") got
+  [ -z "$1" ] || want+=("inet $1/32" "${NODE_IP} dev eth0 scope link" "default via ${NODE_IP} dev eth0")
+  [ -z "$2" ] || want+=("inet6 $2/128" "$2 dev eth0" "default via fe80::1 dev eth0")
+  got="$(guest_network)"
+  [ "${got}" = "$(printf '%s\n' "${want[@]}" | sort)" ] \
+    || fail "the network after a push of '$1' and '$2': ${got}"
+}
+
+# The pull goes out over IPv4, through the namespace's NAT and this
+# machine's, and resolves through the node's resolver.
+boot first
+log "creating container main from ${IMAGE}"
+ctl container create --image-ref "${IMAGE}" --id main --cmd "sleep 3600"
+ctl container start main
+grep -q "State: Running" <<<"$(ctl container info main)" || fail "container not running"
+
+out="$(cexec echo hello)"
+[ "${out}" = "hello" ] || fail "exec echo: ${out}"
+grep -q "nameserver ${DNS}" <<<"$(cexec cat /etc/resolv.conf)" || fail "resolvers not linked"
+cexec ls /feos-tools/bin/coreutils >/dev/null || fail "toolbox missing"
+set +e
+cexec sh -c 'echo to-stderr >&2; exit 3' 2>/dev/null
+code=$?
+set -e
+[ "${code}" = 3 ] || fail "exit code ${code}, expected 3"
+cexec sh -c 'echo kept > /persist'
+log "exec, resolvers, toolbox and exit codes work"
+
+# A container's exit code and log, as FeRun's controller reads them:
+# feosd's GetPod takes the exit code from ListContainers, and a log's last
+# lines come with tail_lines. stdout and stderr share the log; a last line
+# without a newline counts.
+exit_code_of() { sed -n 's/^ *Exit Code: //p' <<<"$(ctl container info "$1")"; }
+wait_exit() {
+  local _
+  for _ in $(seq 100); do
+    [ "$(exit_code_of "$1")" = "$2" ] && return 0
+    sleep 0.1
+  done
+  fail "container $1 did not exit with $2: $(ctl container info "$1")"
+}
+ctl container create --image-ref "${IMAGE}" --id exits \
+  -- sh -c 'echo one; echo two >&2; printf "three\nfour"; exit 7' >/dev/null
+ctl container start exits >/dev/null
+wait_exit exits 7
+grep -q "State: Stopped" <<<"$(ctl container info exits)" || fail "exited, not stopped"
+grep -q "Exit Code" <<<"$(ctl container info main)" && fail "a running container has an exit code"
+out="$(ctl container logs exits --tail 2)"
+[ "${out}" = "$(printf 'three\nfour')" ] || fail "the log's last 2 lines: ${out}"
+out="$(ctl container logs exits)"
+[ "${out}" = "$(printf 'one\ntwo\nthree\nfour')" ] || fail "the whole log: ${out}"
+[ -z "$(ctl container logs exits --tail 0)" ] || fail "a log without the lines so far"
+ctl container create --image-ref "${IMAGE}" --id killed -- sleep 3600 >/dev/null
+ctl container start killed >/dev/null
+ctl container stop killed >/dev/null
+wait_exit killed 137
+log "exit codes, 128 + the signal when killed, and log tails"
+
+# A follow goes on with what the container writes, and ends when the
+# container is deleted.
+ctl container create --image-ref "${IMAGE}" --id ticks \
+  -- sh -c 'i=0; while :; do echo "tick $i"; i=$((i + 1)); sleep 0.1; done' >/dev/null
+ctl container start ticks >/dev/null
+FOLLOW_LOG="${RUN_DIR}/follow.log"
+ctl container logs ticks --follow --tail 1 >"${FOLLOW_LOG}" 2>&1 &
+FOLLOW_PID=$!
+for _ in $(seq 100); do [ "$(wc -l <"${FOLLOW_LOG}")" -ge 20 ] && break; sleep 0.1; done
+ctl container delete ticks >/dev/null
+for _ in $(seq 50); do [ -d "/proc/${FOLLOW_PID}" ] || break; sleep 0.1; done
+[ -d "/proc/${FOLLOW_PID}" ] && fail "the follow did not end with its container"
+wait "${FOLLOW_PID}" || fail "the follow failed: $(tail -3 "${FOLLOW_LOG}")"
+# The ticks it printed follow each other, without a gap or a repeat.
+awk '$1 != "tick" || (NR > 1 && $2 != prev + 1) {bad = 1} {prev = $2} END {exit bad || NR < 20}' \
+  "${FOLLOW_LOG}" || fail "the follow: $(head -c 400 "${FOLLOW_LOG}")"
+ctl container delete exits >/dev/null
+ctl container delete killed >/dev/null
+log "a follow streams what the container writes until it is deleted"
+
+tool() { ctl tool --container main "$@"; }
+printf 'alpha\nbeta\n' | tool write /work/notes.txt
+[ "$(tool read /work/notes.txt)" = "$(printf 'alpha\nbeta')" ] || fail "tool write/read"
+tool edit /work/notes.txt --old beta --new gamma >/dev/null
+grep -q "notes.txt:2:gamma" <<<"$(tool rg gamma /work)" || fail "tool edit/rg"
+grep -q "notes.txt" <<<"$(tool fd notes /work)" || fail "tool fd"
+grep -q "nameserver ${DNS}" <<<"$(tool read /etc/resolv.conf)" || fail "tool read of the managed resolv.conf"
+tool write /etc/resolv.conf </dev/null 2>/dev/null && fail "tool wrote the managed resolv.conf"
+[ "$(cexec cat /work/notes.txt)" = "$(printf 'alpha\ngamma')" ] || fail "tool changes not visible in the container"
+grep -q "Example Domain" <<<"$(tool webfetch https://example.com/)" || fail "tool webfetch"
+log "tools read, write, edit, rg, fd and webfetch in the container"
+
+WATCH_LOG="${RUN_DIR}/watch.log"
+"${FEOSCTL}" watch --address "vsock:${VSOCK}" --container main /work >"${WATCH_LOG}" 2>&1 &
+WATCH_PID=$!
+for _ in $(seq 50); do grep -q "^watching" "${WATCH_LOG}" && break; sleep 0.1; done
+cexec touch /work/new-file
+for _ in $(seq 50); do grep -q "CREATED /work/new-file" "${WATCH_LOG}" && break; sleep 0.1; done
+kill "${WATCH_PID}" 2>/dev/null || true
+grep -q "CREATED /work/new-file" "${WATCH_LOG}" || fail "watch saw no event: $(cat "${WATCH_LOG}")"
+log "watch reports a file created in the container"
+
+# Port forwarding: a web server on the container's loopback, reached from
+# this machine through the guest's API.
+cexec sh -c 'mkdir -p /www && echo forwarded > /www/index.html && httpd -p 8080 -h /www </dev/null >/dev/null 2>&1'
+"${FEOSCTL}" forward --address "vsock:${VSOCK}" --port 8080 --listen 127.0.0.1:18080 >/dev/null 2>&1 &
+FORWARD_PID=$!
+for _ in $(seq 50); do curl -s http://127.0.0.1:18080/ >/dev/null 2>&1 && break; sleep 0.1; done
+out="$(curl -s http://127.0.0.1:18080/index.html)"
+kill "${FORWARD_PID}" 2>/dev/null || true
+[ "${out}" = "forwarded" ] || fail "port forward: ${out}"
+log "port forwarding reaches a server on the container's loopback"
+
+# Kubernetes offloading: a loopback listener in the guest whose connections
+# go to the host's kube proxy (vsock port 10002). Without a proxy the guest
+# answers 502; with this stand-in, the proxy's answer comes through.
+ctl kube set-listeners 6443 >/dev/null
+grep -q "502 Bad Gateway" <<<"$(cexec wget -qO- http://127.0.0.1:6443/ 2>&1 || true)" \
+  || fail "no 502 without a kube proxy"
+rm -f "${VSOCK}_10002"
+python3 - "${VSOCK}_10002" <<'PY' &
+import socket, sys
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(sys.argv[1])
+server.listen(8)
+while True:
+    conn, _ = server.accept()
+    preamble = b""
+    while not preamble.endswith(b"\n"):
+        preamble += conn.recv(1)
+    conn.recv(65536)
+    body = preamble.strip()
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s" % (len(body), body))
+    conn.close()
+PY
+KUBE_PID=$!
+for _ in $(seq 50); do [ -S "${VSOCK}_10002" ] && break; sleep 0.1; done
+out="$(cexec wget -qO- http://127.0.0.1:6443/ || true)"
+kill "${KUBE_PID}" 2>/dev/null || true
+[ "${out}" = "kube 6443" ] || fail "kube offloading: ${out}"
+log "kube listeners reach the host's proxy with the port in the preamble"
+
+# SSH agent offloading: the socket every container sees.
+ctl ssh set-agent --enabled >/dev/null
+cexec test -S /run/feos/ssh-agent.sock || fail "no ssh agent socket in the container"
+grep -q "SSH_AUTH_SOCK=/run/feos/ssh-agent.sock" <<<"$(cexec env)" || fail "SSH_AUTH_SOCK not set"
+ctl ssh set-agent >/dev/null
+cexec test -S /run/feos/ssh-agent.sock && fail "ssh agent socket not removed"
+log "the ssh agent socket comes and goes in the container"
+
+# A pod's network, as feosd pushes it: the guest answers the node on its
+# IPv4 /32 and its IPv6 /128, through routes via the node's addresses on
+# the link, and so does the web server in its container; its container
+# resolves through the node's resolver.
+answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP}"
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6}"
+expect_network "${GUEST_IP}" "${GUEST_IP6}"
+out="$(node curl -s "http://${GUEST_IP}:8080/index.html")"
+[ "${out}" = "forwarded" ] || fail "web server over IPv4: ${out}"
+out="$(node curl -s -g "http://[${GUEST_IP6}]:8080/index.html")"
+[ "${out}" = "forwarded" ] || fail "web server over IPv6: ${out}"
+out="$(cexec cat /etc/resolv.conf | grep -v '^#' || true)"
+[ "${out}" = "nameserver ${DNS}" ] || fail "resolvers: ${out}"
+grep -q "Server:.*${DNS}" <<<"$(cexec nslookup example.com)" || fail "no name through ${DNS}"
+out="$(ctl host get-network)"
+grep -qx "IPv4: *${GUEST_IP}/32" <<<"${out}" && grep -qx "IPv4 gateway: *${NODE_IP}" <<<"${out}" \
+  && grep -qx "IPv6: *${GUEST_IP6}/128" <<<"${out}" && grep -qx "IPv6 gateway: *fe80::1" <<<"${out}" \
+  && grep -qx "DNS: *${DNS}" <<<"${out}" || fail "get-network: ${out}"
+log "the guest answers on ${GUEST_IP} and ${GUEST_IP6} and resolves through ${DNS}"
+
+before="$(guest_network)"
+push "${GUEST_IP}" "${GUEST_IP6}" || fail "the same push again"
+[ "$(guest_network)" = "${before}" ] || fail "the same push again changed the network: $(guest_network)"
+answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP} after the same push again"
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} after the same push again"
+log "the same push again changes nothing"
+
+# After a resume on another node, the guest is pushed other addresses: the
+# old ones go.
+push "${GUEST_IP_MOVED}" "${GUEST_IP6_MOVED}"
+expect_network "${GUEST_IP_MOVED}" "${GUEST_IP6_MOVED}"
+answers "${GUEST_IP_MOVED}" || fail "no answer on ${GUEST_IP_MOVED}"
+answers "${GUEST_IP6_MOVED}" || fail "no answer on ${GUEST_IP6_MOVED}"
+for ip in "${GUEST_IP}" "${GUEST_IP6}"; do
+  node ping -c1 -W1 "${ip}" >/dev/null 2>&1 && fail "still an answer on ${ip}"
+done
+log "other addresses replace the old ones"
+
+# A family the push leaves out goes, with its routes.
+push "" "${GUEST_IP6_MOVED}"
+expect_network "" "${GUEST_IP6_MOVED}"
+answers "${GUEST_IP6_MOVED}" || fail "no answer on ${GUEST_IP6_MOVED} with IPv6 alone"
+node ping -c1 -W1 "${GUEST_IP_MOVED}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP_MOVED}"
+push "${GUEST_IP_MOVED}" ""
+expect_network "${GUEST_IP_MOVED}" ""
+answers "${GUEST_IP_MOVED}" || fail "no answer on ${GUEST_IP_MOVED} with IPv4 alone"
+node ping -c1 -W1 "${GUEST_IP6_MOVED}" >/dev/null 2>&1 && fail "still an answer on ${GUEST_IP6_MOVED}"
+log "a push of one family leaves the other unconfigured"
+
+# A pod whose IPv6 address is a ULA, as feosd pushes it (ADR 0017): a route
+# for the ULAs with the mesh's MTU in place of the default route over IPv6,
+# so that the guest answers the node and has no IPv6 route to the internet.
+ctl host set-network --interface eth0 --ipv4 "${GUEST_IP}/32" --gateway "${NODE_IP}" \
+  --ipv6 "${GUEST_IP6}/128" --ipv6-gateway fe80::1 --route fc00::/7 --route-mtu 1420 \
+  --dns "${DNS}" --hostname feos-test >/dev/null
+want=("fe80::/64 dev eth0" "inet ${GUEST_IP}/32" "${NODE_IP} dev eth0 scope link"
+  "default via ${NODE_IP} dev eth0" "inet6 ${GUEST_IP6}/128" "${GUEST_IP6} dev eth0"
+  "fc00::/7 via fe80::1 dev eth0")
+got="$(guest_network)"
+[ "${got}" = "$(printf '%s\n' "${want[@]}" | sort)" ] || fail "the network with a route for the ULAs: ${got}"
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} through the route for the ULAs"
+out="$(cexec wget -q -T 2 -O- 'http://[2001:db8::1]/' 2>&1 || true)"
+grep -qi "unreachable" <<<"${out}" || fail "a global IPv6 address is not unreachable at once: ${out}"
+grep -qx "Route: *fc00::/7 via fe80::1, MTU 1420" <<<"$(ctl host get-network)" \
+  || fail "get-network without the route: $(ctl host get-network)"
+push "${GUEST_IP}" "${GUEST_IP6}"
+expect_network "${GUEST_IP}" "${GUEST_IP6}"
+log "a route for the ULAs replaces the default route over IPv6"
+
+# A pod that runs from an earlier network, IPv6 alone with a resolver of
+# its own, is pushed this one by feosd: its running container resolves
+# through the node's resolver at once.
+push "" "${GUEST_IP6}" "${OLD_DNS}"
+out="$(cexec cat /etc/resolv.conf | grep -v '^#' || true)"
+[ "${out}" = "nameserver ${OLD_DNS}" ] || fail "resolvers of the earlier network: ${out}"
+push "${GUEST_IP}" "${GUEST_IP6}"
+expect_network "${GUEST_IP}" "${GUEST_IP6}"
+answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP} after the push of this network"
+out="$(cexec cat /etc/resolv.conf | grep -v '^#' || true)"
+[ "${out}" = "nameserver ${DNS}" ] || fail "resolvers after the push of this network: ${out}"
+grep -q "Server:.*${DNS}" <<<"$(cexec nslookup example.com)" || fail "no name through ${DNS} after the push"
+log "a running container takes the resolver of a new push"
+
+# Postgres and Valkey on volumes of their own, as FeRun's addons run them
+# (go/internal/env/addons): the guest formats the new volumes and mounts
+# them, the images' entrypoints chown them and drop their privileges, and
+# the addons' probes pass.
+mount_volumes() {
+  ctl guest mount-volumes --volume "pgdata:${PG_VOLUME_ID}:1:${VOLUME_SIZE}$1" \
+    --volume "kvdata:${KV_VOLUME_ID}:2:${VOLUME_SIZE}$1"
+}
+# Runs a probe in a container until it passes, for at most a minute.
+probe() {
+  local container=$1 _
+  shift
+  for _ in $(seq 120); do
+    ctl container exec "${container}" -- "$@" >/dev/null 2>&1 && return 0
+    sleep 0.5
+  done
+  return 1
+}
+pg_ready() { probe pg pg_isready -U postgres -h 127.0.0.1; }
+kv_ready() { probe kv sh -c 'REDISCLI_AUTH="$VALKEY_PASSWORD" valkey-cli ping | grep -qx PONG'; }
+psql_c() { ctl container exec pg --env PGPASSWORD=secret -- psql -X -q -At -h 127.0.0.1 -U postgres -c "$1"; }
+kv_cli() { ctl container exec kv -- sh -c "REDISCLI_AUTH=\"\$VALKEY_PASSWORD\" valkey-cli $1"; }
+out="$(mount_volumes :format)" || fail "mounting the volumes: ${out}"
+grep -qx "pgdata: mounted from /dev/vdb, formatted" <<<"${out}" \
+  && grep -qx "kvdata: mounted from /dev/vdc, formatted" <<<"${out}" || fail "the volumes: ${out}"
+log "creating postgres from ${PG_IMAGE} and valkey from ${KV_IMAGE}"
+ctl container create --image-ref "${PG_IMAGE}" --id pg \
+  --env PGDATA=/var/lib/postgresql/data/pgdata --env POSTGRES_PASSWORD=secret \
+  --env POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
+  --volume pgdata:/var/lib/postgresql/data \
+  -- docker-entrypoint.sh postgres -c shared_buffers=64MB >/dev/null
+ctl container start pg >/dev/null
+ctl container create --image-ref "${KV_IMAGE}" --id kv \
+  --env "VALKEY_EXTRA_FLAGS=--appendonly yes --requirepass secret --maxmemory 64mb --maxmemory-policy noeviction" \
+  --env VALKEY_PASSWORD=secret --volume kvdata:/data >/dev/null
+ctl container start kv >/dev/null
+pg_ready || fail "postgres is not ready: $(ctl container logs pg --tail 20)"
+kv_ready || fail "valkey is not ready: $(ctl container logs kv --tail 20)"
+grep -q "database system is ready to accept connections" <<<"$(ctl container logs pg --tail 50)" \
+  || fail "postgres's log: $(ctl container logs pg --tail 20)"
+psql_c "CREATE TABLE kept (v text); INSERT INTO kept VALUES ('survives')" || fail "psql"
+[ "$(kv_cli 'set kept survives')" = OK ] || fail "valkey set"
+grep -q "/var/lib/postgresql/data" <<<"$(ctl container exec pg -- cat /proc/mounts)" \
+  || fail "the volume is not mounted in postgres's container"
+# Valkey writes its append-only file every second.
+sleep 2
+log "postgres and valkey run on their volumes and pass their probes"
+
+# A host freezes the data volume before it stops a guest it wants to adopt
+# later; freezing writes back what is in the guest's page cache.
+ctl host freeze >/dev/null
+stop_vm
+boot second
+answers "${GUEST_IP}" || fail "no answer on ${GUEST_IP} after the reboot"
+answers "${GUEST_IP6}" || fail "no answer on ${GUEST_IP6} after the reboot"
+ctl container create --id main --adopt >/dev/null || fail "adopt"
+ctl container start main
+[ "$(cexec cat /persist)" = "kept" ] || fail "writable layer lost across the reboot"
+log "adopted the container after a reboot; its writable layer survived"
+
+# The volumes again, as feosd mounts them on every boot, and the addons'
+# containers adopted on them: their data survived.
+out="$(mount_volumes "")" || fail "mounting the volumes after the reboot: ${out}"
+grep -q formatted <<<"${out}" && fail "a volume was formatted again: ${out}"
+for c in pg kv; do
+  ctl container create --id "${c}" --adopt >/dev/null || fail "adopt ${c}"
+  ctl container start "${c}" >/dev/null
+done
+pg_ready || fail "postgres is not ready after the reboot: $(ctl container logs pg --tail 20)"
+kv_ready || fail "valkey is not ready after the reboot: $(ctl container logs kv --tail 20)"
+[ "$(psql_c 'SELECT v FROM kept')" = survives ] || fail "postgres lost its data"
+[ "$(kv_cli 'get kept')" = survives ] || fail "valkey lost its data"
+log "postgres and valkey kept their data on their volumes across the reboot"
+out="$(cexec cat /proc/sys/net/ipv6/conf/eth0/accept_ra /proc/sys/net/ipv6/conf/eth0/autoconf)"
+[ "${out}" = "$(printf '0\n0')" ] || fail "router advertisements or autoconfiguration on: ${out}"
+log "a guest pushed its network at boot takes no router advertisements"
+
+for c in pg kv; do ctl container delete "${c}" >/dev/null; done
+ctl container delete main
+grep -q main <<<"$(ctl container list)" && fail "container still listed after delete"
+log "PASS"

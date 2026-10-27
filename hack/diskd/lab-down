@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Stops the lab's diskd. With --clean it stops every device first;
+# without, the devices stay quiesced for the next diskd to recover.
+set -euo pipefail
+
+thisDir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+ROOT="$(cd "${thisDir}/../.." && pwd)"
+STATE=$(readlink -f "${DISKD_STATE:-${ROOT}/target/diskd/state}")
+BIN="${DISKD_BIN:-${ROOT}/target/release/diskd}"
+CTL="${ROOT}/target/release/diskctl"
+
+if [ "${1:-}" = "--clean" ] && [ -S "${STATE}/diskd.sock" ]; then
+  for id in $(python3 -c "
+import json
+try: print(' '.join(json.load(open('${STATE}/diskd.state'))['devices'].keys()))
+except Exception: pass
+"); do
+    sudo "${CTL}" --socket "${STATE}/diskd.sock" stop "${id}" || true
+  done
+fi
+
+for p in $(pgrep -xf "${BIN} --state-dir ${STATE}.*"); do sudo kill "$p" || true; done
+sleep 0.3
+echo "[lab-down] stopped"

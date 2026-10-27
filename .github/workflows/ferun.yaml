@@ -1,0 +1,151 @@
+name: FeRun
+
+on:
+  push:
+  pull_request:
+
+# A pull request from a branch of this repository is tested by the push
+# of that branch already; pull requests run the jobs for forks only.
+
+jobs:
+  go:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # The tests make a database of their own per test in it
+    # (FERUN_TEST_DATABASE_URL); the server's settings follow in a step,
+    # since a service takes no command line.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ferun
+          POSTGRES_PASSWORD: ferun
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ferun"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        # The toolchain go/go.mod names.
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Configure PostgreSQL
+        # As hack/go/with-postgres runs it: enough connections for the
+        # packages' tests side by side, and no durability.
+        run: |
+          docker exec ${{ job.services.postgres.id }} psql -U ferun -d postgres \
+            -c "ALTER SYSTEM SET max_connections = 500" \
+            -c "ALTER SYSTEM SET fsync = off" \
+            -c "ALTER SYSTEM SET synchronous_commit = off" \
+            -c "ALTER SYSTEM SET full_page_writes = off"
+          docker restart ${{ job.services.postgres.id }}
+          for _ in $(seq 1 60); do
+            docker exec ${{ job.services.postgres.id }} pg_isready -U ferun -q && exit 0
+            sleep 1
+          done
+          exit 1
+
+      - name: Lint
+        run: make go-lint
+
+      - name: Build
+        # Static binaries, as every FeOS binary is.
+        run: |
+          make go-build
+          for binary in target/go/ferund target/go/ferun-testnode; do
+            file "$binary"
+            file "$binary" | grep -q 'statically linked'
+          done
+
+      - name: Test
+        # A package's tests may take longer than go test's default of 10
+        # minutes here, with the race detector and the other packages
+        # beside them; the job's limit stays the bound.
+        env:
+          FERUN_TEST_DATABASE_URL: postgres://ferun:ferun@127.0.0.1:5432/postgres?sslmode=disable
+          GOFLAGS: -race -timeout=25m
+        run: make go-test
+
+  web:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        # The version of go/Dockerfile's web stage.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        # Into go/internal/ui/dist, which ferund embeds.
+        run: npm run build
+
+  fechat:
+    # FeChat, FeRun's reference client: its Go backend and its SPA.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: fechat
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: fechat/backend/go.mod
+          cache-dependency-path: fechat/backend/go.sum
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: fechat/package-lock.json
+
+      - name: Lint the Backend
+        working-directory: fechat/backend
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt: $out"; exit 1; fi
+          go vet ./...
+
+      - name: Test the Backend
+        working-directory: fechat/backend
+        run: go test -race ./...
+
+      - name: Build the SPA
+        run: |
+          npm ci
+          npm run build

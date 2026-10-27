@@ -1,0 +1,55 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+use oci_client::{errors::OciDistributionError, ParseError};
+use tonic::Status;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ImageServiceError {
+    #[error("Failed to pull OCI image")]
+    OciPull(#[from] OciDistributionError),
+
+    #[error("Failed to parse OCI image reference")]
+    OciParse(#[from] ParseError),
+
+    #[error("Required image layer '{0}' not found in manifest")]
+    MissingLayer(String),
+
+    #[error("A file storage error occurred")]
+    Storage(#[from] std::io::Error),
+
+    #[error("Image with ID '{0}' not found")]
+    NotFound(String),
+
+    #[error("Image with ID '{0}' is in use: {1}")]
+    InUse(String, String),
+
+    #[error("An internal orchestrator error occurred: {0}")]
+    Internal(String),
+
+    #[error("Pull failed: {0}")]
+    Pull(String),
+
+    #[error("Unsupported layer media type: {0}")]
+    UnsupportedLayer(String),
+}
+
+impl From<ImageServiceError> for Status {
+    fn from(err: ImageServiceError) -> Self {
+        log::error!("ImageServiceError: {err}");
+        match err {
+            ImageServiceError::NotFound(id) => {
+                Status::not_found(format!("Image with ID '{id}' not found"))
+            }
+            ImageServiceError::OciParse(_) => Status::invalid_argument(err.to_string()),
+            ImageServiceError::InUse(..) => Status::failed_precondition(err.to_string()),
+            ImageServiceError::OciPull(_)
+            | ImageServiceError::MissingLayer(_)
+            | ImageServiceError::Pull(_) => Status::unavailable(err.to_string()),
+            ImageServiceError::UnsupportedLayer(_) => Status::unimplemented(err.to_string()),
+            ImageServiceError::Storage(_) | ImageServiceError::Internal(_) => {
+                Status::internal(err.to_string())
+            }
+        }
+    }
+}

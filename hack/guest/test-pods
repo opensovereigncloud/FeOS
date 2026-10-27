@@ -1,0 +1,149 @@
+#!/bin/bash
+# Run pods against Firecracker: the pod integration tests install the
+# guest and Firecracker as their packages would, and create, stop, start,
+# crash, suspend, resume, hibernate, restore and delete pods, on disks
+# from a diskd of their own, and their volumes. The image test pulls the
+# guest from a local registry; the volumes' containers pull their image
+# (TEST_CONTAINER_IMAGE_REF, busybox) from the internet.
+#
+#   hack/guest/test-pods [test name filter...]
+#
+# A filter selects other integration tests too: "integration" runs all.
+#
+# The tests run as root in a privileged container, so that FeOS's
+# directories (/var/lib/feos, /run/feos) stay in there, in the network
+# namespace of the registry's container, so that FeOS's API port stays in
+# there too. The node's /dev is the container's: diskd's ublk devices
+# appear there. Needs docker, /dev/kvm, the ublk driver, Firecracker (make
+# firecracker) and the guest (make guest).
+#
+# Hibernation needs an object store: the S3 variables of diskd (S3_BUCKET,
+# AWS_*) from the environment or from FEOS_S3_ENV, by default
+# ~/.config/feos/diskd/s3.env. The tests use a key prefix of their own and
+# sweep it at the end; without an object store, they skip hibernation.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+TARGET="x86_64-unknown-linux-musl"
+REGISTRY_IMAGE="registry:2.8.3"
+# A registry of this run's own, so that runs side by side do not remove
+# each other's. The tests reach it at its port in its network namespace,
+# which they share; this machine at the port docker picks.
+REGISTRY_NAME="feos-test-pods-registry-$$"
+REGISTRY_PORT=5000
+TEST_IMAGE_REF="127.0.0.1:${REGISTRY_PORT}/feos/guest:test"
+RUNNER_IMAGE="debian:13"
+FILTERS=("$@")
+[ ${#FILTERS[@]} -gt 0 ] || FILTERS=(pod_tests pod_disk_tests pod_volume_tests image_tests::test_image_lifecycle)
+S3_ENV="${FEOS_S3_ENV:-${HOME}/.config/feos/diskd/s3.env}"
+
+log() { printf '[test-pods] %s\n' "$*"; }
+
+for f in target/firecracker/firecracker target/guest/vmlinuz target/guest/initramfs.cpio.zst \
+  target/guest/data.img.zst; do
+  [ -e "${REPO_ROOT}/${f}" ] || { log "missing ${f}"; exit 1; }
+done
+
+log "building diskd for ${TARGET}"
+cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" --release --target "${TARGET}" \
+  -p diskd -p diskctl
+DISKD_BIN="${REPO_ROOT}/target/${TARGET}/release"
+
+# The object store's variables, by name: docker takes their values from
+# here, and nothing prints them.
+S3_VARS=(S3_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_ENDPOINT_URL AWS_REGION)
+if [ -z "${S3_BUCKET:-}" ] && [ -r "${S3_ENV}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${S3_ENV}"
+  set +a
+fi
+S3_ARGS=()
+if [ -n "${S3_BUCKET:-}" ]; then
+  export DISKD_S3_PREFIX="feos-test-pods/$(date -u +%Y%m%dT%H%M%S)-$$/"
+  for var in "${S3_VARS[@]}" DISKD_S3_PREFIX; do S3_ARGS+=(-e "${var}"); done
+  log "hibernating to the object store, under ${DISKD_S3_PREFIX}"
+else
+  log "no object store: the tests skip hibernation"
+fi
+
+# Static binaries run in any container.
+log "building the integration tests for ${TARGET}"
+TEST_BIN=$(cargo test --manifest-path "${REPO_ROOT}/Cargo.toml" -p feos \
+  --test integration_tests --target "${TARGET}" --no-run --message-format=json |
+  python3 -I -c '
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("reason") == "compiler-artifact" and msg["target"]["name"] == "integration_tests" and msg.get("executable"):
+        print(msg["executable"])')
+[ -x "${TEST_BIN}" ] || { log "no test binary"; exit 1; }
+
+# With the registry's anonymous volume.
+cleanup() { docker rm -f -v "${REGISTRY_NAME}" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+cleanup
+docker run -d --name "${REGISTRY_NAME}" -p "127.0.0.1::${REGISTRY_PORT}" \
+  "${REGISTRY_IMAGE}" >/dev/null
+HOST_REGISTRY="$(docker port "${REGISTRY_NAME}" "${REGISTRY_PORT}/tcp" | head -1)"
+log "started a registry on ${HOST_REGISTRY}"
+for _ in $(seq 50); do
+  curl -fsS "http://${HOST_REGISTRY}/v2/" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+"${REPO_ROOT}/hack/guest/push-image" "${HOST_REGISTRY}/${TEST_IMAGE_REF#*/}"
+
+# A worktree's target may be a link to another tree's: that is mounted
+# too, at its own path, so that the link resolves in the container.
+MOUNTS=(-v "${REPO_ROOT}:${REPO_ROOT}:ro")
+TARGET_DIR="$(realpath "${REPO_ROOT}/target")"
+case "${TARGET_DIR}" in
+  "${REPO_ROOT}"/*) ;;
+  *) MOUNTS+=(-v "${TARGET_DIR}:${TARGET_DIR}:ro") ;;
+esac
+
+log "running ${FILTERS[*]}"
+# --init: FeOS takes PID 1 for the init system and sets the machine up.
+# /var/lib/feos is a tmpfs, as when FeOS is the host's PID 1, where the
+# VMs' disks and snapshots live in memory; with device nodes, which the
+# jailer creates in there. The containers' overlay roots could not have their upper layer on
+# the container's own overlayfs either. diskd runs beside the tests, with
+# its state in /var/lib/feos/disk, and sweeps its prefix in the object
+# store at the end, over TLS with the node's CA certificates.
+docker run --rm --privileged --init \
+  --network "container:${REGISTRY_NAME}" \
+  --tmpfs /var/lib/feos:exec,dev \
+  -v /dev:/dev \
+  -v /etc/ssl/certs:/etc/ssl/certs:ro \
+  "${MOUNTS[@]}" \
+  "${S3_ARGS[@]}" \
+  -e DISKD_BIN="${DISKD_BIN}" \
+  -e TEST_IMAGE_REF="${TEST_IMAGE_REF}" \
+  -e PATH="${REPO_ROOT}/target/firecracker:/usr/sbin:/usr/bin:/sbin:/bin" \
+  -e RUST_LOG=info \
+  "${RUNNER_IMAGE}" \
+  sh -c '
+    # Container cgroups go below the root of the cgroup namespace, which
+    # then may hold no processes: move these to a child, as dind does.
+    mkdir /sys/fs/cgroup/init
+    xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || :
+    sed -e "s/ / +/g" -e "s/^/+/" /sys/fs/cgroup/cgroup.controllers \
+      > /sys/fs/cgroup/cgroup.subtree_control
+    state=/var/lib/feos/disk
+    "${DISKD_BIN}/diskd" --state-dir "${state}" >/var/lib/feos/diskd.log 2>&1 &
+    diskd=$!
+    for _ in $(seq 100); do [ -S "${state}/diskd.sock" ] && break; sleep 0.1; done
+    [ -S "${state}/diskd.sock" ] || { echo "diskd did not start:"; cat /var/lib/feos/diskd.log; exit 1; }
+    "$@"
+    status=$?
+    # The devices a failed test left are stopped: a device outlives its
+    # diskd, waiting for the next, which does not come here.
+    ctl="${DISKD_BIN}/diskctl --socket ${state}/diskd.sock"
+    if [ -n "${S3_BUCKET:-}" ]; then
+      $ctl sweep --no-grace >/dev/null || echo "the sweep of ${DISKD_S3_PREFIX} failed"
+    fi
+    for pod in $(ls "${state}/live" 2>/dev/null); do $ctl stop "${pod}" >/dev/null 2>&1; done
+    kill "${diskd}"
+    [ "${status}" = 0 ] || tail -40 /var/lib/feos/diskd.log
+    exit "${status}"' sh "${TEST_BIN}" --nocapture "${FILTERS[@]}"
+log "PASS"

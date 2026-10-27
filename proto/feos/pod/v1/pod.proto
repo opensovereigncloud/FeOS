@@ -1,0 +1,404 @@
+syntax = "proto3";
+
+package feos.pod.v1;
+
+// Pods on a node (ADR 0004): a microVM that runs feos-guest, and the
+// containers in it. A pod's containers, images, tools and watches are
+// reached through feosd with the APIs they have in the guest: a call that
+// carries the metadata "feos-pod-id" goes unchanged to that pod's guest.
+//
+// Every pod has a disk of its own from the node's disk daemon (ADR 0011),
+// which the guest mounts at /var/lib/feos: its images and containers
+// live there, and what the containers write survives a stop, a crash and
+// a hibernation. A pod's disk and memory can go to object storage and
+// come back on any node (ADR 0008). A pod may have volumes too
+// (feos.volume.v1, ADR 0016), which outlive it.
+service PodService {
+  // Creates a pod and brings it up: its microVM boots the newest guest
+  // installed on the node, its volumes are mounted, formatted at their
+  // first boot, and its containers are pulled, created and started in it,
+  // in order. The call returns once the pod is recorded; the pod is
+  // POD_STATE_PENDING until it runs, or POD_STATE_FAILED. A create with
+  // the ID of a pod that exists returns that pod if the spec is the same,
+  // and fails with ALREADY_EXISTS if it is not. A create whose volumes are
+  // not on the node, or attached to another pod, fails with
+  // FAILED_PRECONDITION: a pod claims its volumes, all or none.
+  rpc CreatePod(CreatePodRequest) returns (CreatePodResponse);
+  // Brings a stopped or failed pod up again: a new boot on its disk, where
+  // its containers are adopted with what they wrote, or created from the
+  // spec where they are not there.
+  rpc StartPod(StartPodRequest) returns (StartPodResponse);
+  // Shuts the pod's microVM down; its disk stays. A hibernated pod drops
+  // its memory, and its next start boots on the disk of its checkpoint.
+  rpc StopPod(StopPodRequest) returns (StopPodResponse);
+  // Removes the pod, its microVM and its disk, in whatever state. Its
+  // checkpoints stay in object storage until a sweep finds no head that
+  // names them (feos.disk.v1 Sweep). Its volumes stay, attached to no
+  // pod.
+  rpc DeletePod(DeletePodRequest) returns (DeletePodResponse);
+  rpc GetPod(GetPodRequest) returns (PodInfo);
+  rpc ListPods(ListPodsRequest) returns (ListPodsResponse);
+  // Streams the pods' state changes as they happen.
+  rpc StreamPodEvents(StreamPodEventsRequest) returns (stream PodEvent);
+  // Writes the running pod to a snapshot on the node and ends its
+  // microVM.
+  rpc SuspendPod(SuspendPodRequest) returns (SuspendPodResponse);
+  // Restores a suspended pod, with its containers as they were. A
+  // hibernated pod is restored from its checkpoint, as RestorePod does.
+  // A resume that comes while the pod hibernates abandons the hibernation
+  // (PodInfo.hibernation.abandonable): the hibernation stops at its next
+  // step, its HibernatePod fails with ABORTED, and the pod resumes from its
+  // snapshot on the node. What the hibernation uploaded stays in object
+  // storage, named by no head, and serves the pod's next hibernation. A
+  // hibernation that may not be abandoned (HibernatePodRequest.no_abandon),
+  // one of a pod without memory, or one whose head is being put, the
+  // resume waits for, and restores the pod from its checkpoint.
+  rpc ResumePod(ResumePodRequest) returns (ResumePodResponse);
+  // Takes the pod off the node into object storage: suspends it if it
+  // runs, seals its disk, its volumes and its memory, uploads them with
+  // its spec, and frees what it held on the node: its microVM, its disk,
+  // its volumes' disks and its addresses. The pod is POD_STATE_HIBERNATED
+  // then, a record with its checkpoint, from which ResumePod and
+  // RestorePod bring it back, here or on another node. A stopped or
+  // failed pod hibernates its disk alone. The hibernation runs on its own:
+  // a call that is cancelled, or whose connection goes, leaves it running,
+  // and a HibernatePod that comes while it runs waits for it and gets its
+  // answer. Until its head is being put, a ResumePod abandons it, unless
+  // no_abandon: it fails with ABORTED then, and leaves the pod suspended on
+  // the node for the resume; so does a later HibernatePod with the
+  // request_id of an abandoned hibernation. A hibernation that fails leaves
+  // the pod suspended on the node. Needs diskd with an object store:
+  // without one, the pod stays as it is.
+  rpc HibernatePod(HibernatePodRequest) returns (HibernatePodResponse);
+  // Brings a hibernated pod back from a checkpoint: on this node, or on
+  // one that does not have the pod, which takes its spec from the
+  // checkpoint. Its memory is restored where this node can load the
+  // snapshot (the Firecracker that wrote it is installed, on the same CPU
+  // model and kernel): the pod runs before the call returns, and its
+  // memory arrives while it runs. Elsewhere the pod boots anew on the
+  // checkpoint's disk, with its containers adopted, and is
+  // POD_STATE_PENDING until it runs. The checkpoint's volumes come with
+  // it; the restore fails with FAILED_PRECONDITION before anything changes
+  // when another pod on the node has one of them, or the node has one with
+  // data the checkpoint may not have. The control plane places a pod on
+  // one node at a time: two restores of one checkpoint are two pods.
+  rpc RestorePod(RestorePodRequest) returns (RestorePodResponse);
+  // The serial console of the pod's microVM: the first message names the
+  // pod, the ones after it carry input.
+  rpc StreamPodConsole(stream PodConsoleInput) returns (stream PodConsoleOutput);
+}
+
+message PodSpec {
+  Resources resources = 1;
+  // The containers, created and started in this order. Without any, the
+  // pod's containers are made through its forwarded ContainerService.
+  repeated ContainerSpec containers = 2;
+  PodNetwork network = 3;
+  // The caller's labels, which feosd keeps and returns.
+  map<string, string> labels = 4;
+  // The pod's volumes (feos.volume.v1), at most eight, in the order of the
+  // microVM's drives. They are fixed at its creation, and attached to it
+  // until it is deleted.
+  repeated PodVolume volumes = 5;
+  // What the pod reads from its metadata service at 169.254.169.254
+  // (Firecracker's MMDS, version 2: a session token first), under
+  // "metadata", beside feosd's "feos" with the pod's ID and addresses. No
+  // credentials belong here: anything in the pod can read it (ADR 0014).
+  // Keys are 1 to 128 letters, digits, "-", "_" and "."; keys and values
+  // take 32 KiB at most. A pod without a network has no metadata service,
+  // and no metadata.
+  map<string, string> metadata = 6;
+}
+
+// A volume of a pod, by the name its containers mount it by.
+message PodVolume {
+  // 1 to 63 lowercase letters, digits and "-", beginning and ending with a
+  // letter or a digit, unique in the pod.
+  string name = 1;
+  // The volume, which must be on the node and attached to no other pod.
+  string volume_id = 2;
+}
+
+message Resources {
+  // Defaults to 1.
+  uint32 vcpus = 1;
+  // Defaults to 512.
+  uint64 memory_mib = 2;
+}
+
+message ContainerSpec {
+  // The container's ID in the guest: 1 to 64 characters of letters, digits,
+  // "-", "_" and ".", unique in the pod.
+  string name = 1;
+  // The OCI image, e.g. "docker.io/library/alpine:latest". The guest pulls
+  // it.
+  string image_ref = 2;
+  // The command; the image's when empty.
+  repeated string command = 3;
+  map<string, string> env = 4;
+  // The pod's volumes the container mounts.
+  repeated VolumeMount volume_mounts = 5;
+}
+
+message VolumeMount {
+  // A name of PodSpec.volumes.
+  string volume = 1;
+  // Where the container sees it: an absolute path other than "/", once in
+  // the container.
+  string path = 2;
+  // The container cannot write to it.
+  bool read_only = 3;
+}
+
+// Every pod has a network (ADR 0010): an IPv6 address of the node's pod
+// prefix and a link-local IPv4 address for leaving, on a TAP device of
+// its own, DNS through feosd's resolver, and what it may reach decided by
+// its security groups (ADR 0012).
+message PodNetwork {
+  // A TAP device and an address the caller chose: feosd makes both now.
+  reserved 1 to 5;
+  reserved "tap_name", "mac_address", "ipv4_cidr", "gateway", "dns";
+  // No network at all: the pod can pull no image then.
+  bool none = 6;
+  // The pod's security groups (feos.network.v1.SecurityGroupService), which
+  // feosd must have before the pod starts. Without any, feosd's default
+  // group applies: out to the internet, nothing in.
+  repeated string security_groups = 7;
+  // The resolvers feosd's resolver asks for the pod, as IP addresses; the
+  // node's (feosd --dns-upstream) when empty.
+  repeated string dns_upstreams = 8;
+  // The name tables (feos.network.v1.NameService) whose names feosd's
+  // resolver answers the pod, in this order, before it asks upstream; feosd
+  // must have them before the pod starts.
+  repeated string name_tables = 9;
+}
+
+enum PodState {
+  POD_STATE_UNSPECIFIED = 0;
+  // Recorded; the microVM boots, or the containers are being pulled,
+  // created and started.
+  POD_STATE_PENDING = 1;
+  // Its containers were started.
+  POD_STATE_RUNNING = 2;
+  // Its microVM is shut down.
+  POD_STATE_STOPPED = 3;
+  // In a snapshot on the node.
+  POD_STATE_SUSPENDED = 4;
+  // Bringing it up failed, or its microVM crashed: PodInfo.reason says why.
+  // Its disk stays, and a start boots on it.
+  POD_STATE_FAILED = 5;
+  // In object storage, its checkpoint (PodInfo.checkpoint): nothing of it
+  // is on the node but its record.
+  POD_STATE_HIBERNATED = 6;
+}
+
+message PodInfo {
+  string pod_id = 1;
+  PodSpec spec = 2;
+  PodState state = 3;
+  // Why the pod is in its state, if it is not POD_STATE_RUNNING.
+  string reason = 4;
+  // The containers as the guest reports them; empty unless the pod runs.
+  repeated ContainerStatus containers = 5;
+  // The pod's microVM; unset unless it runs.
+  MicroVm microvm = 6;
+  // The pod's IPv4 address on the node, of feosd --pod-ipv4-range
+  // (169.254.16.0/20), for leaving only; empty without a network.
+  string ipv4_address = 7;
+  // The pod's IPv6 address, of the node's pod prefix, while it is on the
+  // node; empty without a network.
+  string ipv6_address = 8;
+  // The checkpoint the pod hibernated to last, or was restored from. A
+  // pod that runs from one reads layers of it, so a sweep of the object
+  // store keeps the heads of every pod's checkpoint.
+  Checkpoint checkpoint = 9;
+  // The hibernation in flight (HibernatePod), until it ends; unset
+  // otherwise.
+  Hibernation hibernation = 10;
+}
+
+// A hibernation in flight.
+message Hibernation {
+  HibernationPhase phase = 1;
+  // A ResumePod abandons it now: no HibernatePod set no_abandon, the
+  // pod's memory goes with it, and its head is not being put yet.
+  bool abandonable = 2;
+  // The epoch of the checkpoint it writes; 0 until it is chosen.
+  uint64 epoch = 3;
+  // The request_id of each HibernatePod that started or joined it.
+  repeated string request_ids = 4;
+}
+
+enum HibernationPhase {
+  HIBERNATION_PHASE_UNSPECIFIED = 0;
+  // Waiting for the pod's lock, behind another call or a bring-up.
+  HIBERNATION_PHASE_WAITING = 1;
+  // The running pod is written to a snapshot.
+  HIBERNATION_PHASE_SUSPENDING = 2;
+  // Its disk is sealed on the node.
+  HIBERNATION_PHASE_SEALING = 3;
+  // Its disk's layers go to the object store.
+  HIBERNATION_PHASE_UPLOADING_DISK = 4;
+  // Its volumes are sealed and uploaded.
+  HIBERNATION_PHASE_VOLUMES = 5;
+  // Its memory, vmstate and spec go to the object store.
+  HIBERNATION_PHASE_UPLOADING_MEMORY = 6;
+  // Its volumes' heads and its head are being put: from here on the
+  // checkpoint is the pod.
+  HIBERNATION_PHASE_HEAD = 7;
+  // It leaves the node.
+  HIBERNATION_PHASE_LEAVING = 8;
+}
+
+// A pod in object storage, as HibernatePod wrote it.
+message Checkpoint {
+  // The S3 key of its head, snapshots/<pod>/<epoch>/head.json: what a
+  // restore on any node takes.
+  string head_key = 1;
+  // Grows with every hibernation of the pod; the seconds since 1970 when
+  // it was written, or one more than the last.
+  uint64 epoch = 2;
+  // Whether it holds the pod's memory, or its disk alone.
+  bool memory = 3;
+}
+
+message MicroVm {
+  // Firecracker's process.
+  int64 pid = 1;
+  // feos-guest's version, as the guest reports it.
+  string guest_version = 2;
+  // Whether the guest holds its uplink open.
+  bool guest_attached = 3;
+}
+
+message ContainerStatus {
+  string name = 1;
+  ContainerState state = 2;
+  // Set once the container's process exited.
+  optional int32 exit_code = 3;
+}
+
+enum ContainerState {
+  CONTAINER_STATE_UNSPECIFIED = 0;
+  CONTAINER_STATE_CREATING = 1;
+  CONTAINER_STATE_CREATED = 2;
+  CONTAINER_STATE_RUNNING = 3;
+  CONTAINER_STATE_EXITED = 4;
+}
+
+message CreatePodRequest {
+  // The pod's ID, chosen by the caller, so that a create delivered twice
+  // finds the pod it made: 11 characters of lowercase Crockford base32, a
+  // letter first, which also name its TAP device, or a UUID, as pods made
+  // before ADR 0019 have.
+  string pod_id = 1;
+  PodSpec spec = 2;
+}
+
+message CreatePodResponse {
+  PodInfo pod = 1;
+}
+
+message StartPodRequest {
+  string pod_id = 1;
+}
+
+message StartPodResponse {}
+
+message StopPodRequest {
+  string pod_id = 1;
+}
+
+message StopPodResponse {}
+
+message DeletePodRequest {
+  string pod_id = 1;
+}
+
+message DeletePodResponse {}
+
+message GetPodRequest {
+  string pod_id = 1;
+}
+
+message ListPodsRequest {}
+
+message ListPodsResponse {
+  repeated PodInfo pods = 1;
+}
+
+message StreamPodEventsRequest {
+  // Only this pod's events; all pods' when empty.
+  string pod_id = 1;
+}
+
+message PodEvent {
+  string pod_id = 1;
+  PodState state = 2;
+  string reason = 3;
+  // The pod was deleted; state and reason are its last.
+  bool deleted = 4;
+}
+
+message SuspendPodRequest {
+  string pod_id = 1;
+}
+
+message SuspendPodResponse {
+  // The size of the snapshot's memory.
+  uint64 memory_bytes = 1;
+}
+
+message ResumePodRequest {
+  string pod_id = 1;
+}
+
+message ResumePodResponse {}
+
+message HibernatePodRequest {
+  string pod_id = 1;
+  // A ResumePod never abandons this hibernation: the control plane takes
+  // the pod off a node it empties. A HibernatePod that joins a hibernation
+  // in flight with it set makes that one so, too.
+  bool no_abandon = 2;
+  // Who asks; the control plane sends its op's id. A HibernatePod that
+  // starts or joins a hibernation adds it to Hibernation.request_ids. One
+  // whose request_id an abandoned hibernation of the pod had fails with
+  // ABORTED and starts nothing.
+  string request_id = 3;
+}
+
+message HibernatePodResponse {
+  Checkpoint checkpoint = 1;
+  // What it holds: the bytes of data in its memory layer and in the
+  // pod's own layer of its disk.
+  uint64 memory_bytes = 2;
+  uint64 disk_bytes = 3;
+}
+
+message RestorePodRequest {
+  string pod_id = 1;
+  // The S3 key of the checkpoint's head; the pod's own checkpoint when
+  // empty, which a node that does not have the pod does not know.
+  string head_key = 2;
+  // Boot the pod anew on its disk even where its memory could be
+  // restored.
+  bool cold = 3;
+}
+
+message RestorePodResponse {
+  PodInfo pod = 1;
+  // Whether its memory was restored; if not, why it boots anew.
+  bool memory_restored = 2;
+  string reason = 3;
+}
+
+message PodConsoleInput {
+  // The first message's: the pod.
+  string pod_id = 1;
+  bytes input = 2;
+}
+
+message PodConsoleOutput {
+  bytes output = 1;
+}

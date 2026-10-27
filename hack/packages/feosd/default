@@ -1,0 +1,71 @@
+# Arguments of feosd (feosd.service). For example, to serve the API on TCP
+# too, without authentication, for a lab:
+#
+#   FEOSD_ARGS="--tcp [::]:1337"
+#
+# Pods have an IPv6 address on the network and an IPv4 address for
+# leaving this node through masquerade (ADR 0010). feosd needs the prefix
+# that the network routes to this node to give pods a network, or, with a
+# control plane, a /64 of its cluster's mesh (ADR 0017); without either,
+# pods with a network fail:
+#
+#   --pod-prefix PREFIX       e.g. 2001:db8:7:1::/64. A /64 is best, a
+#                             smaller one such as a /80 is enough. A lab
+#                             whose network routes nothing to the node takes
+#                             a ULA, such as fd00:fe05:1::/64: its pods leave
+#                             over IPv4 alone, and nothing outside the node
+#                             reaches them.
+#   --pod-ipv4-range PREFIX   the pods' IPv4 addresses, a /32 each,
+#                             169.254.16.0/20 by default.
+#   --dns-address ADDRESS     the pods' resolver, an IPv4 address this node
+#                             holds, 169.254.0.53 by default. The pods'
+#                             gateway is 169.254.0.1, which the node answers
+#                             ARP for on their TAP devices and never holds.
+#                             feosd.socket holds the resolver's sockets
+#                             across restarts of feosd: another address
+#                             needs a drop-in for it too, as the unit says.
+#   --dns-upstream ADDRESS    a resolver it asks for pods that name none
+#                             (repeatable); Google's and Cloudflare's by
+#                             default.
+#   --deny-prefix PREFIX      a prefix of either family that no pod reaches
+#                             (repeatable): the control plane, management
+#                             networks. Link-local addresses, such as a
+#                             cloud's metadata service, and this node's own
+#                             are denied always.
+#
+# A lab:
+#
+#   FEOSD_ARGS="--pod-prefix fd00:fe05:1::/64 --deny-prefix 10.0.0.0/8"
+#
+# With a control plane (ADR 0015), feosd joins it once with a join token
+# from its operator and then connects to every instance of it. Without
+# --control-plane, the node is on its own.
+#
+#   --control-plane HOST:PORT   the control plane's port for nodes, which
+#                               the join dials, e.g. 10.43.0.17:7443.
+#   --control-plane-name NAME   the DNS name of the control plane's
+#                               certificate, checked wherever feosd dials;
+#                               HOST by default, needed when HOST is an
+#                               address.
+#   --trust-domain NAME         the control plane's SPIFFE trust domain,
+#                               feos.local by default.
+#   --join-token-file PATH      the join token, feos-join-<secret>.<pin>,
+#                               readable by root alone; /etc/feos/join-token
+#                               by default. It is read until the node has
+#                               joined, and again when the control plane
+#                               removed the node.
+#   --node-dir PATH             the node's key, certificate and trust
+#                               bundle, /var/lib/feos/node by default.
+#
+# A node with a control plane and without --pod-prefix is on its cluster's
+# mesh: the control plane gives it a /64 of the cluster's ULA, and a
+# WireGuard device, feos-mesh, carries its pods' IPv6 to the other nodes'.
+# The nodes reach each other on UDP port 51820.
+#
+#   --mesh-port PORT            the device's UDP port, 51820 by default.
+#   --mesh-address ADDRESS      where the other nodes reach this node; the
+#                               address from which it reaches the control
+#                               plane by default.
+#
+#   FEOSD_ARGS="--control-plane 10.43.0.17:7443 --control-plane-name ferun.example.com --trust-domain run.example.com"
+FEOSD_ARGS=""

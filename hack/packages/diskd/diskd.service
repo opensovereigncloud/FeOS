@@ -1,0 +1,34 @@
+[Unit]
+Description=FeOS disk daemon: pods' disks and memory over a chunk store
+Documentation=https://github.com/gardenlinux/FeOS
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+# feosd's pods need their disks.
+Before=feosd.service
+
+[Service]
+# Active once it serves, its devices recovered.
+Type=notify
+EnvironmentFile=-/etc/default/diskd
+ExecStart=/usr/sbin/diskd --state-dir /var/lib/feos/disk $DISKD_ARGS
+Restart=always
+RestartSec=1
+# The pods' disks outlive diskd: while it is down, their I/O waits, and
+# the next diskd takes the devices over. A restart or an upgrade is no
+# stop for them. The memory diskd serves pods restored from object storage
+# does not outlive it: their guests wait until they are stopped.
+KillMode=process
+# /var/lib/feos/disk: the chunk cache, the layers and the pods' tops,
+# which hold what pods wrote and is nowhere else. It stays when diskd
+# stops. It belongs on a filesystem of its own, preferably XFS.
+StateDirectory=feos/disk
+StateDirectoryMode=0700
+# Every device locks its I/O buffers in memory.
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+TasksMax=infinity
+# While diskd is down, every pod's disk waits.
+OOMScoreAdjust=-900
+
+[Install]
+WantedBy=multi-user.target

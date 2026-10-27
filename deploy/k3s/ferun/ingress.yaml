@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# https://run.<DOMAIN>: ferund's front doors through traefik, the
+# certificate from cert-manager. The nodes' port never goes through here.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ferun-tls
+  namespace: ferun
+spec:
+  secretName: ferun-tls
+  dnsNames:
+    - run.${DOMAIN}
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ferund
+  namespace: ferun
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: run.${DOMAIN}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ferund
+                port:
+                  number: 8100
+  tls:
+    - hosts:
+        - run.${DOMAIN}
+      secretName: ferun-tls

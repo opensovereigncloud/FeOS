@@ -1,0 +1,166 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# FeOS on k3s nodes (deploy/k3s/README.md): a DaemonSet that installs
+# feosd, diskd and the rest from the image's packages on every node
+# labelled feos.fecode.dev/node=true, and has systemd run them. feosd dials
+# ferund itself (ADR 0015); nothing here listens. The ${...} are the
+# deployment's parameters (config.env.example), which make fills in:
+#
+#   make -C deploy/k3s apply-feos
+#   kubectl -n feos create secret generic diskd-s3 --from-env-file=<s3.env>
+#   kubectl -n feos create secret generic feosd-join \
+#     --from-literal=<node>=feos-join-…   (one key per node, ferund join-token)
+#   kubectl label node <node> feos.fecode.dev/node=true
+#
+# Removing the DaemonSet leaves FeOS installed and running on the nodes:
+# `apt-get remove feosd diskd` there, after deleting the pods.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: feos
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feos-node
+  namespace: feos
+data:
+  # What pods may not reach: RFC 1918, which holds k3s's pods and
+  # services (10.42/16, 10.43/16), and CGNAT. Add the nodes' network if it
+  # is elsewhere.
+  DENY_PREFIXES: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
+  # The chunk cache, 16 GiB. A hibernation puts its disk's 64 KiB chunks
+  # one by one, and an object store such as R2 answers about 6 PUTs a
+  # second per stream: 16 streams (the default) take over ten minutes for
+  # a pod with a 2 GB image.
+  DISKD_ARGS: "--budget-bytes 17179869184 --s3-concurrency 64"
+  # ferund's nodes' port: the fixed ClusterIP of service ferund-nodes
+  # (deploy/k3s/ferun), which the hosts reach without the cluster's DNS,
+  # and the name its certificate carries. Empty: no control plane.
+  CONTROL_PLANE: "${FERUN_NODES_IP}:7443"
+  CONTROL_PLANE_NAME: "ferun.run.${DOMAIN}"
+  TRUST_DOMAIN: "run.${DOMAIN}"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: feos-node
+  namespace: feos
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: feos-node
+  template:
+    metadata:
+      labels:
+        app: feos-node
+    spec:
+      nodeSelector:
+        feos.fecode.dev/node: "true"
+      # The control-plane node runs pods too.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      imagePullSecrets:
+        - name: oci-pull
+      initContainers:
+        - name: install
+          image: ${REGISTRY}/feos-node:dev
+          imagePullPolicy: Always
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          envFrom:
+            - configMapRef:
+                name: feos-node
+            - secretRef:
+                name: diskd-s3
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: cache
+              mountPath: /host/var/cache/feos-k3s
+            - name: etc-default
+              mountPath: /host/etc/default
+            - name: etc-feos
+              mountPath: /host/etc/feos
+            - name: join
+              mountPath: /join
+              readOnly: true
+      containers:
+        # The services' journal, for kubectl logs; it is ready while both
+        # run.
+        - name: journal
+          image: ${REGISTRY}/feos-node:dev
+          imagePullPolicy: Always
+          command:
+            - nsenter
+            - -t
+            - "1"
+            - -m
+            - -u
+            - -i
+            - -n
+            - -p
+            - --
+            - journalctl
+            - -f
+            - -n
+            - "100"
+            - -o
+            - short-iso
+            - -u
+            - diskd.service
+            - -u
+            - feosd.service
+          securityContext:
+            privileged: true
+          readinessProbe:
+            exec:
+              command:
+                - nsenter
+                - -t
+                - "1"
+                - -m
+                - --
+                - systemctl
+                - is-active
+                - --quiet
+                - diskd.service
+                - feosd.service
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 5m, memory: 16Mi }
+            limits: { memory: 64Mi }
+      volumes:
+        - name: cache
+          hostPath:
+            path: /var/cache/feos-k3s
+            type: DirectoryOrCreate
+        - name: etc-default
+          hostPath:
+            path: /etc/default
+            type: Directory
+        - name: etc-feos
+          hostPath:
+            path: /etc/feos
+            type: DirectoryOrCreate
+        - name: join
+          secret:
+            secretName: feosd-join
+            optional: true
+            defaultMode: 0400

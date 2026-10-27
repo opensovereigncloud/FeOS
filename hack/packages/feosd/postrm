@@ -1,0 +1,10 @@
+#!/bin/sh
+# A purge removes the unit's enablement; /var/lib/feos stays even then: it
+# holds the VMs' disks.
+set -e
+if [ "$1" = purge ]; then
+    rm -f /etc/systemd/system/multi-user.target.wants/feosd.service
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi

@@ -1,0 +1,93 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/incidents",
+  "query": {},
+  "status": 200,
+  "request": null,
+  "response": {
+    "incidents": [
+      {
+        "id": "13",
+        "object": "addon/postgres",
+        "release": 8,
+        "condition": "rollout_failed",
+        "openedAt": "2026-10-18T15:30:02Z",
+        "closedAt": "2026-10-18T15:41:10Z",
+        "summary": "release 8 did not roll out within 10m0s: addon postgres is not ready",
+        "evidence": {
+          "diff": [
+            {
+              "kind": "addon",
+              "name": "postgres",
+              "change": "update",
+              "fields": [
+                {
+                  "path": "plan",
+                  "from": "small",
+                  "to": "medium"
+                }
+              ],
+              "effect": "replaces 1 pod"
+            }
+          ],
+          "pending": [
+            "addon postgres is not ready",
+            "service expense-service waits for the addons",
+            "addon/postgres replica 0: provisioning step provision exited 1: psql: FATAL:  password authentication failed for user \"postgres\""
+          ]
+        }
+      },
+      {
+        "id": "12",
+        "object": "service/expense-service",
+        "release": 7,
+        "condition": "crash_loop",
+        "openedAt": "2026-10-18T14:07:15Z",
+        "closedAt": "",
+        "summary": "expense-service (release 7) exited 3 times within 10 minutes, last with code 1",
+        "evidence": {
+          "exits": [
+            {
+              "at": "2026-10-18T14:05:01Z",
+              "code": 1
+            },
+            {
+              "at": "2026-10-18T14:05:04Z",
+              "code": 1
+            },
+            {
+              "at": "2026-10-18T14:07:12Z",
+              "code": 1
+            }
+          ],
+          "logTail": [
+            "2026/10/18 14:07:11 expense-service 1.4 starting on [::]:8080",
+            "2026/10/18 14:07:11 connect to nats: nats: authorization violation",
+            "2026/10/18 14:07:12 exit status 1"
+          ]
+        }
+      },
+      {
+        "id": "9",
+        "object": "job/migrate",
+        "release": 4,
+        "condition": "job_failed",
+        "openedAt": "2026-10-14T10:00:40Z",
+        "closedAt": "2026-10-15T08:01:30Z",
+        "summary": "job migrate failed its last attempt (2 of 2) with code 2",
+        "evidence": {
+          "exits": [
+            {
+              "at": "2026-10-14T10:00:39Z",
+              "code": 2
+            }
+          ],
+          "logTail": [
+            "migrate: 0007_receipts.sql: relation \"receipt\" already exists"
+          ]
+        }
+      }
+    ]
+  },
+  "note": "newest first"
+}

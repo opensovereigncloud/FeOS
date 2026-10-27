@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Builds with the repository's root as their context (go/Dockerfile) send
+# neither the build outputs nor the UI's dependencies nor the history.
+target/
+web/node_modules/
+.git/

@@ -1,0 +1,80 @@
+#!/bin/bash
+# Install ferund's package (make ferund-package) on Debian 13 and check
+# what it leaves on the machine through its life: the user ferun, the unit
+# neither enabled nor started, and the group ferun on /etc/ferun/ca and
+# /etc/ferun/ferund.env after a first install, a removal and a new
+# install, an upgrade that brings a new ferund.env, and a purge, which
+# keeps an issuer's directory that is not empty.
+#
+#   hack/packages/test-ferund-package
+#
+# FERUND_PACKAGES_DIR names another directory that holds the package.
+# Needs docker; the container runs no systemd, as a package's scripts
+# meet it while an image is built.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+PACKAGES_DIR="${FERUND_PACKAGES_DIR:-${REPO_ROOT}/target/packages/ferund}"
+IMAGE="feos-test-ferund-package"
+
+log() { printf '[test-ferund-package] %s\n' "$*"; }
+
+shopt -s nullglob
+debs=("${PACKAGES_DIR}"/ferund_*.deb)
+[ ${#debs[@]} -eq 1 ] || { log "no single ferund package; run make ferund-package"; exit 1; }
+
+log "building ${IMAGE}: Debian 13 with systemd's tools"
+docker build -q -t "${IMAGE}" - >/dev/null <<'EOF'
+FROM debian:13
+RUN apt-get update && apt-get install -y --no-install-recommends systemd ca-certificates && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+EOF
+
+log "installing $(basename "${debs[0]}")"
+docker run --rm -i -v "${debs[0]}:/ferund.deb:ro" "${IMAGE}" bash -s <<'EOF'
+set -euo pipefail
+log() { printf '[test-ferund-package] %s\n' "$*"; }
+fail() { log "FAIL: $*"; exit 1; }
+# owned <step>: the issuer's directory, and the configuration when the
+# package holds it, belong to root and the group ferun.
+owned() {
+  [ "$(stat -c '%U:%G %a' /etc/ferun/ca)" = "root:ferun 750" ] ||
+    fail "$1: /etc/ferun/ca is $(stat -c '%U:%G %a' /etc/ferun/ca)"
+  [ "$(stat -c '%U:%G %a' /etc/ferun/ferund.env)" = "root:ferun 640" ] ||
+    fail "$1: /etc/ferun/ferund.env is $(stat -c '%U:%G %a' /etc/ferun/ferund.env)"
+  log "ok: $1"
+}
+
+# A later version whose ferund.env differs, as an upgrade brings it.
+dpkg-deb -R /ferund.deb /tmp/next
+sed -i 's/^Version: .*/&+next/' /tmp/next/DEBIAN/control
+echo '# next' >>/tmp/next/etc/ferun/ferund.env
+dpkg-deb -b /tmp/next /tmp/next.deb >/dev/null
+
+dpkg -i /ferund.deb >/dev/null
+getent passwd ferun >/dev/null || fail "no user ferun"
+[ -x /usr/bin/ferund ] || fail "no /usr/bin/ferund"
+/usr/bin/ferund serve --help >/dev/null 2>&1 || fail "ferund does not run"
+[ ! -e /etc/systemd/system/multi-user.target.wants/ferund.service ] ||
+  fail "the first install enabled the unit"
+owned "a first install"
+
+# A removal keeps the configuration and removes the empty directory; the
+# new install makes it again.
+dpkg -r ferund >/dev/null
+[ ! -e /etc/ferun/ca ] || fail "a removal kept the empty /etc/ferun/ca"
+dpkg -i /ferund.deb >/dev/null
+owned "a new install after a removal"
+
+dpkg --force-confnew -i /tmp/next.deb >/dev/null
+grep -q '^# next' /etc/ferun/ferund.env || fail "the upgrade did not bring its ferund.env"
+owned "an upgrade with a new ferund.env"
+
+touch /etc/ferun/ca/issuer.key
+dpkg -P ferund >/dev/null 2>&1
+[ -d /etc/ferun/ca ] || fail "a purge removed the issuer's directory"
+[ ! -e /etc/ferun/ferund.env ] || fail "a purge kept ferund.env"
+! dpkg-statoverride --list | grep -q /etc/ferun/ || fail "a purge kept the statoverrides"
+log "ok: a purge"
+EOF
+log "PASS"

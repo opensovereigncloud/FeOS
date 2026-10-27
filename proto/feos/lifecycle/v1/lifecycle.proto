@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package feos.lifecycle.v1;
+
+// LifecycleService is the one API that goes from guest to host. FeOS in the
+// guest profile dials its host (vsock CID 2, port 10001); the VMM forwards
+// the connection to the host, where FeOS's VM service serves this service.
+//
+// It answers one question: when is a freshly booted guest able to serve?
+// Only the guest knows when its listeners are up, so the guest announces it
+// instead of the host polling. Holding the call open makes a guest that dies
+// without being paused observable: the call ends.
+//
+// It does not detect a resume. On a resume the host is the side that knows,
+// and the guest's listeners come back with the snapshot, so the host calls
+// the guest directly.
+service LifecycleService {
+  // Called by the guest once per boot segment and held open for its
+  // lifetime. The host accepting the call is the guest's readiness; the
+  // call ending means the guest or its VMM is gone.
+  //
+  // The response stream carries nothing; it exists so the call can be held
+  // open.
+  rpc Attach(Hello) returns (stream HostMessage);
+}
+
+// Hello is the guest's announcement.
+message Hello {
+  enum Reason {
+    // First attach after a cold boot.
+    BOOT = 0;
+    // The previous attach was lost: a snapshot resume reset the vsock
+    // transport, or the host's VM service restarted.
+    RECONNECT = 1;
+  }
+  Reason reason = 1;
+  // /proc/sys/kernel/random/boot_id. It survives pause and resume, so it
+  // tells a resumed guest from a rebooted one.
+  string boot_id = 2;
+  // Counts attaches within one boot: 0 is the boot attach; every resume and
+  // every restart of the host's VM service adds one.
+  uint64 attach_seq = 3;
+  // FeOS version of the guest.
+  string feos_version = 4;
+}
+
+// HostMessage is empty: the host pushes nothing over this call. Guest
+// configuration travels host to guest over the regular API.
+message HostMessage {}

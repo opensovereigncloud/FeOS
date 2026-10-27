@@ -1,0 +1,31 @@
+[package]
+name = "host-service"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-utils = { workspace = true }
+feos-proto = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+nix = { workspace = true , features = ["hostname", "reboot", "mman", "time", "ioctl"] }
+log = { workspace = true }
+prost-types = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+
+rtnetlink = { workspace = true }
+futures = { workspace = true }
+
+reqwest = { workspace = true }
+
+[features]
+# A Firecracker guest, which cannot be powered off: shutting down reboots,
+# which ends the VM.
+guest = []

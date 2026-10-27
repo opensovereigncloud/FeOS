@@ -1,0 +1,371 @@
+syntax = "proto3";
+
+package feos.network.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// The security groups of the node's pods (ADR 0012). The control plane
+// owns the groups and sends each node the groups of its pods, and every
+// group their rules name as a peer: whole, or as a delta of members from
+// one version to the next. feosd keeps them on disk and enforces them with
+// nftables.
+service SecurityGroupService {
+  // Puts a group whole: its rules, members and version. It replaces the
+  // group feosd has, whatever its version.
+  rpc PutSecurityGroup(PutSecurityGroupRequest) returns (PutSecurityGroupResponse);
+  // Adds and removes members of a group, from one version to the next.
+  // Fails with FAILED_PRECONDITION unless feosd has the group at
+  // from_version: the control plane then puts the group whole.
+  rpc UpdateSecurityGroup(UpdateSecurityGroupRequest) returns (UpdateSecurityGroupResponse);
+  // Removes a group. Fails with FAILED_PRECONDITION while a pod on the
+  // node names it.
+  rpc DeleteSecurityGroup(DeleteSecurityGroupRequest) returns (DeleteSecurityGroupResponse);
+  rpc GetSecurityGroup(GetSecurityGroupRequest) returns (SecurityGroup);
+  // The groups feosd has, with their versions.
+  rpc ListSecurityGroups(ListSecurityGroupsRequest) returns (ListSecurityGroupsResponse);
+}
+
+// The node's place on its cluster's mesh (ADR 0017): a WireGuard device
+// whose peers are the other nodes, each with its /64 of the cluster's ULA
+// as the one prefix allowed for it. The control plane sends every node the
+// others as its peers: whole, or as a delta from one version to the next.
+// feosd keeps them on disk.
+service MeshService {
+  // Puts the peers whole, at a version. It replaces the peers feosd has,
+  // whatever their version. Fails with FAILED_PRECONDITION on a node that
+  // is not on a mesh.
+  rpc PutMeshPeers(PutMeshPeersRequest) returns (PutMeshPeersResponse);
+  // Adds, changes and removes peers, from one version to the next. Fails
+  // with FAILED_PRECONDITION unless feosd has the peers at from_version:
+  // the control plane then puts them whole.
+  rpc UpdateMeshPeers(UpdateMeshPeersRequest) returns (UpdateMeshPeersResponse);
+  // The node's mesh: its prefixes, its key and port, and its peers.
+  rpc GetMesh(GetMeshRequest) returns (Mesh);
+}
+
+// The names of the node's pods (ADR 0010, ADR 0018): tables of names and
+// their addresses, from which feosd's resolver answers the pods whose
+// network names a table (PodNetwork.name_tables). The control plane owns
+// the tables and sends each node the tables of its pods, and every table
+// they include: whole, or as a delta of entries from one version to the
+// next. feosd keeps them on disk.
+service NameService {
+  // Puts a table whole: its entries, includes and version. It replaces the
+  // table feosd has, whatever its version.
+  rpc PutNameTable(PutNameTableRequest) returns (PutNameTableResponse);
+  // Puts and removes entries of a table, from one version to the next.
+  // Fails with FAILED_PRECONDITION unless feosd has the table at
+  // from_version: the control plane then puts the table whole.
+  rpc UpdateNameTable(UpdateNameTableRequest) returns (UpdateNameTableResponse);
+  // Removes a table. Fails with FAILED_PRECONDITION while a pod on the
+  // node names it.
+  rpc DeleteNameTable(DeleteNameTableRequest) returns (DeleteNameTableResponse);
+  rpc GetNameTable(GetNameTableRequest) returns (NameTable);
+  // The tables feosd has, with their entries and versions.
+  rpc ListNameTables(ListNameTablesRequest) returns (ListNameTablesResponse);
+}
+
+// What the node's pods did on the network (ADR 0013): flows, drops, DNS
+// queries and server names, as feosd records them.
+service TrafficService {
+  // Streams records as feosd makes them, from the call on. Records a slow
+  // reader misses are counted in TrafficRecord.missed of the next one.
+  rpc StreamTrafficRecords(StreamTrafficRecordsRequest) returns (stream TrafficRecord);
+}
+
+message SecurityGroup {
+  // 1 to 64 characters of letters, digits, "-", "_" and ".".
+  string id = 1;
+  // Counts up with every change of the group's rules or members.
+  uint64 version = 2;
+  // Rules only allow, and have no order.
+  repeated Rule rules = 3;
+  // The IPv6 addresses of the group's pods, on every node.
+  repeated string members = 4;
+}
+
+message Rule {
+  Direction direction = 1;
+  Protocol protocol = 2;
+  // Ports of TCP and UDP; empty means every port.
+  repeated PortRange ports = 3;
+  // Whom the rule allows: the far end of a connection.
+  oneof peer {
+    AddressBlock block = 4;
+    // The ID of a security group: its members.
+    string group = 5;
+  }
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  // What reaches the pod.
+  DIRECTION_INGRESS = 1;
+  // What the pod sends.
+  DIRECTION_EGRESS = 2;
+}
+
+enum Protocol {
+  // Any protocol.
+  PROTOCOL_ANY = 0;
+  PROTOCOL_TCP = 1;
+  PROTOCOL_UDP = 2;
+  PROTOCOL_ICMPV6 = 3;
+  // ICMP of IPv4.
+  PROTOCOL_ICMP = 4;
+}
+
+message PortRange {
+  uint32 first = 1;
+  // The last port of the range; 0 means first alone.
+  uint32 last = 2;
+}
+
+// A prefix of either family, without the prefixes in except. Pods' IPv4
+// is for leaving only (ADR 0010): an IPv4 block matters in egress rules.
+message AddressBlock {
+  // E.g. "::/0", "2001:db8::/32", "0.0.0.0/0".
+  string cidr = 1;
+  // Prefixes inside cidr, of the same family.
+  repeated string except = 2;
+}
+
+message PutSecurityGroupRequest {
+  SecurityGroup group = 1;
+}
+
+message PutSecurityGroupResponse {}
+
+message UpdateSecurityGroupRequest {
+  string id = 1;
+  // The version feosd must have.
+  uint64 from_version = 2;
+  // The version after this change.
+  uint64 version = 3;
+  repeated string add_members = 4;
+  repeated string remove_members = 5;
+}
+
+message UpdateSecurityGroupResponse {}
+
+message DeleteSecurityGroupRequest {
+  string id = 1;
+}
+
+message DeleteSecurityGroupResponse {}
+
+message GetSecurityGroupRequest {
+  string id = 1;
+}
+
+message ListSecurityGroupsRequest {}
+
+message ListSecurityGroupsResponse {
+  repeated SecurityGroup groups = 1;
+}
+
+// Names and their addresses. A pod whose network names the table gets
+// them from feosd's resolver: a query for a name of one label, in any
+// case, that the pod's tables hold is answered from them, and never asked
+// upstream.
+message NameTable {
+  // 1 to 64 characters of letters, digits, "-", "_" and ".".
+  string id = 1;
+  // Changes with every change of the table; the control plane chooses it
+  // (ferund: a hash of the content). A delta names the version it starts
+  // from and the one it makes.
+  uint64 version = 2;
+  // The table's names, each once.
+  repeated NameEntry entries = 3;
+  // Tables whose names the pods that name this one resolve too, after this
+  // one's own and in this order, as a rule names a peer group: by ID. Their
+  // includes are not followed. One the node does not have holds no names.
+  repeated string includes = 4;
+}
+
+message NameEntry {
+  // One label of a DNS name: 1 to 63 letters, digits and "-", "-" neither
+  // first nor last. Kept in lower case; a query matches it in any case.
+  string name = 1;
+  // At least one: IPv6 addresses answer AAAA queries, IPv4 addresses A
+  // queries.
+  repeated string addresses = 2;
+}
+
+message PutNameTableRequest {
+  NameTable table = 1;
+}
+
+message PutNameTableResponse {}
+
+message UpdateNameTableRequest {
+  string id = 1;
+  // The version feosd must have.
+  uint64 from_version = 2;
+  // The version after this change; not from_version.
+  uint64 version = 3;
+  // Entries that are new or changed, by name: an entry replaces the
+  // addresses the name had.
+  repeated NameEntry put_entries = 4;
+  // The names that go.
+  repeated string remove_names = 5;
+}
+
+message UpdateNameTableResponse {}
+
+message DeleteNameTableRequest {
+  string id = 1;
+}
+
+message DeleteNameTableResponse {}
+
+message GetNameTableRequest {
+  string id = 1;
+}
+
+message ListNameTablesRequest {}
+
+message ListNameTablesResponse {
+  repeated NameTable tables = 1;
+}
+
+message Mesh {
+  // The cluster's ULA, a /48; empty on a node that is not on a mesh.
+  string pod_network = 1;
+  // The node's /64 of it.
+  string pod_prefix = 2;
+  // The node's WireGuard public key, 32 bytes.
+  bytes public_key = 3;
+  // The UDP port the node's device listens on.
+  uint32 port = 4;
+  // The peers' version, 0 before the control plane sent any.
+  uint64 version = 5;
+  repeated MeshPeer peers = 6;
+}
+
+// Another node, as a peer of the mesh.
+message MeshPeer {
+  // The node's name.
+  string node = 1;
+  // Its WireGuard public key, 32 bytes.
+  bytes public_key = 2;
+  // "host:port" of its device, e.g. "10.0.0.11:51820".
+  string endpoint = 3;
+  // Its /64 of the cluster's ULA: the one prefix allowed for it.
+  string pod_prefix = 4;
+}
+
+message PutMeshPeersRequest {
+  uint64 version = 1;
+  repeated MeshPeer peers = 2;
+}
+
+message PutMeshPeersResponse {}
+
+message UpdateMeshPeersRequest {
+  // The version feosd must have.
+  uint64 from_version = 1;
+  // The version after this change.
+  uint64 version = 2;
+  // Peers that are new or changed, by node.
+  repeated MeshPeer put_peers = 3;
+  // The nodes that are peers no longer.
+  repeated string remove_peers = 4;
+}
+
+message UpdateMeshPeersResponse {}
+
+message GetMeshRequest {}
+
+message StreamTrafficRecordsRequest {
+  // Only this pod's records; all pods' when empty.
+  string pod_id = 1;
+}
+
+message TrafficRecord {
+  google.protobuf.Timestamp time = 1;
+  // The pod the record is about.
+  string pod_id = 2;
+  // Records missed before this one: lost by the kernel, or by a slow
+  // reader.
+  uint64 missed = 3;
+  oneof record {
+    Flow flow = 4;
+    Drop drop = 5;
+    DnsQuery dns = 6;
+    ServerName server_name = 7;
+  }
+}
+
+// Addresses and ports of a connection, as its first packet had them: the
+// pod's own addresses, before NAT.
+message Tuple {
+  // The IP protocol number: 1 ICMP, 6 TCP, 17 UDP, 58 ICMPv6.
+  uint32 protocol = 1;
+  string source_address = 2;
+  uint32 source_port = 3;
+  string destination_address = 4;
+  uint32 destination_port = 5;
+}
+
+// A connection of a pod, in either direction, when it ended; a flow that
+// is still open is recorded when it began, with ended false.
+message Flow {
+  Tuple tuple = 1;
+  // Whether the pod opened it.
+  bool outbound = 2;
+  google.protobuf.Timestamp start = 3;
+  google.protobuf.Timestamp end = 4;
+  bool ended = 5;
+  // Counted from the side that opened the connection.
+  uint64 bytes_sent = 6;
+  uint64 bytes_received = 7;
+  uint64 packets_sent = 8;
+  uint64 packets_received = 9;
+}
+
+// A packet a security group or a denied prefix dropped.
+message Drop {
+  Tuple tuple = 1;
+  bool outbound = 2;
+  DropReason reason = 3;
+}
+
+enum DropReason {
+  DROP_REASON_UNSPECIFIED = 0;
+  // No rule of the pod's groups allowed it.
+  DROP_REASON_NO_RULE = 1;
+  // Its destination is in a denied prefix (feosd --deny-prefix).
+  DROP_REASON_DENIED_PREFIX = 2;
+  // Its source address was not the pod's.
+  DROP_REASON_SPOOFED = 3;
+}
+
+message DnsQuery {
+  string name = 1;
+  // The query type: 1 A, 28 AAAA, 65 HTTPS, ...
+  uint32 type = 2;
+  // The response code: 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN, ...
+  uint32 rcode = 3;
+  // The addresses of the answer's A and AAAA records.
+  repeated string addresses = 4;
+  // Field 5 said whether the resolver had synthesized the answer; it
+  // passes answers as the upstream gave them.
+  reserved 5;
+  reserved "synthesized";
+}
+
+// The server a pod's connection asked for.
+message ServerName {
+  Tuple tuple = 1;
+  ServerNameSource source = 2;
+  string name = 3;
+}
+
+enum ServerNameSource {
+  SERVER_NAME_SOURCE_UNSPECIFIED = 0;
+  // The server name indication of a TLS ClientHello.
+  SERVER_NAME_SOURCE_TLS = 1;
+  // The Host of a plain HTTP request.
+  SERVER_NAME_SOURCE_HTTP = 2;
+}

@@ -1,0 +1,37 @@
+# nfpm configuration of a Firecracker package (ADR 0009). Versions install
+# side by side, as kernel packages do: a suspended VM needs the Firecracker
+# it was written with.
+name: feos-firecracker-${FIRECRACKER_VERSION}
+arch: amd64
+platform: linux
+version: ${FIRECRACKER_VERSION}
+# The packaging's revision: a change to the package that keeps Firecracker's
+# version takes a new one.
+release: "1"
+section: admin
+priority: optional
+maintainer: IronCore authors <ospo@sap.com>
+vendor: SAP SE
+homepage: https://github.com/firecracker-microvm/firecracker
+license: Apache-2.0
+description: |-
+  Firecracker ${FIRECRACKER_VERSION} and its jailer, for feosd
+  Firecracker's release binaries, in
+  /usr/lib/feos/firecracker/${FIRECRACKER_VERSION}/.
+contents:
+  - src: target/firecracker/firecracker
+    dst: /usr/lib/feos/firecracker/${FIRECRACKER_VERSION}/firecracker
+    expand: true
+    file_info:
+      mode: 0755
+  - src: target/firecracker/jailer
+    dst: /usr/lib/feos/firecracker/${FIRECRACKER_VERSION}/jailer
+    expand: true
+    file_info:
+      mode: 0755
+  - src: target/firecracker/LICENSE
+    dst: /usr/share/doc/feos-firecracker-${FIRECRACKER_VERSION}/LICENSE
+    expand: true
+  - src: target/firecracker/NOTICE
+    dst: /usr/share/doc/feos-firecracker-${FIRECRACKER_VERSION}/NOTICE
+    expand: true

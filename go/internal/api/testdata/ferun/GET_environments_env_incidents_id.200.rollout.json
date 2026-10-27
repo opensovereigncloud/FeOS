@@ -1,0 +1,39 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/incidents/13",
+  "query": {},
+  "status": 200,
+  "request": null,
+  "response": {
+    "id": "13",
+    "object": "addon/postgres",
+    "release": 8,
+    "condition": "rollout_failed",
+    "openedAt": "2026-10-18T15:30:02Z",
+    "closedAt": "2026-10-18T15:41:10Z",
+    "summary": "release 8 did not roll out within 10m0s: addon postgres is not ready",
+    "evidence": {
+      "diff": [
+        {
+          "kind": "addon",
+          "name": "postgres",
+          "change": "update",
+          "fields": [
+            {
+              "path": "plan",
+              "from": "small",
+              "to": "medium"
+            }
+          ],
+          "effect": "replaces 1 pod"
+        }
+      ],
+      "pending": [
+        "addon postgres is not ready",
+        "service expense-service waits for the addons",
+        "addon/postgres replica 0: provisioning step provision exited 1: psql: FATAL:  password authentication failed for user \"postgres\""
+      ]
+    }
+  },
+  "note": "a release past its deadline: what it still waited for, and its instances' details (credentials redacted)"
+}

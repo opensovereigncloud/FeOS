@@ -1,0 +1,1010 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package env
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/gardenlinux/feos/go/internal/apierr"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/env/ctl"
+	"github.com/gardenlinux/feos/go/internal/env/envdeps"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
+)
+
+func TestCreateListGetDelete(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	id := uuid.New().String()
+	labels := map[string]string{"fecode.project": "p1", "fecode.class": "stage"}
+	st, created, err := h.svc.CreateEnv(ctx, tenantA, CreateEnvRequest{Name: "stage", ID: id, Labels: labels})
+	if err != nil || !created || st.ID != id || st.Name != "stage" || st.Release != 0 || st.Rollout != nil ||
+		st.Labels["fecode.class"] != "stage" || st.CreatedAt == "" || st.Objects == nil || st.Routes == nil {
+		t.Fatalf("create: %+v %v %v", st, created, err)
+	}
+	// The same ID and name again: the environment, not created.
+	again, created, err := h.svc.CreateEnv(ctx, tenantA, CreateEnvRequest{Name: "stage", ID: strings.ToUpper(id)})
+	if err != nil || created || again.ID != id {
+		t.Fatalf("again: %+v %v %v", again, created, err)
+	}
+	var ae *apierr.Error
+	_, _, err = h.svc.CreateEnv(ctx, tenantA, CreateEnvRequest{Name: "other", ID: id})
+	if !errors.As(err, &ae) || ae.Status != http.StatusConflict || ae.Code != CodeIDTaken ||
+		ae.Msg != "an environment of id "+id+" exists with another name" {
+		t.Fatalf("id taken: %v", err)
+	}
+	_, _, err = h.svc.CreateEnv(ctx, tenantA, CreateEnvRequest{Name: "stage"})
+	if !errors.As(err, &ae) || ae.Code != CodeNameTaken || ae.Msg != "an environment named stage exists with another id" {
+		t.Fatalf("name taken: %v", err)
+	}
+	// Another tenant's ID is taken too; its names are not.
+	_, _, err = h.svc.CreateEnv(ctx, tenantB, CreateEnvRequest{Name: "stage", ID: id})
+	if !errors.As(err, &ae) || ae.Code != CodeIDTaken {
+		t.Fatalf("foreign id: %v", err)
+	}
+	if _, created, err := h.svc.CreateEnv(ctx, tenantB, CreateEnvRequest{Name: "stage"}); err != nil || !created {
+		t.Fatalf("another tenant's name: %v", err)
+	}
+	for _, c := range []CreateEnvRequest{{Name: "Stage"}, {Name: ""}, {Name: id}, {Name: "x", ID: "nope"},
+		{Name: "x", Labels: map[string]string{"": "v"}}} {
+		_, _, err := h.svc.CreateEnv(ctx, tenantA, c)
+		wantStatus(t, err, http.StatusBadRequest, "")
+	}
+	h.create("prod", map[string]string{"fecode.project": "p1", "fecode.class": "production"})
+	h.create("alpha", map[string]string{"fecode.project": "p2"})
+
+	// By UUID or name; another tenant's is absent.
+	for _, ref := range []string{"stage", id, strings.ToUpper(id)} {
+		if st, err := h.svc.GetEnv(ctx, tenantA, ref); err != nil || st.ID != id {
+			t.Fatalf("get %s: %+v %v", ref, st, err)
+		}
+	}
+	for _, ref := range []string{"nope", uuid.NewString(), "Bad Name", "prod%2f"} {
+		_, err := h.svc.GetEnv(ctx, tenantA, ref)
+		wantStatus(t, err, http.StatusNotFound, "no such environment")
+	}
+	_, err = h.svc.GetEnv(ctx, tenantB, id)
+	wantStatus(t, err, http.StatusNotFound, "no such environment")
+
+	// The listing: by name, labels ANDed.
+	list, err := h.svc.ListEnvs(ctx, tenantA, nil)
+	if err != nil || len(list.Environments) != 3 || list.Environments[0].Name != "alpha" ||
+		list.Environments[2].Name != "stage" || list.Environments[2].State != model.EnvNone {
+		t.Fatalf("list %+v %v", list, err)
+	}
+	list, _ = h.svc.ListEnvs(ctx, tenantA, map[string]string{"fecode.project": "p1"})
+	if len(list.Environments) != 2 || list.Environments[0].Name != "prod" {
+		t.Fatalf("list p1 %+v", list)
+	}
+	list, _ = h.svc.ListEnvs(ctx, tenantA, map[string]string{"fecode.project": "p1", "fecode.class": "stage"})
+	if len(list.Environments) != 1 || list.Environments[0].ID != id {
+		t.Fatalf("list p1 stage %+v", list)
+	}
+	if list, _ := h.svc.ListEnvs(ctx, tenantB, nil); len(list.Environments) != 1 {
+		t.Fatalf("tenant B %+v", list)
+	}
+
+	// Delete: marked, the controller woken; again is no error.
+	ch, unsubscribe := h.d.Subscribe(db.ChanLeader)
+	defer unsubscribe()
+	if err := h.svc.DeleteEnv(ctx, tenantA, "stage"); err != nil {
+		t.Fatal(err)
+	}
+	waitHint(t, ch, ctl.LoopDelete)
+	if err := h.svc.DeleteEnv(ctx, tenantA, id); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := h.svc.GetEnv(ctx, tenantA, id); !st.Deleting {
+		t.Fatalf("not deleting: %+v", st)
+	}
+	list, _ = h.svc.ListEnvs(ctx, tenantA, map[string]string{"fecode.class": "stage"})
+	if list.Environments[0].State != model.EnvDeleting {
+		t.Fatalf("state %+v", list)
+	}
+	err = h.svc.DeleteEnv(ctx, tenantB, "prod")
+	wantStatus(t, err, http.StatusNotFound, "no such environment")
+	_, err = h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Spec: json.RawMessage(`{}`)})
+	wantStatus(t, err, http.StatusConflict, "environment stage is being deleted")
+	_, err = h.svc.PutSecret(ctx, tenantA, "stage", "token", PutSecretRequest{Value: "x"})
+	wantStatus(t, err, http.StatusConflict, "being deleted")
+
+	// A deleting tenant creates nothing.
+	h.exec("UPDATE tenants SET deleting_at = now() WHERE id = $1", tenantB)
+	_, _, err = h.svc.CreateEnv(ctx, tenantB, CreateEnvRequest{Name: "new"})
+	wantStatus(t, err, http.StatusConflict, "tenant other is being deleted")
+}
+
+func TestPlanApply(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	st := h.create("stage", nil)
+
+	// No secret yet: an error finding, the diff all adds.
+	p, err := h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(stageSpec)})
+	if err != nil || p.Valid || p.Base != 0 || p.Current != 0 || len(p.Diff) != 7 ||
+		!hasFinding(p.Findings, spec.SeverityError, "services.api.env.TOKEN", "no secret token") {
+		t.Fatalf("plan %+v %v", p, err)
+	}
+	_, err = h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Spec: json.RawMessage(stageSpec)})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "services.api.env.TOKEN", "no secret") {
+		t.Fatalf("apply without the secret: %v", err)
+	}
+	if v := h.putSecret("stage", "token", "s3cret"); v != 1 {
+		t.Fatalf("version %d", v)
+	}
+	p, err = h.svc.Plan(ctx, tenantA, st.ID, PlanRequest{Spec: json.RawMessage(stageSpec)})
+	if err != nil || !p.Valid || len(p.Findings) != 0 {
+		t.Fatalf("plan %+v %v", p, err)
+	}
+
+	// Apply: release 1, pending, the controller woken.
+	ch, unsubscribe := h.d.Subscribe(db.ChanLeader)
+	defer unsubscribe()
+	a := h.apply("stage", stageSpec, 0)
+	waitHint(t, ch, ctl.HintReconcile)
+	if a.Number != 1 || a.State != model.ReleasePending || a.Origin != model.OriginApply || a.Base != 0 ||
+		a.Unchanged || a.StatusCode() != http.StatusCreated || len(a.Diff) != 8 || a.Author != "tester" {
+		t.Fatalf("apply %+v", a)
+	}
+	e := h.env("stage")
+	if e.Release != 1 || e.Realised != 0 {
+		t.Fatalf("env %+v", e)
+	}
+	stored, err := h.st.GetRelease(ctx, e.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := parseStored(stored.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if api := sp.Services["api"]; api.Image != digestOf("ghcr.io/acme/api:1") || api.ImageAsWritten != "ghcr.io/acme/api:1" ||
+		*api.Replicas != 2 || sp.Secrets["token"].Version != 1 || sp.Addons["pg"].Plan != "small" ||
+		sp.Addons["q"].Plan != "small" || sp.Jobs["migrate"].Timeout != "10m0s" {
+		t.Fatalf("stored %s", stored.Spec)
+	}
+
+	// The same spec again: unchanged, whatever the base.
+	for _, base := range []int{1, 0} {
+		a = h.apply("stage", stageSpec, base)
+		if !a.Unchanged || a.Number != 1 || a.StatusCode() != http.StatusOK || len(a.Diff) != 0 ||
+			!hasFinding(a.Findings, spec.SeverityInfo, "", "nothing changes: the spec equals release 1's") {
+			t.Fatalf("unchanged %+v", a)
+		}
+	}
+	// A change on a stale base: 409 with the current release.
+	changed := strings.Replace(stageSpec, `"replicas": 2`, `"replicas": 3`, 1)
+	_, err = h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Spec: json.RawMessage(changed), Base: 0})
+	var bm *BaseMismatchError
+	if !errors.As(err, &bm) || bm.Current != 1 || bm.Base != 0 {
+		t.Fatalf("base mismatch: %v", err)
+	}
+	// The plan of a change against the current release and an older base.
+	p, _ = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(changed)})
+	if len(p.Diff) != 1 || p.Diff[0].Effect != spec.EffectInPlace || p.Diff[0].Fields[0].Path != "replicas" {
+		t.Fatalf("plan diff %+v", p.Diff)
+	}
+	zero, far := 0, 9
+	p, _ = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(changed), Base: &zero})
+	if p.Base != 0 || p.Current != 1 || len(p.Diff) != 8 {
+		t.Fatalf("plan on base 0 %+v", p)
+	}
+	_, err = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(changed), Base: &far})
+	wantStatus(t, err, http.StatusNotFound, "no such release")
+
+	// On the current base: release 2, the pending 1 superseded.
+	a = h.apply("stage", changed, 1)
+	if a.Number != 2 || a.Base != 1 {
+		t.Fatalf("apply %+v", a)
+	}
+	if r1, _ := h.st.GetRelease(ctx, e.ID, 1); r1.State != model.ReleaseSuperseded || r1.FinishedAt.IsZero() {
+		t.Fatalf("release 1 %+v", r1)
+	}
+
+	// A failed release is retried by the same spec.
+	h.exec("UPDATE env_releases SET state = 'failed', reason = 'rollout timed out' WHERE env_id = $1 AND number = 2", e.ID)
+	a = h.apply("stage", changed, 2)
+	if a.Unchanged || a.Number != 3 || !hasFinding(a.Findings, spec.SeverityInfo, "", "nothing changes") {
+		t.Fatalf("retry %+v", a)
+	}
+
+	// A new secret version moves the pins: the dependents are replaced.
+	h.putSecret("stage", "token", "next")
+	a = h.apply("stage", changed, 3)
+	if a.Number != 4 || len(a.Diff) != 2 || a.Diff[0].Name != "api" || a.Diff[0].Effect != "replaces 3 pods" ||
+		a.Diff[1].Kind != spec.KindSecret {
+		t.Fatalf("new version %+v", a.Diff)
+	}
+
+	// Images: unresolvable is a warning in a plan and an error in an apply.
+	h.eng.mu.Lock()
+	h.eng.bad["ghcr.io/acme/web:2"] = "manifest unknown"
+	h.eng.mu.Unlock()
+	broken := strings.Replace(changed, "ghcr.io/acme/web:1", "ghcr.io/acme/web:2", 1)
+	p, _ = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(broken)})
+	if !p.Valid || !hasFinding(p.Findings, spec.SeverityWarning, "services.web.image", "manifest unknown") {
+		t.Fatalf("plan %+v", p)
+	}
+	_, err = h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Spec: json.RawMessage(broken), Base: 4})
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "services.web.image", "could not be resolved") {
+		t.Fatalf("apply %v", err)
+	}
+
+	// The addons' effects come from the blueprints.
+	reprov := strings.Replace(changed, `"roles": ["api_svc"]`, `"roles": ["api_svc", "report_svc"]`, 1)
+	p, _ = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(reprov)})
+	if len(p.Diff) != 1 || p.Diff[0].Effect != spec.EffectReprovisions {
+		t.Fatalf("reprovision %+v", p.Diff)
+	}
+	recreate := strings.Replace(changed, `"q": {"type": "nats", "version": "2"}`,
+		`"q": {"type": "nats", "version": "2", "options": {"jetstream": false}}`, 1)
+	p, _ = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(recreate)})
+	if len(p.Diff) != 1 || p.Diff[0].Effect != spec.EffectRecreates {
+		t.Fatalf("recreate %+v", p.Diff)
+	}
+	// A major version change against the current release is refused.
+	major := strings.Replace(changed, `"version": "17"`, `"version": "16"`, 1)
+	p, _ = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(major)})
+	if p.Valid || !hasFinding(p.Findings, spec.SeverityError, "addons.pg.version", "") {
+		t.Fatalf("major %+v", p)
+	}
+
+	// Parse errors: no diff.
+	p, err = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(`{"services": {"x": {"replica": 1}}}`)})
+	if err != nil || p.Valid || len(p.Diff) != 0 || p.Diff == nil || !hasFinding(p.Findings, spec.SeverityError,
+		"services.x.replica", "unknown field") {
+		t.Fatalf("parse errors %+v %v", p, err)
+	}
+	// Annotations are bounded.
+	_, err = h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Spec: json.RawMessage(changed), Base: 4,
+		Annotations: map[string]string{"k": strings.Repeat("v", 5000)}})
+	wantStatus(t, err, http.StatusBadRequest, "annotations take")
+	// Another tenant's environment is absent.
+	_, err = h.svc.Plan(ctx, tenantB, "stage", PlanRequest{Spec: json.RawMessage(changed)})
+	wantStatus(t, err, http.StatusNotFound, "no such environment")
+}
+
+func TestPlanSpec(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	sb := h.sandbox(tenantA, true)
+	foreign := h.sandbox(tenantB, true)
+	raw := `{"services": {"web": {"runtime": "attached", "sandbox": "` + sb.String() + `", "command": ["npm", "run", "dev"],
+		"env": {"T": {"secret": "absent"}}, "ports": [{"name": "http", "port": 5173}]},
+		"api": {"image": "ghcr.io/acme/api:9"}}}`
+	h.eng.bad["ghcr.io/acme/api:9"] = "manifest unknown"
+	a, err := h.svc.PlanSpec(ctx, tenantA, PlanSpecRequest{Spec: json.RawMessage(raw)})
+	if err != nil || !a.Valid || len(a.Findings) != 1 ||
+		!hasFinding(a.Findings, spec.SeverityWarning, "services.api.image", "manifest unknown") {
+		t.Fatalf("plan spec %+v %v", a, err)
+	}
+	// Another tenant's sandbox is none of yours; an instance row neither.
+	a, _ = h.svc.PlanSpec(ctx, tenantA, PlanSpecRequest{Spec: json.RawMessage(strings.Replace(raw, sb.String(),
+		foreign.String(), 1))})
+	if a.Valid || !hasFinding(a.Findings, spec.SeverityError, "services.web.sandbox", "no sandbox") {
+		t.Fatalf("foreign sandbox %+v", a)
+	}
+	a, _ = h.svc.PlanSpec(ctx, tenantA, PlanSpecRequest{})
+	if a.Valid || !hasFinding(a.Findings, spec.SeverityError, "", "no spec") {
+		t.Fatalf("no spec %+v", a)
+	}
+}
+
+func TestAttachedValidation(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	sb := h.sandbox(tenantA, true)
+	plain := h.sandbox(tenantA, false)
+	h.create("one", nil)
+	h.create("two", nil)
+	attachedAs := func(sandbox podid.ID, name, port string) string {
+		return `{"services": {"` + name + `": {"runtime": "attached", "sandbox": "` + sandbox.String() + `", "command": ["vite"],
+			"ports": [{"name": "http", "port": ` + port + `}]}}, "routes": {"root": {"path": "/", "service": "` + name +
+			`", "port": "http"}}}`
+	}
+	attached := func(sandbox podid.ID, port string) string { return attachedAs(sandbox, "vite", port) }
+	h.apply("one", attached(sb, "5173"), 0)
+	// Another environment's attached service holds the port in the
+	// sandbox.
+	p, err := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attachedAs(sb, "web", "5173"))})
+	if err != nil || p.Valid || !hasFinding(p.Findings, spec.SeverityError, "services.web.ports[0].port",
+		"port 5173 is used in sandbox "+sb.String()+" by service vite of environment one") {
+		t.Fatalf("clash %+v %v", p, err)
+	}
+	// The environment's own release does not clash with itself.
+	if p, _ := h.svc.Plan(ctx, tenantA, "one", PlanRequest{Spec: json.RawMessage(attached(sb, "5173"))}); !p.Valid {
+		t.Fatalf("own %+v", p)
+	}
+	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attachedAs(sb, "web", "5174"))}); !p.Valid {
+		t.Fatalf("other port %+v", p)
+	}
+	// Nor may a name be the sandbox's as both environments':
+	// their attached services', image services' or addons'.
+	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attached(sb, "5174"))}); p.Valid ||
+		!hasFinding(p.Findings, spec.SeverityError, "services.vite",
+			"vite is a name in sandbox "+sb.String()+" of environment one's too") {
+		t.Fatalf("attached name %+v", p)
+	}
+	withAPI := func(sandbox podid.ID, name, port string) string {
+		return strings.Replace(attachedAs(sandbox, name, port), `"services": {`,
+			`"services": {"api": {"image": "ghcr.io/acme/api:1", "ports": [{"name": "http", "port": 8080}]}, `, 1)
+	}
+	h.create("three", nil)
+	h.create("four", nil)
+	h.apply("three", withAPI(sb, "web3", "5175"), 0)
+	_, err = h.svc.Apply(ctx, tenantA, "four", ApplyRequest{Spec: json.RawMessage(withAPI(sb, "web4", "5176"))})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "services.api",
+		"api is a name in sandbox "+sb.String()+" of environment three's too") {
+		t.Fatalf("image service name: %s", describe(err))
+	}
+	// In separate sandboxes the names are their own.
+	other := h.sandbox(tenantA, true)
+	if p, _ := h.svc.Plan(ctx, tenantA, "four", PlanRequest{Spec: json.RawMessage(withAPI(other, "web4", "5176"))}); !p.Valid {
+		t.Fatalf("separate sandboxes %+v", p)
+	}
+	// A sandbox with a UUID, made before ADR 0019, is a sandbox as a short
+	// ID's is, in either case; a value that is neither is refused.
+	legacy := h.legacySandbox(tenantA, true)
+	for _, id := range []podid.ID{legacy, podid.ID(strings.ToUpper(legacy.String()))} {
+		if p, _ := h.svc.Plan(ctx, tenantA, "four", PlanRequest{Spec: json.RawMessage(withAPI(id, "web4", "5176"))}); !p.Valid {
+			t.Fatalf("legacy sandbox %s: %+v", id, p)
+		}
+	}
+	for _, bad := range []podid.ID{"nope", podid.ID(strings.ToUpper(other.String()))} {
+		if p, _ := h.svc.Plan(ctx, tenantA, "four", PlanRequest{Spec: json.RawMessage(attachedAs(bad, "web4", "5176"))}); p.Valid ||
+			!hasFinding(p.Findings, spec.SeverityError, "services.web4.sandbox", "is not a sandbox ID") {
+			t.Fatalf("sandbox %q: %+v", bad, p)
+		}
+	}
+	// A sandbox that is not attachable warns when there is something to
+	// reach; an instance row is no sandbox.
+	withAddon := strings.Replace(attached(plain, "5173"), `"routes"`, `"addons": {"q": {"type": "nats", "version": "2"}}, "routes"`, 1)
+	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(withAddon)}); !p.Valid ||
+		!hasFinding(p.Findings, spec.SeverityWarning, "services.vite.sandbox", "not attachable") {
+		t.Fatalf("not attachable %+v", p)
+	}
+	inst := h.instance(h.env("one").ID, spec.KindService, "x", 0, 1, model.PhaseReady, model.StateRunning, "n1", "fd00::1")
+	if p, _ := h.svc.Plan(ctx, tenantA, "two", PlanRequest{Spec: json.RawMessage(attached(inst, "5173"))}); p.Valid {
+		t.Fatalf("an instance row as sandbox %+v", p)
+	}
+}
+
+func TestReleasesAndRevert(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	h.putSecret("stage", "token", "one")
+	if _, err := h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Spec: json.RawMessage(stageSpec), Author: "a1",
+		Message: "first", Annotations: map[string]string{"fecode.dev/revision": "r1"}}); err != nil {
+		t.Fatal(describe(err))
+	}
+	changed := strings.Replace(stageSpec, "ghcr.io/acme/web:1", "ghcr.io/acme/web:2", 1)
+	h.apply("stage", changed, 1)
+	if _, err := h.svc.PutTag(ctx, tenantA, "stage", "v1", PutTagRequest{Release: 1, Author: "a2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := h.svc.Releases(ctx, tenantA, "stage", 0)
+	if err != nil || len(list.Releases) != 2 || list.Releases[0].Number != 2 || list.Releases[1].Tags[0] != "v1" ||
+		list.Releases[1].Message != "first" || list.Releases[1].Annotations["fecode.dev/revision"] != "r1" ||
+		list.Releases[0].Tags == nil {
+		t.Fatalf("releases %+v %v", list, err)
+	}
+	if list, _ := h.svc.Releases(ctx, tenantA, "stage", 1); len(list.Releases) != 1 {
+		t.Fatalf("limit %+v", list)
+	}
+	d, err := h.svc.Release(ctx, tenantA, "stage", 2)
+	if err != nil || d.Number != 2 || len(d.Diff) != 1 || d.Diff[0].Name != "web" ||
+		d.Diff[0].Fields[0].To != "ghcr.io/acme/web:2 ("+strings.SplitN(digestOf("ghcr.io/acme/web:2"), "@", 2)[1]+")" {
+		t.Fatalf("release 2 %+v %v", d, err)
+	}
+	var sp spec.Spec
+	if err := json.Unmarshal(d.Spec, &sp); err != nil || sp.Services["web"].ImageAsWritten != "ghcr.io/acme/web:2" {
+		t.Fatalf("spec %s %v", d.Spec, err)
+	}
+	if d, _ := h.svc.Release(ctx, tenantA, "stage", 1); len(d.Diff) != 8 {
+		t.Fatalf("release 1 diff %+v", d.Diff)
+	}
+	_, err = h.svc.Release(ctx, tenantA, "stage", 3)
+	wantStatus(t, err, http.StatusNotFound, "no such release")
+
+	// Revert to 1: its spec, its annotations plus ferun.revertOf.
+	a, err := h.svc.Revert(ctx, tenantA, "stage", 1, RevertRequest{Base: 2, Author: "a3", Message: "back"})
+	if err != nil || a.Number != 3 || a.Origin != model.OriginRevert || a.OriginRef != "1" ||
+		a.Annotations["ferun.revertOf"] != "1" || a.Annotations["fecode.dev/revision"] != "r1" || len(a.Diff) != 1 {
+		t.Fatalf("revert %+v %v", a, err)
+	}
+	if a, err := h.svc.Revert(ctx, tenantA, "stage", 3, RevertRequest{Base: 3}); err != nil || !a.Unchanged {
+		t.Fatalf("revert to the current %+v %v", a, err)
+	}
+	// A clone of the revert copies its annotations without ferun.revertOf,
+	// whose number names one of the source's releases.
+	if _, err := h.svc.Clone(ctx, tenantA, "stage", CloneRequest{Name: "copy",
+		Secrets: map[string]CloneSecret{"token": {Copy: true}}}); err != nil {
+		t.Fatal(describe(err))
+	}
+	if r, err := h.svc.Release(ctx, tenantA, "copy", 1); err != nil || r.Annotations["fecode.dev/revision"] != "r1" ||
+		len(r.Annotations) != 1 {
+		t.Fatalf("the clone's release's annotations %v, %v", r.Annotations, err)
+	}
+	_, err = h.svc.Revert(ctx, tenantA, "stage", 1, RevertRequest{Base: 2})
+	var bm *BaseMismatchError
+	if errors.As(err, &bm) {
+		// Release 1 equals the current 3: unchanged answers before the
+		// base.
+		t.Fatalf("revert %v", err)
+	}
+	_, err = h.svc.Revert(ctx, tenantA, "stage", 9, RevertRequest{Base: 3})
+	wantStatus(t, err, http.StatusNotFound, "no such release")
+
+	// A pinned version that was deleted refuses the revert.
+	noSecret := strings.Replace(stageSpec, `"TOKEN": {"secret": "token"},`, ``, 1)
+	h.apply("stage", noSecret, 3)
+	if err := h.svc.DeleteSecret(ctx, tenantA, "stage", "token"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.svc.Revert(ctx, tenantA, "stage", 1, RevertRequest{Base: 4})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "secrets.token",
+		"version 1 of secret token was deleted") {
+		t.Fatalf("revert with a deleted version: %v", describe(err))
+	}
+}
+
+func TestObjects(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	h.putSecret("stage", "token", "x")
+	h.apply("stage", stageSpec, 0)
+
+	web := json.RawMessage(`{"image": "ghcr.io/acme/web:1", "ports": [{"name": "http", "port": 3000}], "idle": "15m",
+		"replicas": 3, "env": {"API": {"service": "api", "port": "http", "key": "url"}}}`)
+	dry, err := h.svc.PutObject(ctx, tenantA, "stage", spec.KindService, "web", PutObjectRequest{Object: web, Base: 1,
+		DryRun: true})
+	if err != nil || !dry.DryRun || !dry.Plan.Valid || len(dry.Plan.Diff) != 1 || dry.Plan.Diff[0].Fields[0].Path != "replicas" ||
+		dry.StatusCode() != http.StatusOK || dry.Plan.Base != 1 {
+		t.Fatalf("dry run %+v %v", dry, err)
+	}
+	if e := h.env("stage"); e.Release != 1 {
+		t.Fatalf("a dry run applied: %+v", e)
+	}
+	put, err := h.svc.PutObject(ctx, tenantA, "stage", spec.KindService, "web", PutObjectRequest{Object: web, Base: 1,
+		Author: "a", Message: "three webs"})
+	if err != nil || put.Apply.Number != 2 || put.Apply.Origin != model.OriginObject || put.Apply.OriginRef != "service/web" ||
+		put.StatusCode() != http.StatusCreated {
+		t.Fatalf("put %+v %v", put, err)
+	}
+	// A route goes; an absent object is 404; a bad kind 400.
+	del, err := h.svc.DeleteObject(ctx, tenantA, "stage", spec.KindRoute, "api", DeleteObjectRequest{Base: 2})
+	if err != nil || del.Apply.Number != 3 || del.Apply.OriginRef != "route/api" || len(del.Apply.Diff) != 1 ||
+		del.Apply.Diff[0].Change != spec.ChangeRemove {
+		t.Fatalf("delete %+v %v", del, err)
+	}
+	_, err = h.svc.DeleteObject(ctx, tenantA, "stage", spec.KindRoute, "api", DeleteObjectRequest{Base: 3})
+	wantStatus(t, err, http.StatusNotFound, "no such object: route/api")
+	_, err = h.svc.PutObject(ctx, tenantA, "stage", "volume", "v", PutObjectRequest{Object: json.RawMessage(`{}`), Base: 3})
+	wantStatus(t, err, http.StatusBadRequest, "kind must be")
+	_, err = h.svc.PutObject(ctx, tenantA, "stage", spec.KindService, "web", PutObjectRequest{Base: 3})
+	wantStatus(t, err, http.StatusBadRequest, "object is required")
+	// A dry run of a delete that breaks references: invalid, with the
+	// diff.
+	dry, err = h.svc.DeleteObject(ctx, tenantA, "stage", spec.KindAddon, "q", DeleteObjectRequest{Base: 3, DryRun: true})
+	if err != nil || dry.Plan.Valid || !hasFinding(dry.Plan.Findings, spec.SeverityError, "services.api.env.Q", "no addon q") ||
+		len(dry.Plan.Diff) != 1 || dry.Plan.Diff[0].Effect != spec.EffectDeletes {
+		t.Fatalf("dry delete %+v %v", dry, err)
+	}
+	// Unknown fields in an object have their paths in the spec.
+	_, err = h.svc.PutObject(ctx, tenantA, "stage", spec.KindJob, "seed", PutObjectRequest{
+		Object: json.RawMessage(`{"image": "img", "schedule": "daily"}`), Base: 3})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "jobs.seed.schedule", "unknown field") {
+		t.Fatalf("unknown field %v", describe(err))
+	}
+	// An object into an environment without a release.
+	h.create("empty", nil)
+	put, err = h.svc.PutObject(ctx, tenantA, "empty", spec.KindAddon, "q", PutObjectRequest{
+		Object: json.RawMessage(`{"type": "nats", "version": "2"}`)})
+	if err != nil || put.Apply.Number != 1 {
+		t.Fatalf("first object %+v %v", put, describe(err))
+	}
+}
+
+func TestTags(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	h.putSecret("stage", "token", "x")
+	h.apply("stage", stageSpec, 0)
+	tag, err := h.svc.PutTag(ctx, tenantA, "stage", "v1.4", PutTagRequest{Release: 1, Author: "a"})
+	if err != nil || tag.Tag != "v1.4" || tag.Release != 1 || tag.MovedBy != "a" || tag.MovedAt == "" {
+		t.Fatalf("put %+v %v", tag, err)
+	}
+	if tag, _ := h.svc.PutTag(ctx, tenantA, "stage", "stable", PutTagRequest{Release: 1}); tag.MovedBy != tenantA {
+		t.Fatalf("moved by %+v", tag)
+	}
+	list, err := h.svc.Tags(ctx, tenantA, "stage")
+	if err != nil || len(list.Tags) != 2 || list.Tags[0].Tag != "stable" {
+		t.Fatalf("tags %+v %v", list, err)
+	}
+	if got, err := h.svc.Tag(ctx, tenantA, "stage", "v1.4"); err != nil || got.Release != 1 {
+		t.Fatalf("tag %+v %v", got, err)
+	}
+	_, err = h.svc.Tag(ctx, tenantA, "stage", "nope")
+	wantStatus(t, err, http.StatusNotFound, "no such tag")
+	_, err = h.svc.PutTag(ctx, tenantA, "stage", "v2", PutTagRequest{Release: 7})
+	wantStatus(t, err, http.StatusNotFound, "no such release")
+	_, err = h.svc.PutTag(ctx, tenantA, "stage", ".bad", PutTagRequest{Release: 1})
+	wantStatus(t, err, http.StatusBadRequest, "must match")
+	if err := h.svc.DeleteTag(ctx, tenantA, "stage", "v1.4"); err != nil {
+		t.Fatal(err)
+	}
+	err = h.svc.DeleteTag(ctx, tenantA, "stage", "v1.4")
+	wantStatus(t, err, http.StatusNotFound, "no such tag")
+	_, err = h.svc.Tags(ctx, tenantB, "stage")
+	wantStatus(t, err, http.StatusNotFound, "no such environment")
+}
+
+func TestSecrets(t *testing.T) {
+	t.Parallel()
+	off := newHarness(t, harnessOptions{noSealer: true})
+	off.create("stage", nil)
+	ctx := off.ctx()
+	_, err := off.svc.Secrets(ctx, tenantA, "stage")
+	wantStatus(t, err, http.StatusServiceUnavailable, "secrets need --secret-key-file")
+	_, err = off.svc.PutSecret(ctx, tenantA, "stage", "token", PutSecretRequest{Value: "x"})
+	wantStatus(t, err, http.StatusServiceUnavailable, "secrets need --secret-key-file")
+	err = off.svc.DeleteSecret(ctx, tenantA, "stage", "token")
+	wantStatus(t, err, http.StatusServiceUnavailable, "secrets need --secret-key-file")
+	if off.svc.SecretsEnabled() {
+		t.Fatal("secrets without a sealer")
+	}
+	_, err = off.svc.ResolveSecret(ctx, uuid.New(), "token", 1)
+	if err == nil || !strings.Contains(err.Error(), "--secret-key-file") {
+		t.Fatalf("resolve without a sealer: %v", err)
+	}
+
+	h := newHarness(t, harnessOptions{})
+	ctx = h.ctx()
+	st := h.create("stage", nil)
+	id := uuid.MustParse(st.ID)
+	if v := h.putSecret("stage", "token", "one"); v != 1 {
+		t.Fatal(v)
+	}
+	if v := h.putSecret(st.ID, "token", "two"); v != 2 {
+		t.Fatal(v)
+	}
+	h.putSecret("stage", "other", "x")
+	list, err := h.svc.Secrets(ctx, tenantA, "stage")
+	if err != nil || len(list.Secrets) != 2 || list.Secrets[1].Name != "token" || list.Secrets[1].Version != 2 ||
+		list.Secrets[1].CreatedBy != "tester" || list.Secrets[1].CreatedAt == "" {
+		t.Fatalf("list %+v %v", list, err)
+	}
+	// Sealed under its own AAD: another version's does not open it.
+	row, err := h.st.GetSecret(ctx, id, "token", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := h.sealer.Open(row.Sealed, envdeps.SecretAAD(id, "token", 2)); err != nil || string(v) != "two" {
+		t.Fatalf("open %q %v", v, err)
+	}
+	if _, err := h.sealer.Open(row.Sealed, envdeps.SecretAAD(id, "token", 1)); err == nil {
+		t.Fatal("opened under another version's AAD")
+	}
+	if strings.Contains(string(row.Sealed), "two") {
+		t.Fatal("stored in the clear")
+	}
+	for _, name := range []string{"addon.pg.password", "Token", ""} {
+		_, err := h.svc.PutSecret(ctx, tenantA, "stage", name, PutSecretRequest{Value: "x"})
+		wantStatus(t, err, http.StatusBadRequest, "secret name")
+	}
+	_, err = h.svc.PutSecret(ctx, tenantA, "stage", "big", PutSecretRequest{Value: strings.Repeat("x", 70000)})
+	wantStatus(t, err, http.StatusBadRequest, "at most")
+
+	// Pinned by the latest release: refused; then deleted.
+	h.apply("stage", stageSpec, 0)
+	err = h.svc.DeleteSecret(ctx, tenantA, "stage", "token")
+	wantStatus(t, err, http.StatusConflict, "release 1 pins secret token: apply a release without it first")
+	if err := h.svc.DeleteSecret(ctx, tenantA, "stage", "other"); err != nil {
+		t.Fatal(err)
+	}
+	err = h.svc.DeleteSecret(ctx, tenantA, "stage", "other")
+	wantStatus(t, err, http.StatusNotFound, "no such secret")
+	err = h.svc.DeleteSecret(ctx, tenantA, "stage", "addon.pg.password")
+	wantStatus(t, err, http.StatusNotFound, "no such secret")
+	if list, _ := h.svc.Secrets(ctx, tenantA, "stage"); len(list.Secrets) != 1 {
+		t.Fatalf("after delete %+v", list)
+	}
+	// A deleted secret's next version continues its numbers.
+	if v := h.putSecret("stage", "other", "again"); v != 2 {
+		t.Fatalf("version after delete %d", v)
+	}
+	// System secrets are never listed.
+	sealed, _ := h.sealer.Seal([]byte("pw"), envdeps.SecretAAD(id, "addon.pg.password", 1))
+	if _, err := h.st.InsertSecret(ctx, store.EnvSecret{EnvID: id, Name: "addon.pg.password", Version: 1, Sealed: sealed,
+		System: true}); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := h.svc.Secrets(ctx, tenantA, "stage"); len(list.Secrets) != 2 {
+		t.Fatalf("system secret listed %+v", list)
+	}
+	// The S0 controller resolves no secret yet: an error, not a panic.
+	if _, err := h.svc.ResolveSecret(ctx, id, "token", 1); err == nil {
+		t.Log("the controller resolves secrets")
+	}
+}
+
+func TestLogsRestartRunJob(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	_, err := h.svc.Logs(ctx, tenantA, "stage", "volume", "v", 0, 0)
+	wantStatus(t, err, http.StatusNotFound, "no such object: volume/v")
+	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "x", 0, -1)
+	wantStatus(t, err, http.StatusBadRequest, "negative")
+	_, err = h.svc.Logs(ctx, tenantB, "stage", spec.KindService, "x", 0, 0)
+	wantStatus(t, err, http.StatusNotFound, "no such environment")
+	// Whatever the controller answers maps to its status.
+	for _, c := range []struct {
+		err    error
+		status int
+		msg    string
+	}{
+		{ctl.ErrNoObject, http.StatusNotFound, "no such object: service/x"},
+		{ctl.ErrPaused, http.StatusConflict, "paused"},
+		{ctl.ErrNoContainerLogs, http.StatusNotImplemented, "this node does not serve container logs yet"},
+		{fmt.Errorf("an op ensure of instance i2 is in flight: %w", model.ErrBusy), http.StatusConflict,
+			"service x is busy with another operation; try again shortly"},
+		{fmt.Errorf("sandbox s: %w", model.ErrNotFound), http.StatusConflict, "service x is not running: its sandbox is gone"},
+		{fmt.Errorf("lock: %w", store.ErrNoRow), http.StatusConflict, "service x changed meanwhile; try again"},
+		{fmt.Errorf("the instance is pending: no log to read (%w)", ctl.ErrNotRunning), http.StatusConflict,
+			"the instance is pending: no log to read"},
+		{fmt.Errorf("job x cannot run yet: addon pg has no address yet (%w)", ctl.ErrNotReady), http.StatusConflict,
+			"job x cannot run yet"},
+		{errors.New("the environment is being deleted"), http.StatusConflict, "the environment is being deleted"},
+		{errors.New("the tenant is being deleted"), http.StatusConflict, "the tenant is being deleted"},
+		{errors.New("process logs need the tools' runner, which this instance lacks"), http.StatusServiceUnavailable,
+			"process logs need the tools' runner"},
+		{errors.New("boom"), http.StatusInternalServerError, "boom"},
+	} {
+		wantStatus(t, ctlError(c.err, spec.KindService, "x"), c.status, c.msg)
+	}
+	if ctlError(nil, "", "") != nil {
+		t.Fatal("nil")
+	}
+	if err := h.svc.DeleteEnv(ctx, tenantA, "stage"); err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, h.svc.RestartService(ctx, tenantA, "stage", "x"), http.StatusConflict, "being deleted")
+	wantStatus(t, h.svc.RunJob(ctx, tenantA, "stage", "x"), http.StatusConflict, "being deleted")
+}
+
+func TestRouteTokens(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	st := h.create("stage", nil)
+	a, err := h.svc.CreateRouteToken(ctx, tenantA, "stage")
+	if err != nil || len(a.Token) != 43 {
+		t.Fatalf("token %+v %v", a, err)
+	}
+	b, _ := h.svc.CreateRouteToken(ctx, tenantA, "stage")
+	if a.Token == b.Token {
+		t.Fatal("the same token twice")
+	}
+	rt, err := h.st.ResolveRouteToken(ctx, store.HashToken(a.Token))
+	if err != nil || rt.EnvID.String() != st.ID {
+		t.Fatalf("stored %+v %v", rt, err)
+	}
+	if err := h.svc.RevokeRouteTokens(ctx, tenantA, "stage"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.st.ResolveRouteToken(ctx, store.HashToken(b.Token)); !errors.Is(err, store.ErrNoRow) {
+		t.Fatalf("not revoked: %v", err)
+	}
+	_, err = h.svc.CreateRouteToken(ctx, tenantB, "stage")
+	wantStatus(t, err, http.StatusNotFound, "no such environment")
+}
+
+// An environment's ID is free again once env-delete removed it; the next
+// environment of that ID, another tenant's here, never sees the old one's
+// releases through the parsed-spec cache.
+func TestReusedEnvID(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	id := uuid.New()
+	if _, _, err := h.svc.CreateEnv(ctx, tenantA, CreateEnvRequest{Name: "stage", ID: id.String()}); err != nil {
+		t.Fatal(err)
+	}
+	h.putSecret("stage", "token", "x")
+	h.apply("stage", stageSpec, 0)
+	// Read release 1 every way the service caches it.
+	if st, err := h.svc.GetEnv(ctx, tenantA, "stage"); err != nil || len(st.Objects) != 5 {
+		t.Fatalf("status %+v %v", st, err)
+	}
+	if _, err := h.svc.Release(ctx, tenantA, "stage", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(stageSpec)}); err != nil {
+		t.Fatal(err)
+	}
+	// env-delete removes the row, its releases with it.
+	h.exec("DELETE FROM environments WHERE id = $1", id)
+
+	if _, _, err := h.svc.CreateEnv(ctx, tenantB, CreateEnvRequest{Name: "solo", ID: id.String()}); err != nil {
+		t.Fatal(err)
+	}
+	own := `{"services": {"solo": {"image": "ghcr.io/b/solo:1", "ports": [{"name": "http", "port": 80}]}},
+	  "routes": {"root": {"path": "/", "service": "solo", "port": "http"}}}`
+	a, err := h.svc.Apply(ctx, tenantB, "solo", ApplyRequest{Spec: json.RawMessage(own)})
+	if err != nil || a.Number != 1 {
+		t.Fatalf("apply %+v %v", a, describe(err))
+	}
+	st, err := h.svc.GetEnv(ctx, tenantB, "solo")
+	if err != nil || len(st.Objects) != 1 || st.Objects[0].Name != "solo" || len(st.Routes) != 1 || st.Routes[0].Port != 80 {
+		t.Fatalf("the new environment's status %+v %v", st, err)
+	}
+	// The same spec again is unchanged; the old environment's is a change
+	// that removes solo, with nothing of the old one's as "from".
+	if a, err := h.svc.Apply(ctx, tenantB, "solo", ApplyRequest{Spec: json.RawMessage(own), Base: 1}); err != nil || !a.Unchanged {
+		t.Fatalf("unchanged %+v %v", a, describe(err))
+	}
+	p, err := h.svc.Plan(ctx, tenantB, "solo", PlanRequest{Spec: json.RawMessage(strings.Replace(stageSpec,
+		`"TOKEN": {"secret": "token"},`, "", 1))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := false
+	for _, d := range p.Diff {
+		if d.Kind == spec.KindService && d.Name == "solo" && d.Change == spec.ChangeRemove {
+			removed = true
+		}
+		if d.Kind == spec.KindService && d.Name == "api" && d.Change != spec.ChangeAdd {
+			t.Fatalf("api is %s: the old environment's spec leaked into the diff", d.Change)
+		}
+	}
+	if !removed {
+		t.Fatalf("diff %+v", p.Diff)
+	}
+	if d, err := h.svc.Release(ctx, tenantB, "solo", 1); err != nil || len(d.Diff) != 2 {
+		t.Fatalf("release 1 %+v %v", d, err)
+	}
+}
+
+// Plan, apply and revert validate an addon against the data its volume
+// holds, which the controller keeps by the addon's name: a removal or a
+// type change the controller has not acted on yet deletes nothing.
+func TestAddonAgainstVolume(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	e := h.env("stage")
+	addon := func(typ, version string) string {
+		return `{"addons": {"db": {"type": "` + typ + `", "version": "` + version + `"}}}`
+	}
+	const none = `{"services": {"web": {"image": "ghcr.io/acme/web:1"}}}`
+	refused := func(raw string, base int, path, problem string) {
+		t.Helper()
+		_, err := h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Spec: json.RawMessage(raw), Base: base})
+		var ise *InvalidSpecError
+		if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, path, problem) {
+			t.Fatalf("apply %s on %d: %v", raw, base, describe(err))
+		}
+	}
+	volume := func(typ, version string) store.EnvVolume {
+		t.Helper()
+		v, err := h.st.InsertEnvVolume(ctx, store.EnvVolume{EnvID: e.ID, Object: "addon/db", VolumeID: uuid.New(),
+			SizeMiB: 1024, AddonType: typ, DataVersion: version})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	deleting := func(v store.EnvVolume) {
+		t.Helper()
+		after := v
+		after.Deleting = true
+		if _, err := h.st.UpdateEnvVolume(ctx, v, after); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.apply("stage", addon("postgres", "16"), 0)
+	pg16 := volume("postgres", "16")
+
+	// Removed, and added again as 17 before the controller deleted the
+	// volume: postgres 17 would start on 16's data directory.
+	h.apply("stage", none, 1)
+	refused(addon("postgres", "17"), 2, "addons.db.version", "needs a data migration")
+	if a := h.apply("stage", addon("postgres", "16"), 2); a.Number != 3 {
+		t.Fatalf("re-added as it was %+v", a)
+	}
+
+	// A type round trip the controller has not acted on: valkey is told
+	// the data goes, and back to postgres the data is still 16's.
+	a := h.apply("stage", addon("valkey", "8"), 3)
+	if !hasFinding(a.Findings, spec.SeverityWarning, "addons.db.type", "volume holds postgres data, not valkey: its data is deleted") {
+		t.Fatalf("to valkey %+v", a.Findings)
+	}
+	refused(addon("postgres", "17"), 4, "addons.db.version", "needs a data migration")
+	p, err := h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(addon("postgres", "16"))})
+	if err != nil || !p.Valid || hasFinding(p.Findings, spec.SeverityWarning, "addons.db.type", "") {
+		t.Fatalf("back to postgres 16 %+v %v", p, err)
+	}
+	// A revert to release 1 is checked the same way.
+	if _, err := h.svc.Revert(ctx, tenantA, "stage", 1, RevertRequest{Base: 4}); err != nil {
+		t.Fatalf("revert to postgres 16: %v", describe(err))
+	}
+
+	// Once the controller acts on valkey, postgres 16's volume is being
+	// deleted and constrains nothing; once it is gone, valkey's new one
+	// holds valkey data.
+	h.apply("stage", addon("valkey", "8"), 5)
+	deleting(pg16)
+	p, err = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(addon("postgres", "17"))})
+	if err != nil || !p.Valid || !hasFinding(p.Findings, spec.SeverityWarning, "addons.db.type", "changes its type from valkey to postgres") {
+		t.Fatalf("postgres 17 beside a deleting volume %+v %v", p, err)
+	}
+	h.exec("DELETE FROM env_volumes WHERE env_id = $1", e.ID)
+	volume("valkey", "8")
+	a = h.apply("stage", addon("postgres", "17"), 6)
+	if a.Number != 7 || !hasFinding(a.Findings, spec.SeverityWarning, "addons.db.type", "volume holds valkey data, not postgres") {
+		t.Fatalf("postgres 17 over valkey's volume %+v", a)
+	}
+
+	// The version that ran ready on the volume decides a downgrade, not
+	// the latest release: an upgrade to 8 that never ran may go back.
+	h.exec("DELETE FROM env_volumes WHERE env_id = $1", e.ID)
+	h.apply("stage", addon("valkey", "7.2"), 7)
+	vk72 := volume("valkey", "7.2")
+	h.apply("stage", addon("valkey", "8"), 8)
+	if _, err := h.svc.Revert(ctx, tenantA, "stage", 8, RevertRequest{Base: 9}); err != nil {
+		t.Fatalf("revert of an upgrade that never ran: %v", describe(err))
+	}
+	// Once 8 ran ready on it, the data is 8's.
+	h.apply("stage", addon("valkey", "8"), 10)
+	after := vk72
+	after.DataVersion = "8"
+	if _, err := h.st.UpdateEnvVolume(ctx, vk72, after); err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.svc.Revert(ctx, tenantA, "stage", 8, RevertRequest{Base: 11})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "addons.db.version", "cannot go back from 8 to 7.2") {
+		t.Fatalf("revert over 8's data: %v", describe(err))
+	}
+}
+
+// A secret deleted between an apply's plan and its transaction is never
+// pinned by the new release: the apply plans again and refuses it.
+func TestApplyRacesDeleteSecret(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	h.putSecret("stage", "x", "v1")
+	h.apply("stage", `{"services": {"web": {"image": "ghcr.io/acme/web:1"}}}`, 0)
+	var once sync.Once
+	h.svc.afterPlan = func() {
+		once.Do(func() {
+			if err := h.svc.DeleteSecret(ctx, tenantA, "stage", "x"); err != nil {
+				t.Errorf("delete secret: %v", err)
+			}
+		})
+	}
+	_, err := h.svc.Apply(ctx, tenantA, "stage", ApplyRequest{Base: 1,
+		Spec: json.RawMessage(`{"services": {"web": {"image": "ghcr.io/acme/web:1", "env": {"X": {"secret": "x"}}}}}`)})
+	var ise *InvalidSpecError
+	if !errors.As(err, &ise) || !hasFinding(ise.Findings, spec.SeverityError, "services.web.env.X", "secret x was deleted") {
+		t.Fatalf("apply: %v", describe(err))
+	}
+	if e := h.env("stage"); e.Release != 1 {
+		t.Fatalf("release %d was made", e.Release)
+	}
+}
+
+// The controller's refusals of expected states answer 409 with a code,
+// never 500: a restart while an op is in flight (Retry-After), a job that
+// cannot run yet, the log of an instance that does not run.
+func TestControllerRefusals(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	e := h.env("stage")
+	h.putSecret("stage", "token", "x")
+	sb := h.sandbox(tenantA, true)
+	h.apply("stage", previewSpec(sb), 0)
+	code := func(err error) string {
+		var ae *apierr.Error
+		if !errors.As(err, &ae) {
+			return ""
+		}
+		return ae.Code
+	}
+
+	// The migrate job's addon has no address yet.
+	err := h.svc.RunJob(ctx, tenantA, "stage", "migrate")
+	wantStatus(t, err, http.StatusConflict, "job migrate cannot run yet: ")
+	if code(err) != "not_ready" {
+		t.Fatalf("code %q", code(err))
+	}
+
+	// A replica the release has but that has no instance yet (it waits
+	// for its addons) has no log; one the object does not have is no
+	// object, and the answer says which.
+	for _, c := range []struct {
+		kind, name string
+		replica    int
+		status     int
+		msg, code  string
+	}{
+		{spec.KindService, "api", 1, http.StatusConflict, "service api has no instance of replica 1 yet: no log to read",
+			"not_running"},
+		{spec.KindAddon, "pg", 0, http.StatusConflict, "addon pg has no instance of replica 0 yet: no log to read", "not_running"},
+		{spec.KindService, "api", 5, http.StatusNotFound, "service api has no replica 5 (it has 2)", ""},
+		{spec.KindAddon, "pg", 1, http.StatusNotFound, "addon pg has no replica 1 (it has 1)", ""},
+		{spec.KindService, "nope", 0, http.StatusNotFound, "no such object: service/nope", ""},
+	} {
+		_, err := h.svc.Logs(ctx, tenantA, "stage", c.kind, c.name, 0, c.replica)
+		wantStatus(t, err, c.status, c.msg)
+		if code(err) != c.code {
+			t.Fatalf("%s/%s replica %d: code %q", c.kind, c.name, c.replica, code(err))
+		}
+	}
+	// replicas: 0 runs none.
+	h.apply("stage", strings.Replace(previewSpec(sb), `"replicas": 2`, `"replicas": 0`, 1), 1)
+	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "api", 0, 0)
+	wantStatus(t, err, http.StatusConflict, "service api runs no replica (replicas: 0): no log to read")
+	h.apply("stage", previewSpec(sb), 2)
+
+	// A pending instance has no log.
+	h.instance(e.ID, spec.KindService, "api", 0, 1, model.PhaseStarting, model.StatePending, "", "")
+	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "api", 0, 0)
+	wantStatus(t, err, http.StatusConflict, "the instance is pending: no log to read")
+	if code(err) != "not_running" {
+		t.Fatalf("code %q", code(err))
+	}
+	// Nor has an attached service whose sandbox is gone.
+	if _, err := h.st.InsertAttached(ctx, store.EnvAttached{EnvID: e.ID, Service: "dev", SandboxID: sb, ProcessID: "p1"}); err != nil {
+		t.Fatal(err)
+	}
+	h.exec("DELETE FROM sandboxes WHERE id = $1", sb)
+	_, err = h.svc.Logs(ctx, tenantA, "stage", spec.KindService, "dev", 0, 0)
+	wantStatus(t, err, http.StatusConflict, "sandbox "+sb.String()+" is gone or not this tenant's: no log to read")
+
+	// The replicas have an op in flight: the controller refuses before it
+	// touches them.
+	h.exec(`UPDATE sandboxes SET op = 'repair', op_id = gen_random_uuid(), op_owner = 'i2'
+		WHERE environment_id = $1`, e.ID)
+	err = h.svc.RestartService(ctx, tenantA, "stage", "api")
+	wantStatus(t, err, http.StatusConflict, "service api is busy with another operation; try again shortly")
+	var ae *apierr.Error
+	if !errors.As(err, &ae) || ae.Code != "busy" || ae.Header.Get("Retry-After") != "5" {
+		t.Fatalf("busy %+v", ae)
+	}
+}

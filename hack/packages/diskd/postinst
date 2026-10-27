@@ -1,0 +1,18 @@
+#!/bin/sh
+# diskd's unit: enabled on the first install, and started, or restarted
+# after an upgrade, whenever it is enabled. A restart keeps the pods'
+# disks: the next diskd takes them over. The ublk driver is loaded now,
+# and at every boot (modules-load.d).
+set -e
+if [ "$1" = configure ]; then
+    modprobe ublk_drv >/dev/null 2>&1 || true
+    if [ -z "$2" ]; then
+        systemctl enable diskd.service >/dev/null 2>&1 || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if systemctl is-enabled --quiet diskd.service; then
+            systemctl restart diskd.service
+        fi
+    fi
+fi

@@ -1,0 +1,26 @@
+[package]
+name = "tool-service"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-proto = { workspace = true }
+feos-utils = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+reqwest = { workspace = true }
+# Readable-content extraction, a Rust port of trafilatura.
+trafilatura = "0.3"
+# rg and fd: ripgrep's and fd's own engines, in-process.
+ignore = "0.4"
+regex = "1"
+regex-syntax = "0.8"
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"

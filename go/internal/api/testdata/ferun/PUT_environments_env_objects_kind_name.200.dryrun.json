@@ -1,0 +1,72 @@
+{
+  "method": "PUT",
+  "path": "/api/v1/environments/expensa-stage/objects/service/expense-service",
+  "query": {},
+  "status": 200,
+  "request": {
+    "object": {
+      "image": "ghcr.io/acme/expense:1.4",
+      "command": [
+        "/app/expense-service"
+      ],
+      "replicas": 3,
+      "env": {
+        "EXPENSA_APPROVAL_URL": {
+          "service": "approval-service",
+          "port": "http",
+          "key": "url"
+        },
+        "EXPENSA_DATABASE_URL": {
+          "addon": "postgres",
+          "database": "expensa",
+          "key": "url",
+          "role": "expense_svc"
+        },
+        "EXPENSA_HTTP_ADDR": "[::]:8080",
+        "EXPENSA_INTERNAL_TOKEN": {
+          "secret": "internal-token"
+        },
+        "EXPENSA_NATS_URL": {
+          "addon": "nats",
+          "key": "url"
+        }
+      },
+      "ports": [
+        {
+          "name": "http",
+          "port": 8080
+        }
+      ],
+      "readiness": {
+        "http": {
+          "port": "http",
+          "path": "/readyz"
+        }
+      }
+    },
+    "base": 7,
+    "dryRun": true
+  },
+  "response": {
+    "valid": true,
+    "findings": [],
+    "diff": [
+      {
+        "kind": "service",
+        "name": "expense-service",
+        "change": "update",
+        "fields": [
+          {
+            "path": "replicas",
+            "from": 2,
+            "to": 3
+          }
+        ],
+        "effect": "in place"
+      }
+    ],
+    "base": 7,
+    "current": 7
+  },
+  "note": "dryRun: a plan's answer"
+}

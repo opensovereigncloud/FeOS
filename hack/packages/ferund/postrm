@@ -1,0 +1,16 @@
+#!/bin/sh
+# A purge removes the unit's enablement and postinst's statoverrides;
+# /etc/ferun/ca stays even then when it is not empty: it holds the
+# issuer's key.
+set -e
+if [ "$1" = purge ]; then
+    rm -f /etc/systemd/system/multi-user.target.wants/ferund.service
+    for path in /etc/ferun/ca /etc/ferun/ferund.env; do
+        if dpkg-statoverride --list "$path" >/dev/null; then
+            dpkg-statoverride --remove "$path"
+        fi
+    done
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi

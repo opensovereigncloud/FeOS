@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stops ferund when the package goes, not when it is upgraded. The control
+# plane's state stays in its database.
+set -e
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl stop ferund.service || true
+fi

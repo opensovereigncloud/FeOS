@@ -1,0 +1,32 @@
+[Unit]
+Description=FeOS node agent
+Documentation=https://github.com/gardenlinux/FeOS
+After=network-online.target diskd.service feos-vms.service
+Wants=network-online.target diskd.service feos-vms.service
+# The pods' resolver's sockets, which outlive feosd (feosd.socket).
+Wants=feosd.socket
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/default/feosd
+# The microVMs' cgroups are feos-vms.service's: from systemd 258 on, a
+# service whose cgroup has controllers on for its children cannot start.
+# ExecStopPost= hands the microVMs of a feosd from before over to it.
+ExecStart=/usr/sbin/feosd --vms-cgroup system.slice/feos-vms.service $FEOSD_ARGS
+ExecStopPost=-/usr/sbin/feosd --hand-over-vms --vms-cgroup system.slice/feos-vms.service
+Restart=always
+RestartSec=1
+# feosd runs from the leaf feosd of the unit's cgroup. A restart or an
+# upgrade stops feosd alone: VMs and the task service keep running, and the
+# next feosd takes them over.
+Delegate=yes
+DelegateSubgroup=feosd
+KillMode=process
+# /var/lib/feos: images, VMs, snapshots. It stays when feosd stops.
+StateDirectory=feos
+LimitNOFILE=1048576
+TasksMax=infinity
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

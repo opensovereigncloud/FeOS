@@ -1,0 +1,348 @@
+syntax = "proto3";
+
+package feos.fleet.v1;
+
+import "google/protobuf/timestamp.proto";
+import "feos/network/v1/network.proto";
+import "feos/pod/v1/pod.proto";
+
+// The control plane's API for nodes (ADR 0015): the uplink. feosd is the
+// client. It dials every instance of the control plane, each on its port
+// for nodes, over TLS 1.3 with ALPN "h2", and uses the uplink of one
+// instance at a time, moving to another when that one fails.
+//
+// Every call but Join needs the node's certificate, whose URI name
+// spiffe://<trust domain>/node/<name> names the node. The control plane
+// takes the node's name from the certificate, never from a message.
+//
+// The node connection is the other connection to the same port, with ALPN
+// "feos-node/1". On it feosd is the HTTP/2 server and the control plane
+// calls the feos.* APIs, as feosctl does on the Unix socket.
+service FleetService {
+  // Joins a node: over a connection that authenticates the control plane
+  // only, with a one-time join token that an operator issued through the
+  // control plane. The token is "feos-join-<secret>.<pin>": the node sends
+  // the secret part and checks the control plane's certificate against the
+  // pin, the lowercase hex SHA-256 of the DER SubjectPublicKeyInfo of a
+  // root of the platform CA, which the control plane sends at the end of
+  // its chain on this port. The node accepts a trust bundle only if it
+  // holds that root.
+  //
+  // A token creates a name that no node has, or fails with ALREADY_EXISTS.
+  // A token that an operator pinned to a name joins that name again, for a
+  // node that lost its key, and revokes the name's earlier certificates. A
+  // token that is unknown, used or expired fails with PERMISSION_DENIED,
+  // except that a Join repeated with the same token and the same key
+  // within ten minutes, whose answer was lost, is answered again. From
+  // then on everything is mTLS.
+  rpc Join(JoinRequest) returns (JoinResponse);
+  // Issues the node a new certificate, for its name, at the old one's
+  // renew_after. A node that was removed is refused with PERMISSION_DENIED
+  // and has to join again.
+  rpc RenewCertificate(RenewCertificateRequest) returns (RenewCertificateResponse);
+  // The node's telemetry, every few seconds: the heartbeat. The control
+  // plane marks a node down when it stops, never on one missed report. The
+  // node gives a report three seconds, and moves its uplink to another
+  // instance at once when one fails.
+  rpc ReportTelemetry(Telemetry) returns (TelemetryResponse);
+  // The node's events, with a dense sequence number per start of feosd.
+  // The node sends batches in the order of their numbers, and the control
+  // plane acknowledges each batch once it has stored it; the node keeps
+  // what is not acknowledged and sends it again after a reconnect, to
+  // whichever instance. A batch without events asks where the control
+  // plane is: its acknowledgement names the last number stored for the
+  // start, and the node continues after it. The control plane ignores a
+  // number it has, and records the numbers it skips, less those the node
+  // counted as dropped, as a gap. An acknowledgement covers every number
+  // up to its own. A batch the control plane cannot store ends the stream
+  // with UNAVAILABLE, before any later batch of the stream is looked at;
+  // a malformed one (numbers not ascending, a start that is no UUID) ends
+  // it with INVALID_ARGUMENT. A batch holds at most 512 events and 1 MiB.
+  rpc PublishEvents(stream EventBatch) returns (stream EventAck);
+  // A pod's credentials (ADR 0014), asked for by the pod's feos-authn at
+  // every start, resume and restore: its signing request and HPKE key in,
+  // its certificate, the trust bundle and its bindings sealed to that key
+  // out. Fails with PERMISSION_DENIED for a pod the control plane has not
+  // placed on the node or that has no run there (it is not being created,
+  // started, resumed or restored, and does not run), and with NOT_FOUND for
+  // a pod it does not know. A request repeated with the same key, whose
+  // answer was lost, is answered again. Too many requests for one pod fail
+  // with RESOURCE_EXHAUSTED; feos-authn retries them with backoff.
+  rpc IssuePodCredentials(IssuePodCredentialsRequest) returns (IssuePodCredentialsResponse);
+  // The node's place on the cluster's mesh (ADR 0017), asked for whenever
+  // the uplink comes up and whenever the node's key or endpoint changes:
+  // its WireGuard key and endpoint in, the cluster's ULA and the node's
+  // /64 of it out. The control plane gives a node its /64 at its first
+  // call, the next of the ULA, never one twice, and the same one on every
+  // call after it, until the node is removed; the other nodes get the key
+  // and the endpoint as a peer (feos.network.v1.MeshService). In a
+  // cluster whose network is routed, the answer is empty. A request
+  // without a key, from a node with a prefix of its network's, asks only
+  // whether the cluster is meshed: its answer has the ULA and no /64.
+  rpc JoinMesh(JoinMeshRequest) returns (JoinMeshResponse);
+}
+
+message JoinRequest {
+  // The join token's secret: "feos-join-<secret>", without the pin.
+  string token = 1;
+  // The name the node proposes, its hostname: 1 to 63 lowercase letters,
+  // digits and "-", beginning and ending with a letter or a digit.
+  string name = 2;
+  // A PKCS#10 certificate signing request in DER, for the node's key
+  // (Ed25519 or ECDSA P-256). Its subject and names are ignored: the
+  // certificate names what the control plane assigns.
+  bytes csr = 3;
+}
+
+message JoinResponse {
+  // The name the control plane assigned.
+  string name = 1;
+  Certificate certificate = 2;
+  // The instances of the control plane: the node keeps a node connection
+  // to each.
+  repeated ControlPlaneInstance instances = 3;
+}
+
+// An instance of the control plane, as nodes reach it.
+message ControlPlaneInstance {
+  string id = 1;
+  // "host:port" of its port for nodes. The node checks the certificate
+  // there for the name it was configured with, not for this address:
+  // behind a balancer, every instance has an address of its own and the
+  // name they share.
+  string node_address = 2;
+}
+
+message RenewCertificateRequest {
+  // A signing request as for Join; it may carry a new key.
+  bytes csr = 1;
+}
+
+message RenewCertificateResponse {
+  Certificate certificate = 1;
+}
+
+// An issued certificate, with what the holder needs to use it.
+message Certificate {
+  // The SPIFFE ID the certificate carries as its URI name.
+  string spiffe_id = 1;
+  // DER, the issued certificate first, then the intermediates up to, not
+  // including, a root of the trust bundle.
+  repeated bytes chain = 2;
+  // The platform CA's roots in DER: what the holder checks its peers
+  // against.
+  repeated bytes trust_bundle = 3;
+  google.protobuf.Timestamp not_before = 4;
+  google.protobuf.Timestamp not_after = 5;
+  // When the holder renews: a node at half the lifetime, so that a node
+  // switched off at any time keeps half of it; a pod at three quarters.
+  google.protobuf.Timestamp renew_after = 6;
+}
+
+message Telemetry {
+  // A UUID that feosd makes at its start; the events' sequence numbers
+  // count within it.
+  string start_id = 1;
+  // The node's hostname, as the kernel has it.
+  string hostname = 2;
+  // "x86_64" or "aarch64".
+  string arch = 3;
+  string cpu_model = 4;
+  uint32 cpu_cores = 5;
+  // The load average over one minute.
+  double load1 = 6;
+  uint64 memory_total_bytes = 7;
+  uint64 memory_available_bytes = 8;
+  // Of the file system that holds the pods' disks.
+  uint64 disk_total_bytes = 9;
+  uint64 disk_available_bytes = 10;
+  // The pods on the node, by state.
+  uint32 pods_pending = 11;
+  uint32 pods_running = 12;
+  uint32 pods_suspended = 13;
+  uint32 pods_other = 14;
+  // The hash of the node's steady pods: the lowercase hex SHA-256 of one
+  // line "<pod id> <state>\n" per pod that is POD_STATE_RUNNING or
+  // POD_STATE_SUSPENDED, sorted by pod ID, with the ID in lowercase
+  // hyphenated form and the state as its enum name, e.g.
+  // "3f2c…-…-… POD_STATE_RUNNING\n". The control plane computes the same
+  // hash from its registry and lists the node's pods and reconciles when
+  // the two differ.
+  string inventory_hash = 15;
+  Versions versions = 16;
+  // Whether diskd has an object store, without which a pod cannot
+  // hibernate.
+  bool object_store = 17;
+  // The node's IPv6 prefix for pods (ADR 0010), e.g. "2001:db8:1:2::/64".
+  string pod_prefix = 18;
+  // Which object store diskd uses: the lowercase hex SHA-256 of its
+  // endpoint and bucket, "<endpoint>\n<bucket>". A pod hibernated on one
+  // node restores on another only if both name the same store. Empty
+  // without one.
+  string object_store_id = 19;
+}
+
+// What the node has installed (ADR 0009).
+message Versions {
+  string feosd = 1;
+  // The kernel's release, e.g. "6.12.48".
+  string kernel = 2;
+  // The Firecracker and guest versions installed side by side, newest
+  // first.
+  repeated string firecracker = 3;
+  repeated string guest = 4;
+  string diskd = 5;
+}
+
+message TelemetryResponse {
+  // How long the node waits before its next report.
+  uint32 interval_seconds = 1;
+  // The instances of the control plane, as in JoinResponse: the node
+  // dials the ones it has no node connection to, and drops those that
+  // are no longer listed.
+  repeated ControlPlaneInstance instances = 2;
+}
+
+message EventBatch {
+  // The start of feosd the events belong to (Telemetry.start_id). A
+  // stream may carry the batches of several starts, an earlier start's
+  // first: what the node had not sent before it restarted.
+  string start_id = 1;
+  // Ascending, dense numbers; none for a batch that only asks where the
+  // control plane is.
+  repeated Event events = 2;
+  // How many events of this start the node has dropped so far, because its
+  // buffer was full (ADR 0013). Their numbers are skipped.
+  uint64 dropped = 3;
+}
+
+message Event {
+  // Dense within the start, from 1.
+  uint64 seq = 1;
+  google.protobuf.Timestamp time = 2;
+  oneof body {
+    // A pod's state changed.
+    feos.pod.v1.PodEvent pod = 10;
+    // A record of a pod's feos-authn (ADR 0014).
+    AuditRecord audit = 11;
+    // A traffic record of a pod (ADR 0013).
+    feos.network.v1.TrafficRecord traffic = 12;
+    // Something of the node itself: feosd started or stops.
+    NodeEvent node = 13;
+  }
+}
+
+message AuditRecord {
+  string pod_id = 1;
+  // What was recorded: "kube_request", "kube_deny", "tls_connection",
+  // "ssh_signature", "ssh_deny", "tls_signature", "handshake_report".
+  string kind = 2;
+  // The record's fields as a JSON object, e.g. {"binding":"prod",
+  // "method":"GET","path":"/api","status":200}.
+  string detail_json = 3;
+}
+
+message NodeEvent {
+  // "started", or "stopping": feosd is restarting, for example for an
+  // upgrade, and the control plane waits a little longer for its
+  // connections to come back before it fails calls for the node.
+  string kind = 1;
+  string message = 2;
+}
+
+message EventAck {
+  string start_id = 1;
+  // Every event of the start up to and including this number is stored.
+  uint64 seq = 2;
+}
+
+message IssuePodCredentialsRequest {
+  string pod_id = 1;
+  // A PKCS#10 signing request in DER for the pod's Ed25519 key, made in
+  // feos-authn's memory. Its subject and names are ignored: the
+  // certificate names the pod's SPIFFE ID and its service's DNS names.
+  bytes csr = 2;
+  // The run's HPKE public key (X25519, 32 bytes), to which the bindings
+  // are sealed.
+  bytes hpke_public_key = 3;
+}
+
+message IssuePodCredentialsResponse {
+  Certificate certificate = 1;
+  // The pod's bindings, sealed to the run's key; unset when it has none.
+  SealedBindings bindings = 2;
+}
+
+// A PodBindings, sealed with HPKE (RFC 9180) in base mode, suite
+// DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, with the
+// info "feos bindings v1". The additional data is the pod's ID in
+// lowercase hyphenated form, a zero byte and the version, so that the
+// version is authenticated too.
+message SealedBindings {
+  // The encapsulated key.
+  bytes enc = 1;
+  bytes ciphertext = 2;
+  // The version of the binding sets it holds.
+  string version = 3;
+}
+
+// What a sealed box holds: all of a pod's bindings (ADR 0014). A change
+// states the whole set again.
+message PodBindings {
+  repeated KubeBinding kube = 1;
+  repeated SshBinding ssh = 2;
+}
+
+// A Kubernetes API that the pod reaches on a loopback port in plaintext,
+// and to which feos-authn adds the credential.
+message KubeBinding {
+  string name = 1;
+  // The loopback port in the pod.
+  uint32 port = 2;
+  // The API server, "https://host[:port]".
+  string server = 3;
+  // The name to check the server's certificate for; the server's host
+  // when empty.
+  string server_name = 4;
+  // PEM; the system's roots when empty.
+  string ca_pem = 5;
+  oneof credential {
+    string token = 6;
+    ClientCertificate client_certificate = 7;
+  }
+}
+
+message ClientCertificate {
+  string cert_pem = 1;
+  string key_pem = 2;
+}
+
+// An SSH login that the pod's agent signs.
+message SshBinding {
+  string name = 1;
+  // "ssh://host[:port]"; empty for a binding to any server.
+  string server = 2;
+  string user = 3;
+  // The server's host keys, "<type> <base64>".
+  repeated string host_keys = 4;
+  // The private key, unencrypted OpenSSH.
+  string private_key = 5;
+}
+
+message JoinMeshRequest {
+  // The node's WireGuard public key, 32 bytes; none asks only whether the
+  // cluster is meshed.
+  bytes public_key = 1;
+  // "host:port" where the other nodes reach the node's WireGuard device,
+  // e.g. "10.0.0.11:51820" or "[2001:db8::11]:51820".
+  string endpoint = 2;
+}
+
+message JoinMeshResponse {
+  // The cluster's ULA, a /48, e.g. "fd5e:1b2c:93a0::/48"; empty in a
+  // cluster whose network is routed.
+  string pod_network = 1;
+  // The node's /64 of it, e.g. "fd5e:1b2c:93a0:7::/64"; empty for a
+  // request without a key.
+  string pod_prefix = 2;
+}

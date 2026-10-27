@@ -1,0 +1,281 @@
+#!/bin/bash
+# Boots FeOS as a node's operating system in QEMU: the host kernel of
+# make kernel, with
+#
+# 1. the kernel's tests: those against the kernel of feos-utils' nftables,
+#    pod-service's pods' table and pod link, and traffic-service's
+#    connection tracking and nflog, built static and run as init of a
+#    Debian userland (iproute2, ping, nft), so that the kernel is shown to
+#    take what feosd writes;
+# 2. the node: the initramfs of make initramfs, feos-host-init as init, on
+#    QEMU's user network (DHCPv4, router advertisements, NAT) and with
+#    feos.pod-prefix on the kernel's command line. It checks the serial log
+#    (the node's IPv4 by DHCPv4, its IPv6, its clock, diskd and feosd, the
+#    pods' network) and feosd's API through a port forward, with feosctl,
+#    and an upgrade of feosd by itself, which keeps its pid and hands the
+#    pods' resolver's sockets to the new binary. With
+#    PODS=1, a pod on the node too, a microVM one level of nesting deeper:
+#    its addresses of both families, a name through feosd's resolver, and
+#    IPv4 out through the node's masquerade and QEMU's NAT, to the
+#    internet. It needs KVM to nest twice, and a host quiet enough for the
+#    pod's guest to attach within feosd's minute.
+#
+#   make test-host                  # after make kernel initramfs
+#   STAGES=node make test-host      # one of the two: kernel or node
+#   PODS=1 make test-host           # with a pod on the node
+#
+# Needs /dev/kvm, qemu-system-x86_64, docker, cpio and zstd, and for the
+# pod the internet. The logs stay in target/test-host/.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+OUT="${REPO_ROOT}/target/test-host"
+KERNEL="${KERNEL:-${REPO_ROOT}/target/kernel/vmlinuz}"
+INITRAMFS="${INITRAMFS:-${REPO_ROOT}/target/initramfs.zst}"
+STAGES="${STAGES:-kernel node}"
+MUSL_TARGET=x86_64-unknown-linux-musl
+TESTS_IMAGE=feos-test-host-kernel
+# The pods' prefix of the node, from the kernel's command line.
+POD_PREFIX="fd00:fe05:ffff::/64"
+# The prefix of QEMU's user network, which its router advertises, and
+# how the node's address by SLAAC in it is logged.
+UPLINK_PREFIX="fd00:fe05:1::/64"
+UPLINK_ADDRESS="fd00:fe05:1:0:[0-9a-f:]+/64"
+# How long a boot may take until its checks pass.
+BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"
+
+log() { printf '[test-host] %s\n' "$*"; }
+fail() {
+  printf '[test-host] FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+[ -e /dev/kvm ] || fail "no /dev/kvm"
+[ -f "${KERNEL}" ] || fail "no ${KERNEL}: make kernel"
+mkdir -p "${OUT}"
+
+# QEMU under sudo where /dev/kvm is not the caller's.
+SUDO=""
+[ -w /dev/kvm ] || SUDO="sudo"
+QEMU=(${SUDO} qemu-system-x86_64 -enable-kvm -cpu host -smp 2 -no-reboot
+  -kernel "${KERNEL}" -display none -monitor none)
+
+# Waits until the file has a line matching the pattern, or the timeout.
+wait_for_line() {
+  local file="$1" pattern="$2" timeout="$3" start=${SECONDS}
+  until grep -Eq -- "${pattern}" "${file}" 2>/dev/null; do
+    if ((SECONDS - start > timeout)); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+kernel_stage() {
+  local dir="${OUT}/kernel"
+  ${SUDO} rm -rf "${dir}"
+  mkdir -p "${dir}/image/tests"
+
+  log "building the kernel's tests, static"
+  local executables
+  executables="$(cd "${REPO_ROOT}" && cargo test --no-run --lib --target "${MUSL_TARGET}" \
+    -p feos-utils -p pod-service -p traffic-service --message-format=json |
+    jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null)
+           | .executable')"
+  [ -n "${executables}" ] || fail "no test executables"
+  local executable
+  for executable in ${executables}; do
+    cp "${executable}" "${dir}/image/tests/$(basename "${executable}" | sed 's/-[0-9a-f]*$//')"
+  done
+
+  cat >"${dir}/image/init" <<'EOF'
+#!/bin/bash
+# The kernel's tests as init (hack/initramfs/test-host).
+mkdir -p /proc /sys /dev /run /tmp
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+ip link set lo up
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin NFT=/usr/sbin/nft
+echo "feos-kernel-tests: linux $(uname -r)"
+status=PASS
+# Each test in a network namespace of its own, as they want to be run.
+for test in /feos-tests/*; do
+  echo "feos-kernel-tests: ${test##*/}"
+  for name in $("${test}" --ignored --list | sed -n 's/: test$//p'); do
+    case "${name}" in *capture_test_vectors) continue ;; esac
+    unshare -n sh -c 'ip link set lo up && exec "$@"' sh \
+      "${test}" --ignored --exact "${name}" || status=FAIL
+  done
+done
+echo "feos-kernel-tests: ${status}"
+# The console drains first: the kernel's "Power Off" would cut the line.
+sleep 1
+echo o >/proc/sysrq-trigger
+sleep 10
+EOF
+  chmod +x "${dir}/image/init"
+  cat >"${dir}/image/Dockerfile" <<'EOF'
+FROM debian:13-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iproute2 iputils-ping nftables cpio && rm -rf /var/lib/apt/lists/*
+COPY tests /feos-tests
+COPY init /init
+EOF
+  docker build -q -t "${TESTS_IMAGE}" "${dir}/image" >/dev/null
+  # The container's root, but what the kernel mounts.
+  docker run --rm "${TESTS_IMAGE}" sh -c 'cd / && find . -xdev \
+      \( -path ./proc -o -path ./sys -o -path ./dev -o -path ./.dockerenv \) -prune \
+      -o -print0 | cpio --null -o -H newc --quiet' |
+    zstd -q -T0 >"${dir}/initramfs.zst"
+
+  log "booting the host kernel with the kernel's tests"
+  local serial="${dir}/serial.log"
+  # The caller's, although QEMU may run as root.
+  : >"${serial}"
+  timeout "${BOOT_TIMEOUT}" "${QEMU[@]}" -m 2G -nic none -initrd "${dir}/initramfs.zst" \
+    -append "console=ttyS0 panic=-1" -serial "file:${serial}" ||
+    log "QEMU ended with $?"
+  grep -E '^test |^test result|feos-kernel-tests' "${serial}" | tr -d '\r' || true
+  grep -q 'feos-kernel-tests: PASS' "${serial}" || fail "the kernel's tests failed, see ${serial}"
+  log "the kernel takes what feosd writes"
+}
+
+node_stage() {
+  [ -f "${INITRAMFS}" ] || fail "no ${INITRAMFS}: make initramfs"
+  local dir="${OUT}/node"
+  ${SUDO} rm -rf "${dir}"
+  mkdir -p "${dir}"
+
+  log "building feosctl"
+  (cd "${REPO_ROOT}" && cargo build -q -p feosctl)
+  local feosctl="${REPO_ROOT}/target/debug/feosctl"
+  local port
+  port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+  export FEOS_ADDRESS="http://127.0.0.1:${port}"
+
+  log "booting the node; feosd's API on ${FEOS_ADDRESS}"
+  local serial="${dir}/serial.log"
+  : >"${serial}"
+  QEMU_PID="${dir}/qemu.pid"
+  "${QEMU[@]}" -m 4G -initrd "${INITRAMFS}" \
+    -append "console=ttyS0 panic=-1 feos.pod-prefix=${POD_PREFIX}" \
+    -nic "user,model=virtio-net-pci,ipv6-net=${UPLINK_PREFIX},hostfwd=tcp:127.0.0.1:${port}-:1337" \
+    -serial "file:${serial}" -pidfile "${QEMU_PID}" -daemonize
+  # The pid file is root's where QEMU runs under sudo.
+  trap '${SUDO} kill "$(${SUDO} cat "${QEMU_PID}" 2>/dev/null)" 2>/dev/null || true' EXIT
+
+  local start=${SECONDS}
+  until "${feosctl}" host ping >/dev/null 2>&1; do
+    if ((SECONDS - start > BOOT_TIMEOUT)); then
+      tail -40 "${serial}" | tr -d '\r'
+      fail "feosd does not answer within ${BOOT_TIMEOUT}s"
+    fi
+    sleep 2
+  done
+  log "feosd answers after $((SECONDS - start))s"
+  "${feosctl}" host version-info
+  "${feosctl}" pod list >/dev/null || fail "the pods' service does not answer"
+
+  # The node's network and clock, as host-init and feosd log them.
+  # Host-init logs its uplink's addresses once DHCPv6 is through, which QEMU
+  # does not serve, and sets the clock by pool.ntp.org over IPv4, as QEMU
+  # names no NTP server.
+  local check
+  for check in \
+    'feos-host-init .* is setting the machine up' \
+    'DHCPv4: 10\.0\.2\.15/24 on eth0, routed by 10\.0\.2\.2' \
+    "eth0's addresses: .*10\.0\.2\.15/24" \
+    "eth0's addresses: .*${UPLINK_ADDRESS}" \
+    'Resolvers: 10\.0\.2\.3' \
+    "The pods' prefix, from the kernel's command line: ${POD_PREFIX}" \
+    'Started diskd \(pid' \
+    'Started feosd \(pid' \
+    "Network: Pods get addresses of ${POD_PREFIX%/*}/${POD_PREFIX#*/} and 169\.254\.16\.0/20, DNS at 169\.254\.0\.53" \
+    'TimeSyncWorker: System clock updated'; do
+    wait_for_line "${serial}" "${check}" 60 || {
+      tail -60 "${serial}" | tr -d '\r'
+      fail "not in the node's log: ${check}"
+    }
+    log "ok: ${check}"
+  done
+  # Nothing ended and was started again, the kernel's log takes every
+  # line, and the pods' network is whole.
+  sleep 5
+  for check in \
+    'exited with code' \
+    "The kernel's log keeps its limit" \
+    "The pods' network is not set up" \
+    'pods with a network fail'; do
+    if grep -E -- "${check}" "${serial}"; then
+      fail "in the node's log: ${check}"
+    fi
+  done
+  log "the node runs, with IPv4 by DHCPv4 and IPv6, its clock, and the pods' network"
+
+  # feosd replaces itself from a URL, here QEMU's host, and runs the new
+  # binary at its pid, with the resolver's sockets that feos-host-init
+  # handed it.
+  local serve="${dir}/serve" http sum
+  mkdir -p "${serve}"
+  cp "${REPO_ROOT}/target/container/${MUSL_TARGET}/release/feosd" "${serve}/feosd"
+  sum="$(sha256sum "${serve}/feosd" | cut -d' ' -f1)"
+  http="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+  python3 -m http.server --bind 127.0.0.1 --directory "${serve}" "${http}" >"${dir}/http.log" 2>&1 &
+  HTTP_PID=$!
+  trap '${SUDO} kill "$(${SUDO} cat "${QEMU_PID}" 2>/dev/null)" 2>/dev/null || true
+    kill "${HTTP_PID}" 2>/dev/null || true' EXIT
+  sleep 1
+  "${feosctl}" host upgrade --url "http://10.0.2.2:${http}/feosd" --sha256-sum "${sum}" >/dev/null ||
+    fail "feosd refuses an upgrade"
+  wait_for_line "${serial}" 'Main: Executing new binary' 60 || {
+    tail -30 "${serial}" | tr -d '\r'
+    fail "feosd did not run its new binary"
+  }
+  start=${SECONDS}
+  until [ "$(grep -c "The resolver takes the UDP socket handed to feosd" "${serial}")" -ge 2 ] &&
+    "${feosctl}" host ping >/dev/null 2>&1; do
+    ((SECONDS - start <= 60)) || {
+      tail -30 "${serial}" | tr -d '\r'
+      fail "the upgraded feosd does not answer, or takes no sockets"
+    }
+    sleep 1
+  done
+  [ "$(grep -c 'Started feosd (pid' "${serial}")" = 1 ] || fail "feos-host-init started feosd again"
+  if grep -E -- 'exited with code' "${serial}"; then
+    fail "in the node's log after the upgrade: exited with code"
+  fi
+  log "feosd upgrades itself at its pid, and its resolver takes the handed sockets again"
+
+  [ "${PODS:-0}" = 1 ] || return 0
+  local pod info
+  pod="$(cat /proc/sys/kernel/random/uuid)"
+  log "a pod on the node: ${pod}"
+  timeout 600 "${feosctl}" pod create --pod-id "${pod}" \
+    --image docker.io/library/busybox:1.36 --wait -- sleep 3600 ||
+    fail "the pod does not run"
+  info="$("${feosctl}" pod get "${pod}")"
+  echo "${info}"
+  grep -q "IPv6 address: ${POD_PREFIX%::/*}::" <<<"${info}" ||
+    fail "the pod has no address of ${POD_PREFIX}"
+  grep -q 'IPv4 address: 169\.254\.' <<<"${info}" ||
+    fail "the pod has no IPv4 address of the node's range"
+  timeout 120 "${feosctl}" container --pod "${pod}" exec main -- \
+    wget -q -O /dev/null http://example.com/ ||
+    fail "the pod does not reach http://example.com/ by name"
+  timeout 120 "${feosctl}" container --pod "${pod}" exec main -- \
+    ping -c 2 -W 5 1.1.1.1 ||
+    fail "the pod does not reach 1.1.1.1"
+  log "the pod reaches the internet by name and over IPv4"
+}
+
+for stage in ${STAGES}; do
+  case "${stage}" in
+    kernel) kernel_stage ;;
+    node) node_stage ;;
+    *) fail "no stage ${stage}" ;;
+  esac
+done
+log "PASS"

@@ -1,59 +1,115 @@
 [workspace]
 members = [
-    "feos",
-    "feos/services/vm-service",
-    "feos/services/host-service",
-    "feos/services/image-service",
-    "feos/services/task-service",
-    "feos/services/container-service",
-    "cli",
-    "feos/proto",
-    "feos/utils",
+    "crates/disk-store",
+    "crates/diskctl",
+    "crates/diskd",
+    "crates/feos",
+    "crates/feos-host-init",
+    "crates/feos-proto",
+    "crates/feos-utils",
+    "crates/feosctl",
+    "crates/fleet-client",
+    "crates/services/container-service",
+    "crates/services/dns-service",
+    "crates/services/forward-service",
+    "crates/services/host-service",
+    "crates/services/image-service",
+    "crates/services/network-service",
+    "crates/services/pod-service",
+    "crates/services/task-service",
+    "crates/services/tool-service",
+    "crates/services/traffic-service",
+    "crates/services/watch-service",
+    "crates/services/microvm-service",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.lints.clippy]
 uninlined_format_args = "warn"
+# tonic::Status is 176 bytes; every gRPC handler returns it.
+result_large_err = "allow"
 
 [workspace.package]
-version = "0.5.0"
-edition = "2021"
+version = "0.6.0"
+edition = "2024"
 
 [workspace.dependencies]
-tokio = { version = "1.47.1", features = ["full"] }
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "process", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.15", features = ["net"] }
+tokio-vsock = { version = "0.7.2", features = ["tonic013"] }
 tonic = "0.13.0"
 prost = "0.13.5"
 prost-types = "0.13.5"
 anyhow = "1.0.100"
-nix = { version = "0.30.1", features = ["mount", "user", "reboot", "feature", "net", "aio", "signal", "process", "fs", "hostname"] }
+nix = { version = "0.30.1", features = ["mount", "user", "reboot", "feature", "net", "aio", "signal", "process", "fs", "hostname", "ioctl"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.132"
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "macros", "uuid"] }
+# sqlite needs no TLS.
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "uuid"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 tonic-build = "0.13.0"
 log = "0.4.28"
 env_logger = "0.11"
-openssl = { version = "0.10.72", features = ["vendored"] }
-oci-distribution = "0.11.0"
+# youki as a library: cgroup v2 only, no libseccomp (C), no systemd.
+libcontainer = { version = "0.7.0", default-features = false, features = ["v2"] }
+oci-client = { version = "0.15.0", default-features = false, features = ["rustls-tls"] }
+# The one HTTP client, the version oci-client uses. rustls with ring; webpki
+# roots for registries and the web, the system's roots for upgrades.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots"] }
 tempfile = "3.23.0"
-tower = { version = "0.5.2", features = ["full"] }
+tower = { version = "0.5.2", features = ["util"] }
 sha2 = "0.10"
-hex = "0.4"
-digest = "0.10"
 clap = { version = "4.5.48", features = ["derive", "env"] }
-dotenvy = { version = "0.15"}
 libc = "0.2"
 rtnetlink = "0.18.1"
-netlink-packet-route = "~0.25.0"
 pnet = "0.35.0"
 dhcproto = "0.13.0"
+# DNS messages for feosd's resolver: the wire format only, no I/O, no DNSSEC.
+hickory-proto = { version = "0.25.2", default-features = false }
+rand = "0.9"
 socket2 = "0.6.0"
 futures = "0.3.31"
 chrono = "0.4.42"
 thiserror = "2.0.16"
 hyper = "1.7.0"
-hyper-util = { version = "0.1.17", features = ["full"] }
+hyper-util = { version = "0.1.17", features = ["tokio"] }
 termcolor = "1.1"
-once_cell = "1.19"
-feos-proto = { path = "feos/proto" }
+# diskd and its chunk store.
+blake3 = "1"
+zstd = "0.13"
+object_store = { version = "0.12", features = ["aws"] }
+# crates.io stops at 0.4.8; the async API diskd uses (UblkCtrlAsync and
+# the typed ops such as read_at_raw and poll_add) is only on main. Re-pin
+# on the next release.
+libublk = { git = "https://github.com/ublk-org/libublk-rs", rev = "0d172817b3737079477337b39538ccdc91766e6e" }
+io-uring = "0.7"
+linked-hash-map = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+proptest = "1"
+# TLS with ring, as reqwest has it: the control plane's connections
+# (ADR 0015), and real ClientHellos in tests.
+rustls = { version = "0.23.31", default-features = false }
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["ring"] }
+# The node's key and signing request, and the certificates it checks.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+x509-parser = "0.18.1"
+pem = "4.0.0"
+
+# Workspace crates
+disk-store = { path = "crates/disk-store" }
+feos-proto = { path = "crates/feos-proto" }
+feos-utils = { path = "crates/feos-utils" }
+fleet-client = { path = "crates/fleet-client" }
+container-service = { path = "crates/services/container-service" }
+dns-service = { path = "crates/services/dns-service" }
+forward-service = { path = "crates/services/forward-service" }
+host-service = { path = "crates/services/host-service" }
+image-service = { path = "crates/services/image-service" }
+network-service = { path = "crates/services/network-service" }
+pod-service = { path = "crates/services/pod-service" }
+task-service = { path = "crates/services/task-service" }
+tool-service = { path = "crates/services/tool-service" }
+traffic-service = { path = "crates/services/traffic-service" }
+watch-service = { path = "crates/services/watch-service" }
+microvm-service = { path = "crates/services/microvm-service" }

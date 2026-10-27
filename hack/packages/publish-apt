@@ -1,0 +1,142 @@
+#!/bin/bash
+# Publish .deb packages to FeOS's apt repository, an R2 bucket served as
+# https://apt.fecode.dev (ADR 0009):
+#
+#   pool/main/<p>/<package>/<package>_<version>_<arch>.deb
+#   dists/stable/{Release,InRelease,Release.gpg}
+#   dists/stable/main/binary-amd64/Packages{,.gz}
+#   feos.gpg, feos.asc        the repository's signing key
+#
+#   hack/packages/publish-apt target/packages/*.deb
+#
+# Without packages, it signs the index again.
+#
+# The index keeps what was published before: the versions of Firecracker
+# and the guest install side by side, and nodes need the old ones for
+# their suspended VMs. A version that is published already is not uploaded
+# again; one published with other content is refused.
+#
+# The bucket's credentials come from FEOS_APT_ENV (R2_ENDPOINT, R2_BUCKET,
+# R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY), the signing key from the GnuPG
+# home FEOS_APT_GNUPGHOME. Needs curl with --aws-sigv4, gpg and
+# apt-ftparchive.
+set -euo pipefail
+
+FEOS_APT_ENV="${FEOS_APT_ENV:-${HOME}/.config/feos/apt/r2.env}"
+export GNUPGHOME="${FEOS_APT_GNUPGHOME:-${HOME}/.config/feos/apt/gnupg}"
+SUITE=stable
+COMPONENT=main
+ARCH=amd64
+INDEX_DIR="dists/${SUITE}/${COMPONENT}/binary-${ARCH}"
+
+log() { printf '[publish-apt] %s\n' "$*"; }
+[ -r "${FEOS_APT_ENV}" ] || { log "no credentials in ${FEOS_APT_ENV}"; exit 1; }
+# shellcheck disable=SC1090
+. "${FEOS_APT_ENV}"
+: "${R2_ENDPOINT:?}" "${R2_BUCKET:?}" "${R2_ACCESS_KEY_ID:?}" "${R2_SECRET_ACCESS_KEY:?}"
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK:?}"' EXIT
+# The credentials go to curl in a file, not on its command line.
+CURL_CONFIG="${WORK}/curl.config"
+(umask 077 && printf 'aws-sigv4 = "aws:amz:auto:s3"\nuser = "%s:%s"\n' \
+  "${R2_ACCESS_KEY_ID}" "${R2_SECRET_ACCESS_KEY}" >"${CURL_CONFIG}")
+BASE="${R2_ENDPOINT}/${R2_BUCKET}"
+
+# put <file> <key> <content type> <cache control>
+put() {
+  curl -fsS -K "${CURL_CONFIG}" -o /dev/null -H "Content-Type: $3" \
+    -H "Cache-Control: $4" -T "$1" "${BASE}/$2"
+}
+# get <key> <file>: fails if the object does not exist.
+get() { curl -fsS -K "${CURL_CONFIG}" -o "$2" "${BASE}/$1"; }
+# The MD5 of an object (R2's ETag), empty if it does not exist.
+etag() {
+  curl -sS -K "${CURL_CONFIG}" -I "${BASE}/$1" |
+    sed -n 's/^[Ee][Tt]ag: *"\{0,1\}\([0-9a-f]*\)"\{0,1\}.*/\1/p' | tr -d '\r'
+}
+
+KEY_ID="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')"
+[ -n "${KEY_ID}" ] || { log "no signing key in ${GNUPGHOME}"; exit 1; }
+
+# --- the packages, into the pool ------------------------------------------
+STAGE="${WORK}/repo"
+mkdir -p "${STAGE}/${INDEX_DIR}" "${STAGE}/pool"
+for deb in "$@"; do
+  package="$(dpkg-deb -f "${deb}" Package)"
+  prefix="${package:0:1}"
+  [[ "${package}" == lib* ]] && prefix="${package:0:4}"
+  key="pool/${COMPONENT}/${prefix}/${package}/$(basename "${deb}")"
+  mkdir -p "${STAGE}/$(dirname "${key}")"
+  cp "${deb}" "${STAGE}/${key}"
+  published="$(etag "${key}")"
+  if [ -z "${published}" ]; then
+    log "uploading ${key}"
+    put "${deb}" "${key}" application/vnd.debian.binary-package \
+      "public, max-age=31536000, immutable"
+  elif [ "${published}" = "$(md5sum "${deb}" | cut -d' ' -f1)" ]; then
+    log "${key} is published already"
+  else
+    log "${key} is published with other content; give it a new version"
+    exit 1
+  fi
+done
+
+# --- the index: what was published, with the new packages on top --------
+OLD="${WORK}/Packages.old"
+if ! get "${INDEX_DIR}/Packages" "${OLD}" 2>/dev/null; then
+  log "no index yet; starting one"
+  : >"${OLD}"
+fi
+(cd "${STAGE}" && apt-ftparchive packages pool) >"${WORK}/Packages.new"
+python3 -I - "${OLD}" "${WORK}/Packages.new" >"${STAGE}/${INDEX_DIR}/Packages" <<'EOF'
+import sys
+
+def stanzas(path):
+    text = open(path).read().strip()
+    return [s for s in text.split("\n\n") if s.strip()] if text else []
+
+def field(stanza, name):
+    for line in stanza.splitlines():
+        if line.startswith(name + ":"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+# One stanza per file; the new one wins.
+index = {field(s, "Filename"): s for s in stanzas(sys.argv[1])}
+index.update({field(s, "Filename"): s for s in stanzas(sys.argv[2])})
+ordered = sorted(index.values(), key=lambda s: (field(s, "Package"), field(s, "Filename")))
+print("\n\n".join(s.strip() for s in ordered))
+EOF
+gzip -9nk "${STAGE}/${INDEX_DIR}/Packages"
+log "the index lists $(grep -c '^Package:' "${STAGE}/${INDEX_DIR}/Packages") packages"
+
+(
+  cd "${STAGE}/dists/${SUITE}"
+  apt-ftparchive \
+    -o APT::FTPArchive::Release::Origin=FeOS \
+    -o APT::FTPArchive::Release::Label=FeOS \
+    -o APT::FTPArchive::Release::Suite="${SUITE}" \
+    -o APT::FTPArchive::Release::Codename="${SUITE}" \
+    -o APT::FTPArchive::Release::Architectures="${ARCH}" \
+    -o APT::FTPArchive::Release::Components="${COMPONENT}" \
+    -o APT::FTPArchive::Release::Description="FeOS node packages" \
+    release . >"${WORK}/Release"
+  mv "${WORK}/Release" Release
+  gpg --batch --yes --local-user "${KEY_ID}" --clearsign -o InRelease Release
+  gpg --batch --yes --local-user "${KEY_ID}" -abs -o Release.gpg Release
+)
+gpg --export "${KEY_ID}" >"${STAGE}/feos.gpg"
+gpg --armor --export "${KEY_ID}" >"${STAGE}/feos.asc"
+
+# The index before the Release that names it; clients never see a Release
+# whose files are not there yet.
+NO_CACHE="no-cache, max-age=0"
+put "${STAGE}/${INDEX_DIR}/Packages" "${INDEX_DIR}/Packages" "text/plain; charset=utf-8" "${NO_CACHE}"
+put "${STAGE}/${INDEX_DIR}/Packages.gz" "${INDEX_DIR}/Packages.gz" application/gzip "${NO_CACHE}"
+put "${STAGE}/dists/${SUITE}/Release" "dists/${SUITE}/Release" "text/plain; charset=utf-8" "${NO_CACHE}"
+put "${STAGE}/dists/${SUITE}/Release.gpg" "dists/${SUITE}/Release.gpg" application/pgp-signature "${NO_CACHE}"
+put "${STAGE}/dists/${SUITE}/InRelease" "dists/${SUITE}/InRelease" "text/plain; charset=utf-8" "${NO_CACHE}"
+put "${STAGE}/feos.gpg" feos.gpg application/pgp-keys "public, max-age=3600"
+put "${STAGE}/feos.asc" feos.asc application/pgp-keys "public, max-age=3600"
+log "published to ${R2_BUCKET}, signed by ${KEY_ID}"

@@ -1,0 +1,33 @@
+# nfpm configuration of a guest package (ADR 0009). Versions install side by
+# side: a suspended VM goes on with the guest it was booted with.
+name: feos-guest-${GUEST_NAME}
+arch: amd64
+platform: linux
+version: ${GUEST_VERSION}
+section: admin
+priority: optional
+maintainer: IronCore authors <ospo@sap.com>
+vendor: SAP SE
+homepage: https://github.com/gardenlinux/FeOS
+license: Apache-2.0 AND GPL-2.0-only
+description: |-
+  FeOS guest ${GUEST_VERSION}, the PID 1 of feosd's microVMs
+  The guest's Linux kernel, its initramfs with feos-guest as /init, and the
+  blank data volume pods' disks start from, in
+  /usr/lib/feos/guest/${GUEST_VERSION}/.
+contents:
+  - src: target/guest/vmlinuz
+    dst: /usr/lib/feos/guest/${GUEST_VERSION}/vmlinuz
+    expand: true
+    file_info:
+      mode: 0644
+  - src: target/guest/initramfs.cpio.zst
+    dst: /usr/lib/feos/guest/${GUEST_VERSION}/initramfs
+    expand: true
+    file_info:
+      mode: 0644
+  - src: target/guest/data.img.zst
+    dst: /usr/lib/feos/guest/${GUEST_VERSION}/data.img.zst
+    expand: true
+    file_info:
+      mode: 0644

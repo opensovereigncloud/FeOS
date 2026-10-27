@@ -1,0 +1,227 @@
+syntax = "proto3";
+
+package feos.container.v1;
+
+import "google/protobuf/any.proto";
+
+// ContainerService manages the lifecycle of containers. It provides an
+// external-facing API for clients to create, run, and manage containers,
+// abstracting the underlying details of shims and runtimes like youki.
+//
+// A container's root filesystem is an overlay: the image's files below, the
+// container's writes above, in the container's directory on the data root.
+// Containers share the host's network namespace. Every container sees the
+// FeOS toolbox (static coreutils) at /feos-tools, on its PATH after the
+// image's own directories, and the share directory read-only at /run/feos;
+// its /etc/resolv.conf links to the resolvers the host pushed.
+service ContainerService {
+  // Creates a new container from an OCI image but does not start it.
+  // The image is pulled first if it is not present; the call returns once
+  // the container is created, or fails with the reason it could not be.
+  rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
+
+  // Starts a previously created container.
+  rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
+
+  // Stops a running container by sending it a configurable signal.
+  rpc StopContainer(StopContainerRequest) returns (StopContainerResponse);
+
+  // Retrieves detailed information about a specific container.
+  rpc GetContainer(GetContainerRequest) returns (ContainerInfo);
+
+  // Lists all containers currently managed by the service.
+  rpc ListContainers(ListContainersRequest) returns (ListContainersResponse);
+
+  // Deletes a container, cleaning up all associated resources including its
+  // root filesystem. A running container is killed first.
+  rpc DeleteContainer(DeleteContainerRequest) returns (DeleteContainerResponse);
+
+  // Runs a command in a running container, like `docker exec` without a
+  // terminal and without stdin. stdout and stderr stream as frames; the last
+  // frame is the exit code. Ending the call kills the command's process
+  // group.
+  rpc Exec(ExecRequest) returns (stream ExecStreamFrame);
+
+  // Streams logs (stdout and stderr) from a running or stopped container.
+  rpc StreamContainerLogs(StreamContainerLogsRequest) returns (stream LogEntry);
+
+  // Streams lifecycle events for one or all containers. This is useful for
+  // tracking the status of asynchronous operations like CreateContainer.
+  rpc StreamContainerEvents(StreamContainerEventsRequest) returns (stream ContainerEvent);
+}
+
+// Configuration for creating a new container.
+message ContainerConfig {
+  // Reference to the OCI image to use for the container's root filesystem
+  // (e.g., "docker.io/library/alpine:latest").
+  string image_ref = 1;
+  // Optional command to execute inside the container. If not provided, the
+  // image's default command (from its config) is used.
+  repeated string command = 2;
+  // Optional environment variables to set inside the container.
+  map<string, string> env = 3;
+  // Volumes of the pod (ADR 0016) that the guest mounted, bind-mounted
+  // into the container. A create fails while one of them is not mounted.
+  repeated VolumeMount volume_mounts = 4;
+}
+
+// A volume in a container.
+message VolumeMount {
+  // The volume's name in its pod, as the guest mounted it
+  // (feos.guest.v1.GuestService.MountVolumes).
+  string volume = 1;
+  // Where the container sees it: an absolute path other than "/".
+  string path = 2;
+  // The container cannot write to it.
+  bool read_only = 3;
+}
+
+message CreateContainerRequest {
+  // The configuration for the container.
+  ContainerConfig config = 1;
+  // An optional client-provided ID for the container: 1 to 64 characters of
+  // letters, digits, "-", "_" and ".". If not provided, a UUID will be
+  // generated.
+  optional string container_id = 2;
+  // Adopt the container of this ID from before a reboot: its writable
+  // layer and logs on the data root are kept, its mounts, runtime spec and
+  // runtime state are built anew. An empty config keeps the image, command
+  // and environment it was created with; set fields replace them. Without a
+  // container to adopt, this is a plain create.
+  bool adopt = 3;
+}
+
+message CreateContainerResponse {
+  // The unique ID of the newly created container.
+  string container_id = 1;
+  // Adopt only: why the container's /etc/resolv.conf could not be linked to
+  // the pushed resolvers. The container is adopted all the same. Empty when
+  // the link is in place; a plain create fails instead.
+  string resolver_error = 2;
+}
+
+message ExecRequest {
+  string container_id = 1;
+  // argv; a bare first element is looked up in the container's PATH.
+  repeated string command = 2;
+  // Environment on top of the container's own.
+  map<string, string> env = 3;
+  // Working directory; "/" when empty or missing.
+  string working_dir = 4;
+}
+
+message ExecStreamFrame {
+  oneof frame {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    // The exit code, 128 + the signal when signalled. Always the last frame.
+    int32 exit_code = 3;
+  }
+}
+
+message StartContainerRequest {
+  string container_id = 1;
+}
+
+message StartContainerResponse {}
+
+message StopContainerRequest {
+  string container_id = 1;
+  // Optional signal to send for stopping the container. Defaults to SIGTERM.
+  optional uint32 signal = 2;
+  // Optional timeout in seconds to wait before sending SIGKILL if the container
+  // has not stopped.
+  optional uint32 timeout_seconds = 3;
+}
+
+message StopContainerResponse {}
+
+message GetContainerRequest {
+  string container_id = 1;
+}
+
+message ListContainersRequest {}
+
+message ListContainersResponse {
+  repeated ContainerInfo containers = 1;
+}
+
+message DeleteContainerRequest {
+  string container_id = 1;
+}
+
+message DeleteContainerResponse {}
+
+message StreamContainerLogsRequest {
+  string container_id = 1;
+  // If true, the stream will not close when the end of the log is reached,
+  // but will wait for new log entries.
+  bool follow = 2;
+  // If true, sends all previous logs before streaming new ones.
+  bool tail = 3;
+  // If above 0, sends only the last tail_lines lines of the previous logs
+  // (at most 10000, and never from further back than 4 MiB before the
+  // log's end: the line there is cut to its last whole 64 KiB parts, or
+  // left out when not one fits) before streaming new ones, whatever tail
+  // says; 0: tail decides. ferund reads a log tail this way, without
+  // follow. A node that predates this field ignores it; one that predates
+  // the 4 MiB cap sends up to 10000 lines of 64 KiB.
+  uint32 tail_lines = 4;
+}
+
+message LogEntry {
+  // The raw log line from either stdout or stderr.
+  bytes line = 1;
+  // Specifies the source stream of the log line.
+  enum Source {
+    SOURCE_UNSPECIFIED = 0;
+    STDOUT = 1;
+    STDERR = 2;
+  }
+  Source source = 2;
+}
+
+enum ContainerState {
+  CONTAINER_STATE_UNSPECIFIED = 0;
+  // The service is pulling the OCI image for the container.
+  PULLING_IMAGE = 1;
+  // The container's resources have been prepared, and it is ready to be started.
+  CREATED = 2;
+  // The container is currently running.
+  RUNNING = 3;
+  // The container process has exited.
+  STOPPED = 4;
+}
+
+// Represents information about a single container.
+message ContainerInfo {
+  string container_id = 1;
+  ContainerState state = 2;
+  ContainerConfig config = 3;
+  // The process ID of the container, if it is running.
+  optional int64 pid = 4;
+  // The exit code of the container process, if it has stopped.
+  optional int32 exit_code = 5;
+}
+
+// --- Event Streaming Messages ---
+
+message StreamContainerEventsRequest {
+  // The ID of the container for which to retrieve events.
+  // If not provided, the stream will send events for all containers.
+  optional string container_id = 1;
+}
+
+message ContainerEvent {
+  string container_id = 1;
+  // A unique identifier for the event.
+  string id = 2;
+  // The specific event payload.
+  google.protobuf.Any data = 3;
+}
+
+message ContainerStateChangedEvent {
+  ContainerState new_state = 1;
+  // A human-readable reason for the state change.
+  string reason = 2;
+}

@@ -1,0 +1,18 @@
+[package]
+name = "diskctl"
+version.workspace = true
+edition.workspace = true
+description = "Command-line client of diskd"
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-proto = { workspace = true }
+libublk = { workspace = true }
+clap = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package feos.guest.v1;
+
+// What only a guest does (ADR 0007): calls of feosd into feos-guest that
+// mean nothing on a node. Internal between feosd and feos-guest, and, as
+// every API of the guest, it only grows.
+service GuestService {
+  // Mounts the pod's volumes (ADR 0016), each at a directory of its
+  // name in the guest, from which containers bind-mount it. The guest
+  // finds a volume's disk by its drive, checks its size and the UUID of
+  // its filesystem, which is the volume's ID, and formats it only when
+  // asked to, and then not over another volume's filesystem that was
+  // mounted or another filesystem. A volume mounted already is left as
+  // it is, unless it is to be formatted. Every volume gets an answer of
+  // its own; one that fails leaves the others.
+  rpc MountVolumes(MountVolumesRequest) returns (MountVolumesResponse);
+}
+
+message MountVolumesRequest {
+  repeated Volume volumes = 1;
+}
+
+message Volume {
+  // Its name in the pod: 1 to 63 lowercase letters, digits and "-".
+  string name = 1;
+  // The volume's ID, a UUID: the UUID of its filesystem.
+  string volume_id = 2;
+  // Which of the microVM's drives it is, in the order Firecracker
+  // attaches them: 0 is the pod's disk, the volumes follow.
+  uint32 drive = 3;
+  // The disk's size, which the guest checks.
+  uint64 size_bytes = 4;
+  // The host knows the volume to be new: it has no filesystem yet. Never
+  // set once the guest reported the volume mounted.
+  bool format = 5;
+}
+
+message MountVolumesResponse {
+  // One per volume of the request, in its order.
+  repeated MountedVolume volumes = 1;
+}
+
+message MountedVolume {
+  string name = 1;
+  // The guest's device, e.g. /dev/vdb.
+  string device = 2;
+  // This call made its filesystem.
+  bool formatted = 3;
+  // Why the volume is not mounted; empty when it is, with its
+  // filesystem.
+  string error = 4;
+}

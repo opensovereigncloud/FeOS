@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# The platform's image registry, oci.<DOMAIN>, on the Gardener shoot
+# (deploy/gardener/README.md): CNCF distribution v3 with its blobs in an
+# object store, so that the replicas share the same images. The ${...} are
+# the deployment's parameters (config.env.example):
+#
+#   make -C deploy/gardener apply-registry
+#
+# The secrets are not here:
+#   registry-config  config.yml: distribution's configuration, with
+#                    storage.s3 (the bucket and its credentials),
+#                    http.secret, which must be the same for every replica
+#                    (an upload's state is signed with it), http.debug.addr
+#                    :5001 (the probes' /debug/health) and auth.htpasswd
+#                    with the path /auth/htpasswd
+#   registry-auth    htpasswd: the users who pull and push, bcrypt
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: registry
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: registry
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: registry
+  template:
+    metadata:
+      labels:
+        app: registry
+    spec:
+      containers:
+        - name: registry
+          image: distribution/distribution:3.0.0
+          args: ["serve", "/etc/registry/config.yml"]
+          env:
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+          ports:
+            - name: http
+              containerPort: 5000
+            - name: debug
+              containerPort: 5001
+          readinessProbe:
+            httpGet:
+              path: /debug/health
+              port: debug
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /debug/health
+              port: debug
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/registry
+              readOnly: true
+            - name: auth
+              mountPath: /auth
+              readOnly: true
+      volumes:
+        - name: config
+          secret:
+            secretName: registry-config
+            items:
+              - key: config.yml
+                path: config.yml
+        - name: auth
+          secret:
+            secretName: registry-auth
+            items:
+              - key: htpasswd
+                path: htpasswd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: registry
+spec:
+  selector:
+    app: registry
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: registry
+  namespace: registry
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: oci.${DOMAIN}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: registry
+                port:
+                  number: 5000
+  tls:
+    - hosts:
+        - oci.${DOMAIN}
+      secretName: registry-tls

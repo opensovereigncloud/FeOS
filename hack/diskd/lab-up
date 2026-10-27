@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Starts diskd under sudo for the labs, with its state in target/diskd/state.
+# S3 is used if S3_BUCKET and the AWS_* variables are in the environment;
+# nothing is read from files. Usage: hack/diskd/lab-up [diskd args]
+set -euo pipefail
+
+thisDir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+ROOT="$(cd "${thisDir}/../.." && pwd)"
+mkdir -p "${DISKD_STATE:-${ROOT}/target/diskd/state}"
+STATE=$(readlink -f "${DISKD_STATE:-${ROOT}/target/diskd/state}")
+BIN="${DISKD_BIN:-${ROOT}/target/release/diskd}"
+LOG="${STATE}/diskd.log"
+
+if [ ! -x "${BIN}" ]; then
+  cargo build --release -p diskd
+  cargo build --release -p diskctl
+fi
+
+if [ -S "${STATE}/diskd.sock" ] && pgrep -xf "${BIN} --state-dir ${STATE}.*" >/dev/null 2>&1; then
+  echo "[lab-up] already running (${STATE})"
+  exit 0
+fi
+sudo rm -f "${STATE}/diskd.sock"
+
+echo "[lab-up] starting diskd (state ${STATE})"
+sudo AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
+     AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
+     AWS_REGION="${AWS_REGION:-}" \
+     AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-}" \
+     S3_BUCKET="${S3_BUCKET:-}" \
+     RUST_LOG="${RUST_LOG:-info}" \
+     "${BIN}" --state-dir "${STATE}" "$@" >"${LOG}" 2>&1 &
+DPID=$!
+
+for _ in $(seq 1 600); do
+  [ -S "${STATE}/diskd.sock" ] && break
+  sleep 0.2
+done
+[ -S "${STATE}/diskd.sock" ] || { echo "[lab-up] FAIL: no socket; log:"; tail -20 "${LOG}"; exit 1; }
+kill -0 ${DPID} 2>/dev/null || { echo "[lab-up] FAIL: diskd exited; log:"; tail -20 "${LOG}"; exit 1; }
+# The socket is root's; give the invoking user diskctl access for the lab.
+sudo chown "$(id -u):$(id -g)" "${STATE}/diskd.sock"
+echo "[lab-up] diskd up, socket ${STATE}/diskd.sock"

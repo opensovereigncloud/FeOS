@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Build the guest initramfs: feos-guest as /init, mke2fs for the pod's
+# volumes, and a small static toolbox for containers. No root needed.
+#
+#   hack/guest/rootfs/mk-rootfs
+#
+# Output: target/guest/initramfs.cpio.zst. Firecracker boots it as the
+# initrd next to target/guest/vmlinuz; the VM needs no root disk.
+set -euo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/target/guest}"
+ROOTFS_DIR="${OUT_DIR}/rootfs"
+OUT_INITRD="${OUT_DIR}/initramfs.cpio.zst"
+MUSL_TARGET=x86_64-unknown-linux-musl
+FEOS_GUEST="${REPO_ROOT}/target/${MUSL_TARGET}/release/feos-guest"
+
+log() { printf '[mk-rootfs] %s\n' "$*"; }
+
+require_static() {
+    local info
+    info="$(file -b "$1")"
+    case "${info}" in
+        *statically\ linked*|*static-pie\ linked*) log "$(basename "$1"): ${info%%,*}, static" ;;
+        *) log "ERROR: $1 is not statically linked: ${info}"; exit 1 ;;
+    esac
+}
+
+# --- feos-guest; cargo decides whether to rebuild -------------------------
+log "building feos-guest"
+cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" --release \
+    --no-default-features --features guest,git-version --target "${MUSL_TARGET}" \
+    -p feos --bin feos-guest
+require_static "${FEOS_GUEST}"
+
+# --- toolbox: static uutils coreutils, bind-mounted into containers -------
+# Agents can rely on ls, cat and friends even in images that have none.
+TOOLS_CACHE="${OUT_DIR}/tools-cache"
+CU_VER="0.11.0"
+CU_NAME="coreutils-${CU_VER}-x86_64-unknown-linux-musl"
+CU_TGZ="${TOOLS_CACHE}/${CU_NAME}.tar.gz"
+CU_SHA="ac8e24885abf9062b80e8e86990d5727c186939c02fee777b1723e5c85293ca9"
+mkdir -p "${TOOLS_CACHE}"
+if ! echo "${CU_SHA}  ${CU_TGZ}" | sha256sum -c - >/dev/null 2>&1; then
+    log "downloading ${CU_NAME}"
+    curl -fsSL -o "${CU_TGZ}" \
+        "https://github.com/uutils/coreutils/releases/download/${CU_VER}/${CU_NAME}.tar.gz"
+    echo "${CU_SHA}  ${CU_TGZ}" | sha256sum -c - >/dev/null
+fi
+rm -rf "${TOOLS_CACHE}/x"
+mkdir -p "${TOOLS_CACHE}/x"
+tar -xzf "${CU_TGZ}" -C "${TOOLS_CACHE}/x" "${CU_NAME}/coreutils"
+CU_BIN="${TOOLS_CACHE}/x/${CU_NAME}/coreutils"
+require_static "${CU_BIN}"
+
+# --- mke2fs: formats a pod's new volumes (ADR 0016) -------------------------
+# The one tool the guest runs, static e2fsprogs built with musl; not in the
+# toolbox. Needs musl-gcc (MUSL_CC) and the kernel's headers, which musl
+# does not bring: linux/ and asm/ of /usr/include.
+E2FS_VER="1.47.4"
+E2FS_TXZ="${TOOLS_CACHE}/e2fsprogs-${E2FS_VER}.tar.xz"
+E2FS_SHA="fd5bf388cbdbe006a3d3b318d983b2948382440acc85a87f1e7d108653e8db0b"
+MKE2FS_BIN="${TOOLS_CACHE}/mke2fs-${E2FS_VER}"
+if [ ! -x "${MKE2FS_BIN}" ]; then
+    MUSL_CC="${MUSL_CC:-musl-gcc}"
+    command -v "${MUSL_CC}" >/dev/null || {
+        log "ERROR: ${MUSL_CC} is missing (Debian: apt install musl-tools linux-libc-dev)"
+        exit 1
+    }
+    if ! echo "${E2FS_SHA}  ${E2FS_TXZ}" | sha256sum -c - >/dev/null 2>&1; then
+        log "downloading e2fsprogs ${E2FS_VER}"
+        curl -fsSL -o "${E2FS_TXZ}" \
+            "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${E2FS_VER}/e2fsprogs-${E2FS_VER}.tar.xz"
+        echo "${E2FS_SHA}  ${E2FS_TXZ}" | sha256sum -c - >/dev/null
+    fi
+    E2FS_DIR="${TOOLS_CACHE}/e2fsprogs"
+    rm -rf "${E2FS_DIR}"
+    mkdir -p "${E2FS_DIR}/src" "${E2FS_DIR}/build" "${E2FS_DIR}/include"
+    tar -xJf "${E2FS_TXZ}" -C "${E2FS_DIR}/src" --strip-components=1
+    ASM_DIR="/usr/include/$(gcc -dumpmachine 2>/dev/null)/asm"
+    [ -d "${ASM_DIR}" ] || ASM_DIR=/usr/include/asm
+    for dir in /usr/include/linux /usr/include/asm-generic "${ASM_DIR}"; do
+        [ -d "${dir}" ] || { log "ERROR: no kernel headers in ${dir}"; exit 1; }
+    done
+    ln -s /usr/include/linux "${E2FS_DIR}/include/linux"
+    ln -s /usr/include/asm-generic "${E2FS_DIR}/include/asm-generic"
+    ln -s "${ASM_DIR}" "${E2FS_DIR}/include/asm"
+    log "building mke2fs ${E2FS_VER}, static with musl"
+    (
+        cd "${E2FS_DIR}/build"
+        ../src/configure CC="${MUSL_CC}" CFLAGS="-O2 -idirafter ${E2FS_DIR}/include" \
+            LDFLAGS=-static --disable-nls --disable-elf-shlibs --disable-bsd-shlibs \
+            --disable-fuse2fs --disable-uuidd --disable-fsck --disable-e2initrd-helper \
+            --disable-debugfs --disable-imager --disable-resizer --disable-defrag \
+            --disable-tdb --disable-backtrace --disable-mmp \
+            --without-libarchive --without-pthread >configure.log 2>&1 ||
+            { tail -20 configure.log; exit 1; }
+        make -j"$(nproc)" libs >make.log 2>&1 || { tail -20 make.log; exit 1; }
+        make -j"$(nproc)" -C misc mke2fs >>make.log 2>&1 || { tail -20 make.log; exit 1; }
+    )
+    strip -o "${MKE2FS_BIN}" "${E2FS_DIR}/build/misc/mke2fs"
+    rm -rf "${E2FS_DIR}"
+fi
+require_static "${MKE2FS_BIN}"
+
+# --- the tree --------------------------------------------------------------
+log "assembling ${ROOTFS_DIR}"
+rm -rf "${ROOTFS_DIR}"
+mkdir -p "${ROOTFS_DIR}"/{sbin,etc,proc,sys,dev,run,tmp,root,var/lib/feos}
+chmod 1777 "${ROOTFS_DIR}/tmp"
+chmod 0700 "${ROOTFS_DIR}/root"
+
+install -m 0755 "${FEOS_GUEST}" "${ROOTFS_DIR}/sbin/feos-guest"
+install -m 0755 "${MKE2FS_BIN}" "${ROOTFS_DIR}/sbin/mke2fs"
+# The kernel runs /init from the initramfs.
+ln -s sbin/feos-guest "${ROOTFS_DIR}/init"
+
+# coreutils is a multicall binary: argv[0] picks the utility.
+TOOLS_DST="${ROOTFS_DIR}/usr/lib/feos-tools/bin"
+mkdir -p "${TOOLS_DST}"
+install -m 0755 "${CU_BIN}" "${TOOLS_DST}/coreutils"
+for util in ls cat head tail sort uniq wc du df mkdir touch rm cp mv chmod \
+            basename dirname realpath tr cut tee date echo printf env true false; do
+    ln -s coreutils "${TOOLS_DST}/${util}"
+done
+
+printf 'feos\n' > "${ROOTFS_DIR}/etc/hostname"
+printf '127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tfeos\n' > "${ROOTFS_DIR}/etc/hosts"
+# The host pushes the resolvers.
+: > "${ROOTFS_DIR}/etc/resolv.conf"
+
+# --- pack ------------------------------------------------------------------
+log "packing ${OUT_INITRD}"
+(cd "${ROOTFS_DIR}" && find . -print0 | cpio --null -o --format=newc --quiet) \
+    | zstd -19 -q -f -o "${OUT_INITRD}"
+log "done: ${OUT_INITRD} ($(du -h "${OUT_INITRD}" | cut -f1))"

@@ -1,0 +1,29 @@
+#!/bin/sh
+# ferund's user, and its unit. An instance needs a database and the
+# platform CA's issuer before it can run, so the first install neither
+# enables nor starts the unit; an upgrade restarts it when it runs.
+#
+# The configuration's group is ferun's: it holds the database's password
+# and the issuer's key. The group does not exist yet when dpkg unpacks the
+# first install, so the group is set here, as a dpkg-statoverride: from
+# then on dpkg itself sets it on what it unpacks, a reinstall's
+# /etc/ferun/ca and a new ferund.env that an upgrade brings. An override
+# the administrator set stays.
+set -e
+if [ "$1" = configure ]; then
+    systemd-sysusers ferund.conf >/dev/null 2>&1 || true
+    if getent group ferun >/dev/null; then
+        for entry in 0750:/etc/ferun/ca 0640:/etc/ferun/ferund.env; do
+            path="${entry#*:}"
+            if ! dpkg-statoverride --list "$path" >/dev/null; then
+                dpkg-statoverride --update --add root ferun "${entry%%:*}" "$path"
+            fi
+        done
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if systemctl is-active --quiet ferund.service; then
+            systemctl restart ferund.service
+        fi
+    fi
+fi

@@ -1,0 +1,97 @@
+[package]
+name = "feos"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# The node agent.
+[[bin]]
+name = "feosd"
+path = "src/bin/feosd.rs"
+required-features = ["host"]
+
+# PID 1 in a pod's microVM.
+[[bin]]
+name = "feos-guest"
+path = "src/bin/feos-guest.rs"
+required-features = ["guest"]
+
+[lib]
+name = "main_server"
+path = "src/lib.rs"
+
+[dependencies]
+feos-utils = { workspace = true }
+microvm-service = { workspace = true, optional = true }
+pod-service = { workspace = true, optional = true }
+network-service = { workspace = true, optional = true }
+traffic-service = { workspace = true, optional = true }
+fleet-client = { workspace = true, optional = true }
+host-service = { workspace = true }
+image-service = { workspace = true }
+task-service = { workspace = true }
+container-service = { workspace = true }
+tool-service = { workspace = true, optional = true }
+watch-service = { workspace = true, optional = true }
+forward-service = { workspace = true, optional = true }
+feos-proto = { workspace = true }
+
+# Workspace dependencies
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-vsock = { workspace = true, optional = true }
+tonic = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+nix = { workspace = true }
+prost = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+feos-utils = { workspace = true, features = ["pod-id"] }
+pod-service = { workspace = true }
+uuid = { workspace = true }
+microvm-service = { workspace = true }
+image-service = { workspace = true }
+host-service = { workspace = true }
+anyhow = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+log = { workspace = true }
+tokio-stream = { workspace = true }
+prost = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+# The pods' devices, as the pod tests read them.
+rtnetlink = { workspace = true }
+futures = { workspace = true }
+
+[features]
+default = ["host"]
+git-version = ["feos-utils/git-version"]
+# feosd, the node agent: the VM and pod services, the pods' network, the
+# API on TCP if asked, and the connections to the control plane.
+host = [
+    "dep:microvm-service",
+    "dep:pod-service",
+    "dep:network-service",
+    "dep:traffic-service",
+    "dep:fleet-client",
+]
+# feos-guest, PID 1 in a pod's microVM. The API listens on vsock, the guest
+# tells the host when it is ready, and a data volume holds images and
+# containers.
+guest = [
+    "host-service/guest",
+    "dep:tokio-vsock",
+    "dep:tool-service",
+    "dep:watch-service",
+    "dep:forward-service",
+]

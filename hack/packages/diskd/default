@@ -1,0 +1,17 @@
+# Arguments of diskd (diskd.service), and its object store. Pods hibernate
+# into the object store and come back from it on any node: without one,
+# their disks stay on this node and HibernatePod fails. This file holds the
+# store's credentials and is root's alone.
+#
+#   DISKD_ARGS              e.g. "--budget-bytes 17179869184": the local
+#                           chunk cache, 8 GiB by default; see diskd --help.
+#   S3_BUCKET               the bucket
+#   AWS_ACCESS_KEY_ID       its credentials
+#   AWS_SECRET_ACCESS_KEY
+#   AWS_ENDPOINT_URL        an S3-compatible store's endpoint, path-style;
+#                           AWS's when unset
+#   AWS_REGION              us-east-1 by default
+#   DISKD_S3_PREFIX         a key prefix in the bucket, for a bucket shared
+#                           with others; all nodes that restore each other's
+#                           pods need the same
+DISKD_ARGS=""

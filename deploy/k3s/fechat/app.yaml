@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# FeChat's SPA, served by nginx. fechat/deploy.sh sets the image's tag.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fechat-app
+  namespace: fechat
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: fechat-app
+  template:
+    metadata:
+      labels:
+        app: fechat-app
+    spec:
+      imagePullSecrets:
+        - name: oci-pull
+      containers:
+        - name: fechat-app
+          image: ${REGISTRY}/fechat-app:0.6.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fechat-app
+  namespace: fechat
+spec:
+  selector:
+    app: fechat-app
+  ports:
+    - port: 8080
+      targetPort: 8080

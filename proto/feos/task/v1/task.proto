@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package feos.task.v1;
+
+// TaskService is an internal-only API implemented by the `--task-service`
+// process, which feosd or feos-guest starts and restarts. It provides a
+// low-level interface for the container-service to manage the lifecycle of a
+// single container with youki's libcontainer. Running the runtime in a
+// process of its own keeps a runtime failure away from feosd and the guest's
+// PID 1; the process is the subreaper of the containers.
+service TaskService {
+  // Creates the container's environment based on an OCI bundle but does not
+  // start the user-specified process.
+  rpc Create(CreateRequest) returns (CreateResponse);
+
+  // Starts the user-specified process within the created container.
+  rpc Start(StartRequest) returns (StartResponse);
+
+  // Sends a signal to the container's process.
+  rpc Kill(KillRequest) returns (KillResponse);
+
+  // Deletes the container and cleans up its resources. A container that still
+  // runs is killed first.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Waits for the container's process to exit and returns its exit status.
+  // This is a long-polling RPC that will only return once the process has
+  // terminated.
+  rpc Wait(WaitRequest) returns (WaitResponse);
+
+  // Runs a process in the namespaces of a running container (pid, ipc, uts,
+  // mount), like `docker exec` without a terminal and without stdin. Its
+  // stdout and stderr stream as frames; the last frame is the exit code.
+  // Ending the call kills the process group.
+  rpc Exec(ExecRequest) returns (stream ExecFrame);
+}
+
+message CreateRequest {
+  string container_id = 1;
+  // Absolute path to the OCI bundle directory, which contains the 'config.json'
+  // and the 'rootfs' subdirectory.
+  string bundle_path = 2;
+  // Path to a socket or file for the container's stdin.
+  string stdin_path = 3;
+  // Path to a socket or file for the container's stdout.
+  string stdout_path = 4;
+  // Path to a socket or file for the container's stderr.
+  string stderr_path = 5;
+}
+
+message CreateResponse {
+  // The process ID of the created container's init process.
+  int64 pid = 1;
+}
+
+message StartRequest {
+  string container_id = 1;
+}
+
+message StartResponse {}
+
+message KillRequest {
+  string container_id = 1;
+  // The signal number to send to the process.
+  uint32 signal = 2;
+}
+
+message KillResponse {}
+
+message DeleteRequest {
+  string container_id = 1;
+}
+
+message DeleteResponse {}
+
+message WaitRequest {
+  string container_id = 1;
+}
+
+message WaitResponse {
+  int32 exit_code = 1;
+}
+
+message ExecRequest {
+  string container_id = 1;
+  // argv; a bare first element is looked up in the PATH of `env`.
+  repeated string args = 2;
+  // The complete environment, "KEY=value".
+  repeated string env = 3;
+  // Working directory in the container; "/" when empty or missing.
+  string working_dir = 4;
+}
+
+message ExecFrame {
+  oneof frame {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    // The exit code, 128 + the signal when signalled. Always the last frame.
+    int32 exit_code = 3;
+  }
+}

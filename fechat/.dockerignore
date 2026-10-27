@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# The SPA's build context: the backend has its own (backend/).
+node_modules
+dist
+backend
+hack
+*.htpasswd
+deploy.sh
+README.md
+*.env

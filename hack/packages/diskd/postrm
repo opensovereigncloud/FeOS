@@ -1,0 +1,10 @@
+#!/bin/sh
+# A purge removes the unit's enablement; /var/lib/feos/disk stays even
+# then: it holds what the pods wrote.
+set -e
+if [ "$1" = purge ]; then
+    rm -f /etc/systemd/system/multi-user.target.wants/diskd.service
+fi
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi

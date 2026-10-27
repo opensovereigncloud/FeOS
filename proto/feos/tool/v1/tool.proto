@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package feos.tool.v1;
+
+// ToolService: agent tool primitives implemented natively in FeOS, not
+// inside the container. They are part of the agent's surface, not of the
+// image, so they must work for any image, even one without any tools.
+//
+// All tools run in FeOS, confined to the container's rootfs via
+// openat2(RESOLVE_BENEATH): no symlink escapes, no tools needed in the
+// image. rg and fd use the ripgrep and fd library crates
+// (grep-regex/grep-searcher, ignore/globset/regex), so they work against a
+// scratch image; line limits are enforced inside the search loops.
+service ToolService {
+  // Webfetch = HTTP GET + readable-content extraction
+  // (trafilatura-rs, Rust port of Python trafilatura).
+  rpc Webfetch(WebfetchRequest) returns (WebfetchResponse);
+
+  // File primitives (openat2-confined to the container rootfs).
+  rpc Read(ReadRequest) returns (ReadResponse);
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc Edit(EditRequest) returns (EditResponse);
+  rpc Ls(LsRequest) returns (LsResponse);
+
+  // Content/name search with the ripgrep/fd library engines (in-process);
+  // limits enforced inside the search loops.
+  rpc Rg(RgRequest) returns (RgResponse);
+  rpc Fd(FdRequest) returns (FdResponse);
+}
+
+message WebfetchRequest {
+  string url = 1; // http/https only; validated by both sides
+}
+
+message WebfetchResponse {
+  uint32 status = 1;        // HTTP status; 0 if the fetch itself failed
+  string effective_url = 2; // after redirects
+  string title = 3;         // extracted metadata title (may be empty)
+  string text = 4;          // extracted readable text
+  string error = 5;         // fetch/extract failure description
+}
+
+// All paths below are container-rooted: an absolute "/x" and a relative "x"
+// both mean <container rootfs>/x. openat2(RESOLVE_BENEATH) confines reads
+// and writes to the container rootfs — escaping onto the guest filesystem
+// (via ../ or symlink) fails with an error.
+
+message ReadRequest {
+  string container = 1; // container ID; empty → "main"
+  string path = 2;
+  uint32 offset = 3; // 1-based line offset; 0 → 1
+  uint32 limit = 4;  // max lines; 0 → 2000
+}
+
+message ReadResponse {
+  string text = 1;      // the selected lines
+  bool truncated = 2;   // file has more lines beyond the selection
+  string error = 3;     // tool-level failure (missing file, not utf-8, …)
+  // A PNG, JPEG, GIF or WebP — recognised by its leading bytes, not its
+  // name — comes back whole in `image` instead of as text, so a model can
+  // look at it (a screenshot the agent just took). offset/limit do not
+  // apply. Capped so that its base64 stays within the 5 MiB a model API
+  // accepts, and refused past 8000 px on a side for the same reason.
+  bytes image = 4;
+  string media_type = 5; // "image/png", "image/jpeg", "image/gif", "image/webp"
+  uint32 width = 6;
+  uint32 height = 7;
+}
+
+message WriteRequest {
+  string container = 1;
+  string path = 2;
+  bytes content = 3;
+}
+
+message WriteResponse {
+  string error = 1;
+}
+
+message EditOp {
+  string old = 1; // exact text; must occur exactly once in the file
+  string new = 2;
+}
+
+message EditRequest {
+  string container = 1;
+  string path = 2;
+  repeated EditOp edits = 3;
+}
+
+message EditResponse {
+  uint32 replacements = 1;
+  string error = 2;
+}
+
+message LsRequest {
+  string container = 1;
+  string path = 2;    // directory; empty → "/"
+  uint32 limit = 3;   // max entries; 0 → 500
+}
+
+message LsResponse {
+  repeated string entries = 1; // sorted (case-insensitive), dirs suffixed "/"
+  bool truncated = 2;
+  string error = 3;
+}
+
+// Rg: content search with the ripgrep engine (grep-regex/grep-searcher).
+// Pattern is a Rust-regex (like rg), unless literal is set (rg -F).
+// Respects .gitignore, skips binary files — stock ripgrep semantics.
+message RgRequest {
+  string container = 1;
+  string pattern = 2;   // regex (ripgrep default) or literal (literal=true)
+  string path = 3;      // search root; empty → "/"
+  string glob = 4;      // rg -g filter (globset)
+  bool ignore_case = 5;
+  bool literal = 6;     // rg -F
+  uint32 context = 7;   // rg -C
+  uint32 limit = 8;     // max output lines; 0 → 100; enforced in the searcher
+}
+
+message RgResponse {
+  string text = 1;      // match lines ("path:line:content", rg --no-heading)
+  uint32 matches = 2;   // match lines emitted
+  bool truncated = 3;   // limit (or byte cap) hit — more matches exist
+  string error = 4;     // bad pattern, …
+}
+
+// Fd: file-name search with fd semantics — pattern is a regex matched
+// against file NAMES (not paths), smart-case like fd: all-lowercase
+// pattern → case-insensitive, otherwise sensitive. glob=true switches the
+// pattern to a glob (fd --glob). Respects .gitignore, skips hidden files.
+message FdRequest {
+  string container = 1;
+  string pattern = 2; // fd regex (smart case) or glob (glob=true)
+  string path = 3;    // search root; empty → "/"
+  bool glob = 4;      // fd --glob
+  uint32 limit = 5;   // max entries; 0 → 1000
+}
+
+message FdResponse {
+  repeated string entries = 1;
+  bool truncated = 2;
+  string error = 3;
+}

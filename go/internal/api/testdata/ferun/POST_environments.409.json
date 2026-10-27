@@ -1,0 +1,14 @@
+{
+  "method": "POST",
+  "path": "/api/v1/environments",
+  "query": {},
+  "status": 409,
+  "request": {
+    "name": "expensa-stage",
+    "id": "0193c4d0-5e6f-7a01-8b2c-3d4e5f6a7b04"
+  },
+  "response": {
+    "error": "an environment named expensa-stage exists with another id",
+    "code": "name_taken"
+  }
+}

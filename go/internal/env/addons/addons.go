@@ -1,0 +1,171 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package addons holds the addon blueprints of environments (ADR 0018):
+// what a managed backing service (postgres, valkey, nats) of a given
+// type, version and plan runs as, which credentials it has, what a
+// reference to it resolves to, and how it is provisioned. A blueprint is
+// pure: it renders, the environment controller (internal/env/ctl) runs.
+//
+// Credentials are never values here: a blueprint names them by key
+// ("password", "role.expense_svc.password") in TemplatePart.Credential;
+// the controller generates each once as the system secret
+// "addon.<addon>.<key>", version 1, and maps the parts to it.
+//
+// Every blueprint registers itself (Register) from an init function of
+// its file; Get and Types read the registry.
+package addons
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"sync"
+
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
+)
+
+// Blueprint is an addon type.
+type Blueprint interface {
+	// Type is the type's name, as a spec's addons.*.type names it:
+	// "postgres".
+	Type() string
+	// Versions are the versions a spec may name, oldest first.
+	Versions() []string
+	// Plans are the plans by name ("dev", "small", …).
+	Plans() map[string]Plan
+	// DefaultPlan is the plan of an addon that names none.
+	DefaultPlan() string
+	// Validate checks an addon against the current release's same addon
+	// (prev nil: none): version, plan and options. Paths are relative to
+	// the addon: "version", "options.roles[1]". A major version change is
+	// an error, a plan change that would resize the volume a warning (the
+	// volume keeps its size).
+	Validate(prev *Addon, next Addon) []spec.Finding
+	// Credentials are the keys of the addon's credentials, e.g.
+	// "password", "role.expense_svc.password".
+	Credentials(a Addon) []string
+	// Render is the addon's pod.
+	Render(a Addon, c Context) (Instance, error)
+	// Outputs is the value of a reference to the addon: literal parts and
+	// credential parts (with Escape where they sit in a URL), given the
+	// instance's address (c.Address, "[addr]" in URLs). An unknown key, or
+	// a field that names nothing (a role not in the options), is an error.
+	Outputs(a Addon, c Context, ref Ref) ([]model.TemplatePart, error)
+	// OutputKeys are the keys a reference may name, for validation and
+	// docs.
+	OutputKeys() []string
+	// Provision are the steps that bring a running addon to its options
+	// (databases, roles), run in its container in order, each idempotent;
+	// none: nil. Their hash decides whether they run again.
+	Provision(a Addon, c Context) []Step
+}
+
+// Addon is an addon of a spec, with its name (the key of spec.addons).
+type Addon struct {
+	Name, Type, Version, Plan string
+	Options                   map[string]any
+}
+
+// Plan is a size of an addon.
+type Plan struct {
+	// VCPUs and MemoryMib size the pod.
+	VCPUs, MemoryMib int
+	// VolumeMib is the volume's size when it is first created; it is
+	// never resized.
+	VolumeMib int
+}
+
+// Context is what a blueprint renders against. Credentials are
+// referenced by key, never passed as values.
+type Context struct {
+	// Env is the environment's name, Name the addon's.
+	Env, Name string
+	// Address is the instance's IPv6 address ("" before it has one).
+	Address string
+}
+
+// Instance is an addon's pod as its blueprint renders it.
+type Instance struct {
+	// Image is the image to run, as written ("postgres:17-alpine").
+	Image string
+	// Command replaces the image's entrypoint and cmd; empty: they run.
+	Command []string
+	// Env are the container's variables: literals, or credential parts
+	// that the controller maps to system secrets.
+	Env map[string]model.TemplateValue
+	// Port is the port it serves on.
+	Port int
+	// Mount is where the addon's volume is mounted; "": no volume.
+	Mount string
+	// Probe is its readiness check: an argv run in the container with
+	// Env, ready on exit 0.
+	Probe []string
+}
+
+// Step is one provisioning step: an argv run in the addon's container
+// with Env (credentials as parts).
+type Step struct {
+	Name string
+	Argv []string
+	Env  map[string]model.TemplateValue
+}
+
+// Ref is a reference to an addon's output: its key and the blueprint's
+// fields ({"addon": "postgres", "key": "url", "role": "r"} → Key "url",
+// Fields {"role": "r"}).
+type Ref struct {
+	Key    string
+	Fields map[string]string
+}
+
+var (
+	mu       sync.RWMutex
+	registry = map[string]Blueprint{}
+)
+
+// Register adds a blueprint to the registry, from an init function of
+// its file. A nil blueprint, an empty type and a type registered before
+// are refused.
+func Register(b Blueprint) error {
+	if b == nil {
+		return errors.New("addons: register a nil blueprint")
+	}
+	t := b.Type()
+	if t == "" {
+		return errors.New("addons: register a blueprint without a type")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if _, ok := registry[t]; ok {
+		return fmt.Errorf("addons: a blueprint of type %q is registered already", t)
+	}
+	registry[t] = b
+	return nil
+}
+
+// Get returns the blueprint of type typ; ok false when none is
+// registered.
+func Get(typ string) (b Blueprint, ok bool) {
+	mu.RLock()
+	defer mu.RUnlock()
+	b, ok = registry[typ]
+	return b, ok
+}
+
+// Types are the registered types, sorted.
+func Types() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make([]string, 0, len(registry))
+	for t := range registry {
+		out = append(out, t)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// CredentialSecret is the system secret a credential key of addon is
+// kept as: "addon.<addon>.<key>", version 1.
+func CredentialSecret(addon, key string) string { return "addon." + addon + "." + key }

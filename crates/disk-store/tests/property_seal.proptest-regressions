@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 920b34a6786ce3b4e59d302d37920d60fa792ed9d7127014014be45cab326e04 # shrinks to seed = 0, base_ops = [GenOp { off: 2911868, len: 12677, zero: false }], top_ops = [GenOp { off: 3398432, len: 64072, zero: true }, GenOp { off: 2927865, len: 11751, zero: false }, GenOp { off: 2859317, len: 25975, zero: true }, GenOp { off: 2043995, len: 72928, zero: false }, GenOp { off: 2072381, len: 42043, zero: true }, GenOp { off: 1285180, len: 35900, zero: false }, GenOp { off: 989723, len: 91861, zero: false }]

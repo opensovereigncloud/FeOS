@@ -1,0 +1,30 @@
+[package]
+name = "diskd"
+version.workspace = true
+edition.workspace = true
+description = "The node's disk daemon: ublk block devices over the chunk store"
+
+[lints]
+workspace = true
+
+[dependencies]
+disk-store = { workspace = true }
+feos-proto = { workspace = true }
+feos-utils = { workspace = true }
+libublk = { workspace = true }
+io-uring = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+nix = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+blake3 = { workspace = true }

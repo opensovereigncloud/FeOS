@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# A loop-backed XFS volume at target/diskd/xfs for diskd's benchmarks,
+# owned by the invoking user. Functional tests run on any filesystem;
+# the store's numbers only count on XFS (ADR 0011). Run with sudo.
+# Usage: sudo hack/diskd/mkscratch [size]
+set -euo pipefail
+
+thisDir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+RUN="$(cd "${thisDir}/../.." && pwd)/target/diskd"
+IMG="${RUN}/xfs.img"
+MNT="${RUN}/xfs"
+SIZE="${1:-20G}"
+
+mkdir -p "${RUN}"
+if mountpoint -q "${MNT}"; then
+  echo "already mounted: ${MNT}"
+  exit 0
+fi
+if [ ! -f "${IMG}" ]; then
+  echo "creating ${IMG} (${SIZE}, sparse)"
+  truncate -s "${SIZE}" "${IMG}"
+  mkfs.xfs -q -f "${IMG}"
+fi
+mkdir -p "${MNT}"
+mount -o loop "${IMG}" "${MNT}"
+if [ -n "${SUDO_USER:-}" ]; then
+  chown -R "${SUDO_USER}:$(id -gn "${SUDO_USER}")" "${MNT}"
+fi
+echo "mounted ${IMG} at ${MNT}"

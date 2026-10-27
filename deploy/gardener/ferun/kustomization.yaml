@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ferund and its PostgreSQL on the Gardener shoot: the k3s manifests
+# (deploy/k3s/ferun), with the nodes' port at FERUN_NODES_IP, an address of
+# the shoot's service network. They live outside this directory, and make
+# fills in their parameters (config.env.example):
+#
+#   make -C deploy/gardener apply-ferun
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../k3s/ferun/namespace.yaml
+  - ../../k3s/ferun/postgres.yaml
+  - ../../k3s/ferun/ferund.yaml
+  - ../../k3s/ferun/ingress.yaml
+patches:
+  # A feos-node pod's stop suspends its microVMs (terminationGracePeriodSeconds
+  # 300) and the next one resumes them before it connects (ADR 0020): calls
+  # wait for the node that long instead of failing. Below --lost-grace
+  # (10 min).
+  - target:
+      kind: Deployment
+      name: ferund
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: FERUN_ROLLOUT_GRACE
+          value: 8m

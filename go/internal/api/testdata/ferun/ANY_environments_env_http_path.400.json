@@ -1,0 +1,12 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/http/api/%2e%2e/admin",
+  "query": {},
+  "status": 400,
+  "request": null,
+  "response": "the path has a .. segment\n",
+  "headers": {
+    "Authorization": "Bearer <route token>"
+  },
+  "responseContentType": "text/plain; charset=utf-8"
+}

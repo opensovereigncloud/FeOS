@@ -1,0 +1,16 @@
+[package]
+name = "dns-service"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+feos-proto = { workspace = true }
+hickory-proto = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+prost-types = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }

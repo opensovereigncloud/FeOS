@@ -1,0 +1,33 @@
+[package]
+name = "feos-utils"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# "std": feos_logger installs itself with log::set_boxed_logger.
+log = { workspace = true, features = ["std"] }
+nix = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+termcolor = { workspace = true }
+libc = { workspace = true }
+# Pod IDs (feature pod-id), for feosd and feosctl, not the guest.
+uuid = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default = []
+git-version = []
+# Pod IDs: their format, new ones, and their TAP devices and MAC
+# addresses (ADR 0019).
+pod-id = ["dep:uuid", "dep:rand", "dep:sha2"]

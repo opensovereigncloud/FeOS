@@ -1,0 +1,153 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# FeOS on the Gardener shoot's workers (ADR 0020, deploy/gardener/README.md):
+# a pod per worker of the pool, with diskd and feosd. The pods' microVMs
+# live in the feosd container and end with it; a planned stop suspends
+# them, and the next feosd resumes them. feosd dials ferund itself (ADR
+# 0015); nothing here listens. feos-k8s (feos-k8s.yaml) puts the join
+# tokens into feosd-join and drains a cordoned worker in FeRun. The ${...}
+# are the deployment's parameters (config.env.example), which make fills
+# in:
+#
+#   make -C deploy/gardener apply-feos
+#   kubectl -n feos create secret generic diskd-s3 --from-env-file=<s3.env> \
+#     --from-literal=DISKD_S3_PREFIX=<prefix>/
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: feos
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feos-node
+  namespace: feos
+data:
+  # What pods may not reach: RFC 1918 and CGNAT (100.64/10), which hold
+  # the shoot's networks, its nodes', pods' and services'
+  # (spec.networking). Add a prefix for one that is elsewhere.
+  DENY_PREFIXES: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
+  # The chunk cache, 12 GiB, for workers with a 50 GiB root, which holds
+  # the pods' disks too. 64 streams to the object store.
+  DISKD_ARGS: "--budget-bytes 12884901888 --s3-concurrency 64"
+  # ferund's nodes' port: the fixed ClusterIP of service ferund-nodes
+  # (deploy/gardener/ferun), and the name its certificate carries.
+  CONTROL_PLANE: "${FERUN_NODES_IP}:7443"
+  CONTROL_PLANE_NAME: "ferun.run.${DOMAIN}"
+  TRUST_DOMAIN: "run.${DOMAIN}"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: feos-node
+  namespace: feos
+spec:
+  # A node at a time: a rollout suspends and resumes its pods.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: feos-node
+  template:
+    metadata:
+      labels:
+        app: feos-node
+    spec:
+      # Every worker of the pool, the ones Gardener replaces them with too.
+      nodeSelector:
+        worker.gardener.cloud/pool: ${WORKER_POOL}
+      tolerations:
+        - operator: Exists
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # The pause container is PID 1; feosd is not.
+      shareProcessNamespace: true
+      priorityClassName: system-node-critical
+      # A stop suspends the node's pods into their directories: 60 s and
+      # 4 s per GiB of the microVMs' 40 GiB, with room.
+      terminationGracePeriodSeconds: 300
+      imagePullSecrets:
+        - name: oci-pull
+      initContainers:
+        - name: prepare
+          image: ${REGISTRY}/feos-node:dev
+          imagePullPolicy: Always
+          args: [prepare]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - { name: feos, mountPath: /var/lib/feos }
+            - { name: modules, mountPath: /lib/modules, readOnly: true }
+        # A sidecar: it starts before feosd, which waits for it, and stops
+        # after feosd, whose suspend on stop writes through its disks.
+        # --stop-after-lock keeps it serving while feosd still runs.
+        - name: diskd
+          image: ${REGISTRY}/feos-node:dev
+          imagePullPolicy: Always
+          restartPolicy: Always
+          args: [diskd]
+          envFrom:
+            - configMapRef:
+                name: feos-node
+            - secretRef:
+                name: diskd-s3
+          securityContext:
+            privileged: true
+          startupProbe:
+            exec:
+              command: [test, -S, /var/lib/feos/disk/diskd.sock]
+            periodSeconds: 1
+            failureThreshold: 120
+          resources:
+            # The chunk cache's buffers and the disks' queues.
+            requests: { cpu: 250m, memory: 2Gi }
+          volumeMounts:
+            - { name: feos, mountPath: /var/lib/feos }
+            - { name: dev, mountPath: /dev }
+      containers:
+        - name: feosd
+          image: ${REGISTRY}/feos-node:dev
+          imagePullPolicy: Always
+          args: [feosd]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          envFrom:
+            - configMapRef:
+                name: feos-node
+          securityContext:
+            privileged: true
+          resources:
+            # The microVMs live in this container: what the node gives
+            # them, which the scheduler keeps free of other pods; 40 GiB
+            # for workers of 64 GiB. No limits: a cap would kill
+            # microVMs.
+            requests: { cpu: "4", memory: 40Gi }
+          volumeMounts:
+            - { name: feos, mountPath: /var/lib/feos }
+            # The Firecracker and guest versions of every image so far.
+            - { name: dist, mountPath: /usr/lib/feos }
+            - { name: dev, mountPath: /dev }
+            - { name: run, mountPath: /run/feos }
+            - { name: join, mountPath: /join, readOnly: true }
+      volumes:
+        - name: feos
+          hostPath: { path: /var/lib/feos, type: DirectoryOrCreate }
+        - name: dist
+          hostPath: { path: /var/lib/feos/dist, type: DirectoryOrCreate }
+        - name: dev
+          hostPath: { path: /dev, type: Directory }
+        - name: modules
+          hostPath: { path: /lib/modules, type: Directory }
+        - name: run
+          emptyDir: {}
+        - name: join
+          secret:
+            secretName: feosd-join
+            optional: true
+            defaultMode: 0400
