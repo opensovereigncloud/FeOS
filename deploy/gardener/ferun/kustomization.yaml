@@ -24,3 +24,16 @@ patches:
       - op: replace
         path: /spec/clusterIP
         value: 100.72.70.70
+  # A feos-node pod's stop suspends its microVMs (terminationGracePeriodSeconds
+  # 300) and the next one resumes them before it connects (ADR 0020): calls
+  # wait for the node that long instead of failing. Below --lost-grace
+  # (10 min).
+  - target:
+      kind: Deployment
+      name: ferund
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: FERUN_ROLLOUT_GRACE
+          value: 8m

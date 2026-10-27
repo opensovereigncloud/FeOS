@@ -1,0 +1,140 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# feos-k8s (ADR 0020, docs/architecture/kubernetes.md): makes join tokens
+# for new workers, keeps a guard pod on every worker so that a drain waits
+# until FeRun moved the worker's sandboxes off, and removes deleted workers
+# from FeRun. It speaks to FeRun as the admin user feos-k8s:
+#
+#   pw=$(openssl rand -hex 32)
+#   # append ",feos-k8s:$pw" to FERUN_ADMIN_USERS in secret ferun/ferund,
+#   # restart ferund, then
+#   kubectl -n feos create secret generic feos-k8s-ferun \
+#     --from-literal=credentials="feos-k8s:$pw"
+#   kubectl apply -f deploy/gardener/feos/feos-k8s.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: feos-k8s
+  namespace: feos
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: feos-k8s
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [list, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: feos-k8s
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: feos-k8s
+subjects:
+  - kind: ServiceAccount
+    name: feos-k8s
+    namespace: feos
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: feos-k8s
+  namespace: feos
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list, create, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [feosd-join]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: feos-k8s
+  namespace: feos
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: feos-k8s
+subjects:
+  - kind: ServiceAccount
+    name: feos-k8s
+    namespace: feos
+---
+# Refuses every eviction of a guard. The guards are pods without a
+# controller, for which only an integer minAvailable counts: more than
+# there will ever be guards. Not maxUnavailable: 0, which allows every
+# eviction of pods without a controller.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: feos-guard
+  namespace: feos
+spec:
+  minAvailable: 100000
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: feos-guard
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feos-k8s
+  namespace: feos
+spec:
+  replicas: 1
+  # Never two at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: feos-k8s
+  template:
+    metadata:
+      labels:
+        app: feos-k8s
+    spec:
+      serviceAccountName: feos-k8s
+      imagePullSecrets:
+        - name: oci-pull
+      containers:
+        - name: feos-k8s
+          image: oci.fecode.dev/feos-k8s:dev
+          imagePullPolicy: Always
+          args:
+            - --ferun-url=http://ferund.ferun.svc.cluster.local:8100
+            - --ferun-credentials-file=/ferun/credentials
+            - --node-selector=worker.gardener.cloud/pool=worker-w1pmo
+            - --node-name-prefix=shoot--feos--fecode-dev-worker-
+            - --namespace=feos
+          ports:
+            - name: health
+              containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            periodSeconds: 30
+            failureThreshold: 4
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: ferun, mountPath: /ferun, readOnly: true }
+      volumes:
+        - name: ferun
+          secret:
+            secretName: feos-k8s-ferun
+            defaultMode: 0400

@@ -1,0 +1,59 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# The feos-node pod's containers (ADR 0020, feos.yaml):
+#
+#   run prepare   the init container: loads the ublk driver from the host's
+#                 modules, and adds this image's Firecracker and guest
+#                 versions to the node's (/var/lib/feos/dist), where the
+#                 versions before stay: a pod resumes and restores only with
+#                 the Firecracker it was suspended with
+#   run diskd     diskd, configured by DISKD_ARGS and the S3 variables
+#   run feosd     feosd, configured by the ConfigMap feos-node
+set -eu
+
+log() { echo "run: $*"; }
+
+case "${1:-}" in
+prepare)
+	modprobe ublk_drv
+	for kind in firecracker guest; do
+		mkdir -p "/var/lib/feos/dist/$kind"
+		for dir in "/usr/lib/feos/$kind"/*/; do
+			version=$(basename "$dir")
+			target="/var/lib/feos/dist/$kind/$version"
+			[ -d "$target" ] && continue
+			# Whole or not at all: a version is renamed into place.
+			rm -rf "$target.new"
+			cp -a "$dir" "$target.new"
+			mv "$target.new" "$target"
+			log "added $kind $version"
+		done
+	done
+	log "image $(cat /feos/version)"
+	;;
+diskd)
+	mkdir -p /var/lib/feos/disk
+	chmod 0700 /var/lib/feos/disk
+	# shellcheck disable=SC2086 # DISKD_ARGS is a list of arguments.
+	exec /usr/sbin/diskd --state-dir /var/lib/feos/disk \
+		--stop-after-lock /var/lib/feos/feosd.lock ${DISKD_ARGS:-}
+	;;
+feosd)
+	: "${NODE_NAME:?}" "${CONTROL_PLANE:?}" "${CONTROL_PLANE_NAME:?}" "${TRUST_DOMAIN:?}"
+	set -- --suspend-on-stop \
+		--control-plane "$CONTROL_PLANE" \
+		--control-plane-name "$CONTROL_PLANE_NAME" \
+		--trust-domain "$TRUST_DOMAIN" \
+		--join-token-file "/join/$NODE_NAME"
+	for prefix in ${DENY_PREFIXES:-}; do
+		set -- "$@" --deny-prefix "$prefix"
+	done
+	exec /usr/sbin/feosd "$@"
+	;;
+*)
+	echo "usage: run prepare|diskd|feosd" >&2
+	exit 2
+	;;
+esac
