@@ -317,9 +317,9 @@ where there is one, is FeID.
 - Credentials supported first: bearer tokens and client certificates for
   Kubernetes, Ed25519, ECDSA and RSA keys of 2048 bits or more for SSH.
   Not supported: exec plugins, cloud auth providers, OIDC with refresh.
-- The protocol and the libraries start from FeTLS's code
-  (github.com/MalteJ/FeTLS); the Kubernetes proxy and the SSH agent from
-  the sandbox system's.
+- The protocol and the libraries start from the code of FeTLS, an earlier
+  prototype that is not published; the Kubernetes proxy and the SSH agent
+  from the sandbox system's.
 
 ## Open questions
 
