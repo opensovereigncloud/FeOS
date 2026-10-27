@@ -15,12 +15,12 @@ import (
 
 	"github.com/google/uuid"
 
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/activity"
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/activity"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // plainTemplate is an instance's template without secrets: the env group

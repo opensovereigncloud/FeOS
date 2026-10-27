@@ -25,9 +25,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 func create(t *testing.T, pc podv1.PodServiceClient, id string, spec *podv1.PodSpec) (*podv1.PodInfo, error) {

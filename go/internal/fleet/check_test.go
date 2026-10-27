@@ -13,10 +13,10 @@ import (
 
 	"google.golang.org/grpc/codes"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // definitive reports an error nodelink acts on.

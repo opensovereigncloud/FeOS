@@ -13,9 +13,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	watchv1 "github.com/gardenlinux/feos/go/gen/feos/watch/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // Hook runs before the node handles a call of its method, with the request

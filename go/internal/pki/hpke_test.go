@@ -10,8 +10,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 func TestSealOpen(t *testing.T) {

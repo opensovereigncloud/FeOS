@@ -8,8 +8,8 @@ import (
 	"slices"
 	"strconv"
 
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // nats is a NATS server from the official alpine image, with JetStream's

@@ -1,6 +1,6 @@
 [Unit]
 Description=FeOS pods' resolver
-Documentation=https://github.com/ironcore-dev/FeOS
+Documentation=https://github.com/gardenlinux/FeOS
 
 # feosd answers the pods' DNS on these sockets. They outlive restarts and
 # upgrades of feosd, so that a pod's query waits in them meanwhile, and a

@@ -13,11 +13,11 @@ import (
 
 	"github.com/google/uuid"
 
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/config"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/config"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/testnode"
 )
 
 // failureTimings are the timings of the node failure scenarios: a node is

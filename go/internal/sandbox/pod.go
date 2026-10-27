@@ -10,8 +10,8 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // The labels of a sandbox's pod (§2, §9). A pod belongs to ferund when it

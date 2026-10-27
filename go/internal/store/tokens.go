@@ -10,8 +10,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // tokenTouchInterval is how often a token's last_used_at is written at

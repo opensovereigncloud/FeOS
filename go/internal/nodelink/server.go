@@ -19,8 +19,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
 // The ALPN protocols of the nodes' port. Anything else, none included, is

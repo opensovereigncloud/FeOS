@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/kube"
+	"github.com/gardenlinux/feos/go/internal/kube"
 )
 
 // fakeKube is the Kubernetes API of the objects the controller uses:

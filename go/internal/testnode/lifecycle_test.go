@@ -16,11 +16,11 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/pki"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/pki"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // After a renewal the node keeps its new identity, dials a new node

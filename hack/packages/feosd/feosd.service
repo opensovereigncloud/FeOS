@@ -1,6 +1,6 @@
 [Unit]
 Description=FeOS node agent
-Documentation=https://github.com/ironcore-dev/FeOS
+Documentation=https://github.com/gardenlinux/FeOS
 After=network-online.target diskd.service feos-vms.service
 Wants=network-online.target diskd.service feos-vms.service
 # The pods' resolver's sockets, which outlive feosd (feosd.socket).

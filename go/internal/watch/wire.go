@@ -13,8 +13,8 @@ import (
 
 	"github.com/google/uuid"
 
-	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
-	"github.com/ironcore-dev/feos/go/internal/apierr"
+	watchv1 "github.com/gardenlinux/feos/go/gen/feos/watch/v1"
+	"github.com/gardenlinux/feos/go/internal/apierr"
 )
 
 // pathError is one path that could not be watched, and why.

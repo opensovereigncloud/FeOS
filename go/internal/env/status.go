@@ -10,10 +10,10 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/ironcore-dev/feos/go/internal/env/ctl"
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/env/ctl"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // status assembles an environment's status (§4.9) from the tables: its

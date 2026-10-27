@@ -13,7 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // Node is a row of nodes. A node is never deleted: removal is a status.

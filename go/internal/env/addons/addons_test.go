@@ -7,8 +7,8 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // fake is a blueprint of its own type, for the registry's test.

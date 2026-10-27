@@ -12,14 +12,14 @@ import (
 	"sync"
 	"time"
 
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/env/addons"
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/ports"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/env/addons"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/ports"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // probeConcurrency bounds the probes in flight on this instance (§4.2).

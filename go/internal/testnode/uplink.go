@@ -23,10 +23,10 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/pki"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/pki"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // Version is what the test node reports as its feosd version.

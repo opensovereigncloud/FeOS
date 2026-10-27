@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/db/dbtest"
 )
 
 // writePair writes a new self-signed certificate for 127.0.0.1 and its key

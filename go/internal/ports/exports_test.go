@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // lease is the world's sandbox's lease, as the environments read it from

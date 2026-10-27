@@ -22,11 +22,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	"github.com/ironcore-dev/feos/go/internal/activity"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	"github.com/gardenlinux/feos/go/internal/activity"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // Limits of one EventBatch (fleet.proto).

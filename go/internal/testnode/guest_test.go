@@ -25,12 +25,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/protobuf/proto"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
-	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	portforwardv1 "github.com/gardenlinux/feos/go/gen/feos/portforward/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
+	watchv1 "github.com/gardenlinux/feos/go/gen/feos/watch/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // guestEnv is a node with a running pod.

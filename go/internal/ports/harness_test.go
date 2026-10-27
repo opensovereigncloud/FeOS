@@ -19,11 +19,11 @@ import (
 	"testing"
 	"time"
 
-	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
-	"github.com/ironcore-dev/feos/go/internal/auth"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
+	portforwardv1 "github.com/gardenlinux/feos/go/gen/feos/portforward/v1"
+	"github.com/gardenlinux/feos/go/internal/auth"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/tools/toolstest"
 )
 
 // The guest ports of the tests: guestPort is served by the world's guest

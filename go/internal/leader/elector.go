@@ -27,9 +27,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // Loop is a job the leader runs on its interval and when woken.

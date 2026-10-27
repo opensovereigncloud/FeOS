@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // addon reads an addon of a spec as ferund does (spec.Addon from JSON,

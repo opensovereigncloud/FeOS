@@ -9,9 +9,9 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // The placement gates of §9 and the pin of ADR 0018, numbered as they

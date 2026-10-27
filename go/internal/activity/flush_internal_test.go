@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // A batch the database refuses for some of its rows loses only those:

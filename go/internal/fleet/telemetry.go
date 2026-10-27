@@ -13,9 +13,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
-	"github.com/ironcore-dev/feos/go/internal/activity"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	"github.com/gardenlinux/feos/go/internal/activity"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // reportTelemetry is ReportTelemetry (§8), a node's heartbeat: the report

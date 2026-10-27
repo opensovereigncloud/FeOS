@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // What the environments (ADR 0018) use of the door (envdeps.Ports): the

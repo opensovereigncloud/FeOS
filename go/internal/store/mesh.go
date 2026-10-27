@@ -12,8 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/mesh"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/mesh"
 )
 
 // HintMeshPeers is the ferun_leader hint of a change of the mesh's peers:

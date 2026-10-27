@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
 // The subcommands of ferund.

@@ -11,8 +11,8 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/protobuf/proto"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
 )
 
 func audit(kind string) *fleetv1.Event {

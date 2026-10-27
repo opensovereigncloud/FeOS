@@ -28,11 +28,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/ironcore-dev/feos/go/internal/config"
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/fleet"
-	"github.com/ironcore-dev/feos/go/internal/pki"
-	"github.com/ironcore-dev/feos/go/internal/server"
+	"github.com/gardenlinux/feos/go/internal/config"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/fleet"
+	"github.com/gardenlinux/feos/go/internal/pki"
+	"github.com/gardenlinux/feos/go/internal/server"
 )
 
 // version is the build's version, set with -ldflags "-X main.version=…";

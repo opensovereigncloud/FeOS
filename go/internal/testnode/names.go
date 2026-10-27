@@ -16,8 +16,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // nameService is feosd's NameService over tables in memory, with feosd's

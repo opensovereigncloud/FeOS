@@ -18,13 +18,13 @@ import (
 
 	"github.com/google/uuid"
 
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	"github.com/ironcore-dev/feos/go/internal/env/addons"
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/sandbox"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	"github.com/gardenlinux/feos/go/internal/env/addons"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/sandbox"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // The egress table mirrors feosd's internet sets: the internet of either

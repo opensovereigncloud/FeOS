@@ -10,10 +10,10 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
-	"github.com/ironcore-dev/feos/go/internal/leader"
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/leader"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 func TestLoopsList(t *testing.T) {

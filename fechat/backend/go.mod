@@ -1,4 +1,4 @@
-module github.com/ironcore-dev/feos/fechat/backend
+module github.com/gardenlinux/feos/fechat/backend
 
 go 1.25.0
 

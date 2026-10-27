@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/activity"
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/activity"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/db/dbtest"
 )
 
 func days(t *testing.T, d *db.DB, table string) []time.Time {

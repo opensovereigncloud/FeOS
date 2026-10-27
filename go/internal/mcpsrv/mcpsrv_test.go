@@ -21,14 +21,14 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"google.golang.org/protobuf/proto"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
-	"github.com/ironcore-dev/feos/go/internal/tools"
-	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/testnode"
+	"github.com/gardenlinux/feos/go/internal/tools"
+	"github.com/gardenlinux/feos/go/internal/tools/toolstest"
 )
 
 // The door's own answers, before the SDK sees a request.

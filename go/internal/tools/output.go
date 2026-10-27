@@ -6,7 +6,7 @@ package tools
 import (
 	"strings"
 
-	"github.com/ironcore-dev/feos/go/internal/activity"
+	"github.com/gardenlinux/feos/go/internal/activity"
 )
 
 // Image is a picture a tool returned beside its text: a read of a PNG,

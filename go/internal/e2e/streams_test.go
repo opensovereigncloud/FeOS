@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
+	watchv1 "github.com/gardenlinux/feos/go/gen/feos/watch/v1"
 )
 
 // guestApp is a web server in a sandbox's guest, as a dev server is: it

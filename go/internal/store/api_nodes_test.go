@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // The expiries of the nodes' current certificates, in one statement.

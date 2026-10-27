@@ -29,7 +29,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
 )
 
 // backdate is how far before its issuance a certificate becomes valid:

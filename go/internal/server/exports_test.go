@@ -10,10 +10,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
-	"github.com/ironcore-dev/feos/go/internal/env"
-	"github.com/ironcore-dev/feos/go/internal/ports"
-	"github.com/ironcore-dev/feos/go/internal/seal"
+	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/env"
+	"github.com/gardenlinux/feos/go/internal/ports"
+	"github.com/gardenlinux/feos/go/internal/seal"
 )
 
 // newEnvironments takes the port door's exports and the sealer by type:

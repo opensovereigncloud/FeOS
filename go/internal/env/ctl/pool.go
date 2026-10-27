@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // poolWorkers is how many tasks the pool runs at once (§4.2: 8 per

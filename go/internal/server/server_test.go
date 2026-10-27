@@ -19,13 +19,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/ironcore-dev/feos/go/internal/config"
-	"github.com/ironcore-dev/feos/go/internal/db/dbtest"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/pki"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
+	"github.com/gardenlinux/feos/go/internal/config"
+	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/pki"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/testnode"
 )
 
 // The tests of this package do not run in parallel: the streams hook is

@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/apierr"
-	"github.com/ironcore-dev/feos/go/internal/auth"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/apierr"
+	"github.com/gardenlinux/feos/go/internal/auth"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // The access route, GET /api/v1/sandboxes/{id}/access (tenant): the

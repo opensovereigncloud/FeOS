@@ -14,16 +14,16 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/env/addons"
-	"github.com/ironcore-dev/feos/go/internal/env/ctl"
-	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/leader"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/nodelink"
-	"github.com/ironcore-dev/feos/go/internal/sandbox"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/env/addons"
+	"github.com/gardenlinux/feos/go/internal/env/ctl"
+	"github.com/gardenlinux/feos/go/internal/env/envdeps"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/leader"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/nodelink"
+	"github.com/gardenlinux/feos/go/internal/sandbox"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // The interfaces the service and its controller reach the instance

@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // Recheck runs CheckNode again for every connection of node on this

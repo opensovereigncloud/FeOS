@@ -21,7 +21,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
 )
 
 // Peer is the node an uplink call comes from, from its verified

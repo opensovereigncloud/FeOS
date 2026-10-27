@@ -13,7 +13,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // The SPIFFE layout (provisional; ADR 0014 leaves it open): a node is

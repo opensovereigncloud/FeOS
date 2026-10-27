@@ -1,7 +1,7 @@
 version = 1
 SPDX-PackageName = "FeOS"
 SPDX-PackageSupplier = "IronCore authors <ospo@sap.com>"
-SPDX-PackageDownloadLocation = "https://github.com/ironcore-dev/FeOS"
+SPDX-PackageDownloadLocation = "https://github.com/gardenlinux/FeOS"
 
 
 [[annotations]]

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // The rollout grace a node has left is measured on the database clock: the

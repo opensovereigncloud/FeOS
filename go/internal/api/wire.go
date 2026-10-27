@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/apierr"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/apierr"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // i64 is an int64 rendered as a JSON string, protojson's encoding, which

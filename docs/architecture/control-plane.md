@@ -108,7 +108,7 @@ certificate on the nodes' port 24 h.
 
 ## Packages
 
-`go/` is the module `github.com/ironcore-dev/feos/go`. The generated code
+`go/` is the module `github.com/gardenlinux/feos/go`. The generated code
 of `proto/` is in `go/gen/feos/<api>/v1` (`make go-gen`), the rest in
 `go/internal/`:
 

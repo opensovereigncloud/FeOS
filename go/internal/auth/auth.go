@@ -11,7 +11,7 @@ package auth
 import (
 	"context"
 
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // Sandbox is a request made with a sandbox's token: the token is the

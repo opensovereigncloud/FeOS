@@ -30,8 +30,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/feosk8s"
-	"github.com/ironcore-dev/feos/go/internal/kube"
+	"github.com/gardenlinux/feos/go/internal/feosk8s"
+	"github.com/gardenlinux/feos/go/internal/kube"
 )
 
 func main() {

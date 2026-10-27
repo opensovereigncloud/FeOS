@@ -18,14 +18,14 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
-	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
-	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
-	"github.com/ironcore-dev/feos/go/internal/pki"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	portforwardv1 "github.com/gardenlinux/feos/go/gen/feos/portforward/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
+	volumev1 "github.com/gardenlinux/feos/go/gen/feos/volume/v1"
+	watchv1 "github.com/gardenlinux/feos/go/gen/feos/watch/v1"
+	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
 // The ALPN protocols of the nodes' port (fleet.proto).

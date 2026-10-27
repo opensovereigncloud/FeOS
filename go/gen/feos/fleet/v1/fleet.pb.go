@@ -7,8 +7,8 @@
 package fleetv1
 
 import (
-	v11 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	v1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
+	v11 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	v1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"

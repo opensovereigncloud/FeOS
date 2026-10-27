@@ -22,8 +22,8 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // Blueprint is an addon type.

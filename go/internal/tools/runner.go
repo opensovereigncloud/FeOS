@@ -19,16 +19,16 @@ import (
 
 	"github.com/google/uuid"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
-	"github.com/ironcore-dev/feos/go/internal/activity"
-	"github.com/ironcore-dev/feos/go/internal/auth"
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/nodelink"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
+	"github.com/gardenlinux/feos/go/internal/activity"
+	"github.com/gardenlinux/feos/go/internal/auth"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/nodelink"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // Sandboxes is what the Runner needs of the sandbox engine

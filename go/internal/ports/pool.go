@@ -20,10 +20,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/nodelink"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	portforwardv1 "github.com/gardenlinux/feos/go/gen/feos/portforward/v1"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/nodelink"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // tkey names a pool: a sandbox's pod and one of its ports.

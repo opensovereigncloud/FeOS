@@ -15,7 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
 )
 
 // groupService is feosd's SecurityGroupService over groups in memory,

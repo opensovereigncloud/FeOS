@@ -9,7 +9,7 @@ import (
 	"net/netip"
 	"testing"
 
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 var testULA = netip.MustParsePrefix("fd5e:1b2c:93a0::/48")

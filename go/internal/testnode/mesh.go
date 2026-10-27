@@ -16,8 +16,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
 )
 
 // joinMeshTimeout bounds a JoinMesh on the uplink.

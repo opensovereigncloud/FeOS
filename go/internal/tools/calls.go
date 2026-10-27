@@ -15,7 +15,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
 )
 
 // mainContainer is the sandbox's container that tools work in.

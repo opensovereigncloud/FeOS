@@ -14,12 +14,12 @@ import (
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
-	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	portforwardv1 "github.com/gardenlinux/feos/go/gen/feos/portforward/v1"
+	volumev1 "github.com/gardenlinux/feos/go/gen/feos/volume/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 var bgctx = context.Background()

@@ -18,11 +18,11 @@ import (
 
 	"github.com/google/uuid"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
-	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/testnode"
+	"github.com/gardenlinux/feos/go/internal/tools/toolstest"
 )
 
 // detachedLease brings the sandbox's pod up through the fake engine and

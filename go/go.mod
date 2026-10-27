@@ -1,4 +1,4 @@
-module github.com/ironcore-dev/feos/go
+module github.com/gardenlinux/feos/go
 
 go 1.26.0
 

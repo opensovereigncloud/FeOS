@@ -1,6 +1,6 @@
 [Unit]
 Description=FeOS microVMs
-Documentation=https://github.com/ironcore-dev/FeOS
+Documentation=https://github.com/gardenlinux/FeOS
 # The cgroup of feosd's microVMs: feosd puts each into vms/<id> below this
 # unit's cgroup, and turns cpu and memory on in it (ADR 0005). The unit
 # runs nothing itself, so that systemd never has to start a process in a

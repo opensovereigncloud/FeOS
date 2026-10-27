@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // A sign-in under way is taken once, and only within its 10 minutes.

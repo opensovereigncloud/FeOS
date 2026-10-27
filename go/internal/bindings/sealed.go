@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"sort"
 
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // The tables whose rows carry a sealed credential (internal/seal); each

@@ -9,7 +9,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 func TestNATSVersionsPlans(t *testing.T) {

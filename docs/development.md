@@ -52,7 +52,7 @@ crates/
     watch-service/      guest: inotify subscriptions on a container's files
     forward-service/    guest: port forwarding, kube and SSH credential offloading
 proto/feos/<api>/v1/    the gRPC APIs, package feos.<api>.v1
-go/                     the Go module github.com/ironcore-dev/feos/go: ferund
+go/                     the Go module github.com/gardenlinux/feos/go: ferund
                         and ferun-testnode (cmd/), their packages
                         (internal/), the generated code of proto/ (gen/)
 web/                    ferund's management UI (React, Vite), built into

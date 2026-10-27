@@ -17,16 +17,16 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
-	"github.com/ironcore-dev/feos/go/internal/activity"
-	"github.com/ironcore-dev/feos/go/internal/auth"
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
-	"github.com/ironcore-dev/feos/go/internal/tools/toolstest"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
+	"github.com/gardenlinux/feos/go/internal/activity"
+	"github.com/gardenlinux/feos/go/internal/auth"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/testnode"
+	"github.com/gardenlinux/feos/go/internal/tools/toolstest"
 )
 
 // Every error out of Acquire reaches the client as "ensure sandbox: <err>",

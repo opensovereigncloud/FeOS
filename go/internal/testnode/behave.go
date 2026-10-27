@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // objectLabel is the label naming an environment's object of a pod

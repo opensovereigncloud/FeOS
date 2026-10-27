@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/pki"
+	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
 // The fixed timings of ferund (§3 of the design), named here in one place.

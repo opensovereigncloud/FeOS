@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // The shipped blueprints and an addon of each with every option, for the

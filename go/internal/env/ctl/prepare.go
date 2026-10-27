@@ -12,10 +12,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/sandbox"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	volumev1 "github.com/gardenlinux/feos/go/gen/feos/volume/v1"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/sandbox"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // PrepareHook is the engine's prepare hook (sandbox.PrepareHook) for a

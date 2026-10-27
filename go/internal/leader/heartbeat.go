@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // HeartbeatInterval is how often an instance writes its row. An instance

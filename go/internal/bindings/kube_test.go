@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/seal"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/seal"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 const kubeTestToken = "eyJhbGciOiJSUzI1NiJ9.kube-test-token-PLAINTEXT-7d1f"

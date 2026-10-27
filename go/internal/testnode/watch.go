@@ -13,8 +13,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	watchv1 "github.com/ironcore-dev/feos/go/gen/feos/watch/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	watchv1 "github.com/gardenlinux/feos/go/gen/feos/watch/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // watchLimit is the guest's cap on inotify watches, which acks report.

@@ -8,7 +8,7 @@ LOCALBIN ?= $(shell pwd)/bin
 GO ?= go
 PROTOC_GEN_GO_VERSION ?= v1.36.12
 PROTOC_GEN_GO_GRPC_VERSION ?= v1.6.2
-GO_MODULE := github.com/ironcore-dev/feos/go
+GO_MODULE := github.com/gardenlinux/feos/go
 # Every proto/feos/<api>/v1/<api>.proto becomes the Go package
 # $(GO_MODULE)/gen/feos/<api>/v1, named <api>v1. The protos name no Go
 # package of their own, so the mapping is given to protoc here.

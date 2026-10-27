@@ -35,10 +35,10 @@ import (
 	"syscall"
 	"time"
 
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	volumev1 "github.com/gardenlinux/feos/go/gen/feos/volume/v1"
+	"github.com/gardenlinux/feos/go/internal/testnode"
 )
 
 func main() {

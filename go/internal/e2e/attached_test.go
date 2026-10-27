@@ -17,11 +17,11 @@ import (
 
 	"github.com/google/uuid"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/testnode"
 )
 
 // FeCode's replaceLostSandbox over REST: the workspace sandbox of a

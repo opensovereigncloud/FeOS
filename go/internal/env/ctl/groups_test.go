@@ -17,14 +17,14 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/podid"
-	"github.com/ironcore-dev/feos/go/internal/store"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/testnode"
 )
 
 // The env group is on a node before the pod that names it (the node

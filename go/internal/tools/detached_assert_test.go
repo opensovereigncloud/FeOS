@@ -4,8 +4,8 @@
 package tools_test
 
 import (
-	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
-	"github.com/ironcore-dev/feos/go/internal/tools"
+	"github.com/gardenlinux/feos/go/internal/env/envdeps"
+	"github.com/gardenlinux/feos/go/internal/tools"
 )
 
 // The server picks the runner's detached calls up by a type assertion

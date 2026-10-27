@@ -13,12 +13,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ironcore-dev/feos/go/internal/apierr"
-	"github.com/ironcore-dev/feos/go/internal/env/ctl"
-	"github.com/ironcore-dev/feos/go/internal/env/envdeps"
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
-	"github.com/ironcore-dev/feos/go/internal/model"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/apierr"
+	"github.com/gardenlinux/feos/go/internal/env/ctl"
+	"github.com/gardenlinux/feos/go/internal/env/envdeps"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // The operations of the environments' REST routes (the contract's §5),

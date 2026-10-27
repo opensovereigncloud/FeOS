@@ -15,9 +15,9 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/ironcore-dev/feos/go/internal/activity"
-	"github.com/ironcore-dev/feos/go/internal/apierr"
-	"github.com/ironcore-dev/feos/go/internal/store"
+	"github.com/gardenlinux/feos/go/internal/activity"
+	"github.com/gardenlinux/feos/go/internal/apierr"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // This file is human sign-in (§11 "Human sign-in"): people sign in to the

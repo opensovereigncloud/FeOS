@@ -6,10 +6,10 @@ package nodelink
 import (
 	"testing"
 
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
-	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
+	volumev1 "github.com/gardenlinux/feos/go/gen/feos/volume/v1"
 )
 
 // The calls that prepare a node for an environment's pod (its volume, its

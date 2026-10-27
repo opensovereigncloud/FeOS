@@ -13,7 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	portforwardv1 "github.com/ironcore-dev/feos/go/gen/feos/portforward/v1"
+	portforwardv1 "github.com/gardenlinux/feos/go/gen/feos/portforward/v1"
 )
 
 // forwardChunk is the largest data frame toward the caller.

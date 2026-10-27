@@ -19,7 +19,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/db"
 )
 
 // The JSON-RPC methods the door looks at, and the session header.

@@ -7,7 +7,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/db"
 )
 
 // cancelPayload is the payload of ferun_cancel.

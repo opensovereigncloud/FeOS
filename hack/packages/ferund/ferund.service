@@ -1,6 +1,6 @@
 [Unit]
 Description=FeRun control plane (ferund)
-Documentation=https://github.com/ironcore-dev/FeOS
+Documentation=https://github.com/gardenlinux/FeOS
 After=network-online.target postgresql.service
 Wants=network-online.target
 # ferund exits when it cannot reach its database at start. It is started

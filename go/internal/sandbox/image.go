@@ -20,7 +20,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/bindings"
+	"github.com/gardenlinux/feos/go/internal/bindings"
 )
 
 // The image resolver pins an image to the digest of its linux/amd64

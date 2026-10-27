@@ -23,7 +23,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/db"
 )
 
 // EnvURL names the variable that points the tests at a PostgreSQL server.

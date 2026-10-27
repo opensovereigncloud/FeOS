@@ -14,7 +14,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	fleetv1 "github.com/ironcore-dev/feos/go/gen/feos/fleet/v1"
+	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
 )
 
 // The limits of an EventBatch (fleet.proto), and the node's buffer.

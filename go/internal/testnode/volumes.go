@@ -15,7 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
+	volumev1 "github.com/gardenlinux/feos/go/gen/feos/volume/v1"
 )
 
 // feosd's bounds of a volume's size (volumes.rs).

@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/ironcore-dev/feos/go/internal/env/spec"
+	"github.com/gardenlinux/feos/go/internal/env/spec"
 )
 
 // The request and answer bodies of the environments' REST routes (the

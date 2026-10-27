@@ -6,8 +6,8 @@ package server
 import (
 	"context"
 
-	"github.com/ironcore-dev/feos/go/internal/ports"
-	"github.com/ironcore-dev/feos/go/internal/watch"
+	"github.com/gardenlinux/feos/go/internal/ports"
+	"github.com/gardenlinux/feos/go/internal/watch"
 )
 
 // The streams of every instance: the port door and the watches.

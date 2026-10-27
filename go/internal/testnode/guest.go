@@ -21,7 +21,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
 )
 
 // PodIDMetadata is the gRPC metadata that sends a call to a pod's guest.

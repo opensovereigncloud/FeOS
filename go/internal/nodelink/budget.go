@@ -13,10 +13,10 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	networkv1 "github.com/ironcore-dev/feos/go/gen/feos/network/v1"
-	podv1 "github.com/ironcore-dev/feos/go/gen/feos/pod/v1"
-	volumev1 "github.com/ironcore-dev/feos/go/gen/feos/volume/v1"
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
+	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
+	volumev1 "github.com/gardenlinux/feos/go/gen/feos/volume/v1"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // PodIDMetadata is the gRPC metadata key that routes a call to a pod's

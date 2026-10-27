@@ -27,7 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/kube"
+	"github.com/gardenlinux/feos/go/internal/kube"
 )
 
 // The names the controller marks its objects with.

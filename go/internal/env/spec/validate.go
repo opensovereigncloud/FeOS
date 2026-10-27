@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/podid"
 )
 
 // Mode is what a validation is for: it decides which checks run and how

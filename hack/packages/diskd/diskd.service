@@ -1,6 +1,6 @@
 [Unit]
 Description=FeOS disk daemon: pods' disks and memory over a chunk store
-Documentation=https://github.com/ironcore-dev/FeOS
+Documentation=https://github.com/gardenlinux/FeOS
 After=network-online.target systemd-modules-load.service
 Wants=network-online.target
 # feosd's pods need their disks.

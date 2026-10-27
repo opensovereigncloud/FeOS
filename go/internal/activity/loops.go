@@ -10,8 +10,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/db"
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // RetentionConfig is how long the partitioned logs are kept

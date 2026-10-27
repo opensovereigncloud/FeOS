@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/ironcore-dev/feos/go/internal/model"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 func TestPostgresVersionsPlans(t *testing.T) {

@@ -8,7 +8,7 @@ section: admin
 priority: optional
 maintainer: IronCore authors <ospo@sap.com>
 vendor: SAP SE
-homepage: https://github.com/ironcore-dev/FeOS
+homepage: https://github.com/gardenlinux/FeOS
 license: Apache-2.0 AND GPL-2.0-only
 description: |-
   FeOS guest ${GUEST_VERSION}, the PID 1 of feosd's microVMs

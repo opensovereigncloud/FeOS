@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	containerv1 "github.com/ironcore-dev/feos/go/gen/feos/container/v1"
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
-	"github.com/ironcore-dev/feos/go/internal/model"
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
+	"github.com/gardenlinux/feos/go/internal/model"
 )
 
 // The Runner's detached calls (detached_types.go): what the environment

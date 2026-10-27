@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ironcore-dev/feos/go/internal/config"
-	"github.com/ironcore-dev/feos/go/internal/server"
-	"github.com/ironcore-dev/feos/go/internal/testnode"
+	"github.com/gardenlinux/feos/go/internal/config"
+	"github.com/gardenlinux/feos/go/internal/server"
+	"github.com/gardenlinux/feos/go/internal/testnode"
 )
 
 // peersOf is a node's peers on the mesh, by name, with their endpoints and

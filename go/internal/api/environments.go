@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ironcore-dev/feos/go/internal/apierr"
-	envs "github.com/ironcore-dev/feos/go/internal/env"
+	"github.com/gardenlinux/feos/go/internal/apierr"
+	envs "github.com/gardenlinux/feos/go/internal/env"
 )
 
 // The environments' routes (ADR 0018, the contract's §5): tenant class,

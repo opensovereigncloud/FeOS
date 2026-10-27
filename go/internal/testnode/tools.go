@@ -27,7 +27,7 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
-	toolv1 "github.com/ironcore-dev/feos/go/gen/feos/tool/v1"
+	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
 )
 
 // The guest's tool limits (tool-service tools.rs).
