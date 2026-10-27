@@ -14,14 +14,14 @@ func TestParse(t *testing.T) {
 	env := map[string]string{
 		"FEOS_K8S_FERUN_URL":              "http://ferund.ferun:8100",
 		"FEOS_K8S_FERUN_CREDENTIALS_FILE": "/creds",
-		"FEOS_K8S_NODE_NAME_PREFIX":       "shoot--feos--fecode-dev-",
+		"FEOS_K8S_NODE_NAME_PREFIX":       "shoot--myproject--myshoot-",
 		"FEOS_K8S_INTERVAL":               "10s",
 	}
 	o, err := parse([]string{"--interval", "3s", "--namespace", "x"}, func(k string) string { return env[k] }, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.ferunURL != "http://ferund.ferun:8100" || o.ferunCreds != "/creds" || o.ctl.NodeNamePrefix != "shoot--feos--fecode-dev-" ||
+	if o.ferunURL != "http://ferund.ferun:8100" || o.ferunCreds != "/creds" || o.ctl.NodeNamePrefix != "shoot--myproject--myshoot-" ||
 		o.ctl.Interval != 3*time.Second || o.ctl.Namespace != "x" || o.ctl.JoinSecret != "feosd-join" ||
 		o.ctl.GuardImage != "registry.k8s.io/pause:3.10" || o.ctl.NodeSelector != "feos.fecode.dev/node=true" ||
 		o.ctl.JoinTokenTTL != time.Hour {

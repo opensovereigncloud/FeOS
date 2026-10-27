@@ -9,7 +9,7 @@
 //
 //	feos-k8s --ferun-url http://ferund.ferun:8100 \
 //	    --ferun-credentials-file /etc/feos-k8s/ferun/credentials \
-//	    --node-name-prefix shoot--feos--fecode-dev- [flags]
+//	    --node-name-prefix shoot--myproject--myshoot- [flags]
 //
 // Every flag has an environment variable FEOS_K8S_<NAME> (upper snake case
 // of the flag); a flag wins over its variable. SIGTERM and SIGINT stop it.

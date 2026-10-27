@@ -22,11 +22,11 @@ import (
 
 const (
 	ns     = "feos"
-	prefix = "shoot--feos--fecode-dev-worker-"
+	prefix = "shoot--myproject--myshoot-worker-"
 	// A node name as Gardener makes them: 51 characters, within a label
 	// value's 63.
-	node1 = "shoot--feos--fecode-dev-worker-w1pmo-z1-cf876-l4bmn"
-	node2 = "shoot--feos--fecode-dev-worker-w1pmo-z1-cf876-x9q2z"
+	node1 = "shoot--myproject--myshoot-worker-pool1-z1-cf876-l4bmn"
+	node2 = "shoot--myproject--myshoot-worker-pool1-z1-cf876-x9q2z"
 )
 
 var feosLabels = map[string]string{"feos.fecode.dev/node": "true"}
