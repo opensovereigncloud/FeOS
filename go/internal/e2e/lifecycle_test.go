@@ -179,6 +179,9 @@ func TestIdlePause(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// A check that fails below ends the test before the rollback, and
+		// the cleanup's close of the pool would wait for this connection.
+		defer func() { _ = tx.Rollback(bg) }()
 		if _, err := tx.Exec(bg, "SELECT 1 FROM sandboxes WHERE id = $1 FOR UPDATE", sb.id); err != nil {
 			t.Fatal(err)
 		}
