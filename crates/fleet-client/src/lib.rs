@@ -10,7 +10,17 @@
 //! feos.fleet.v1: its telemetry, the renewal of its certificate and its
 //! events. Nothing here stops feosd: whatever fails is logged and tried
 //! again, while feosd serves its socket.
+//!
+//! Nor does anything feosd does stop this. It all runs on threads of its
+//! own, the control plane's, and none of feosd's work runs on them: the
+//! calls on the node connections run on feosd's runtime (`calls`), what is
+//! read of feosd for a report has a deadline, and what blocks runs on the
+//! blocking pool. A runtime thread that blocks, as one on a file that
+//! Firecracker writes, can stall the whole runtime it belongs to: the
+//! reports, the heartbeat, would stop, and the connections' pings would go
+//! unanswered, and the control plane would count the node down.
 
+mod calls;
 mod events;
 mod identity;
 mod node;
@@ -19,6 +29,7 @@ mod tls;
 mod token;
 mod uplink;
 
+pub use calls::{CallsOn, OnRuntime};
 pub use events::Events;
 pub use identity::NODE_DIR;
 pub use node::{server, Incoming, NodeConn};
@@ -32,11 +43,14 @@ use log::{error, info, warn};
 use node::Nodes;
 use rustls::crypto::CryptoProvider;
 use rustls::ClientConfig;
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use telemetry::Collector;
+use tokio::runtime::Handle;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tonic::transport::Channel;
 use tonic::Code;
@@ -55,6 +69,12 @@ const REPORT_DEADLINE: Duration = Duration::from_secs(3);
 const JOIN_DEADLINE: Duration = Duration::from_secs(10);
 const RENEW_DEADLINE: Duration = Duration::from_secs(10);
 const JOIN_MESH_DEADLINE: Duration = Duration::from_secs(10);
+/// How long feosd may take to take the mesh's answer, which the next report
+/// waits for; an answer not taken in time is asked for again.
+const TAKE_MESH_DEADLINE: Duration = Duration::from_secs(5);
+/// The control plane's threads: TLS, HTTP/2 and the reports of a handful of
+/// connections.
+const THREADS: usize = 2;
 /// How often a node that waits for a join token looks at its file.
 const TOKEN_POLL: Duration = Duration::from_secs(5);
 const JOIN_BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
@@ -154,12 +174,25 @@ pub struct Fleet {
     events: Events,
     /// What joins, reports and holds the node connections.
     runner: tokio::task::AbortHandle,
+    /// The control plane's threads.
+    runtime: Handle,
 }
 
 impl Fleet {
     /// The node's events, which go to the control plane.
     pub fn events(&self) -> &Events {
         &self.events
+    }
+
+    /// Runs `future` on the control plane's threads: the server of the
+    /// node connections (`server`), so that they answer the control plane
+    /// whatever feosd's own threads do.
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.runtime.spawn(future)
     }
 
     /// Tells the control plane that feosd stops, for a restart or an
@@ -184,17 +217,40 @@ impl Fleet {
     }
 }
 
-/// Starts the node's side of the control plane: the join if the node has
-/// not joined, then the uplink and the node connections, which the caller
-/// serves its API on.
+/// The control plane's threads, made at the first start and kept for the
+/// rest of the process.
+fn runtime() -> Result<Handle, String> {
+    static RUNTIME: Mutex<Option<Handle>> = Mutex::new(None);
+    let mut runtime = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = runtime.as_ref() {
+        return Ok(handle.clone());
+    }
+    let built = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(THREADS)
+        .thread_name("fleet")
+        .enable_all()
+        .build()
+        .map_err(|e| format!("the control plane's threads: {e}"))?;
+    // Never dropped: it serves until feosd ends, and a runtime that is
+    // dropped on another's thread panics.
+    let handle = Box::leak(Box::new(built)).handle().clone();
+    *runtime = Some(handle.clone());
+    Ok(handle)
+}
+
+/// Starts the node's side of the control plane on threads of its own: the
+/// join if the node has not joined, then the uplink and the node
+/// connections, which the caller serves its API on (`server`,
+/// `Fleet::spawn`).
 pub fn start<I: Inventory>(config: Config, inventory: I) -> Result<(Fleet, Incoming), String> {
+    let runtime = runtime()?;
     let link = Arc::new(Link::new(&config.name)?);
     let start_id = uuid::Uuid::new_v4().to_string();
     let events = Events::new(&start_id);
     events.node("started", &format!("feosd {}", config.version));
     let (nodes, incoming) = Nodes::new(link.name.clone());
     let (uplink, published) = watch::channel(None);
-    tokio::spawn(events::publish(events.clone(), published));
+    runtime.spawn(events::publish(events.clone(), published));
     let collector = Collector::new(inventory, &start_id, &config.version, &config.pod_prefix);
     info!(
         "Fleet: The control plane is at {} as {}, trust domain {}",
@@ -212,8 +268,15 @@ pub fn start<I: Inventory>(config: Config, inventory: I) -> Result<(Fleet, Incom
             &start_id,
         ) as usize,
     };
-    let runner = tokio::spawn(runner.run()).abort_handle();
-    Ok((Fleet { events, runner }, incoming))
+    let runner = runtime.spawn(runner.run()).abort_handle();
+    Ok((
+        Fleet {
+            events,
+            runner,
+            runtime,
+        },
+        incoming,
+    ))
 }
 
 struct Runner<I> {
@@ -596,7 +659,8 @@ impl<I: Inventory> Runner<I> {
                             .collect();
                         info!("Fleet: The control plane's instances are at {listed:?}");
                         identity.state.instances = instances;
-                        if let Err(e) = dir.store_state(&identity.state) {
+                        let (dir, state) = (dir.clone(), identity.state.clone());
+                        if let Err(e) = blocking(move || dir.store_state(&state)).await {
                             warn!("Fleet: Failed to keep the control plane's instances: {e}");
                         }
                     }
@@ -662,14 +726,22 @@ impl<I: Inventory> Runner<I> {
                         or_none(&answer.pod_network)
                     );
                 }
-                match self
-                    .collector
-                    .inventory()
-                    .joined_mesh(answer.pod_network, answer.pod_prefix)
-                    .await
-                {
-                    Ok(()) => *joined = Some(request),
-                    Err(e) => error!("Fleet: The mesh's answer is not taken, asking again: {e}"),
+                let taken = timeout(
+                    TAKE_MESH_DEADLINE,
+                    self.collector
+                        .inventory()
+                        .joined_mesh(answer.pod_network, answer.pod_prefix),
+                )
+                .await;
+                match taken {
+                    Ok(Ok(())) => *joined = Some(request),
+                    Ok(Err(e)) => {
+                        error!("Fleet: The mesh's answer is not taken, asking again: {e}")
+                    }
+                    Err(_) => warn!(
+                        "Fleet: The mesh's answer was not taken within {}s; asking again",
+                        TAKE_MESH_DEADLINE.as_secs()
+                    ),
                 }
             }
             Err(status) if status.code() == Code::PermissionDenied => {
@@ -748,14 +820,27 @@ impl<I: Inventory> Runner<I> {
             &self.provider,
         )
         .map_err(|e| Outcome::Broken(format!("the control plane's answer: {e}")))?;
-        dir.store(&renewed).map_err(|e| {
-            Outcome::Broken(format!(
-                "keeping the renewed certificate in {}: {e}",
-                dir.path().display()
-            ))
-        })?;
-        Ok(renewed)
+        let kept = dir.clone();
+        blocking(move || kept.store(&renewed).map(|()| renewed))
+            .await
+            .map_err(|e| {
+                Outcome::Broken(format!(
+                    "keeping the renewed certificate in {}: {e}",
+                    dir.path().display()
+                ))
+            })
     }
+}
+
+/// Runs `f` on the blocking pool: the node's files are written and synced,
+/// which can take seconds while the disk is busy, and the control plane's
+/// threads must not wait for that.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
 }
 
 fn or_none(value: &str) -> &str {

@@ -7,6 +7,7 @@
 //! that server as its incoming stream, and learn from the connection when
 //! the server dropped it.
 
+use crate::calls::CallsOn;
 use crate::tls;
 use log::{debug, info, warn};
 use rustls::pki_types::ServerName;
@@ -21,12 +22,14 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, Instant};
 use tokio_rustls::client::TlsStream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::transport::Server;
+use tower::layer::util::{Identity, Stack};
 
 /// The node connections, as the server takes them.
 pub type Incoming = ReceiverStream<Result<NodeConn, Infallible>>;
@@ -43,12 +46,14 @@ const DRAIN: Duration = Duration::from_secs(3600);
 /// The server for node connections: the control plane may run up to 1024
 /// calls and streams at once on one, and pings it every 10 s, idle or not,
 /// which h2 answers whatever their rate. Its own pings notice a dead
-/// connection.
-pub fn server() -> Server {
+/// connection. It is served on the control plane's threads
+/// (`Fleet::spawn`), and its calls run on `calls`, feosd's runtime.
+pub fn server(calls: Handle) -> Server<Stack<CallsOn, Identity>> {
     Server::builder()
         .max_concurrent_streams(1024)
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+        .layer(CallsOn::new(calls))
 }
 
 /// A node connection, as the server serves it. Dropping it tells its

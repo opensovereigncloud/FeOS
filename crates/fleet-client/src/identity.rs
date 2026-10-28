@@ -205,6 +205,7 @@ fn rfc3339(t: DateTime<Utc>) -> String {
 }
 
 /// The node's directory.
+#[derive(Clone)]
 pub struct NodeDir {
     path: PathBuf,
 }

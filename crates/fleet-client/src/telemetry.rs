@@ -5,13 +5,19 @@
 //! has and how busy it is. What is cheap comes from /proc and statvfs at
 //! every report; what changes rarely, the installed versions and diskd's
 //! object store, once a minute.
+//!
+//! The report goes out whatever feosd does: what it reads of feosd has a
+//! deadline, and what feosd does not answer in time, it reports as feosd
+//! said it before.
 
 use crate::token::sha256_hex;
 use feos_proto::fleet_service::{Telemetry, Versions};
 use feos_proto::pod_service::{PodInfo, PodState};
-use log::warn;
+use log::{info, warn};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
 /// Of the file system that holds the pods' disks: diskd's state directory,
@@ -20,10 +26,15 @@ const DISK_DIRS: [&str; 2] = ["/var/lib/feos/disk", "/var/lib/feos"];
 /// How long the installed versions and diskd's answer are kept.
 const SLOW: Duration = Duration::from_secs(60);
 const DISKD_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a report waits for feosd's pods and installed versions.
+const INVENTORY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// What feosd knows of the node that the control plane is told.
+/// What feosd knows of the node that the control plane is told. It is
+/// asked on the control plane's threads: `pods` and `installed` are called
+/// on the blocking pool, and what the others do of feosd's own runs on
+/// feosd's runtime.
 pub trait Inventory: Send + Sync + 'static {
-    /// The node's pods.
+    /// The node's pods. It may block, as on the lock of the pods' records.
     fn pods(&self) -> Vec<PodInfo>;
     /// The Firecracker and guest versions installed side by side.
     fn installed(&self) -> Installed;
@@ -73,10 +84,64 @@ pub struct Diskd {
 }
 
 pub(crate) struct Collector<I> {
-    inventory: I,
+    inventory: Arc<I>,
     /// What stays as long as feosd runs.
     fixed: Telemetry,
     slow: Option<(Instant, Installed, Diskd)>,
+    /// The pods as feosd said them last.
+    pods: Vec<PodInfo>,
+    read_pods: Read<Vec<PodInfo>>,
+    read_installed: Read<Installed>,
+}
+
+/// A read of feosd's inventory on the blocking pool, which a report waits
+/// for at most `INVENTORY_TIMEOUT`. One that takes longer is waited for
+/// again by the next report rather than started anew, so that a read that
+/// hangs holds one thread, not one per report.
+struct Read<T> {
+    what: &'static str,
+    pending: Option<JoinHandle<T>>,
+    late: bool,
+}
+
+impl<T: Send + 'static> Read<T> {
+    fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            pending: None,
+            late: false,
+        }
+    }
+
+    /// What `read` reads, if it answers in time.
+    async fn get(&mut self, read: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let pending = self
+            .pending
+            .get_or_insert_with(|| tokio::task::spawn_blocking(read));
+        let value = match timeout(INVENTORY_TIMEOUT, pending).await {
+            Err(_) => {
+                if !self.late {
+                    warn!(
+                        "Fleet: feosd's {} do not answer within {}s; the reports carry them as \
+                         they were",
+                        self.what,
+                        INVENTORY_TIMEOUT.as_secs()
+                    );
+                    self.late = true;
+                }
+                return None;
+            }
+            Ok(done) => {
+                self.pending = None;
+                done.ok()
+            }
+        };
+        if self.late {
+            info!("Fleet: feosd's {} answer again", self.what);
+            self.late = false;
+        }
+        value
+    }
 }
 
 impl<I: Inventory> Collector<I> {
@@ -101,9 +166,12 @@ impl<I: Inventory> Collector<I> {
             ..Default::default()
         };
         Self {
-            inventory,
+            inventory: Arc::new(inventory),
             fixed,
             slow: None,
+            pods: Vec::new(),
+            read_pods: Read::new("pods"),
+            read_installed: Read::new("installed versions"),
         }
     }
 
@@ -127,13 +195,16 @@ impl<I: Inventory> Collector<I> {
         }
         (report.disk_total_bytes, report.disk_available_bytes) = disk();
 
-        let pods = self.inventory.pods();
-        let counts = count(&pods);
+        let inventory = self.inventory.clone();
+        if let Some(pods) = self.read_pods.get(move || inventory.pods()).await {
+            self.pods = pods;
+        }
+        let counts = count(&self.pods);
         report.pods_pending = counts.pending;
         report.pods_running = counts.running;
         report.pods_suspended = counts.suspended;
         report.pods_other = counts.other;
-        report.inventory_hash = inventory_hash(&pods);
+        report.inventory_hash = inventory_hash(&self.pods);
 
         self.refresh().await;
         if let Some((_, installed, diskd)) = &self.slow {
@@ -155,19 +226,27 @@ impl<I: Inventory> Collector<I> {
         {
             return;
         }
-        let installed = self.inventory.installed();
-        // A diskd that does not answer keeps what it said before.
-        let diskd = match timeout(DISKD_TIMEOUT, self.inventory.diskd()).await {
-            Ok(Some(diskd)) => diskd,
-            _ => {
-                warn!("Fleet: diskd does not answer; its object store is reported as before");
-                self.slow
-                    .take()
-                    .map(|(_, _, diskd)| diskd)
-                    .unwrap_or_default()
-            }
-        };
-        self.slow = Some((Instant::now(), installed, diskd));
+        let inventory = self.inventory.clone();
+        let installed = self.read_installed.get(move || inventory.installed()).await;
+        // A diskd that does not answer keeps what it said before, and so do
+        // the installed versions.
+        let diskd = timeout(DISKD_TIMEOUT, self.inventory.diskd())
+            .await
+            .ok()
+            .flatten();
+        if diskd.is_none() {
+            warn!("Fleet: diskd does not answer; its object store is reported as before");
+        }
+        let (before_installed, before_diskd) = self
+            .slow
+            .take()
+            .map(|(_, installed, diskd)| (installed, diskd))
+            .unwrap_or_default();
+        self.slow = Some((
+            Instant::now(),
+            installed.unwrap_or(before_installed),
+            diskd.unwrap_or(before_diskd),
+        ));
     }
 }
 

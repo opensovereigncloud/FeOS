@@ -256,7 +256,9 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     #[cfg(feature = "host")]
     let node_server = {
         let pods = services.pods.clone();
-        let router = services.router_with(fleet_client::server());
+        // The calls run here, on feosd's runtime; the connections on the
+        // control plane's threads.
+        let router = services.router_with(fleet_client::server(tokio::runtime::Handle::current()));
         let slot = fleet_slot.clone();
         let config = options.fleet.clone();
         async move {
@@ -285,17 +287,23 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             match started {
                 // Never ends, whatever becomes of the dialers.
                 Some((fleet, incoming)) => {
-                    let _ = slot.set(fleet);
                     let incoming =
                         tokio_stream::StreamExt::chain(incoming, tokio_stream::pending());
-                    router.serve_with_incoming(incoming).await
+                    // On the control plane's threads, as the rest of it: the
+                    // connections answer whatever feosd's own threads do.
+                    let serving = fleet.spawn(router.serve_with_incoming(incoming));
+                    let _ = slot.set(fleet);
+                    serving
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())
                 }
                 None => std::future::pending().await,
             }
         }
     };
     #[cfg(not(feature = "host"))]
-    let node_server = std::future::pending::<Result<(), tonic::transport::Error>>();
+    let node_server = std::future::pending::<Result<(), String>>();
     let mut node_serving = true;
 
     // SIGTERM: with --suspend-on-stop, feosd refuses calls that change
@@ -413,11 +421,13 @@ struct Services {
     guest: guest::GuestServices,
 }
 
-/// feosd forwards the calls for a pod's guest (ADR 0004).
+/// feosd forwards the calls for a pod's guest (ADR 0004), below the layers
+/// `L` of a listener's server.
 #[cfg(feature = "host")]
-type Layers = Stack<ForwardLayer, Identity>;
+type Layered<L> = Stack<ForwardLayer, L>;
 #[cfg(not(feature = "host"))]
-type Layers = Identity;
+type Layered<L> = L;
+type Layers = Layered<Identity>;
 
 impl Services {
     fn router(&self) -> Router<Layers> {
@@ -425,7 +435,7 @@ impl Services {
     }
 
     /// The services on `server`, as a listener configures it.
-    fn router_with(&self, server: Server) -> Router<Layers> {
+    fn router_with<L: Clone>(&self, server: Server<L>) -> Router<Layered<L>> {
         #[cfg(feature = "host")]
         let mut server = server.layer(ForwardLayer::new(self.pods.clone()));
         #[cfg(not(feature = "host"))]

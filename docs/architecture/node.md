@@ -191,6 +191,19 @@ always checked for `--control-plane-name` and the URI, later against the
 trust bundle. Their sockets have keepalive and a `TCP_USER_TIMEOUT` of
 20 s.
 
+The control plane's side runs on two threads of its own, on which nothing
+else of `feosd` runs: the join, the reports, the events, the dialers and
+the HTTP/2 of the node connections, their pings included. A call on a node
+connection runs on `feosd`'s runtime, as one on the socket does, and so
+does its answer's body; a call that the control plane resets is dropped
+there. A report waits a second at most for the pods and the installed
+versions, which may wait for the pods' records' lock, and reports them as
+they were when they do not answer; the mesh's answer is taken on `feosd`'s
+runtime, and asked for again when it is not taken within 5 s. A tokio
+runtime can stall as a whole while one of its threads blocks, such as on
+an unlink of a file that Firecracker still writes; the reports and the
+node connections go on all the same, and the node stays up.
+
 ## A pod
 
 A pod ([ADR 0004](../adr/0004-pods.md)) is a microVM

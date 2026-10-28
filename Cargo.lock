@@ -1357,6 +1357,7 @@ version = "0.6.0"
 dependencies = [
  "chrono",
  "feos-proto",
+ "hyper",
  "hyper-util",
  "log",
  "nix 0.30.1",
