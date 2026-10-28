@@ -23,6 +23,8 @@
     "release": 0,
     "realised": 0,
     "deleting": false,
+    "public": false,
+    "hosts": [],
     "rollout": null,
     "objects": [],
     "routes": [],

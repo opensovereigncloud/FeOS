@@ -70,20 +70,32 @@ func (e *InstanceInUseError) Error() string {
 		e.Age.Round(time.Millisecond))
 }
 
+// InstanceClaim is what ClaimInstance ended of an earlier run under the
+// instance ID: the sandboxes whose ops it released, and how many tool
+// calls.
+type InstanceClaim struct {
+	Released  []podid.ID
+	ToolCalls int64
+}
+
 // ClaimInstance begins a run of the instance in.ID, in one transaction: it
 // writes the row anew (started_at = last_seen = now(), not stopping) and
 // releases the ops the ID still owns, which no process runs any more: they
 // are an earlier run's that ended without its stop's release. The release
 // is ReleaseOpsOf's, with the description "op <op> of instance <id> was
 // released: the instance started again"; the released sandboxes are
-// notified and returned. A row written within the TTL refuses the claim
-// with *InstanceInUseError: a process still runs under the ID, or stops
-// (its last steps release the ops the ID owns and delete the row), or one
-// ended without deleting it less than the TTL ago.
-func (s *Store) ClaimInstance(ctx context.Context, in InstanceInfo) ([]podid.ID, error) {
-	var released []podid.ID
+// notified and returned. The tool calls the ID still runs end in the same
+// transaction (EndInstanceToolCalls: interrupted when sent, not_run when
+// not, each notified on ferun_call), and their number is returned: the
+// earlier run had them, and no process renews them any more. A row
+// written within the TTL refuses the claim with *InstanceInUseError: a
+// process still runs under the ID, or stops (its last steps release the
+// ops the ID owns and delete the row), or one ended without deleting it
+// less than the TTL ago.
+func (s *Store) ClaimInstance(ctx context.Context, in InstanceInfo) (InstanceClaim, error) {
+	var c InstanceClaim
 	err := s.InTx(ctx, func(tx *Store) error {
-		released = nil
+		c = InstanceClaim{}
 		var claimed bool
 		err := tx.q.QueryRow(ctx, `INSERT INTO instances (id, address, node_address, version) VALUES ($1, $2, $3, $4)
 			ON CONFLICT (id) DO UPDATE SET address = excluded.address, node_address = excluded.node_address,
@@ -110,10 +122,19 @@ func (s *Store) ClaimInstance(ctx context.Context, in InstanceInfo) ([]podid.ID,
 				status_description = 'op ' || op || ' of instance ' || $1 || ' was released: the instance started again',
 				gen = gen + 1, updated_at = now()
 			WHERE op_owner = $1 AND op <> '' RETURNING id`, in.ID)
-		released, err = tx.notifyReturned(ctx, rows, err)
+		c.Released, err = tx.notifyReturned(ctx, rows, err)
+		if err != nil {
+			return err
+		}
+		// The earlier run's tool calls, which it neither finished nor
+		// renews: no stop ended them.
+		c.ToolCalls, err = tx.EndInstanceToolCalls(ctx, in.ID)
 		return err
 	})
-	return released, err
+	if err != nil {
+		return InstanceClaim{}, err
+	}
+	return c, nil
 }
 
 // UpsertInstance writes the instance's heartbeat: its row with last_seen =

@@ -41,6 +41,16 @@ const (
 // A ValidateContext may also implement interface{ BlueprintTypes()
 // []string }: the registered addon types, which a finding about an
 // unknown type then lists.
+//
+// It may also implement interface{ IngressHost() (host string, public,
+// ok bool) }: the environment's default host under the platform's apps
+// zone ("" for a spec without an environment, or for an environment never
+// published), whether the environment is public, and ok false when the
+// platform has no apps zone, so that no ingress serves any route. With ok,
+// each route whose target exists gets an info finding that says which
+// doors serve it (ADR 0021): the route door alone for an attached
+// service; the ingress and the route door for an image service of a
+// public environment.
 type ValidateContext interface {
 	// Mode is what the validation is for.
 	Mode() Mode
@@ -740,6 +750,9 @@ func (v *validator) typesRemedy() string {
 func (v *validator) route(name string, r Route) {
 	p := "routes." + name
 	switch {
+	case len(r.Path) > MaxRoutePathBytes:
+		v.errorf(p+".path", fmt.Sprintf("shorten the path to at most %d bytes", MaxRoutePathBytes),
+			"the path has %d bytes; at most %d are allowed", len(r.Path), MaxRoutePathBytes)
 	case !strings.HasPrefix(r.Path, "/"):
 		v.errorf(p+".path", "write the path beginning with /", "path %q does not begin with /", r.Path)
 	case !routePathChars.MatchString(r.Path):
@@ -753,9 +766,37 @@ func (v *validator) route(name string, r Route) {
 		v.errorf(p+".service", "route to a service that is declared under services", "no service %q", r.Service)
 	} else {
 		v.portRef(p+".port", r.Port, target.Ports, r.Service)
+		if len(r.Path) <= MaxRoutePathBytes {
+			v.doors(p, r, target)
+		}
 	}
 	if r.Host != "" {
-		v.add(SeverityInfo, p+".host", "", "host is stored, not realised yet: the route door serves every host")
+		v.add(SeverityInfo, p+".host", "", "host is stored, not realised yet: the ingress and the route door "+
+			"serve the route on every host of the environment")
+	}
+}
+
+// doors says which doors serve route r to target, at path p, while the
+// platform has an apps zone (the context's IngressHost): nothing without
+// one, where the route door serves every route.
+func (v *validator) doors(p string, r Route, target Service) {
+	ih, is := v.vc.(interface{ IngressHost() (string, bool, bool) })
+	if !is {
+		return
+	}
+	host, public, ok := ih.IngressHost()
+	switch {
+	case !ok:
+	case target.Runtime == RuntimeAttached:
+		v.add(SeverityInfo, p, "", "served by the route door alone: an attached service runs in a sandbox, "+
+			"which the ingress does not reach")
+	case public && host != "":
+		v.add(SeverityInfo, p, "", "served by the ingress at https://%s%s and by the route door", host,
+			RoutePrefix(r.Path))
+	case public:
+		v.add(SeverityInfo, p, "", "served by the ingress and by the route door")
+	default:
+		v.add(SeverityInfo, p, "", "served by the route door; the ingress serves it once the environment is public")
 	}
 }
 
@@ -788,7 +829,7 @@ func (v *validator) routePaths() {
 	seen := map[string]string{}
 	for _, name := range slices.Sorted(maps.Keys(v.s.Routes)) {
 		path := v.s.Routes[name].Path
-		if !strings.HasPrefix(path, "/") {
+		if !strings.HasPrefix(path, "/") || len(path) > MaxRoutePathBytes {
 			continue
 		}
 		key := RoutePrefix(path)

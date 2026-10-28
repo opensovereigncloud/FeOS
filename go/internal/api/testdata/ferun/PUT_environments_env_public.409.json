@@ -1,0 +1,13 @@
+{
+  "method": "PUT",
+  "path": "/api/v1/environments/expensa-stage/public",
+  "query": {},
+  "status": 409,
+  "request": {
+    "public": true
+  },
+  "response": {
+    "error": "the platform serves no apps zone (--apps-zone); an environment cannot be public"
+  },
+  "note": "also 409 while the environment or its tenant is being deleted"
+}

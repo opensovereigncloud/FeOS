@@ -180,6 +180,8 @@
     "release": 1,
     "realised": 0,
     "deleting": false,
+    "public": false,
+    "hosts": [],
     "rollout": {
       "release": 1,
       "state": "pending",
@@ -242,19 +244,22 @@
         "name": "api-approval",
         "path": "/api/approval",
         "service": "approval-service",
-        "port": 8080
+        "port": 8080,
+        "door": "route"
       },
       {
         "name": "api-expense",
         "path": "/api/expense",
         "service": "expense-service",
-        "port": 8080
+        "port": 8080,
+        "door": "route"
       },
       {
         "name": "root",
         "path": "/",
         "service": "web",
-        "port": 8080
+        "port": 8080,
+        "door": "route"
       }
     ],
     "openIncidents": 0,

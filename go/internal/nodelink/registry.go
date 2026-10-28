@@ -13,7 +13,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/status"
 )
 
 // ConnEvent says that a node got its first current connection on this
@@ -514,9 +513,10 @@ func (s *Server) SetStoppingUntil(node string, until time.Time) {
 	s.dropIdleLocked(st)
 }
 
-// unavailable is the answer for a node without a connection here.
+// unavailable is the answer for a node without a connection here: a
+// RefusalError.
 func (s *Server) unavailable(node string) error {
-	return status.Errorf(codes.Unavailable, "node %s is not connected to instance %s", node, s.cfg.InstanceID)
+	return refusef(codes.Unavailable, "node %s is not connected to instance %s", node, s.cfg.InstanceID)
 }
 
 // waitCurrent waits until node has a current connection, up to the node

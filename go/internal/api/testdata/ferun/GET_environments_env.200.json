@@ -15,6 +15,10 @@
     "release": 7,
     "realised": 6,
     "deleting": false,
+    "public": true,
+    "hosts": [
+      "expensa-stage-fecode.apps.fecode.dev"
+    ],
     "rollout": {
       "release": 7,
       "state": "rolling",
@@ -180,23 +184,29 @@
         "name": "api-approval",
         "path": "/api/approval",
         "service": "approval-service",
-        "port": 8080
+        "port": 8080,
+        "door": "ingress",
+        "url": "https://expensa-stage-fecode.apps.fecode.dev/api/approval"
       },
       {
         "name": "api-expense",
         "path": "/api/expense",
         "service": "expense-service",
-        "port": 8080
+        "port": 8080,
+        "door": "ingress",
+        "url": "https://expensa-stage-fecode.apps.fecode.dev/api/expense"
       },
       {
         "name": "root",
         "path": "/",
         "service": "web",
-        "port": 8080
+        "port": 8080,
+        "door": "ingress",
+        "url": "https://expensa-stage-fecode.apps.fecode.dev/"
       }
     ],
     "openIncidents": 1,
     "createdAt": "2026-10-01T09:12:44Z"
   },
-  "note": "{env} is the UUID or the name; stage rolls release 7 while 6 serves"
+  "note": "{env} is the UUID or the name; stage rolls release 7 while 6 serves; it is public, so the ingress serves its image services' routes at its host (door \"ingress\", url) besides the route door"
 }

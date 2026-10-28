@@ -664,18 +664,21 @@ func TestReleaseDeadline(t *testing.T) {
 }
 
 // A scale-up counts as a rollout: replicas that cannot place fail the
-// release at the service's budget, and the replicas it kept serve on.
+// release at the service's budget, and the replicas it kept serve on. The
+// first release keeps the default budget, so that its replica does not
+// have to be ready within the scale-up's 3 s; the budget is no part of
+// the template, so the scale-up keeps that replica.
 func TestScaleUpBudget(t *testing.T) {
 	h := newHarness(t, options{})
 	h.addNode("n1", func(c *testnode.Config) { c.MemoryBytes = 8 << 30 })
 	env := h.newEnv("stage")
-	big := func(replicas int) string {
-		return serviceSpec(replicas, "1", `,"resources":{"memoryMib":6144},"rollout":{"timeout":"3s"}`)
+	big := func(replicas int, extra string) string {
+		return serviceSpec(replicas, "1", `,"resources":{"memoryMib":6144}`+extra)
 	}
-	r1 := h.apply(env.ID, big(1))
+	r1 := h.apply(env.ID, big(1, ""))
 	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
 	kept := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0]
-	r2 := h.apply(env.ID, big(2))
+	r2 := h.apply(env.ID, big(2, `,"rollout":{"timeout":"3s"}`))
 	rel := h.waitRelease(env.ID, r2, model.ReleaseFailed, 30*time.Second)
 	if rel.Reason != "service web did not roll out within 3s" {
 		t.Errorf("reason %q", rel.Reason)

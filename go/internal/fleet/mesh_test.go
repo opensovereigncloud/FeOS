@@ -81,6 +81,8 @@ func TestJoinMesh(t *testing.T) {
 		{meshKey(1), "10.0.0.1"},
 		{meshKey(1), "10.0.0.1:0"},
 		{meshKey(1), "[fe80::1%eth0]:51820"},
+		{make([]byte, 32), "10.0.0.1:51820"},
+		{append([]byte{1}, make([]byte, 31)...), "10.0.0.1:51820"},
 	} {
 		_, err := h.joinMesh("n1", s1, bad.key, bad.endpoint)
 		wantCode(t, err, codes.InvalidArgument, "")
@@ -100,6 +102,19 @@ func TestJoinMesh(t *testing.T) {
 	}
 	if n := h.node("n1"); !bytes.Equal(n.MeshPublicKey, meshKey(3)) || n.MeshEndpoint != "10.0.0.1:51820" || n.MeshSubnet != 1 {
 		t.Fatalf("n1 %+v", n)
+	}
+
+	// One key, one peer: n2's key, and an ingress's, are not n1's.
+	_, err = h.joinMesh("n1", s1, meshKey(2), "10.0.0.1:51820")
+	wantCode(t, err, codes.FailedPrecondition, "the mesh key of node n1 is another peer's")
+	if _, err := h.st.InsertIngress(bg, "g1"); err != nil {
+		t.Fatal(err)
+	}
+	h.exec("UPDATE ingresses SET mesh_public_key = $1 WHERE name = 'g1'", meshKey(5))
+	_, err = h.joinMesh("n1", s1, meshKey(5), "10.0.0.1:51820")
+	wantCode(t, err, codes.FailedPrecondition, "is another peer's")
+	if n := h.node("n1"); !bytes.Equal(n.MeshPublicKey, meshKey(3)) {
+		t.Fatalf("a refused key changed n1 %+v", n)
 	}
 
 	_, err = h.joinMesh("ghost", s1, meshKey(4), "10.0.0.4:51820")

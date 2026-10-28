@@ -9,8 +9,12 @@ replication, and how nodes connect),
 credentials), [ADR 0013](../adr/0013-traffic-records.md) (traffic records),
 [ADR 0017](../adr/0017-pod-mesh.md) (the pods' mesh),
 [ADR 0018](../adr/0018-environments-and-releases.md) (environments and
-releases), [ADR 0009](../adr/0009-node-os-and-packages.md) (packages). The
-node's side of the wire is in [node.md](node.md#the-control-plane).
+releases), [ADR 0021](../adr/0021-ingress.md) (the ingress),
+[ADR 0023](../adr/0023-calls-outlive-their-caller.md) (calls that outlive
+their caller), [ADR 0009](../adr/0009-node-os-and-packages.md) (packages).
+The node's side of the wire is in [node.md](node.md#the-control-plane);
+`ferun-ingress`, the program that serves public environments' hosts, and
+ferund's side of it are in [ingress.md](ingress.md).
 
 ferund is the successor of the sandbox system's control plane. Its REST
 API, MCP and port front door keep that system's paths, bodies, status codes
@@ -30,7 +34,7 @@ instance serves any request. Each has two listeners:
 | Listener | Default | Serves | In front of it |
 |---|---|---|---|
 | the front doors, `--listen` | `:8100` | the REST API, MCP at `/mcp`, the ports at `/fwd/`, sign-in at `/auth/`, the management UI, `/healthz`, `/readyz` | an HTTPS balancer, without sticky sessions; or TLS of its own with `--tls-cert` and `--tls-key` |
-| the nodes' port, `--node-listen` | `:7443` | node connections, uplinks and joins, TLS 1.3 always | a TCP passthrough, or the instances' own addresses |
+| the nodes' port, `--node-listen` | `:7443` | node connections, uplinks and joins, and the connections of `ferun-ingress`; TLS 1.3 always | a TCP passthrough, or the instances' own addresses |
 
 `ferund` has four subcommands:
 
@@ -38,7 +42,7 @@ instance serves any request. Each has two listeners:
     ferund init-ca --root-dir R --dir D --dns-domain X [--dns-domain Y ...]
                    [--trust-domain T] [--control-plane-domain C]
     ferund join-token --database-url URL [--ca-dir D] [--trust-domain T]
-                      [--ttl 1h] [--node NAME]
+                      [--kind node|ingress] [--ttl 1h] [--node NAME]
     ferund migrate --database-url URL
 
 Every flag has an environment variable `FERUN_<NAME>`, the flag's name in
@@ -48,7 +52,9 @@ unset. Durations are written in Go's syntax (`90s`, `10m`, `12h`), byte
 sizes as integers with an optional `KiB`, `MiB` or `GiB` suffix.
 `ferund <command> --help` lists the flags with their variables and
 defaults. `serve` migrates the database at its start; `migrate` does only
-that.
+that. `join-token` issues a node's token, or with `--kind ingress` one
+for an instance of `ferun-ingress`; `--node` pins it to a name of that
+kind ([The ingress](#the-ingress)).
 
 ### serve's flags
 
@@ -65,7 +71,7 @@ that.
 | `--node-server-names` | the control-plane domain | the DNS names of the instance's certificate on the nodes' port, each under the control-plane domain |
 | `--secret-key-file` | none | 32 bytes (raw, hex or base64) that seal the bindings and the environments' secrets at rest |
 | `--bindings` | off | serve the Kubernetes and SSH bindings; only with `--secret-key-file` |
-| `--deny-prefix` | a built-in set | a destination that preflights, bindings and the image resolver may not reach, repeatable |
+| `--deny-prefix` | a built-in set | a destination that preflights, bindings and the image resolver may not reach, repeatable; a set given replaces the built-in one, and `default` stands for it (`default,100.144.0.0/13` adds a network) |
 | `--admin-users` | none | `user:password,...` for the admin API: Basic, beside or instead of OIDC |
 | `--public-url` | none | the front door's external URL, e.g. `https://run.fecode.dev`; required with `--oidc-issuer` |
 | `--oidc-issuer` | none | the OIDC issuer of human sign-in, exactly as its discovery document states it |
@@ -77,6 +83,7 @@ that.
 | `--bootstrap-token` | none | becomes a token of the tenant `operator` while no tenant exists |
 | `--mcp-allowed-origins` | none | the Origins `/mcp` accepts; empty refuses every request with an Origin |
 | `--pod-network` | empty | the pods' network ([The pods' mesh](#the-pods-mesh)): empty, routed, every node with a prefix of its network's; `mesh`, a ULA /48 drawn at the first start and kept in the database; or such a /48, `fdXX:XXXX:XXXX::/48` |
+| `--apps-zone` | empty | the DNS zone of public environments' default hosts, `<label>.<zone>`, which `ferun-ingress` serves ([The ingress](#the-ingress)); empty: no hosts, and no environment can be made public |
 | `--default-image` | `ghcr.io/maltej/debian-ai:latest` | the image of a sandbox created without one |
 | `--default-vcpus`, `--default-memory-mib` | 2, 512 | the size of a sandbox created without one |
 | `--placement` | `binpack` | or `spread` |
@@ -94,7 +101,7 @@ that.
 | `--node-max-streams` | 1024 | the HTTP/2 stream limit nodes advertise on a node connection; the stream budgets derive from it |
 | `--conn-drain-timeout` | `20m` | a draining node connection is closed after this at the latest |
 | `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
-| `--shutdown-grace` | `10m` | how long a stopping instance waits for its requests and ops |
+| `--shutdown-grace` | `11m` | how long a stopping instance waits for its requests, its tool calls and its ops |
 | `--activity-retention`, `--traffic-retention` | `720h`, `168h` | how long activity and traffic records are kept |
 | `--log-level` | `info` | |
 
@@ -103,8 +110,13 @@ Fixed timings, not flags (`internal/config`): an instance's heartbeat every
 preparation before a tool call at most 7 min 5 s (REST advertises
 `preparationWaitMs: 425000`); telemetry every 5 s; one node's inventory
 reconcile at most every 30 s; holds leased for 30 s and renewed every
-10 s; join tokens valid 1 h when no lifetime is given; the instance's
-certificate on the nodes' port 24 h.
+10 s; a keyed tool call's lease 30 s, renewed every 10 s; its record kept
+1 h; a keyed `bash` at most 600 s ([Calls that outlive their
+caller](#calls-that-outlive-their-caller)); join tokens valid 1 h when no
+lifetime is given; the instance's certificate on the nodes' port 24 h;
+an ingress's older certificates valid 10 minutes after it presented a
+newer one, its holds leased for 30 s, its Sync stream's heartbeat every
+10 s ([The ingress](#the-ingress)).
 
 ## Packages
 
@@ -125,13 +137,15 @@ of `proto/` is in `go/gen/feos/<api>/v1` (`make go-gen`), the rest in
 | `fleet` | `feos.fleet.v1`: joins, renewals, telemetry, events, pods' credentials, the mesh, the nodes' liveness; the mesh's peers to the nodes |
 | `leader` | the leader lease and the leader's loops, the instance's heartbeat |
 | `sandbox` | the sandbox engine: states, ops, placement, sync, reconcile, tombstones, policies, images |
-| `tools` | the agent's tools in a sandbox, and their REST routes |
+| `tools` | the agent's tools in a sandbox, their REST routes, and the calls that outlive their caller |
 | `mcpsrv` | the MCP door |
 | `ports` | the port door |
 | `watch` | file watches across instances |
 | `bindings` | Kubernetes and SSH bindings |
 | `seal` | AES-256-GCM sealing under `--secret-key-file`'s key: the bindings' credentials, the environments' secrets |
 | `env`, `env/spec`, `env/addons`, `env/ctl`, `env/envdeps` | the environments ([Environments](#environments)) |
+| `ingress/service`, `ingress/table` | ferund's side of the ingress: the API `ferun-ingress` calls, its identity, the table it serves from ([The ingress](#the-ingress)) |
+| `ingress/wire`, `routing` | shared with `ferun-ingress`: the ingress's protocol; path matching, which the route door uses too |
 | `api`, `auth`, `apierr` | the REST router, its auth classes and errors, human sign-in |
 | `ui` | the embedded build of `web/` |
 | `server` | one instance, built from its configuration, and its stop |
@@ -139,7 +153,8 @@ of `proto/` is in `go/gen/feos/<api>/v1` (`make go-gen`), the rest in
 | `e2e` | end-to-end tests: several instances and test nodes on one database |
 
 `cmd/ferund` is the daemon; `cmd/ferun-testnode` runs a test node
-([below](#the-test-node)).
+([below](#the-test-node)); `cmd/ferun-ingress` is the ingress, with its
+packages under `internal/ingress` ([ingress.md](ingress.md)).
 
 ## The database
 
@@ -149,7 +164,19 @@ columns on partitioned tables, and `migrate` refuses an older server with
 replicate synchronously ([Operations](#operations)).
 
 - **Sessions.** Every connection of the pool runs with `lock_timeout`
-  5 s, `statement_timeout` 30 s and the time zone UTC.
+  5 s, `statement_timeout` 30 s and the time zone UTC. Connections dial
+  with TCP keepalive (after 5 s idle, every 5 s, 3 probes) and
+  `TCP_USER_TIMEOUT` 15 s, and ask the server for the same
+  (`tcp_keepalives_*`, `tcp_user_timeout`), and for
+  `idle_in_transaction_session_timeout` 60 s: a connection to a server
+  that vanished without a reset fails within about 20 s and the pool and
+  the listener connect again, to the new primary behind the same name;
+  the server ends the session of an instance that vanished,
+  mid-transaction too, and frees its locks (a stranded share lock on the
+  lease row would keep every instance from leading). The server's
+  WARNING notices are logged, at most one per 10 s: among them a commit
+  whose wait for its synchronous standby was cancelled
+  (`statement_timeout`), done on the primary but perhaps not replicated.
 - **Transactions** run at READ COMMITTED with explicit row locks.
   Each statement sees its own snapshot, so a check that must see what
   another transaction committed while this one waited for a lock is a
@@ -169,7 +196,12 @@ replicate synchronously ([Operations](#operations)).
   `sandboxes` ([Environments](#environments)); `0007_names.sql`, the
   incident `names_unserved` ([Names](#names)); `0008_pod_ids.sql`, the
   sandbox IDs' columns from `uuid` to `text` and the drop of `placements`
-  ([Sandbox IDs](#sandbox-ids))) and
+  ([Sandbox IDs](#sandbox-ids)); `0009_tool_calls.sql`, the table
+  `tool_calls` of the keyed tool calls ([Calls that outlive their
+  caller](#calls-that-outlive-their-caller)); `0010_ingress.sql`, the
+  ingress's tables and its columns of `pod_network`, `join_tokens`,
+  `nodes`, `env_instances` and `environments` ([The
+  ingress](#the-ingress))) and
   applied under an advisory lock, recorded in `schema_migrations`. The
   same locked section creates the cluster's MCP session key, reconciles
   `--pod-network` with the database's ([The pods'
@@ -190,16 +222,24 @@ replicate synchronously ([Operations](#operations)).
 | `ferun_reconcile` | a node name | an instance not connected to the node asks one that is to reconcile it |
 | `ferun_leader` | a hint | the leader's loops have work: the hint wakes those whose name contains it (`mesh-peers`, `env-reconcile`, `env-groups`, `env-names`, `env-delete`), every loop when none does or the hint is empty or `*` |
 | `ferun_watch` | a watch ID | a watch's paths, owner or result changed |
-| `ferun_cancel` | JSON | an exec or an MCP call is to be cancelled on whichever instance runs it |
+| `ferun_cancel` | JSON | an exec, an MCP call or a keyed call (ADR 0023) is to be cancelled on whichever instance runs it |
+| `ferun_call` | a tool call's ID (`tool_calls.id`), or `*` for more than 256 | a keyed call left running: done, interrupted, not run |
+| `ferun_ingress` | `env:<uuid>`, `ingress:<name>`, `mesh`, or `*` | what the ingress's table shows changed: an environment's publicity, label, releases, deletion (its tenant's too), service instances or their admitted ports; an ingress instance's row or certificates; the mesh's peers; a node's admitted version of `ferun-ingress`, or more than 256 environments (`*`) |
 
 The tables: `instances`, `leases`, `cluster_secrets`; `tenants`,
 `tenant_tokens`; `nodes`, `node_telemetry` (the hot row, about a hundred
 updates a second at 512 nodes, never locked by placement), `node_certs`
-(every node certificate issued), `join_tokens`, `node_starts`,
-`event_gaps`; `pod_network` (the mesh's ULA and its peers' version, one
-row while the cluster is meshed); `sandboxes`, `sandbox_tokens`, `sandbox_holds`,
-`pod_tombstones`, `bookings`; `activity` and `traffic_records`,
-partitioned by day; `issued_certs` (pods' certificates); `watches`;
+(every node certificate issued), `join_tokens` (of kind `node` or
+`ingress`), `node_starts`, `event_gaps`; `pod_network` (the mesh's ULA,
+its peers' version and the version of the group `ferun-ingress`, one
+row while the cluster is meshed); `ingresses` (the instances of
+`ferun-ingress`, never deleted), `ingress_certs` (every ingress
+certificate issued), `host_labels` (every default host label ever given,
+and its tenant); `sandboxes`, `sandbox_tokens`, `sandbox_holds`,
+`pod_tombstones`, `bookings`; `tool_calls` (the keyed tool calls, [Calls
+that outlive their caller](#calls-that-outlive-their-caller));
+`activity` and `traffic_records`, partitioned by day; `issued_certs`
+(pods' certificates); `watches`;
 `kube_bindings`, `ssh_bindings`; `auth_logins`, `ui_sessions`;
 `environments`, `env_releases`, `env_tags`, `env_secrets`,
 `env_instances`, `env_job_runs`, `env_attached`, `env_volumes`,
@@ -220,7 +260,10 @@ audit is its activity row.
   the ops the ID still owns are released as in a stop's step 4, since no
   process runs them: they are an earlier run's that ended without its
   stop, crashed or killed. Their sandboxes say "op <op> of instance <id>
-  was released: the instance started again". A row younger than 15 s,
+  was released: the instance started again". The keyed tool calls the ID
+  still runs end in the same transaction, interrupted when they reached
+  the guest and not run otherwise ([Calls that outlive their
+  caller](#calls-that-outlive-their-caller)). A row younger than 15 s,
   stopping or not, is another process's under the same ID, or a run's
   that ended less than 15 s ago: the start tries again every second until
   the row is older, and is refused when the row is written meanwhile.
@@ -241,24 +284,40 @@ audit is its activity row.
 | node expiry | 5 s | marks a node down whose telemetry is older than `--node-ttl`; only while the leader has led for `--node-ttl` and the database has not failed for as long |
 | reconcile sweep | 60 s | reconciles every ready node the leader is connected to |
 | join-token expiry, fleet retention | 60 s, 1 h | expired join tokens; old feosd starts, event gaps, node and pod certificates |
-| mesh peers | 15 s | sends every node on the pods' mesh that the leader is connected to its peers ([The pods' mesh](#the-pods-mesh)) |
+| mesh peers | 15 s | sends every node on the pods' mesh that the leader is connected to its peers, the ingress's instances among them ([The pods' mesh](#the-pods-mesh)) |
 | down sweep | 5 s | sandboxes of down and removed nodes become `unknown` |
 | lost grace | 30 s | `unknown` sandboxes of nodes down past `--lost-grace` become `hibernated`, `lost`, or `pending` when their pod was never seen |
-| idle pause | 1 s | pauses running sandboxes idle for `--idle-pause` (a row's own `idle_after_s` when set; 0 never), unless a failed pause backs off |
+| idle pause | 1 s | pauses running sandboxes idle for `--idle-pause` (a row's own `idle_after_s` when set; 0 never), unless a failed pause backs off; only while the leader has led for 15 s and the database has not failed for as long (every instance renews its holds first); never a public environment's service instance while an ingress instance may be cut off (the [idle fence](ingress.md#the-idle-fence)) |
 | hibernate-after | 5 s | hibernates sandboxes paused for `--hibernate-after`, unless a failed hibernation backs off |
 | drain | 5 s | moves sandboxes off draining nodes |
 | tombstones | 10 s | deletes pods that belong to no sandbox |
-| stale ops | 10 s | takes over or releases the ops of dead or stopping instances |
+| stale ops | 10 s | takes over or releases the ops of dead or stopping instances; only under the same condition |
 | unknown sweep | 15 s | syncs `unknown` sandboxes on connected nodes |
 | repair | 30 s | repairs pods stuck pending or with an unreachable guest |
 | pending re-description | 30 s | tells a sandbox waiting for capacity that there is some |
-| process holds, expired holds | 60 s | releases holds of processes that ended, and expired leases |
+| process holds, expired holds | 60 s | releases holds of processes that ended, and expired leases; expired holds only under the same condition |
 | tenant deletion | 60 s | finishes deleting tenants |
 | watch expiry | 60 s | deletes watches past their lease |
+| `tool-calls-expiry` | 5 s | marks running keyed calls whose lease passed: interrupted if they reached the guest, not run otherwise; only while the leader has led for a call lease (30 s) and the database has not failed within it. Waiters mark the call they wait on themselves after two leases ([Calls that outlive their caller](#calls-that-outlive-their-caller)) |
+| `tool-calls-retention` | 60 s | deletes keyed calls that ended more than an hour ago |
 | stale instances | 60 s | deletes instance rows older than an hour |
 | activity partitions | 1 h | keeps partitions for today and the next two days; drops those past retention |
 | sign-in clean-up | 10 min | deletes stale sign-ins and expired UI sessions |
 | `env-reconcile`, `env-probe`, `env-groups`, `env-volumes`, `env-delete` | 2 s, 1 s, 10 s, 30 s, 5 s | the environments' controller ([Environments](#the-controller)) |
+
+An outage or a stall of the database lets the first holds expire 20 s
+in (a hold's lease is 30 s, renewed every 10 s) and every hold after
+30 s. A stall ends the leader's term 8 to 13 s in: 13 s (the lease's
+15 s less the 2 s margin) after the send of the last renew that
+succeeded, which went out 0 to 5 s before the stall. No term outlives a
+stall that let a hold expire, so the next term begins after it, and its
+15 s are a hold's renewal interval (10 s) and 5 s, by which every live
+instance has renewed its holds and its heartbeat. An instance's row can
+turn stale 10 s into a stall (written every 5 s, live for 15 s), and a
+term, or its acquisition, can span a stall of up to 13 s: after a stall
+of 10 to 13 s, stale ops may take over an op of an instance that still
+runs, as it does for one cut off from the database; such a takeover is
+safe, only redundant.
 
 ### Stopping
 
@@ -269,12 +328,27 @@ request, tool call or op:
    It begins no work of its own initiative any more, but still begins the
    ops that requests need: a request in the readiness window that needs a
    resume does not fail. From now on other instances may take its ops
-   over.
+   over. The ingress's side stops too: the nodes' port closes every new
+   `ferun-ingress/1` connection before any check, the Sync streams end
+   with `UNAVAILABLE` "instance stopping", and Wake and Hold answer
+   `UNAVAILABLE`; the ingress's instances move to another instance
+   ([The ingress](#the-ingress)).
 2. It serves on for 5 s, so that balancers see `/readyz`, then stops
    accepting requests and waits for those in flight, until
-   `--shutdown-grace`. The watches' event streams end at once, and their
-   clients reconnect elsewhere; upgraded port connections (WebSockets)
-   are closed once no request is left.
+   `--shutdown-grace`. From now on a keyed tool call reaches a guest only
+   if its timeout and 30 s fit before that deadline (otherwise it ends
+   not run, and its client sends it to another instance), a new keyed
+   call is refused as not run unless its key names a call that ran or
+   runs, and requests waiting on another instance's call are told to ask
+   again ([Calls that outlive their
+   caller](#calls-that-outlive-their-caller)). The watches' event streams
+   end at once, and their clients reconnect elsewhere; upgraded port
+   connections (WebSockets) are closed once no request is left.
+
+   **2b.** It waits for the keyed calls whose callers left, until the
+   same deadline; those still running then are cancelled and recorded:
+   interrupted, with their output so far, when they reached the guest,
+   not run otherwise.
 3. The engine refuses new ops ("instance <id> is stopping") and waits for
    its own, until the same deadline.
 4. The ops still in flight are released: their sandboxes become `unknown`
@@ -283,7 +357,9 @@ request, tool call or op:
    deleted and the pool closed.
 
 The process therefore takes up to `--shutdown-grace` plus a little to
-end; whatever stops it must wait at least that long plus 30 s
+end; whatever stops it must wait at least that long plus 60 s, which
+cover step 1 (10 s), the readiness delay (5 s), the cut calls' final
+writes (15 s) and step 5 (2 × 10 s), with room for the ops' release
 ([Operations](#operations)).
 
 ## The nodes' port
@@ -296,6 +372,9 @@ One TLS 1.3 listener, routed strictly by ALPN:
 | `h2` | the node's | the uplink server: `feos.fleet.v1` without Join |
 | `h2` | the node's, definitively refused | the refusal server: every call `PERMISSION_DENIED` |
 | `h2` | none | the join server: Join alone |
+| `ferun-ingress/1` | an ingress instance's | the ingress server: `ferun.ingress.v1.IngressService` without Join ([ingress.md](ingress.md#the-connection)) |
+| `ferun-ingress/1` | an ingress instance's, definitively refused | the ingress server as a refusal: every call `PERMISSION_DENIED` with the refusal's text |
+| `ferun-ingress/1` | none | the ingress join server: Join alone |
 | anything else, or none | | closed |
 
 - **Accept.** Every TCP connection gets keepalive (15 s) and a
@@ -363,14 +442,27 @@ One TLS 1.3 listener, routed strictly by ALPN:
 - **Re-checks.** `ferun_node` makes every instance re-check the node's
   connections and reload its rollout deadline; after the listener
   reconnected, every node's, spread over 5 s.
+- **Ingress connections** (ALPN `ferun-ingress/1`, [The
+  ingress](#the-ingress)) take the instance's identity from the
+  certificate's one URI, `spiffe://<trust domain>/ingress/<name>`, and are
+  checked against the database at accept and on every re-check, in the
+  same 32 slots as the nodes' (`CheckIngress`): an unknown certificate, a
+  removed ingress, a revoked or an expired certificate are definitive
+  refusals, a superseded one is refused once its revocation time has
+  passed and closed at that time before; any other error refuses a new
+  connection only. At most 4 connections per ingress name; an ingress's
+  join and refusal connections count against the join and refusal
+  servers' limit of 64, and close after 60 s as theirs do. `ferun_ingress`
+  `ingress:<name>` re-checks the name's connections on every instance.
+  A stopping instance closes new ingress connections at once.
 
 ## The CA
 
 The platform CA ([ADR 0014](../adr/0014-identity-and-credentials.md)) has
 one root, kept offline, and one intermediate, the **issuer**, which every
 instance holds in `--ca-dir`. The issuer is the only CA key on an
-instance: it signs node and pod certificates and the instances' own
-certificates on the nodes' port. With the database's credential and the
+instance: it signs node, ingress and pod certificates and the instances'
+own certificates on the nodes' port. With the database's credential and the
 at-rest key of the bindings, it is one of the control plane's three
 secrets.
 
@@ -392,8 +484,9 @@ secrets.
   domain, and a URI constraint binds only the trust domain, never the
   path (Go's verifier enforces URI constraints; rustls-webpki ignores
   them). The separation is therefore in software, on two lines: issuance
-  (a pod never gets a wildcard, a name in the control-plane domain or the
-  control plane's URI; a node gets only its URI; only the instances'
+  (a pod never gets a wildcard, a name in the control-plane domain, the
+  control plane's URI or an ID under `/ingress`; a node and an ingress
+  instance get only their URIs; only the instances'
   server certificates carry `spiffe://<trust domain>/ferun`), and the node,
   which requires that URI on the control plane's certificate beside the
   DNS name it was configured with. A pod's certificate of the same issuer
@@ -404,16 +497,23 @@ secrets.
   since nodes may boot before their clock is set; never an IP address,
   never a URI outside the trust domain; a signing request's own names are
   ignored. Nodes: client auth, `spiffe://<td>/node/<name>`, Ed25519 or
-  ECDSA P-256, `--node-cert-ttl`. Pods: client and server auth, the
-  sandbox's SPIFFE ID `spiffe://<td>/tenant/<tenant>/sandbox/<id>`,
-  Ed25519, `--pod-cert-ttl`. Each says when its holder renews it
-  (`renew_after`): a node's at half its lifetime, so that a node switched
-  off at any time keeps at least half of it; a pod's at three quarters.
+  ECDSA P-256, `--node-cert-ttl`. Instances of `ferun-ingress`: client
+  auth, `spiffe://<td>/ingress/<name>`, the name as CN, Ed25519 or ECDSA
+  P-256, `--node-cert-ttl`. Pods: client and server auth, the sandbox's
+  SPIFFE ID `spiffe://<td>/tenant/<tenant>/sandbox/<id>`, Ed25519,
+  `--pod-cert-ttl`. Each says when its holder renews it
+  (`renew_after`): a node's and an ingress instance's at half its
+  lifetime, so that one switched off at any time keeps at least half of
+  it; a pod's at three quarters.
 - **Join tokens.** A token is 32 random bytes. The node sends
   `feos-join-<secret>`; the operator gets `feos-join-<secret>.<pin>`, where
   the pin is the SHA-256 of the root that anchors the issuer (its
   SubjectPublicKeyInfo). The database keeps only the hash of what the node
-  sends. A token may be pinned to a node name. The node checks, before it
+  sends. A token has a kind, `node` or `ingress`, and joins only its kind;
+  it may be pinned to a name of its kind. A token of kind `ingress` has a
+  form of its own, `feos-ingress-join-<secret>.<pin>`, so that a node's
+  Join refuses it by its form before any lookup, also in a `ferund` that
+  knows no kinds (during a rollout, or after a rollback). The node checks, before it
   sends the token, that the server's chain holds the pinned root, names
   the configured DNS name and carries the control plane's URI, and takes
   the join's answer only if its trust bundle holds that root.
@@ -430,8 +530,11 @@ row is never deleted: removal is a status. Its statuses: `joined`, `ready`
 
 - **Join.** The token's form, the name (a DNS label) and the signing
   request (at most 16 KiB) are checked first; at most 10 joins a second,
-  20 in a burst, and 4 at once in the database, per instance. Then, in one
-  transaction: an unknown token is refused, an expired one too. An
+  20 in a burst, and 4 at once in the database, per instance; a token in
+  an ingress's form is `INVALID_ARGUMENT` "this join token is for an
+  ingress". Then, in one transaction: an unknown token is refused, an
+  expired one too, and one of kind `ingress` ("this join token is for an
+  ingress"). An
   unpinned token creates a new name only: a name that exists, whatever
   its status, gets `ALREADY_EXISTS` "node <name> exists; join it with a
   token pinned to its name". A pinned token is the operator's intent to
@@ -533,8 +636,14 @@ every node the others as its peers.
   is empty, and a request without a key, from a node with a prefix of its
   own, gets the ULA alone. Otherwise the key must be 32 bytes and the
   endpoint an IP address and a port, an IPv6 address in brackets, neither
-  unspecified, multicast, IPv4-mapped nor with a zone
-  (`INVALID_ARGUMENT`). Under the node's row lock, a node without a
+  unspecified, multicast, IPv4-mapped nor with a zone, and the key not a
+  point of small order, all zeros among them (`INVALID_ARGUMENT`). A key
+  is one peer's: a new key that another node or an ingress instance holds,
+  removed ones aside, is `FAILED_PRECONDITION`, checked under
+  `pod_network`'s row lock, which every writer of a new key takes after
+  its own row's and before it checks, since feosd keeps one device peer
+  per key and two peers with one key would take each other's prefix.
+  Under the node's row lock, a node without a
   subnet ID gets the next of the sequence `mesh_subnets`, 1 to 65535,
   which never hands one out twice (`RESOURCE_EXHAUSTED` once it ends), and
   its /64 is the ULA with the ID in bits 48 to 63; the same node gets the
@@ -560,8 +669,23 @@ every node the others as its peers.
   answers `UNIMPLEMENTED` is logged once and not asked again on its
   connection. What the leader sent lives in its memory only: a node's last
   connection to it gone, it is forgotten.
+- **Ingress peers.** The instances of `ferun-ingress` are the first peers
+  that are not nodes ([ADR 0021](../adr/0021-ingress.md)): each takes a
+  /64 of the same sequence at its first Hello after its first join, keeps
+  it across joins, and uses `<prefix>::1`. The peers are the nodes and
+  the ingress instances that are not removed and have a subnet, a key and
+  an endpoint, an instance under the name `ingress.<name>`, so that
+  `feosd`, which takes /64 peers alone, needs nothing new. An instance's
+  first subnet, a new key or endpoint, a re-join and a removal count the
+  peers' version up. A change of the peers also sends `ferun_ingress`
+  `mesh`, and the ingress gets the nodes in its table
+  ([ingress.md](ingress.md#the-mesh)). An instance's WireGuard key is
+  fixed from its first Hello after a join; a join again clears it and
+  refuses it at the next Hello, so that every join brings a new key, and
+  no other peer may hold it.
 - **The admin API** shows a node's /64 and endpoint as `meshPrefix` and
-  `meshEndpoint`.
+  `meshEndpoint`, and an ingress instance's in `GET
+  /api/v1/admin/ingresses`.
 
 ## Sandboxes
 
@@ -804,7 +928,11 @@ the sandbox from being paused while a call or a forward runs, leased for
 30 s and renewed every 10 s by its instance, taken under a lock that
 excludes a pause's begin. Holds of processes started with `process_start`
 last until the process ends or its timeout passes; a timeout of 0 holds
-the sandbox until the process is stopped or found ended.
+the sandbox until the process is stopped or found ended. An instance of
+`ferun-ingress` holds the instances of public environments' idle
+services it sends requests to with holds of kind `forward` and the
+holder `ingress:<name>`, which it renews itself every 10 s through
+`ferund` ([ingress.md](ingress.md#holds-and-the-idle-fence)).
 
 ### Placement
 
@@ -887,7 +1015,12 @@ the node took down with it: nothing ran, so nothing is lost, and the
 next use creates the sandbox. No tombstone is written, since the pod may
 still run: a returning node's pod is adopted, or tombstoned by reconcile
 when its sandbox is pending or placed elsewhere by then. Idle pause,
-hibernate-after, drain and repair begin ops as their triggers. A drain
+hibernate-after, drain and repair begin ops as their triggers. The idle
+pause, and its begin's recheck, leave out a public environment's service
+instance while an ingress instance that is joined, has an address and
+has not left was last seen between 45 s and 15 minutes ago: it may be
+cut off from `ferund`, its holds lapsed, and still serve the service
+(the [idle fence](ingress.md#the-idle-fence)). A drain
 hibernates what is paused, and pauses and hibernates what runs without
 execs; a forward does not keep a sandbox, since the port door closes its
 upgraded connections, a preview's WebSocket among them, once the sandbox
@@ -934,7 +1067,7 @@ The routes, bodies, status codes and texts are the sandbox system's;
 |---|---|---|
 | admin | `/api/v1/admin/…` | an admin's UI session (cookie), or Basic with `--admin-users` |
 | tenant | `/api/v1/sandboxes`, `/api/v1/sandboxes/{id}` (create, list, get, delete, pause, resume, tokens, access), `/api/v1/tools`, `/api/v1/environments[/…]` but the route door | a tenant's token |
-| sandbox | `/api/v1/sandboxes/{id}/…`: exec, files, dirs, search, fetch, processes, watches, bindings | the sandbox's own token |
+| sandbox | `/api/v1/sandboxes/{id}/…`: exec, files, dirs, search, fetch, processes, calls, watches, bindings | the sandbox's own token |
 | mcp | `/mcp` | the sandbox's token, with the door's own answers |
 | forward | `/fwd/…`, `/api/v1/sandboxes/{id}/ports/…` | the sandbox's token in `Authorization` alone ([ports](#ports)) |
 | route | `/api/v1/environments/{env}/http/…` | a route token of the environment ([the route door](#the-route-door)) |
@@ -1027,6 +1160,24 @@ and retries once. REST and MCP share the one entry point:
   `PUT …/files/{path}` writes its body byte for byte, whatever the bytes;
   the activity log records the write with its content when that is UTF-8
   text, as MCP's, and by its path and size otherwise.
+  Every tool route takes a key in `Idempotency-Key`, bare or as one
+  quoted sf-string, and answers a malformed key, or more than one, 400
+  `bad_idempotency_key`; exec, `PUT` and `PATCH …/files/{path}`, `POST
+  …/processes` and `DELETE …/processes/{pid}` honour it, the other
+  routes ignore it. A keyed
+  call's answer carries `Ferun-Call-State` (`done`, `interrupted`,
+  `not_run`, `running`) and, when it is another request's call, attached
+  to or read from its record, `Ferun-Call-Replayed: true`. Beside the
+  answers above, a keyed call is 422 `call_id_conflict` when its key
+  names another call in the sandbox, 400 `call_timeout_too_long` for a
+  `bash` timeout over 600 s, 503 `call_running` with `Retry-After: 1`
+  when it runs on another instance and this one stops, and 502
+  `call_interrupted` without `Retry-After` when it may have run and
+  stopped without a result; one that ran and failed is 502 without
+  `Retry-After`, one that did not run keeps the rule above. The codes
+  are the error body's `code`. `GET …/calls/{key}?wait=N` reads a keyed
+  call's record and `DELETE …/calls/{key}` cancels the call ([Calls that
+  outlive their caller](#calls-that-outlive-their-caller)).
 - **MCP** (`/mcp`) runs the go-sdk's Streamable HTTP handler stateless,
   so that any instance serves any request: the bearer is resolved on
   every request. Its answers are the door's own, which the SDK's clients
@@ -1034,9 +1185,38 @@ and retries once. REST and MCP share the one entry point:
   token or an unknown one on `initialize`, a JSON-RPC "session not found"
   (404) for an unknown token on any other request, so that a client
   starts a new session, and 503 when the token cannot be looked up. A
-  session ID exists only for cancellation: it is signed with the cluster's
-  key and verified by any instance, and a `notifications/cancelled` with
-  it is broadcast (`ferun_cancel`) to whichever instance runs the call.
+  session ID exists only for cancellation, and only `initialize` issues
+  one: it is signed with the cluster's key and verified by any instance,
+  and a `notifications/cancelled` with it is broadcast (`ferun_cancel`)
+  to whichever instance runs the call. Such a cancel reaches a keyed call
+  only for these session clients: the door keeps a request's keyed call
+  cancellable for 30 s after the request ended, since the go-sdk hangs up
+  before it sends the cancel, and remembers for 30 s a cancel that came
+  before its request, which then starts nothing. It keeps both per
+  token, at most 256 of each a token on the instance: a token that would
+  pass that loses its own oldest ended entry, never another token's, so
+  no client's churn flushes the entries another client's cancels need,
+  and a token with 256 keyed requests running on the instance gets an
+  error result without `_meta` for the next, before its call is looked
+  up. The broadcast names the token by a digest of its hash, so that
+  every instance counts the cancel alike. Nothing in this memory is
+  scanned: its entries expire and are evicted in the order they ended.
+  A known limit: the `notifications/cancelled` of a verified session are
+  not rate-limited before their broadcast; each is one `pg_notify` on
+  `ferun_cancel`, which every instance receives, as fast as the client
+  sends them.
+  The go-sdk's default protocol opens with `server/discover` and has no
+  session; its clients, FeCode among them, cancel a keyed call with REST
+  `DELETE …/calls/{key}`. A tool call's key is its `_meta["ferun.callId"]`, and a
+  keyed result carries `_meta` `ferun.callId`, `ferun.callState` and
+  `ferun.callReplayed`. A JSON-RPC error `-32602` with `data.reason`
+  refuses a key that is not a string or not a key (`invalid_call_id`), a
+  key that names another call (`call_id_conflict`, with `data.tool`) and
+  a `bash` timeout over 600 s (`timeout_too_long`, with
+  `data.maxTimeoutSeconds`). The answers to `initialize` and
+  `server/discover` advertise `experimental["ferun.callId"]`, beside the
+  SDK's `logging` and `tools`:
+  `{"tools": […], "retentionSeconds": 3600, "maxTimeoutSeconds": 600}`.
   While a call runs, progress goes out every 10 s and per output chunk,
   and an SSE comment every 25 s keeps balancers from closing the
   response.
@@ -1048,6 +1228,198 @@ less room for framing) is therefore refused before it runs: "the content
 is larger than 4032 KiB, the most one write carries into the sandbox"
 (the edits, the command), on REST a 413. A JSON body is read up to 32
 MiB, a write's body up to that limit.
+
+### Calls that outlive their caller
+
+A call of a tool with a side effect, `bash`, `write`, `edit`,
+`process_start` or `process_stop`, that carries a key (MCP's
+`_meta["ferun.callId"]`, REST's `Idempotency-Key`) is a **keyed call**
+([ADR 0023](../adr/0023-calls-outlive-their-caller.md)). It is a row of
+`tool_calls` and runs on a context of its own, in the instance that
+received it; its request only waits for it. A request that ends, because
+its client hung up, crashed or was deployed, therefore cancels nothing:
+the call runs to its end, and its result is kept. A repeat of the key
+with the same call attaches to it or gets its result, on any instance; a
+repeat with another tool or other arguments is a conflict, and nothing
+runs. The read-only tools check a key and ignore it: their calls run on
+their request, as calls without a key do.
+
+- **Keys** are 1 to 255 characters of `A-Z a-z 0-9 . _ ~ : @ -`, which a
+  URL path never escapes and an RFC 8941 sf-string holds as they are. A
+  key is unique per sandbox, whichever of the sandbox's tokens sends it.
+- **The arguments' hash** is a SHA-256 over the tool and its normalised
+  arguments: decoded into the tool's parameters and encoded again, so
+  that spacing, key order, unknown keys and zero values spelled out make
+  no other call. `write` hashes its path as given and its content's
+  bytes, so that REST's raw body and MCP's string hash alike.
+
+The row holds an ID of its own for every run of the call, the sandbox,
+the key, the tool, the hash, the instance that runs the call, its state,
+`sent`, its lease, its start and end, and its result: the exit code, the
+output, `truncated`, `is_error` and the error. `sent` is committed before
+the call's request leaves for the guest, and a call whose row cannot be
+marked is not sent, so that every state is exact, whoever writes it:
+
+| State | Means |
+|---|---|
+| `running` | the call runs, or its instance stopped renewing it and nobody has ended the row yet |
+| `done` | the call ended with its result, or with an error after it reached the guest (a timeout, a node's error, a forced drain), or its caller cancelled it |
+| `interrupted` | the call reached the guest, may have run, and stopped without a recorded result: its instance was cut at the shutdown grace, died, or lost its database; ferund never runs it again |
+| `not_run` | the call never reached the guest; the same call under the same key runs anew |
+
+```
+(none) ─begin─> running ─finish──────────────────────> done ─────────1 h─> (deleted)
+  ▲               │ ─finish: cut at the grace, sent──> interrupted ──1 h─> (deleted)
+  │               │ ─expiry or claim, sent───────────> interrupted
+  │               │ ─expiry or claim, not sent───────> not_run ──────1 h─> (deleted)
+  │               └─finish or abandon, not sent──────> not_run
+  │                                                       │
+  └────── a begin of the same call: a new run, a new ID ──┘
+```
+
+- **The run.** The call's context keeps the request's values and drops
+  its cancellation. A timer ends it at its budget, the sandbox's
+  preparation (7 min 5 s), the tool's timeout and 1 min, and never a
+  deadline, which gRPC would send to the node as `grpc-timeout`; the
+  instance's end ends it too (the drain's cut, the runner's stop).
+  `Acquire` runs inside it, so the exec hold that keeps the sandbox awake
+  is the call's, not the request's: a `bash` of 600 s whose client left
+  holds the sandbox for 600 s. A forced node drain (`ferun_cancel` kind
+  `exec`) cancels keyed calls as it cancels the others.
+- **Joining.** A request takes the key's lock on its instance. A call of
+  the key that runs on the same instance is attached to in memory.
+  Otherwise the request reserves one of the sandbox's 64 slots on the
+  instance and inserts the row: a new row, or a new run in place of a
+  `not_run` row of the same call, starts the call; an existing row of the
+  same call is attached to while it runs and answered once it ended.
+  Attaching across instances waits on the row, for a `ferun_call`
+  notification or a read every 1 s, and tolerates database errors for
+  1 min. Requests that wait for a call they did not start, attaches in
+  memory or on a row and record waits (`?wait` over 0), count per
+  sandbox and instance: past 256, four times the slots, one is refused
+  at once with the cap's retryable error and state `running` (REST 502
+  with `Retry-After`, MCP an error result whose `ferun.callState` is
+  `running`, the record 502 with `Retry-After`), and the call runs on.
+  This bounds a sandbox's goroutines on an instance, and its row reads
+  every 1 s. A stopping instance, one whose renewal does not run and a
+  full cap refuse the slot; the refusal is answered `not_run` only when
+  the key has no row or a `not_run` row of the same call, and a running
+  or ended row is attached to or answered instead. A request that has
+  already ended when its call would start starts nothing. An answer that
+  is another request's call says it is replayed.
+- **Not run.** A call ends `not_run` when it failed before the guest
+  could have run anything. Once its row is inserted, `not_run` is a
+  stored state, and the row keeps the error for the retention: its
+  preparation failed; its row could not be marked sent; the exec cap
+  refused it, or the nodes' port did before the call reached a node
+  connection (the node not connected to this instance, its connection
+  closing, a budget of the connection exhausted); feosd's
+  own refusals ("pod <id> is <STATE>", "no pod <id>") came before any
+  output; the drain's send gate held it back, or the drain's cut came
+  before the send; its row was ended before the send. A refusal before
+  the insert stores nothing: the cap of 64, an instance that stops or
+  does not record keys, and an insert that failed are answered
+  `not_run`, and a later read of the key finds no record (404
+  `no_such_call`) or the key's earlier `not_run` row. Only an insert
+  that committed without its answer leaves a row, which the instance
+  ends `not_run` at once, or its expiry later. An unreachable guest is
+  no refusal: feosd says so in the same words before and after it hands
+  the call to the guest, so the call may have run; it keeps `sent` and
+  ends `done` with the error. The same call under the same key replaces
+  a `not_run` row with a new run, another call under it is a conflict,
+  and REST answers `not_run` 502 with a `Retry-After` when its cause is
+  worth a retry. A cancel by the caller is final even before the send:
+  `done`, "the call was cancelled by its caller".
+- **The lease.** The instance renews the leases of its running calls
+  every 10 s, for 30 s, in one statement, and cancels a call whose row
+  the renewal no longer returns, because another writer ended it; the
+  call's final write is then refused. It records keys only while that
+  renewal runs, and refuses keyed calls `not_run` otherwise. A running
+  row whose lease passed is ended by three writers, each with a
+  conditional update that sends `ferun_call`, `interrupted` when the call
+  was sent and `not_run` when not:
+  - the leader's `tool-calls-expiry`, every 5 s, fenced, 256 rows a
+    transaction, only while the leader has led for a lease and its
+    database has not failed within one, so that after a failover or an
+    outage every instance has had a full lease to renew its rows;
+  - any instance that waits on the row, for that row, once its own
+    database has not failed within a lease and the lease passed more than
+    a lease ago: waiters end a dead instance's calls also while the
+    leader runs an older version, or died with that instance;
+  - the start of an instance under the same ID, for its earlier run's
+    rows ([Leader and instances](#leader-and-instances)).
+
+  The leader ends a dead instance's call 30 to 35 s after its last
+  renewal, a waiter about 60 s after it.
+- **A call on an instance that lost its database** runs on until one of
+  two things stops it. The nodes drop the instance once its row is
+  stale, at their next telemetry answer, about 15 to 25 s after the loss
+  ([Nodes](#nodes)): its exec streams end, and the guest kills the
+  command's process group. Or the database comes back first, the renewal
+  misses the call's ID, and the instance cancels the call. Either way its
+  final write is refused, and the row holds the expiry's verdict. This
+  relies on the nodes' handling of the instance list: a node keeps its
+  list while its telemetry fails, so in an outage of the whole database
+  every call runs on, and the guards of the leader and the waiters keep
+  their rows running. A self-fence by time was set aside: it would cut
+  every keyed call on a database failover.
+- **Cancel.** `DELETE /api/v1/sandboxes/{id}/calls/{key}` cancels a
+  running call for every client, on whichever instance runs it
+  (`ferun_cancel` kind `call`): 202 `{"cancelled": true}`, or 404
+  `no_such_call` when no call of the key runs. MCP's
+  `notifications/cancelled` reaches a keyed call only for session
+  clients ([Tools and MCP](#tools-and-mcp)). A cancelled call ends `done`
+  with "the call was cancelled by its caller", and whoever waits for it
+  gets that error.
+- **The record.** `GET /api/v1/sandboxes/{id}/calls/{key}?wait=N` reads
+  a keyed call's record and never runs anything. It answers at once when
+  the call ended; otherwise when the call ends, or after N s (0 to 60)
+  with state `running`, and at once with `running` on a stopping
+  instance. The body is `{key, tool, state, instance, startedAt}`, and
+  once the call ended also `finishedAt`, `exitCode`, `output`,
+  `truncated`, `isError`, `error` and `text`, where `text` and `isError`
+  are the result as MCP renders it. A key without a record, never used or
+  past its retention, is 404 `no_such_call`; a malformed key or a wait
+  outside 0 to 60 is 400; a wait past the sandbox's 256 waiting requests
+  on the instance (see Joining) is 502 with `Retry-After`. A client that
+  lost an answer reads it here rather than sending the call again:
+  FeCode recovers its calls only this way, and sends one again only
+  after `not_run`.
+- **The drain** ([Stopping](#stopping)) begins when a stopping instance
+  stops accepting requests. New keyed calls are refused `not_run` unless
+  their key names a call that ran or runs. A call reaches the guest only
+  if its timeout and 30 s end before the shutdown grace; otherwise it
+  ends `not_run`, and its client sends it to another instance. Requests
+  that wait on another instance's call, and record reads, are answered
+  at once that the call still runs (REST 503 `call_running` with
+  `Retry-After: 1`, MCP an error result whose `ferun.callState` is
+  `running`, the record with state `running`). After the
+  HTTP shutdown the instance waits for its keyed calls until the grace's
+  end, then cuts them: a call that reached the guest ends `interrupted`,
+  with its output so far, one that did not ends `not_run`, and their
+  final writes get 15 s more. A call sent before the drain ends within
+  its timeout, at most 600 s after the drain began, and one sent during
+  it ends 30 s before the deadline. So a grace below 600 s can cut a call
+  that was sent before the stop, and one below 630 s refuses a keyed
+  `bash` of the full 600 s `not_run` from the drain's start. The default
+  of 11 minutes does neither.
+- **Bounds.** The output is the tool's text as cut, at most 50,000 bytes,
+  stored as bytes (`bytea`), since it may hold NUL and invalid UTF-8. The
+  error is made valid UTF-8 without NUL and cut at 4 KiB on a character
+  boundary. A keyed `bash` names at most 600 s, so a call lives at most
+  its preparation, 600 s and 1 min. The final write is retried for up to
+  5 minutes; when another writer ended the row first, the call's waiters
+  get the stored row.
+- **Retention.** The leader's `tool-calls-retention` deletes, every
+  minute, the rows that ended more than an hour ago, up to 10 × 1000 a
+  run; their keys are free again.
+- **Progress** is heartbeats only: MCP's progress every 10 s, and per
+  output chunk for a request on the instance that runs the call. No
+  output is relayed to a request on another instance, or replayed to one
+  that attaches late.
+- **Older instances**, in a rolling deploy from a version without keyed
+  calls, ignore the key, the header and `ferun_cancel` kind `call`, run
+  such a call on its request, and never touch `tool_calls`.
 
 ### Ports
 
@@ -1224,16 +1596,17 @@ a deleting one.
 
 | Table | Holds |
 |---|---|
-| `environments` | owner, name (a DNS label, never a UUID, unique per owner), labels, `release` (the latest desired), `realised`, `deleting`, `gen` (the env group's version) |
+| `environments` | owner, name (a DNS label, never a UUID, unique per owner), labels, `release` (the latest desired), `realised`, `deleting`, `gen` (the env group's version); `public` (its tenant's decision that the ingress serves it), `ingress_group` (set at its first publish and never cleared: its image services' pods name `ing-<sandbox id>`) and `host_label` (its default host's label, given at its first publish, unique), public only with both ([Public environments](#public-environments)) |
 | `env_releases` | per number: the normalised spec, `base`, author, message, annotations (a string map, at most 4 KiB), `origin` (`apply`, `revert`, `clone`, `object`) with `origin_ref` (the number reverted to, `<env id>/<number>` of a clone's source, `<kind>/<name>` of an object change), `state` (`pending`, `rolling`, `realised`, `failed`, `superseded`), `reason`, start and end |
 | `env_tags` | a tag's release, who moved it and when |
 | `env_secrets` | one version of a secret, sealed; `system` for an addon's credential, `addon.<addon>.<key>`, never listed; soft-deleted |
-| `env_instances` | the controller's view of an instance row: kind, object, replica, template hash, release, phase (`starting`, `ready`, `unready`, `exited`, `succeeded`, `failed`, `retiring`), restarts, the last 5 exits, probe failures, the next restart, an addon's provisioning hash, detail |
+| `env_instances` | the controller's view of an instance row: kind, object, replica, template hash, release, phase (`starting`, `ready`, `unready`, `exited`, `succeeded`, `failed`, `retiring`), restarts, the last 5 exits, probe failures, the next restart, an addon's provisioning hash, detail; `ingress_ports`, the ports its `ing-` group opens to the ingress as its node holds them ([Security groups](#security-groups)) |
 | `env_job_runs` | one attempt of a job: template hash, release, attempt, phase, exit code, detail, the last 50 lines of its log, redacted and bounded ([Logs](#probes-exits-and-restarts)) |
 | `env_attached` | an attached service: its sandbox and the incarnation of it the service last used, template hash, process ID, phase, restarts, the next restart, probe failures, the last exit, detail |
 | `env_volumes` | an addon's volume (`addon/<name>`): ID, size, node, `provisioned`, holder, `addon_type` (fixed) and `data_version`, `deleting` |
 | `env_incidents` | a condition of an object in a release: `rollout_failed`, `crash_loop`, `job_failed`, `no_capacity`, `addon_unhealthy`, `volume_unavailable` or `names_unserved` (`attach_failed` is reserved), opened, closed, summary, evidence; one open per object, release and condition |
 | `env_route_tokens` | the route door's tokens, as hashes |
+| `host_labels` | every default host label ever given: its owner, the tenant that first claimed it and alone may claim it again, and the environment that has it, set free when that is deleted |
 
 `hosts_written` of `env_instances` and `env_attached`, the hash of the
 hosts block that ferund wrote into a pod before its names moved into
@@ -1245,7 +1618,11 @@ The database holds no secret value: the log tails it keeps, a run's and
 an incident's, are redacted before they are stored, as far as
 redaction reaches ([Logs](#probes-exits-and-restarts)). A writer that
 wants the controller to act sends `env-reconcile` (or `env-groups`,
-`env-names`) on `ferun_leader` in its transaction.
+`env-names`) on `ferun_leader` in its transaction. The writers of what
+the ingress's table shows (publishing, an environment's release,
+realised release and deletion, a tenant's deletion, a service
+instance's insert, delete, phase, release and admitted ports) send
+`ferun_ingress` `env:<id>` themselves.
 
 ### The release spec
 
@@ -1289,8 +1666,9 @@ shapes:
   errors, a volume of another type is the warning that its data is
   deleted.
 - **Routes**: a path of unreserved characters without empty, `.` or
-  `..` segments, unique; a service and one of its ports; `strip`; `host`
-  is stored and not realised (info).
+  `..` segments, unique, of at most 1 KiB (every ingress instance holds
+  it); a service and one of its ports; `strip`; `host` is stored and not
+  realised (info).
 - **Secrets**: every `{"secret": n}` names a tenant secret of the
   environment that exists and is not deleted.
 - `volumes` and a service's `mounts` are errors: not available yet.
@@ -1352,7 +1730,7 @@ inside a transaction:
 |---|---|---|
 | `env-reconcile` | 2 s, hint `env-reconcile` | a step ([below](#a-reconcile-step)) for each environment that has a release and is not deleted, four at once |
 | `env-probe` | 1 s | exits, restarts and readiness of the instances whose rows run without an op on a node this instance is connected to; attached services; at most 16 checks at once |
-| `env-groups` | 10 s, hint `env-groups` | per connected node, the groups its rows' templates name and the groups their rules name, put again where the node's differ; the groups of environments and sandboxes that are gone deleted, once no pod names them |
+| `env-groups` | 10 s, hint `env-groups` | per connected node, the groups its rows' templates name and the groups their rules name (`ferun-ingress` among them), put again where the node's differ, and what the node holds of the ingress's groups recorded ([Security groups](#security-groups)); the groups of environments and sandboxes that are gone deleted, once no pod names them, and an `ing-` group of a sandbox that runs elsewhere too |
 | `env-names` | 2 s, hint `env-names` | per connected node, the name tables its rows' templates name and the tables they include, updated by a delta or put again where the node's differ; the tables of environments and sandboxes that are gone deleted, once no pod names them ([Names](#names)) |
 | `env-volumes` | 30 s | volumes marked deleting, 64 a pass, deleted on their node once no pod holds them (`FAILED_PRECONDITION`: later, at the end of the queue; `NOT_FOUND`: done), then their rows; a removed node's lose their rows only; records of environments' volumes on a connected node that no pod holds and no row places there are deleted |
 | `env-delete` | 5 s | the environments of deleting tenants marked deleting; per deleting environment, 16 a pass, the oldest-touched first: its instances deleted, its attached services cleaned up ([below](#attached-services)) before their rows go, its volumes marked deleting, its env group and env table deleted from every connected node; its row goes once no instance, volume, group, table or attached service still to clean is left, and its releases, secrets, runs, incidents and route tokens with it; an environment whose pass did not finish (a volume on a node that is down, a sandbox not woken yet) is touched, so that it goes to the end of the queue and stuck environments never hold the others back |
@@ -1580,8 +1958,9 @@ from a running instance is not redacted.
 
 ### Security groups
 
-The controller's groups are `env-<env id>` and `sbx-<sandbox id>`. Both
-carry the egress table: any protocol to `0.0.0.0/0` except `0.0.0.0/8`,
+The controller's groups are `env-<env id>` and `sbx-<sandbox id>`, and
+the ingress's `ing-<sandbox id>` and `ferun-ingress` (below). The first
+two carry the egress table: any protocol to `0.0.0.0/0` except `0.0.0.0/8`,
 `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`,
 `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`,
 `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`,
@@ -1596,10 +1975,35 @@ carry the egress table: any protocol to `0.0.0.0/0` except `0.0.0.0/8`,
 - **The sbx group** of an attachable sandbox adds egress to each env
   group the sandbox's attached services belong to, and no ingress: image
   pods never reach a sandbox.
+- **The ing group** of an image service's pod of an environment whose
+  `ingress_group` is set ([Public environments](#public-environments))
+  is the pod's own: the controller adds `ing-<sandbox id>` to the row's
+  groups at its insert. While the environment is public it allows TCP
+  in on the pod's routed ports from the group `ferun-ingress`: the
+  numbers, in the pod's own release, of the ports that the routes of the
+  realised and the latest release give its service. Otherwise, or
+  without routed ports, it has no rules; it never has members. Addons,
+  jobs and attachable sandboxes name none.
+- **`ferun-ingress`** has no rules; its members are the mesh addresses of
+  the ingress instances that are not removed. It is never deleted.
 - **Versions.** An env group's is `environments.gen`, counted up when a
-  node holds the group at that version with other content; an sbx
-  group's is a hash of its content. Put ignores versions, so a group is
-  put again whenever version or content differ from the node's.
+  node holds the group at that version with other content; an sbx or ing
+  group's is a hash of its content; `ferun-ingress`'s is
+  `pod_network.ingress_group_version`, counted up under that row's lock
+  in the transaction that changes the members, so that its versions
+  follow commit order. Put ignores versions, so a group is put again
+  whenever version or content differ from the node's.
+- **What a node holds of the ingress's groups** is recorded after every
+  put, and on every pass from the node's list when it has the wanted
+  content already: an `ing-` group's ports in
+  `env_instances.ingress_ports`, the version of `ferun-ingress` in
+  `nodes.ingress_group_version`. The
+  ingress sends to an instance only on those ports and only when that
+  version admits it ([ingress.md](ingress.md#groups-and-admission)). Two
+  puts that race (the prepare hook's and a pass's) can leave a record
+  wrong for one pass; the next one records again. An `ing-` group a node
+  holds that none of its rows wants is deleted when its sandbox is gone
+  or placed on another node, once no pod there names it.
 
 **Attachable sandboxes.** `POST /api/v1/sandboxes` with `"attachable":
 true` gives the sandbox a template: `sleep infinity`, no env, the group
@@ -1612,7 +2016,8 @@ template once its op has the node's connection and its pod spec (a
 secret that does not resolve fails first), before CreatePod, StartPod,
 ResumePod and RestorePod, and inside a repair before its pod calls. The
 controller's hook puts the row's groups, and those their rules name, on
-the node, whole, and its name tables, and those they include, as
+the node, whole, recording what it put of the ingress's groups, and its
+name tables, and those they include, as
 `env-names` does ([Names](#names)). Before a create it also sees to the
 volumes: one never
 created is created on the node with its size and labels, then recorded
@@ -1707,7 +2112,9 @@ first removes the records of the processes of its name that are over
 time; a running process keeps its record, and so does one whose start is
 not fully recorded yet. Attached services have no `crash_loop`. A
 restart stops and starts the process, never the sandbox's pod; in a
-paused sandbox it is 409 "paused".
+paused sandbox it is 409 "paused". It never counts as an exit: the row
+forgets the process before the stop, and a look of the supervisor
+writes only onto a row that still records the process it looked at.
 
 The service may use its sandbox while that exists, is the environment
 owner's and is no instance row. Otherwise the service is `failed`,
@@ -1799,6 +2206,14 @@ FeCode's environment hosts forward to the door with the environment's
 route token in `X-FeRun-Route-Token`, and pass the browser's
 `Authorization` on to the application.
 
+The door serves every environment, with its route tokens. Beside it,
+`ferun-ingress` serves the routes to image services of the environments
+whose tenant made them public, at their default hosts and without a
+token, straight to the pods ([Public environments](#public-environments));
+routes to attached services are the door's alone. A plan's info finding
+at each route says which doors serve it, and the status names each
+route's `door`.
+
 ### Secrets
 
 A tenant secret is named `^[a-z0-9][a-z0-9._-]{0,62}$`, never beginning
@@ -1869,7 +2284,12 @@ the ready ones its live instances, and its instances, an addon with
 type, version, plan, phase and `provisioned`, a job with its last run,
 an attached service with its sandbox, phase, restarts and last exit;
 `starting` before an object has an instance), its routes (of the
-realised release, else the latest) and the number of open incidents. An
+realised release, else the latest), each with its `door`, `ingress` with
+its `url` (`https://<host><prefix>`) for a route to an image service of
+a public environment and `route` for every other, `public`, its `hosts`
+(its default host while it is public, the platform has an apps zone and
+it is not being deleted; otherwise empty), and the number of open
+incidents. The listing shows `public` and `hosts` too. An
 incident has its object, release, condition, summary, opening and
 closing, and evidence: `exits`, `logTail` (redacted and bounded), `diff`
 (since the realised release), `placement`, and `pending`, what a release
@@ -1885,8 +2305,9 @@ name; one the tenant does not have is 404 "no such environment".
 | Method and path | Answers |
 |---|---|
 | `POST /api/v1/environments` `{name, id?, labels?}` | 201 its status; the same ID and name again 200; 409 `name_taken`, `id_taken` |
-| `GET /api/v1/environments?label=k=v` | `{environments: [{id, name, labels, release, realised, state, openIncidents, createdAt}]}`, the labels ANDed; `state` is the latest release's, `none` or `deleting` |
+| `GET /api/v1/environments?label=k=v` | `{environments: [{id, name, labels, release, realised, state, public, hosts, openIncidents, createdAt}]}`, the labels ANDed; `state` is the latest release's, `none` or `deleting` |
 | `GET`, `DELETE /api/v1/environments/{env}` | the status; 202 |
+| `PUT /api/v1/environments/{env}/public` `{public}` | `{public, hosts, rolling}`; 400 without a boolean `public`; 409 while the platform has no apps zone (publishing) or the environment or its tenant is being deleted ([Public environments](#public-environments)) |
 | `POST /api/v1/environments/plan` `{spec}` | `{valid, findings}` |
 | `POST …/{env}/plan` `{spec, base?}` | `{valid, findings, diff, base, current}` |
 | `POST …/{env}/releases` `{spec, base, author?, message?, annotations?}` | 201 the release; 200 with `unchanged: true`; 422 `invalid_spec` with `findings`; 409 `base_mismatch` with `current` |
@@ -1905,8 +2326,10 @@ name; one the tenant does not have is 404 "no such environment".
 
 Other answers: plain 409s "environment X is being deleted", "tenant X is
 being deleted", "release N pins secret X: apply a release without it
-first" and "paused"; 409s with a code for states the controller expects:
-`busy` (with `Retry-After`) while the object has an op in flight or, for
+first", "the platform serves no apps zone (--apps-zone); an environment
+cannot be public" and "paused"; 409s with a code for states the
+controller expects: `busy` (with `Retry-After`) while the object has an
+op in flight or, for
 a job, a run, `not_running` for an instance that does not run,
 `not_ready` for a job whose template cannot render yet ("job X cannot
 run yet: …"); 404 "no such release", "no such tag", "no such secret",
@@ -1916,6 +2339,124 @@ author has at most 1 KiB, a message 64 KiB, annotations 4 KiB, labels 64
 of at most 253 bytes. Not built: MCP tools and grants for environments,
 an admin listing, volumes for services, a copy of data on a clone, addon
 backups and minor upgrades, a CLI.
+
+## The ingress
+
+`ferun-ingress` ([ADR 0021](../adr/0021-ingress.md),
+[ingress.md](ingress.md)) serves public environments' hosts,
+`https://<label>.<apps zone>/…`, straight to their image services' pods:
+a program of its own and a peer on the pods' mesh, which connects out to
+`ferund` on the nodes' port as a node does and serves from the table
+`ferund` streams to it. `ferund` never calls it, carries none of its
+traffic, and any instance serves any of its instances. This section is
+`ferund`'s part; ingress.md describes the whole.
+
+### Public environments
+
+The route door serves every environment, with its route tokens. The
+ingress serves an environment only once its tenant made it public, `PUT
+/api/v1/environments/{env}/public {"public": true}` (tenant class):
+
+- **The first publish**, in one transaction under the environment's row
+  lock, gives the environment its host label, sets `ingress_group` and
+  `public`, sends `ferun_ingress` `env:<id>` and wakes `env-reconcile`
+  and `env-groups`. `ingress_group` puts `IngressGroup` into its image
+  services' templates, part of the template hash, so the services roll
+  once and their pods name `ing-<sandbox id>` ([Security
+  groups](#security-groups)); the answer says `rolling: true`.
+- **Unpublishing** takes the environment out of the ingress's table
+  within about 100 ms; its `ing-` groups lose their rules in the next
+  `env-groups` pass. Label and `ingress_group` stay, so publishing again
+  rolls nothing.
+- **Refusals**: 409 for publishing while `--apps-zone` is empty, the
+  platform's switch, and for either while the environment or its tenant
+  is being deleted. A clone never copies `public`; deploying the ingress
+  makes nothing public.
+- **The label** is `<environment>-<tenant>` when it names that pair
+  alone: the name has no hyphen, the tenant no dot, it does not end in a
+  hyphen and 16 hex characters, and it is a DNS label of at most 63
+  characters without `--` as its third and fourth characters. Else it is
+  at most 46 characters of the name, a hyphen and 16 hex characters of
+  the SHA-256 of the environment's UUID ([Host
+  labels](ingress.md#host-labels)). `host_labels` registers it to the
+  tenant that first claimed it, in one atomic upsert: another tenant
+  never gets it, and its owner may claim it again once its environment
+  is gone. It never changes while the environment lives.
+
+### The ingress service
+
+Every instance serves `ferun.ingress.v1.IngressService`, JSON over gRPC
+on the nodes' port under ALPN `ferun-ingress/1` ([The nodes'
+port](#the-nodes-port), [api.md](api.md#the-ingresss-api)), from
+`internal/ingress/service`:
+
+- **Join** turns a one-time join token of kind `ingress`,
+  `feos-ingress-join-<secret>`, into the instance's name and first
+  certificate, `spiffe://<td>/ingress/<name>`; a token pinned to a name
+  joins it again (its certificates revoked, its WireGuard key cleared and
+  retired, its /64 kept). **RenewCertificate** renews only the
+  instance's newest certificate (the current one, or, while none is, the
+  newest not revoked), never one revoked, also from a time ahead, for its
+  own key alone, and not before its renew time less 10 minutes, so that a
+  copy of a certificate does not outlive the instance's own. **Hello**
+  makes the presenting certificate current, superseding the older ones
+  10 minutes ahead, and puts the instance on the mesh with its fixed key
+  ([The pods' mesh](#the-pods-mesh)); its answer is the ULA, the
+  instance's /64 and address, the apps zone and the answering instance.
+  `ingress_certs` records every certificate.
+- **Sync** streams the instance's table: whole, then the environments
+  put and removed, the mesh's nodes when their version changes, `Self`
+  (its address, the apps zone, its admitted version of `ferun-ingress`)
+  when its row changes, and an empty table every 10 s that records the
+  instance as seen. A stream ends `UNAVAILABLE` when its instance's
+  table builder has not read the database for 30 s.
+- **The table builder** (`internal/ingress/table`) runs on every
+  instance that has a stream: it builds each public environment's entry
+  from the database (routes of the realised release, else the latest;
+  endpoints with their admitted ports; asleep, waking and pending
+  counts), rebuilds an environment on `ferun_ingress` `env:<id>` or
+  `ferun_sandbox` of one of its instances after 50 ms, the mesh on
+  `mesh`, and everything on `*`, a reconnect and every 5 s. A replica's
+  change reaches the ingress about 100 ms after its commit.
+- **Wake** wakes exactly the asleep instances of a routed image service
+  of a public environment, each once at a time, in the background
+  (`Engine.Sync`, then `Engine.Ensure`, within the preparation budget),
+  never on the caller's context.
+- **Hold** admits, under the sandbox's row lock, a hold of kind
+  `forward` with the holder `ingress:<name>` and a lease of 30 s on a
+  running service instance of a public environment without an op;
+  releases holds; and with `leaving` releases all of the instance's and
+  sets `ingresses.left_at`. The holds keep idle services from pausing
+  under a request; the [idle fence](ingress.md#the-idle-fence) covers an
+  instance cut off from `ferund`.
+- **Following the others' writes.** `ferun_ingress` `ingress:<name>`
+  re-checks that instance's connections and has its streams read its
+  row (a removal ends them with `PERMISSION_DENIED`); `*` and a
+  reconnect re-check every connected instance.
+- **Stopping** ([Stopping](#stopping), step 1): new ingress connections
+  close, the streams end with `UNAVAILABLE` "instance stopping", Wake and
+  Hold answer `UNAVAILABLE`.
+
+### The ingress's admin API
+
+- `POST /api/v1/admin/join-tokens` takes `kind`, `node` (the default) or
+  `ingress`, and `name` (`node` is its older alias; both given and
+  different is 400), and answers `{id, token, expiresAt, kind, name,
+  node}`, so that an operator sees a node's token issued by an instance
+  that knows no kinds; an ingress's token is
+  `feos-ingress-join-<secret>.<pin>`. `GET` lists each token's `kind`.
+  `ferund join-token --kind ingress [--node <name>]` issues one without
+  REST.
+- `GET /api/v1/admin/ingresses` lists the instances, removed ones
+  included: name, status, joined and removed, mesh prefix, address,
+  endpoint and public key, version, last seen and left, `connected` (seen
+  within 30 s, on the database clock), `admittedVersion`, the
+  certificate's expiry.
+- `DELETE /api/v1/admin/ingresses/{name}` removes an instance (204, or
+  404): a status, never a deleted row. Its certificates are revoked, its
+  streams and connections closed on every instance, and it leaves the
+  mesh's peers and `ferun-ingress`; a token pinned to its name joins it
+  again.
 
 ## The activity log
 
@@ -2039,7 +2580,12 @@ that dial the instances.
   balancer in front of the front doors, a TCP passthrough or DNS in front
   of the nodes' port, and every instance with a `--node-advertise-address`
   at which nodes reach that very instance. `deploy/k3s/ferun/` is an
-  example deployment on k3s.
+  example deployment on k3s; `deploy/gardener/ferun/` runs three
+  instances over a CloudNativePG cluster of three, on three workers.
+- **The ingress**, beside either: instances of `ferun-ingress` that reach
+  the nodes' port and the nodes' mesh endpoints, behind a balancer of
+  their own; `deploy/gardener/ferun-ingress/` runs two
+  ([ingress.md](ingress.md#kubernetes)).
 
 ### Requirements
 
@@ -2049,14 +2595,63 @@ that dial the instances.
   never loses a commit that ferund acknowledged: a booking, an op's
   begin, an event's acknowledgement. ferund sees a failover as a
   reconnect, after which it reconciles every node it is connected to.
-- **Termination grace.** A stopping instance finishes its requests and
-  ops for up to `--shutdown-grace` (10 minutes) before it closes its node
-  connections. Whatever stops it waits at least that plus 30 s: the
-  package's unit has `TimeoutStopSec=630`, and a container deployment sets
-  its termination grace period (Kubernetes:
-  `terminationGracePeriodSeconds`) to at least `--shutdown-grace` plus
-  30 s. The default of 30 s kills ferund long before the tool calls in
-  flight end. A longer or shorter `--shutdown-grace` moves both.
+  Three PostgreSQL instances on three machines keep this through the
+  loss of any one: a commit waits for one of the two standbys (`ANY 1`,
+  CloudNativePG's `dataDurability: required`), so a lost machine leaves
+  a primary and a synchronous standby, writes go on, and a failover
+  loses no acknowledged commit (RPO 0); only with both standbys gone
+  does every commit wait. A failover must promote only a standby that
+  has every acknowledged commit (CloudNativePG's `failoverQuorum`: with
+  two standbys and `ANY 1`, while both are ready), and a standby must
+  count as ready only while it streams (readiness probe of type
+  `streaming`), and for longer than a lost machine takes to be noticed,
+  so that both are still ready when the primary's machine is lost.
+  Two instances cannot have both: with required durability every write
+  waits while the standby is down, and with preferred durability, which
+  goes on accepting writes, those are on the primary's volume alone,
+  and only `failoverQuorum` keeps a failover from losing them. The
+  guarantee holds for replication stalls shorter than
+  `statement_timeout` (30 s): PostgreSQL ends a commit's wait for a
+  standby when the statement is cancelled and reports the commit done,
+  so a primary cut off from its standbys must stop well before that
+  (CloudNativePG: liveness every 5 s, 3 failures). The server must
+  notice a client that vanished; ferund's sessions ask for it
+  ([The database](#the-database), Sessions).
+- **Connections.** An instance holds up to 32 pooled connections
+  (`pool_max_conns` in the URL changes it) and one for LISTEN. A
+  stopping instance keeps them until it ends, up to its termination
+  grace, so `max_connections` must cover the revisions alive within
+  that grace × instances × 33, plus what else connects: 400 for three
+  instances and two deploys within twelve minutes (3 × 3 × 33 = 297).
+  Point the URL at the name that follows the primary (CloudNativePG's
+  `-rw` service) with `target_session_attrs=read-write`, so that a
+  connection that lands on a standby during a switchover is refused at
+  once rather than at its first write; the password may come from
+  `PGPASSWORD`.
+- **Kubernetes.** Roll one instance at a time with a surge
+  (`maxSurge: 1`, `maxUnavailable: 0`, `minReadySeconds`), spread the
+  instances over the machines (topology spread, not required
+  anti-affinity: on three machines a rolling deploy's fourth instance
+  would find none), and give them a PodDisruptionBudget of
+  `maxUnavailable: 1`. /readyz passes once the nodes have dialled a new
+  instance, at the latest 30 s after its start
+  (`deploy/k3s/ferun/ferund.yaml`).
+- **Termination grace.** A stopping instance finishes its requests, its
+  tool calls and its ops for up to `--shutdown-grace` (11 minutes) before
+  it closes its node connections. Whatever stops it waits at least that
+  plus 60 s ([Stopping](#stopping)): the package's unit has
+  `TimeoutStopSec=720`, and a container deployment sets its termination
+  grace period (Kubernetes: `terminationGracePeriodSeconds`) to at least
+  `--shutdown-grace` plus 60 s, 720 s. The default of 30 s kills ferund
+  long before the tool calls in flight end. A longer or shorter
+  `--shutdown-grace` moves both; one below 600 s, a keyed `bash`'s
+  longest timeout, can cut keyed calls that were sent before the stop,
+  and one below 630 s refuses a keyed `bash` of 600 s from the drain's
+  start ([Calls that outlive their
+  caller](#calls-that-outlive-their-caller)). In a
+  rolling deploy, a stopping instance whose calls still run lingers
+  beside the new ones for up to the grace and 60 s, 12 minutes by
+  default.
 - **The front-door balancer:** an idle timeout of at least 60 s (MCP's
   keepalive comes every 25 s), no response buffering (MCP's answers, the
   watches' events and forwarded responses stream; the watches send
@@ -2067,7 +2662,16 @@ that dial the instances.
 - **The nodes' balancer** passes TCP through; a proxy that terminates TLS
   or reads HTTP/2 breaks the node connection and the client
   certificates. Nodes connect to every instance listed to them, which is
-  why every instance sets `--node-advertise-address`.
+  why every instance sets `--node-advertise-address`. The ingress's
+  instances connect through it too, to one instance at a time.
+- **For the ingress**: a meshed cluster (`--pod-network mesh`), since the
+  ingress reaches pods only over the mesh; `--apps-zone` on every
+  instance, its wildcard DNS record at the ingress's balancer and its
+  wildcard certificate in the ingress's files; UDP between the ingress's
+  endpoints and the nodes' mesh endpoints. In a rolling deploy, issue
+  ingress tokens and publish environments only once every instance runs
+  a version with the ingress: an older instance issues a node's token
+  whatever kind is asked, and its writes send no `ferun_ingress`.
 
 ### The CA ceremony
 
@@ -2126,8 +2730,8 @@ leaves:
 | `/etc/ferun/ca/` | the issuer's directory, mode 0750, group `ferun`; empty |
 
 `ferund.service` runs `ferund serve` as `ferun`, with
-`EnvironmentFile=/etc/ferun/ferund.env` and `TimeoutStopSec=630`, the
-default `--shutdown-grace` plus 30 s; a longer grace needs a drop-in with
+`EnvironmentFile=/etc/ferun/ferund.env` and `TimeoutStopSec=720`, the
+default `--shutdown-grace` plus 60 s; a longer grace needs a drop-in with
 a longer timeout. It starts ferund again 5 s after it exits, without a
 start limit (`StartLimitIntervalSec=0`): an instance that cannot reach
 its database at its start exits, and keeps being started until the
@@ -2146,7 +2750,8 @@ statoverrides, and `/etc/ferun/ca` stays when it holds the issuer.
 ## Choices ADR 0015 leaves open
 
 - **ALPN names.** `feos-node/1` for the node connection, `h2` for the
-  uplink and the join.
+  uplink and the join; `ferun-ingress/1` for the ingress's connections
+  (ADR 0021).
 - **MCP** runs stateless, with signed, self-describing session IDs used
   only for cancellation across instances.
 - **Watches** have one owner instance each, which a stream opened
@@ -2218,4 +2823,5 @@ the standard library's `testing`; those that need PostgreSQL make a
 database of their own per test in the server `FERUN_TEST_DATABASE_URL`
 names, and skip without it. `make go-test` runs them against a throwaway
 PostgreSQL 17 in docker. `internal/e2e` runs several instances in one
-process against one database, with test nodes.
+process against one database, with test nodes, and `ferun-ingress` in
+the same process for the ingress's tests ([ingress.md](ingress.md#tests)).

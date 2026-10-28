@@ -55,7 +55,7 @@ func TestDefaults(t *testing.T) {
 			"node-wait": 5 * time.Second, "rollout-grace": 30 * time.Second, "drain-timeout": 2 * time.Minute,
 			"pending-repair-after": 10 * time.Minute, "unreachable-repair-after": 2 * time.Minute,
 			"node-cert-ttl": 168 * time.Hour, "pod-cert-ttl": time.Hour, "node-max-streams": 1024,
-			"conn-drain-timeout": 20 * time.Minute, "shutdown-grace": 10 * time.Minute,
+			"conn-drain-timeout": 20 * time.Minute, "shutdown-grace": 11 * time.Minute,
 			"activity-retention": 720 * time.Hour, "traffic-retention": 168 * time.Hour, "log-level": slog.LevelInfo,
 			"oidc-scopes": "openid profile email", "hibernate-timeout": time.Hour,
 		}[name]
@@ -65,6 +65,9 @@ func TestDefaults(t *testing.T) {
 	}
 	if c.ReadinessDelay != 5*time.Second || c.ReadyWindow != 30*time.Second {
 		t.Errorf("readiness %v %v", c.ReadinessDelay, c.ReadyWindow)
+	}
+	if c.CallLease != 30*time.Second || c.CallRetention != time.Hour {
+		t.Errorf("calls with an id: lease %v, retention %v", c.CallLease, c.CallRetention)
 	}
 }
 
@@ -80,7 +83,7 @@ func TestDeploymentEnv(t *testing.T) {
 		"FERUN_TRUST_DOMAIN":            "run.fecode.dev",
 		"FERUN_CA_DIR":                  "/etc/ferun/ca",
 		"FERUN_HIBERNATE_AFTER":         "2m",
-		"FERUN_SHUTDOWN_GRACE":          "2m",
+		"FERUN_SHUTDOWN_GRACE":          "11m",
 		"FERUN_PUBLIC_URL":              "https://run.fecode.dev",
 		"FERUN_OIDC_ISSUER":             "https://id.fecode.dev/",
 		"FERUN_OIDC_CLIENT_ID":          "client-123",
@@ -93,10 +96,29 @@ func TestDeploymentEnv(t *testing.T) {
 	}
 	if got.DatabaseURL != testURL || got.Listen != ":8100" || got.NodeListen != ":7443" ||
 		got.NodeAdvertiseAddress != "10.42.0.7:7443" || got.TrustDomain != "run.fecode.dev" || got.CADir != "/etc/ferun/ca" ||
-		got.HibernateAfter != 2*time.Minute || got.ShutdownGrace != 2*time.Minute || got.PublicURL != "https://run.fecode.dev" ||
+		got.HibernateAfter != 2*time.Minute || got.ShutdownGrace != 11*time.Minute || got.PublicURL != "https://run.fecode.dev" ||
 		got.OIDCIssuer != "https://id.fecode.dev/" || got.OIDCClientID != "client-123" ||
 		got.OIDCClientSecretFile != "/etc/ferun/oidc/secret" || got.OIDCAdminGroup != "admins" || got.SessionTTL != 12*time.Hour {
 		t.Fatalf("parsed %+v", got)
+	}
+}
+
+// "default" in --deny-prefix is the built-in set, so that a deployment
+// adds its own networks to it; repeated prefixes stay.
+func TestDenyPrefixDefault(t *testing.T) {
+	t.Parallel()
+	c, err := Parse([]string{"--database-url", testURL}, env(map[string]string{
+		"FERUN_DENY_PREFIX": "default, 100.144.0.0/13,100.152.0.0/13",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(DefaultDenyPrefixes(), netip.MustParsePrefix("100.144.0.0/13"), netip.MustParsePrefix("100.152.0.0/13"))
+	if !reflect.DeepEqual(c.DenyPrefixes, want) {
+		t.Fatalf("deny %v, want %v", c.DenyPrefixes, want)
+	}
+	if _, err := Parse([]string{"--database-url", testURL, "--deny-prefix", "defaults"}, env(nil)); err == nil {
+		t.Fatal("a misspelt default parsed")
 	}
 }
 
@@ -274,7 +296,8 @@ func TestUsage(t *testing.T) {
 	var b strings.Builder
 	Usage(&b, CmdServe)
 	for _, s := range []string{"--database-url (FERUN_DATABASE_URL)", "--oidc-client-secret-file (FERUN_OIDC_CLIENT_SECRET_FILE)",
-		`--shutdown-grace (FERUN_SHUTDOWN_GRACE, default "10m0s")`, "--node-advertise-address (FERUN_NODE_ADVERTISE_ADDRESS)",
+		`--shutdown-grace (FERUN_SHUTDOWN_GRACE, default "11m0s")`, "--node-advertise-address (FERUN_NODE_ADVERTISE_ADDRESS)",
+		"how long a stopping instance waits for its requests, its tool calls and its ops; set a container's termination grace to at least this plus 60s",
 		`--hibernate-timeout (FERUN_HIBERNATE_TIMEOUT, default "1h0m0s")`,
 		"how long ferund waits for a hibernate (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB, and the node's hibernation goes on after the wait",
 		"lifetime of node certificates; renewed at half of it, so that a node switched off for up to half of it needs nothing"} {
@@ -348,5 +371,55 @@ func TestPodNetwork(t *testing.T) {
 	p, err := ParsePodNetwork("fd5e:1b2c:93a0::/48")
 	if err != nil || p != netip.MustParsePrefix("fd5e:1b2c:93a0::/48") {
 		t.Fatalf("%v %v", p, err)
+	}
+}
+
+// --apps-zone: empty by default, which serves no hosts; otherwise a
+// lowercase DNS name, from the flag or FERUN_APPS_ZONE.
+func TestAppsZone(t *testing.T) {
+	t.Parallel()
+	if EnvName("apps-zone") != "FERUN_APPS_ZONE" {
+		t.Fatal(EnvName("apps-zone"))
+	}
+	c, err := Parse([]string{"--database-url", testURL}, env(nil))
+	if err != nil || c.AppsZone != "" || Default().AppsZone != "" {
+		t.Fatalf("default %q, %v", c.AppsZone, err)
+	}
+	c, err = Parse([]string{"--database-url", testURL, "--apps-zone", ""}, env(map[string]string{"FERUN_APPS_ZONE": "apps.example"}))
+	if err != nil || c.AppsZone != "" {
+		t.Fatalf("an empty zone: %q, %v", c.AppsZone, err)
+	}
+	c, err = Parse([]string{"--database-url", testURL}, env(map[string]string{"FERUN_APPS_ZONE": "apps.example"}))
+	if err != nil || c.AppsZone != "apps.example" {
+		t.Fatalf("from the variable %q, %v", c.AppsZone, err)
+	}
+	c, err = Parse([]string{"--database-url", testURL, "--apps-zone", "fecode-apps.dev"},
+		env(map[string]string{"FERUN_APPS_ZONE": "apps.example"}))
+	if err != nil || c.AppsZone != "fecode-apps.dev" {
+		t.Fatalf("from the flag %q, %v", c.AppsZone, err)
+	}
+	for _, bad := range []string{
+		"Apps.Example", "apps.example.", ".apps.example", "apps..example", "-apps.example", "apps_zone.example",
+		"apps.example:443", "https://apps.example", "*.apps.example", "10.0.0.1", "2001:db8::1", " apps.example",
+		strings.Repeat("a", 64) + ".example",
+	} {
+		if _, err := Parse([]string{"--database-url", testURL, "--apps-zone", bad}, env(nil)); err == nil ||
+			!strings.Contains(err.Error(), "--apps-zone") {
+			t.Errorf("%q: %v", bad, err)
+		}
+		if _, err := Parse([]string{"--database-url", testURL}, env(map[string]string{"FERUN_APPS_ZONE": bad})); err == nil {
+			t.Errorf("FERUN_APPS_ZONE %q was taken", bad)
+		}
+	}
+	c = Default()
+	c.DatabaseURL = testURL
+	c.AppsZone = "Bad_Zone"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "--apps-zone") {
+		t.Fatalf("an instance built in process with a bad zone: %v", err)
+	}
+	var b strings.Builder
+	Usage(&b, CmdServe)
+	if !strings.Contains(b.String(), "--apps-zone (FERUN_APPS_ZONE)") {
+		t.Fatalf("serve help lacks --apps-zone:\n%s", b.String())
 	}
 }

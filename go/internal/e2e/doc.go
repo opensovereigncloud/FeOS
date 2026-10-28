@@ -8,7 +8,9 @@
 // REST, MCP with the go-sdk client, the port door and the watches. Where a
 // scenario needs what no client sends (a Join repeated with the same key,
 // a node connection with a superseded certificate, a crafted event batch),
-// the tests speak feos.fleet.v1 themselves.
+// the tests speak feos.fleet.v1 themselves. ferun-ingress (ADR 0021) runs
+// in the test's process too, an ingress.Program with a fake WireGuard
+// device and a dial hook that plays the pods' mesh (ingress_test.go).
 //
 // The package has no code besides its tests. The tests need a PostgreSQL
 // (FERUN_TEST_DATABASE_URL, as every database test of the module) and skip

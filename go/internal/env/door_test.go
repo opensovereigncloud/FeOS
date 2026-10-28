@@ -254,7 +254,7 @@ func TestStatus(t *testing.T) {
 		job.LastRun.FinishedAt == "" {
 		t.Fatalf("job %+v", job.LastRun)
 	}
-	if len(got.Routes) != 2 || got.Routes[0] != (RouteStatus{Name: "api", Path: "/api", Service: "api", Port: 8080}) ||
+	if len(got.Routes) != 2 || got.Routes[0] != (RouteStatus{Name: "api", Path: "/api", Service: "api", Port: 8080, Door: DoorRoute}) ||
 		got.Routes[1].Port != 3000 {
 		t.Fatalf("routes %+v", got.Routes)
 	}

@@ -473,13 +473,27 @@ func TestInstances(t *testing.T) {
 
 func TestJoinTokens(t *testing.T) {
 	s, _ := newStore(t)
-	jt, err := s.CreateJoinToken(bg, "h1", "admin", "", time.Hour)
+	jt, err := s.CreateJoinToken(bg, "h1", "admin", model.JoinKindNode, "", time.Hour)
 	must(t, err)
-	if jt.ID == uuid.Nil || jt.Used() || jt.ExpiresAt.Sub(jt.CreatedAt) != time.Hour {
+	if jt.ID == uuid.Nil || jt.Used() || jt.ExpiresAt.Sub(jt.CreatedAt) != time.Hour || jt.Kind != model.JoinKindNode {
 		t.Fatalf("token %+v", jt)
 	}
-	pinned, err := s.CreateJoinToken(bg, "h2", "admin", "n1", time.Hour)
+	pinned, err := s.CreateJoinToken(bg, "h2", "admin", model.JoinKindNode, "n1", time.Hour)
 	must(t, err)
+	ingress, err := s.CreateJoinToken(bg, "h3", "admin", model.JoinKindIngress, "ferun-ingress-0", time.Hour)
+	must(t, err)
+	if ingress.Kind != model.JoinKindIngress || ingress.NodeName != "ferun-ingress-0" {
+		t.Fatalf("ingress token %+v", ingress)
+	}
+	if _, err := s.CreateJoinToken(bg, "h4", "admin", "pod", "", time.Hour); err == nil {
+		t.Fatal("a join token of an unknown kind")
+	}
+	// A row the previous version inserts, without a kind, is a node's.
+	exec(t, s, "INSERT INTO join_tokens (hash, expires_at) VALUES ('h5', now() + interval '1 hour')")
+	if old, err := s.LockJoinToken(bg, "h5"); err != nil || old.Kind != model.JoinKindNode {
+		t.Fatalf("a token without a kind %+v %v", old, err)
+	}
+	exec(t, s, "DELETE FROM join_tokens WHERE hash IN ('h3', 'h5')")
 	tx(t, s, func(tx *store.Store) error {
 		got, err := tx.LockJoinToken(bg, "h1")
 		if err != nil {

@@ -589,7 +589,8 @@ func TestStreamAndToolBudgets(t *testing.T) {
 		}
 	}
 	_, err = containers.Exec(context.Background(), &containerv1.ExecRequest{})
-	if status.Code(err) != codes.ResourceExhausted || status.Convert(err).Message() != "node n1: stream budget exhausted" {
+	if status.Code(err) != codes.ResourceExhausted || status.Convert(err).Message() != "node n1: stream budget exhausted" ||
+		!refused(err) {
 		t.Fatalf("fifth long stream: %v", err)
 	}
 	// What is not budgeted still goes through.
@@ -630,7 +631,8 @@ func TestStreamAndToolBudgets(t *testing.T) {
 		<-ns.tools.entered
 	}
 	_, err = tools.Read(context.Background(), readReq("y"))
-	if status.Code(err) != codes.ResourceExhausted || status.Convert(err).Message() != "node n1: tool budget exhausted" {
+	if status.Code(err) != codes.ResourceExhausted || status.Convert(err).Message() != "node n1: tool budget exhausted" ||
+		!refused(err) {
 		t.Fatalf("third tool call: %v", err)
 	}
 	close(ns.tools.gate)
@@ -681,7 +683,8 @@ func TestConnWaits(t *testing.T) {
 
 	start := time.Now()
 	_, err := e.srv.Conn(context.Background(), "n9")
-	if status.Code(err) != codes.Unavailable || status.Convert(err).Message() != "node n9 is not connected to instance i1" {
+	if status.Code(err) != codes.Unavailable || status.Convert(err).Message() != "node n9 is not connected to instance i1" ||
+		!refused(err) {
 		t.Fatalf("Conn: %v", err)
 	}
 	if d := time.Since(start); d < 250*time.Millisecond || d > 2*time.Second {
@@ -783,4 +786,10 @@ func TestSubscribeEvents(t *testing.T) {
 	unsubscribe()
 	for range events {
 	}
+}
+
+// refused reports whether err is the port's own refusal (a *RefusalError).
+func refused(err error) bool {
+	var re *RefusalError
+	return errors.As(err, &re)
 }

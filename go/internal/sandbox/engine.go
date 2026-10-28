@@ -148,6 +148,12 @@ type timings struct {
 	// policyBackoffMin and policyBackoffMax bound the backoff of a
 	// policy whose op failed (backOff).
 	policyBackoffMin, policyBackoffMax time.Duration
+	// outageGuard is how long the leader must have led, and the database
+	// gone without a connection failure, before the loops that act on
+	// expired leases (idle pause, stale ops, expired holds) act: long
+	// enough for every live instance to renew its holds (holdRenew) and
+	// its heartbeat after an outage or a stall. 0 turns the guard off.
+	outageGuard time.Duration
 }
 
 // defaultTimings are the timings of an instance whose hibernates may run
@@ -185,6 +191,10 @@ func defaultTimings(hibernateTimeout time.Duration) timings {
 
 		policyBackoffMin: 30 * time.Second,
 		policyBackoffMax: 30 * time.Minute,
+
+		// holdRenew and 5 s: every live instance renews its holds within
+		// holdRenew and its heartbeat within 5 s (leader.HeartbeatInterval).
+		outageGuard: 15 * time.Second,
 	}
 }
 
@@ -234,6 +244,11 @@ type Engine struct {
 	ownAct bool
 	log    *slog.Logger
 	t      timings
+
+	// leadingSince and lastFailure are the elector's LeadingSince and the
+	// database's LastFailure, which settled reads; tests replace them.
+	leadingSince func() time.Time
+	lastFailure  func() time.Time
 
 	// resolveImage pins an image to its digest (image.go); tests replace
 	// it.
@@ -337,6 +352,11 @@ func New(cfg Config, deps Deps) (*Engine, error) {
 		unreachable: map[podid.ID]*reach{}, evacuations: map[podid.ID]string{}, evacuatingOn: map[string]int{},
 		holds: map[holdKey]*holdState{}, tombs: map[store.TombstoneKey]*tombRun{}, rl: newRateLog(log),
 	}
+	e.leadingSince = func() time.Time { return time.Time{} }
+	if e.el != nil {
+		e.leadingSince = e.el.LeadingSince
+	}
+	e.lastFailure = deps.DB.LastFailure
 	if e.act == nil {
 		e.act = activity.NewRecorder(st, cfg.InstanceID, cfg.Log)
 		e.ownAct = true
@@ -350,6 +370,25 @@ func New(cfg Config, deps Deps) (*Engine, error) {
 	e.syncs.m = map[podid.ID]*syncEntry{}
 	e.bg, e.bgCancel = context.WithCancel(context.Background())
 	return e, nil
+}
+
+// settled reports whether the loops that act on expired leases may act:
+// the leader has led for outageGuard and the database has not failed
+// within it, so that after an outage, a stall (which ends the leader's
+// term) or a failover every live instance has renewed its holds and its
+// heartbeat first (as fleet's node expiry waits for the node TTL).
+func (e *Engine) settled() bool {
+	if e.t.outageGuard <= 0 {
+		return true
+	}
+	since := e.leadingSince()
+	if since.IsZero() || time.Since(since) < e.t.outageGuard {
+		return false
+	}
+	if f := e.lastFailure(); !f.IsZero() && time.Since(f) < e.t.outageGuard {
+		return false
+	}
+	return true
 }
 
 // SetProcessLister sets what the process-holds loop lists processes with:

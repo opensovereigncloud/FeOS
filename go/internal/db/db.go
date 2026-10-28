@@ -26,6 +26,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -57,10 +58,20 @@ const (
 	// ChanReconcile carries a node name an instance asks another to
 	// reconcile.
 	ChanReconcile = "ferun_reconcile"
+	// ChanCall carries the id of a tool call (tool_calls.id) that left the
+	// state running (done, interrupted, not_run), or "*": re-read every
+	// tool call you wait on.
+	ChanCall = "ferun_call"
+	// ChanIngress carries what changed in the ingress's table (ADR 0021):
+	// "env:<uuid>", an environment whose publicity, releases, deletion or
+	// service instances changed; "ingress:<name>", an ingress whose row or
+	// certificates changed; "mesh", the mesh's peers; or "*": rebuild
+	// everything.
+	ChanIngress = "ferun_ingress"
 )
 
 // Channels lists every channel the hub listens to.
-var Channels = []string{ChanSandbox, ChanNode, ChanLeader, ChanWatch, ChanCancel, ChanReconcile}
+var Channels = []string{ChanSandbox, ChanNode, ChanLeader, ChanWatch, ChanCancel, ChanReconcile, ChanCall, ChanIngress}
 
 // Session settings of every connection: a lock waited on for longer than
 // lock_timeout fails the statement with 55P03 (Tx retries it), a statement
@@ -73,6 +84,44 @@ const (
 // defaultMaxConns is the pool size unless the URL names one
 // (pool_max_conns).
 const defaultMaxConns = 32
+
+// TCP settings of every connection, the pool's and the listener's, on
+// both ends: a server that vanished without a reset fails the connection
+// within about 20 s, and the pool and the listener connect again, to
+// whichever server the name leads to now; the server likewise ends the
+// session of an instance that vanished, and frees its locks.
+const (
+	tcpKeepAlive   = 5 * time.Second
+	tcpUserTimeout = 15 * time.Second
+	dialTimeout    = 10 * time.Second
+)
+
+// sessionIdleInTx ends a session that idles inside a transaction for
+// longer: ferund never does (a transaction runs nothing slow), so only an
+// instance that vanished mid-transaction meets it.
+const sessionIdleInTx = "60s"
+
+// noticeInterval is the least time between two logged WARNING notices.
+const noticeInterval = 10 * time.Second
+
+// dialer is the dialer of every connection; timeout bounds a dial, 0 for
+// dialTimeout. connect_timeout in the URL bounds the whole connect anyway
+// (pgconn applies it as the context's deadline).
+func dialer(timeout time.Duration) *net.Dialer {
+	if timeout <= 0 {
+		timeout = dialTimeout
+	}
+	return &net.Dialer{
+		Timeout:         timeout,
+		KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: tcpKeepAlive, Interval: tcpKeepAlive, Count: 3},
+		Control: func(network, _ string, raw syscall.RawConn) error {
+			if strings.HasPrefix(network, "tcp") {
+				setUserTimeout(raw, tcpUserTimeout)
+			}
+			return nil
+		},
+	}
+}
 
 // DB is an open database: the pool, the notification hub and the record of
 // the last connection failure.
@@ -90,11 +139,21 @@ type DB struct {
 	listenMu  sync.Mutex
 	listening chan struct{} // closed while the listener listens
 	listenOK  bool
+
+	// noticeMu guards the rate limit of the logged WARNING notices:
+	// when the last was logged, and how many were left out since.
+	noticeMu         sync.Mutex
+	noticeAt         time.Time
+	noticeSuppressed int
 }
 
-// Open connects the pool. Every connection gets the session settings
-// lock_timeout = 5s, statement_timeout = 30s and TimeZone = UTC. Open does
-// not migrate; see Migrate.
+// Open connects the pool. Every connection, the pool's and the
+// listener's, gets the session settings lock_timeout = 5s,
+// statement_timeout = 30s, TimeZone = UTC, the TCP keepalive and user
+// timeout on both ends (tcp_keepalives_*, tcp_user_timeout) and
+// idle_in_transaction_session_timeout = 60s; it dials with dialer, and the
+// server's WARNING notices are logged (onNotice). Open does not migrate;
+// see Migrate.
 func Open(ctx context.Context, url string, log *slog.Logger) (*DB, error) {
 	if log == nil {
 		log = slog.Default()
@@ -110,11 +169,21 @@ func Open(ctx context.Context, url string, log *slog.Logger) (*DB, error) {
 	rp["lock_timeout"] = sessionLockTimeout
 	rp["statement_timeout"] = sessionStatementTimeout
 	rp["timezone"] = "UTC"
+	// The server's side of the TCP settings (ignored on a Unix socket).
+	rp["tcp_keepalives_idle"] = "5"
+	rp["tcp_keepalives_interval"] = "5"
+	rp["tcp_keepalives_count"] = "3"
+	rp["tcp_user_timeout"] = "15000"
+	rp["idle_in_transaction_session_timeout"] = sessionIdleInTx
 	if rp["application_name"] == "" {
 		rp["application_name"] = "ferund"
 	}
 	d := &DB{log: log, listening: make(chan struct{})}
 	d.hub.subs = map[string]map[*subscriber]struct{}{}
+
+	// Before the copy, so that the listener's connection has both.
+	cfg.ConnConfig.DialFunc = dialer(cfg.ConnConfig.ConnectTimeout).DialContext
+	cfg.ConnConfig.OnNotice = d.onNotice
 
 	lc := cfg.ConnConfig.Copy()
 	lc.RuntimeParams["application_name"] = "ferund-listener"
@@ -128,6 +197,24 @@ func Open(ctx context.Context, url string, log *slog.Logger) (*DB, error) {
 	}
 	d.Pool = pool
 	return d, nil
+}
+
+// onNotice logs the server's WARNING notices, at most one per
+// noticeInterval (the next one says how many it left out): among them a
+// commit whose wait for its synchronous standby was cancelled, done on the
+// primary but perhaps not replicated.
+func (d *DB) onNotice(_ *pgconn.PgConn, n *pgconn.Notice) {
+	if n == nil || n.SeverityUnlocalized != "WARNING" {
+		return
+	}
+	d.noticeMu.Lock()
+	defer d.noticeMu.Unlock()
+	if !d.noticeAt.IsZero() && time.Since(d.noticeAt) < noticeInterval {
+		d.noticeSuppressed++
+		return
+	}
+	d.log.Warn("database warning", "message", n.Message, "detail", n.Detail, "code", n.Code, "left_out", d.noticeSuppressed)
+	d.noticeAt, d.noticeSuppressed = time.Now(), 0
 }
 
 // Close closes the pool. The listener ends with its own context.

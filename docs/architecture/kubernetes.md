@@ -122,7 +122,7 @@ in upper snake case; a flag wins over its variable.
 |---|---|---|
 | `--ferun-url` | required | FeRun's front door, e.g. `http://ferund.ferun.svc.cluster.local:8100` |
 | `--ferun-credentials-file` | required | a file with `user:password` of one of ferund's `--admin-users`, read at every request |
-| `--node-name-prefix` | required | only FeRun nodes with this prefix are removed; on Gardener the shoot's, `shoot--<project>--<shoot>-` |
+| `--node-name-prefix` | required | only FeRun nodes with this prefix are removed; on Gardener the pool's, `shoot--<project>--<shoot>-<pool>-`: the shoot's alone also matches the nodes of a shoot whose name begins with it |
 | `--node-selector` | `feos.fecode.dev/node=true` | the label selector of the nodes that run FeOS |
 | `--namespace` | `feos` | the guards' and the join secret's namespace |
 | `--join-secret` | `feosd-join` | the secret with a join token per node name |

@@ -21,8 +21,9 @@ import (
 // PrepareHook is the engine's prepare hook (sandbox.PrepareHook) for a
 // row with a pod template, an environment's instance or an attachable
 // sandbox: it puts the row's security groups, and those their rules
-// reference, on node (whole groups), and its name tables, and those they
-// include (putNames); before a create it also makes sure
+// reference, on node (whole groups; what the node then holds of the
+// ingress's groups is recorded, putGroups), and its name tables, and
+// those they include (putNames); before a create it also makes sure
 // the row's volumes are there: created on node when they never were
 // (then provisioned, their node and the row's pin_node set in a
 // transaction of its own), else present there and free (AVAILABLE,

@@ -7,12 +7,12 @@
 //
 //	ferund [serve] [flags]          run an instance (the default)
 //	ferund init-ca --root-dir R --dir D --dns-domain X ...
-//	ferund join-token --database-url URL [--ttl 1h] [--node NAME]
+//	ferund join-token --database-url URL [--kind node|ingress] [--ttl 1h] [--node NAME]
 //	ferund migrate --database-url URL
 //
 // Every flag has an environment variable FERUN_<NAME> (internal/config).
-// SIGTERM and SIGINT stop an instance as §7 of the design says: requests
-// and ops in flight finish within --shutdown-grace.
+// SIGTERM and SIGINT stop an instance as §7 of the design says: requests,
+// tool calls and ops in flight finish within --shutdown-grace.
 package main
 
 import (
@@ -31,6 +31,8 @@ import (
 	"github.com/gardenlinux/feos/go/internal/config"
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/fleet"
+	ingresssvc "github.com/gardenlinux/feos/go/internal/ingress/service"
+	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/pki"
 	"github.com/gardenlinux/feos/go/internal/server"
 )
@@ -157,7 +159,9 @@ func initCA(args []string, getenv func(string) string, stdout io.Writer) error {
 	return nil
 }
 
-// joinToken issues a join token in the database and prints it.
+// joinToken issues a join token in the database and prints it: for a
+// node through fleet, for an instance of ferun-ingress (--kind ingress)
+// through the ingress service.
 func joinToken(args []string, getenv func(string) string, stdout, stderr io.Writer) error {
 	c, err := config.ParseJoinToken(args, getenv)
 	if err != nil {
@@ -175,16 +179,21 @@ func joinToken(args []string, getenv func(string) string, stdout, stderr io.Writ
 		return fmt.Errorf("open the database: %w", err)
 	}
 	defer d.Close()
-	fl := fleet.New(fleet.Config{TrustDomain: c.TrustDomain, Log: log}, fleet.Deps{DB: d, Issuer: iss})
-	id, token, expires, err := fl.IssueJoinToken(ctx, "ferund join-token", c.Node, c.TTL)
+	issue := fleet.New(fleet.Config{TrustDomain: c.TrustDomain, Log: log}, fleet.Deps{DB: d, Issuer: iss}).IssueJoinToken
+	if c.Kind == model.JoinKindIngress {
+		issue = ingresssvc.New(ingresssvc.Config{TrustDomain: c.TrustDomain, Log: log},
+			ingresssvc.Deps{DB: d, Issuer: iss}).IssueJoinToken
+	}
+	id, token, expires, err := issue(ctx, "ferund join-token", c.Node, c.TTL)
 	if err != nil {
 		return err
 	}
 	pinned := "any new name"
 	if c.Node != "" {
-		pinned = "node " + c.Node
+		pinned = c.Kind + " " + c.Node
 	}
-	fmt.Fprintf(stderr, "join token %s for %s, valid until %s\n", id, pinned, expires.UTC().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(stderr, "%s join token %s for %s, valid until %s\n", c.Kind, id, pinned,
+		expires.UTC().Format("2006-01-02 15:04:05 MST"))
 	fmt.Fprintln(stdout, token)
 	return nil
 }

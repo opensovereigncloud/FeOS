@@ -41,6 +41,13 @@ const (
 	// call (placement, create, resume, restore): 7 minutes and 5 seconds.
 	// REST advertises it as preparationWaitMs.
 	PreparationBudget = 7*time.Minute + 5*time.Second
+	// CallLease is how long the row of a running tool call with an id
+	// (ADR 0023) lives without a renewal by the instance that runs it; the
+	// instance renews it every third of it.
+	CallLease = 30 * time.Second
+	// CallRetention is how long the record of a tool call with an id is
+	// kept after the call ended.
+	CallRetention = time.Hour
 	// TelemetryInterval is the interval nodes report at.
 	TelemetryInterval = 5 * time.Second
 	// ReconcileClaimInterval is how often one node's inventory reconcile
@@ -121,7 +128,8 @@ type Config struct {
 	// effect only with SecretKeyFile.
 	Bindings bool
 	// DenyPrefixes are the destinations preflights, bindings and the image
-	// resolver may not reach; nil: the built-in set.
+	// resolver may not reach; nil: the built-in set (DefaultDenyPrefixes),
+	// which "default" in --deny-prefix adds to the prefixes given.
 	DenyPrefixes []netip.Prefix
 	// AdminUsers are the operators' Basic credentials (user → password),
 	// the fallback beside OIDC sign-in.
@@ -151,6 +159,10 @@ type Config struct {
 	// drawn at random once and kept in the database; or such a /48 itself,
 	// "fdXX:XXXX:XXXX::/48".
 	PodNetwork string
+	// AppsZone is the DNS zone of public environments' default hosts,
+	// which ferun-ingress serves (ADR 0021); empty: no hosts, and no
+	// environment can be public.
+	AppsZone string
 
 	DefaultImage     string
 	DefaultVCPUs     int
@@ -183,9 +195,10 @@ type Config struct {
 	// unless it is a drain's or past its point of no return. An older
 	// feosd runs the hibernation in the call, which the deadline cuts.
 	HibernateTimeout time.Duration
-	// ShutdownGrace is how long a stopping instance waits for its requests
-	// and ops (§7). A container deployment sets its termination grace
-	// period to at least this plus 30 s.
+	// ShutdownGrace is how long a stopping instance waits for its
+	// requests, its tool calls (those whose callers left too: ADR 0023)
+	// and its ops (§7). A container deployment sets its termination grace
+	// period to at least this plus 60 s.
 	ShutdownGrace     time.Duration
 	ActivityRetention time.Duration
 	TrafficRetention  time.Duration
@@ -201,6 +214,10 @@ type Config struct {
 	// ReadyWindow bounds how long /readyz waits for the node connections
 	// after a start; Default sets ReadyWindow. Not a flag.
 	ReadyWindow time.Duration
+	// CallLease and CallRetention are the lease and the retention of the
+	// tool calls with an id (ADR 0023); Default sets CallLease and
+	// CallRetention. Not flags: tests shorten them.
+	CallLease, CallRetention time.Duration
 }
 
 // Default returns the configuration of serve with every default of §3 and
@@ -234,12 +251,14 @@ func Default() Config {
 		NodeMaxStreams:         1024,
 		ConnDrainTimeout:       20 * time.Minute,
 		HibernateTimeout:       time.Hour,
-		ShutdownGrace:          10 * time.Minute,
+		ShutdownGrace:          11 * time.Minute,
 		ActivityRetention:      720 * time.Hour,
 		TrafficRetention:       168 * time.Hour,
 		LogLevel:               slog.LevelInfo,
 		ReadinessDelay:         ReadinessDelay,
 		ReadyWindow:            ReadyWindow,
+		CallLease:              CallLease,
+		CallRetention:          CallRetention,
 	}
 }
 
@@ -294,7 +313,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.StringVar(&c.SecretKeyFile, "secret-key-file", c.SecretKeyFile, "file of the 32-byte key (raw, hex or base64) sealing bindings at rest")
 	fs.BoolVar(&c.Bindings, "bindings", c.Bindings, "serve the Kubernetes and SSH binding surfaces (only with --secret-key-file)")
 	fs.Var((*prefixList)(&c.DenyPrefixes), "deny-prefix",
-		"a destination prefix preflights, bindings and the image resolver may not reach, comma-separated or repeated (default: the built-in set)")
+		"a destination prefix preflights, bindings and the image resolver may not reach, comma-separated or repeated; \"default\" is the built-in set (default: the built-in set)")
 	fs.StringVar(&t.adminUsers, "admin-users", "", "user:password,user:password for the admin API: the Basic fallback beside OIDC")
 	fs.StringVar(&c.PublicURL, "public-url", c.PublicURL, "the front door's external URL, e.g. https://run.fecode.dev; required with --oidc-issuer")
 	fs.StringVar(&c.OIDCIssuer, "oidc-issuer", c.OIDCIssuer, "OIDC issuer of human sign-in, exactly as its discovery document states it; empty: no OIDC")
@@ -309,6 +328,8 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 		"comma-separated Origin allowlist of /mcp; empty: every request with an Origin is refused")
 	fs.StringVar(&c.PodNetwork, "pod-network", c.PodNetwork,
 		"the pods' network: empty, routed (every node a prefix of its network's); mesh, a ULA /48 drawn once and kept in the database; or such a /48 (fdXX:XXXX:XXXX::/48)")
+	fs.StringVar(&c.AppsZone, "apps-zone", c.AppsZone,
+		"the DNS zone of public environments' default hosts, served by ferun-ingress (ADR 0021); empty: no hosts, and no environment can be public")
 	fs.StringVar(&c.DefaultImage, "default-image", c.DefaultImage, "image of a sandbox created without one")
 	fs.IntVar(&c.DefaultVCPUs, "default-vcpus", c.DefaultVCPUs, "vCPUs of a sandbox created without a size")
 	fs.IntVar(&c.DefaultMemoryMiB, "default-memory-mib", c.DefaultMemoryMiB, "memory (MiB) of a sandbox created without a size")
@@ -331,7 +352,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.DurationVar(&c.HibernateTimeout, "hibernate-timeout", c.HibernateTimeout,
 		"how long ferund waits for a hibernate (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB, and the node's hibernation goes on after the wait")
 	fs.DurationVar(&c.ShutdownGrace, "shutdown-grace", c.ShutdownGrace,
-		"how long a stopping instance waits for its requests and ops; set a container's termination grace to at least this plus 30s")
+		"how long a stopping instance waits for its requests, its tool calls and its ops; set a container's termination grace to at least this plus 60s")
 	fs.DurationVar(&c.ActivityRetention, "activity-retention", c.ActivityRetention, "how long activity is kept")
 	fs.DurationVar(&c.TrafficRetention, "traffic-retention", c.TrafficRetention, "how long traffic records are kept")
 	fs.StringVar(&t.logLevel, "log-level", t.logLevel, "debug, info, warn or error")
@@ -422,6 +443,11 @@ func (c *Config) Validate() error {
 	if c.PodNetwork != PodNetworkRouted && c.PodNetwork != PodNetworkMesh {
 		if _, err := ParsePodNetwork(c.PodNetwork); err != nil {
 			bad("--pod-network: %w", err)
+		}
+	}
+	if c.AppsZone != "" {
+		if err := pki.ValidateDomain(c.AppsZone); err != nil {
+			bad("--apps-zone: %w", err)
 		}
 	}
 	if c.DefaultImage == "" {
@@ -592,6 +618,25 @@ func (l *listValue) Set(v string) error {
 // prefixList is a flag of IP prefixes, comma-separated, repeatable.
 type prefixList []netip.Prefix
 
+// DefaultDenyPrefixes is --deny-prefix's built-in set, which a set given
+// replaces: the private, shared, link-local, loopback, "this network",
+// multicast and reserved IPv4 ranges. "default" in --deny-prefix stands
+// for it, so that a deployment adds its own networks to it (a shoot's pod
+// and service networks outside these ranges).
+func DefaultDenyPrefixes() []netip.Prefix {
+	return []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("192.168.0.0/16"),
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("169.254.0.0/16"),
+		netip.MustParsePrefix("127.0.0.0/8"),
+		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("224.0.0.0/4"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+	}
+}
+
 func (l *prefixList) String() string {
 	out := make([]string, len(*l))
 	for i, p := range *l {
@@ -603,6 +648,10 @@ func (l *prefixList) String() string {
 func (l *prefixList) Set(v string) error {
 	for _, s := range strings.Split(v, ",") {
 		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		if s == "default" {
+			*l = append(*l, DefaultDenyPrefixes()...)
 			continue
 		}
 		p, err := netip.ParsePrefix(s)

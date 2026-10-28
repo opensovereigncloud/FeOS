@@ -1,0 +1,17 @@
+{
+  "method": "PUT",
+  "path": "/api/v1/environments/expensa-stage/public",
+  "query": {},
+  "status": 200,
+  "request": {
+    "public": true
+  },
+  "response": {
+    "public": true,
+    "hosts": [
+      "expensa-stage-fecode.apps.fecode.dev"
+    ],
+    "rolling": true
+  },
+  "note": "the tenant's decision whether the ingress serves the environment without a route token; the first publish gives it its host and rolls its image services once (rolling); {\"public\": false} unpublishes, hosts then []; public is required (400)"
+}

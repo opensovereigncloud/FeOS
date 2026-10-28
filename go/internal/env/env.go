@@ -62,7 +62,11 @@ type Deps struct {
 	Sealer     Sealer
 	// Blueprint looks up an addon type.
 	Blueprint func(typ string) (addons.Blueprint, bool)
-	Log       *slog.Logger
+	// AppsZone is the DNS zone of public environments' default hosts
+	// (--apps-zone, ADR 0021); "": no hosts, and no environment can be
+	// made public.
+	AppsZone string
+	Log      *slog.Logger
 }
 
 // Service is the environments service of one instance.

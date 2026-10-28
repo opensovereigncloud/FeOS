@@ -320,6 +320,14 @@ The decision was taken as proposed above; building it changed these:
   left them to an ingress outside this ADR and ADR 0015 keeps inbound
   traffic out of the front doors: previews pass the port door already,
   and there is no ingress.
+- **Routes reach image services of public environments through the
+  ingress** (ADR 0021) beside the route door, which keeps requiring
+  route tokens. Routes to attached services reach them through the door
+  alone, and a plan's info finding says which. An environment becomes
+  public by `PUT /api/v1/environments/{env}/public`; its first publish
+  rolls its image services once, so that their pods name their ingress
+  groups. The `host` finding reads that the ingress and the door serve a
+  route on every host of its environment.
 - **An attached service is a supervised process** in the sandbox's main
   container, not a container added to the running pod: nothing is needed
   of the node or of ADR 0004 and ADR 0007.
@@ -454,7 +462,9 @@ The decision was taken as proposed above; building it changed these:
 
 - The ingress: a service of its own in front of the nodes or a role of
   `ferund`'s instances, hosts, ACME, the way in for IPv4 clients; until
-  then the route door serves HTTP with route tokens.
+  then the route door serves HTTP with route tokens. ADR 0021 decides
+  it, and its core serves public environments' image services at
+  default hosts; domains and ACME are later.
 - The revert route takes no annotations: it copies release K's and adds
   `ferun.revertOf`. A caller that marks its reverts, FeCode's autoRevert,
   applies K's spec through the releases route instead; whether revert

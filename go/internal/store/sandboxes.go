@@ -859,13 +859,16 @@ func idleOn(n int) string {
 // IdleSandboxes returns up to limit running sandboxes without an op on one
 // of nodes whose last_active_at is older than their idle interval (their
 // idle_after_s, or idle for a row without one; 0 never idles), that have
-// no live hold of any kind and that no failed idle pause backs off, the
+// no live hold of any kind, that no failed idle pause backs off and that
+// the ingress's fence does not keep awake (ingressFence: a service
+// instance of a public environment while an ingress may be cut off), the
 // least recently active first.
 func (s *Store) IdleSandboxes(ctx context.Context, idle time.Duration, nodes []string, limit int) ([]Sandbox, error) {
 	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
 		WHERE s.client_state = 'running' AND s.op = '' AND `+idleOn(1)+` AND s.last_active_at < now() - `+idleAfter(1)+`
 			AND s.node = ANY($2) AND `+policyDue(PolicyIdle)+`
 			AND NOT EXISTS (SELECT 1 FROM sandbox_holds h WHERE h.sandbox_id = s.id AND h.lease_until > now())
+			AND `+ingressFence+`
 		ORDER BY s.last_active_at LIMIT $3`, interval(idle), nonNil(nodes), limit))
 }
 

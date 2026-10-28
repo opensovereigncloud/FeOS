@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
 
+	"github.com/gardenlinux/feos/go/internal/ingress/wire"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/pki"
 )
@@ -26,8 +27,9 @@ import (
 // The ALPN protocols of the nodes' port. Anything else, none included, is
 // closed.
 const (
-	ALPNNode   = "feos-node/1" // a node connection: the node is the HTTP/2 server
-	ALPNUplink = "h2"          // the uplink and joins: the node is the client
+	ALPNNode    = "feos-node/1" // a node connection: the node is the HTTP/2 server
+	ALPNUplink  = "h2"          // the uplink and joins: the node is the client
+	ALPNIngress = wire.ALPN     // "ferun-ingress/1": a ferun-ingress instance is the client
 )
 
 // Limits of the accept path (§4 of the design).
@@ -36,6 +38,7 @@ const (
 	maxConcurrentChecks  = 32
 	maxJoinConns         = 64 // join and refusal connections together
 	maxUplinksPerNode    = 4
+	maxIngressPerName    = 4
 	defaultMaxStreams    = 1024
 	defaultDrainTimeout  = 20 * time.Minute
 )
@@ -72,7 +75,17 @@ type Config struct {
 	// OnNodeConn is called, in a goroutine of its own, when a node gets a
 	// current connection on this instance after having none.
 	OnNodeConn func(node string)
-	Log        *slog.Logger
+	// CheckIngress is asked about the certificate of a ferun-ingress
+	// connection at accept and at every RecheckIngress, never cached; nil
+	// closes every ingress connection that presents a certificate.
+	// revokeAt is the certificate's revocation time when it lies ahead
+	// (zero otherwise): the connection is closed then. An error wrapping
+	// ErrIngressRefused (see IngressRefusal) is definitive: at accept, its
+	// text is what every call on the connection is answered with
+	// (PERMISSION_DENIED); on a re-check it closes the connection. Any
+	// other error is transient.
+	CheckIngress func(ctx context.Context, name, serial, peerAddr string) (revokeAt time.Time, err error)
+	Log          *slog.Logger
 }
 
 // Server is an instance's nodes' port. It implements Conns.
@@ -85,6 +98,15 @@ type Server struct {
 
 	uplink, join, refusal          *grpc.Server
 	uplinkLis, joinLis, refusalLis *chanListener
+
+	// The servers of ferun-ingress/1 (ingress.go): ingress serves
+	// IngressService to registered and refused connections, ingressJoin
+	// its Join to connections without a certificate.
+	ingress, ingressJoin       *grpc.Server
+	ingressLis, ingressJoinLis *chanListener
+	// stopIngress, once set (StopIngress), closes every new ingress
+	// connection before any check.
+	stopIngress atomic.Bool
 
 	// The timings of §4, fields so that tests can shorten them.
 	handshakeTimeout  time.Duration // a TLS handshake
@@ -101,6 +123,7 @@ type Server struct {
 	idleTimeout       time.Duration // grpc.WithIdleTimeout of node connections: 0, never idle
 	clientKeepalive   keepalive.ClientParameters
 	maxUplinks        int
+	maxIngress        int // connections per ingress name
 
 	longBudget, toolBudget int
 
@@ -123,11 +146,16 @@ type Server struct {
 	shut     bool
 	sweeping bool
 	sweepDue bool
+	// ingresses is the registry of ingress connections, by name;
+	// ingressSeq numbers them (IngressPeer.Conn).
+	ingresses  map[string]*ingressName
+	ingressSeq uint64
 
 	// Counters of connections refused by the limits.
 	droppedHandshakes atomic.Int64
 	droppedJoins      atomic.Int64
 	droppedUplinks    atomic.Int64
+	droppedIngress    atomic.Int64
 }
 
 // New makes the nodes' port and binds its listener; Serve accepts.
@@ -162,7 +190,7 @@ func New(cfg Config) (*Server, error) {
 		lis: lis,
 		tlsConfig: &tls.Config{
 			MinVersion:             tls.VersionTLS13,
-			NextProtos:             []string{ALPNNode, ALPNUplink},
+			NextProtos:             []string{ALPNNode, ALPNUplink, ALPNIngress},
 			ClientAuth:             tls.VerifyClientCertIfGiven,
 			ClientCAs:              cfg.Bundle,
 			SessionTicketsDisabled: true,
@@ -184,6 +212,7 @@ func New(cfg Config) (*Server, error) {
 			Time: 10 * time.Second, Timeout: 5 * time.Second, PermitWithoutStream: true,
 		},
 		maxUplinks: maxUplinksPerNode,
+		maxIngress: maxIngressPerName,
 		longBudget: max(1, cfg.MaxStreams/2),
 		toolBudget: max(1, cfg.MaxStreams/4),
 		handshakes: make(chan struct{}, maxPendingHandshakes),
@@ -194,13 +223,18 @@ func New(cfg Config) (*Server, error) {
 		nodes:      map[string]*nodeState{},
 		gens:       map[string]uint64{},
 		subs:       map[*subscriber]struct{}{},
+		ingresses:  map[string]*ingressName{},
 	}
 	s.uplinkLis = newChanListener(lis.Addr())
 	s.joinLis = newChanListener(lis.Addr())
 	s.refusalLis = newChanListener(lis.Addr())
+	s.ingressLis = newChanListener(lis.Addr())
+	s.ingressJoinLis = newChanListener(lis.Addr())
 	s.uplink = s.newUplinkServer()
 	s.join = s.newJoinServer()
 	s.refusal = s.newRefusalServer()
+	s.ingress = s.newIngressServer()
+	s.ingressJoin = s.newIngressJoinServer()
 	return s, nil
 }
 
@@ -216,8 +250,8 @@ func (s *Server) Uplink() *grpc.Server { return s.uplink }
 func (s *Server) Join() *grpc.Server { return s.join }
 
 // Serve starts the port: it accepts connections and serves node
-// connections, uplinks and joins until Shutdown. It returns nil when ctx
-// ends or Shutdown is called, whichever comes first.
+// connections, uplinks, joins and ingress connections until Shutdown. It
+// returns nil when ctx ends or Shutdown is called, whichever comes first.
 //
 // The end of ctx stops nothing. A stopping instance stays listed to the
 // nodes until it deletes its row in step 5 of its shutdown (§7, §8): its
@@ -231,11 +265,13 @@ func (s *Server) Serve(ctx context.Context) error {
 		return errors.New("nodelink: Serve called twice or after Shutdown")
 	}
 	s.serving = true
-	s.wg.Add(4)
+	s.wg.Add(6)
 	s.mu.Unlock()
 	go func() { defer s.wg.Done(); _ = s.uplink.Serve(s.uplinkLis) }()
 	go func() { defer s.wg.Done(); _ = s.join.Serve(s.joinLis) }()
 	go func() { defer s.wg.Done(); _ = s.refusal.Serve(s.refusalLis) }()
+	go func() { defer s.wg.Done(); _ = s.ingress.Serve(s.ingressLis) }()
+	go func() { defer s.wg.Done(); _ = s.ingressJoin.Serve(s.ingressJoinLis) }()
 	accepting := make(chan struct{})
 	go func() {
 		defer s.wg.Done()
@@ -343,6 +379,8 @@ func (s *Server) handshake(c net.Conn) {
 		s.acceptNode(tc, state)
 	case ALPNUplink:
 		s.acceptH2(tc, state)
+	case ALPNIngress:
+		s.acceptIngress(tc, state)
 	default:
 		tc.Close()
 		s.rl.warn("alpn", "nodes' port: no known ALPN protocol; connection closed",
@@ -436,8 +474,9 @@ func (s *Server) acceptH2(tc *tls.Conn, state tls.ConnectionState) {
 	s.uplinkLis.hand(sc)
 }
 
-// handLimited hands a join or refusal connection to its server, within
-// the shared limit of 64 such connections, each closed after 60 s.
+// handLimited hands a join or refusal connection, of a node or of an
+// ingress, to its server, within the shared limit of 64 such connections,
+// each closed after 60 s.
 func (s *Server) handLimited(tc *tls.Conn, state tls.ConnectionState, lis *chanListener, refusal string) {
 	select {
 	case s.joinSlots <- struct{}{}:
@@ -470,17 +509,11 @@ func (s *Server) handLimited(tc *tls.Conn, state tls.ConnectionState, lis *chanL
 // passes is reported to OnPresented in the same slot: what an accept does
 // in the database stays within the limit, however fast a node redials.
 func (s *Server) check(ctx context.Context, node, serial, addr string, atAccept bool) (time.Time, error) {
-	t := time.NewTimer(s.checkWait)
-	select {
-	case s.checks <- struct{}{}:
-		t.Stop()
-	case <-t.C:
-		return time.Time{}, errors.New("too many node checks in flight")
-	case <-ctx.Done():
-		t.Stop()
-		return time.Time{}, ctx.Err()
+	release, err := s.checkSlot(ctx, "node")
+	if err != nil {
+		return time.Time{}, err
 	}
-	defer func() { <-s.checks }()
+	defer release()
 	cctx, cancel := context.WithTimeout(ctx, s.checkTimeout)
 	revokeAt, err := s.cfg.CheckNode(cctx, node, serial, addr, atAccept)
 	cancel()
@@ -488,6 +521,22 @@ func (s *Server) check(ctx context.Context, node, serial, addr string, atAccept 
 		s.cfg.OnPresented(node, serial, addr)
 	}
 	return revokeAt, err
+}
+
+// checkSlot takes one of the port's 32 check slots, which node and
+// ingress checks share, waiting at most checkWait; release gives it back.
+func (s *Server) checkSlot(ctx context.Context, kind string) (release func(), err error) {
+	t := time.NewTimer(s.checkWait)
+	select {
+	case s.checks <- struct{}{}:
+		t.Stop()
+		return func() { <-s.checks }, nil
+	case <-t.C:
+		return nil, fmt.Errorf("too many %s checks in flight", kind)
+	case <-ctx.Done():
+		t.Stop()
+		return nil, ctx.Err()
+	}
 }
 
 // definitive reports whether a CheckNode error refuses for good.
@@ -527,10 +576,10 @@ func refusalText(err error) string {
 	return text
 }
 
-// Shutdown closes the node connections at once, stops the uplink, join and
-// refusal servers (gracefully, then forcibly after 5 s or when ctx ends)
-// and closes the listener; it waits for the port's goroutines until ctx
-// ends.
+// Shutdown closes the node connections at once, stops the uplink, join,
+// refusal and both ingress servers (gracefully, then forcibly after 5 s or
+// when ctx ends), which closes the uplinks and ingress connections, and
+// closes the listener; it waits for the port's goroutines until ctx ends.
 func (s *Server) Shutdown(ctx context.Context) {
 	s.mu.Lock()
 	if s.shut {
@@ -547,13 +596,18 @@ func (s *Server) Shutdown(ctx context.Context) {
 			s.closeLinkLocked(l, "instance shutting down", &d)
 		}
 	}
+	for _, st := range s.ingresses {
+		if st.retry != nil {
+			st.retry.Stop()
+		}
+	}
 	s.mu.Unlock()
 	d.run()
 	s.lis.Close()
 	s.cancel()
 
 	var wg sync.WaitGroup
-	for _, g := range []*grpc.Server{s.uplink, s.join, s.refusal} {
+	for _, g := range []*grpc.Server{s.uplink, s.join, s.refusal, s.ingress, s.ingressJoin} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -576,6 +630,8 @@ func (s *Server) Shutdown(ctx context.Context) {
 	s.uplinkLis.Close()
 	s.joinLis.Close()
 	s.refusalLis.Close()
+	s.ingressLis.Close()
+	s.ingressJoinLis.Close()
 
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()

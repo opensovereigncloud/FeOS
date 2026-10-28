@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Once, for a shoot whose ferund ran on the StatefulSet postgres
+# (deploy/k3s/ferun/postgres.yaml): ferun-db of ../postgres.yaml, created
+# from a copy of postgres-0's database ferun (CloudNativePG's pg_dump and
+# pg_restore; README.md, Moving the database). ferund is stopped while it
+# runs: what it writes after the copy began is not in ferun-db.
+#
+#   make -C deploy/gardener apply-ferun-db-import
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../postgres.yaml
+patches:
+  - target:
+      kind: Cluster
+      name: ferun-db
+    patch: |-
+      - op: add
+        path: /spec/bootstrap/initdb/import
+        value:
+          type: microservice
+          databases: [ferun]
+          source:
+            externalCluster: statefulset
+      - op: add
+        path: /spec/externalClusters
+        value:
+          - name: statefulset
+            connectionParameters:
+              host: postgres.ferun.svc
+              user: ferun
+              dbname: ferun
+              sslmode: disable
+            password:
+              name: ferund-postgres
+              key: password

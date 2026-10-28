@@ -6,7 +6,9 @@ package store_test
 import (
 	"errors"
 	"testing"
+	"time"
 
+	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/podid"
 	"github.com/gardenlinux/feos/go/internal/store"
@@ -133,6 +135,87 @@ func TestTenantsAndTokens(t *testing.T) {
 	}
 	if ok, err := s.DeleteTenantToken(bg, "beta", tokB); err != nil || !ok {
 		t.Fatalf("revoke: %v %v", ok, err)
+	}
+}
+
+// Starting a tenant's deletion takes its environments out of the
+// ingress's table: MarkTenantDeleting sends ferun_ingress for each of
+// them, with its transaction's commit, and only when it starts the
+// deletion.
+func TestMarkTenantDeletingNotifiesIngress(t *testing.T) {
+	s, d := newStore(t)
+	mkTenant(t, s, "acme")
+	mkTenant(t, s, "beta")
+	web := mkEnv(t, s, "acme", "web")
+	api := mkEnv(t, s, "acme", "api")
+	other := mkEnv(t, s, "beta", "web")
+	ch, unsubscribe := d.Subscribe(db.ChanIngress)
+	defer unsubscribe()
+	// seen collects the payloads until every one of want arrived (5 s at
+	// most), then for 300 ms more.
+	seen := func(want ...string) map[string]bool {
+		t.Helper()
+		got := map[string]bool{}
+		missing := func() bool {
+			for _, w := range want {
+				if !got[w] {
+					return true
+				}
+			}
+			return false
+		}
+		deadline := time.After(5 * time.Second)
+		for missing() {
+			select {
+			case p := <-ch:
+				got[p] = true
+			case <-deadline:
+				t.Fatalf("payloads %v, want %v", got, want)
+			}
+		}
+		quiet := time.After(300 * time.Millisecond)
+		for {
+			select {
+			case p := <-ch:
+				got[p] = true
+			case <-quiet:
+				return got
+			}
+		}
+	}
+
+	errRollback := errors.New("rolled back")
+	if err := s.InTx(bg, func(tx *store.Store) error {
+		if _, err := tx.MarkTenantDeleting(bg, "acme"); err != nil {
+			return err
+		}
+		return errRollback
+	}); !errors.Is(err, errRollback) {
+		t.Fatal(err)
+	}
+	if got := seen(); len(got) != 0 {
+		t.Fatalf("a rolled back mark sent %v", got)
+	}
+
+	tx(t, s, func(tx *store.Store) error {
+		if _, err := tx.LockTenant(bg, "acme", store.ForUpdate); err != nil {
+			return err
+		}
+		ok, err := tx.MarkTenantDeleting(bg, "acme")
+		if err == nil && !ok {
+			t.Error("mark deleting: no tenant")
+		}
+		return err
+	})
+	if got := seen(ingressEnv(web.ID), ingressEnv(api.ID)); len(got) != 2 || got[ingressEnv(other.ID)] {
+		t.Fatalf("payloads %v", got)
+	}
+	// Marked again: deleting_at stays, and nothing is sent.
+	if ok, err := s.MarkTenantDeleting(bg, "acme"); err != nil || !ok {
+		t.Fatalf("mark again: %v %v", ok, err)
+	}
+	if got := seen(); len(got) != 0 {
+		t.Fatalf("a second mark sent %v", got)
 	}
 }
 

@@ -38,7 +38,9 @@ const (
 // joinMesh is JoinMesh (ADR 0017): the node, named by its certificate,
 // which must pass CheckNode's conditions, gets its /64 of the cluster's
 // ULA, the next subnet ID at its first call and the same one after it, and
-// its key and endpoint make it a peer of the others. In a routed cluster
+// its key and endpoint make it a peer of the others. A key of small order
+// is INVALID_ARGUMENT, a new key that another node or an ingress holds
+// FAILED_PRECONDITION (store.ErrMeshKeyTaken). In a routed cluster
 // the answer is empty; a request without a key, from a node with a prefix
 // of its network's, gets the ULA alone.
 func (s *Service) joinMesh(ctx context.Context, req *fleetv1.JoinMeshRequest) (*fleetv1.JoinMeshResponse, error) {
@@ -51,6 +53,9 @@ func (s *Service) joinMesh(ctx context.Context, req *fleetv1.JoinMeshRequest) (*
 	if len(key) > 0 {
 		if len(key) != mesh.KeyLen {
 			return nil, status.Errorf(codes.InvalidArgument, "public_key has %d bytes, not %d", len(key), mesh.KeyLen)
+		}
+		if err := mesh.CheckKey(key); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "public_key: %v", err)
 		}
 		if endpoint, err = mesh.CheckEndpoint(req.GetEndpoint()); err != nil {
 			return nil, status.Error(codes.InvalidArgument, activity.Clean(err.Error()))
@@ -87,6 +92,10 @@ func (s *Service) joinMesh(ctx context.Context, req *fleetv1.JoinMeshRequest) (*
 		s.log.Error("a node cannot join the pods' mesh: every /64 of it has been handed out", "node", p.Node,
 			"pod_network", ula.String())
 		return nil, status.Errorf(codes.ResourceExhausted, "every /64 of the pod network %s has been handed out", ula)
+	}
+	if errors.Is(err, store.ErrMeshKeyTaken) {
+		s.rl.warn("mesh-key", "JoinMesh refused: the node's key is another peer's", "node", p.Node)
+		return nil, status.Errorf(codes.FailedPrecondition, "the mesh key of node %s is another peer's; make a new one", p.Node)
 	}
 	if err != nil {
 		if st, ok := status.FromError(err); ok && st.Code() != codes.Unavailable {

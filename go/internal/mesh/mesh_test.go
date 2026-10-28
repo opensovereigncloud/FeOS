@@ -4,6 +4,10 @@
 package mesh
 
 import (
+	"bytes"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/hex"
 	"net/netip"
 	"reflect"
 	"testing"
@@ -28,6 +32,54 @@ func TestDraw(t *testing.T) {
 	}
 }
 
+// CheckKey refuses keys of the wrong length and every point of small
+// order, in its canonical form and with the top bit set (libsodium's
+// list), and takes real keys.
+func TestCheckKey(t *testing.T) {
+	t.Parallel()
+	small := []string{
+		"0000000000000000000000000000000000000000000000000000000000000000",
+		"0100000000000000000000000000000000000000000000000000000000000000",
+		"e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+		"5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+		"ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+		"edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+		"eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+	}
+	for _, h := range small {
+		k, err := hex.DecodeString(h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckKey(k); err == nil {
+			t.Errorf("CheckKey(%s) took a point of small order", h)
+		}
+		k[31] |= 0x80
+		if err := CheckKey(k); err == nil {
+			t.Errorf("CheckKey(%x) took a point of small order", k)
+		}
+	}
+	for range 16 {
+		priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckKey(priv.PublicKey().Bytes()); err != nil {
+			t.Fatalf("a real key: %v", err)
+		}
+	}
+	for _, b := range []byte{1, 2, 7, 9} {
+		if err := CheckKey(bytes.Repeat([]byte{b}, KeyLen)); err != nil {
+			t.Errorf("32 bytes of %d: %v", b, err)
+		}
+	}
+	for _, k := range [][]byte{nil, make([]byte, 31), bytes.Repeat([]byte{1}, 33)} {
+		if err := CheckKey(k); err == nil {
+			t.Errorf("CheckKey took %d bytes", len(k))
+		}
+	}
+}
+
 func TestNodePrefix(t *testing.T) {
 	t.Parallel()
 	ula := netip.MustParsePrefix("fd5e:1b2c:93a0::/48")
@@ -37,6 +89,41 @@ func TestNodePrefix(t *testing.T) {
 	} {
 		if got := NodePrefix(ula, subnet).String(); got != want {
 			t.Errorf("subnet %d: %s, want %s", subnet, got, want)
+		}
+	}
+}
+
+// An ingress instance's address is <prefix>::1 of its /64, whatever host
+// bits the prefix carries.
+func TestHostAddress(t *testing.T) {
+	t.Parallel()
+	ula := netip.MustParsePrefix("fd5e:1b2c:93a0::/48")
+	for in, want := range map[netip.Prefix]string{
+		NodePrefix(ula, 7):                                  "fd5e:1b2c:93a0:7::1",
+		NodePrefix(ula, 65535):                              "fd5e:1b2c:93a0:ffff::1",
+		netip.MustParsePrefix("fd5e:1b2c:93a0:12::/64"):     "fd5e:1b2c:93a0:12::1",
+		netip.MustParsePrefix("fd5e:1b2c:93a0:12:ab::9/64"): "fd5e:1b2c:93a0:12::1",
+		netip.MustParsePrefix("10.20.30.40/24"):             "10.20.30.1",
+	} {
+		got := HostAddress(in)
+		if got.String() != want || !in.Contains(got) {
+			t.Errorf("%v: %v, want %s", in, got, want)
+		}
+	}
+	if got := HostAddress(netip.Prefix{}); got.IsValid() {
+		t.Errorf("the zero prefix: %v", got)
+	}
+}
+
+// An ingress instance's key among the peers never collides with a node's.
+func TestIngressPeerName(t *testing.T) {
+	t.Parallel()
+	if got := IngressPeerName("in-1"); got != "ingress.in-1" || !IsIngressPeer(got) {
+		t.Fatalf("%q", got)
+	}
+	for _, node := range []string{"node1", "ingress", "ingress-1", "ingressa", ""} {
+		if IsIngressPeer(node) {
+			t.Errorf("node %q is taken for an ingress", node)
 		}
 	}
 }

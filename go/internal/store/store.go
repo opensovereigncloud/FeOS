@@ -5,7 +5,10 @@
 // file per domain (sandboxes, tenants, tokens, nodes, telemetry, node
 // certificates, join tokens, leases, instances, holds, bookings,
 // placements, tombstones, node events, activity, traffic, issued
-// certificates, watches, bindings, cluster secrets, and the environments'
+// certificates, watches, bindings, cluster secrets, the keyed tool calls
+// in tool_calls.go, the ingress's instances in ingresses.go, its holds in
+// ingress_holds.go, the apps zone's host labels in host_labels.go, the
+// ingress's routing table in ingress_table.go, and the environments'
 // tables in env_*.go). A Store runs either on the pool or inside one
 // transaction (InTx); its methods never begin a transaction of their own
 // unless they say so.
@@ -16,8 +19,18 @@
 // ferun_sandbox with the id (or "*" for more than 256 rows); a node's
 // supersession, re-join, removal, fork, new start, stopping_until or
 // draining sends ferun_node; a watch's new paths, owner, result or deletion
-// sends ferun_watch. Other notifications (ferun_leader, ferun_reconcile,
-// ferun_cancel) are the callers'.
+// sends ferun_watch; the tool_calls.go writers that end a call (done,
+// interrupted, not_run) send ferun_call with the call's id; the writes the
+// ingress's table follows send ferun_ingress: "env:<id>" (or "*" for more
+// than 256 environments) for an environment's publicity, host label,
+// releases and deletion (env_environments.go), its service instances and
+// their admitted ports (env_instances.go) and its tenant's deletion
+// (tenants.go); "ingress:<name>" for an ingress instance's re-join,
+// removal, mesh join and certificates (ingresses.go); "mesh" for every
+// change of the mesh's peers, a node's or an ingress's (bumpMeshPeers in
+// mesh.go); and "*" for a node's version of the ingress's peer group, and
+// its re-join while it held one (nodes.go). Other notifications
+// (ferun_leader, ferun_reconcile, ferun_cancel) are the callers'.
 //
 // Every time a decision depends on is taken from the database clock
 // (now()). Within a transaction now() is the transaction's start time, so
@@ -58,6 +71,7 @@ const (
 	chanSandbox = db.ChanSandbox
 	chanNode    = db.ChanNode
 	chanWatch   = db.ChanWatch
+	chanCall    = db.ChanCall
 )
 
 // notifyBatch is the most rows one transaction names one by one; a writer
@@ -166,6 +180,23 @@ func (s *Store) notifySandboxes(ctx context.Context, ids []podid.ID) error {
 	}
 	for _, id := range ids {
 		if err := s.Notify(ctx, chanSandbox, id.String()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// notifyCalls sends ferun_call for each tool call id, or "*" for more than
+// notifyBatch ids.
+func (s *Store) notifyCalls(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) > notifyBatch {
+		return s.Notify(ctx, chanCall, "*")
+	}
+	for _, id := range ids {
+		if err := s.Notify(ctx, chanCall, id.String()); err != nil {
 			return err
 		}
 	}

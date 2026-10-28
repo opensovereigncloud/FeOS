@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -51,12 +52,16 @@ type EnvInstance struct {
 	Detail          string
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+	// IngressPorts are the TCP ports, ascending, that the instance's group
+	// ing-<sandbox id> opens to the ingress as last put on or listed by its
+	// node (SetIngressPorts; never written by UpdateEnvInstance).
+	IngressPorts []int
 }
 
 func envInstanceColumns(p string) string {
 	cols := []string{"sandbox_id", "env_id", "kind", "object", "replica", "template_hash", "release", "phase",
 		"ready_since", "retire_at", "restarts", "last_exit", "probe_failures", "next_restart_at", "exits",
-		"provisioned_hash", "detail", "created_at", "updated_at"}
+		"provisioned_hash", "detail", "created_at", "updated_at", "ingress_ports"}
 	return prefixed(p, cols)
 }
 
@@ -79,9 +84,9 @@ func envInstanceTargets(i *EnvInstance) ([]any, func()) {
 	var ready, retire, next *time.Time
 	return []any{&i.SandboxID, &i.EnvID, &i.Kind, &i.Object, &i.Replica, &i.TemplateHash, &i.Release, &i.Phase,
 			&ready, &retire, &i.Restarts, &i.LastExit, &i.ProbeFailures, &next, &i.Exits,
-			&i.ProvisionedHash, &i.Detail, &i.CreatedAt, &i.UpdatedAt}, func() {
+			&i.ProvisionedHash, &i.Detail, &i.CreatedAt, &i.UpdatedAt, &i.IngressPorts}, func() {
 			i.ReadySince, i.RetireAt, i.NextRestartAt = timeOf(ready), timeOf(retire), timeOf(next)
-			i.Exits = nonNil(i.Exits)
+			i.Exits, i.IngressPorts = nonNil(i.Exits), nonNil(i.IngressPorts)
 		}
 }
 
@@ -103,8 +108,9 @@ func collectEnvInstances(rows pgx.Rows, err error) ([]EnvInstance, error) {
 }
 
 // InsertEnvInstance inserts the controller's row of an instance row of
-// sandboxes, which must exist (else ErrNoRow); phase starting when empty.
-// One that exists is ErrExists.
+// sandboxes, which must exist (else ErrNoRow); phase starting when empty;
+// ingress_ports empty. One that exists is ErrExists. A service's sends
+// ferun_ingress "env:<env id>".
 func (s *Store) InsertEnvInstance(ctx context.Context, i EnvInstance) (EnvInstance, error) {
 	if i.Phase == "" {
 		i.Phase = model.PhaseStarting
@@ -123,6 +129,9 @@ func (s *Store) InsertEnvInstance(ctx context.Context, i EnvInstance) (EnvInstan
 		i.ProvisionedHash, i.Detail))
 	if err != nil {
 		return EnvInstance{}, insertError("insert instance "+i.SandboxID.String(), err)
+	}
+	if err := s.notifyIngressInstance(ctx, out.EnvID, out.Kind); err != nil {
+		return EnvInstance{}, fmt.Errorf("insert instance %s: %w", i.SandboxID, err)
 	}
 	return out, nil
 }
@@ -182,13 +191,16 @@ func (s *Store) ListEnvInstanceRows(ctx context.Context, envID uuid.UUID) ([]Env
 // the row as the caller read it (normally locked FOR UPDATE): release,
 // phase, ready_since, retire_at, restarts, last_exit, probe_failures,
 // next_restart_at, exits, provisioned_hash and detail;
-// updated_at = now(). The fixed columns are refused. When nothing
-// differs, before is returned unwritten.
+// updated_at = now(). The fixed columns and ingress_ports
+// (SetIngressPorts) are refused. When nothing differs, before is returned
+// unwritten. A service's write of phase or release sends ferun_ingress
+// "env:<env id>".
 func (s *Store) UpdateEnvInstance(ctx context.Context, before, after EnvInstance) (EnvInstance, error) {
 	what := "instance " + before.SandboxID.String()
 	if err := fixed(what, map[string]bool{"sandbox_id": before.SandboxID != after.SandboxID,
 		"env_id": before.EnvID != after.EnvID, "kind": before.Kind != after.Kind, "object": before.Object != after.Object,
-		"replica": before.Replica != after.Replica, "template_hash": before.TemplateHash != after.TemplateHash}); err != nil {
+		"replica": before.Replica != after.Replica, "template_hash": before.TemplateHash != after.TemplateHash,
+		"ingress_ports": !slices.Equal(before.IngressPorts, after.IngressPorts)}); err != nil {
 		return EnvInstance{}, err
 	}
 	u := newUpdates(before.SandboxID)
@@ -213,6 +225,11 @@ func (s *Store) UpdateEnvInstance(ctx context.Context, before, after EnvInstance
 	if err != nil {
 		return EnvInstance{}, fmt.Errorf("update %s: %w", what, noRow(err, ErrNoRow))
 	}
+	if before.Phase != after.Phase || before.Release != after.Release {
+		if err := s.notifyIngressInstance(ctx, i.EnvID, i.Kind); err != nil {
+			return EnvInstance{}, fmt.Errorf("update %s: %w", what, err)
+		}
+	}
 	return i, nil
 }
 
@@ -221,8 +238,51 @@ func sameExits(a, b []EnvExit) bool {
 }
 
 // DeleteEnvInstance removes the controller's row of an instance (the
-// sandbox row's deletion does so too) and reports whether it was there.
+// sandbox row's deletion does so too, whose ferun_sandbox the ingress's
+// table follows) and reports whether it was there. A service's sends
+// ferun_ingress "env:<env id>".
 func (s *Store) DeleteEnvInstance(ctx context.Context, sandboxID podid.ID) (bool, error) {
-	ct, err := s.q.Exec(ctx, "DELETE FROM env_instances WHERE sandbox_id = $1", sandboxID)
-	return ct.RowsAffected() > 0, err
+	var envID uuid.UUID
+	var kind string
+	err := s.q.QueryRow(ctx, "DELETE FROM env_instances WHERE sandbox_id = $1 RETURNING env_id, kind", sandboxID).
+		Scan(&envID, &kind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, s.notifyIngressInstance(ctx, envID, kind)
+}
+
+// SetIngressPorts records the ports the instance's group ing-<sandbox id>
+// opens to the ingress, as put on or listed by its node: sorted and
+// without duplicates, written only when they differ, with ferun_ingress
+// "env:<env id>". It reports whether it wrote; false too for an instance
+// without a row.
+func (s *Store) SetIngressPorts(ctx context.Context, id podid.ID, ports []int) (bool, error) {
+	ports = slices.Compact(slices.Sorted(slices.Values(ports)))
+	var envID uuid.UUID
+	err := s.q.QueryRow(ctx, `UPDATE env_instances SET ingress_ports = $2::integer[]
+		WHERE sandbox_id = $1 AND ingress_ports IS DISTINCT FROM $2::integer[] RETURNING env_id`, id, nonNil(ports)).Scan(&envID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("set the ingress ports of instance %s: %w", id, err)
+	}
+	if err := s.notifyIngressEnvs(ctx, []uuid.UUID{envID}); err != nil {
+		return false, fmt.Errorf("set the ingress ports of instance %s: %w", id, err)
+	}
+	return true, nil
+}
+
+// notifyIngressInstance sends ferun_ingress "env:<env id>" for a write of
+// an instance of kind, when it is a service: the only kind the ingress's
+// table reads.
+func (s *Store) notifyIngressInstance(ctx context.Context, envID uuid.UUID, kind string) error {
+	if kind != "service" {
+		return nil
+	}
+	return s.notifyIngressEnvs(ctx, []uuid.UUID{envID})
 }

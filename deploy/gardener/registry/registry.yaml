@@ -14,7 +14,8 @@
 #                    http.secret, which must be the same for every replica
 #                    (an upload's state is signed with it), http.debug.addr
 #                    :5001 (the probes' /debug/health) and auth.htpasswd
-#                    with the path /auth/htpasswd
+#                    with the path /auth/htpasswd; http.draintimeout comes
+#                    from the Deployment (REGISTRY_HTTP_DRAINTIMEOUT)
 #   registry-auth    htpasswd: the users who pull and push, bcrypt
 apiVersion: v1
 kind: Namespace
@@ -28,6 +29,11 @@ metadata:
   namespace: registry
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: registry
@@ -36,6 +42,21 @@ spec:
       labels:
         app: registry
     spec:
+      # 5 s for the balancer to stop sending (preStop), then
+      # http.draintimeout (30 s) for the requests in flight.
+      terminationGracePeriodSeconds: 45
+      # The replicas on different workers (maxSkew 1); cordoned or
+      # unreachable workers do not count.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app: registry
+          matchLabelKeys:
+            - pod-template-hash
       containers:
         - name: registry
           image: distribution/distribution:3.0.0
@@ -43,6 +64,9 @@ spec:
           env:
             - name: OTEL_SDK_DISABLED
               value: "true"
+            # http.draintimeout: requests in flight finish after SIGTERM.
+            - name: REGISTRY_HTTP_DRAINTIMEOUT
+              value: 30s
           ports:
             - name: http
               containerPort: 5000
@@ -58,6 +82,10 @@ spec:
               path: /debug/health
               port: debug
             periodSeconds: 30
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           resources:
             requests: { cpu: 25m, memory: 64Mi }
             limits: { memory: 512Mi }
@@ -81,6 +109,18 @@ spec:
             items:
               - key: htpasswd
                 path: htpasswd
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: registry
+  namespace: registry
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app: registry
 ---
 apiVersion: v1
 kind: Service

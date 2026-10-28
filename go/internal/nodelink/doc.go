@@ -14,8 +14,14 @@
 //   - "h2" without a certificate goes to the join server, which serves only
 //     Join; "h2" whose certificate is definitively refused goes to the
 //     refusal server, which tells the node to join again.
+//   - "ferun-ingress/1" is a ferun-ingress instance (ADR 0021), speaking
+//     IngressService in JSON: with its certificate to the ingress server,
+//     where a definitively refused one has every call answered with the
+//     refusal; without one to the ingress join server, which serves only
+//     Join.
 //
 // Every connection with a certificate is checked against the database
-// through Config.CheckNode at accept and on every re-check, never from a
-// cache, and is closed when its certificate expires or is revoked.
+// through Config.CheckNode (Config.CheckIngress for an ingress) at accept
+// and on every re-check, never from a cache, and is closed when its
+// certificate expires or is revoked.
 package nodelink

@@ -147,6 +147,8 @@ func (h *harness) addInstance(id string, mod ...func(*Config)) *instance {
 	in.eng.t.deferredEvery = 500 * time.Millisecond
 	// The tests look for orphaned ops themselves (Engine.orphans).
 	in.eng.t.orphanEvery = time.Hour
+	// The tests call the loops directly; TestLoopsWaitAfterOutage covers the guard.
+	in.eng.t.outageGuard = 0
 	in.fl = fleet.New(fleet.Config{InstanceID: id, TrustDomain: testTD, RolloutGrace: 30 * time.Second,
 		NodeTTL: time.Hour, ConnDrainTimeout: time.Minute, Log: log},
 		fleet.Deps{DB: h.d, Issuer: h.iss, Links: srv, Hooks: in.eng, Elector: in.el})

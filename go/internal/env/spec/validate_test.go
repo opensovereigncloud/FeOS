@@ -485,6 +485,112 @@ func TestValidateRules(t *testing.T) {
 	}
 }
 
+// fakeIngressVC also says the environment's default host (IngressHost).
+type fakeIngressVC struct {
+	fakeVC
+	host       string
+	public, ok bool
+}
+
+func (f fakeIngressVC) IngressHost() (string, bool, bool) { return f.host, f.public, f.ok }
+
+// Which doors serve a route: info findings at the route while the
+// platform has an apps zone, for each route whose target exists; none
+// without a zone, or from a context that does not say. A stored host is
+// noted either way.
+func TestValidateRouteDoors(t *testing.T) {
+	routes := func(s *Spec) {
+		s.Services["approval-service"] = Service{Image: "ghcr.io/acme/approval:1.2", Ports: []Port{{Name: "http", Port: 8080}}}
+		s.Routes["approval"] = Route{Path: "/api/approval/", Service: "approval-service", Port: PortRef{Name: "http"},
+			Host: "approval.example.com"}
+		s.Routes["nope"] = Route{Path: "/nope", Service: "nope", Port: PortRef{Name: "http"}}
+	}
+	const (
+		host     = "stage-acme.apps.test"
+		attached = "served by the route door alone: an attached service runs in a sandbox, which the ingress does not reach"
+		later    = "served by the route door; the ingress serves it once the environment is public"
+		both     = "served by the ingress and by the route door"
+	)
+	stored := i("routes.approval.host", "host is stored, not realised yet: the ingress and the route door serve the route "+
+		"on every host of the environment")
+	nope := e("routes.nope.service", `no service "nope"`)
+	cases := []struct {
+		name string
+		vc   ValidateContext
+		want []expect
+	}{
+		{"no zone", fakeIngressVC{fakeVC: defaultVC(ModePlan), host: host, public: true}, []expect{stored, nope}},
+		{"no IngressHost", defaultVC(ModePlan), []expect{stored, nope}},
+		{"public with host", fakeIngressVC{fakeVC: defaultVC(ModePlan), host: host, public: true, ok: true}, []expect{
+			i("routes.api-expense", "served by the ingress at https://stage-acme.apps.test/api/expense and by the route door"),
+			i("routes.approval", "served by the ingress at https://stage-acme.apps.test/api/approval and by the route door"),
+			stored, nope, i("routes.root", attached)}},
+		{"public without host", fakeIngressVC{fakeVC: defaultVC(ModeApply), public: true, ok: true}, []expect{
+			i("routes.api-expense", both), i("routes.approval", both), stored, nope, i("routes.root", attached)}},
+		{"not public", fakeIngressVC{fakeVC: defaultVC(ModePlan), host: host, ok: true}, []expect{
+			i("routes.api-expense", later), i("routes.approval", later), stored, nope, i("routes.root", attached)}},
+		{"without an environment", fakeIngressVC{fakeVC: defaultVC(ModeSpec), ok: true}, []expect{
+			i("routes.api-expense", later), i("routes.approval", later), stored, nope, i("routes.root", attached)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			checkFindings(t, validateMutated(t, c.vc, nil, routes), c.want)
+		})
+	}
+	// The finding names the URL in full.
+	fs := validateMutated(t, fakeIngressVC{fakeVC: defaultVC(ModePlan), host: host, public: true, ok: true}, nil, routes)
+	if fs[0].Problem != "served by the ingress at https://stage-acme.apps.test/api/expense and by the route door" ||
+		fs[0].Remedy != "" {
+		t.Fatalf("finding %+v", fs[0])
+	}
+}
+
+// F13: a route's path has at most MaxRoutePathBytes, since every
+// instance of the ingress holds it. A longer one is refused with its
+// length alone, whatever else is wrong with it: it is neither quoted nor
+// compared with the other routes' paths, nor said to be served.
+func TestValidateRoutePathLength(t *testing.T) {
+	approval := func(s *Spec) {
+		s.Services["approval-service"] = Service{Image: "ghcr.io/acme/approval:1.2", Ports: []Port{{Name: "http", Port: 8080}}}
+	}
+	route := func(path string) Route {
+		return Route{Path: path, Service: "expense-service", Port: PortRef{Name: "http"}}
+	}
+	longest := "/" + strings.Repeat("a", MaxRoutePathBytes-1)
+	// The attack's path: '&' passes the characters' check, and HTML
+	// escaping made it six bytes on the wire.
+	attack := "/" + strings.Repeat("&", 8130) + "123"
+	fs := validateMutated(t, defaultVC(ModeApply), nil, func(s *Spec) {
+		approval(s)
+		s.Routes["longest"] = route(longest)
+		s.Routes["long"] = route(longest + "b")
+		s.Routes["twin"] = route(longest + "b")
+		s.Routes["attack"] = route(attack)
+		s.Routes["bad"] = route(strings.Repeat("?", MaxRoutePathBytes+1))
+	})
+	tooLong := func(n int) string {
+		return fmt.Sprintf("the path has %d bytes; at most %d are allowed", n, MaxRoutePathBytes)
+	}
+	checkFindings(t, fs, []expect{e("routes.attack.path", tooLong(len(attack))), e("routes.bad.path", tooLong(MaxRoutePathBytes+1)),
+		e("routes.long.path", tooLong(MaxRoutePathBytes+1)), e("routes.twin.path", tooLong(MaxRoutePathBytes+1))})
+	for _, f := range fs {
+		if len(f.Problem)+len(f.Remedy) > 200 {
+			t.Errorf("finding of %d bytes: %.80s…", len(f.Problem)+len(f.Remedy), f.Problem)
+		}
+	}
+
+	vc := fakeIngressVC{fakeVC: defaultVC(ModeApply), host: "stage-acme.apps.test", public: true, ok: true}
+	fs = validateMutated(t, vc, nil, func(s *Spec) {
+		approval(s)
+		s.Routes["long"] = route(longest + "b")
+	})
+	for _, f := range fs {
+		if f.Path == "routes.long" {
+			t.Errorf("a refused path is said to be served: %.80s…", f.Problem)
+		}
+	}
+}
+
 func TestValidateContextDependent(t *testing.T) {
 	approval := func(s *Spec) {
 		s.Services["approval-service"] = Service{Image: "ghcr.io/acme/approval:1.2", Ports: []Port{{Name: "http", Port: 8080}}}

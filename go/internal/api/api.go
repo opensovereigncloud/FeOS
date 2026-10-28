@@ -47,6 +47,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/config"
 	"github.com/gardenlinux/feos/go/internal/db"
 	envs "github.com/gardenlinux/feos/go/internal/env"
+	ingresssvc "github.com/gardenlinux/feos/go/internal/ingress/service"
 	"github.com/gardenlinux/feos/go/internal/leader"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/nodelink"
@@ -121,7 +122,17 @@ type Environments interface {
 	RunJob(ctx context.Context, tenant, envRef, name string) error
 	CreateRouteToken(ctx context.Context, tenant, envRef string) (envs.RouteToken, error)
 	RevokeRouteTokens(ctx context.Context, tenant, envRef string) error
+	SetPublic(ctx context.Context, tenant, envRef string, public bool) (envs.PublicAnswer, error)
 	ServeRoute(w http.ResponseWriter, r *http.Request)
+}
+
+// Ingress is the ingress's identity service (*ingress/service.Service,
+// ADR 0021) as the admin API uses it: join tokens of kind ingress, the
+// ingress instances, their removal. nil: those answer 503.
+type Ingress interface {
+	IssueJoinToken(ctx context.Context, createdBy, name string, ttl time.Duration) (uuid.UUID, string, time.Time, error)
+	ListIngresses(ctx context.Context) ([]ingresssvc.IngressInfo, error)
+	RemoveIngress(ctx context.Context, name string) (bool, error)
 }
 
 // Config is the API's part of the instance's configuration.
@@ -192,6 +203,9 @@ type Deps struct {
 	// Environments serves the environment routes; nil: none are
 	// registered.
 	Environments Environments
+	// Ingress issues join tokens of kind ingress and serves the ingress
+	// instances' admin routes; nil: they answer 503.
+	Ingress Ingress
 	// UI is the built management UI; nil: none.
 	UI fs.FS
 	// Ready is /readyz (§11): server's check of the database, stopping,
@@ -330,9 +344,10 @@ func (s *server) routes() []route {
 	}
 	public := func(pattern string, h http.Handler) { add(classPublic, pattern, h) }
 
-	// Operators: tenants, the node fleet, join tokens, the instances and
-	// the activity log. Nobody's tenant: the activity log carries full
-	// tool params and outputs, and a drain takes capacity from everyone.
+	// Operators: tenants, the node fleet, join tokens, the ingress's
+	// instances, the instances and the activity log. Nobody's tenant: the
+	// activity log carries full tool params and outputs, and a drain takes
+	// capacity from everyone.
 	admin("GET /api/v1/admin/tenants", s.listTenants)
 	admin("POST /api/v1/admin/tenants", s.createTenant)
 	admin("DELETE /api/v1/admin/tenants/{tenant}", s.deleteTenant)
@@ -350,6 +365,8 @@ func (s *server) routes() []route {
 	admin("POST /api/v1/admin/join-tokens", s.createJoinToken)
 	admin("GET /api/v1/admin/join-tokens", s.listJoinTokens)
 	admin("DELETE /api/v1/admin/join-tokens/{id}", s.revokeJoinToken)
+	admin("GET /api/v1/admin/ingresses", s.listIngresses)
+	admin("DELETE /api/v1/admin/ingresses/{name}", s.removeIngress)
 	admin("GET /api/v1/admin/instances", s.listInstances)
 
 	// Tenants: the sandbox as a thing one owns, and the tokens that reach
@@ -367,7 +384,8 @@ func (s *server) routes() []route {
 	tenant("GET /api/v1/sandboxes/{id}/access", s.access)
 
 	// The sandbox's own token: the tool baseline over REST. Each route
-	// makes the same tools.Runner.Call that MCP makes.
+	// makes the same tools.Runner call that MCP makes, with the call's id
+	// from the Idempotency-Key header.
 	t := s.deps.Tools
 	sandboxHTTP("POST /api/v1/sandboxes/{id}/exec", toolRoute(t, (*tools.REST).Exec))
 	sandboxHTTP("GET /api/v1/sandboxes/{id}/files/{path...}", toolRoute(t, (*tools.REST).ReadFile))
@@ -380,6 +398,10 @@ func (s *server) routes() []route {
 	sandboxHTTP("POST /api/v1/sandboxes/{id}/processes", toolRoute(t, (*tools.REST).StartProcess))
 	sandboxHTTP("GET /api/v1/sandboxes/{id}/processes/{pid}/logs", toolRoute(t, (*tools.REST).ProcessLogs))
 	sandboxHTTP("DELETE /api/v1/sandboxes/{id}/processes/{pid}", toolRoute(t, (*tools.REST).StopProcess))
+	// The record of a call with an id, and its cancel (ADR 0023): neither
+	// runs anything in the sandbox.
+	sandboxHTTP("GET /api/v1/sandboxes/{id}/calls/{key}", toolRoute(t, (*tools.REST).Call))
+	sandboxHTTP("DELETE /api/v1/sandboxes/{id}/calls/{key}", toolRoute(t, (*tools.REST).CancelCall))
 
 	// Watches, same class; none of it wakes or holds the sandbox.
 	w := s.deps.Watches

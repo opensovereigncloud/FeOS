@@ -1,0 +1,137 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ferund's PostgreSQL on the Gardener shoot: a CloudNativePG cluster (the
+# operator, 1.30 or newer, runs in the shoot: README.md) of three
+# instances, one on each of the shoot's three workers. It replicates
+# synchronously, so that a failover loses no commit ferund acknowledged
+# (docs/architecture/control-plane.md, Requirements):
+#   - one of the two standbys acknowledges every commit (ANY 1), and a
+#     commit waits until one has (dataDurability: required). A lost
+#     worker leaves a primary and a synchronous standby: writes go on,
+#     and no acknowledged commit is lost. Only with both standbys gone,
+#     or neither streaming, does a commit wait, for a standby or for
+#     ferund's statement_timeout (30 s), which ends the wait with the
+#     commit on the primary alone; nothing is promoted then;
+#   - a standby counts as promotable once it streams (startup and
+#     readiness probes of type streaming) and stops counting after about
+#     90 s without: longer than a lost worker takes to be noticed (40-55
+#     s), so that both standbys are still ready when the primary's worker
+#     is lost;
+#   - failoverQuorum: a standby is promoted only when the ready ones are
+#     sure to include one that acknowledged every commit: with two
+#     standbys and ANY 1, when both are ready. After a standby's worker
+#     was lost, the primary's loss waits for an instance to come back, or
+#     for a person (kubectl cnpg promote, after checking what the standby
+#     received);
+#   - an isolated primary (neither the API server nor a standby
+#     reachable) fails its liveness within about 15 s and stops, before
+#     ferund's statement_timeout (30 s) could end a commit's wait for a
+#     standby and report the commit done;
+#   - TCP keepalives: a client that vanished (its machine lost) is noticed
+#     within about 20 s, and the locks it held are freed.
+# The anti-affinity is required: a lost worker's instance comes back only
+# on a worker without one, on three workers the one that replaces it
+# (README.md, A lost worker), and on fewer workers than instances one
+# stays pending.
+# CloudNativePG keeps the owner ferun's password in the secret
+# ferun-db-app; kustomization.yaml hands it to ferund as PGPASSWORD.
+# A shoot whose ferund ran on the StatefulSet postgres creates this
+# cluster from a copy of that database first (import/, README.md).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: ferun-db
+  namespace: ferun
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.6
+  # An update restarts the standbys first, one at a time, then switches
+  # over to one of them.
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+  # A switchover's fast shutdown; a commit ferund was told of is on a
+  # standby already.
+  switchoverDelay: 60
+  # A stopped primary shuts down fast: ferund's pooled connections never
+  # end on their own, so a smart shutdown would only wait out its timeout.
+  smartShutdownTimeout: 0
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+  probes:
+    startup:
+      type: streaming
+    readiness:
+      type: streaming
+      periodSeconds: 10
+      failureThreshold: 9
+    liveness:
+      periodSeconds: 5
+      failureThreshold: 3
+  postgresql:
+    parameters:
+      # Per instance of ferund 32 pooled connections and the listener. A
+      # stopping one keeps them for up to its termination grace, 12 minutes
+      # (deploy/k3s/ferun/ferund.yaml), so two deploys within it keep
+      # three revisions alive: 3 x 3 x 33 = 297. The operator, psql and
+      # ferund join-token connect too; the standbys' streaming does not
+      # count (max_wal_senders).
+      max_connections: '400'
+      tcp_keepalives_idle: '5'
+      tcp_keepalives_interval: '5'
+      tcp_keepalives_count: '3'
+      tcp_user_timeout: '15000'
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: required
+      failoverQuorum: true
+  bootstrap:
+    initdb:
+      database: ferun
+      owner: ferun
+  storage:
+    size: 10Gi
+    storageClass: general-purpose
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { memory: 2Gi }
+---
+# Who reaches ferun-db: the pods of this namespace (ferund, the instances
+# themselves, CloudNativePG's jobs), the operator, and the API server's
+# proxy (kube-system; kubectl cnpg status) on the status port. Nothing
+# else: no other namespace, no other machine's address.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ferun-db
+  namespace: ferun
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: ferun-db
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 5432
+        - port: 8000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudnative-pg
+      ports:
+        - port: 5432
+        - port: 8000
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 8000

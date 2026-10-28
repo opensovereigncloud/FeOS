@@ -27,6 +27,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/auth"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
 	"github.com/gardenlinux/feos/go/internal/testnode"
 	"github.com/gardenlinux/feos/go/internal/tools/toolstest"
 )
@@ -47,6 +48,8 @@ func restMux(h *REST, sb auth.Sandbox) http.Handler {
 	mux.HandleFunc("POST "+p+"/processes", h.StartProcess)
 	mux.HandleFunc("GET "+p+"/processes/{pid}/logs", h.ProcessLogs)
 	mux.HandleFunc("DELETE "+p+"/processes/{pid}", h.StopProcess)
+	mux.HandleFunc("GET "+p+"/calls/{key}", h.Call)
+	mux.HandleFunc("DELETE "+p+"/calls/{key}", h.CancelCall)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !sb.ID.IsZero() {
 			r = r.WithContext(auth.WithSandbox(r.Context(), sb))
@@ -487,4 +490,336 @@ func TestRESTOverHTTP(t *testing.T) {
 	if resp.StatusCode != 200 || string(body) != `{"exitCode":0,"output":"a?b.txt\n"}`+"\n" {
 		t.Errorf("%d %s", resp.StatusCode, body)
 	}
+}
+
+// keyedREST sends a request with one Idempotency-Key header per key, on
+// ctx, and returns the answer.
+func keyedREST(ctx context.Context, h http.Handler, method, path, body string, keys ...string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body)).WithContext(ctx)
+	for _, k := range keys {
+		req.Header.Add(idempotencyHeader, k)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// keyedAsync sends keyedREST's request in a goroutine; the channel gets
+// the answer.
+func keyedAsync(ctx context.Context, h http.Handler, method, path, body string, keys ...string) chan *httptest.ResponseRecorder {
+	ch := make(chan *httptest.ResponseRecorder, 1)
+	go func() { ch <- keyedREST(ctx, h, method, path, body, keys...) }()
+	return ch
+}
+
+func awaitREST(t *testing.T, ch chan *httptest.ResponseRecorder) *httptest.ResponseRecorder {
+	t.Helper()
+	select {
+	case rec := <-ch:
+		return rec
+	case <-time.After(10 * time.Second):
+		t.Fatal("no answer within 10 s")
+	}
+	return nil
+}
+
+// notYet checks that ch has no answer for 300 ms: its request waits.
+func notYet(t *testing.T, what string, ch chan *httptest.ResponseRecorder) {
+	t.Helper()
+	select {
+	case rec := <-ch:
+		t.Fatalf("%s answered %d %q", what, rec.Code, rec.Body.String())
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// keyedWant is a keyed answer: its status, its body exactly ("" for any),
+// and its headers (Ferun-Call-State, Ferun-Call-Replayed: true,
+// Retry-After).
+type keyedWant struct {
+	status     int
+	body       string
+	state      string
+	replayed   bool
+	retryAfter string
+}
+
+func checkKeyed(t *testing.T, what string, rec *httptest.ResponseRecorder, want keyedWant) {
+	t.Helper()
+	replayed := rec.Header().Get(callReplayedHeader)
+	if rec.Code != want.status || (want.body != "" && rec.Body.String() != want.body) ||
+		rec.Header().Get(callStateHeader) != want.state || (replayed == "true") != want.replayed ||
+		(replayed != "" && replayed != "true") || rec.Header().Get("Retry-After") != want.retryAfter {
+		t.Errorf("%s: %d %q state %q replayed %q Retry-After %q; want %+v", what, rec.Code, rec.Body.String(),
+			rec.Header().Get(callStateHeader), replayed, rec.Header().Get("Retry-After"), want)
+	}
+	if rec.Header().Get("Content-Type") != "application/json" {
+		t.Errorf("%s: content type %q", what, rec.Header().Get("Content-Type"))
+	}
+}
+
+// recordOfREST decodes the record route's answer, and checks that it has
+// exactly the fields of its state: the result's only once the call ended.
+func recordOfREST(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("the record: %d %q", rec.Code, rec.Body.String())
+	}
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	fields := []string{"key", "tool", "state", "instance", "startedAt"}
+	if m["state"] != CallRunning {
+		fields = append(fields, "finishedAt", "exitCode", "output", "truncated", "isError", "error", "text")
+	}
+	if len(m) != len(fields) {
+		t.Errorf("the record has %d fields: %s", len(m), rec.Body.String())
+	}
+	for _, f := range fields {
+		if _, ok := m[f]; !ok {
+			t.Errorf("the record has no %s: %s", f, rec.Body.String())
+		}
+	}
+	for _, f := range []string{"startedAt", "finishedAt"} {
+		s, ok := m[f].(string)
+		if !ok {
+			continue
+		}
+		if ts, err := time.Parse(time.RFC3339Nano, s); err != nil || !strings.HasSuffix(s, "Z") || ts.IsZero() {
+			t.Errorf("the record's %s %q: %v", f, s, err)
+		}
+	}
+	return m
+}
+
+// The REST answers of calls with an id (ADR 0023): the Idempotency-Key
+// header, the call's state and replay in the answer's headers, the
+// statuses of a conflict, a timeout over the cap, a call that did not run
+// and one that ran and failed; the record route with its wait, and the
+// cancel.
+func TestRESTKeyed(t *testing.T) {
+	env := toolstest.New(t, toolstest.Options{})
+	r := newRunner(env)
+	startRun(t, r)
+	sb := env.NewSandbox()
+	h := restMux(NewREST(r), sb)
+	base := "/api/v1/sandboxes/" + sb.ID.String()
+	const okOut = `{"exitCode":0,"output":"out\n"}` + "\n"
+
+	// Twice: the second request attaches to the first's call while it
+	// runs, and answers the same, as a replay.
+	p := probeExec(env, "out\n")
+	first := keyedAsync(bg, h, "POST", base+"/exec", `{"command":"work"}`, "k1")
+	waitN(t, p.started, 1)
+	second := keyedAsync(bg, h, "POST", base+"/exec", `{ "command": "work", "timeout": 0 }`, "k1")
+	notYet(t, "the second request", second)
+	close(p.release)
+	checkKeyed(t, "the first request", awaitREST(t, first), keyedWant{200, okOut, CallDone, false, ""})
+	checkKeyed(t, "the second request", awaitREST(t, second), keyedWant{200, okOut, CallDone, true, ""})
+	// The id as a quoted sf-string, and with spaces around it, is the same
+	// id: the stored answer.
+	for _, k := range []string{`"k1"`, " k1 ", ` "k1"`} {
+		checkKeyed(t, "the id "+k, keyedREST(bg, h, "POST", base+"/exec", `{"command":"work"}`, k),
+			keyedWant{200, okOut, CallDone, true, ""})
+	}
+	if n := p.n.Load(); n != 1 {
+		t.Errorf("%d Execs for one id", n)
+	}
+
+	// Another command under the same id: 422, and nothing runs.
+	checkKeyed(t, "another command", keyedREST(bg, h, "POST", base+"/exec", `{"command":"other"}`, "k1"),
+		keyedWant{422, `{"error":"bash: call id conflict: the id names another call in this sandbox (bash with other ` +
+			`arguments); a new call needs a new id","code":"call_id_conflict"}` + "\n", "", false, ""})
+	if n := p.n.Load(); n != 1 {
+		t.Errorf("%d Execs after a conflict", n)
+	}
+
+	// Ids the header does not take: 400 on every tool route, read-only or
+	// not, before anything runs.
+	acquired := env.Engine.Calls("Acquire", sb.ID)
+	const badKey = `{"error":"Idempotency-Key must be 1 to 255 characters of A-Z a-z 0-9 . _ ~ : @ -",` +
+		`"code":"bad_idempotency_key"}` + "\n"
+	for _, k := range []string{"a b", "a/b", strings.Repeat("a", MaxCallKey+1), "", `""`, `"k1`, "k\u00e91", `"a"b"`} {
+		for _, c := range []struct{ method, path, body string }{
+			{"POST", base + "/exec", `{"command":"x"}`},
+			{"GET", base + "/files/a", ``},
+			{"PUT", base + "/files/a", `content`},
+			{"GET", base + "/dirs/", ``},
+			{"DELETE", base + "/processes/p1", ``},
+		} {
+			checkKeyed(t, fmt.Sprintf("%s %s with the id %q", c.method, c.path, k),
+				keyedREST(bg, h, c.method, c.path, c.body, k), keyedWant{400, badKey, "", false, ""})
+		}
+	}
+	checkKeyed(t, "two ids", keyedREST(bg, h, "POST", base+"/exec", `{"command":"x"}`, "a", "b"),
+		keyedWant{400, `{"error":"one Idempotency-Key, got 2","code":"bad_idempotency_key"}` + "\n", "", false, ""})
+	// A bash timeout over the cap: 400, nothing recorded.
+	checkKeyed(t, "timeout 601", keyedREST(bg, h, "POST", base+"/exec", `{"command":"x","timeout":601}`, "long"),
+		keyedWant{400, `{"error":"bash: a call with an id may run at most 600 s: lower its timeout, or start longer ` +
+			`work with process_start","code":"call_timeout_too_long"}` + "\n", "", false, ""})
+	if n := env.Engine.Calls("Acquire", sb.ID); n != acquired {
+		t.Errorf("refused requests acquired the sandbox %d times", n-acquired)
+	}
+	noCallRow(t, env, sb.ID, "long")
+
+	// A read-only tool takes a valid id, the longest too, and ignores it.
+	for _, k := range []string{"k1", strings.Repeat("a", MaxCallKey)} {
+		checkKeyed(t, "ls with an id", keyedREST(bg, h, "GET", base+"/dirs/", ``, k), keyedWant{200, "", "", false, ""})
+	}
+	noCallRow(t, env, sb.ID, strings.Repeat("a", MaxCallKey))
+
+	// A call that did not run (no capacity): 502 with Retry-After, not_run;
+	// sent again once the cause is gone, it runs.
+	env.Engine.FailAcquire(sb.ID, fmt.Errorf("%w (retryable): no feasible node", model.ErrNoCapacity))
+	checkKeyed(t, "no capacity", keyedREST(bg, h, "POST", base+"/exec", `{"command":"cap"}`, "cap"),
+		keyedWant{502, `{"error":"bash: ensure sandbox: no capacity (retryable): no feasible node"}` + "\n", CallNotRun, false, "5"})
+	checkKeyed(t, "no capacity, sent again", keyedREST(bg, h, "POST", base+"/exec", `{"command":"cap"}`, "cap"),
+		keyedWant{200, okOut, CallDone, false, ""})
+	if n := p.n.Load(); n != 2 {
+		t.Errorf("%d Execs", n)
+	}
+
+	// A call that ran and failed (its timeout): 502 without Retry-After,
+	// done; its record carries the error as MCP renders it.
+	p = probeExec(env, "")
+	checkKeyed(t, "timeout", keyedREST(bg, h, "POST", base+"/exec", `{"command":"sleep","timeout":1}`, "slow"),
+		keyedWant{502, `{"error":"bash: timeout after 1s"}` + "\n", CallDone, false, ""})
+	m := recordOfREST(t, keyedREST(bg, h, "GET", base+"/calls/slow", ``))
+	wantText, _ := RenderText(Result{}, &TimeoutError{Seconds: 1})
+	if m["state"] != CallDone || m["error"] != "timeout after 1s" || m["isError"] != true || m["text"] != wantText ||
+		m["output"] != "" || m["exitCode"] != float64(callRow(t, env, sb.ID, "slow").ExitCode) || m["key"] != "slow" ||
+		m["tool"] != ToolBash {
+		t.Errorf("the record of a timeout: %v", m)
+	}
+
+	// A client that hangs up: nothing is written, the call runs on, and its
+	// record says running until it ended.
+	p = probeExec(env, "late\n")
+	ctx, cancel := context.WithCancel(bg)
+	hungUp := keyedAsync(ctx, h, "POST", base+"/exec", `{"command":"x"}`, "hu")
+	waitN(t, p.started, 1)
+	cancel()
+	if rec := awaitREST(t, hungUp); rec.Body.Len() != 0 || len(rec.Header()) != 0 {
+		t.Errorf("a hung-up client got %d %v %q", rec.Code, rec.Header(), rec.Body.String())
+	}
+	m = recordOfREST(t, keyedREST(bg, h, "GET", base+"/calls/hu", ``))
+	if m["state"] != CallRunning || m["key"] != "hu" || m["tool"] != ToolBash || m["instance"] != toolstest.InstanceID {
+		t.Errorf("the record while running: %v", m)
+	}
+	waited := keyedAsync(bg, h, "GET", base+"/calls/hu?wait=5", ``)
+	notYet(t, "the record with a wait", waited)
+	close(p.release)
+	m = recordOfREST(t, awaitREST(t, waited))
+	wantText, _ = RenderText(Result{Text: "late\n"}, nil)
+	if m["state"] != CallDone || m["output"] != "late\n" || m["exitCode"] != 0.0 || m["text"] != wantText ||
+		m["isError"] != false || m["error"] != "" || m["truncated"] != false || m["instance"] != toolstest.InstanceID {
+		t.Errorf("the record after the wait: %v", m)
+	}
+	select {
+	case <-p.cancelled:
+		t.Error("the hung-up request cancelled its call")
+	default:
+	}
+
+	// The record route's requests.
+	for _, c := range []restCase{
+		{"GET", base + "/calls/hu?wait=61", ``, 400, `{"error":"wait must be 0 to 60 seconds, got 61"}` + "\n", ""},
+		{"GET", base + "/calls/hu?wait=-1", ``, 400, `{"error":"wait must be 0 to 60 seconds, got -1"}` + "\n", ""},
+		{"GET", base + "/calls/hu?wait=x", ``, 400, `{"error":"wait must be an integer, got \"x\""}` + "\n", ""},
+		{"GET", base + "/calls/a%20b", ``, 400, badKey, ""},
+		{"DELETE", base + "/calls/a%2Fb", ``, 400, badKey, ""},
+		{"GET", base + "/calls/unknown", ``, 404, `{"error":"no call with this id in the sandbox","code":"no_such_call"}` + "\n", ""},
+		{"GET", base + "/calls/unknown?wait=1", ``, 404, `{"error":"no call with this id in the sandbox","code":"no_such_call"}` + "\n", ""},
+		{"DELETE", base + "/calls/unknown", ``, 404, `{"error":"no running call with this id in the sandbox","code":"no_such_call"}` + "\n", ""},
+	} {
+		doREST(t, h, c)
+	}
+
+	// The cancel: 202, and the waiting request gets the cancel, final;
+	// then nothing runs under the id.
+	p = probeExec(env, "")
+	waiting := keyedAsync(bg, h, "POST", base+"/exec", `{"command":"x"}`, "del")
+	waitN(t, p.started, 1)
+	doREST(t, h, restCase{"DELETE", base + "/calls/del", ``, 202, `{"cancelled":true}` + "\n", ""})
+	checkKeyed(t, "the cancelled request", awaitREST(t, waiting),
+		keyedWant{502, `{"error":"bash: the call was cancelled by its caller"}` + "\n", CallDone, false, ""})
+	waitN(t, p.cancelled, 1)
+	doREST(t, h, restCase{"DELETE", base + "/calls/del", ``, 404,
+		`{"error":"no running call with this id in the sandbox","code":"no_such_call"}` + "\n", ""})
+	checkKeyed(t, "the cancelled call again", keyedREST(bg, h, "POST", base+"/exec", `{"command":"x"}`, "del"),
+		keyedWant{502, `{"error":"bash: the call was cancelled by its caller"}` + "\n", CallDone, true, ""})
+
+	// A file write with an id, of bytes that are not UTF-8: sent twice, it
+	// is written once, and the second answer is the first's, replayed.
+	var mu sync.Mutex
+	var writes [][]byte
+	env.Node.Script().SetTool(func(_ context.Context, _ podid.ID, _ string, req proto.Message) (proto.Message, bool, error) {
+		if w, ok := req.(*toolv1.WriteRequest); ok {
+			mu.Lock()
+			writes = append(writes, w.GetContent())
+			mu.Unlock()
+		}
+		return nil, false, nil
+	})
+	content := "\xff\xfe\x00 not UTF-8 \xc3"
+	const wrote = `{"exitCode":0,"output":"wrote /workspace/bin\n"}` + "\n"
+	checkKeyed(t, "the write", keyedREST(bg, h, "PUT", base+"/files/workspace/bin", content, "w1"),
+		keyedWant{200, wrote, CallDone, false, ""})
+	checkKeyed(t, "the write again", keyedREST(bg, h, "PUT", base+"/files/workspace/bin", content, "w1"),
+		keyedWant{200, wrote, CallDone, true, ""})
+	checkKeyed(t, "another write under its id", keyedREST(bg, h, "PUT", base+"/files/workspace/bin", content+"!", "w1"),
+		keyedWant{422, `{"error":"write: call id conflict: the id names another call in this sandbox (write with other ` +
+			`arguments); a new call needs a new id","code":"call_id_conflict"}` + "\n", "", false, ""})
+	mu.Lock()
+	if len(writes) != 1 || string(writes[0]) != content {
+		t.Errorf("the node received %q", writes)
+	}
+	mu.Unlock()
+}
+
+// A request that waits for another instance's call is answered 503
+// call_running with Retry-After 1 once this instance drains; a call that
+// was interrupted is a 502 call_interrupted without Retry-After.
+func TestRESTKeyedOtherInstance(t *testing.T) {
+	env := toolstest.New(t, toolstest.Options{})
+	r := newRunner(env)
+	startRun(t, r)
+	sb := env.NewSandbox()
+	h := restMux(NewREST(r), sb)
+	base := "/api/v1/sandboxes/" + sb.ID.String()
+	args := `{"command":"x"}`
+
+	row := foreignRow(t, env, sb, "gone", args, true, time.Minute)
+	const interrupted = "interrupted: instance i9 stopped before the call ended"
+	if ok, err := env.Store.FinishToolCall(bg, row.ID, store.ToolCallOutcome{State: store.ToolCallInterrupted,
+		Output: []byte("half"), Error: interrupted}); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	checkKeyed(t, "an interrupted call", keyedREST(bg, h, "POST", base+"/exec", args, "gone"),
+		keyedWant{502, `{"error":"bash: ` + interrupted + `","code":"call_interrupted"}` + "\n", CallInterrupted, true, ""})
+	m := recordOfREST(t, keyedREST(bg, h, "GET", base+"/calls/gone", ``))
+	wantText, _ := RenderText(Result{Text: "half"}, errors.New(interrupted))
+	if m["state"] != CallInterrupted || m["instance"] != "i9" || m["output"] != "half" || m["text"] != wantText ||
+		m["isError"] != true || m["error"] != interrupted {
+		t.Errorf("the record of an interrupted call: %v", m)
+	}
+
+	foreignRow(t, env, sb, "x", args, true, time.Minute)
+	waiting := keyedAsync(bg, h, "POST", base+"/exec", args, "x")
+	notYet(t, "the request of another instance's call", waiting)
+	r.BeginDrain(time.Now().Add(time.Minute))
+	checkKeyed(t, "the released request", awaitREST(t, waiting),
+		keyedWant{503, `{"error":"bash: the call is still running on instance i9, and this instance is stopping: ` +
+			`ask again with the same id","code":"call_running"}` + "\n", CallRunning, true, "1"})
+	// The record says running, at once, while this instance drains.
+	start := time.Now()
+	m = recordOfREST(t, keyedREST(bg, h, "GET", base+"/calls/x?wait=30", ``))
+	if m["state"] != CallRunning || m["instance"] != "i9" || time.Since(start) > 2*time.Second {
+		t.Errorf("the record while draining: %v after %s", m, time.Since(start))
+	}
+	// A new call while draining did not run: 502 with Retry-After.
+	checkKeyed(t, "a new call while draining", keyedREST(bg, h, "POST", base+"/exec", args, "new"),
+		keyedWant{502, `{"error":"bash: instance ` + toolstest.InstanceID + ` is stopping: instance is stopping"}` + "\n",
+			CallNotRun, false, "5"})
 }

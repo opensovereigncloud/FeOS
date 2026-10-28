@@ -21,6 +21,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/env/spec"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/routing"
 	"github.com/gardenlinux/feos/go/internal/store"
 )
 
@@ -109,111 +110,41 @@ func routePath(r *http.Request) (path, raw string, err error) {
 	return path, raw, err
 }
 
-// dotSegment is ".." or "." when a segment of a path's escaped form is
-// that, as it is or decoded once or twice, else "". Each decode is
-// lenient, as an upstream that decodes again may be: a valid %XX becomes
-// its byte and any other "%" stays, so a "%" that the first decode made
-// ("/q/100%25") is a character, not a reason to refuse, and still hides
-// no "%2e%2e" beside it.
+// The route door reads paths as ferun-ingress does (internal/routing).
+
+// dotSegment is ".." or "." when a segment of raw is that, as it is or
+// decoded once or twice (routing.DotSegment).
 func dotSegment(raw string) string {
-	p := raw
-	for i := range 3 {
-		for seg := range strings.SplitSeq(p, "/") {
-			if seg == "." || seg == ".." {
-				return seg
-			}
-		}
-		if i < 2 {
-			p = lenientUnescape(p)
-		}
-	}
-	return ""
-}
-
-// lenientUnescape decodes each valid %XX of s and leaves any other "%"
-// as it is.
-func lenientUnescape(s string) string {
-	if !strings.Contains(s, "%") {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); i++ {
-		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
-			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
-			i += 2
-			continue
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
-
-func isHex(c byte) bool {
-	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
-}
-
-func unhex(c byte) byte {
-	switch {
-	case c >= 'a':
-		return c - 'a' + 10
-	case c >= 'A':
-		return c - 'A' + 10
-	}
-	return c - '0'
+	return routing.DotSegment(raw)
 }
 
 // matchRoute returns the route whose path is the longest segment-aware
 // prefix of raw's segments (each unescaped), and how many segments it
 // has; ok false when none matches.
 func matchRoute(routes map[string]spec.Route, raw string) (spec.Route, int, bool) {
-	segs := strings.Split(strings.TrimPrefix(raw, "/"), "/")
-	var best spec.Route
-	bestN, found := -1, false
-	for _, name := range slices.Sorted(maps.Keys(routes)) {
-		r := routes[name]
-		prefix := spec.RoutePrefix(r.Path)
-		var want []string
-		if prefix != "/" {
-			want = strings.Split(strings.TrimPrefix(prefix, "/"), "/")
-		}
-		if len(want) > len(segs) || len(want) <= bestN {
-			continue
-		}
-		ok := true
-		for i, w := range want {
-			if seg, err := url.PathUnescape(segs[i]); err != nil || seg != w {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			best, bestN, found = r, len(want), true
-		}
+	names := slices.Sorted(maps.Keys(routes))
+	prefixes := make([]string, len(names))
+	for i, name := range names {
+		prefixes[i] = spec.RoutePrefix(routes[name].Path)
 	}
-	return best, bestN, found
+	i, n, ok := routing.Match(prefixes, raw)
+	if !ok {
+		return spec.Route{}, -1, false
+	}
+	return routes[names[i]], n, true
 }
 
 // stripSegments removes the first n segments of a path's escaped form
 // and returns what remains, unescaped and escaped ("" when it needs no
 // escaping).
 func stripSegments(raw string, n int) (string, string, error) {
-	segs := strings.Split(strings.TrimPrefix(raw, "/"), "/")
-	rest := "/" + strings.Join(segs[n:], "/")
-	path, err := url.PathUnescape(rest)
-	if err != nil {
-		return "", "", err
-	}
-	return path, rawOf(path, rest), nil
+	return routing.StripSegments(raw, n)
 }
 
 // rawOf is the escaped form of a path, "" when it is the default
 // escaping.
 func rawOf(path, raw string) string {
-	if (&url.URL{Path: path}).EscapedPath() == raw {
-		return ""
-	}
-	return raw
+	return routing.RawOf(path, raw)
 }
 
 // ServeRoute is the route door, ANY

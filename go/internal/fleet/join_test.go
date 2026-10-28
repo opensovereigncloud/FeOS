@@ -199,6 +199,51 @@ func TestJoinRefusals(t *testing.T) {
 	}
 }
 
+// A join token of kind ingress never joins a node, pinned or not, and
+// stays unused for the ingress it is for.
+func TestJoinIngressToken(t *testing.T) {
+	h := newHarness(t)
+	for _, pinned := range []string{"", "n1"} {
+		_, sent, hash, err := pki.NewJoinToken(h.iss.JoinPin())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.st.CreateJoinToken(bg, hash, "test", model.JoinKindIngress, pinned, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		_, err = h.join("n1", sent, newCSR(t))
+		wantCode(t, err, codes.PermissionDenied, "this join token is for an ingress")
+		tok, err := h.st.LockJoinToken(bg, hash)
+		if err != nil || tok.Used() {
+			t.Fatalf("the ingress token after a node's join: %+v %v", tok, err)
+		}
+	}
+	// An ingress's token in its own form is refused by that form, before
+	// any lookup, as the form check of a ferund that knows no kinds does
+	// (prefix feos-join-, 53 characters).
+	for _, pinned := range []string{"", "n1"} {
+		_, sent, hash, err := pki.NewIngressJoinToken(h.iss.JoinPin())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(sent, "feos-join-") || len(sent) == 53 {
+			t.Fatalf("an ingress's token %q in a node's form", sent)
+		}
+		if _, err := h.st.CreateJoinToken(bg, hash, "test", model.JoinKindIngress, pinned, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		_, err = h.join("n1", sent, newCSR(t))
+		wantCode(t, err, codes.InvalidArgument, "this join token is for an ingress")
+		tok, err := h.st.LockJoinToken(bg, hash)
+		if err != nil || tok.Used() {
+			t.Fatalf("the ingress token after a node's join: %+v %v", tok, err)
+		}
+	}
+	if _, err := h.st.GetNode(bg, "n1"); !errors.Is(err, store.ErrNoRow) {
+		t.Fatalf("an ingress token made a node: %v", err)
+	}
+}
+
 func TestJoinPinned(t *testing.T) {
 	h := newHarness(t)
 	old := h.joined("n1")

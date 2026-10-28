@@ -56,7 +56,9 @@ const (
 // re-description (30 s), process holds (60 s), expired holds (60 s) and
 // tenant deletion (60 s). The loops that begin ops or call nodes consider
 // only nodes the leader is connected to; the database-only loops are not
-// filtered by connection.
+// filtered by connection. Idle pause, stale ops and expired holds act on
+// leases that an outage lets expire, and wait until the leader has
+// settled (settled).
 func (e *Engine) Loops() []leader.Loop {
 	loops := []leader.Loop{
 		{Name: LoopDownSweep, Interval: 5 * time.Second, Run: e.downSweep},
@@ -204,8 +206,11 @@ func quiet(err error) bool {
 // idlePause pauses running sandboxes without a live hold whose last
 // activity is older than their idle interval, the row's idle_after_s or
 // else --idle-pause, 0 for never (trigger idle: the begin rechecks both
-// with fresh statements).
+// with fresh statements), only once the leader has settled (settled).
 func (e *Engine) idlePause(ctx context.Context) error {
+	if !e.settled() {
+		return nil
+	}
 	rows, err := e.st.IdleSandboxes(ctx, e.cfg.IdlePause, e.conns.Nodes(), loopBatch)
 	if err != nil {
 		return fmt.Errorf("idle pause: %w", err)
@@ -459,7 +464,11 @@ func (e *Engine) tombstones(ctx context.Context) error {
 // leader is connected to their target, else released (unknown, for Sync).
 // A live owner's op more than 5 minutes past its deadline, which only a
 // bug or a database outage explains, is released and logged as an error.
+// It acts only once the leader has settled (settled).
 func (e *Engine) staleOps(ctx context.Context) error {
+	if !e.settled() {
+		return nil
+	}
 	rows, err := e.st.StaleOps(ctx, e.t.staleOverdue, loopBatch)
 	if err != nil {
 		return fmt.Errorf("stale ops: %w", err)
@@ -702,8 +711,12 @@ func (e *Engine) processHolds(ctx context.Context) error {
 	return nil
 }
 
-// expiredHolds deletes the holds whose lease has passed.
+// expiredHolds deletes the holds whose lease has passed, only once the
+// leader has settled (settled).
 func (e *Engine) expiredHolds(ctx context.Context) error {
+	if !e.settled() {
+		return nil
+	}
 	if _, err := e.st.DeleteExpiredHolds(ctx); err != nil {
 		return fmt.Errorf("expired holds: %w", err)
 	}

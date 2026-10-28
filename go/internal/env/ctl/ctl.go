@@ -16,7 +16,8 @@
 //	env-probe      1 s: containers' exits and restarts with backoff, readiness
 //	               (http, tcp, exec), attached services' processes
 //	env-groups     10 s, hint "env-groups": the security groups each connected
-//	               node should have, re-put where they differ
+//	               node should have, re-put where they differ; what a node holds
+//	               of the ingress's groups recorded; stale groups deleted
 //	env-names      2 s, hint "env-names": the name tables each connected node
 //	               should have, updated or re-put where they differ
 //	env-volumes    30 s: the volumes marked deleting, deleted on their nodes
@@ -26,6 +27,18 @@
 // environment_id) and runs Engine.Ensure for the rows that should run in
 // a bounded pool of its own (8 workers per instance, single flight per
 // row); reconcile steps enqueue, never call Ensure themselves.
+//
+// The security groups (groups.go) are env-<environment> for an
+// environment's pods, sbx-<sandbox> for an attachable sandbox,
+// ing-<sandbox> for an image service's pod of an environment that was
+// ever public (environments.ingress_group, model.PodTemplate.IngressGroup:
+// the first publish rolls the services once), whose rule lets the ingress
+// in on the routed ports while the environment is public, and
+// ferun-ingress, the mesh addresses of the ingress instances. The prepare
+// hook and env-groups record the ports of each ing group and the version
+// of ferun-ingress that a node holds (env_instances.ingress_ports,
+// nodes.ingress_group_version): the ingress sends to an instance only
+// with both.
 //
 // The target T of an environment is its latest release R, unless R
 // failed: then the realised release (nothing when none was realised), so

@@ -27,8 +27,8 @@ import (
 // DefaultJoinTokenTTL is a join token's lifetime when none is given.
 const DefaultJoinTokenTTL = time.Hour
 
-// IssueJoinToken makes a one-time join token, valid for ttl (an hour when
-// 0), pinned to the name node unless node is "" (a pinned token re-joins
+// IssueJoinToken makes a one-time join token for a node (kind
+// model.JoinKindNode), valid for ttl (an hour when 0), pinned to the name node unless node is "" (a pinned token re-joins
 // that name; an unpinned one creates a new name only). token is what the
 // operator gets, "feos-join-<secret>.<pin>", shown once: the database keeps
 // only the hash of the part the node sends. An invalid node name is an
@@ -45,7 +45,7 @@ func (s *Service) IssueJoinToken(ctx context.Context, createdBy, node string, tt
 	if err != nil {
 		return uuid.Nil, "", time.Time{}, fmt.Errorf("make a join token: %w", err)
 	}
-	t, err := s.st.CreateJoinToken(ctx, hash, createdBy, node, ttl)
+	t, err := s.st.CreateJoinToken(ctx, hash, createdBy, model.JoinKindNode, node, ttl)
 	if err != nil {
 		return uuid.Nil, "", time.Time{}, fmt.Errorf("store the join token: %w", err)
 	}
@@ -57,6 +57,9 @@ func (s *Service) IssueJoinToken(ctx context.Context, createdBy, node string, tt
 // certificate.
 func (s *Service) join(ctx context.Context, req *fleetv1.JoinRequest) (*fleetv1.JoinResponse, error) {
 	token, name, csrDER := req.GetToken(), req.GetName(), req.GetCsr()
+	if strings.HasPrefix(token, pki.IngressJoinTokenPrefix) {
+		return nil, status.Error(codes.InvalidArgument, "this join token is for an ingress")
+	}
 	if !strings.HasPrefix(token, pki.JoinTokenPrefix) || len(token) != pki.JoinSecretLen {
 		return nil, status.Error(codes.InvalidArgument, "the join token is not feos-join-<secret>: send it without the pin")
 	}
@@ -97,6 +100,9 @@ func (s *Service) join(ctx context.Context, req *fleetv1.JoinRequest) (*fleetv1.
 		}
 		if err != nil {
 			return err
+		}
+		if t.Kind != model.JoinKindNode {
+			return status.Error(codes.PermissionDenied, "this join token is for an ingress")
 		}
 		_, keyHash, err := pki.CheckCSR(csrDER, true)
 		if err != nil {

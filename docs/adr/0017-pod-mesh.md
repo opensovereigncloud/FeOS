@@ -201,7 +201,9 @@ nothing but a pod's own node put the pod's address on a packet.
   meshed nodes' pods.
 - **Peers that are not nodes**: the control plane's front doors and load
   balancers reaching pods' ports over IPv6 (ADR 0010), at addresses of
-  subnet 0.
+  subnet 0. Answered by ADR 0021: the ingress's instances are the
+  first peers that are not nodes. They take /64s of the same counter, so
+  nodes need no other kind of peer. Subnet 0 stays reserved.
 - **Nodes that cannot reach each other's endpoints**, both behind NAT: a
   relay.
 - **NAT66** for meshed nodes that have IPv6 of their own.

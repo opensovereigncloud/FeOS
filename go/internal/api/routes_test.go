@@ -33,6 +33,8 @@ var routeClasses = map[string]class{
 	"POST /api/v1/admin/join-tokens":                      classAdmin,
 	"GET /api/v1/admin/join-tokens":                       classAdmin,
 	"DELETE /api/v1/admin/join-tokens/{id}":               classAdmin,
+	"GET /api/v1/admin/ingresses":                         classAdmin,
+	"DELETE /api/v1/admin/ingresses/{name}":               classAdmin,
 	"GET /api/v1/admin/instances":                         classAdmin,
 
 	"GET /api/v1/tools":                           classTenant,
@@ -58,6 +60,8 @@ var routeClasses = map[string]class{
 	"POST /api/v1/sandboxes/{id}/processes":           classSandbox,
 	"GET /api/v1/sandboxes/{id}/processes/{pid}/logs": classSandbox,
 	"DELETE /api/v1/sandboxes/{id}/processes/{pid}":   classSandbox,
+	"GET /api/v1/sandboxes/{id}/calls/{key}":          classSandbox,
+	"DELETE /api/v1/sandboxes/{id}/calls/{key}":       classSandbox,
 	"POST /api/v1/sandboxes/{id}/watches":             classSandbox,
 	"PUT /api/v1/sandboxes/{id}/watches/{wid}":        classSandbox,
 	"GET /api/v1/sandboxes/{id}/watches/{wid}/events": classSandbox,
@@ -97,6 +101,7 @@ var routeClasses = map[string]class{
 	"POST /api/v1/environments/{env}/jobs/{name}/run":           classTenant,
 	"POST /api/v1/environments/{env}/route-tokens":              classTenant,
 	"DELETE /api/v1/environments/{env}/route-tokens":            classTenant,
+	"PUT /api/v1/environments/{env}/public":                     classTenant,
 	"/api/v1/environments/{env}/http/{path...}":                 classRoute,
 
 	"/api/":             classPublic,
@@ -137,7 +142,7 @@ func concrete(pattern string, id string) (string, string) {
 	}
 	r := strings.NewReplacer("{id}", id, "{tenant}", testTenant, "{node}", "n1", "{hash}", "abcdef0123",
 		"{pid}", "p1", "{wid}", "w1", "{name}", "k1", "{port}", "3000", "{path...}", "etc/hosts", "{rest...}", "x/y",
-		"{env}", "stage", "{n}", "7", "{kind}", "service", "{tag}", "v1")
+		"{env}", "stage", "{n}", "7", "{kind}", "service", "{tag}", "v1", "{key}", "c1")
 	return method, r.Replace(path)
 }
 

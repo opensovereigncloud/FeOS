@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -104,10 +105,18 @@ func TestAttachedService(t *testing.T) {
 	n1 := h.addNode("n1")
 	hostProcesses(n1, t.TempDir())
 	sb := h.attachable()
+	// The prepare hook puts the group with its rules before the pod is
+	// created, when the pod has no address yet; env-groups adds the
+	// address as its member once the create's answer recorded it (the
+	// hint of SetSandboxAddress), which may be after Ensure returned.
 	sbx := h.group("n1", model.SandboxGroupID(sb.ID))
-	if sbx == nil || len(sbx.Rules) != 2 || !slices.Equal(sbx.Members, []string{sb.Address}) {
+	if sbx == nil || len(sbx.Rules) != 2 {
 		t.Fatalf("the sandbox's group %v", sbx)
 	}
+	eventually(t, 30*time.Second, "the sandbox's address the member of its group", func() bool {
+		sbx = h.group("n1", model.SandboxGroupID(sb.ID))
+		return sbx != nil && len(sbx.Rules) == 2 && slices.Equal(sbx.Members, []string{sb.Address})
+	})
 	if tbl := h.table("n1", model.SandboxTableID(sb.ID)); tbl == nil || len(tbl.Entries) != 0 || len(tbl.Includes) != 0 {
 		t.Fatalf("the sandbox's name table %v", tbl)
 	}
@@ -355,8 +364,8 @@ func TestAttachedSandboxReusedByAnotherTenant(t *testing.T) {
 	}
 	// Groups: the other sandbox is no member of the environment's group,
 	// and its own group reaches no group of the environment.
-	if g, _, err := h.c.buildGroup(bg, model.EnvGroupID(env.ID)); err != nil || slices.Contains(g.Members, other.Address) {
-		t.Fatalf("the env group %v %v", g, err)
+	if b, err := h.c.buildGroup(bg, model.EnvGroupID(env.ID), newGroupPass()); err != nil || slices.Contains(b.g.Members, other.Address) {
+		t.Fatalf("the env group %v %v", b, err)
 	}
 	if g := h.group("n1", model.SandboxGroupID(sb.ID)); g == nil || slices.ContainsFunc(g.Rules, func(r *networkv1.Rule) bool {
 		return r.GetGroup() == model.EnvGroupID(env.ID)
@@ -477,6 +486,74 @@ func TestAttachedStrayProcesses(t *testing.T) {
 		return err == nil && c.ProcessID != "" && c.ProcessID != b.ProcessID &&
 			slices.Equal(h.runningNamed(sb, "ferun-env-dev-web"), []string{c.ProcessID})
 	})
+}
+
+// A restart on request is no exit: a look of the supervisor that read the
+// row before the restart and lists the processes after it finds the
+// process gone, and must not count that as an exit (a restart, its
+// backoff, the last exit) onto the row the restart cleared.
+func TestAttachedRestartIsNoExit(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 is not installed; the process scripts need it")
+	}
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	root := t.TempDir()
+	// Armed, the next listing of the service's processes waits for
+	// release: the look that lists is then between reading its row and
+	// learning what runs.
+	var armed atomic.Bool
+	listing, release := make(chan struct{}), make(chan struct{})
+	n1.Script().SetExec(func(ctx context.Context, pod podid.ID, req *containerv1.ExecRequest, _ testnode.ExecOutput) (int32, bool, error) {
+		argv := req.Command
+		if len(argv) > 2 && argv[0] == "python3" {
+			if len(argv) == 4 && strings.HasPrefix(argv[2], "import json,") && argv[3] == "ferun-env-dev-web" &&
+				armed.CompareAndSwap(true, false) {
+				close(listing)
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			}
+			start := strings.Contains(argv[2], "no such working directory")
+			argv[2] = strings.ReplaceAll(argv[2], processRoot, root)
+			if start && len(argv) > 6 && argv[6] != "" {
+				argv[6] = filepath.Join(n1.PodDir(pod), argv[6])
+			}
+		}
+		return 0, false, nil
+	})
+	sb := h.attachable()
+	env := h.newEnv("dev")
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"web":{"runtime":"attached","sandbox":%q,"command":["sleep","60"]}}}`, sb.ID))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 60*time.Second)
+	a, err := h.st.GetAttached(bg, env.ID, "web")
+	if err != nil || a.ProcessID == "" || a.Restarts != 0 {
+		t.Fatalf("attached %+v %v", a, err)
+	}
+
+	armed.Store(true)
+	select {
+	case <-listing:
+	case <-time.After(30 * time.Second):
+		t.Fatal("no look listed the processes within 30s")
+	}
+	err = h.c.RestartService(bg, env.ID, "web")
+	close(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b store.EnvAttached
+	eventually(t, 30*time.Second, "the restarted process", func() bool {
+		b, err = h.st.GetAttached(bg, env.ID, "web")
+		return err == nil && b.ProcessID != "" && b.ProcessID != a.ProcessID && b.Phase == model.PhaseReady
+	})
+	if b.Restarts != 0 || b.LastExit != nil {
+		t.Errorf("the restart counted as an exit: %+v", b)
+	}
+	if got := h.runningNamed(sb, "ferun-env-dev-web"); !slices.Equal(got, []string{b.ProcessID}) {
+		t.Errorf("running %v, the row records %s", got, b.ProcessID)
+	}
 }
 
 // An attached service that goes while its sandbox sleeps — removed from

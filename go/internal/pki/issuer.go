@@ -37,7 +37,7 @@ import (
 const backdate = 10 * time.Minute
 
 // Issuer is the platform CA's intermediate, the one issuing key of ADR
-// 0014 that every instance holds. It issues node, pod and server
+// 0014 that every instance holds. It issues node, ingress, pod and server
 // certificates.
 type Issuer struct {
 	td        string
@@ -196,12 +196,42 @@ func (i *Issuer) IssueNode(csrDER []byte, name string, ttl time.Duration) (*flee
 	return i.certificateProto(id, leaf, leaf.NotBefore.Add(leaf.NotAfter.Sub(leaf.NotBefore)/2)), leaf, nil
 }
 
+// IssueIngress issues the client certificate of the ferun-ingress instance
+// name for the key of csrDER: ClientAuth, the URI
+// spiffe://<td>/ingress/<name> and no DNS name, subject CN name, valid for
+// ttl. The CSR's own subject and names are ignored. The key is Ed25519 or
+// ECDSA P-256. Like a node, the instance renews it at half its lifetime.
+func (i *Issuer) IssueIngress(csrDER []byte, name string, ttl time.Duration) (*fleetv1.Certificate, *x509.Certificate, error) {
+	if !isDNSLabel(name) {
+		return nil, nil, fmt.Errorf("ingress name %q is not a DNS label", name)
+	}
+	csr, _, err := CheckCSR(csrDER, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	id := IngressID(i.td, name)
+	u, err := url.Parse(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	leaf, err := i.sign(&x509.Certificate{
+		Subject:     pkix.Name{CommonName: name},
+		URIs:        []*url.URL{u},
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}, csr.PublicKey, ttl)
+	if err != nil {
+		return nil, nil, err
+	}
+	return i.certificateProto(id, leaf, leaf.NotBefore.Add(leaf.NotAfter.Sub(leaf.NotBefore)/2)), leaf, nil
+}
+
 // IssuePod issues a pod's certificate (ADR 0014) for the Ed25519 key of
 // csrDER: ClientAuth and ServerAuth, the URI spiffeID and the DNS names
 // given, subject CN derived from the ID, valid for ttl. It refuses the
-// control plane's SPIFFE ID and every ID in the node namespace, any
-// wildcard name, any name equal to or under the control-plane domain and
-// any name outside the issuer's permitted DNS domains. The CSR's own
+// control plane's SPIFFE ID and every ID in the node and ingress
+// namespaces, any wildcard name, any name equal to or under the
+// control-plane domain and any name outside the issuer's permitted DNS
+// domains. The CSR's own
 // subject and names are ignored. It is renewed at three quarters of its
 // lifetime.
 func (i *Issuer) IssuePod(csrDER []byte, spiffeID string, dnsNames []string, ttl time.Duration) (*fleetv1.Certificate, *x509.Certificate, error) {

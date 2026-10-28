@@ -11,15 +11,17 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// JoinToken is a row of join_tokens. Only the hash of what the node sends
-// ("feos-join-<secret>") is stored.
+// JoinToken is a row of join_tokens. Only the hash of what the node
+// ("feos-join-<secret>") or the ingress ("feos-ingress-join-<secret>")
+// sends is stored.
 type JoinToken struct {
 	Hash        string
 	ID          uuid.UUID
 	CreatedBy   string
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
-	NodeName    string    // pinned name; "" creates a new name only
+	Kind        string    // model.JoinKindNode, model.JoinKindIngress: what it joins
+	NodeName    string    // pinned name (of either kind); "" creates a new name only
 	UsedAt      time.Time // zero: unused
 	UsedName    string
 	UsedKeyHash string
@@ -30,25 +32,26 @@ type JoinToken struct {
 // Used reports whether the token was used.
 func (t *JoinToken) Used() bool { return !t.UsedAt.IsZero() }
 
-const joinTokenCols = `hash, id, created_by, created_at, expires_at, node_name, used_at, used_name, used_key_hash,
-	used_serial, used_peer`
+const joinTokenCols = `hash, id, created_by, created_at, expires_at, kind, node_name, used_at, used_name,
+	used_key_hash, used_serial, used_peer`
 
 func scanJoinToken(row pgx.Row) (JoinToken, error) {
 	var t JoinToken
 	var used *time.Time
-	if err := row.Scan(&t.Hash, &t.ID, &t.CreatedBy, &t.CreatedAt, &t.ExpiresAt, &t.NodeName, &used, &t.UsedName,
-		&t.UsedKeyHash, &t.UsedSerial, &t.UsedPeer); err != nil {
+	if err := row.Scan(&t.Hash, &t.ID, &t.CreatedBy, &t.CreatedAt, &t.ExpiresAt, &t.Kind, &t.NodeName, &used,
+		&t.UsedName, &t.UsedKeyHash, &t.UsedSerial, &t.UsedPeer); err != nil {
 		return JoinToken{}, err
 	}
 	t.UsedAt = timeOf(used)
 	return t, nil
 }
 
-// CreateJoinToken stores a join token by its hash, valid for ttl from
-// now(), pinned to node unless node is "".
-func (s *Store) CreateJoinToken(ctx context.Context, hash, createdBy, node string, ttl time.Duration) (JoinToken, error) {
-	return scanJoinToken(s.q.QueryRow(ctx, `INSERT INTO join_tokens (hash, created_by, node_name, expires_at)
-		VALUES ($1, $2, $3, now() + $4::interval) RETURNING `+joinTokenCols, hash, createdBy, node, interval(ttl)))
+// CreateJoinToken stores a join token of kind (model.JoinKindNode or
+// model.JoinKindIngress) by its hash, valid for ttl from now(), pinned to
+// the node's or ingress's name unless name is "".
+func (s *Store) CreateJoinToken(ctx context.Context, hash, createdBy, kind, name string, ttl time.Duration) (JoinToken, error) {
+	return scanJoinToken(s.q.QueryRow(ctx, `INSERT INTO join_tokens (hash, created_by, kind, node_name, expires_at)
+		VALUES ($1, $2, $3, $4, now() + $5::interval) RETURNING `+joinTokenCols, hash, createdBy, kind, name, interval(ttl)))
 }
 
 // LockJoinToken reads a join token by its hash and locks it FOR UPDATE;

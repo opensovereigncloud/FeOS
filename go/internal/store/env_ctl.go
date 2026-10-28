@@ -243,6 +243,68 @@ func (s *Store) EnvCtlExisting(ctx context.Context, envs []uuid.UUID, sandboxes 
 	return e, sb, nil
 }
 
+// IngressInput is what the group ing-<sandbox id> of a sandbox is built
+// from (EnvCtlIngressInputs): the instance the sandbox is, as its
+// env_instances row has it; EnvID uuid.Nil when it has none.
+type IngressInput struct {
+	EnvID   uuid.UUID
+	Kind    string // "service", "addon", "job"
+	Object  string
+	Release int
+}
+
+// EnvCtlIngressInputs returns, for each of the ids that is a sandbox, what
+// its group ing-<id> is built from; an ID that is no sandbox is missing
+// from the map.
+func (s *Store) EnvCtlIngressInputs(ctx context.Context, ids []podid.ID) (map[podid.ID]IngressInput, error) {
+	out := map[podid.ID]IngressInput{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.q.Query(ctx, `SELECT s.id, i.env_id, coalesce(i.kind, ''), coalesce(i.object, ''),
+			coalesce(i.release, 0)
+		FROM sandboxes s LEFT JOIN env_instances i ON i.sandbox_id = s.id WHERE s.id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id podid.ID
+		var envID *uuid.UUID
+		var in IngressInput
+		if err := rows.Scan(&id, &envID, &in.Kind, &in.Object, &in.Release); err != nil {
+			return nil, err
+		}
+		in.EnvID = uuidOf(envID)
+		out[id] = in
+	}
+	return out, rows.Err()
+}
+
+// EnvCtlSandboxNodes returns the node of each of the ids that is a
+// sandbox ("" while it has none); an ID that is no sandbox is missing from
+// the map.
+func (s *Store) EnvCtlSandboxNodes(ctx context.Context, ids []podid.ID) (map[podid.ID]string, error) {
+	out := map[podid.ID]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.q.Query(ctx, "SELECT id, coalesce(node, '') FROM sandboxes WHERE id = ANY($1)", ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id podid.ID
+		var node string
+		if err := rows.Scan(&id, &node); err != nil {
+			return nil, err
+		}
+		out[id] = node
+	}
+	return out, rows.Err()
+}
+
 // existing runs sql, which selects those of the ids ($1) that have a row,
 // and returns them as a set.
 func existing[T comparable](ctx context.Context, q db.Querier, sql string, ids []T) (map[T]bool, error) {

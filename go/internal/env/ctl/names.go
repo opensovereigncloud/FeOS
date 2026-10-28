@@ -186,21 +186,28 @@ func tableDelta(have, want *networkv1.NameTable) ([]*networkv1.NameEntry, []stri
 	return put, remove
 }
 
+// parseTable reads a name table ID of the controller's: an env or an sbx
+// group's ID (EnvTableID, SandboxTableID); ok false for any other.
+func parseTable(id string) (groupRef, bool) {
+	ref, ok := parseGroup(id)
+	return ref, ok && (ref.kind == groupEnv || ref.kind == groupSbx)
+}
+
 // buildTable is a name table as the database says it should be, with the
 // tables it includes. An env table of an environment that has no release
 // or is being deleted holds no names.
 func (c *Controller) buildTable(ctx context.Context, id string) (*networkv1.NameTable, []string, error) {
-	isEnv, u, sbx, ok := parseGroup(id)
+	ref, ok := parseTable(id)
 	if !ok {
 		return nil, nil, fmt.Errorf("%s is not a name table of the environments", id)
 	}
-	if isEnv {
-		if _, err := c.st.GetEnvironment(ctx, u); errors.Is(err, store.ErrNoRow) {
+	if ref.kind == groupEnv {
+		if _, err := c.st.GetEnvironment(ctx, ref.env); errors.Is(err, store.ErrNoRow) {
 			return nil, nil, errNoGroup
 		} else if err != nil {
 			return nil, nil, err
 		}
-		v, err := c.load(ctx, u)
+		v, err := c.load(ctx, ref.env)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -210,12 +217,12 @@ func (c *Controller) buildTable(ctx context.Context, id string) (*networkv1.Name
 		}
 		return newTable(id, names, nil), nil, nil
 	}
-	if _, err := c.st.GetSandbox(ctx, sbx); errors.Is(err, model.ErrNotFound) {
+	if _, err := c.st.GetSandbox(ctx, ref.sbx); errors.Is(err, model.ErrNotFound) {
 		return nil, nil, errNoGroup
 	} else if err != nil {
 		return nil, nil, err
 	}
-	attached, err := c.st.EnvCtlAttachedIn(ctx, sbx)
+	attached, err := c.st.EnvCtlAttachedIn(ctx, ref.sbx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -422,11 +429,11 @@ func (c *Controller) syncNodeNames(ctx context.Context, node string, cache map[s
 		if _, wanted := want[id]; wanted {
 			continue
 		}
-		if isEnv, u, sbx, ok := parseGroup(id); ok {
-			if isEnv {
-				envs = append(envs, u)
+		if ref, ok := parseTable(id); ok {
+			if ref.kind == groupEnv {
+				envs = append(envs, ref.env)
 			} else {
-				sbxs = append(sbxs, sbx)
+				sbxs = append(sbxs, ref.sbx)
 			}
 		}
 	}

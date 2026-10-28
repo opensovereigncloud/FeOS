@@ -18,12 +18,13 @@ EnvironmentFile=/etc/ferun/ferund.env
 ExecStart=/usr/bin/ferund serve
 Restart=always
 RestartSec=5
-# On SIGTERM an instance keeps serving its requests and finishing its ops
-# for up to --shutdown-grace (10 minutes by default), then closes its node
-# connections. The stop timeout is that grace plus 30 s; a longer
-# FERUN_SHUTDOWN_GRACE needs a drop-in with a longer TimeoutStopSec, or
-# systemd kills ferund while tool calls are still in flight.
-TimeoutStopSec=630
+# On SIGTERM an instance keeps serving its requests and finishing its tool
+# calls and ops for up to --shutdown-grace (11 minutes by default), then
+# closes its node connections. The stop timeout is that grace plus 60 s;
+# a longer FERUN_SHUTDOWN_GRACE needs a drop-in with a longer
+# TimeoutStopSec, or systemd kills ferund while tool calls are still in
+# flight.
+TimeoutStopSec=720
 # ferund reads its CA directory and key files and writes nothing locally:
 # its state is in PostgreSQL.
 NoNewPrivileges=yes

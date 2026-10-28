@@ -1,4 +1,4 @@
-##@ Go (go/: ferund, ADR 0015)
+##@ Go (go/: ferund, ADR 0015; ferun-ingress, ADR 0021)
 
 GO_DIR := go
 GO_OUT := target/go
@@ -15,7 +15,7 @@ GO_MODULE := github.com/gardenlinux/feos/go
 GO_PROTOS := $(sort $(wildcard proto/feos/*/v1/*.proto))
 GO_PROTO_MAP := $(foreach p,$(GO_PROTOS),M$(patsubst proto/%,%,$(p))=$(GO_MODULE)/gen/$(patsubst proto/%/,%,$(dir $(p)));$(word 2,$(subst /, ,$(patsubst proto/%,%,$(p))))v1)
 
-.PHONY: go-gen go-build feos-k8s go-fmt-check go-vet go-lint go-test go-test-unit web
+.PHONY: go-gen go-build feos-k8s go-fmt-check go-vet go-lint go-test go-test-unit go-test-netns web
 
 $(LOCALBIN)/protoc-gen-go: | $(LOCALBIN)
 	GOBIN=$(LOCALBIN) $(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
@@ -35,9 +35,10 @@ go-gen: $(LOCALBIN)/protoc-gen-go $(LOCALBIN)/protoc-gen-go-grpc ## Generate go/
 		$(foreach m,$(GO_PROTO_MAP),'--go-grpc_opt=$(m)') \
 		$(GO_PROTOS)
 
-go-build: feos-k8s ## Build ferund, ferun-testnode and feos-k8s, static, into target/go/.
+go-build: feos-k8s ## Build ferund, ferun-ingress, ferun-testnode and feos-k8s, static, into target/go/.
 	mkdir -p $(GO_OUT)
 	cd $(GO_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -o ../$(GO_OUT)/ferund ./cmd/ferund
+	cd $(GO_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -o ../$(GO_OUT)/ferun-ingress ./cmd/ferun-ingress
 	cd $(GO_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -o ../$(GO_OUT)/ferun-testnode ./cmd/ferun-testnode
 
 feos-k8s: ## Build feos-k8s, the controller of FeOS on Kubernetes (ADR 0020), static, into target/go/.
@@ -58,6 +59,9 @@ go-test-unit: ## The Go tests that need no database: those that do skip.
 
 go-test: ## All Go tests, against a PostgreSQL in docker unless FERUN_TEST_DATABASE_URL names one.
 	hack/go/with-postgres sh -c 'cd $(GO_DIR) && $(GO) test -count=1 ./...'
+
+go-test-netns: ## The WireGuard test of ferun-ingress in network namespaces of its own; needs sudo -n and WireGuard.
+	GO=$(GO) hack/go/netns-test
 
 web: ## Build the management UI into go/internal/ui/dist.
 	cd web && npm ci && npm run build

@@ -91,7 +91,10 @@ the connections the nodes open to it, mTLS both ways: it calls the node's
 API on one, the node reports telemetry and events on the other
 (ADR 0015). It is written in Go, in `go/`, with its management UI in
 `web/`; [architecture/control-plane.md](architecture/control-plane.md)
-describes it.
+describes it. A second program, `ferun-ingress`, carries the traffic of
+public environments' hosts: a peer on the pods' mesh that serves from
+what `ferund` streams to it, so that no application byte crosses
+`ferund` (ADR 0021, [architecture/ingress.md](architecture/ingress.md)).
 
 ### The contract
 
@@ -122,7 +125,7 @@ The guest's API is internal between `feosd` and `feos-guest`.
 - Confidential computing (TDX, SEV-SNP).
 - Point-in-time recovery: a snapshot is the latest state, not a history.
 
-## Where it stands (2026-10-27)
+## Where it stands (2026-10-28)
 
 | Part | State |
 |---|---|
@@ -132,8 +135,8 @@ The guest's API is internal between `feosd` and `feos-guest`.
 | `diskd` | the disk daemon (ADR 0011): ublk devices over sealed layers, a local cache and S3. Every pod has a disk from it, and hibernates into its object store: `HibernatePod` and `RestorePod`, here or on another node, with the pod's memory served lazily where the snapshot fits the node, and a boot on its disk where it does not (ADR 0008). Packaged beside `feosd`; no baked images, no sweep yet |
 | packages | `.deb` packages of `feosd`, `feosctl`, `diskd`, Firecracker and the guest, in a signed apt repository at apt.fecode.dev; `ferund`'s is published beside them |
 | control plane connections | `feosd --control-plane` (ADR 0015): joins with a one-time token, keeps its key and certificate and renews it, reports telemetry and its events (pods, start, stop) on the uplink, and serves its API on a node connection to every instance. The event buffer is in memory, not yet on disk; pods' credentials are not built |
-| control plane | `ferund` (ADR 0015), in Go: tenants and their tokens, sandboxes on the nodes with placement, ops that survive their callers, pause, hibernation and restore elsewhere, drains, the agent's tools over REST and MCP, ports and file watches, Kubernetes and SSH bindings (off until feosd delivers them), the fleet of nodes with joins, certificates, telemetry and events, human sign-in with OIDC and the management UI; replicas over PostgreSQL with a leader. It runs on Kubernetes, on k3s or on a Gardener shoot, where `feos-k8s` joins new nodes and drains replaced ones in FeRun (ADR 0020, [deploy/](../deploy/)) |
-| CaaS | partly built in `ferund` (ADR 0018): environments with services, jobs, addons (`postgres`, `valkey`, `nats` on volumes), routes and sealed secrets; numbered releases with a plan, compare-and-swap, revert and tags; image services rolled with a surge of one and scaled to zero, attached services in attachable sandboxes; names from the nodes' name tables, security groups, incidents, HTTP through `ferund`'s route door; the REST API and a read-only view in the UI. Not built: volumes for services, MCP tools and a CLI for environments, data on a clone, addon backups, an ingress |
+| control plane | `ferund` (ADR 0015), in Go: tenants and their tokens, sandboxes on the nodes with placement, ops that survive their callers, pause, hibernation and restore elsewhere, drains, the agent's tools over REST and MCP, ports and file watches, Kubernetes and SSH bindings (off until feosd delivers them), the fleet of nodes with joins, certificates, telemetry and events, human sign-in with OIDC and the management UI; replicas over PostgreSQL with a leader. It runs on Kubernetes, on k3s or on a Gardener shoot, where `feos-k8s` joins new nodes and drains replaced ones in FeRun (ADR 0020, [deploy/](../deploy/)). Beside it `ferun-ingress` (ADR 0021): instances that join with a token, take a /64 of the pods' mesh, keep the table `ferund` streams to them through an outage, and proxy public environments' hosts over HTTPS to the pods, gated by the nodes' security groups and the mesh's handshakes, holding idle services awake and waking sleeping ones; two on the Gardener shoot behind a balancer of their own |
+| CaaS | partly built in `ferund` (ADR 0018): environments with services, jobs, addons (`postgres`, `valkey`, `nats` on volumes), routes and sealed secrets; numbered releases with a plan, compare-and-swap, revert and tags; image services rolled with a surge of one and scaled to zero, attached services in attachable sandboxes; names from the nodes' name tables, security groups, incidents, HTTP through `ferund`'s route door with route tokens, and for environments their tenant made public (`PUT …/public`) through `ferun-ingress` at a default host under the apps zone, with an operator's wildcard certificate; the REST API and a read-only view in the UI. Not built: volumes for services, MCP tools and a CLI for environments, data on a clone, addon backups, domains and their ACME certificates, the ingress's traffic records, L4 routes |
 
 ## Glossary
 

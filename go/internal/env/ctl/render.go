@@ -219,7 +219,10 @@ func (c *Controller) planAddon(v *view, name string, a spec.Addon, vol *store.En
 
 // planImage renders an image service or a job of the target: its pod is
 // a member of the env group and resolves the env table's names (an
-// addon's pod reaches nothing by name, and names no table).
+// addon's pod reaches nothing by name, and names no table). An image
+// service's pod of an environment that was ever public also names its own
+// group ing-<sandbox id> (IngressGroup; the insert appends the group), so
+// that the first publish rolls the service once and later ones never.
 func (c *Controller) planImage(v *view, kind, name, image string, command []string, env map[string]spec.EnvValue,
 	res *spec.Resources) *podPlan {
 	p := &podPlan{kind: kind, name: name, image: image}
@@ -234,6 +237,7 @@ func (c *Controller) planImage(v *view, kind, name, image string, command []stri
 		Env:            vals,
 		SecurityGroups: []string{model.EnvGroupID(v.env.ID)},
 		NameTables:     []string{model.EnvTableID(v.env.ID)},
+		IngressGroup:   kind == spec.KindService && v.env.IngressGroup,
 	}
 	p.finish(v.env.ID)
 	return p

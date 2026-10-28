@@ -129,6 +129,29 @@ func TestMigrateAndJoinToken(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("wrong trust domain: exit %d", code)
 	}
+
+	// --kind ingress issues a token for an instance of ferun-ingress.
+	code, out, errOut = runCmd([]string{"join-token", "--database-url", url, "--ca-dir", dir, "--trust-domain",
+		"run.example.test", "--kind", "ingress", "--node", "ferun-ingress-0"}, noEnv)
+	if code != 0 {
+		t.Fatalf("join-token --kind ingress: exit %d %s", code, errOut)
+	}
+	if !strings.HasPrefix(errOut, "ingress join token ") || !strings.Contains(errOut, "for ingress ferun-ingress-0") {
+		t.Fatalf("stderr %q", errOut)
+	}
+	sent, _, err = pki.SplitIngressJoinToken(strings.TrimSpace(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	toks, err = store.New(d).ListJoinTokens(ctx)
+	if err != nil || len(toks) != 2 || toks[0].Hash != pki.HashJoinSecret(sent) || toks[0].Kind != "ingress" ||
+		toks[0].NodeName != "ferun-ingress-0" || toks[1].Kind != "node" {
+		t.Fatalf("tokens %+v %v", toks, err)
+	}
+	if code, _, errOut = runCmd([]string{"join-token", "--database-url", url, "--ca-dir", dir, "--kind", "pod"}, noEnv); code != 2 ||
+		!strings.Contains(errOut, "--kind") {
+		t.Fatalf("--kind pod: exit %d %s", code, errOut)
+	}
 }
 
 func TestCommandLine(t *testing.T) {

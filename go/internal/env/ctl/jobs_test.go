@@ -341,12 +341,11 @@ func rollingSince(t *testing.T, h *harness, envID uuid.UUID, n int) time.Time {
 }
 
 // webAndMigrate is a spec with a service web (its rollout budget, more
-// fields in extra) and a release job migrate of command (its timeout
-// 15 s).
-func webAndMigrate(command, version, rollout, extra string) string {
-	return fmt.Sprintf(`{"jobs":{"migrate":{"image":%q,"command":["/app","migrate",%q],"timeout":"15s"}},
+// fields in extra) and a release job migrate of command with its timeout.
+func webAndMigrate(command, timeout, version, rollout, extra string) string {
+	return fmt.Sprintf(`{"jobs":{"migrate":{"image":%q,"command":["/app","migrate",%q],"timeout":%q}},
 		"services":{"web":{"image":%q,"command":["/app"],"env":{"VERSION":%q},"rollout":{"timeout":%q}%s}}}`,
-		testImage, command, testImage, version, rollout, extra)
+		testImage, command, timeout, testImage, version, rollout, extra)
 }
 
 // The time a release waited for another release's run of its job moves
@@ -361,11 +360,17 @@ func TestReleaseJobWaitShiftsTheRolloutBudget(t *testing.T) {
 	failed := func(n int) func() bool {
 		return func() bool { return h.release(env.ID, n).State == model.ReleaseFailed }
 	}
-	h.apply(env.ID, webAndMigrate("v1", "1", "10s", ""))
+	// The test ends the runs itself, up to 11 s into the next release,
+	// which starts some time after the run (seconds under load); the
+	// target's job timeout bounds every run, so it is far longer than
+	// that. Web's budget, not the release's deadline, is what the test is
+	// about.
+	const job = "60s"
+	h.apply(env.ID, webAndMigrate("v1", job, "1", "10s", ""))
 	first := runningJob(t, h, env.ID)
 	// A changed job: release 1's run ends 9 s into release 2, whose own
 	// run then succeeds at once, near web's 10 s from release 2's start.
-	r2 := h.apply(env.ID, webAndMigrate("v2", "2", "10s", ""))
+	r2 := h.apply(env.ID, webAndMigrate("v2", job, "2", "10s", ""))
 	started := rollingSince(t, h, env.ID, r2)
 	time.Sleep(time.Until(started.Add(9 * time.Second)))
 	if err := n1.Script().ExitContainer(first, "main", 1); err != nil {
@@ -381,13 +386,13 @@ func TestReleaseJobWaitShiftsTheRolloutBudget(t *testing.T) {
 
 	// The same template: release 3's run succeeds 11 s into release 4,
 	// past web's 10 s from release 4's start, and serves it.
-	r3 := h.apply(env.ID, webAndMigrate("v3", "3", "10s", ""))
+	r3 := h.apply(env.ID, webAndMigrate("v3", job, "3", "10s", ""))
 	eventually(t, 10*time.Second, "release 3's run", func() bool {
 		r, err := h.st.LatestJobRun(bg, env.ID, "migrate")
 		return err == nil && r.Release == r3 && r.Phase == model.RunRunning
 	})
 	third := runningJob(t, h, env.ID)
-	r4 := h.apply(env.ID, webAndMigrate("v3", "4", "10s", ""))
+	r4 := h.apply(env.ID, webAndMigrate("v3", job, "4", "10s", ""))
 	started = rollingSince(t, h, env.ID, r4)
 	time.Sleep(time.Until(started.Add(11 * time.Second)))
 	if err := n1.Script().ExitContainer(third, "main", 0); err != nil {
@@ -417,9 +422,9 @@ func TestReleaseJobWaitShiftsTheDeadline(t *testing.T) {
 	env := h.newEnv("stage")
 	// Web's budget and the job's timeout are 15 s, and so the deadline.
 	const check = `,"readiness":{"exec":{"command":["check"]},"period":"1s"}`
-	h.apply(env.ID, webAndMigrate("v1", "1", "15s", check))
+	h.apply(env.ID, webAndMigrate("v1", "15s", "1", "15s", check))
 	first := runningJob(t, h, env.ID)
-	r2 := h.apply(env.ID, webAndMigrate("v2", "2", "15s", check))
+	r2 := h.apply(env.ID, webAndMigrate("v2", "15s", "2", "15s", check))
 	started := rollingSince(t, h, env.ID, r2)
 	time.Sleep(time.Until(started.Add(9 * time.Second)))
 	if err := n1.Script().ExitContainer(first, "main", 1); err != nil {

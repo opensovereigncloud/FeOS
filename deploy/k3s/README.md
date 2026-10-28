@@ -25,6 +25,9 @@ DaemonSet itself. feosd connects out to ferund; no node opens a port.
 
 ## What it needs
 
+- Kubernetes 1.27 or newer (k3s v1.27+): the manifests use topology
+  spread constraints with matchLabelKeys and nodeTaintsPolicy, and a
+  PodDisruptionBudget with unhealthyPodEvictionPolicy.
 - k3s with its traefik, and cert-manager with a ClusterIssuer
   `letsencrypt-prod`, which answers HTTP-01 through traefik or DNS-01 as
   [`../gardener/cluster.yaml`](../gardener/cluster.yaml) does.
@@ -107,6 +110,12 @@ its group `admins` (the `groups` claim) gets the admin surface.
     make -C deploy/k3s push-ferund apply-ferun    # build and push the image, apply
 
 Afterwards, a new image: `make -C deploy/k3s deploy-ferund`.
+
+ferund rolls one instance at a time: the new one starts first and takes
+requests once /readyz passes (normally when the nodes have dialled it, at
+the latest 30 s after its start); a PodDisruptionBudget lets a drain stop
+one instance at a time. On more machines, raise replicas over a
+replicated database, as [`../gardener/ferun`](../gardener/ferun) does.
 
 ## Nodes
 

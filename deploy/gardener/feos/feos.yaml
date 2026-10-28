@@ -24,10 +24,11 @@ metadata:
   name: feos-node
   namespace: feos
 data:
-  # What pods may not reach: RFC 1918 and CGNAT (100.64/10), which hold
-  # the shoot's networks, its nodes', pods' and services'
-  # (spec.networking). Add a prefix for one that is elsewhere.
-  DENY_PREFIXES: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
+  # What pods may not reach: the shoot's networks, its nodes', pods' and
+  # services' (spec.networking), and the private ranges. No default:
+  # config.env.example says where the shoot's networks are, and make
+  # apply-feos checks that none is left out.
+  DENY_PREFIXES: "${DENY_PREFIXES}"
   # The chunk cache, 12 GiB, for workers with a 50 GiB root, which holds
   # the pods' disks too. 64 streams to the object store.
   DISKD_ARGS: "--budget-bytes 12884901888 --s3-concurrency 64"

@@ -161,6 +161,8 @@ type harness struct {
 type harnessOptions struct {
 	noSealer bool
 	noPorts  bool
+	// appsZone is Deps.AppsZone.
+	appsZone string
 }
 
 func newHarness(t *testing.T, o harnessOptions) *harness {
@@ -168,7 +170,7 @@ func newHarness(t *testing.T, o harnessOptions) *harness {
 	d := dbtest.New(t)
 	st := store.New(d)
 	h := &harness{t: t, d: d, st: st, eng: &fakeEngine{bad: map[string]string{}}, ports: &fakePorts{}}
-	deps := Deps{InstanceID: "i1", DB: d, Store: st, Engine: h.eng, Log: dbtest.Logger(t)}
+	deps := Deps{InstanceID: "i1", DB: d, Store: st, Engine: h.eng, AppsZone: o.appsZone, Log: dbtest.Logger(t)}
 	if !o.noSealer {
 		sl, err := seal.New(make([]byte, 32))
 		if err != nil {

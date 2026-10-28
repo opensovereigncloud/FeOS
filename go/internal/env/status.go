@@ -22,10 +22,13 @@ import (
 // instances (env_instances with their sandbox rows: state, node,
 // address), attached services (env_attached) and jobs' latest runs
 // (env_job_runs); the routes of its realised release (the latest when
-// none is realised); and its open incidents. It reads only.
+// none is realised), with the doors that serve them; and its open
+// incidents. It reads only.
 func (s *Service) status(ctx context.Context, e store.Environment) (EnvStatus, error) {
+	hosts := hostsOf(e, s.d.AppsZone)
 	st := EnvStatus{ID: e.ID.String(), Name: e.Name, Labels: e.Labels, Release: e.Release, Realised: e.Realised,
-		Deleting: e.Deleting, Objects: []ObjectStatus{}, Routes: []RouteStatus{}, CreatedAt: rfc3339(e.CreatedAt)}
+		Deleting: e.Deleting, Public: e.Public, Hosts: hosts, Objects: []ObjectStatus{}, Routes: []RouteStatus{},
+		CreatedAt: rfc3339(e.CreatedAt)}
 	if st.Labels == nil {
 		st.Labels = map[string]string{}
 	}
@@ -72,7 +75,7 @@ func (s *Service) status(ctx context.Context, e store.Environment) (EnvStatus, e
 		return EnvStatus{}, fmt.Errorf("job runs: %w", err)
 	}
 	st.Objects = objectsOf(targetSpec, instances, attached, runs)
-	st.Routes = routesOf(routeSpec)
+	st.Routes = routesOf(routeSpec, hosts)
 	return st, nil
 }
 
@@ -159,19 +162,38 @@ func instanceStatus(row store.EnvInstanceRow) InstanceStatus {
 		ReadySince: rfc3339(i.ReadySince), Detail: detail}
 }
 
-// routesOf are a spec's routes by name, their ports resolved.
-func routesOf(sp *spec.Spec) []RouteStatus {
+// routesOf are a spec's routes by name, their ports resolved, each with
+// its door: the ingress serves a route to an image service at the first
+// of hosts (the environment's hosts, hostsOf), the route door alone every
+// other route.
+func routesOf(sp *spec.Spec, hosts []string) []RouteStatus {
 	out := []RouteStatus{}
 	for _, name := range slices.Sorted(maps.Keys(sp.Routes)) {
 		r := sp.Routes[name]
-		port, _ := spec.PortNumber(sp.Services[r.Service].Ports, r.Port)
-		out = append(out, RouteStatus{Name: name, Path: r.Path, Service: r.Service, Port: port})
+		target, ok := sp.Services[r.Service]
+		port, _ := spec.PortNumber(target.Ports, r.Port)
+		rs := RouteStatus{Name: name, Path: r.Path, Service: r.Service, Port: port, Door: DoorRoute}
+		if len(hosts) > 0 && ok && !spec.IsAttached(target) {
+			rs.Door, rs.URL = DoorIngress, "https://"+hosts[0]+spec.RoutePrefix(r.Path)
+		}
+		out = append(out, rs)
 	}
 	return out
 }
 
-// summaryOf is an environment as its tenant's listing shows it.
-func summaryOf(r store.EnvSummaryRow) EnvSummary {
+// hostsOf are the hosts the ingress serves environment e at: its default
+// host under zone while it is public and zone is set; none otherwise, and
+// none while it is being deleted, which the ingress no longer serves.
+func hostsOf(e store.Environment, zone string) []string {
+	if !e.Public || zone == "" || e.HostLabel == "" || e.Deleting {
+		return []string{}
+	}
+	return []string{e.HostLabel + "." + zone}
+}
+
+// summaryOf is an environment as its tenant's listing shows it, with its
+// hosts under zone.
+func summaryOf(r store.EnvSummaryRow, zone string) EnvSummary {
 	state := r.ReleaseState
 	switch {
 	case r.Deleting:
@@ -184,7 +206,8 @@ func summaryOf(r store.EnvSummaryRow) EnvSummary {
 		labels = map[string]string{}
 	}
 	return EnvSummary{ID: r.ID.String(), Name: r.Name, Labels: labels, Release: r.Release, Realised: r.Realised,
-		State: state, OpenIncidents: int(r.OpenIncidents), CreatedAt: rfc3339(r.CreatedAt)}
+		State: state, Public: r.Public, Hosts: hostsOf(r.Environment, zone), OpenIncidents: int(r.OpenIncidents),
+		CreatedAt: rfc3339(r.CreatedAt)}
 }
 
 // incidentOf is an incident as the answers show it.

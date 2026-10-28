@@ -10,26 +10,16 @@ import (
 	"net/netip"
 	"syscall"
 	"time"
+
+	"github.com/gardenlinux/feos/go/internal/config"
 )
 
 // DefaultDenyPrefixes is the destination deny set when --deny-prefix names
-// none: the private, shared, link-local, loopback, "this network",
-// multicast and reserved IPv4 ranges. A binding's server is external by
-// definition; the platform's own networks are infrastructure no binding
-// may name.
-func DefaultDenyPrefixes() []netip.Prefix {
-	return []netip.Prefix{
-		netip.MustParsePrefix("10.0.0.0/8"),
-		netip.MustParsePrefix("172.16.0.0/12"),
-		netip.MustParsePrefix("192.168.0.0/16"),
-		netip.MustParsePrefix("100.64.0.0/10"),
-		netip.MustParsePrefix("169.254.0.0/16"),
-		netip.MustParsePrefix("127.0.0.0/8"),
-		netip.MustParsePrefix("0.0.0.0/8"),
-		netip.MustParsePrefix("224.0.0.0/4"),
-		netip.MustParsePrefix("240.0.0.0/4"),
-	}
-}
+// none: config.DefaultDenyPrefixes, the private, shared, link-local,
+// loopback, "this network", multicast and reserved IPv4 ranges. A
+// binding's server is external by definition; the platform's own networks
+// are infrastructure no binding may name.
+func DefaultDenyPrefixes() []netip.Prefix { return config.DefaultDenyPrefixes() }
 
 // DenyPolicy is the destination rule of bindings and preflights as a
 // function, for the control plane's other outbound clients (the image

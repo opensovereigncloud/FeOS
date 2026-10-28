@@ -78,7 +78,7 @@ type PodTemplate struct {
 	// Mounts are the volumes the container mounts.
 	Mounts []TemplateMount `json:"mounts,omitempty"`
 	// SecurityGroups are the pod's security groups (EnvGroupID,
-	// SandboxGroupID); none: feosd's default group.
+	// SandboxGroupID, IngressGroupID); none: feosd's default group.
 	SecurityGroups []string `json:"securityGroups,omitempty"`
 	// NameTables are the name tables whose names feosd's resolver answers
 	// the pod (EnvTableID, SandboxTableID), in order; none: no names but
@@ -87,6 +87,14 @@ type PodTemplate struct {
 	// Labels are added to the sandbox labels (which win on a clash).
 	// Hash leaves them out.
 	Labels map[string]string `json:"labels,omitempty"`
+	// IngressGroup: the pod is an image service's of an environment that
+	// was ever public (environments.ingress_group), and names its own
+	// group IngressGroupID(<its sandbox ID>), which lets the ingress in on
+	// the routed ports while the environment is public. The controller
+	// appends that group to the row's SecurityGroups when it inserts the
+	// row, where the ID is minted; the plan's template, which Hash takes,
+	// has the flag only.
+	IngressGroup bool `json:"ingressGroup,omitempty"`
 }
 
 // TemplateVolume is a volume of the pod (feos.volume.v1): its name in the
@@ -185,11 +193,11 @@ func (t PodTemplate) HasCredential() bool {
 // canonical JSON of what the pod runs, that is the image (pinned to its
 // digest), the resources, and the template without its labels (command,
 // env with secrets as name and version, volumes, mounts, security groups
-// in sorted order, name tables in order, and only when there are any, so
-// that a template without them hashes as before they were). Equal pods
-// hash equal: a nil and an empty list or map hash alike. What an instance
-// is not rebuilt for (its labels, the idle policy, the release) is not in
-// it.
+// in sorted order, then name tables in order and the ingress group flag,
+// each only when there are any or it is set, so that a template without
+// them hashes as before they were). Equal pods hash equal: a nil and an
+// empty list or map hash alike. What an instance is not rebuilt for (its
+// labels, the idle policy, the release) is not in it.
 func (t PodTemplate) Hash(image string, vcpus, memoryMiB int) string {
 	groups := slices.Clone(t.SecurityGroups)
 	slices.Sort(groups)
@@ -204,10 +212,11 @@ func (t PodTemplate) Hash(image string, vcpus, memoryMiB int) string {
 		Mounts         []TemplateMount          `json:"mounts"`
 		SecurityGroups []string                 `json:"securityGroups"`
 		NameTables     []string                 `json:"nameTables,omitempty"`
+		IngressGroup   bool                     `json:"ingressGroup,omitempty"`
 	}{
 		Scheme: 1, Image: image, VCPUs: vcpus, MemoryMiB: memoryMiB,
 		Command: nonNil(t.Command), Env: t.Env, Volumes: nonNil(t.Volumes), Mounts: nonNil(t.Mounts),
-		SecurityGroups: nonNil(groups), NameTables: t.NameTables,
+		SecurityGroups: nonNil(groups), NameTables: t.NameTables, IngressGroup: t.IngressGroup,
 	}
 	if h.Env == nil {
 		h.Env = map[string]TemplateValue{}

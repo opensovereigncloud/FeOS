@@ -55,7 +55,8 @@ type envOptions struct {
 	fleet      interface {
 		IssueJoinToken(ctx context.Context, createdBy, node string, ttl time.Duration) (uuid.UUID, string, time.Time, error)
 	}
-	ready func(context.Context) error
+	ingress Ingress
+	ready   func(context.Context) error
 	// db shares another env's database (a second instance).
 	db *db.DB
 	// environments builds the environments service on the test's
@@ -117,6 +118,7 @@ func newEnv(t *testing.T, o envOptions) *env {
 	deps := Deps{
 		DB: d, Store: st, Engine: eng, Conns: e.conns, Fleet: o.fleet, Tools: tools.NewREST(runner),
 		Specs: tools.Specs, MCP: o.mcp, Ports: o.ports, Watches: o.watches, Bindings: o.bindings, Ready: o.ready,
+		Ingress: o.ingress,
 	}
 	if o.environments != nil {
 		deps.Environments = o.environments(d, st)

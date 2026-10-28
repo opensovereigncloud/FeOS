@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -111,15 +112,46 @@ func (s *Store) ListTenants(ctx context.Context) ([]TenantInfo, error) {
 
 // MarkTenantDeleting starts a tenant's deletion: deleting_at = now()
 // unless set, and every tenant token deleted, so that its requests and its
-// sandbox tokens stop resolving at once. The caller holds the tenant's row
+// sandbox tokens stop resolving at once. Setting deleting_at takes the
+// tenant's environments out of the ingress's table, so it sends
+// ferun_ingress "env:<id>" for each of them ("*" for more than
+// notifyBatch), all in one transaction. The caller holds the tenant's row
 // FOR UPDATE. It reports whether the tenant exists.
 func (s *Store) MarkTenantDeleting(ctx context.Context, id string) (bool, error) {
-	tag, err := s.q.Exec(ctx, "UPDATE tenants SET deleting_at = coalesce(deleting_at, now()) WHERE id = $1", id)
-	if err != nil || tag.RowsAffected() == 0 {
+	var exists bool
+	err := s.InTx(ctx, func(tx *Store) error {
+		exists = false
+		var started bool
+		err := tx.q.QueryRow(ctx, `WITH old AS (SELECT deleting_at FROM tenants WHERE id = $1)
+			UPDATE tenants SET deleting_at = coalesce(tenants.deleting_at, now()) WHERE id = $1
+			RETURNING (SELECT deleting_at IS NULL FROM old)`, id).Scan(&started)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		exists = true
+		if _, err := tx.q.Exec(ctx, "DELETE FROM tenant_tokens WHERE tenant_id = $1", id); err != nil {
+			return err
+		}
+		if !started {
+			return nil
+		}
+		rows, err := tx.q.Query(ctx, "SELECT id FROM environments WHERE owner = $1", id)
+		if err != nil {
+			return err
+		}
+		envs, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+		if err != nil {
+			return err
+		}
+		return tx.notifyIngressEnvs(ctx, envs)
+	})
+	if err != nil {
 		return false, err
 	}
-	_, err = s.q.Exec(ctx, "DELETE FROM tenant_tokens WHERE tenant_id = $1", id)
-	return true, err
+	return exists, nil
 }
 
 // DeleteTenantIfEmpty removes the tenant when it has no sandboxes and no

@@ -271,4 +271,30 @@ func TestEnvCtlQueries(t *testing.T) {
 	if envs, sbs, err := s.EnvCtlExisting(bg, nil, nil); err != nil || len(envs) != 0 || len(sbs) != 0 {
 		t.Fatalf("existing of none %v %v %v", envs, sbs, err)
 	}
+
+	// The inputs of ing groups: an instance's environment, kind, object
+	// and release; a sandbox without an instance row with none; a sandbox
+	// that is gone missing.
+	if _, err := s.InsertEnvInstance(bg, store.EnvInstance{SandboxID: a.ID, EnvID: env.ID, Kind: "service", Object: "web",
+		TemplateHash: "h", Release: 3}); err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := s.EnvCtlIngressInputs(bg, []podid.ID{a.ID, b.ID, sbx.ID, goneSbx, goneLegacy})
+	if err != nil || len(inputs) != 3 ||
+		inputs[a.ID] != (store.IngressInput{EnvID: env.ID, Kind: "service", Object: "web", Release: 3}) ||
+		inputs[b.ID] != (store.IngressInput{}) || inputs[sbx.ID] != (store.IngressInput{}) {
+		t.Fatalf("ingress inputs %+v %v", inputs, err)
+	}
+	if inputs, err := s.EnvCtlIngressInputs(bg, nil); err != nil || len(inputs) != 0 {
+		t.Fatalf("ingress inputs of none %+v %v", inputs, err)
+	}
+	// The sandboxes' nodes: "" while a sandbox has none; a sandbox that
+	// is gone missing.
+	nodes, err := s.EnvCtlSandboxNodes(bg, []podid.ID{a.ID, b.ID, goneSbx, goneLegacy})
+	if err != nil || len(nodes) != 2 || nodes[a.ID] != "n1" || nodes[b.ID] != "" {
+		t.Fatalf("sandbox nodes %v %v", nodes, err)
+	}
+	if nodes, err := s.EnvCtlSandboxNodes(bg, nil); err != nil || len(nodes) != 0 {
+		t.Fatalf("sandbox nodes of none %v %v", nodes, err)
+	}
 }

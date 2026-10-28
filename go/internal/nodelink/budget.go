@@ -97,18 +97,38 @@ func streamKind(method string) callKind {
 	return callLong
 }
 
+// RefusalError is the nodes' port's own refusal of a call, made before
+// the call reached a node connection, so no byte of it left this
+// instance: the node has no current connection here, or its connection
+// is closing (codes.Unavailable), or a budget is exhausted
+// (codes.ResourceExhausted). It reads and converts like its status's
+// error. A status that a node sends back is never a RefusalError, even
+// with the same code and text, so errors.As tells the two apart.
+type RefusalError struct{ Status *status.Status }
+
+func (e *RefusalError) Error() string { return e.Status.Err().Error() }
+
+// GRPCStatus lets status.Code, status.FromError and status.Convert see
+// the refusal's status.
+func (e *RefusalError) GRPCStatus() *status.Status { return e.Status }
+
+// refusef makes a RefusalError.
+func refusef(code codes.Code, format string, a ...any) error {
+	return &RefusalError{Status: status.Newf(code, format, a...)}
+}
+
 // reserveLocked takes a call's slot on l, or fails with the budget's
-// error.
+// refusal.
 func (s *Server) reserveLocked(l *link, kind callKind) error {
 	switch kind {
 	case callLong:
 		if l.long >= s.longBudget {
-			return status.Errorf(codes.ResourceExhausted, "node %s: stream budget exhausted", l.node)
+			return refusef(codes.ResourceExhausted, "node %s: stream budget exhausted", l.node)
 		}
 		l.long++
 	case callTool:
 		if l.tools >= s.toolBudget {
-			return status.Errorf(codes.ResourceExhausted, "node %s: tool budget exhausted", l.node)
+			return refusef(codes.ResourceExhausted, "node %s: tool budget exhausted", l.node)
 		}
 		l.tools++
 	case callLifecycle:
@@ -175,7 +195,7 @@ func (c *nodeConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method 
 			c.s.mu.Unlock()
 			cancel()
 			c.s.release(l, kind)
-			return nil, status.Errorf(codes.Unavailable, "node %s: connection is closing", c.node)
+			return nil, refusef(codes.Unavailable, "node %s: connection is closing", c.node)
 		}
 		l.streamSeq++
 		id = l.streamSeq

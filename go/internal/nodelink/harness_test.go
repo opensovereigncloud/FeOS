@@ -30,6 +30,7 @@ import (
 	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
 	portforwardv1 "github.com/gardenlinux/feos/go/gen/feos/portforward/v1"
 	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
+	"github.com/gardenlinux/feos/go/internal/ingress/wire"
 	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
@@ -135,15 +136,17 @@ func (c *checker) count(serial string, atAccept bool) int {
 	return n
 }
 
-// env is an instance's nodes' port with an in-test CA, checker and
-// FleetService stubs.
+// env is an instance's nodes' port with an in-test CA, checkers, and
+// FleetService and IngressService stubs.
 type env struct {
 	t        *testing.T
 	iss      *pki.Issuer
 	srv      *Server
 	chk      *checker
+	ichk     *checker // CheckIngress; every call counts as at accept
 	logs     *logs
 	fleet    *fleetStub
+	isvc     *ingressStub
 	served   chan error
 	cancel   context.CancelFunc
 	mu       sync.Mutex
@@ -188,8 +191,9 @@ func newEnv(t *testing.T, opts ...envOpt) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, iss: iss, logs: &logs{msgs: map[string]int{}}, fleet: &fleetStub{},
-		chk: &checker{answers: map[string]answer{}, recheck: map[string]answer{}}, served: make(chan error, 1)}
+	e := &env{t: t, iss: iss, logs: &logs{msgs: map[string]int{}}, fleet: &fleetStub{}, isvc: &ingressStub{},
+		chk:  &checker{answers: map[string]answer{}, recheck: map[string]answer{}},
+		ichk: &checker{answers: map[string]answer{}, recheck: map[string]answer{}}, served: make(chan error, 1)}
 	cfg := Config{
 		Addr:             "127.0.0.1:0",
 		TrustDomain:      testTD,
@@ -209,6 +213,9 @@ func newEnv(t *testing.T, opts ...envOpt) *env {
 			e.mu.Lock()
 			e.nodeConn = append(e.nodeConn, node)
 			e.mu.Unlock()
+		},
+		CheckIngress: func(ctx context.Context, name, serial, addr string) (time.Time, error) {
+			return e.ichk.check(ctx, name, serial, addr, true)
 		},
 		Log: slog.New(e.logs),
 	}
@@ -232,6 +239,8 @@ func newEnv(t *testing.T, opts ...envOpt) *env {
 	}
 	fleetv1.RegisterFleetServiceServer(srv.Uplink(), e.fleet)
 	fleetv1.RegisterFleetServiceServer(srv.Join(), joins)
+	wire.RegisterIngressServer(srv.Ingress(), e.isvc)
+	wire.RegisterIngressServer(srv.IngressJoin(), e.isvc)
 	e.srv = srv
 	ctx, cancel := context.WithCancel(context.Background())
 	e.cancel = cancel
@@ -274,6 +283,18 @@ type tnode struct {
 
 func (e *env) node(name string, ttl time.Duration) *tnode {
 	e.t.Helper()
+	return e.identity(name, ttl, e.iss.IssueNode)
+}
+
+// ingress is a ferun-ingress instance's identity: its certificate, issued
+// as the ingress service issues it, and key.
+func (e *env) ingress(name string, ttl time.Duration) *tnode {
+	e.t.Helper()
+	return e.identity(name, ttl, e.iss.IssueIngress)
+}
+
+func (e *env) identity(name string, ttl time.Duration, issue func([]byte, string, time.Duration) (*fleetv1.Certificate, *x509.Certificate, error)) *tnode {
+	e.t.Helper()
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		e.t.Fatal(err)
@@ -282,7 +303,7 @@ func (e *env) node(name string, ttl time.Duration) *tnode {
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	pc, leaf, err := e.iss.IssueNode(csr, name, ttl)
+	pc, leaf, err := issue(csr, name, ttl)
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -458,6 +479,129 @@ func (u *uplink) dials() int {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	return len(u.conns)
+}
+
+// ingressSide is a ferun-ingress instance's channel to the port, from n
+// (nil: without a certificate); every dial is a new TLS connection with
+// ALPN ferun-ingress/1, recorded in conns.
+type ingressSide struct {
+	cc    *grpc.ClientConn
+	mu    sync.Mutex
+	conns []*watchedConn
+	api   *wire.Client
+}
+
+func (e *env) dialIngress(n *tnode) *ingressSide {
+	e.t.Helper()
+	is := &ingressSide{}
+	cfg := e.tlsConfig(n, ALPNIngress)
+	cc, err := grpc.NewClient("passthrough:///"+serverName,
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			c, err := (&tls.Dialer{Config: cfg}).DialContext(ctx, "tcp", e.addr())
+			if err != nil {
+				return nil, err
+			}
+			w := watch(c)
+			is.mu.Lock()
+			is.conns = append(is.conns, w)
+			is.mu.Unlock()
+			return w, nil
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 15 * time.Second, Timeout: 5 * time.Second, PermitWithoutStream: true}),
+	)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.t.Cleanup(func() { cc.Close() })
+	is.cc = cc
+	is.api = wire.NewClient(cc)
+	return is
+}
+
+func (is *ingressSide) dials() int {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	return len(is.conns)
+}
+
+// conn is the i-th connection dialled.
+func (is *ingressSide) conn(i int) *watchedConn {
+	is.mu.Lock()
+	defer is.mu.Unlock()
+	return is.conns[i]
+}
+
+// hello calls Hello.
+func (is *ingressSide) hello() (*wire.HelloResponse, error) {
+	return is.api.Hello(context.Background(), &wire.HelloRequest{Version: "test"})
+}
+
+// waitClosed waits until the i-th connection is closed.
+func (is *ingressSide) waitClosed(t *testing.T, i int, within time.Duration) {
+	t.Helper()
+	select {
+	case <-is.conn(i).closed:
+	case <-time.After(within):
+		t.Fatalf("ingress connection %d not closed within %v", i, within)
+	}
+}
+
+func (is *ingressSide) isClosed(i int) bool {
+	select {
+	case <-is.conn(i).closed:
+		return true
+	default:
+		return false
+	}
+}
+
+// ingressStub is the IngressService of both ingress servers: Join answers
+// with the name, Hello with the IngressPeer that nodelink put into the
+// context (and records it), Sync sends one whole table and runs until it
+// ends, Hold answers with the number of IDs it got.
+type ingressStub struct {
+	wire.UnimplementedIngressServer
+	mu    sync.Mutex
+	peers []IngressPeer
+}
+
+func (s *ingressStub) Join(_ context.Context, req *wire.JoinRequest) (*wire.JoinResponse, error) {
+	return &wire.JoinResponse{Name: req.Name}, nil
+}
+
+func (s *ingressStub) Hello(ctx context.Context, _ *wire.HelloRequest) (*wire.HelloResponse, error) {
+	p, ok := IngressFromContext(ctx)
+	if !ok {
+		return nil, errors.New("no ingress peer")
+	}
+	s.mu.Lock()
+	s.peers = append(s.peers, p)
+	s.mu.Unlock()
+	return &wire.HelloResponse{Name: p.Name, Instance: p.Serial}, nil
+}
+
+func (s *ingressStub) Sync(_ *wire.SyncRequest, ss wire.SyncServer) error {
+	p, ok := IngressFromContext(ss.Context())
+	if !ok {
+		return errors.New("no ingress peer")
+	}
+	if err := ss.Send(&wire.Table{Seq: 1, Whole: true, Self: &wire.Self{Name: p.Name}}); err != nil {
+		return err
+	}
+	<-ss.Context().Done()
+	return nil
+}
+
+func (s *ingressStub) Hold(_ context.Context, req *wire.HoldRequest) (*wire.HoldResponse, error) {
+	return &wire.HoldResponse{LeaseSeconds: len(req.Hold)}, nil
+}
+
+// seen returns the IngressPeers Hello got, in order.
+func (s *ingressStub) seen() []IngressPeer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]IngressPeer(nil), s.peers...)
 }
 
 // fleetStub is the uplink server's FleetService: it answers with the Peer

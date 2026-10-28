@@ -3,7 +3,10 @@
 
 # The image of ferund, FeRun (ADR 0015): the management UI (web/) built
 # and embedded, ferund built static, on a distroless base, as a non-root
-# user. The build context is the repository's root, which holds both:
+# user. It carries ferun-ingress as well (ADR 0021), built static into
+# /ferun-ingress: its pods run the same image with the entrypoint
+# /ferun-ingress. The build context is the repository's root, which holds
+# both:
 #
 #   docker build -f go/Dockerfile -t ferund .
 #
@@ -13,6 +16,13 @@
 # termination grace period (Kubernetes: terminationGracePeriodSeconds) to
 # at least --shutdown-grace plus 30 s; the default of 30 s would kill
 # ferund long before the tool calls in flight end.
+#
+# ferun-ingress runs as root with NET_ADMIN (its WireGuard device), which
+# its pod's securityContext sets over the image's user; its init
+# container runs `/ferun-ingress prepare`, privileged. On SIGTERM it serves
+# on for --shutdown-delay (10 s), then waits for its requests for up to
+# --shutdown-grace (40 s) and releases its holds within 2 s: its pods set a
+# termination grace above the sum, 60 s.
 
 # The management UI. The stage keeps the checkout's layout (/src/web beside
 # /src/go), so that the build writes go/internal/ui/dist as
@@ -36,9 +46,11 @@ RUN rm -rf internal/ui/dist
 COPY --from=web /src/go/internal/ui/dist/ ./internal/ui/dist/
 ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${VERSION}" -o /out/ferund ./cmd/ferund
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${VERSION}" -o /out/ferun-ingress ./cmd/ferun-ingress
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/ferund /ferund
+COPY --from=build /out/ferun-ingress /ferun-ingress
 # The front doors (REST, MCP, the UI, the ports) and the nodes' port.
 EXPOSE 8100 7443
 ENTRYPOINT ["/ferund"]

@@ -33,8 +33,7 @@ func (s *Store) EnvSummaries(ctx context.Context, owner string, labels map[strin
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.q.Query(ctx, "SELECT "+prefixed("e", []string{"id", "owner", "name", "labels", "release", "realised",
-		"deleting", "gen", "created_at", "updated_at"})+`, coalesce(r.state, ''),
+	rows, err := s.q.Query(ctx, "SELECT "+environmentColumns("e")+`, coalesce(r.state, ''),
 			(SELECT count(*) FROM env_incidents i WHERE i.env_id = e.id AND i.closed_at IS NULL)
 		FROM environments e LEFT JOIN env_releases r ON r.env_id = e.id AND r.number = e.release
 		WHERE e.owner = $1 AND e.labels @> $2::jsonb ORDER BY e.name`, owner, want)
@@ -43,12 +42,11 @@ func (s *Store) EnvSummaries(ctx context.Context, owner string, labels map[strin
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (EnvSummaryRow, error) {
 		var out EnvSummaryRow
-		e := &out.Environment
-		if err := r.Scan(&e.ID, &e.Owner, &e.Name, &e.Labels, &e.Release, &e.Realised, &e.Deleting, &e.Gen,
-			&e.CreatedAt, &e.UpdatedAt, &out.ReleaseState, &out.OpenIncidents); err != nil {
+		targets, finish := environmentTargets(&out.Environment)
+		if err := r.Scan(append(targets, &out.ReleaseState, &out.OpenIncidents)...); err != nil {
 			return EnvSummaryRow{}, err
 		}
-		e.Labels = stringMap(e.Labels)
+		finish()
 		return out, nil
 	})
 }

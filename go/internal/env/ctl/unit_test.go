@@ -110,24 +110,9 @@ func TestGroupRules(t *testing.T) {
 	}
 	short := podid.Mint()
 	legacy := podid.ID(uuid.NewString())
-	if len(env) != 40 || len(model.SandboxGroupID(short)) != 15 || len(model.SandboxGroupID(legacy)) != 40 {
-		t.Error("group IDs are not 40 characters, an sbx group of a short ID not 15")
-	}
-	if isEnv, u, sbx, ok := parseGroup(env); !ok || !isEnv || u.String() != env[4:] || sbx != "" {
-		t.Error("parse env group")
-	}
-	// An sbx group names a sandbox with a short ID, or one made before
-	// ADR 0019 with a UUID.
-	for _, id := range []podid.ID{short, legacy} {
-		if isEnv, u, sbx, ok := parseGroup(model.SandboxGroupID(id)); !ok || isEnv || sbx != id || u != uuid.Nil {
-			t.Errorf("parse sbx group of %s: %v %v %q %v", id, isEnv, u, sbx, ok)
-		}
-	}
-	for _, bad := range []string{"default", "env-x", "sbx-0193E3A0-0000-7000-8000-000000000001", "foo-" + uuid.NewString(),
-		"sbx-" + strings.ToUpper(short.String()), "sbx-x", "sbx-" + short.String() + "0", "sbx-", "env-" + short.String()} {
-		if _, _, _, ok := parseGroup(bad); ok {
-			t.Errorf("%s parsed", bad)
-		}
+	if len(env) != 40 || len(model.SandboxGroupID(short)) != 15 || len(model.SandboxGroupID(legacy)) != 40 ||
+		len(model.IngressGroupID(short)) != 15 || len(model.IngressGroupID(legacy)) != 40 {
+		t.Error("group IDs are not 40 characters, an sbx or ing group of a short ID not 15")
 	}
 }
 

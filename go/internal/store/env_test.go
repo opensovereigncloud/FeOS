@@ -791,3 +791,245 @@ func TestTenantCountLeavesInstancesOut(t *testing.T) {
 		t.Fatalf("tenants %+v %v", list, err)
 	}
 }
+
+// publish makes an environment public or not through SetEnvironmentPublic.
+func publish(t *testing.T, s *store.Store, id uuid.UUID, public bool) store.Environment {
+	t.Helper()
+	e, err := s.SetEnvironmentPublic(bg, id, public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// ingressEnv is the ferun_ingress payload of an environment.
+func ingressEnv(id uuid.UUID) string { return "env:" + id.String() }
+
+// Publishing claims the natural host label, sets ingress_group and
+// notifies; unpublishing and publishing again keep both. TestClaimHostLabel
+// has the labels across tenants.
+func TestSetEnvironmentPublic(t *testing.T) {
+	s, d := newStore(t)
+	mkTenant(t, s, "acme-io")
+	ch, unsubscribe := d.Subscribe(db.ChanIngress)
+	defer unsubscribe()
+
+	web := mkEnv(t, s, "acme-io", "web")
+	if web.Public || web.IngressGroup || web.HostLabel != "" {
+		t.Fatalf("new environment %+v", web)
+	}
+	e := publish(t, s, web.ID, true)
+	if !e.Public || !e.IngressGroup || e.HostLabel != "web-acme-io" || !e.UpdatedAt.After(web.UpdatedAt) {
+		t.Fatalf("published %+v", e)
+	}
+	expectPayload(t, ch, ingressEnv(web.ID))
+	if got, err := s.GetEnvironment(bg, web.ID); err != nil || got.Public != e.Public || got.HostLabel != e.HostLabel {
+		t.Fatalf("read back %+v %v", got, err)
+	}
+	// Publishing again changes nothing and writes nothing.
+	if again := publish(t, s, web.ID, true); !again.UpdatedAt.Equal(e.UpdatedAt) || again.HostLabel != e.HostLabel {
+		t.Fatalf("published twice %+v", again)
+	}
+	expectNoPayload(t, ch, ingressEnv(web.ID))
+	e = publish(t, s, web.ID, false)
+	if e.Public || !e.IngressGroup || e.HostLabel != "web-acme-io" {
+		t.Fatalf("unpublished %+v", e)
+	}
+	expectPayload(t, ch, ingressEnv(web.ID))
+	if e = publish(t, s, web.ID, true); !e.Public || e.HostLabel != "web-acme-io" {
+		t.Fatalf("published again %+v", e)
+	}
+	// The summaries carry the new columns too.
+	if l, err := s.EnvSummaries(bg, "acme-io", nil); err != nil || len(l) != 1 || !l[0].Public || !l[0].IngressGroup ||
+		l[0].HostLabel != "web-acme-io" {
+		t.Fatalf("summaries %+v %v", l, err)
+	}
+
+	// A name too long for the natural label: the fallback.
+	long := mkEnv(t, s, "acme-io", strings.Repeat("a", 60))
+	_, ok, fallback := model.HostLabels(long.Name, long.Owner, long.ID)
+	if ok {
+		t.Fatal("a natural label of 63+ characters is usable")
+	}
+	if e := publish(t, s, long.ID, true); e.HostLabel != fallback || len(e.HostLabel) != 63 {
+		t.Fatalf("long name %+v (fallback %s)", e, fallback)
+	}
+
+	// The CHECK refuses public without a label; UpdateEnvironment never
+	// writes the columns; an unknown environment is ErrNoRow.
+	plain := mkEnv(t, s, "acme-io", "plain")
+	for _, sql := range []string{"UPDATE environments SET public = true WHERE id = $1",
+		"UPDATE environments SET public = true, ingress_group = true WHERE id = $1"} {
+		if _, err := s.Q().Exec(bg, sql, plain.ID); err == nil || !strings.Contains(err.Error(), "environments_public_ready") {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	after := plain
+	after.Public = true
+	if _, err := s.UpdateEnvironment(bg, plain, after); err == nil || !strings.Contains(err.Error(), "public") {
+		t.Fatalf("public written: %v", err)
+	}
+	after = plain
+	after.HostLabel = "x"
+	if _, err := s.UpdateEnvironment(bg, plain, after); err == nil || !strings.Contains(err.Error(), "host_label") {
+		t.Fatalf("host_label written: %v", err)
+	}
+	if _, err := s.SetEnvironmentPublic(bg, uuid.New(), true); !errors.Is(err, store.ErrNoRow) {
+		t.Fatalf("unknown environment: %v", err)
+	}
+	// In the caller's transaction, a claim is rolled back with it.
+	if err := s.InTx(bg, func(tx *store.Store) error {
+		if _, err := tx.SetEnvironmentPublic(bg, plain.ID, true); err != nil {
+			return err
+		}
+		return errors.New("roll back")
+	}); err == nil {
+		t.Fatal("no error")
+	}
+	var n int
+	must(t, s.Q().QueryRow(bg, "SELECT count(*) FROM host_labels WHERE env_id = $1", plain.ID).Scan(&n))
+	if got, _ := s.GetEnvironment(bg, plain.ID); n != 0 || got.Public || got.HostLabel != "" {
+		t.Fatalf("rolled back: %d labels, %+v", n, got)
+	}
+}
+
+// The writes the ingress's table follows send ferun_ingress "env:<id>":
+// the ports admitted to an instance (once), a service instance's insert,
+// phase or release and deletion, an environment's release, realised or
+// deleting, a tenant's deletion and an environment's.
+func TestIngressNotifications(t *testing.T) {
+	s, d := newStore(t)
+	mkTenant(t, s, "acme")
+	e := mkEnv(t, s, "acme", "stage")
+	ch, unsubscribe := d.Subscribe(db.ChanIngress)
+	defer unsubscribe()
+	want := ingressEnv(e.ID)
+
+	sb := mkInstance(t, s, e)
+	i, err := s.InsertEnvInstance(bg, store.EnvInstance{SandboxID: sb.ID, EnvID: e.ID, Kind: "service", Object: "web",
+		TemplateHash: "h1", Release: 1})
+	if err != nil || i.IngressPorts == nil || len(i.IngressPorts) != 0 {
+		t.Fatalf("insert %+v %v", i, err)
+	}
+	expectPayload(t, ch, want)
+
+	// SetIngressPorts writes sorted and unique ports once.
+	if ok, err := s.SetIngressPorts(bg, sb.ID, []int{8080, 80, 8080}); err != nil || !ok {
+		t.Fatalf("set ports %v %v", ok, err)
+	}
+	expectPayload(t, ch, want)
+	if got, _ := s.GetEnvInstance(bg, sb.ID); !slices.Equal(got.IngressPorts, []int{80, 8080}) {
+		t.Fatalf("ports %v", got.IngressPorts)
+	}
+	if ok, err := s.SetIngressPorts(bg, sb.ID, []int{80, 8080}); err != nil || ok {
+		t.Fatalf("set the same ports %v %v", ok, err)
+	}
+	expectNoPayload(t, ch, want)
+	if ok, err := s.SetIngressPorts(bg, sb.ID, nil); err != nil || !ok {
+		t.Fatalf("clear ports %v %v", ok, err)
+	}
+	expectPayload(t, ch, want)
+	if ok, err := s.SetIngressPorts(bg, podid.Mint(), []int{80}); err != nil || ok {
+		t.Fatalf("ports of no instance %v %v", ok, err)
+	}
+	must(t, func() error { _, err := s.SetIngressPorts(bg, sb.ID, []int{443}); return err }())
+	expectPayload(t, ch, want)
+
+	// A service instance's phase or release notifies; its detail does not;
+	// ingress_ports is never written by UpdateEnvInstance.
+	i, _ = s.GetEnvInstance(bg, sb.ID)
+	after := i
+	after.Detail = "starting"
+	if i, err = s.UpdateEnvInstance(bg, i, after); err != nil {
+		t.Fatal(err)
+	}
+	expectNoPayload(t, ch, want)
+	after = i
+	after.Phase = model.PhaseReady
+	if i, err = s.UpdateEnvInstance(bg, i, after); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ch, want)
+	after = i
+	after.Release = 2
+	if i, err = s.UpdateEnvInstance(bg, i, after); err != nil || !slices.Equal(i.IngressPorts, []int{443}) {
+		t.Fatalf("release %+v %v", i, err)
+	}
+	expectPayload(t, ch, want)
+	after = i
+	after.IngressPorts = []int{80}
+	if _, err := s.UpdateEnvInstance(bg, i, after); err == nil || !strings.Contains(err.Error(), "ingress_ports") {
+		t.Fatalf("ingress_ports written: %v", err)
+	}
+
+	// A job's instance never notifies.
+	job := mkInstance(t, s, e)
+	j, err := s.InsertEnvInstance(bg, store.EnvInstance{SandboxID: job.ID, EnvID: e.ID, Kind: "job", Object: "migrate",
+		TemplateHash: "j1", Release: 1})
+	must(t, err)
+	after = j
+	after.Phase = model.PhaseSucceeded
+	if _, err := s.UpdateEnvInstance(bg, j, after); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.DeleteEnvInstance(bg, job.ID); err != nil || !ok {
+		t.Fatalf("delete job instance %v %v", ok, err)
+	}
+	expectNoPayload(t, ch, want)
+
+	// The service instance's deletion notifies; a second one finds none.
+	if ok, err := s.DeleteEnvInstance(bg, sb.ID); err != nil || !ok {
+		t.Fatalf("delete instance %v %v", ok, err)
+	}
+	expectPayload(t, ch, want)
+	if ok, err := s.DeleteEnvInstance(bg, sb.ID); err != nil || ok {
+		t.Fatalf("delete again %v %v", ok, err)
+	}
+
+	// The environment: release, realised and deleting notify, labels do
+	// not.
+	cur, _ := s.GetEnvironment(bg, e.ID)
+	ea := cur
+	ea.Labels = map[string]string{"app": "x"}
+	if cur, err = s.UpdateEnvironment(bg, cur, ea); err != nil {
+		t.Fatal(err)
+	}
+	expectNoPayload(t, ch, want)
+	ea = cur
+	ea.Release = 1
+	if cur, err = s.UpdateEnvironment(bg, cur, ea); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ch, want)
+	ea = cur
+	ea.Realised = 1
+	if cur, err = s.UpdateEnvironment(bg, cur, ea); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ch, want)
+
+	// A deleting tenant's environments, each; the deletion.
+	prod := mkEnv(t, s, "acme", "prod")
+	marked, err := s.MarkTenantEnvironmentsDeleting(bg, "acme")
+	if err != nil || len(marked) != 2 {
+		t.Fatalf("marked %v %v", marked, err)
+	}
+	expectPayload(t, ch, want)
+	expectPayload(t, ch, ingressEnv(prod.ID))
+	if ok, err := s.DeleteEnvironment(bg, prod.ID); err != nil || !ok {
+		t.Fatalf("delete %v %v", ok, err)
+	}
+	expectPayload(t, ch, ingressEnv(prod.ID))
+	if ok, err := s.DeleteEnvironment(bg, prod.ID); err != nil || ok {
+		t.Fatalf("delete again %v %v", ok, err)
+	}
+	expectNoPayload(t, ch, ingressEnv(prod.ID))
+	// UpdateEnvironment's deleting.
+	other := mkEnv(t, s, "acme", "other")
+	oa := other
+	oa.Deleting = true
+	if _, err := s.UpdateEnvironment(bg, other, oa); err != nil {
+		t.Fatal(err)
+	}
+	expectPayload(t, ch, ingressEnv(other.ID))
+}

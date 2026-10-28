@@ -12,13 +12,17 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/grpc/status"
 
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
+	"github.com/gardenlinux/feos/go/internal/auth"
 	"github.com/gardenlinux/feos/go/internal/config"
 	"github.com/gardenlinux/feos/go/internal/db/dbtest"
 	"github.com/gardenlinux/feos/go/internal/model"
@@ -26,6 +30,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/podid"
 	"github.com/gardenlinux/feos/go/internal/store"
 	"github.com/gardenlinux/feos/go/internal/testnode"
+	"github.com/gardenlinux/feos/go/internal/tools"
 )
 
 // The tests of this package do not run in parallel: the streams hook is
@@ -340,13 +345,27 @@ func (r *stopRecord) list() []string {
 // The stop of §7 with a node: step 1 fails /readyz and resigns; a request
 // in the readiness window that needs an op (a resume) succeeds; the
 // streams hook's OnShutdown runs when the server's shutdown begins and
-// AfterRequests once no request is left; after step 3 the engine refuses
-// ops (ErrStopping); step 5 removes the row and releases the lease.
+// AfterRequests once no request is left; when the shutdown begins, a new
+// tool call with an id is refused (the drain began), and a call whose
+// request left is waited for before step 3 (step 2b); after step 3 the
+// engine refuses ops (ErrStopping); step 5 removes the row and releases
+// the lease.
 func TestShutdown(t *testing.T) {
 	rec := &stopRecord{}
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
-	streams = func(*Instance) Streams {
+	// The command of the call with an id ends 300 ms after the HTTP
+	// shutdown: long after step 4 unless step 2b waits for it.
+	drainRelease := make(chan struct{})
+	// probeSB is the sandbox of the call that OnShutdown tries; probe gets
+	// its answer.
+	var probeSB auth.Sandbox
+	type probeAnswer struct {
+		info tools.CallInfo
+		err  error
+	}
+	probe := make(chan probeAnswer, 1)
+	streams = func(inst *Instance) Streams {
 		return Streams{
 			Ports: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				entered <- struct{}{}
@@ -354,8 +373,16 @@ func TestShutdown(t *testing.T) {
 				rec.add("port request done")
 				_, _ = w.Write([]byte("ok"))
 			}),
-			OnShutdown:    func() { rec.add("OnShutdown") },
-			AfterRequests: func() { rec.add("AfterRequests") },
+			OnShutdown: func() {
+				rec.add("OnShutdown")
+				_, info, err := inst.Runner.CallKeyed(context.Background(), probeSB, tools.ToolBash,
+					json.RawMessage(`{"command":"echo late"}`), "late", nil)
+				probe <- probeAnswer{info, err}
+			},
+			AfterRequests: func() {
+				rec.add("AfterRequests")
+				time.AfterFunc(300*time.Millisecond, func() { close(drainRelease) })
+			},
 		}
 	}
 	t.Cleanup(func() { streams = nil })
@@ -438,6 +465,9 @@ func TestShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	id, sbToken := created.Status.SandboxID, created.Token
+	if probeSB, err = i.ResolveSandbox(ctx, sbToken); err != nil {
+		t.Fatal(err)
+	}
 	exec := func() (int, string) {
 		return call(t, i, "POST", "/api/v1/sandboxes/"+id+"/exec", bearer(sbToken), `{"command":"echo hi"}`)
 	}
@@ -471,11 +501,16 @@ func TestShutdown(t *testing.T) {
 	}
 
 	// Step 3's refusal, seen right after step 4.
-	var afterStopErr error
+	var (
+		afterStopErr error
+		drained      store.ToolCall
+		drainedErr   error
+	)
 	i.afterStop = func() {
 		// The sandbox runs again (the readiness window's exec resumed it):
 		// a pause needs an op.
 		afterStopErr = i.Engine.Pause(ctx, idOf(t, id))
+		drained, drainedErr = i.Store.GetToolCall(ctx, idOf(t, id), "drained")
 		rec.add("after step 4")
 	}
 	stopped := make(chan error, 1)
@@ -506,6 +541,38 @@ func TestShutdown(t *testing.T) {
 	if code, body := exec(); code != 200 || !strings.Contains(body, `"output":"hi\n"`) {
 		t.Fatalf("exec in the readiness window: %d %s", code, body)
 	}
+	// A call with an id is accepted too; its request leaves while its
+	// command runs on into the stop.
+	drainStarted := make(chan struct{}, 1)
+	node.Script().SetExec(func(ctx context.Context, _ podid.ID, req *containerv1.ExecRequest, out testnode.ExecOutput) (int32, bool, error) {
+		if !slices.Contains(req.GetCommand(), "drain-me") {
+			return 0, false, nil
+		}
+		drainStarted <- struct{}{}
+		select {
+		case <-drainRelease:
+		case <-ctx.Done():
+			return 0, true, status.FromContextError(ctx.Err()).Err()
+		}
+		return 0, true, out.Stdout([]byte("drained\n"))
+	})
+	callCtx, hangUp := context.WithCancel(ctx)
+	called := make(chan error, 1)
+	go func() {
+		_, _, err := i.Runner.CallKeyed(callCtx, probeSB, tools.ToolBash, json.RawMessage(`{"command":"drain-me"}`), "drained", nil)
+		called <- err
+	}()
+	select {
+	case <-drainStarted:
+	case err := <-called:
+		t.Fatalf("the call with an id ended at once: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call with an id did not reach the node")
+	}
+	hangUp()
+	if err := <-called; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the call's request that left: %v", err)
+	}
 	if got := rec.list(); len(got) != 0 {
 		t.Fatalf("events before the server's shutdown: %v", got)
 	}
@@ -533,6 +600,16 @@ func TestShutdown(t *testing.T) {
 	}
 	if !errors.Is(afterStopErr, model.ErrStopping) || !strings.Contains(afterStopErr.Error(), "instance "+i.ID()+" is stopping") {
 		t.Fatalf("pause after step 3: %v", afterStopErr)
+	}
+	// Step 2 began the drain before the HTTP shutdown: the new call was
+	// refused, not run, and nothing ran.
+	if p := <-probe; !errors.Is(p.err, model.ErrStopping) || !strings.Contains(p.err.Error(), "instance "+i.ID()+" is stopping: ") ||
+		p.info.State != tools.CallNotRun {
+		t.Errorf("a call with an id when the shutdown began: %+v %v", p.info, p.err)
+	}
+	// Step 2b waited for the call whose request left.
+	if drainedErr != nil || drained.State != store.ToolCallDone || string(drained.Output) != "drained\n" {
+		t.Errorf("the call with an id after step 4: %+v %v", drained, drainedErr)
 	}
 
 	// Step 5: the row is gone, the lease released; the pool is closed, so

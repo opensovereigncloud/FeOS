@@ -15,18 +15,41 @@ import (
 	"time"
 )
 
-// JoinTokenPrefix starts every join token and the part a node sends.
+// JoinTokenPrefix starts every join token of a node and the part a node
+// sends.
 const JoinTokenPrefix = "feos-join-"
 
 // JoinSecretLen is the length of what a node sends: the prefix and 43
 // characters of base64url, 32 random bytes.
 const JoinSecretLen = len(JoinTokenPrefix) + 43
 
-// NewJoinToken makes a join token pinned to the root with SPKI hash pin.
-// token is what the operator gets, "feos-join-<secret>.<pin>"; sent is
-// what the node sends, "feos-join-<secret>"; hash is what the database
-// keeps, HashJoinSecret(sent).
+// IngressJoinTokenPrefix starts every join token of an instance of
+// ferun-ingress (kind ingress) and the part the instance sends. It is not
+// JoinTokenPrefix, and IngressJoinSecretLen is not JoinSecretLen, so that
+// a node's Join, also of a ferund that knows no kinds, refuses an
+// ingress's token by its form before any lookup.
+const IngressJoinTokenPrefix = "feos-ingress-join-"
+
+// IngressJoinSecretLen is the length of what an instance of ferun-ingress
+// sends: the prefix and 43 characters of base64url, 32 random bytes.
+const IngressJoinSecretLen = len(IngressJoinTokenPrefix) + 43
+
+// NewJoinToken makes a node's join token pinned to the root with SPKI
+// hash pin. token is what the operator gets, "feos-join-<secret>.<pin>";
+// sent is what the node sends, "feos-join-<secret>"; hash is what the
+// database keeps, HashJoinSecret(sent).
 func NewJoinToken(pin string) (token, sent, hash string, err error) {
+	return newJoinToken(JoinTokenPrefix, pin)
+}
+
+// NewIngressJoinToken makes the join token of an instance of
+// ferun-ingress, as NewJoinToken a node's: token is
+// "feos-ingress-join-<secret>.<pin>", sent "feos-ingress-join-<secret>".
+func NewIngressJoinToken(pin string) (token, sent, hash string, err error) {
+	return newJoinToken(IngressJoinTokenPrefix, pin)
+}
+
+func newJoinToken(prefix, pin string) (token, sent, hash string, err error) {
 	if len(pin) != 64 {
 		return "", "", "", fmt.Errorf("pin %q is not a hex SHA-256", pin)
 	}
@@ -37,7 +60,7 @@ func NewJoinToken(pin string) (token, sent, hash string, err error) {
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", "", "", err
 	}
-	sent = JoinTokenPrefix + base64.RawURLEncoding.EncodeToString(b[:])
+	sent = prefix + base64.RawURLEncoding.EncodeToString(b[:])
 	return sent + "." + strings.ToLower(pin), sent, HashJoinSecret(sent), nil
 }
 
@@ -48,14 +71,42 @@ func HashJoinSecret(sent string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// SplitJoinToken splits an operator's token "feos-join-<secret>.<pin>" into
+// SplitJoinToken splits a node's token "feos-join-<secret>.<pin>" into
 // the part the node sends and the pin it checks the control plane with.
+// An ingress's token is refused.
 func SplitJoinToken(token string) (sent, pin string, err error) {
-	sent, pin, ok := strings.Cut(token, ".")
-	if !ok || !strings.HasPrefix(sent, JoinTokenPrefix) || len(sent) != JoinSecretLen {
-		return "", "", errors.New("join token is not feos-join-<secret>.<pin>")
+	return splitJoinToken(token, JoinTokenPrefix)
+}
+
+// SplitIngressJoinToken splits the token of an instance of ferun-ingress,
+// "feos-ingress-join-<secret>.<pin>", as SplitJoinToken a node's. A node's
+// token is refused.
+func SplitIngressJoinToken(token string) (sent, pin string, err error) {
+	return splitJoinToken(token, IngressJoinTokenPrefix)
+}
+
+// IsIngressJoinSecret reports whether sent has the form of what an
+// instance of ferun-ingress sends: "feos-ingress-join-<secret>".
+func IsIngressJoinSecret(sent string) bool {
+	return isJoinSecret(sent, IngressJoinTokenPrefix)
+}
+
+// isJoinSecret reports whether sent is prefix and 43 characters of
+// base64url.
+func isJoinSecret(sent, prefix string) bool {
+	if !strings.HasPrefix(sent, prefix) || len(sent) != len(prefix)+43 {
+		return false
 	}
-	if _, err := base64.RawURLEncoding.DecodeString(sent[len(JoinTokenPrefix):]); err != nil {
+	_, err := base64.RawURLEncoding.DecodeString(sent[len(prefix):])
+	return err == nil
+}
+
+func splitJoinToken(token, prefix string) (sent, pin string, err error) {
+	sent, pin, ok := strings.Cut(token, ".")
+	if !ok || !strings.HasPrefix(sent, prefix) || len(sent) != len(prefix)+43 {
+		return "", "", fmt.Errorf("join token is not %s<secret>.<pin>", prefix)
+	}
+	if !isJoinSecret(sent, prefix) {
 		return "", "", errors.New("join token's secret is not base64url")
 	}
 	if len(pin) != 64 {

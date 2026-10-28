@@ -288,7 +288,7 @@ func (c *Controller) setReason(ctx context.Context, v *view, reason string) erro
 // realise marks R realised (§4.3 step 7): the environment's realised
 // release, older realised and pending ones superseded, the open
 // rollout_failed, job_failed and crash_loop incidents of older releases
-// closed (every instance of R is ready).
+// closed (every instance of R is ready), env-groups woken.
 func (c *Controller) realise(ctx context.Context, v *view) error {
 	n := v.latest.Number
 	return c.fenced(ctx, func(tx *store.Store) error {
@@ -329,6 +329,11 @@ func (c *Controller) realise(ctx context.Context, v *view) error {
 		}
 		if _, err := tx.EnvCtlCloseIncidents(ctx, env.ID, n, model.ConditionRolloutFailed, model.ConditionJobFailed,
 			model.ConditionCrashLoop); err != nil {
+			return err
+		}
+		// The routes of the releases before R no longer count for the
+		// ing- groups' ports: env-groups shrinks them.
+		if err := tx.Notify(ctx, db.ChanLeader, HintGroups); err != nil {
 			return err
 		}
 		c.log.Info("release realised", "environment", env.ID, "release", n)
@@ -406,10 +411,13 @@ func (c *Controller) insertFrom(ctx context.Context, v *view, in insert, leaderS
 	if err != nil {
 		return "", fmt.Errorf("pin image %s: %w", p.image, err)
 	}
-	// The row's ID is minted by the insert: a short ID (ADR 0019).
+	// The row's ID is minted by the insert: a short ID (ADR 0019). A
+	// template with the ingress group flag names the row's own group
+	// ing-<id> (model.IngressGroupID) beside the plan's.
 	var id podid.ID
 	tmpl := p.template
 	tmpl.Labels = maps.Clone(p.template.Labels)
+	tmpl.SecurityGroups = slices.Clone(p.template.SecurityGroups)
 	idle := p.idle
 	write := func(tx *store.Store) error {
 		t, err := tx.LockTenant(ctx, v.env.Owner, store.ForShare)
@@ -436,8 +444,12 @@ func (c *Controller) insertFrom(ctx context.Context, v *view, in insert, leaderS
 			}
 		}
 		row, err := tx.CreateMintedSandbox(ctx, func(id podid.ID) store.NewSandbox {
+			own := tmpl
+			if own.IngressGroup {
+				own.SecurityGroups = append(slices.Clone(tmpl.SecurityGroups), model.IngressGroupID(id))
+			}
 			return store.NewSandbox{ID: id, Owner: v.env.Owner, Image: p.image, VCPUs: p.vcpus, MemoryMiB: p.memoryMB,
-				ImageRef: ref, EnvironmentID: v.env.ID, PodTemplate: &tmpl, PinNode: in.pin, IdleAfterS: &idle}
+				ImageRef: ref, EnvironmentID: v.env.ID, PodTemplate: &own, PinNode: in.pin, IdleAfterS: &idle}
 		})
 		if err != nil {
 			return err

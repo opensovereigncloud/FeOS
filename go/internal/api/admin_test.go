@@ -575,11 +575,12 @@ func TestJoinTokens(t *testing.T) {
 	e := newEnv(t, envOptions{db: d, fleet: fl})
 	w := e.do("POST", "/api/v1/admin/join-tokens", adminAuth(), map[string]any{"ttlSeconds": 600, "node": "n7"})
 	expect(t, w, http.StatusCreated, "")
-	if got := keysInOrder(t, w.Body.Bytes()); strings.Join(got, ",") != "id,token,expiresAt,node" {
+	if got := keysInOrder(t, w.Body.Bytes()); strings.Join(got, ",") != "id,token,expiresAt,kind,name,node" {
 		t.Fatalf("keys %v", got)
 	}
 	jt := decode[map[string]string](t, w)
-	if !strings.HasPrefix(jt["token"], "feos-join-") || !strings.HasSuffix(jt["token"], "."+iss.JoinPin()) || jt["node"] != "n7" {
+	if !strings.HasPrefix(jt["token"], "feos-join-") || !strings.HasSuffix(jt["token"], "."+iss.JoinPin()) || jt["node"] != "n7" ||
+		jt["kind"] != "node" || jt["name"] != "n7" {
 		t.Fatalf("join token %+v", jt)
 	}
 	exp, err := time.Parse(time.RFC3339, jt["expiresAt"])
@@ -604,7 +605,8 @@ func TestJoinTokens(t *testing.T) {
 	list := decode[struct {
 		JoinTokens []map[string]string `json:"joinTokens"`
 	}](t, w)
-	if len(list.JoinTokens) != 2 || list.JoinTokens[1]["node"] != "n7" || list.JoinTokens[1]["createdBy"] != testAdmin ||
+	if len(list.JoinTokens) != 2 || list.JoinTokens[1]["node"] != "n7" || list.JoinTokens[1]["kind"] != "node" ||
+		list.JoinTokens[1]["createdBy"] != testAdmin ||
 		list.JoinTokens[1]["usedAt"] != "" {
 		t.Fatalf("list %+v", list.JoinTokens)
 	}

@@ -166,6 +166,54 @@ func TestTemplateHash(t *testing.T) {
 	}
 }
 
+// The hashes of templates without the fields added later (name tables,
+// the ingress group flag) stay what they were: the instances of a release
+// made before keep their pods. With the ingress group flag the hash
+// differs, so that the first publish of an environment rolls its image
+// services once.
+func TestTemplateHashStable(t *testing.T) {
+	var tpl PodTemplate
+	if err := json.Unmarshal([]byte(exampleTemplate), &tpl); err != nil {
+		t.Fatal(err)
+	}
+	const image = "docker.io/library/postgres@sha256:" + "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12"
+	tables := PodTemplate{SecurityGroups: []string{"env-a"}, NameTables: []string{"env-a"}}
+	golden := []struct {
+		name string
+		tpl  PodTemplate
+		mem  int
+		want string
+	}{
+		{"example", tpl, 1024, "322394c9a5fbe15d627b25b2b141a47e40de19615825747a6796c9bac2c3b665"},
+		{"empty", PodTemplate{}, 512, "45b7088156a0299c9c5c443699bc4cc5bf44bd2b2cba80f5ab93031413564642"},
+		{"name tables", tables, 512, "ffddb7b72ce9d7b3605a5d29c256f17e20d0a96b871dd94082da83f757f8a91d"},
+	}
+	for _, g := range golden {
+		h := g.tpl.Hash(image, 1, g.mem)
+		if h != g.want {
+			t.Errorf("%s: hash %s, want %s", g.name, h, g.want)
+		}
+		flagged := g.tpl
+		flagged.IngressGroup = true
+		if flagged.Hash(image, 1, g.mem) == h {
+			t.Errorf("%s: the ingress group flag leaves the hash", g.name)
+		}
+	}
+	// The flag round-trips through the stored JSON, and is absent when
+	// not set.
+	b, err := json.Marshal(PodTemplate{IngressGroup: true})
+	if err != nil || string(b) != `{"ingressGroup":true}` {
+		t.Fatalf("encoded %s %v", b, err)
+	}
+	var back PodTemplate
+	if err := json.Unmarshal(b, &back); err != nil || !back.IngressGroup {
+		t.Fatalf("decoded %+v %v", back, err)
+	}
+	if b, _ := json.Marshal(PodTemplate{}); string(b) != `{}` {
+		t.Fatalf("encoded %s", b)
+	}
+}
+
 func TestGroupIDs(t *testing.T) {
 	id := uuid.MustParse("0193a000-0000-7000-8000-0000000000e1")
 	if g := EnvGroupID(id); g != "env-0193a000-0000-7000-8000-0000000000e1" || len(g) != 40 {

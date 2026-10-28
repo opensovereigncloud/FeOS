@@ -326,13 +326,23 @@ func (s *Script) podExecFunc(pod podid.ID) ExecFunc {
 	return s.podExec[pod]
 }
 
-func (s *Script) portAddr(pod podid.ID, port uint32) string {
+// PortAddrOf returns the address that a port forward to port of the pod
+// dials as SetPodPortAddr or SetPortAddr mapped it, the pod's own first;
+// false when neither did (the forward dials 127.0.0.1:<port>). A test
+// that plays another way into the pod (the ingress's mesh) reaches the
+// same server through it.
+func (s *Script) PortAddrOf(pod podid.ID, port uint32) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if a, ok := s.podPortAddrs[pod][port]; ok {
-		return a
+		return a, true
 	}
-	if a, ok := s.portAddrs[port]; ok {
+	a, ok := s.portAddrs[port]
+	return a, ok
+}
+
+func (s *Script) portAddr(pod podid.ID, port uint32) string {
+	if a, ok := s.PortAddrOf(pod, port); ok {
 		return a
 	}
 	return "127.0.0.1:" + strconv.FormatUint(uint64(port), 10)

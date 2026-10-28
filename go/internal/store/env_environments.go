@@ -15,6 +15,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/gardenlinux/feos/go/internal/db"
 )
 
 // This file and the other env_*.go files hold the typed access to the
@@ -23,8 +25,11 @@ import (
 // runs, attached services, addon volumes, incidents and route tokens. They
 // are the basic reads and writes; the service and the controller keep the
 // queries of their own domain in files of their own. No writer here sends
-// a notification: the callers send ferun_leader "env-reconcile" or
-// "env-groups" in their transaction when the controller is to act.
+// a notification, except ferun_ingress, which the writes that the
+// ingress's table follows send themselves (ADR 0021): an environment's
+// publicity, releases and deletion, and its service instances. The callers
+// send ferun_leader "env-reconcile" or "env-groups" in their transaction
+// when the controller is to act.
 
 // ErrExists is returned by an insert whose primary or unique key another
 // row of the table holds.
@@ -146,17 +151,45 @@ type Environment struct {
 	// BumpEnvironmentGen when its rules or members change.
 	Gen                  int64
 	CreatedAt, UpdatedAt time.Time
+	// Public: the ingress serves it at its default host, without a route
+	// token (its tenant's decision, SetEnvironmentPublic). IngressGroup:
+	// its image services' pods name ing-<sandbox id>; set at the first
+	// publish, never cleared. HostLabel is its default host's label under
+	// the apps zone, given at the first publish and never changed; "":
+	// never published.
+	Public, IngressGroup bool
+	HostLabel            string
 }
 
-const environmentCols = "id, owner, name, labels, release, realised, deleting, gen, created_at, updated_at"
+// environmentColumns are the columns of an Environment, each prefixed with
+// p and a dot when p is not empty.
+func environmentColumns(p string) string {
+	cols := prefixed(p, []string{"id", "owner", "name", "labels", "release", "realised", "deleting", "gen",
+		"created_at", "updated_at", "public", "ingress_group"})
+	if p != "" {
+		p += "."
+	}
+	return cols + ", coalesce(" + p + "host_label, '')"
+}
+
+var environmentCols = environmentColumns("")
+
+// environmentTargets are the scan targets of environmentColumns for e, and
+// the function that finishes the scan.
+func environmentTargets(e *Environment) ([]any, func()) {
+	return []any{&e.ID, &e.Owner, &e.Name, &e.Labels, &e.Release, &e.Realised, &e.Deleting, &e.Gen,
+			&e.CreatedAt, &e.UpdatedAt, &e.Public, &e.IngressGroup, &e.HostLabel}, func() {
+			e.Labels = stringMap(e.Labels)
+		}
+}
 
 func scanEnvironment(row pgx.Row) (Environment, error) {
 	var e Environment
-	if err := row.Scan(&e.ID, &e.Owner, &e.Name, &e.Labels, &e.Release, &e.Realised, &e.Deleting, &e.Gen,
-		&e.CreatedAt, &e.UpdatedAt); err != nil {
+	targets, finish := environmentTargets(&e)
+	if err := row.Scan(targets...); err != nil {
 		return Environment{}, err
 	}
-	e.Labels = stringMap(e.Labels)
+	finish()
 	return e, nil
 }
 
@@ -239,13 +272,17 @@ func (s *Store) DeletingEnvironments(ctx context.Context, limit int) ([]Environm
 // UpdateEnvironment writes the columns in which after differs from before,
 // the row as the caller read it (normally locked FOR UPDATE in the same
 // transaction): labels, release, realised, deleting and gen; updated_at =
-// now(). id, owner, name and created_at are never written. A row whose
-// gen is no longer before's is not written (ErrRowChanged); when nothing
-// differs, before is returned unwritten.
+// now(). id, owner, name, created_at, public, ingress_group and host_label
+// are never written (SetEnvironmentPublic writes the last three). A row
+// whose gen is no longer before's is not written (ErrRowChanged); when
+// nothing differs, before is returned unwritten. A write of release,
+// realised or deleting sends ferun_ingress "env:<id>".
 func (s *Store) UpdateEnvironment(ctx context.Context, before, after Environment) (Environment, error) {
 	what := "environment " + before.ID.String()
 	if err := fixed(what, map[string]bool{"id": before.ID != after.ID, "owner": before.Owner != after.Owner,
-		"name": before.Name != after.Name, "created_at": !before.CreatedAt.Equal(after.CreatedAt)}); err != nil {
+		"name": before.Name != after.Name, "created_at": !before.CreatedAt.Equal(after.CreatedAt),
+		"public": before.Public != after.Public, "ingress_group": before.IngressGroup != after.IngressGroup,
+		"host_label": before.HostLabel != after.HostLabel}); err != nil {
 		return Environment{}, err
 	}
 	u := newUpdates(before.ID, before.Gen)
@@ -267,7 +304,51 @@ func (s *Store) UpdateEnvironment(ctx context.Context, before, after Environment
 	if err != nil {
 		return Environment{}, fmt.Errorf("update %s: %w", what, err)
 	}
+	if before.Release != after.Release || before.Realised != after.Realised || before.Deleting != after.Deleting {
+		if err := s.notifyIngressEnvs(ctx, []uuid.UUID{e.ID}); err != nil {
+			return Environment{}, fmt.Errorf("update %s: %w", what, err)
+		}
+	}
 	return e, nil
+}
+
+// SetEnvironmentPublic makes the environment public or not and returns
+// its row; ErrNoRow if there is none. It runs in the caller's transaction
+// (in one of its own on a Store outside one), with the row locked FOR
+// UPDATE. The first publish also claims the environment's default host
+// label (ClaimHostLabel) and sets ingress_group; unpublishing keeps both,
+// so that publishing again names the same host and rolls no pod. A write
+// sends ferun_ingress "env:<id>"; a call that changes nothing writes
+// nothing. The caller refuses a deleting environment or tenant and sends
+// the controller's hints.
+func (s *Store) SetEnvironmentPublic(ctx context.Context, id uuid.UUID, public bool) (Environment, error) {
+	var out Environment
+	err := s.InTx(ctx, func(tx *Store) error {
+		e, err := tx.LockEnvironment(ctx, id, ForUpdate)
+		if err != nil {
+			return err
+		}
+		if e.Public == public {
+			out = e
+			return nil
+		}
+		label := e.HostLabel
+		if public && label == "" {
+			if label, err = tx.ClaimHostLabel(ctx, e); err != nil {
+				return err
+			}
+		}
+		if out, err = scanEnvironment(tx.q.QueryRow(ctx, `UPDATE environments SET public = $2,
+				ingress_group = ingress_group OR $2, host_label = coalesce(host_label, $3), updated_at = now()
+			WHERE id = $1 RETURNING `+environmentCols, id, public, nullString(label))); err != nil {
+			return err
+		}
+		return tx.notifyIngressEnvs(ctx, []uuid.UUID{id})
+	})
+	if err != nil {
+		return Environment{}, fmt.Errorf("set environment %s public %v: %w", id, public, err)
+	}
+	return out, nil
 }
 
 // BumpEnvironmentGen increments the version of the environment's security
@@ -279,26 +360,59 @@ func (s *Store) BumpEnvironmentGen(ctx context.Context, id uuid.UUID) (int64, er
 }
 
 // MarkTenantEnvironmentsDeleting marks the environments of owner deleting
-// (a deleting tenant's) and returns those it marked.
+// (a deleting tenant's) and returns those it marked, each with
+// ferun_ingress "env:<id>".
 func (s *Store) MarkTenantEnvironmentsDeleting(ctx context.Context, owner string) ([]uuid.UUID, error) {
 	rows, err := s.q.Query(ctx, `UPDATE environments SET deleting = true, updated_at = now()
 		WHERE owner = $1 AND NOT deleting RETURNING id`, owner)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return nil, err
+	}
+	if err := s.notifyIngressEnvs(ctx, ids); err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 // DeleteEnvironment removes the environment row; its releases, tags,
 // secrets, job runs, attached services, incidents and route tokens
-// cascade. It fails while an instance row, an env_instances row or a
-// volume names it. It reports whether a row was there.
+// cascade, and its host label becomes free for its tenant
+// (host_labels.env_id ON DELETE SET NULL). It fails while an instance
+// row, an env_instances row or a volume names it. It reports whether a row
+// was there, and sends ferun_ingress "env:<id>" when one was.
 func (s *Store) DeleteEnvironment(ctx context.Context, id uuid.UUID) (bool, error) {
 	tag, err := s.q.Exec(ctx, "DELETE FROM environments WHERE id = $1", id)
 	if err != nil {
 		return false, fmt.Errorf("delete environment %s: %w", id, err)
 	}
-	return tag.RowsAffected() > 0, nil
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+	if err := s.notifyIngressEnvs(ctx, []uuid.UUID{id}); err != nil {
+		return false, fmt.Errorf("delete environment %s: %w", id, err)
+	}
+	return true, nil
+}
+
+// notifyIngressEnvs sends ferun_ingress "env:<id>" for each id, or "*" for
+// more than notifyBatch ids.
+func (s *Store) notifyIngressEnvs(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) > notifyBatch {
+		return s.Notify(ctx, db.ChanIngress, IngressPayloadAll)
+	}
+	for _, id := range ids {
+		if err := s.Notify(ctx, db.ChanIngress, IngressEnvPayload(id)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CountEnvironmentsOfOwner counts a tenant's environments.

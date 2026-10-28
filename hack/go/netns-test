@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Runs the privileged test of ferun-ingress's WireGuard package
+# (go/internal/ingress/wg, TestNetnsWireGuard) as root: it makes network
+# namespaces and WireGuard devices in the kernel. The test binary is built
+# as the calling user; only running it needs sudo, without a password.
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
+
+(cd go && ${GO:-go} test -c -race -o "$out/wg.test" ./internal/ingress/wg)
+sudo -n modprobe wireguard || true
+sudo -n env FERUN_TEST_NETNS=1 "$out/wg.test" -test.run Netns -test.v

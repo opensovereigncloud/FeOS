@@ -27,6 +27,47 @@ import (
 	"github.com/gardenlinux/feos/go/internal/testnode"
 )
 
+// parseGroup reads the controller's groups in their canonical form: env,
+// sbx and ing groups (of a sandbox with a short ID, or one made before ADR
+// 0019 with a UUID) and ferun-ingress; name tables are env and sbx groups'
+// IDs only.
+func TestParseGroup(t *testing.T) {
+	envID := uuid.MustParse("0193e3a0-0000-7000-8000-000000000001")
+	if ref, ok := parseGroup(model.EnvGroupID(envID)); !ok || ref != (groupRef{kind: groupEnv, env: envID}) {
+		t.Errorf("parse env group: %+v %v", ref, ok)
+	}
+	short := podid.Mint()
+	legacy := podid.ID(uuid.NewString())
+	for _, id := range []podid.ID{short, legacy} {
+		if ref, ok := parseGroup(model.SandboxGroupID(id)); !ok || ref != (groupRef{kind: groupSbx, sbx: id}) {
+			t.Errorf("parse sbx group of %s: %+v %v", id, ref, ok)
+		}
+		if ref, ok := parseGroup(model.IngressGroupID(id)); !ok || ref != (groupRef{kind: groupIng, sbx: id}) {
+			t.Errorf("parse ing group of %s: %+v %v", id, ref, ok)
+		}
+		if _, ok := parseTable(model.IngressGroupID(id)); ok {
+			t.Errorf("an ing group parsed as a name table")
+		}
+		if ref, ok := parseTable(model.SandboxTableID(id)); !ok || ref.kind != groupSbx {
+			t.Errorf("parse sbx table of %s: %+v %v", id, ref, ok)
+		}
+	}
+	if ref, ok := parseGroup(model.IngressPeersGroup); !ok || ref != (groupRef{kind: groupIngressPeers}) {
+		t.Errorf("parse ferun-ingress: %+v %v", ref, ok)
+	}
+	if _, ok := parseTable(model.IngressPeersGroup); ok {
+		t.Error("ferun-ingress parsed as a name table")
+	}
+	for _, bad := range []string{"default", "env-x", "sbx-0193E3A0-0000-7000-8000-000000000001", "foo-" + uuid.NewString(),
+		"sbx-" + strings.ToUpper(short.String()), "sbx-x", "sbx-" + short.String() + "0", "sbx-", "env-" + short.String(),
+		"ing-x", "ing-", "ing-" + strings.ToUpper(short.String()), "ing-" + short.String() + "0", "ing-" + envID.String()[:35],
+		"ferun-ingressx", "ferun-ingress-", "ferun", "Ferun-ingress", "ing" + short.String(), "ingress-" + short.String()} {
+		if ref, ok := parseGroup(bad); ok {
+			t.Errorf("%s parsed: %+v", bad, ref)
+		}
+	}
+}
+
 // The env group is on a node before the pod that names it (the node
 // checks), with the instances' addresses as members; a member that comes
 // or goes is put again with a new version; a group a node has with other

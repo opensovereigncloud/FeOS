@@ -436,6 +436,9 @@ const (
 	MaxJobs      = 32
 	MaxAddons    = 16
 	MaxRoutes    = 128
+	// MaxRoutePathBytes bounds a route's path, which every instance of
+	// ferun-ingress holds for every public environment.
+	MaxRoutePathBytes = 1024
 
 	DefaultReplicas  = 1
 	MaxReplicas      = 20

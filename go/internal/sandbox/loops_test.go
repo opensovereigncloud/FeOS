@@ -221,6 +221,81 @@ func TestIdlePauseLoop(t *testing.T) {
 	h.waitState(busy.ID, model.StatePaused, 10*time.Second)
 }
 
+// TestLoopsWaitAfterOutage: idle pause, stale ops and expired holds act
+// only once the leader has led for the outage guard and the database has
+// not failed within it (as fleet's node expiry), so that after an outage
+// every live instance renews its holds and its heartbeat first.
+func TestLoopsWaitAfterOutage(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.IdlePause = 50 * time.Millisecond })
+	h.addNode("n1")
+	e := h.eng()
+	e.t.outageGuard = time.Hour
+	idle := h.running(512)
+	h.settle(idle.ID)
+	// The hold of an exec in flight, expired during the outage; its
+	// instance renews it once the database answers.
+	h.liveInstance("other")
+	h.exec(`INSERT INTO sandbox_holds (sandbox_id, holder, kind, instance_id, lease_until)
+		VALUES ($1, 'other:exec', 'exec', 'other', now() - interval '1 second')`, idle.ID)
+	// An op of an instance whose heartbeat went stale during the outage.
+	h.deadInstance("dead")
+	stale := h.opOfDeadOwner(h.running(512), OpPause, "dead")
+	time.Sleep(100 * time.Millisecond)
+
+	unsettled := func(what string) {
+		t.Helper()
+		if e.settled() {
+			t.Fatalf("%s: settled", what)
+		}
+		for name, loop := range map[string]func(context.Context) error{
+			"idle pause": e.idlePause, "stale ops": e.staleOps, "expired holds": e.expiredHolds,
+		} {
+			if err := loop(bg); err != nil {
+				t.Fatalf("%s: %s: %v", what, name, err)
+			}
+		}
+		if row := h.row(idle.ID); row.ClientState != model.StateRunning || row.Op != "" {
+			t.Fatalf("%s: the idle sandbox was paused: %+v", what, row)
+		}
+		if hs := h.holds(idle.ID); len(hs) != 1 {
+			t.Fatalf("%s: the expired hold went: %+v", what, hs)
+		}
+		if row := h.row(stale.ID); row.Op != string(OpPause) || row.OpOwner != "dead" || row.OpID != stale.OpID {
+			t.Fatalf("%s: the stale op was touched: %+v", what, row)
+		}
+	}
+	// Not leading.
+	e.leadingSince = func() time.Time { return time.Time{} }
+	unsettled("not leading")
+	// Leading for less than the guard: after a stall or a failover.
+	e.leadingSince = func() time.Time { return time.Now() }
+	unsettled("leading since now")
+	// Leading for long, but the database failed within the guard.
+	e.leadingSince = func() time.Time { return time.Now().Add(-2 * time.Hour) }
+	e.lastFailure = func() time.Time { return time.Now() }
+	unsettled("a failure now")
+
+	// Settled: the loops act.
+	e.lastFailure = func() time.Time { return time.Time{} }
+	if !e.settled() {
+		t.Fatal("not settled")
+	}
+	if err := e.expiredHolds(bg); err != nil {
+		t.Fatal(err)
+	}
+	if hs := h.holds(idle.ID); len(hs) != 0 {
+		t.Fatalf("expired hold kept once settled: %+v", hs)
+	}
+	if err := e.idlePause(bg); err != nil {
+		t.Fatal(err)
+	}
+	h.waitState(idle.ID, model.StatePaused, 10*time.Second)
+	if err := e.staleOps(bg); err != nil {
+		t.Fatal(err)
+	}
+	h.waitState(stale.ID, model.StatePaused, 10*time.Second)
+}
+
 func TestHibernateAfterLoop(t *testing.T) {
 	h := newHarness(t, func(c *Config) { c.HibernateAfter = time.Minute })
 	h.addNode("n1")

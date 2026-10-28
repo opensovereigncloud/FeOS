@@ -16,13 +16,19 @@
 // REST API with the UI; and its heartbeat row.
 //
 // Its stop, at the end of Run's context:
-//  1. the row says stopping, /readyz fails, the leader resigns, and the
+//  1. the row says stopping, /readyz fails, the leader resigns, the
 //     engine begins no work of its own initiative (the ops that requests
-//     need still begin);
+//     need still begin), and the ingress's side refuses new ingress
+//     connections, ends its Sync streams and refuses Wake and Hold;
 //  2. it serves on for the readiness delay (5 s), then stops accepting
 //     requests and waits for those in flight until the shutdown grace;
 //     the watch streams end at once (OnShutdown), upgraded port
-//     connections once no request is left (AfterRequests);
+//     connections once no request is left (AfterRequests). From the
+//     delay's end on, a tool call with an id reaches a guest only if it
+//     ends before the grace, and the requests that wait for another
+//     instance's call are told to ask again (ADR 0023). Then (2b) it
+//     waits for the tool calls with an id whose callers left too, until
+//     the same deadline, and cuts and records those still running then;
 //  3. the engine refuses new ops and waits for its own, until the same
 //     deadline;
 //  4. the ops still in flight are released (the engine's Stop);
@@ -59,6 +65,8 @@ import (
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/env"
 	"github.com/gardenlinux/feos/go/internal/fleet"
+	ingresssvc "github.com/gardenlinux/feos/go/internal/ingress/service"
+	"github.com/gardenlinux/feos/go/internal/ingress/table"
 	"github.com/gardenlinux/feos/go/internal/leader"
 	"github.com/gardenlinux/feos/go/internal/mcpsrv"
 	"github.com/gardenlinux/feos/go/internal/mesh"
@@ -120,6 +128,9 @@ const (
 	// claimRetry is how often a start tries again to claim a fresh row of
 	// its instance ID.
 	claimRetry = time.Second
+	// ingressSupersedeGrace is how long an ingress's certificate stays
+	// valid after a newer one was presented in a Hello.
+	ingressSupersedeGrace = 10 * time.Minute
 )
 
 // Instance is one ferund instance.
@@ -139,6 +150,7 @@ type Instance struct {
 	heartbeat *leader.Heartbeat
 	Activity  *activity.Recorder
 	Fleet     *fleet.Service
+	Ingress   *ingresssvc.Service
 	Engine    *sandbox.Engine
 	Runner    *tools.Runner
 	Env       *env.Service
@@ -255,12 +267,16 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.Elector = leader.NewElector(i.DB, i.id, i.log)
 	i.Activity = activity.NewRecorder(i.Store, i.id, i.log)
 	var fl *fleet.Service
+	var ing *ingresssvc.Service
 	if i.Links, err = nodelink.New(nodelink.Config{
 		Addr: cfg.NodeListen, TrustDomain: cfg.TrustDomain, InstanceID: i.id,
 		Bundle: i.Issuer.Bundle(), ServerCert: i.certs.GetCertificate,
 		NodeWait: cfg.NodeWait, ConnDrainTimeout: cfg.ConnDrainTimeout, MaxStreams: cfg.NodeMaxStreams,
 		CheckNode: func(ctx context.Context, node, serial, peer string, atAccept bool) (time.Time, error) {
 			return fl.CheckNode(ctx, node, serial, peer, atAccept)
+		},
+		CheckIngress: func(ctx context.Context, name, serial, peer string) (time.Time, error) {
+			return ing.CheckIngress(ctx, name, serial, peer)
 		},
 		OnPresented: func(node, serial, peer string) { fl.OnPresented(node, serial, peer) },
 		OnNodeConn:  func(node string) { fl.OnNodeConn(node) },
@@ -291,7 +307,15 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.Fleet = fl
 	fleetv1.RegisterFleetServiceServer(i.Links.Uplink(), fl.UplinkServer())
 	fleetv1.RegisterFleetServiceServer(i.Links.Join(), fl.JoinServer())
+	ing = ingresssvc.New(ingresssvc.Config{
+		InstanceID: i.id, TrustDomain: cfg.TrustDomain, AppsZone: cfg.AppsZone, CertTTL: cfg.NodeCertTTL,
+		SupersedeGrace: ingressSupersedeGrace, PodNetwork: i.podNetwork, Log: i.log,
+	}, ingresssvc.Deps{DB: i.DB, Store: i.Store, Issuer: i.Issuer, Links: i.Links, Engine: i.Engine,
+		Builder: table.NewBuilder(i.DB, i.Store, cfg.AppsZone, i.log)})
+	i.Ingress = ing
+	ing.Register()
 	i.Runner = tools.NewRunner(i.Engine, i.Links, i.Activity, i.DB, i.id, i.log)
+	i.Runner.SetCallConfig(tools.CallConfig{Lease: cfg.CallLease, Retention: cfg.CallRetention, Leader: i.Elector})
 	i.Engine.SetProcessLister(i.Runner)
 	i.mcp = mcpsrv.New(mcpsrv.Config{AllowedOrigins: cfg.MCPAllowedOrigins, Version: i.version, Log: i.log},
 		i.Runner, i.ResolveSandbox, i.DB)
@@ -305,7 +329,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	deps := api.Deps{
 		DB: i.DB, Store: i.Store, Engine: i.Engine, Elector: i.Elector, Conns: i.Links, Fleet: fl,
 		Tools: tools.NewREST(i.Runner), Specs: tools.Specs, MCP: i.mcp, Ports: i.streams.Ports,
-		Watches: i.streams.Watches, Bindings: i.Bindings, Environments: i.Env, Ready: i.ready,
+		Watches: i.streams.Watches, Bindings: i.Bindings, Environments: i.Env, Ingress: ing, Ready: i.ready,
 	}
 	if ui.Built() {
 		deps.UI = ui.FS()
@@ -317,6 +341,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.Elector.Register(api.Loops(deps)...)
 	i.Elector.Register(i.streams.Loops...)
 	i.Elector.Register(i.Env.Loops()...)
+	i.Elector.Register(i.Runner.Loops()...)
 	i.handler = api.New(api.Config{
 		AdminUsers: cfg.AdminUsers, InstanceID: i.id, PreparationWaitMs: config.PreparationBudget.Milliseconds(),
 		PublicURL: cfg.PublicURL, OIDC: oidc, SessionTTL: cfg.SessionTTL, DefaultImage: cfg.DefaultImage,
@@ -368,7 +393,7 @@ func (i *Instance) newEnvironments(key []byte) (*env.Service, error) {
 	}
 	s, err := env.New(env.Deps{
 		InstanceID: i.id, DB: i.DB, Store: i.Store, Elector: i.Elector, Conns: i.Links, Engine: i.Engine,
-		Runner: runner, Ports: fwd, Sealer: sealer, Log: i.log,
+		Runner: runner, Ports: fwd, Sealer: sealer, AppsZone: i.cfg.AppsZone, Log: i.log,
 	})
 	if err != nil {
 		return nil, err
@@ -563,13 +588,14 @@ func (i *Instance) claim(ctx context.Context) error {
 	var seen time.Time
 	for {
 		cctx, cancel := context.WithTimeout(ctx, stepTimeout)
-		released, err := i.Store.ClaimInstance(cctx, info)
+		claimed, err := i.Store.ClaimInstance(cctx, info)
 		cancel()
 		var inUse *store.InstanceInUseError
 		switch {
 		case err == nil:
-			if len(released) > 0 {
-				i.log.Warn("released the ops an earlier run under this instance id left", "sandboxes", len(released))
+			if len(claimed.Released) > 0 || claimed.ToolCalls > 0 {
+				i.log.Warn("released the ops and ended the tool calls an earlier run under this instance id left",
+					"sandboxes", len(claimed.Released), "calls", claimed.ToolCalls)
 			}
 			return nil
 		case !errors.As(err, &inUse):
@@ -633,6 +659,7 @@ func (i *Instance) run(ctx context.Context) error {
 	start(&lifeWG, "heartbeat", life, i.heartbeat.Run, false)
 	start(&lifeWG, "leader", life, i.Elector.Run, false)
 	start(&lifeWG, "fleet", life, i.Fleet.Run, false)
+	start(&lifeWG, "ingress", life, i.Ingress.Run, false)
 	start(&lifeWG, "engine", life, i.Engine.Run, false)
 	start(&lifeWG, "environments", life, i.Env.Run, false)
 	start(&lifeWG, "tools", life, i.Runner.Run, false)
@@ -708,6 +735,7 @@ func (i *Instance) stop(httpDone <-chan struct{}) {
 	}
 	cancel()
 	i.Engine.BeginStopping()
+	i.Ingress.BeginStopping()
 
 	// Step 2: serve on while balancers notice, then no new requests and
 	// wait for those in flight.
@@ -719,6 +747,12 @@ func (i *Instance) stop(httpDone <-chan struct{}) {
 	delay.Stop()
 	deadline, cancelDeadline := context.WithTimeout(context.Background(), i.cfg.ShutdownGrace)
 	defer cancelDeadline()
+	// Step 2 (ADR 0023): from now on a keyed call reaches a guest only if
+	// it ends before the deadline, and requests waiting on another
+	// instance's call are told to ask again.
+	if dl, ok := deadline.Deadline(); ok {
+		i.Runner.BeginDrain(dl)
+	}
 	if err := i.httpSrv.Shutdown(deadline); err != nil {
 		i.log.Warn("requests still in flight at the shutdown grace; closing them", "err", err)
 		_ = i.httpSrv.Close()
@@ -727,6 +761,9 @@ func (i *Instance) stop(httpDone <-chan struct{}) {
 	if i.streams.AfterRequests != nil {
 		i.streams.AfterRequests()
 	}
+	// Step 2b (ADR 0023): the tool calls whose callers left, until the
+	// same deadline; those still running then are cut and recorded.
+	i.Runner.Drain(deadline)
 
 	// Steps 3 and 4: no new ops; this instance's ops are waited for until
 	// the same deadline, and released then.

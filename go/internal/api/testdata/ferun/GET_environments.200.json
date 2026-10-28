@@ -21,6 +21,10 @@
         "release": 7,
         "realised": 6,
         "state": "rolling",
+        "public": true,
+        "hosts": [
+          "expensa-stage-fecode.apps.fecode.dev"
+        ],
         "openIncidents": 1,
         "createdAt": "2026-10-01T09:12:44Z"
       },
@@ -35,6 +39,8 @@
         "release": 4,
         "realised": 4,
         "state": "realised",
+        "public": false,
+        "hosts": [],
         "openIncidents": 0,
         "createdAt": "2026-10-01T09:14:02Z"
       },
@@ -49,6 +55,8 @@
         "release": 3,
         "realised": 3,
         "state": "realised",
+        "public": false,
+        "hosts": [],
         "openIncidents": 0,
         "createdAt": "2026-10-18T10:41:07Z"
       }

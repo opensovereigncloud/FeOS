@@ -6,6 +6,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -640,11 +641,17 @@ func (s *server) listNodeCerts(w http.ResponseWriter, r *http.Request) error {
 
 // ------------------------------------------------------------ join tokens --
 
-// createJoinToken is POST /api/v1/admin/join-tokens {ttlSeconds?, node?}:
-// a one-time token, shown once, pinned to node when given.
+// createJoinToken is POST /api/v1/admin/join-tokens {ttlSeconds?, kind?,
+// name?, node?}: a one-time token, shown once, of kind node (the default)
+// or ingress, pinned to name when given. node is name's older alias; both
+// given and different is a 400. The answer names the kind, so that an
+// operator sees what an instance that knows no kinds issued (a node
+// token).
 func (s *server) createJoinToken(w http.ResponseWriter, r *http.Request) error {
 	var req struct {
 		TTLSeconds int64  `json:"ttlSeconds"`
+		Kind       string `json:"kind"`
+		Name       string `json:"name"`
 		Node       string `json:"node"`
 	}
 	if _, err := decodeJSON(r, &req); err != nil {
@@ -653,14 +660,34 @@ func (s *server) createJoinToken(w http.ResponseWriter, r *http.Request) error {
 	if req.TTLSeconds < 0 || req.TTLSeconds > int64((100*365*24*time.Hour)/time.Second) {
 		return apierr.New(http.StatusBadRequest, "ttlSeconds must be positive (0 = default %d)", int64(s.cfg.JoinTokenTTL/time.Second))
 	}
-	if s.deps.Fleet == nil {
+	kind := req.Kind
+	if kind == "" {
+		kind = model.JoinKindNode
+	}
+	if kind != model.JoinKindNode && kind != model.JoinKindIngress {
+		return apierr.New(http.StatusBadRequest, "kind %q: %s or %s", req.Kind, model.JoinKindNode, model.JoinKindIngress)
+	}
+	if req.Name != "" && req.Node != "" && req.Name != req.Node {
+		return apierr.New(http.StatusBadRequest, "name %q and node %q differ: node is an alias of name; send one", req.Name, req.Node)
+	}
+	name := req.Name
+	if name == "" {
+		name = req.Node
+	}
+	var issue func(ctx context.Context, createdBy, name string, ttl time.Duration) (uuid.UUID, string, time.Time, error)
+	switch {
+	case kind == model.JoinKindNode && s.deps.Fleet != nil:
+		issue = s.deps.Fleet.IssueJoinToken
+	case kind == model.JoinKindIngress && s.deps.Ingress != nil:
+		issue = s.deps.Ingress.IssueJoinToken
+	default:
 		return errUnavailable()
 	}
 	ttl := time.Duration(req.TTLSeconds) * time.Second
 	if ttl == 0 {
 		ttl = s.cfg.JoinTokenTTL
 	}
-	id, token, expires, err := s.deps.Fleet.IssueJoinToken(r.Context(), adminOfRequest(r), req.Node, ttl)
+	id, token, expires, err := issue(r.Context(), adminOfRequest(r), name, ttl)
 	if err != nil {
 		return passOr(err, "create join token")
 	}
@@ -668,8 +695,10 @@ func (s *server) createJoinToken(w http.ResponseWriter, r *http.Request) error {
 		ID        string `json:"id"`
 		Token     string `json:"token"`
 		ExpiresAt string `json:"expiresAt"`
+		Kind      string `json:"kind"`
+		Name      string `json:"name"`
 		Node      string `json:"node"`
-	}{id.String(), token, rfc3339(expires), req.Node})
+	}{id.String(), token, rfc3339(expires), kind, name, name})
 }
 
 // listJoinTokens is GET /api/v1/admin/join-tokens, newest first, without
@@ -681,6 +710,7 @@ func (s *server) listJoinTokens(w http.ResponseWriter, r *http.Request) error {
 	}
 	type joinTokenInfo struct {
 		ID        string `json:"id"`
+		Kind      string `json:"kind"`
 		Node      string `json:"node"`
 		CreatedBy string `json:"createdBy"`
 		CreatedAt string `json:"createdAt"`
@@ -694,7 +724,7 @@ func (s *server) listJoinTokens(w http.ResponseWriter, r *http.Request) error {
 	}{JoinTokens: make([]joinTokenInfo, 0, len(ts))}
 	for _, t := range ts {
 		out.JoinTokens = append(out.JoinTokens, joinTokenInfo{
-			ID: t.ID.String(), Node: t.NodeName, CreatedBy: t.CreatedBy, CreatedAt: rfc3339(t.CreatedAt),
+			ID: t.ID.String(), Kind: t.Kind, Node: t.NodeName, CreatedBy: t.CreatedBy, CreatedAt: rfc3339(t.CreatedAt),
 			ExpiresAt: rfc3339(t.ExpiresAt), UsedAt: rfc3339(t.UsedAt), UsedName: t.UsedName, UsedPeer: t.UsedPeer,
 		})
 	}
@@ -712,6 +742,79 @@ func (s *server) revokeJoinToken(w http.ResponseWriter, r *http.Request) error {
 	return writeJSON(w, http.StatusOK, struct {
 		Revoked bool `json:"revoked"`
 	}{revoked})
+}
+
+// -------------------------------------------------------------- ingresses --
+
+// listIngresses is GET /api/v1/admin/ingresses: the ingress's instances
+// (ADR 0021), removed ones included, by name. connected says that one was
+// seen within 30 s, on the database clock; admittedVersion is the version
+// of the security group ferun-ingress at which its address entered it;
+// publicKey is its WireGuard key in base64.
+func (s *server) listIngresses(w http.ResponseWriter, r *http.Request) error {
+	if s.deps.Ingress == nil {
+		return errUnavailable()
+	}
+	list, err := s.deps.Ingress.ListIngresses(r.Context())
+	if err != nil {
+		return passOr(err, "list ingresses")
+	}
+	type ingressInfo struct {
+		Name            string `json:"name"`
+		Status          string `json:"status"`
+		JoinedAt        string `json:"joinedAt"`
+		RemovedAt       string `json:"removedAt"`
+		MeshPrefix      string `json:"meshPrefix"`
+		MeshAddress     string `json:"meshAddress"`
+		MeshEndpoint    string `json:"meshEndpoint"`
+		PublicKey       string `json:"publicKey"`
+		Version         string `json:"version"`
+		LastSeen        string `json:"lastSeen"`
+		LeftAt          string `json:"leftAt"`
+		Connected       bool   `json:"connected"`
+		AdmittedVersion int64  `json:"admittedVersion"`
+		CertNotAfter    string `json:"certNotAfter"`
+	}
+	out := struct {
+		Ingresses []ingressInfo `json:"ingresses"`
+	}{Ingresses: make([]ingressInfo, 0, len(list))}
+	for _, g := range list {
+		key := ""
+		if g.PublicKey != nil {
+			key = base64.StdEncoding.EncodeToString(g.PublicKey)
+		}
+		out.Ingresses = append(out.Ingresses, ingressInfo{
+			Name: g.Name, Status: g.Status, JoinedAt: rfc3339(g.JoinedAt), RemovedAt: rfc3339(g.RemovedAt),
+			MeshPrefix: g.MeshPrefix, MeshAddress: g.MeshAddress, MeshEndpoint: g.MeshEndpoint, PublicKey: key,
+			Version: g.Version, LastSeen: rfc3339(g.LastSeen), LeftAt: rfc3339(g.LeftAt), Connected: g.Connected,
+			AdmittedVersion: g.AdmittedVersion, CertNotAfter: rfc3339(g.CertNotAfter),
+		})
+	}
+	return writeJSON(w, http.StatusOK, out)
+}
+
+// removeIngress is DELETE /api/v1/admin/ingresses/{name}: the ingress
+// instance is removed (never deleted), its certificates revoked, its
+// connections closed on every instance; it leaves the pods' mesh and the
+// security group ferun-ingress. A token pinned to its name joins it
+// again. 204, or 404 for an unknown name.
+func (s *server) removeIngress(w http.ResponseWriter, r *http.Request) error {
+	if s.deps.Ingress == nil {
+		return errUnavailable()
+	}
+	name := r.PathValue("name")
+	found, err := s.deps.Ingress.RemoveIngress(r.Context(), name)
+	if err != nil {
+		return passOr(err, "remove ingress")
+	}
+	if !found {
+		return apierr.New(http.StatusNotFound, "unknown ingress %s", name)
+	}
+	by := adminOfRequest(r)
+	s.log.Info("ingress removed", "ingress", name, "by", by)
+	s.record(r.Context(), store.ActivityRow{Kind: "ingress_removed", Category: "lifecycle",
+		Name: "ingress " + name + " removed by " + by, Detail: detail(map[string]any{"by": by, "ingress": name})})
+	return noContent(w, http.StatusNoContent)
 }
 
 // -------------------------------------------------------------- instances --

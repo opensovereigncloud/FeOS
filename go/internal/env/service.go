@@ -75,7 +75,7 @@ func (s *Service) ListEnvs(ctx context.Context, tenant string, labels map[string
 	}
 	out := EnvList{Environments: make([]EnvSummary, 0, len(rows))}
 	for _, r := range rows {
-		out.Environments = append(out.Environments, summaryOf(r))
+		out.Environments = append(out.Environments, summaryOf(r, s.d.AppsZone))
 	}
 	return out, nil
 }

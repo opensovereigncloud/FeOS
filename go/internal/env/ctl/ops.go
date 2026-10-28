@@ -309,6 +309,12 @@ func (c *Controller) waitReady(ctx context.Context, id podid.ID, idles bool) boo
 // without running it (paused, hibernated, or with an op in flight) is
 // ErrPaused: the process would survive a warm resume beside the new one
 // (§13.5); one that cannot keep it (stopped, failed, …) needs no stop.
+// The row forgets the process before it stops: a look of the supervisor
+// that read the row before finds the process gone, and what it would
+// make of that (an exit: a restart, its backoff) does not apply to a row
+// that no longer records the process (writeAttached). A stop that fails
+// leaves the process to the supervisor, which stops what its row does
+// not record before it starts a new one (stopStrays).
 func (c *Controller) restartAttached(ctx context.Context, v *view, name string) error {
 	a, ok := v.attached[name]
 	if !ok {
@@ -331,9 +337,6 @@ func (c *Controller) restartAttached(ctx context.Context, v *view, name string) 
 		}
 		return nil
 	}
-	if err := stop(a.ProcessID); err != nil {
-		return err
-	}
 	var cleared string
 	err := c.st.InTx(ctx, func(tx *store.Store) error {
 		cur, err := tx.LockAttached(ctx, v.env.ID, name, store.ForUpdate)
@@ -352,11 +355,9 @@ func (c *Controller) restartAttached(ctx context.Context, v *view, name string) 
 		}
 		return tx.Notify(ctx, db.ChanLeader, HintReconcile)
 	})
-	if err != nil || cleared == a.ProcessID {
+	if err != nil {
 		return err
 	}
-	// The supervisor recorded another process meanwhile: stopped too, now
-	// that the row forgot it.
 	return stop(cleared)
 }
 

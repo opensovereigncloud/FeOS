@@ -200,6 +200,10 @@ func (f *fakeEnvs) CreateRouteToken(_ context.Context, tenant, env string) (envs
 func (f *fakeEnvs) RevokeRouteTokens(_ context.Context, tenant, env string) error {
 	return f.do(envCall{"RevokeRouteTokens", tenant, env, nil}, nil)
 }
+func (f *fakeEnvs) SetPublic(_ context.Context, tenant, env string, public bool) (envs.PublicAnswer, error) {
+	var out envs.PublicAnswer
+	return out, f.do(envCall{"SetPublic", tenant, env, []any{envs.PublicRequest{Public: public}}}, &out)
+}
 func (f *fakeEnvs) ServeRoute(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Door", "route")
 	w.WriteHeader(http.StatusTeapot)
@@ -253,6 +257,7 @@ var fixtureMethods = map[string]string{
 	"POST_environments_env_jobs_name_run":         "RunJob",
 	"POST_environments_env_route-tokens":          "CreateRouteToken",
 	"DELETE_environments_env_route-tokens":        "RevokeRouteTokens",
+	"PUT_environments_env_public":                 "SetPublic",
 }
 
 func loadFixtures(t *testing.T) map[string]fixture {
@@ -437,6 +442,10 @@ func TestEnvironmentArguments(t *testing.T) {
 			envCall{"Revert", testTenant, "stage", []any{envs.RevertRequest{Base: 7}, 6}}, 201},
 		{"POST", "/api/v1/environments/plan", map[string]any{"spec": map[string]any{}},
 			envCall{"PlanSpec", testTenant, "", []any{envs.PlanSpecRequest{Spec: json.RawMessage(`{}`)}}}, 200},
+		{"PUT", "/api/v1/environments/stage/public", map[string]any{"public": true},
+			envCall{"SetPublic", testTenant, "stage", []any{envs.PublicRequest{Public: true}}}, 200},
+		{"PUT", "/api/v1/environments/stage/public", map[string]any{"public": false},
+			envCall{"SetPublic", testTenant, "stage", []any{envs.PublicRequest{Public: false}}}, 200},
 	}
 	for _, c := range cases {
 		fe := &fakeEnvs{}
@@ -469,6 +478,23 @@ func TestEnvironmentArguments(t *testing.T) {
 			header: http.Header{"Authorization": {tok}}})
 		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), c.want) || len(fe.calls) != 0 {
 			t.Fatalf("%s %s: %d %s %+v", c.method, c.path, w.Code, w.Body, fe.calls)
+		}
+	}
+	// PUT …/public needs its field: a body without it, or with null, is a
+	// 400, and so is one that is not a boolean.
+	for _, c := range []struct {
+		body any
+		want string
+	}{
+		{nil, "public is required"}, {"{}", "public is required"}, {`{"public": null}`, "public is required"},
+		{`{"other": true}`, "public is required"}, {`{"public": "yes"}`, "invalid request body"},
+	} {
+		fe := &fakeEnvs{}
+		e.srv.deps.Environments = fe
+		w := e.serveWith(newServer(e.srv.cfg, e.srv.deps), request{method: "PUT", path: "/api/v1/environments/stage/public",
+			body: c.body, header: http.Header{"Authorization": {tok}}})
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), c.want) || len(fe.calls) != 0 {
+			t.Fatalf("PUT public %v: %d %s %+v", c.body, w.Code, w.Body, fe.calls)
 		}
 	}
 	// A plain error is a 500 with its text.
@@ -606,6 +632,11 @@ func TestEnvironmentsEndToEnd(t *testing.T) {
 	expect(t, do("GET", "/api/v1/environments/stage/secrets", nil), http.StatusOK, "")
 	expect(t, do("DELETE", "/api/v1/environments/stage/secrets/token", nil), http.StatusConflict,
 		errBody("release 1 pins secret token: apply a release without it first"))
+	// Without an apps zone nothing can be public; unpublishing is no error.
+	expect(t, do("PUT", "/api/v1/environments/stage/public", map[string]any{"public": true}), http.StatusConflict,
+		errBody("the platform serves no apps zone (--apps-zone); an environment cannot be public"))
+	expect(t, do("PUT", "/api/v1/environments/stage/public", map[string]any{"public": false}), http.StatusOK,
+		`{"public":false,"hosts":[],"rolling":false}`+"\n")
 
 	// The route door through the API's mux, with its own token.
 	w = do("POST", "/api/v1/environments/stage/route-tokens", nil)

@@ -73,11 +73,30 @@ func TestObjectStatusJSON(t *testing.T) {
 
 func TestStatusJSON(t *testing.T) {
 	st := EnvStatus{ID: "0193a000-0000-7000-8000-0000000000e1", Name: "stage", Labels: map[string]string{},
-		Objects: []ObjectStatus{}, Routes: []RouteStatus{}, CreatedAt: "2026-10-18T12:00:00Z"}
+		Hosts: []string{}, Objects: []ObjectStatus{}, Routes: []RouteStatus{}, CreatedAt: "2026-10-18T12:00:00Z"}
 	const want = `{"id":"0193a000-0000-7000-8000-0000000000e1","name":"stage","labels":{},"release":0,"realised":0,` +
-		`"deleting":false,"rollout":null,"objects":[],"routes":[],"openIncidents":0,"createdAt":"2026-10-18T12:00:00Z"}`
+		`"deleting":false,"public":false,"hosts":[],"rollout":null,"objects":[],"routes":[],"openIncidents":0,` +
+		`"createdAt":"2026-10-18T12:00:00Z"}`
 	if got := marshal(t, st); got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	// A route door route has no url; an ingress route has one.
+	routes := []RouteStatus{{Name: "dev", Path: "/dev", Service: "dev", Port: 5173, Door: DoorRoute},
+		{Name: "api", Path: "/api/", Service: "api", Port: 8080, Door: DoorIngress, URL: "https://stage-acme.apps.test/api"}}
+	const wantRoutes = `[{"name":"dev","path":"/dev","service":"dev","port":5173,"door":"route"},` +
+		`{"name":"api","path":"/api/","service":"api","port":8080,"door":"ingress","url":"https://stage-acme.apps.test/api"}]`
+	if got := marshal(t, routes); got != wantRoutes {
+		t.Fatalf("routes\n got %s\nwant %s", got, wantRoutes)
+	}
+	sum := EnvSummary{ID: st.ID, Name: "stage", Labels: map[string]string{}, State: model.EnvNone, Public: true,
+		Hosts: []string{"stage-acme.apps.test"}, CreatedAt: st.CreatedAt}
+	const wantSum = `{"id":"0193a000-0000-7000-8000-0000000000e1","name":"stage","labels":{},"release":0,"realised":0,` +
+		`"state":"none","public":true,"hosts":["stage-acme.apps.test"],"openIncidents":0,"createdAt":"2026-10-18T12:00:00Z"}`
+	if got := marshal(t, sum); got != wantSum {
+		t.Fatalf("summary\n got %s\nwant %s", got, wantSum)
+	}
+	if got := marshal(t, PublicAnswer{Hosts: []string{}}); got != `{"public":false,"hosts":[],"rolling":false}` {
+		t.Fatalf("public answer %s", got)
 	}
 }
 

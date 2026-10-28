@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
@@ -68,8 +69,11 @@ type JoinToken struct {
 	DatabaseURL, CADir, TrustDomain string
 	// TTL is the token's lifetime; 0 means JoinTokenTTL.
 	TTL time.Duration
-	// Node pins the token to a node name; "" lets it create a new name
-	// only.
+	// Kind is what the token joins: model.JoinKindNode (the default) or
+	// model.JoinKindIngress, an instance of ferun-ingress.
+	Kind string
+	// Node pins the token to a name, a node's or, of kind ingress, an
+	// ingress instance's; "" lets it create a new name only.
 	Node     string
 	LogLevel slog.Level
 }
@@ -78,7 +82,7 @@ type JoinToken struct {
 // names and defaults for the flags they share.
 func ParseJoinToken(args []string, getenv func(string) string) (JoinToken, error) {
 	d := Default()
-	c := JoinToken{CADir: d.CADir, TrustDomain: d.TrustDomain, TTL: JoinTokenTTL, LogLevel: slog.LevelWarn}
+	c := JoinToken{CADir: d.CADir, TrustDomain: d.TrustDomain, TTL: JoinTokenTTL, Kind: model.JoinKindNode, LogLevel: slog.LevelWarn}
 	fs := newFlagSet(CmdJoinToken)
 	level := registerJoinToken(fs, &c)
 	if err := parseFlags(fs, args, getenv); err != nil {
@@ -100,8 +104,11 @@ func ParseJoinToken(args []string, getenv func(string) string) (JoinToken, error
 	if c.TTL <= 0 {
 		errs = append(errs, errors.New("--ttl must be positive"))
 	}
+	if c.Kind != model.JoinKindNode && c.Kind != model.JoinKindIngress {
+		errs = append(errs, fmt.Errorf("--kind %q: %s or %s", c.Kind, model.JoinKindNode, model.JoinKindIngress))
+	}
 	if c.Node != "" && !pki.IsNodeName(c.Node) {
-		errs = append(errs, fmt.Errorf("--node %q is not a node name (a DNS label)", c.Node))
+		errs = append(errs, fmt.Errorf("--node %q is not a name (a DNS label)", c.Node))
 	}
 	return c, errors.Join(errs...)
 }
@@ -112,7 +119,8 @@ func registerJoinToken(fs *flag.FlagSet, c *JoinToken) *string {
 	fs.StringVar(&c.CADir, "ca-dir", c.CADir, "directory of the issuer (for the token's pin)")
 	fs.StringVar(&c.TrustDomain, "trust-domain", c.TrustDomain, "SPIFFE trust domain")
 	fs.DurationVar(&c.TTL, "ttl", c.TTL, "the token's lifetime")
-	fs.StringVar(&c.Node, "node", c.Node, "pin the token to this node name (a re-join of that name); empty: the node proposes a new name")
+	fs.StringVar(&c.Kind, "kind", c.Kind, "what the token joins: node, or ingress (an instance of ferun-ingress)")
+	fs.StringVar(&c.Node, "node", c.Node, "pin the token to this name, a node's or, with --kind ingress, an ingress instance's (a re-join of that name); empty: the joiner proposes a new name")
 	fs.StringVar(&level, "log-level", level, "debug, info, warn or error")
 	return &level
 }
@@ -163,8 +171,9 @@ func Usage(w io.Writer, cmd string) {
 		fmt.Fprintln(w, "Usage: ferund init-ca --root-dir R --dir D --dns-domain X [--dns-domain Y ...] [flags]\n\nMakes the platform CA: the root (its key stays in R, offline) and the issuer\nevery instance holds in its --ca-dir (D). Existing files are never overwritten.")
 	case CmdJoinToken:
 		fs = newFlagSet(cmd)
-		registerJoinToken(fs, &JoinToken{CADir: Default().CADir, TrustDomain: Default().TrustDomain, TTL: JoinTokenTTL, LogLevel: slog.LevelWarn})
-		fmt.Fprintln(w, "Usage: ferund join-token --database-url URL [flags]\n\nIssues a one-time join token for a node and prints it: feos-join-<secret>.<pin>.")
+		registerJoinToken(fs, &JoinToken{CADir: Default().CADir, TrustDomain: Default().TrustDomain, TTL: JoinTokenTTL,
+			Kind: model.JoinKindNode, LogLevel: slog.LevelWarn})
+		fmt.Fprintln(w, "Usage: ferund join-token --database-url URL [--kind node|ingress] [flags]\n\nIssues a one-time join token for a node or an instance of ferun-ingress and prints it:\nfeos-join-<secret>.<pin>, or feos-ingress-join-<secret>.<pin> for an instance of ferun-ingress.")
 	case CmdMigrate:
 		fs = newFlagSet(cmd)
 		registerMigrate(fs, &Migrate{LogLevel: slog.LevelInfo})
@@ -177,7 +186,7 @@ FeRun, the control plane of FeOS (ADR 0015).
 Commands:
   serve        run an instance (the default when no command is given)
   init-ca      make the platform CA's root and issuer
-  join-token   issue a join token for a node
+  join-token   issue a join token for a node or an ingress instance
   migrate      apply the database migrations and exit
 
 Every flag has an environment variable FERUN_<NAME>, the flag's name in upper

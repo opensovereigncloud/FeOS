@@ -464,6 +464,50 @@ func TestJoinPin(t *testing.T) {
 	}
 }
 
+// An ingress's join token has a form of its own: a node's Join refuses it
+// by its form, also with the check of a ferund that knows no kinds
+// (prefix "feos-join-" and 53 characters), and a node's token is not an
+// ingress's.
+func TestIngressJoinToken(t *testing.T) {
+	iss, _ := newCA(t)
+	token, sent, hash, err := NewIngressJoinToken(iss.JoinPin())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if IngressJoinSecretLen != 61 || len(sent) != IngressJoinSecretLen || !strings.HasPrefix(sent, "feos-ingress-join-") ||
+		token != sent+"."+iss.JoinPin() || hash != HashJoinSecret(sent) || !IsIngressJoinSecret(sent) {
+		t.Fatalf("token %q, sent %q, hash %s", token, sent, hash)
+	}
+	// The node check of every version, before any lookup.
+	if strings.HasPrefix(sent, "feos-join-") || len(sent) == 53 ||
+		(strings.HasPrefix(sent, JoinTokenPrefix) && len(sent) == JoinSecretLen) {
+		t.Fatalf("%q passes a node's form check", sent)
+	}
+	gotSent, gotPin, err := SplitIngressJoinToken(token)
+	if err != nil || gotSent != sent || gotPin != iss.JoinPin() {
+		t.Errorf("SplitIngressJoinToken = %q %q %v", gotSent, gotPin, err)
+	}
+	if _, _, err := SplitJoinToken(token); err == nil {
+		t.Error("SplitJoinToken accepted an ingress's token")
+	}
+	node, nodeSent, _, err := NewJoinToken(iss.JoinPin())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := SplitIngressJoinToken(node); err == nil || IsIngressJoinSecret(nodeSent) {
+		t.Errorf("a node's token is an ingress's: %v", err)
+	}
+	for _, bad := range []string{sent, sent + ".xyz", "feos-ingress-join-short." + iss.JoinPin(),
+		"feos-ingress-join-" + strings.Repeat("*", 43) + "." + iss.JoinPin()} {
+		if _, _, err := SplitIngressJoinToken(bad); err == nil {
+			t.Errorf("SplitIngressJoinToken(%q) accepted", bad)
+		}
+	}
+	if _, _, _, err := NewIngressJoinToken("abc"); err == nil {
+		t.Error("NewIngressJoinToken accepted a bad pin")
+	}
+}
+
 func TestIssueNode(t *testing.T) {
 	iss, _ := newCA(t)
 	// A CSR with names of its own: all of them are ignored.
@@ -546,6 +590,156 @@ func TestIssueNode(t *testing.T) {
 	}
 }
 
+func TestIssueIngress(t *testing.T) {
+	iss, _ := newCA(t)
+	if id := IngressID(testTD, "ingress-0"); id != "spiffe://"+testTD+"/ingress/ingress-0" {
+		t.Errorf("IngressID = %s", id)
+	}
+	// A CSR with names of its own: all of them are ignored.
+	evil, _ := url.Parse(NodeID(testTD, "node-1"))
+	csr, key := ed25519CSR(t, &x509.CertificateRequest{
+		Subject:     pkix.Name{CommonName: "node-1"},
+		DNSNames:    []string{"ferun." + testDomain},
+		IPAddresses: []net.IP{net.ParseIP("10.0.0.1")},
+		URIs:        []*url.URL{evil},
+	})
+	before := time.Now()
+	pc, leaf, err := iss.IssueIngress(csr, "ingress-0", 7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !leaf.PublicKey.(ed25519.PublicKey).Equal(key.Public()) {
+		t.Error("the certificate is not for the CSR's key")
+	}
+	if len(leaf.DNSNames) != 0 || len(leaf.IPAddresses) != 0 || len(leaf.EmailAddresses) != 0 {
+		t.Errorf("ingress certificate carries names %v %v", leaf.DNSNames, leaf.IPAddresses)
+	}
+	if len(leaf.URIs) != 1 || leaf.URIs[0].String() != IngressID(testTD, "ingress-0") {
+		t.Errorf("URIs %v", leaf.URIs)
+	}
+	if leaf.Subject.CommonName != "ingress-0" {
+		t.Errorf("CN %q", leaf.Subject.CommonName)
+	}
+	if len(leaf.ExtKeyUsage) != 1 || leaf.ExtKeyUsage[0] != x509.ExtKeyUsageClientAuth {
+		t.Errorf("EKU %v", leaf.ExtKeyUsage)
+	}
+	if leaf.KeyUsage != x509.KeyUsageDigitalSignature || leaf.IsCA {
+		t.Errorf("KeyUsage %v IsCA %v", leaf.KeyUsage, leaf.IsCA)
+	}
+	checkBackdated(t, leaf, before, 7*24*time.Hour)
+	if err := verifyLeaf(iss, leaf, x509.ExtKeyUsageClientAuth); err != nil {
+		t.Errorf("verify: %v", err)
+	}
+	if err := verifyLeaf(iss, leaf, x509.ExtKeyUsageServerAuth); err == nil {
+		t.Error("an ingress certificate verified as a server's")
+	}
+	if name, err := ParseIngressID(testTD, leaf); err != nil || name != "ingress-0" {
+		t.Errorf("ParseIngressID = %q %v", name, err)
+	}
+	if pc.SpiffeId != IngressID(testTD, "ingress-0") || len(pc.Chain) != 2 || len(pc.TrustBundle) != 1 {
+		t.Errorf("proto %v", pc)
+	}
+	if string(pc.Chain[0]) != string(leaf.Raw) || string(pc.Chain[1]) != string(iss.Certificate().Raw) ||
+		string(pc.TrustBundle[0]) != string(iss.Root().Raw) {
+		t.Error("chain or bundle")
+	}
+	// Renewed at half the lifetime, like a node's.
+	life := leaf.NotAfter.Sub(leaf.NotBefore)
+	if !pc.RenewAfter.AsTime().Equal(leaf.NotBefore.Add(life / 2)) {
+		t.Errorf("renew_after %v, want half the lifetime", pc.RenewAfter.AsTime())
+	}
+
+	// ECDSA P-256 is accepted, other keys are not.
+	p256, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if _, _, err := iss.IssueIngress(csrFor(t, p256), "ingress-1", time.Hour); err != nil {
+		t.Errorf("P-256: %v", err)
+	}
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	if _, _, err := iss.IssueIngress(csrFor(t, rsaKey), "ingress-1", time.Hour); err == nil {
+		t.Error("RSA accepted")
+	}
+	for _, name := range []string{"", "Ingress", "a.b", "a/b", "-a", strings.Repeat("a", 64), "a_b"} {
+		if _, _, err := iss.IssueIngress(csr, name, time.Hour); err == nil {
+			t.Errorf("ingress name %q accepted", name)
+		}
+	}
+	if _, _, err := iss.IssueIngress(csr, "ingress-1", 0); err == nil {
+		t.Error("zero lifetime accepted")
+	}
+}
+
+// TestNodeAndIngressIdentities checks that a node's certificate never
+// passes as an ingress's, nor an ingress's as a node's, and that
+// ParseIngressID wants the one canonical URI.
+func TestNodeAndIngressIdentities(t *testing.T) {
+	iss, _ := newCA(t)
+	csr, _ := ed25519CSR(t, nil)
+	_, node, err := iss.IssueNode(csr, "edge", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ing, err := iss.IssueIngress(csr, "edge", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseIngressID(testTD, node); err == nil {
+		t.Error("ParseIngressID accepted a node certificate")
+	}
+	if _, err := ParseNodeID(testTD, ing); err == nil {
+		t.Error("ParseNodeID accepted an ingress certificate")
+	}
+	if name, err := ParseNodeID(testTD, node); err != nil || name != "edge" {
+		t.Errorf("ParseNodeID = %q %v", name, err)
+	}
+	if _, err := ParseIngressID("other.test", ing); err == nil {
+		t.Error("ParseIngressID accepted another trust domain")
+	}
+	_, pod, err := iss.IssuePod(csr, SandboxID(testTD, "acme", podid.Mint()), nil, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseIngressID(testTD, pod); err == nil {
+		t.Error("ParseIngressID accepted a pod certificate")
+	}
+	if _, err := ParseIngressID(testTD, nil); err == nil {
+		t.Error("ParseIngressID accepted no certificate")
+	}
+
+	// What a leaked issuer key could sign: none of it names an ingress.
+	uris := func(ss ...string) []*url.URL {
+		var out []*url.URL
+		for _, s := range ss {
+			u, err := url.Parse(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, u)
+		}
+		return out
+	}
+	base := "spiffe://" + testTD + "/ingress/"
+	for _, c := range []struct {
+		name string
+		uris []*url.URL
+	}{
+		{"no URI", nil},
+		{"two URIs", uris(base+"a", base+"b")},
+		{"nested", uris(base + "a/b")},
+		{"empty name", uris(base)},
+		{"upper case", uris(base + "Edge")},
+		{"query", uris(base + "a?b")},
+		{"fragment", uris(base + "a#b")},
+		{"user", uris("spiffe://x@" + testTD + "/ingress/a")},
+		{"not spiffe", uris("https://" + testTD + "/ingress/a")},
+		{"ingress namespace itself", uris("spiffe://" + testTD + "/ingress")},
+	} {
+		leaf := signRaw(t, iss, &x509.Certificate{URIs: c.uris})
+		if name, err := ParseIngressID(testTD, leaf); err == nil {
+			t.Errorf("%s: ParseIngressID = %q", c.name, name)
+		}
+	}
+}
+
 func checkBackdated(t *testing.T, leaf *x509.Certificate, before time.Time, ttl time.Duration) {
 	t.Helper()
 	nb := before.Add(-10 * time.Minute)
@@ -609,6 +803,9 @@ func TestIssuePod(t *testing.T) {
 		{"control-plane ID", ControlPlaneID(testTD), nil},
 		{"under the control-plane ID", ControlPlaneID(testTD) + "/x", nil},
 		{"node ID", NodeID(testTD, "node-1"), nil},
+		{"ingress ID", IngressID(testTD, "x"), nil},
+		{"under an ingress ID", IngressID(testTD, "x") + "/y", nil},
+		{"ingress namespace", "spiffe://" + testTD + "/ingress", nil},
 		{"other trust domain", "spiffe://other.test/tenant/a/sandbox/b", nil},
 		{"no path", "spiffe://" + testTD, nil},
 		{"dot segment", "spiffe://" + testTD + "/a/../ferun", nil},

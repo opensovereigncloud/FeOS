@@ -173,11 +173,11 @@ func TestMigrationSchema(t *testing.T) {
 	}
 	wantTables := []string{"activity", "auth_logins", "bookings", "cluster_secrets", "env_attached", "env_incidents",
 		"env_instances", "env_job_runs", "env_releases", "env_route_tokens", "env_secrets", "env_tags", "env_volumes",
-		"environments", "event_gaps", "instances",
+		"environments", "event_gaps", "host_labels", "ingress_certs", "ingresses", "instances",
 		"issued_certs", "join_tokens", "kube_bindings", "leases", "node_certs", "node_starts", "node_telemetry",
 		"nodes", "pod_network", "pod_tombstones", "sandbox_holds", "sandbox_tokens", "sandboxes",
-		"schema_migrations", "ssh_bindings", "tenant_tokens", "tenants", "traffic_records", "ui_sessions",
-		"watches"}
+		"schema_migrations", "ssh_bindings", "tenant_tokens", "tenants", "tool_calls", "traffic_records",
+		"ui_sessions", "watches"}
 	if strings.Join(tables, ",") != strings.Join(wantTables, ",") {
 		t.Fatalf("tables %v, want %v", tables, wantTables)
 	}

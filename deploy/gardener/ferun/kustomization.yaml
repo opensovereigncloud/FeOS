@@ -1,30 +1,99 @@
 # SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 # SPDX-License-Identifier: Apache-2.0
 
-# ferund and its PostgreSQL on the Gardener shoot: the k3s manifests
-# (deploy/k3s/ferun), with the nodes' port at FERUN_NODES_IP, an address of
-# the shoot's service network. They live outside this directory, and make
-# fills in their parameters (config.env.example):
+# ferund and its PostgreSQL on the Gardener shoot: the k3s manifests of
+# ferund (deploy/k3s/ferun), three instances, over ferun-db, a
+# CloudNativePG cluster of three instances (postgres.yaml), with the nodes'
+# port at FERUN_NODES_IP, an address of the shoot's service network. They
+# live outside this directory, and make fills in their parameters
+# (config.env.example):
 #
 #   make -C deploy/gardener apply-ferun
+#
+# A shoot whose ferund still runs on the StatefulSet postgres moves its
+# data first (README.md, Moving the database); apply-ferun refuses until
+# then.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../k3s/ferun/namespace.yaml
-  - ../../k3s/ferun/postgres.yaml
+  - postgres.yaml
   - ../../k3s/ferun/ferund.yaml
   - ../../k3s/ferun/ingress.yaml
 patches:
-  # A feos-node pod's stop suspends its microVMs (terminationGracePeriodSeconds
-  # 300) and the next one resumes them before it connects (ADR 0020): calls
-  # wait for the node that long instead of failing. Below --lost-grace
-  # (10 min).
   - target:
       kind: Deployment
       name: ferund
     patch: |-
-      - op: add
-        path: /spec/template/spec/containers/0/env/-
-        value:
-          name: FERUN_ROLLOUT_GRACE
-          value: 8m
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ferund
+        namespace: ferun
+      spec:
+        # Three instances; the spread puts one on each of the three
+        # workers. The shutdown grace and the termination grace are the
+        # k3s manifest's: a rollout or a drain lets the tool calls in
+        # flight finish.
+        replicas: 3
+        template:
+          spec:
+            # A lost worker's instance starts again on another after a
+            # minute instead of five: until then the other two carry every
+            # stream.
+            tolerations:
+              - key: node.kubernetes.io/unreachable
+                operator: Exists
+                effect: NoExecute
+                tolerationSeconds: 60
+              - key: node.kubernetes.io/not-ready
+                operator: Exists
+                effect: NoExecute
+                tolerationSeconds: 60
+            containers:
+              - name: ferund
+                env:
+                  # How long calls wait for a node that announced it stops
+                  # (config.env.example): 8m for the feos-node pods of
+                  # feos/, which suspend their microVMs and resume them
+                  # before they connect again (ADR 0020). Below --lost-grace
+                  # (10 min).
+                  - name: FERUN_ROLLOUT_GRACE
+                    value: '${FERUN_ROLLOUT_GRACE}'
+                  # What preflights, bindings and the image resolver may not
+                  # reach: the built-in set and DENY_PREFIXES, the shoot's
+                  # networks, which may lie outside it (config.env.example).
+                  - name: FERUN_DENY_PREFIX
+                    value: '${FERUN_DENY_PREFIX}'
+                  # ferun-db's primary, whichever instance that is: the -rw
+                  # service follows it, and read-write refuses a connection
+                  # that lands on a standby during a switchover. This wins
+                  # over FERUN_DATABASE_URL in the secret ferund, which the
+                  # shoot does not need.
+                  - name: FERUN_DATABASE_URL
+                    value: 'postgres://ferun@ferun-db-rw.ferun.svc:5432/ferun?sslmode=require&target_session_attrs=read-write&connect_timeout=5'
+                  - name: PGPASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: ferun-db-app
+                        key: password
+  # The zone of public environments' default hosts (ADR 0021), served by
+  # ferun-ingress (../ferun-ingress); empty, no host is served and no
+  # environment can be made public.
+  - target:
+      kind: Deployment
+      name: ferund
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ferund
+        namespace: ferun
+      spec:
+        template:
+          spec:
+            containers:
+              - name: ferund
+                env:
+                  - name: FERUN_APPS_ZONE
+                    value: '${APPS_ZONE}'

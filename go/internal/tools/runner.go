@@ -24,6 +24,7 @@ import (
 	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
 	"github.com/gardenlinux/feos/go/internal/activity"
 	"github.com/gardenlinux/feos/go/internal/auth"
+	"github.com/gardenlinux/feos/go/internal/config"
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/nodelink"
@@ -69,9 +70,11 @@ const (
 	auditParamString = 1 << 10
 )
 
-// Runner runs tool calls: the one entry point of REST and MCP (Call), the
-// engine's listing of background processes (RunningProcesses), and the
-// cancellation of a sandbox's calls from another instance (Run).
+// Runner runs tool calls: the one entry point of REST and MCP (Call, and
+// CallKeyed for calls with an id, keyed.go), the engine's listing of
+// background processes (RunningProcesses), and the cancellation of a
+// sandbox's calls from another instance and the renewal of the rows of
+// calls with an id (Run).
 type Runner struct {
 	sb         Sandboxes
 	conns      nodelink.Conns
@@ -89,6 +92,9 @@ type Runner struct {
 	mu    sync.Mutex
 	calls map[podid.ID]map[*running]struct{} // the calls in flight on this instance, by sandbox
 	execs map[podid.ID]int                   // the exec streams open on this instance, by sandbox
+
+	// k holds the calls with an id (keyed.go).
+	k keyedState
 }
 
 // running is a call in flight, cancelled with ErrCancelled by a
@@ -110,8 +116,21 @@ func NewRunner(s Sandboxes, conns nodelink.Conns, rec *activity.Recorder, d *db.
 		calls:          map[podid.ID]map[*running]struct{}{},
 		execs:          map[podid.ID]int{},
 	}
+	r.k = keyedState{
+		lease: config.CallLease, retention: config.CallRetention, cap: callCap, waiterCap: waiterCap,
+		budget: func(timeout time.Duration) time.Duration {
+			return config.PreparationBudget + timeout + callSlack
+		},
+		calls:      map[callRef]*keyedCall{},
+		locks:      map[callRef]*refLock{},
+		perSandbox: map[podid.ID]int{},
+		waiters:    map[podid.ID]int{},
+		release:    make(chan struct{}),
+	}
+	r.k.bg, r.k.bgCancel = context.WithCancelCause(context.Background())
 	if d != nil {
 		r.st = store.New(d)
+		r.k.begin, r.k.finish, r.k.abandon = r.st.BeginToolCall, r.st.FinishToolCall, r.st.AbandonToolCall
 	}
 	return r
 }
@@ -123,33 +142,77 @@ func (r *Runner) Specs() []Spec { return Specs() }
 type cancelPayload struct {
 	Kind    string `json:"kind"`
 	Sandbox string `json:"sandbox"`
+	Key     string `json:"key,omitempty"`
 }
 
-// Run cancels this instance's calls of a sandbox when another instance asks
-// for it with ferun_cancel {"kind":"exec","sandbox":id} (a node drained by
-// force), until ctx ends.
+// Run serves this instance's part of other instances' cancellations and
+// keeps the rows of its calls with an id alive, until ctx ends:
+//   - ferun_cancel {"kind":"exec","sandbox":id} (a node drained by force)
+//     cancels the sandbox's calls in flight here;
+//   - ferun_cancel {"kind":"call","sandbox":id,"key":k} cancels the call
+//     with the id k here (CancelCall on another instance), after a join of
+//     that id in progress registered it;
+//   - every third of the call lease, the rows of the calls with an id
+//     running here are renewed; a call whose row another writer ended is
+//     cancelled (errCallLost).
+//
+// Calls with an id are recorded only while Run runs. When it ends, the
+// calls with an id still running here are cut (errRunnerStopped).
 func (r *Runner) Run(ctx context.Context) error {
 	if r.d == nil {
 		<-ctx.Done()
+		r.k.bgCancel(errRunnerStopped)
 		return nil
 	}
 	ch, unsubscribe := r.d.Subscribe(db.ChanCancel)
 	defer unsubscribe()
+	var wg sync.WaitGroup
+	r.k.mu.Lock()
+	r.k.renewing = true
+	r.k.mu.Unlock()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r.renewCalls(ctx)
+	}()
+	defer func() {
+		r.k.mu.Lock()
+		r.k.renewing = false
+		r.k.mu.Unlock()
+		r.k.bgCancel(errRunnerStopped)
+		wg.Wait()
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case payload := <-ch:
 			var p cancelPayload
-			if payload == "" || json.Unmarshal([]byte(payload), &p) != nil || p.Kind != "exec" {
+			if payload == "" || json.Unmarshal([]byte(payload), &p) != nil {
 				continue
 			}
 			id, err := podid.Parse(p.Sandbox)
 			if err != nil {
 				continue
 			}
-			if n := r.cancelSandbox(id); n > 0 {
-				r.log.Info("tool calls cancelled by the control plane", "sandbox", id, "calls", n)
+			switch p.Kind {
+			case "exec":
+				if n := r.cancelSandbox(id); n > 0 {
+					r.log.Info("tool calls cancelled by the control plane", "sandbox", id, "calls", n)
+				}
+			case "call":
+				if !ValidCallKey(p.Key) {
+					continue
+				}
+				// The per-key lock may wait for a join of the id that is
+				// writing its row; the loop goes on meanwhile.
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if r.cancelLocal(callRef{sandbox: id, key: p.Key}, ErrCancelledByCaller) {
+						r.log.Info("tool call cancelled by its caller through another instance", "sandbox", id)
+					}
+				}()
 			}
 		}
 	}
@@ -236,19 +299,56 @@ func (r *Runner) Call(ctx context.Context, sb auth.Sandbox, tool string, args js
 	return r.callPrepared(ctx, sb, c, args, progress)
 }
 
-// writeFile is the write tool with its content as bytes (prepareWrite),
-// as Call runs it otherwise.
-func (r *Runner) writeFile(ctx context.Context, sb auth.Sandbox, path string, content []byte) (Result, error) {
+// writeFileKeyed is the write tool with its content as bytes
+// (prepareWrite), as CallKeyed runs it otherwise: with the id key, or as
+// Call does without one (""). Its argument hash is writeHash's, so that
+// REST's write of a body and MCP's write of the same bytes are the same
+// call.
+func (r *Runner) writeFileKeyed(ctx context.Context, sb auth.Sandbox, path string, content []byte, key string) (Result, CallInfo, error) {
 	c, err := prepareWrite(path, content, r.defaultTimeout)
 	if err != nil {
-		return Result{}, err
+		return Result{}, CallInfo{}, err
 	}
-	return r.callPrepared(ctx, sb, c, writeArgs(path, content), nil)
+	if key != "" && !ValidCallKey(key) {
+		return Result{}, CallInfo{}, ErrBadCallKey
+	}
+	args := writeArgs(path, content)
+	if key == "" || r.d == nil {
+		res, err := r.callPrepared(ctx, sb, c, args, nil)
+		return res, CallInfo{}, err
+	}
+	return r.callKeyed(ctx, sb, c, args, key, writeHash(path, content), nil)
 }
 
-// callPrepared runs the call c, recorded in the activity log with args.
+// callPrepared runs the call c on the caller's ctx, recorded in the
+// activity log with args.
 func (r *Runner) callPrepared(ctx context.Context, sb auth.Sandbox, c *call, args json.RawMessage,
 	progress func(chunk string)) (Result, error) {
+	res, _, err := r.callRun(ctx, sb, c, args, "", progress, nil)
+	return res, err
+}
+
+// causeOf is the Runner's own cause with which ctx was cancelled
+// (ErrCancelledByCaller, errStopping, errRunnerStopped, errCallLost,
+// errCallBudget), or nil.
+func causeOf(ctx context.Context) error {
+	cause := context.Cause(ctx)
+	for _, own := range []error{ErrCancelledByCaller, errStopping, errRunnerStopped, errCallLost, errCallBudget} {
+		if errors.Is(cause, own) {
+			return cause
+		}
+	}
+	return nil
+}
+
+// callRun runs the call c on ctx, recorded in the activity log with args
+// (and key, the call's id, "" for none). beforeSend, when not nil, runs
+// before every request into the guest (output.beforeSend). sent reports
+// that the call may have run in the guest. A ctx that ends with one of
+// the Runner's own causes (causeOf) answers that cause in place of ctx's
+// error.
+func (r *Runner) callRun(ctx context.Context, sb auth.Sandbox, c *call, args json.RawMessage, key string,
+	progress func(chunk string), beforeSend func(timeout time.Duration) error) (res Result, sent bool, err error) {
 	tool := c.tool
 	// The call is cancellable by ferun_cancel from here on, while Acquire
 	// waits for the sandbox too: a forced drain must not miss a call that
@@ -259,32 +359,38 @@ func (r *Runner) callPrepared(ctx context.Context, sb auth.Sandbox, c *call, arg
 
 	lease, release, err := r.sb.Acquire(cctx, sb.ID, model.HoldExec)
 	if err != nil {
-		if ctx.Err() == nil && errors.Is(context.Cause(cctx), ErrCancelled) {
+		if cause := causeOf(cctx); cause != nil {
+			err = cause
+		} else if ctx.Err() == nil && errors.Is(context.Cause(cctx), ErrCancelled) {
 			err = ErrCancelled
 		}
-		return Result{}, fmt.Errorf("ensure sandbox: %w", err)
+		return Result{}, false, fmt.Errorf("ensure sandbox: %w", err)
 	}
 	defer func() { release() }()
 
 	start := time.Now()
-	spanID := r.toolStart(ctx, sb, lease, tool, args)
-	o := &output{progress: progress}
+	spanID := r.toolStart(ctx, sb, lease, tool, args, key)
+	o := &output{progress: progress, beforeSend: beforeSend}
 	code, err := r.attempts(cctx, sb.ID, &lease, &release, c, o)
 	if err != nil {
 		switch {
 		case ctx.Err() != nil:
-			err = ctx.Err()
+			if cause := causeOf(cctx); cause != nil {
+				err = cause
+			} else {
+				err = ctx.Err()
+			}
 		case errors.Is(context.Cause(cctx), ErrCancelled):
 			err = ErrCancelled
 		}
 	}
 	r.toolEnd(ctx, sb, lease, tool, spanID, start, code, err, o)
 	if err != nil {
-		return o.partial(), err
+		return o.partial(), o.sent, err
 	}
-	res := o.result(tool, code)
+	res = o.result(tool, code)
 	r.processHolds(ctx, sb.ID, c, res)
-	return res, nil
+	return res, o.sent, nil
 }
 
 // attempts makes the call into the guest, and once more when the first
@@ -292,10 +398,17 @@ func (r *Runner) callPrepared(ctx context.Context, sb auth.Sandbox, c *call, arg
 // and release follow a new Acquire.
 func (r *Runner) attempts(cctx context.Context, id podid.ID, lease *model.Lease, release *func(), c *call, o *output) (int, error) {
 	for attempt := 0; ; attempt++ {
+		before := o.sent
 		code, received, err := r.invoke(cctx, *lease, c, o)
 		if err == nil {
 			r.sb.Reachable(id)
 			return code, nil
+		}
+		if !received && feosdRefusal(err, id) {
+			// feosd refused the call before routing it to the guest:
+			// this attempt did not run. An earlier attempt that may have
+			// run still counts.
+			o.sent = before
 		}
 		if cctx.Err() != nil {
 			return -1, r.callError(lease.Node, err)
@@ -395,13 +508,32 @@ func (r *Runner) invoke(ctx context.Context, lease model.Lease, c *call, o *outp
 	if err != nil {
 		return -1, false, err
 	}
+	prev, err := o.send(c.timeout)
+	if err != nil {
+		return -1, false, err
+	}
 	actx, cancel := withLimit(ctx, lease.SandboxID, c.timeout)
 	defer cancel()
 	code, err = c.unary(actx, toolv1.NewToolServiceClient(conn), o)
 	if err != nil {
+		if localRefusal(err) {
+			o.sent = prev
+		}
 		return -1, false, deadline(ctx, actx, c.timeout, err)
 	}
 	return code, false, nil
+}
+
+// send runs the call's beforeSend, if any, and marks the call sent; prev
+// is what sent was before, for a call the nodes' port refuses locally.
+func (o *output) send(timeout time.Duration) (prev bool, err error) {
+	if o.beforeSend != nil {
+		if err := o.beforeSend(timeout); err != nil {
+			return o.sent, err
+		}
+	}
+	prev, o.sent = o.sent, true
+	return prev, nil
 }
 
 // exec runs argv in the main container of the lease's pod, emitting its
@@ -418,12 +550,19 @@ func (r *Runner) exec(ctx context.Context, lease model.Lease, argv []string, tim
 	if err != nil {
 		return -1, false, err
 	}
+	prev, err := o.send(timeout)
+	if err != nil {
+		return -1, false, err
+	}
 	actx, cancel := withLimit(ctx, lease.SandboxID, timeout)
 	defer cancel()
 	stream, err := containerv1.NewContainerServiceClient(conn).Exec(actx, &containerv1.ExecRequest{
 		ContainerId: mainContainer, Command: argv, WorkingDir: "/",
 	})
 	if err != nil {
+		if localRefusal(err) {
+			o.sent = prev
+		}
 		return -1, false, deadline(ctx, actx, timeout, err)
 	}
 	var stdout, stderr streamCap
@@ -568,17 +707,22 @@ func (r *Runner) RunningProcesses(ctx context.Context, lease model.Lease) (map[s
 }
 
 // toolStart records a call's tool_start row and returns its span id. The
-// span is a child of the sandbox's open run.
-func (r *Runner) toolStart(ctx context.Context, sb auth.Sandbox, lease model.Lease, tool string, args json.RawMessage) string {
+// span is a child of the sandbox's open run. A call with an id (key) names
+// it in the row's detail as callId.
+func (r *Runner) toolStart(ctx context.Context, sb auth.Sandbox, lease model.Lease, tool string, args json.RawMessage, key string) string {
 	if r.rec == nil {
 		return ""
 	}
 	spanID := uuid.NewString()
+	var detail map[string]any
+	if key != "" {
+		detail = map[string]any{"callId": key}
+	}
 	r.rec.Record(activity.Event{
 		SandboxID: sb.ID, TenantID: sb.Owner, Node: lease.Node,
 		Kind: activity.KindToolStart, Category: activity.CategoryTool,
 		RequestID: spanID, SpanID: spanID, ParentSpanID: r.runID(ctx, sb.ID),
-		Name: toolName(tool, args), Tool: tool, Params: auditParams(args),
+		Name: toolName(tool, args), Tool: tool, Params: auditParams(args), Detail: detail,
 	})
 	return spanID
 }

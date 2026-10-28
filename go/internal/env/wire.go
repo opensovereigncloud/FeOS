@@ -40,9 +40,12 @@ type EnvSummary struct {
 	Realised int               `json:"realised"`
 	// State is the latest release's state (model.Release…),
 	// model.EnvNone without a release, model.EnvDeleting.
-	State         string `json:"state"`
-	OpenIncidents int    `json:"openIncidents"`
-	CreatedAt     string `json:"createdAt"`
+	State string `json:"state"`
+	// Public and Hosts are as EnvStatus has them.
+	Public        bool     `json:"public"`
+	Hosts         []string `json:"hosts"`
+	OpenIncidents int      `json:"openIncidents"`
+	CreatedAt     string   `json:"createdAt"`
 }
 
 // EnvStatus is GET /api/v1/environments/{env}, and the answer of a create
@@ -54,6 +57,13 @@ type EnvStatus struct {
 	Release  int               `json:"release"`
 	Realised int               `json:"realised"`
 	Deleting bool              `json:"deleting"`
+	// Public: its tenant made it public (PUT …/public), and the ingress
+	// serves its image services' routes without a route token (ADR 0021).
+	Public bool `json:"public"`
+	// Hosts are the hosts the ingress serves it at: its default host under
+	// the apps zone while it is public and the platform has a zone; empty
+	// otherwise, and while it is being deleted.
+	Hosts []string `json:"hosts"`
 	// Rollout is the latest release's; null without a release.
 	Rollout       *RolloutStatus `json:"rollout"`
 	Objects       []ObjectStatus `json:"objects"`
@@ -192,7 +202,21 @@ type RouteStatus struct {
 	Path    string `json:"path"`
 	Service string `json:"service"`
 	Port    int    `json:"port"`
+	// Door is DoorIngress for a route to an image service of a public
+	// environment on a platform with an apps zone, which the ingress and
+	// the route door both serve; DoorRoute for every other, which the
+	// route door alone serves (with a route token).
+	Door string `json:"door"`
+	// URL is where the ingress serves an ingress route:
+	// "https://<host><prefix>"; "" for a route door route.
+	URL string `json:"url,omitempty"`
 }
+
+// The doors of a route (RouteStatus.Door).
+const (
+	DoorIngress = "ingress"
+	DoorRoute   = "route"
+)
 
 // PlanSpecRequest is POST /api/v1/environments/plan: validation without
 // an environment.
@@ -471,6 +495,23 @@ type LogsAnswer struct {
 	// Source is "container" (an image pod's main container) or "process"
 	// (an attached service's process).
 	Source string `json:"source"`
+}
+
+// PublicRequest is PUT /api/v1/environments/{env}/public: whether the
+// ingress serves the environment (ADR 0021). Public is required.
+type PublicRequest struct {
+	Public bool `json:"public"`
+}
+
+// PublicAnswer is its answer.
+type PublicAnswer struct {
+	Public bool `json:"public"`
+	// Hosts are the environment's hosts while it is public; empty
+	// otherwise.
+	Hosts []string `json:"hosts"`
+	// Rolling: this call published the environment for the first time, so
+	// its image services roll once, to name their ingress groups.
+	Rolling bool `json:"rolling"`
 }
 
 // RouteToken is POST /api/v1/environments/{env}/route-tokens's answer:

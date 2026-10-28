@@ -348,7 +348,7 @@ func (h *harness) newEnv(name string) store.Environment {
 
 // apply inserts a release of spec as the service's apply does: the next
 // number, older pending and rolling releases superseded, env-reconcile
-// woken. It returns the release's number.
+// and env-groups woken. It returns the release's number.
 func (h *harness) apply(envID uuid.UUID, spec string) int {
 	h.t.Helper()
 	var compact json.RawMessage
@@ -374,7 +374,10 @@ func (h *harness) apply(envID uuid.UUID, spec string) int {
 		if _, err := tx.SupersedeReleases(bg, envID, n, model.ReleasePending, model.ReleaseRolling); err != nil {
 			return err
 		}
-		return tx.Notify(bg, db.ChanLeader, HintReconcile)
+		if err := tx.Notify(bg, db.ChanLeader, HintReconcile); err != nil {
+			return err
+		}
+		return tx.Notify(bg, db.ChanLeader, HintGroups)
 	})
 	if err != nil {
 		h.t.Fatal(err)

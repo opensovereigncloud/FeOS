@@ -21,10 +21,27 @@
 // another instance than its call, is broadcast with ferun_cancel; every
 // instance cancels the call it runs under that session and request id.
 //
-// A tool call runs through tools.Runner.Call, with progress notifications
-// every 10 s and per output chunk when the client sent a progress token,
-// and SSE keepalive comments every 25 s while it runs, so that balancers
-// with an idle timeout keep the response open.
+// A tool call runs through tools.Runner.CallKeyed, with progress
+// notifications every 10 s and per output chunk when the client sent a
+// progress token, and SSE keepalive comments every 25 s while it runs, so
+// that balancers with an idle timeout keep the response open. A call
+// without an id is bound to its request: when the request ends, so does
+// the call.
+//
+// A call of a tool with a side effect whose _meta carries "ferun.callId"
+// is a call with an id (ADR 0023): it runs on a context of its own and
+// outlives its request, which only waits for it. A repeat of the id with
+// the same call attaches to it or reads its record. Its result carries
+// _meta "ferun.callId", "ferun.callState" and "ferun.callReplayed"; the
+// initialize and server/discover answers advertise the tools, the
+// retention and the longest timeout as experimental["ferun.callId"]. An
+// invalid id, an id that names another call and a bash timeout over the
+// cap are JSON-RPC errors -32602 with data.reason. A cancel reaches a call
+// with an id by REST DELETE /api/v1/sandboxes/{id}/calls/{key}, and by
+// notifications/cancelled for session (initialize) clients only, also
+// shortly after its request ended (cancel.go). The go-sdk's default
+// protocol (server/discover) has no session: its clients cancel with the
+// DELETE.
 package mcpsrv
 
 import (
@@ -34,10 +51,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/gardenlinux/feos/go/internal/auth"
@@ -84,6 +103,14 @@ const (
 	touchEvery = time.Minute
 	// maxTouched bounds the remembered touches before the old ones go.
 	maxTouched = 4096
+	// metaCallID is the _meta key of a call's id (ADR 0023), and the name
+	// of the experimental capability that advertises it.
+	metaCallID = "ferun.callId"
+	// metaCallState and metaCallReplayed are the _meta keys of a keyed
+	// result: its state (done, interrupted, not_run, running), and whether
+	// it is another request's call.
+	metaCallState    = "ferun.callState"
+	metaCallReplayed = "ferun.callReplayed"
 )
 
 // Server is the http.Handler of /mcp, with the door's own class of
@@ -103,9 +130,12 @@ type Server struct {
 	keyMu sync.Mutex
 	key   []byte
 
-	mu    sync.Mutex
-	calls map[string]map[uint64]context.CancelFunc // tool calls by "<session>:<request id>"
-	seq   uint64
+	mu     sync.Mutex
+	calls  map[string]map[uint64]context.CancelFunc // tool calls by "<session>:<request id>"
+	seq    uint64
+	keyed  *memory[keyedCancel] // calls with an id by "<session>:<request id>", per client, kept cancelLinger after
+	recent *memory[struct{}]    // cancels that found no call, per client, for recentFor
+	now    func() time.Time     // the clock of keyed and recent
 
 	touchMu sync.Mutex
 	touched map[string]time.Time
@@ -131,6 +161,9 @@ func New(cfg Config, r *tools.Runner, resolve Resolver, d *db.DB) *Server {
 		cfg: cfg, log: cfg.Log, rl: newRateLog(cfg.Log), runner: r, resolve: resolve, d: d,
 		origins: map[string]bool{},
 		calls:   map[string]map[uint64]context.CancelFunc{},
+		keyed:   newMemory[keyedCancel](cancelLinger, maxPerClient),
+		recent:  newMemory[struct{}](recentFor, maxPerClient),
+		now:     time.Now,
 		touched: map[string]time.Time{},
 	}
 	if d != nil {
@@ -161,12 +194,13 @@ func New(cfg Config, r *tools.Runner, resolve Resolver, d *db.DB) *Server {
 
 // requestState is what the door learnt of a request, for the factory and
 // the tool handlers: the sandbox, the request's own context, the key under
-// which its tool call can be cancelled, the keepalive of its response, and
-// the server built for it.
+// which its tool call can be cancelled and the client it is counted for
+// (clientOf), the keepalive of its response, and the server built for it.
 type requestState struct {
 	sandbox   auth.Sandbox
 	reqCtx    context.Context
 	callKey   string
+	client    string
 	keepalive *keepaliveWriter
 	server    *mcp.Server
 }
@@ -234,9 +268,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				s.rl.warn("session", "mcp: no session id for the initialize answer", "err", err)
 			}
 		case m.Method == methodToolsCall && m.hasID() && session != "":
-			st.callKey = callKey(session, m.ID)
+			st.callKey, st.client = callKey(session, m.ID), clientOf(sb.TokenHash)
 		case m.Method == methodCancelled && session != "":
-			s.broadcastCancel(r.Context(), session, m.Params)
+			s.broadcastCancel(r.Context(), clientOf(sb.TokenHash), session, m.Params)
 		}
 	}
 	ctx := auth.WithSandbox(r.Context(), sb)
@@ -316,10 +350,25 @@ func (s *Server) factory(r *http.Request) *mcp.Server {
 }
 
 // newServer is the baseline as an MCP server bound to one sandbox: tools
-// only, each with its schema as it is.
+// only, each with its schema as it is. Its capabilities are the SDK's
+// (logging, and tools inferred from them) and experimental["ferun.callId"]:
+// the tools whose calls with an id are recorded, how long their records
+// are kept, and the longest timeout such a call may name.
 func (s *Server) newServer(sb auth.Sandbox) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: serverName, Version: s.cfg.Version},
-		&mcp.ServerOptions{Instructions: instructions})
+		&mcp.ServerOptions{
+			Instructions: instructions,
+			Capabilities: &mcp.ServerCapabilities{
+				Logging: &mcp.LoggingCapabilities{},
+				// Tools stays nil: the SDK infers {"listChanged":true}
+				// from the tools added below, as it did without options.
+				Experimental: map[string]any{metaCallID: map[string]any{
+					"tools":             tools.KeyedTools(),
+					"retentionSeconds":  int(s.runner.CallRetention() / time.Second),
+					"maxTimeoutSeconds": int(tools.MaxKeyedTimeout / time.Second),
+				}},
+			},
+		})
 	for _, t := range s.tools {
 		srv.AddTool(t, s.toolHandler(sb, t.Name))
 	}
@@ -331,8 +380,21 @@ func (s *Server) newServer(sb auth.Sandbox) *mcp.Server {
 // "\n(exit code N)" for a non-zero exit, a picture as image content, and
 // isError per tool. A call that failed is isError with the output so far,
 // a newline, and "error: <err>".
+//
+// A call with an id (_meta "ferun.callId") runs through CallKeyed: the
+// request waits for the call, which outlives it, and the result carries
+// the call's id, state and replay in _meta. A request of a session whose
+// cancel came before it starts nothing, and one whose client has as many
+// requests with an id running on the instance as it may (maxPerClient)
+// is an isError result without _meta: its call was not looked up.
 func (s *Server) toolHandler(sb auth.Sandbox, tool string) mcp.ToolHandler {
+	keyedTool := slices.Contains(tools.KeyedTools(), tool)
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		key, err := callIDOf(req.Params)
+		if err != nil {
+			return nil, invalidParams("invalid _meta "+metaCallID+": "+tools.ErrBadCallKey.Error(),
+				map[string]any{"reason": "invalid_call_id"})
+		}
 		st := stateFrom(ctx)
 		if st != nil && st.keepalive != nil {
 			st.keepalive.start()
@@ -341,13 +403,27 @@ func (s *Server) toolHandler(sb auth.Sandbox, tool string) mcp.ToolHandler {
 		defer cancel()
 		if st != nil && st.reqCtx != nil {
 			// A stateless call's answer has no way to its client but its
-			// own request: when the request ends, so does the call, in
-			// every protocol version (the SDK cancels only the newer ones).
+			// own request: when the request ends, so does the call without
+			// an id, in every protocol version (the SDK cancels only the
+			// newer ones), and the wait for a call with an id.
 			stop := context.AfterFunc(st.reqCtx, cancel)
 			defer stop()
 		}
 		if st != nil && st.callKey != "" {
+			// Registered before the check of the early cancels, both
+			// under s.mu: a cancel either finds the request here or is
+			// remembered before the check (cancelKey).
 			defer s.register(st.callKey, cancel)()
+			if key != "" && keyedTool {
+				done, err := s.registerKeyed(st.client, st.callKey, sb.ID, key)
+				if err != nil {
+					return render(tools.Result{}, err), nil
+				}
+				defer done()
+			}
+			if s.recentlyCancelled(st.callKey) {
+				return nil, context.Canceled
+			}
 		}
 		var progress func(string)
 		if req.Params != nil && req.Session != nil {
@@ -361,64 +437,68 @@ func (s *Server) toolHandler(sb auth.Sandbox, tool string) mcp.ToolHandler {
 		if req.Params != nil {
 			args = req.Params.Arguments
 		}
-		res, err := s.runner.Call(ctx, sb, tool, args, progress)
+		res, info, err := s.runner.CallKeyed(ctx, sb, tool, args, key, progress)
+		var conflict *tools.CallIDConflictError
+		if errors.As(err, &conflict) {
+			return nil, invalidParams(err.Error(), map[string]any{"reason": "call_id_conflict", "tool": conflict.Tool})
+		}
+		var tooLong *tools.KeyedTimeoutError
+		if errors.As(err, &tooLong) {
+			return nil, invalidParams(err.Error(),
+				map[string]any{"reason": "timeout_too_long", "maxTimeoutSeconds": int(tools.MaxKeyedTimeout / time.Second)})
+		}
 		if ctx.Err() != nil {
-			// The client went away or cancelled the call; the call was
-			// cancelled with it.
+			// The client went away or cancelled the call; a call without
+			// an id was cancelled with it, a call with an id runs on.
 			return nil, ctx.Err()
 		}
-		return render(res, err), nil
+		out := render(res, err)
+		if info.Keyed {
+			// A request released while another instance's call still
+			// runs (*tools.AskAgainError) is an isError result, state
+			// running.
+			out.Meta = mcp.Meta{metaCallID: key, metaCallState: info.State, metaCallReplayed: info.Replay}
+		}
+		return out, nil
 	}
 }
 
-// render is the MCP result of a tool call.
+// callIDOf is the call id in a tools/call's _meta: "" when there is none,
+// tools.ErrBadCallKey for a value that is not a string or not a call id.
+func callIDOf(p *mcp.CallToolParamsRaw) (string, error) {
+	if p == nil || p.Meta == nil {
+		return "", nil
+	}
+	v, ok := p.Meta[metaCallID]
+	if !ok {
+		return "", nil
+	}
+	key, ok := v.(string)
+	if !ok || !tools.ValidCallKey(key) {
+		return "", tools.ErrBadCallKey
+	}
+	return key, nil
+}
+
+// invalidParams is a JSON-RPC error -32602 (invalid params) with msg and
+// data, whose "reason" a client acts on.
+func invalidParams(msg string, data map[string]any) *jsonrpc.Error {
+	e := &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: msg}
+	if b, err := json.Marshal(data); err == nil {
+		e.Data = b
+	}
+	return e
+}
+
+// render is the MCP result of a tool call: tools.RenderText as its text
+// content, and the picture of a call that did not fail as image content.
 func render(res tools.Result, err error) *mcp.CallToolResult {
-	text := res.Text
-	if res.FirstLine > 0 {
-		text = numbered(text, res.FirstLine)
-	}
-	if res.Truncated {
-		text += tools.TruncatedMarker
-	}
-	if res.FirstLine > 0 && (res.More || res.Truncated) {
-		// The first line not shown whole: a cut may end inside one.
-		next := res.FirstLine + strings.Count(res.Text, "\n")
-		text += fmt.Sprintf("... [the file goes on: read with offset=%d for more]\n", next)
-	}
-	if err != nil {
-		if text != "" {
-			text += "\n"
-		}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text + "error: " + err.Error()}}, IsError: true}
-	}
-	if strings.TrimSpace(text) == "" {
-		text = "(no output)"
-	}
-	if res.ExitCode != 0 {
-		text += fmt.Sprintf("\n(exit code %d)", res.ExitCode)
-	}
+	text, isError := tools.RenderText(res, err)
 	content := []mcp.Content{&mcp.TextContent{Text: text}}
-	if img := res.Image; img != nil {
+	if img := res.Image; img != nil && err == nil {
 		content = append(content, &mcp.ImageContent{Data: img.Data, MIMEType: img.MediaType})
 	}
-	return &mcp.CallToolResult{Content: content, IsError: res.IsError}
-}
-
-// numbered puts each line's number in front of it, as cat -n does: right
-// aligned in six columns, then a tab. An agent finds its place by them and
-// edits by the text after the tab.
-func numbered(text string, first int) string {
-	var b strings.Builder
-	b.Grow(len(text) + 8*(strings.Count(text, "\n")+1))
-	for n := first; text != ""; n++ {
-		line, rest, nl := strings.Cut(text, "\n")
-		fmt.Fprintf(&b, "%6d\t%s", n, line)
-		if nl {
-			b.WriteByte('\n')
-		}
-		text = rest
-	}
-	return b.String()
+	return &mcp.CallToolResult{Content: content, IsError: isError}
 }
 
 // heartbeats sends a call's progress notifications: on a timer, and on

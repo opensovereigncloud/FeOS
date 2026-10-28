@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1006,5 +1007,178 @@ func TestControllerRefusals(t *testing.T) {
 	var ae *apierr.Error
 	if !errors.As(err, &ae) || ae.Code != "busy" || ae.Header.Get("Retry-After") != "5" {
 		t.Fatalf("busy %+v", ae)
+	}
+}
+
+// Publishing (ADR 0021): with an apps zone, PUT public gives the
+// environment its default host and rolls its image services once; the
+// status, the listing and a plan say which door serves each route.
+// Unpublishing keeps the host for the next publish, which rolls nothing.
+// A clone is never public. Without a zone publishing is refused, and a
+// public environment has no host; so is a change of a deleting
+// environment or tenant.
+func TestSetPublic(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, harnessOptions{appsZone: "apps.test"})
+	ctx := h.ctx()
+	h.create("stage", nil)
+	h.putSecret("stage", "token", "x")
+	sb := h.sandbox(tenantA, true)
+	withDev := strings.Replace(previewSpec(sb), `"root": {"path": "/", "service": "web", "port": "http"}`,
+		`"root": {"path": "/", "service": "web", "port": "http"}, "dev": {"path": "/dev/", "service": "dev", "port": "http"}`, 1)
+	h.apply("stage", withDev, 0)
+	byDoor := []RouteStatus{
+		{Name: "api", Path: "/api", Service: "api", Port: 8080, Door: DoorRoute},
+		{Name: "dev", Path: "/dev/", Service: "dev", Port: 5173, Door: DoorRoute},
+		{Name: "root", Path: "/", Service: "web", Port: 3000, Door: DoorRoute},
+	}
+	st, err := h.svc.GetEnv(ctx, tenantA, "stage")
+	if err != nil || st.Public || st.Hosts == nil || len(st.Hosts) != 0 || !slices.Equal(st.Routes, byDoor) {
+		t.Fatalf("before: %+v %v", st, err)
+	}
+
+	// Published: the host, a roll, the controller woken.
+	hosts := []string{"stage-acme.apps.test"}
+	ch, unsubscribe := h.d.Subscribe(db.ChanLeader)
+	defer unsubscribe()
+	a, err := h.svc.SetPublic(ctx, tenantA, "stage", true)
+	if err != nil || !a.Public || !slices.Equal(a.Hosts, hosts) || !a.Rolling {
+		t.Fatalf("publish: %+v %v", a, err)
+	}
+	waitHint(t, ch, ctl.HintReconcile)
+	waitHint(t, ch, ctl.HintGroups)
+	if e := h.env("stage"); !e.Public || !e.IngressGroup || e.HostLabel != "stage-acme" {
+		t.Fatalf("row %+v", e)
+	}
+	// Again, by its ID: the same answer, and nothing rolls.
+	a, err = h.svc.SetPublic(ctx, tenantA, st.ID, true)
+	if err != nil || !a.Public || !slices.Equal(a.Hosts, hosts) || a.Rolling {
+		t.Fatalf("again: %+v %v", a, err)
+	}
+
+	// The routes to image services are the ingress's too, at the host;
+	// the attached service's are the route door's alone.
+	ingress := slices.Clone(byDoor)
+	ingress[0].Door, ingress[0].URL = DoorIngress, "https://stage-acme.apps.test/api"
+	ingress[2].Door, ingress[2].URL = DoorIngress, "https://stage-acme.apps.test/"
+	st, err = h.svc.GetEnv(ctx, tenantA, "stage")
+	if err != nil || !st.Public || !slices.Equal(st.Hosts, hosts) || !slices.Equal(st.Routes, ingress) {
+		t.Fatalf("status: %+v %v", st, err)
+	}
+	b, _ := json.Marshal(st)
+	for _, want := range []string{`"public":true,"hosts":["stage-acme.apps.test"]`,
+		`{"name":"api","path":"/api","service":"api","port":8080,"door":"ingress","url":"https://stage-acme.apps.test/api"}`,
+		`{"name":"dev","path":"/dev/","service":"dev","port":5173,"door":"route"}`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("status JSON lacks %s:\n%s", want, b)
+		}
+	}
+	list, err := h.svc.ListEnvs(ctx, tenantA, nil)
+	if err != nil || len(list.Environments) != 1 || !list.Environments[0].Public ||
+		!slices.Equal(list.Environments[0].Hosts, hosts) {
+		t.Fatalf("list %+v %v", list, err)
+	}
+	p, err := h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(withDev)})
+	if err != nil || !p.Valid ||
+		!hasFinding(p.Findings, spec.SeverityInfo, "routes.api",
+			"served by the ingress at https://stage-acme.apps.test/api and by the route door") ||
+		!hasFinding(p.Findings, spec.SeverityInfo, "routes.root", "served by the ingress at https://stage-acme.apps.test/ and") ||
+		!hasFinding(p.Findings, spec.SeverityInfo, "routes.dev", "served by the route door alone: an attached service") ||
+		!hasFinding(p.Findings, spec.SeverityInfo, "", "nothing changes") || len(p.Findings) != 4 {
+		t.Fatalf("plan %+v %v", p, err)
+	}
+
+	// A clone is not public, whatever its source is.
+	if _, err := h.svc.Clone(ctx, tenantA, "stage", CloneRequest{Name: "demo",
+		Secrets: map[string]CloneSecret{"token": {Copy: true}}}); err != nil {
+		t.Fatal(describe(err))
+	}
+	if e := h.env("demo"); e.Public || e.IngressGroup || e.HostLabel != "" {
+		t.Fatalf("clone row %+v", e)
+	}
+	if cst, err := h.svc.GetEnv(ctx, tenantA, "demo"); err != nil || cst.Public || len(cst.Hosts) != 0 ||
+		cst.Routes[0].Door != DoorRoute || cst.Routes[0].URL != "" {
+		t.Fatalf("clone %+v %v", cst, err)
+	}
+
+	// Unpublished: no host, the route door alone; the label and the group
+	// stay, so publishing again names the same host and rolls nothing.
+	a, err = h.svc.SetPublic(ctx, tenantA, "stage", false)
+	if err != nil || a.Public || a.Hosts == nil || len(a.Hosts) != 0 || a.Rolling {
+		t.Fatalf("unpublish: %+v %v", a, err)
+	}
+	st, err = h.svc.GetEnv(ctx, tenantA, "stage")
+	if err != nil || st.Public || len(st.Hosts) != 0 || !slices.Equal(st.Routes, byDoor) {
+		t.Fatalf("unpublished status: %+v %v", st, err)
+	}
+	p, err = h.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(withDev)})
+	if err != nil || !hasFinding(p.Findings, spec.SeverityInfo, "routes.api",
+		"served by the route door; the ingress serves it once the environment is public") {
+		t.Fatalf("unpublished plan %+v %v", p, err)
+	}
+	if e := h.env("stage"); e.Public || !e.IngressGroup || e.HostLabel != "stage-acme" {
+		t.Fatalf("unpublished row %+v", e)
+	}
+	a, err = h.svc.SetPublic(ctx, tenantA, "stage", true)
+	if err != nil || !slices.Equal(a.Hosts, hosts) || a.Rolling {
+		t.Fatalf("republish: %+v %v", a, err)
+	}
+
+	// Refused: another tenant's environment or none, a deleting
+	// environment, a deleting tenant.
+	_, err = h.svc.SetPublic(ctx, tenantB, "stage", true)
+	wantStatus(t, err, http.StatusNotFound, "no such environment")
+	_, err = h.svc.SetPublic(ctx, tenantA, "nope", true)
+	wantStatus(t, err, http.StatusNotFound, "no such environment")
+	if err := h.svc.DeleteEnv(ctx, tenantA, "demo"); err != nil {
+		t.Fatal(err)
+	}
+	for _, public := range []bool{true, false} {
+		_, err = h.svc.SetPublic(ctx, tenantA, "demo", public)
+		wantStatus(t, err, http.StatusConflict, "environment demo is being deleted")
+	}
+	// A public environment being deleted keeps its flag, but the ingress
+	// no longer serves it: no host, the route door alone.
+	if err := h.svc.DeleteEnv(ctx, tenantA, "stage"); err != nil {
+		t.Fatal(err)
+	}
+	st, err = h.svc.GetEnv(ctx, tenantA, "stage")
+	if err != nil || !st.Public || len(st.Hosts) != 0 || !slices.Equal(st.Routes, byDoor) {
+		t.Fatalf("deleting: %+v %v", st, err)
+	}
+	if list, err := h.svc.ListEnvs(ctx, tenantA, nil); err != nil || !list.Environments[1].Public ||
+		list.Environments[1].Name != "stage" || len(list.Environments[1].Hosts) != 0 {
+		t.Fatalf("deleting list %+v %v", list, err)
+	}
+	if _, created, err := h.svc.CreateEnv(ctx, tenantB, CreateEnvRequest{Name: "x"}); err != nil || !created {
+		t.Fatal(err)
+	}
+	h.exec("UPDATE tenants SET deleting_at = now() WHERE id = $1", tenantB)
+	_, err = h.svc.SetPublic(ctx, tenantB, "x", true)
+	wantStatus(t, err, http.StatusConflict, "tenant other is being deleted")
+
+	// Without a zone (the kill switch): publishing is refused; a public
+	// environment has no host and only the route door serves it;
+	// unpublishing works.
+	h2 := newHarness(t, harnessOptions{})
+	h2.create("stage", nil)
+	h2.putSecret("stage", "token", "x")
+	h2.apply("stage", stageSpec, 0)
+	_, err = h2.svc.SetPublic(ctx, tenantA, "stage", true)
+	wantStatus(t, err, http.StatusConflict, "the platform serves no apps zone (--apps-zone); an environment cannot be public")
+	if _, err := h2.st.SetEnvironmentPublic(ctx, h2.env("stage").ID, true); err != nil {
+		t.Fatal(err)
+	}
+	st, err = h2.svc.GetEnv(ctx, tenantA, "stage")
+	if err != nil || !st.Public || len(st.Hosts) != 0 || st.Routes[0].Door != DoorRoute || st.Routes[1].Door != DoorRoute {
+		t.Fatalf("public without a zone: %+v %v", st, err)
+	}
+	if p, err := h2.svc.Plan(ctx, tenantA, "stage", PlanRequest{Spec: json.RawMessage(stageSpec)}); err != nil ||
+		len(p.Findings) != 1 || p.Findings[0].Problem != "nothing changes: the spec equals release 1's" {
+		t.Fatalf("plan without a zone %+v %v", p, err)
+	}
+	a, err = h2.svc.SetPublic(ctx, tenantA, "stage", false)
+	if err != nil || a.Public || len(a.Hosts) != 0 || a.Rolling {
+		t.Fatalf("unpublish without a zone: %+v %v", a, err)
 	}
 }

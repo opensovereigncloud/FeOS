@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/model"
 )
 
@@ -56,6 +57,12 @@ type Node struct {
 	MeshPrefix    string
 	MeshPublicKey []byte
 	MeshEndpoint  string
+
+	// IngressGroupVersion is the version of the security group
+	// model.IngressPeersGroup the node holds, as last put on or listed by
+	// it (0: none): an ingress whose address entered the group at this
+	// version or earlier may send to the node's pods (ADR 0021).
+	IngressGroupVersion int64
 }
 
 // Forked reports whether the node's identity forked.
@@ -78,7 +85,8 @@ func nodeColumns(p string) string {
 		"slots", "mem_headroom_bytes", "cpu_overcommit", "hostname", "arch", "cpu_model", "cpu_cores",
 		"memory_total_bytes", "disk_total_bytes", "versions", "object_store", "object_store_id", "pod_prefix",
 		"start_id", "stopping_until", "current_serial", "identity_forked_at", "joined_at", "reconciled_at",
-		"reconcile_requested_at", "mesh_subnet", "mesh_prefix", "mesh_public_key", "mesh_endpoint"}
+		"reconcile_requested_at", "mesh_subnet", "mesh_prefix", "mesh_public_key", "mesh_endpoint",
+		"ingress_group_version"}
 	if p != "" {
 		for i, c := range cols {
 			cols[i] = p + "." + c
@@ -100,7 +108,7 @@ func nodeScanTargets(n *Node) ([]any, func()) {
 		&n.Slots, &n.MemHeadroomBytes, &overcommit, &n.Hostname, &n.Arch, &n.CPUModel, &n.CPUCores,
 		&n.MemoryTotalBytes, &n.DiskTotalBytes, &n.Versions, &n.ObjectStore, &n.ObjectStoreID, &n.PodPrefix,
 		&startID, &stoppingUntil, &n.CurrentSerial, &forkedAt, &n.JoinedAt, &reconciledAt, &requestedAt,
-		&subnet, &n.MeshPrefix, &n.MeshPublicKey, &n.MeshEndpoint}
+		&subnet, &n.MeshPrefix, &n.MeshPublicKey, &n.MeshEndpoint, &n.IngressGroupVersion}
 	return targets, func() {
 		if subnet != nil {
 			n.MeshSubnet = int(*subnet)
@@ -153,10 +161,11 @@ func (s *Store) InsertNode(ctx context.Context, name string) (bool, error) {
 
 // RejoinNode resets a node for a join with a token pinned to its name: the
 // row (inserted if missing, then locked) becomes joined, not removed, not
-// forked, without a current serial or description (draining stays), and
-// off the pods' mesh, whose /64 it gets anew (ADR 0017); every earlier
-// certificate of the node is revoked ("rejoined"); ferun_node is sent, so
-// that the old connections close everywhere.
+// forked, without a current serial or description (draining stays), off
+// the pods' mesh, whose /64 it gets anew (ADR 0017), and holding no
+// version of model.IngressPeersGroup (ferun_ingress "*" when it held one);
+// every earlier certificate of the node is revoked ("rejoined");
+// ferun_node is sent, so that the old connections close everywhere.
 func (s *Store) RejoinNode(ctx context.Context, name string) error {
 	if _, err := s.InsertNode(ctx, name); err != nil {
 		return err
@@ -167,7 +176,7 @@ func (s *Store) RejoinNode(ctx context.Context, name string) error {
 	}
 	if _, err := s.q.Exec(ctx, `UPDATE nodes SET status = 'joined', removed_at = NULL, identity_forked_at = NULL,
 		current_serial = '', status_description = '', mesh_subnet = NULL, mesh_prefix = '', mesh_public_key = NULL,
-		mesh_endpoint = '' WHERE name = $1`, name); err != nil {
+		mesh_endpoint = '', ingress_group_version = 0 WHERE name = $1`, name); err != nil {
 		return err
 	}
 	if _, err := s.RevokeNodeCerts(ctx, name, RevokedRejoined, ""); err != nil {
@@ -178,7 +187,25 @@ func (s *Store) RejoinNode(ctx context.Context, name string) error {
 			return err
 		}
 	}
+	if n.IngressGroupVersion != 0 {
+		if err := s.Notify(ctx, db.ChanIngress, IngressPayloadAll); err != nil {
+			return err
+		}
+	}
 	return s.Notify(ctx, chanNode, name)
+}
+
+// SetNodeIngressGroupVersion records the version of
+// model.IngressPeersGroup that node holds, only when it differs; then
+// ferun_ingress "*" is sent, as the version admits the ingress to every
+// endpoint on the node. It reports whether it wrote.
+func (s *Store) SetNodeIngressGroupVersion(ctx context.Context, node string, v int64) (bool, error) {
+	tag, err := s.q.Exec(ctx, `UPDATE nodes SET ingress_group_version = $2
+		WHERE name = $1 AND ingress_group_version IS DISTINCT FROM $2`, node, v)
+	if err != nil || tag.RowsAffected() == 0 {
+		return false, err
+	}
+	return true, s.Notify(ctx, db.ChanIngress, IngressPayloadAll)
 }
 
 // NodeStatic is what a node reports about itself that rarely changes.

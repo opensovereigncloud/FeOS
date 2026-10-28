@@ -5,6 +5,7 @@ package tools
 
 import (
 	"strings"
+	"time"
 
 	"github.com/gardenlinux/feos/go/internal/activity"
 )
@@ -76,6 +77,13 @@ type output struct {
 	// The lines of a read (Result.FirstLine, Result.More).
 	firstLine int
 	more      bool
+	// sent: the call may have run in the guest: its request left this
+	// instance and feosd did not refuse it before routing it there.
+	sent bool
+	// beforeSend runs before every request into the guest, with the
+	// call's timeout; an error ends the call unsent. nil for calls without
+	// a key (keyed.go: the drain's send gate and the sent mark).
+	beforeSend func(timeout time.Duration) error
 }
 
 // emit takes one chunk of text output. The client's text takes chunks

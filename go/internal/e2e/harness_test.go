@@ -4,18 +4,29 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,10 +38,16 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	networkv1 "github.com/gardenlinux/feos/go/gen/feos/network/v1"
 	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
 	"github.com/gardenlinux/feos/go/internal/config"
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/env"
+	"github.com/gardenlinux/feos/go/internal/ingress"
+	"github.com/gardenlinux/feos/go/internal/ingress/agent"
+	"github.com/gardenlinux/feos/go/internal/ingress/wg"
+	"github.com/gardenlinux/feos/go/internal/mesh"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/pki"
 	"github.com/gardenlinux/feos/go/internal/podid"
@@ -971,6 +988,517 @@ func (p *dbProxy) untrack(conn net.Conn) {
 	p.mu.Lock()
 	delete(p.conns, conn)
 	p.mu.Unlock()
+}
+
+// --------------------------------------------------------------- ingress --
+
+// appsZone is the apps zone of the clusters that ferun-ingress serves:
+// public environments' hosts are <label>.apps.test.
+const appsZone = "apps.test"
+
+// ingressCluster tunes a cluster for ferun-ingress: the pods' mesh, which
+// the ingress joins, and the apps zone; extra changes it further.
+func ingressCluster(extra ...func(*config.Config)) func(*config.Config) {
+	return func(cfg *config.Config) {
+		cfg.PodNetwork, cfg.AppsZone = config.PodNetworkMesh, appsZone
+		for _, f := range extra {
+			f(cfg)
+		}
+	}
+}
+
+// meshNode tunes a test node for the ingress's clusters: on the mesh,
+// checking the security groups its pods name, as feosd does.
+func meshNode(cfg *testnode.Config) { cfg.Mesh, cfg.CheckSecurityGroups = true, true }
+
+// ingressToken issues a join token of kind ingress pinned to name over
+// the admin API, as the operator does, and checks that the answer names
+// the kind.
+func (c *cluster) ingressToken(name string) string {
+	c.t.Helper()
+	b, _ := json.Marshal(map[string]string{"kind": model.JoinKindIngress, "name": name})
+	r := c.call(nil, "POST", "/api/v1/admin/join-tokens", adminAuth, string(b))
+	if r.code != http.StatusCreated {
+		c.t.Fatalf("ingress join token: %d %s", r.code, r.body)
+	}
+	var out struct {
+		Token string `json:"token"`
+		Kind  string `json:"kind"`
+		Name  string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(r.body), &out); err != nil || out.Token == "" || out.Kind != model.JoinKindIngress ||
+		out.Name != name {
+		c.t.Fatalf("ingress join token: %s (%v)", r.body, err)
+	}
+	return out.Token
+}
+
+// setPublic makes an environment public, or not, with the tenant's token
+// through the balancer (PUT …/public), and returns the answer. (publish
+// is the events' already.)
+func (c *cluster) setPublic(envID uuid.UUID, public bool) env.PublicAnswer {
+	c.t.Helper()
+	r := c.call(nil, "PUT", "/api/v1/environments/"+envID.String()+"/public", tenantAuth,
+		fmt.Sprintf(`{"public":%t}`, public))
+	if r.code != http.StatusOK {
+		c.t.Fatalf("public %t: %d %s", public, r.code, r.body)
+	}
+	var ans env.PublicAnswer
+	if err := json.Unmarshal([]byte(r.body), &ans); err != nil || ans.Public != public {
+		c.t.Fatalf("public %t: %s (%v)", public, r.body, err)
+	}
+	return ans
+}
+
+// ingressProc is a ferun-ingress instance of a cluster in the test's
+// process: an ingress.Program on loopback listeners with a self-signed
+// *.apps.test certificate, which joins with a token of its own, connects
+// to the instances' nodes' port, and reaches the pods through a fake mesh
+// (fakeMesh) and a dial hook (dialPod). It stops before the cluster does;
+// restart runs it again on the same state directory.
+type ingressProc struct {
+	c    *cluster
+	name string
+	cfg  ingress.Config
+	tr   *http.Transport
+
+	mu     sync.Mutex
+	prog   *ingress.Program
+	mesh   *fakeMesh
+	cancel context.CancelFunc
+	done   chan error
+	// cut: the ingress is cut off from the control plane (cutOff);
+	// cpConns are its connections there.
+	cut     bool
+	cpConns map[net.Conn]struct{}
+}
+
+// runIngress runs a ferun-ingress instance named name (tune changes its
+// configuration) until the test ends: its token file holds a token pinned
+// to name, --control-plane lists every live instance's nodes' port, and
+// its listeners are on loopback. It does not wait for its join.
+func (c *cluster) runIngress(name string, tune ...func(*ingress.Config)) *ingressProc {
+	c.t.Helper()
+	dir := c.t.TempDir()
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte(c.ingressToken(name)+"\n"), 0o600); err != nil {
+		c.t.Fatal(err)
+	}
+	certFile, keyFile, pool := wildcardPair(c.t, dir, "*."+appsZone)
+	cfg := ingress.Default()
+	cfg.Name = name
+	cfg.StateDir = filepath.Join(dir, "state")
+	cfg.JoinTokenFile = tokenFile
+	for _, in := range c.live() {
+		cfg.ControlPlane = append(cfg.ControlPlane, in.NodeAddr())
+	}
+	cfg.ControlPlaneName = c.issuer.ControlPlaneDomain()
+	cfg.TrustDomain = trustDomain
+	cfg.ListenHTTP, cfg.ListenHTTPS, cfg.HealthListen = "127.0.0.1:0", "127.0.0.1:0", "127.0.0.1:0"
+	cfg.TLSCert, cfg.TLSKey = certFile, keyFile
+	cfg.MeshEndpoint = "127.0.0.9:51820"
+	cfg.ShutdownDelay, cfg.ShutdownGrace = 100*time.Millisecond, 5*time.Second
+	cfg.Version = "e2e"
+	for _, f := range tune {
+		f(&cfg)
+	}
+	p := &ingressProc{c: c, name: name, cfg: cfg, cpConns: map[net.Conn]struct{}{}}
+	p.tr = &http.Transport{
+		// SNI is the URL's host; the connection goes to the HTTPS
+		// listener whatever the host, as through the balancer.
+		TLSClientConfig: &tls.Config{RootCAs: pool},
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, p.program().Addrs().HTTPS)
+		},
+		ForceAttemptHTTP2: true,
+	}
+	p.start()
+	c.t.Cleanup(func() {
+		p.stop()
+		p.tr.CloseIdleConnections()
+	})
+	return p
+}
+
+// start makes a Program of the configuration, with a new fake mesh
+// device, and runs it.
+func (p *ingressProc) start() {
+	p.c.t.Helper()
+	m := &fakeMesh{}
+	prog, err := ingress.New(p.cfg, ingress.Deps{Mesh: m, Dial: p.dialPod, DialControlPlane: p.dialControlPlane,
+		Log: p.c.log.With("ingress", p.name)})
+	if err != nil {
+		p.c.t.Fatalf("ingress %s: %v", p.name, err)
+	}
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan error, 1)
+	go func() { done <- prog.Run(ctx) }()
+	p.mu.Lock()
+	p.prog, p.mesh, p.cancel, p.done = prog, m, cancel, done
+	p.mu.Unlock()
+}
+
+// stop stops the program as SIGTERM does and waits for its end; a stopped
+// one stays stopped.
+func (p *ingressProc) stop() {
+	p.mu.Lock()
+	cancel, done := p.cancel, p.done
+	p.cancel = nil
+	p.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			p.c.t.Errorf("ingress %s: %v", p.name, err)
+		}
+	case <-time.After(time.Minute):
+		p.c.t.Errorf("ingress %s did not stop", p.name)
+	}
+}
+
+// restart stops the program and runs a new one on the same state
+// directory, as a restarted pod does with its volume.
+func (p *ingressProc) restart() {
+	p.c.t.Helper()
+	p.stop()
+	p.tr.CloseIdleConnections()
+	p.start()
+}
+
+func (p *ingressProc) program() *ingress.Program {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.prog
+}
+
+func (p *ingressProc) device() *fakeMesh {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.mesh
+}
+
+// status is the program's status (/statusz).
+func (p *ingressProc) status() ingress.Status { return p.program().Status() }
+
+// ready is the program's readiness (/readyz) and why not.
+func (p *ingressProc) ready() (bool, string) { return p.program().Ready() }
+
+// waitReady waits until the program is ready.
+func (p *ingressProc) waitReady(within time.Duration) {
+	p.c.t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		ok, why := p.ready()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			p.c.t.Fatalf("ingress %s is not ready after %v: %s", p.name, within, why)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// health GETs a path of the program's health listener.
+func (p *ingressProc) health(path string) (int, string) {
+	resp, err := plainClient.Get("http://" + p.program().Addrs().Health + path)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// client is an HTTPS client of the program's HTTPS listener: the SNI and
+// the Host are the URL's host, and the certificate is checked against the
+// test's wildcard. Connections are kept alive, over HTTP/2.
+func (p *ingressProc) client() *http.Client {
+	return &http.Client{Transport: p.tr, Timeout: 3 * time.Minute}
+}
+
+// get GETs https://<host><path> through the program.
+func (p *ingressProc) get(ctx context.Context, host, path string) (reply, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
+	if err != nil {
+		return reply{}, err
+	}
+	resp, err := p.client().Do(req)
+	if err != nil {
+		return reply{}, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return reply{}, err
+	}
+	return reply{code: resp.StatusCode, body: string(b), header: resp.Header}, nil
+}
+
+// address is the program's address on the mesh, as its device was
+// configured; "" before.
+func (p *ingressProc) address() string {
+	c, ok := p.device().config()
+	if !ok {
+		return ""
+	}
+	return c.Address.Addr().String()
+}
+
+// dialControlPlane is the program's dial to the control plane: a plain
+// TCP dial, which fails while the ingress is cut off.
+func (p *ingressProc) dialControlPlane(ctx context.Context, addr string) (net.Conn, error) {
+	p.mu.Lock()
+	cut := p.cut
+	p.mu.Unlock()
+	if cut {
+		return nil, fmt.Errorf("dial %s: the test cut the ingress off the control plane: %w", addr, syscall.ENETUNREACH)
+	}
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cut {
+		_ = conn.Close()
+		return nil, fmt.Errorf("dial %s: the test cut the ingress off the control plane: %w", addr, syscall.ENETUNREACH)
+	}
+	p.cpConns[conn] = struct{}{}
+	return conn, nil
+}
+
+// cutOff cuts the ingress off the control plane, as a partition does:
+// its connections there close and new ones fail, until heal. The nodes
+// and the pods stay reachable.
+func (p *ingressProc) cutOff() {
+	p.mu.Lock()
+	p.cut = true
+	conns := p.cpConns
+	p.cpConns = map[net.Conn]struct{}{}
+	p.mu.Unlock()
+	for conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+// heal ends a cut.
+func (p *ingressProc) heal() {
+	p.mu.Lock()
+	p.cut = false
+	p.mu.Unlock()
+}
+
+// dialPod is the program's dial to the instances: the pods' mesh and the
+// nodes' firewalls as the tests play them. It reaches [address]:port of a
+// pod that runs on a test node of the cluster when the program's device
+// has the node as a peer and the node has the program (its key and its
+// /64), the node's group ing-<pod> lets TCP in on the port from the group
+// ferun-ingress, which lists the program's address, and the test serves
+// the pod's port (testnode.Script.PortAddrOf). Anything else is refused,
+// as nothing would answer there.
+func (p *ingressProc) dialPod(ctx context.Context, network, addr string) (net.Conn, error) {
+	refuse := func(format string, args ...any) (net.Conn, error) {
+		return nil, fmt.Errorf("dial %s: %s: %w", addr, fmt.Sprintf(format, args...), syscall.ECONNREFUSED)
+	}
+	host, portText, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return refuse("not an IP address")
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil {
+		return refuse("not a port")
+	}
+	m := p.device()
+	mc, ok := m.config()
+	if !ok {
+		return refuse("the mesh device is not configured")
+	}
+	n, pod := p.c.podAt(ip)
+	if n == nil {
+		return refuse("no pod runs at %s", ip)
+	}
+	nm := n.Mesh()
+	if !slices.ContainsFunc(m.peerList(), func(peer wg.Peer) bool { return bytes.Equal(peer.PublicKey[:], nm.GetPublicKey()) }) {
+		return refuse("node %s is not a peer of the ingress's device", n.name)
+	}
+	ownKey := mc.PrivateKey.PublicKey()
+	if !slices.ContainsFunc(nm.GetPeers(), func(peer *networkv1.MeshPeer) bool {
+		pfx, err := netip.ParsePrefix(peer.GetPodPrefix())
+		return peer.GetNode() == mesh.IngressPeerName(p.name) && bytes.Equal(peer.GetPublicKey(), ownKey[:]) &&
+			err == nil && pfx.Contains(mc.Address.Addr())
+	}) {
+		return refuse("node %s does not have the ingress as a peer", n.name)
+	}
+	if !admits(nodeGroup(n, model.IngressGroupID(pod)), uint32(port)) {
+		return refuse("node %s does not let the ingress in to port %d of %s", n.name, port, pod)
+	}
+	peers := nodeGroup(n, model.IngressPeersGroup)
+	if peers == nil || !slices.ContainsFunc(peers.GetMembers(), func(s string) bool {
+		a, err := netip.ParseAddr(s)
+		return err == nil && a == mc.Address.Addr()
+	}) {
+		return refuse("node %s's group %s does not list the ingress", n.name, model.IngressPeersGroup)
+	}
+	target, ok := n.Script().PortAddrOf(pod, uint32(port))
+	if !ok {
+		return refuse("nothing listens on port %d of %s", port, pod)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, target)
+}
+
+// admits reports whether a group ing-<pod> lets TCP in on port from the
+// group ferun-ingress.
+func admits(g *networkv1.SecurityGroup, port uint32) bool {
+	if g == nil {
+		return false
+	}
+	for _, r := range g.GetRules() {
+		if r.GetDirection() != networkv1.Direction_DIRECTION_INGRESS || r.GetProtocol() != networkv1.Protocol_PROTOCOL_TCP ||
+			r.GetGroup() != model.IngressPeersGroup {
+			continue
+		}
+		for _, pr := range r.GetPorts() {
+			if port == pr.GetFirst() || pr.GetFirst() <= port && port <= pr.GetLast() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// podAt returns the running test node whose pod at ip runs, and the pod;
+// nil when none.
+func (c *cluster) podAt(ip netip.Addr) (*node, podid.ID) {
+	c.mu.Lock()
+	nodes := append([]*node(nil), c.nodes...)
+	c.mu.Unlock()
+	for _, n := range nodes {
+		select {
+		case <-n.done:
+			continue
+		default:
+		}
+		for _, info := range n.Pods() {
+			a, err := netip.ParseAddr(info.GetIpv6Address())
+			if err != nil || a != ip || info.GetState() != podv1.PodState_POD_STATE_RUNNING {
+				continue
+			}
+			id, err := podid.Parse(info.GetPodId())
+			if err != nil {
+				continue
+			}
+			return n, id
+		}
+	}
+	return nil, ""
+}
+
+// fakeMesh is ferun-ingress's WireGuard device in the tests: it keeps the
+// configuration and the peers it is given, and reports a handshake of now
+// with every peer, as a mesh on which every node answers.
+type fakeMesh struct {
+	mu      sync.Mutex
+	configs []agent.MeshConfig
+	peers   []wg.Peer
+}
+
+func (m *fakeMesh) Configure(c agent.MeshConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.configs = append(m.configs, c)
+	return nil
+}
+
+func (m *fakeMesh) SetPeers(peers []wg.Peer) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peers = slices.Clone(peers)
+	return nil
+}
+
+func (m *fakeMesh) Status() (wg.Device, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d := wg.Device{Name: agent.DefaultMeshDevice}
+	if len(m.configs) > 0 {
+		c := m.configs[len(m.configs)-1]
+		d.Name, d.PublicKey, d.ListenPort = c.Device, c.PrivateKey.PublicKey(), c.ListenPort
+	}
+	now := time.Now()
+	for _, p := range m.peers {
+		d.Peers = append(d.Peers, wg.PeerState{Peer: p, LastHandshake: now})
+	}
+	return d, nil
+}
+
+// config is the device's last configuration; false before the first.
+func (m *fakeMesh) config() (agent.MeshConfig, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.configs) == 0 {
+		return agent.MeshConfig{}, false
+	}
+	return m.configs[len(m.configs)-1], true
+}
+
+// peerList is the device's peers.
+func (m *fakeMesh) peerList() []wg.Peer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.peers)
+}
+
+// wildcardPair writes a self-signed certificate for name and its key into
+// dir, and returns a pool that trusts it.
+func wildcardPair(t *testing.T, dir, name string) (certFile, keyFile string, pool *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: name},
+		DNSNames:              []string{name},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certFile, keyFile = filepath.Join(dir, "tls.crt"), filepath.Join(dir, "tls.key")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool = x509.NewCertPool()
+	pool.AddCert(cert)
+	return certFile, keyFile, pool
 }
 
 // ------------------------------------------------------------------ wait --

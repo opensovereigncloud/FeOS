@@ -26,9 +26,9 @@ import (
 func TestClaimInstance(t *testing.T) {
 	s, _ := newStore(t)
 	info := store.InstanceInfo{ID: "ferund-0", Address: ":8100", NodeAddress: "10.0.0.1:7443", Version: "v1"}
-	released, err := s.ClaimInstance(bg, info)
-	if err != nil || len(released) != 0 {
-		t.Fatalf("first claim: %v %v", released, err)
+	claimed, err := s.ClaimInstance(bg, info)
+	if err != nil || len(claimed.Released) != 0 || claimed.ToolCalls != 0 {
+		t.Fatalf("first claim: %+v %v", claimed, err)
 	}
 	in, err := s.GetInstance(bg, "ferund-0")
 	if err != nil || !in.Live || !in.Fresh || in.NodeAddress != "10.0.0.1:7443" || in.Version != "v1" {
@@ -60,9 +60,9 @@ func TestClaimInstance(t *testing.T) {
 	startOp(t, s, other.ID, "pause", "ferund-1", "paused", time.Hour)
 	exec(t, s, "UPDATE instances SET last_seen = now() - interval '16 seconds', started_at = now() - interval '1 hour'")
 	before := get(t, s, sb.ID)
-	released, err = s.ClaimInstance(bg, store.InstanceInfo{ID: "ferund-0", Address: ":8101", Version: "v2"})
-	if err != nil || len(released) != 1 || released[0] != sb.ID {
-		t.Fatalf("claim after a kill: %v %v", released, err)
+	claimed, err = s.ClaimInstance(bg, store.InstanceInfo{ID: "ferund-0", Address: ":8101", Version: "v2"})
+	if err != nil || len(claimed.Released) != 1 || claimed.Released[0] != sb.ID || claimed.ToolCalls != 0 {
+		t.Fatalf("claim after a kill: %+v %v", claimed, err)
 	}
 	in, err = s.GetInstance(bg, "ferund-0")
 	if err != nil || !in.Live || !in.Stopping.IsZero() || time.Since(in.StartedAt) > time.Minute || in.Address != ":8101" ||
@@ -117,9 +117,9 @@ func TestClaimReleasesAsAStop(t *testing.T) {
 	if released, err := s.ReleaseOpsOf(bg, "stopping"); err != nil || len(released) != 1 || released[0] != ids["stopping"] {
 		t.Fatalf("stop's release %v %v", released, err)
 	}
-	if released, err := s.ClaimInstance(bg, store.InstanceInfo{ID: "ended"}); err != nil || len(released) != 1 ||
-		released[0] != ids["ended"] {
-		t.Fatalf("claim's release %v %v", released, err)
+	if claimed, err := s.ClaimInstance(bg, store.InstanceInfo{ID: "ended"}); err != nil || len(claimed.Released) != 1 ||
+		claimed.Released[0] != ids["ended"] {
+		t.Fatalf("claim's release %+v %v", claimed, err)
 	}
 	expectPayload(t, ch, ids["ended"].String())
 
@@ -144,6 +144,34 @@ func TestClaimReleasesAsAStop(t *testing.T) {
 	if len(changed["ended"]) == 0 || !reflect.DeepEqual(changed["ended"], changed["stopping"]) {
 		t.Fatalf("the claim released\n%v\na stop released\n%v", changed["ended"], changed["stopping"])
 	}
+}
+
+// A claim after a crash ends the tool calls the earlier run had, and
+// counts them: a sent one interrupted, an unsent one not_run, each
+// notified; another instance's call keeps running.
+func TestClaimInstanceEndsToolCalls(t *testing.T) {
+	s, d := newStore(t)
+	if _, err := s.ClaimInstance(bg, store.InstanceInfo{ID: "ferund-0"}); err != nil {
+		t.Fatal(err)
+	}
+	sb := callSandbox(t, s)
+	sent := beginCall(t, s, sb, "sent", "ferund-0")
+	markSent(t, s, sent)
+	unsent := beginCall(t, s, sb, "unsent", "ferund-0")
+	other := beginCall(t, s, sb, "other", "ferund-1")
+	// The run crashed: its row aged past the TTL, its calls stay running.
+	exec(t, s, "UPDATE instances SET last_seen = now() - interval '16 seconds' WHERE id = 'ferund-0'")
+	ch, unsubscribe := d.Subscribe(db.ChanCall)
+	defer unsubscribe()
+
+	if claimed, err := s.ClaimInstance(bg, store.InstanceInfo{ID: "ferund-0"}); err != nil || claimed.ToolCalls != 2 ||
+		len(claimed.Released) != 0 {
+		t.Fatalf("claim after a crash: %+v %v", claimed, err)
+	}
+	expectPayloads(t, ch, sent.ID.String(), unsent.ID.String())
+	expectEnded(t, s, sent, store.ToolCallInterrupted, claimedSent("ferund-0"))
+	expectEnded(t, s, unsent, store.ToolCallNotRun, claimedUnsent("ferund-0"))
+	expectRunning(t, s, other)
 }
 
 // Two processes that start together under one ID: one claims it, the other

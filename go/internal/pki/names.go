@@ -17,12 +17,14 @@ import (
 )
 
 // The SPIFFE layout (provisional; ADR 0014 leaves it open): a node is
-// spiffe://<td>/node/<name>, the control plane's instances share
+// spiffe://<td>/node/<name>, an instance of ferun-ingress is
+// spiffe://<td>/ingress/<name>, the control plane's instances share
 // spiffe://<td>/ferun, a sandbox's pod is
 // spiffe://<td>/tenant/<tenant>/sandbox/<id>.
 const (
 	spiffeScheme    = "spiffe://"
 	nodePath        = "/node/"
+	ingressPath     = "/ingress/"
 	controlPlanePth = "/ferun"
 	maxCNBytes      = 64
 )
@@ -30,6 +32,11 @@ const (
 // NodeID is the SPIFFE ID of node name.
 func NodeID(td, name string) string {
 	return spiffeScheme + td + nodePath + name
+}
+
+// IngressID is the SPIFFE ID of the ferun-ingress instance name.
+func IngressID(td, name string) string {
+	return spiffeScheme + td + ingressPath + name
 }
 
 // SandboxID is the SPIFFE ID of a sandbox's pod.
@@ -53,22 +60,38 @@ func Serial(c *x509.Certificate) string {
 // must carry exactly one URI name, spiffe://<td>/node/<name>, with name a
 // DNS label.
 func ParseNodeID(td string, cert *x509.Certificate) (string, error) {
+	return parseNamedID(td, cert, nodePath, "a node", NodeID)
+}
+
+// ParseIngressID returns the instance name of a ferun-ingress certificate:
+// the certificate must carry exactly one URI name,
+// spiffe://<td>/ingress/<name>, with name a DNS label. A node's
+// certificate never passes, nor an ingress's as a node's.
+func ParseIngressID(td string, cert *x509.Certificate) (string, error) {
+	return parseNamedID(td, cert, ingressPath, "an ingress", IngressID)
+}
+
+// parseNamedID is ParseNodeID and ParseIngressID: the one URI name of cert
+// must be spiffe://<td><path><name> in canonical form, with name a DNS
+// label; holder names the holder in errors ("a node") and id rebuilds the
+// URI.
+func parseNamedID(td string, cert *x509.Certificate, path, holder string, id func(td, name string) string) (string, error) {
 	if cert == nil {
 		return "", errors.New("no certificate")
 	}
 	if len(cert.URIs) != 1 {
-		return "", fmt.Errorf("certificate has %d URI names; a node's has exactly one", len(cert.URIs))
+		return "", fmt.Errorf("certificate has %d URI names; %s's has exactly one", len(cert.URIs), holder)
 	}
 	u := cert.URIs[0]
 	s := u.String()
-	prefix := spiffeScheme + td + nodePath
+	prefix := spiffeScheme + td + path
 	if u.Scheme != "spiffe" || u.Host != td || u.User != nil || u.Opaque != "" ||
 		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || !strings.HasPrefix(s, prefix) {
-		return "", fmt.Errorf("URI name %q is not a node of trust domain %s", s, td)
+		return "", fmt.Errorf("URI name %q is not %s of trust domain %s", s, holder, td)
 	}
 	name := s[len(prefix):]
-	if !isDNSLabel(name) || s != NodeID(td, name) {
-		return "", fmt.Errorf("URI name %q does not name a node", s)
+	if !isDNSLabel(name) || s != id(td, name) {
+		return "", fmt.Errorf("URI name %q does not name %s", s, holder)
 	}
 	return name, nil
 }
@@ -142,8 +165,9 @@ func within(name, domain string) bool {
 
 // validatePodID checks a pod's SPIFFE ID: spiffe://<td>/<path> in canonical
 // form, path segments of letters, digits, ".", "-" and "_" (the SPIFFE ID
-// rules), and outside the namespaces of the control plane (/ferun) and of
-// nodes (/node/...), so that a pod's certificate can never pose as either.
+// rules), and outside the namespaces of the control plane (/ferun), of
+// nodes (/node/...) and of ferun-ingress (/ingress/...), so that a pod's
+// certificate can never pose as any of them.
 func validatePodID(td, id string) error {
 	if strings.ContainsAny(id, "%?#@") {
 		return fmt.Errorf("SPIFFE ID %q is not canonical", id)
@@ -178,6 +202,9 @@ func validatePodID(td, id string) error {
 	}
 	if path == strings.TrimSuffix(nodePath, "/") || strings.HasPrefix(path, nodePath) {
 		return fmt.Errorf("SPIFFE ID %q names a node; a pod never gets it", id)
+	}
+	if path == strings.TrimSuffix(ingressPath, "/") || strings.HasPrefix(path, ingressPath) {
+		return fmt.Errorf("SPIFFE ID %q names an ingress; a pod never gets it", id)
 	}
 	return nil
 }

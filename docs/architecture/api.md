@@ -3,7 +3,9 @@ The API
 
 The `feos.*` gRPC APIs are the contract between the node and the control
 plane, and between `feosd` and `feos-guest`. They live in
-`proto/feos/<api>/v1/`, in the package `feos.<api>.v1`.
+`proto/feos/<api>/v1/`, in the package `feos.<api>.v1`. One API is not in
+`proto/`: the ingress's, between `ferund` and `ferun-ingress`
+([below](#the-ingresss-api)).
 
 ## Packages
 
@@ -135,6 +137,72 @@ via `169.254.0.1`, and its resolver, and for a pod whose IPv6 address is a
 ULA a route for `fc00::/7` in place of the default route over IPv6
 ([guest.md](guest.md)). An older guest ignores the routes and keeps its
 default route.
+
+## The ingress's API
+
+`ferun.ingress.v1.IngressService` is what `ferun-ingress` calls on
+`ferund` ([ADR 0021](../adr/0021-ingress.md),
+[ingress.md](ingress.md#identity-and-connection)): gRPC on the nodes'
+port under its own ALPN, `ferun-ingress/1`, with mTLS. Its messages are
+Go structs coded as JSON, and its service descriptor is written by hand,
+in `go/internal/ingress/wire`, which both programs import: the build has
+no `protoc`, and a protobuf service would need a generator for every
+change. Both ends force the codec `json`, so every call carries the
+content type `application/grpc+json`. Method names are
+`/ferun.ingress.v1.IngressService/<Method>`; `ferund` serves it,
+`ferund` never calls the ingress.
+
+| Method | Server | Request → answer |
+|---|---|---|
+| `Join` | the ingress join server, without a client certificate | `{token, name, csr}` → `{name, certificate}` |
+| `RenewCertificate` | the ingress server, with the instance's certificate | `{csr}` → `{certificate}` |
+| `Hello` | the ingress server | `{publicKey, endpoint, version}` → `{name, podNetwork, prefix, address, appsZone, instance}` |
+| `Sync` | the ingress server, streaming | `{}` → a stream of `Table` |
+| `Wake` | the ingress server | `{env, service}` → `{waking, retryAfterSeconds}` |
+| `Hold` | the ingress server | `{hold, release, leaving}` → `{held, refused: [{instance, reason}], leaseSeconds}` |
+
+- **Encoding.** JSON names are camelCase, and nothing is HTML-escaped;
+  `[]byte` is base64, a time RFC 3339 with nanoseconds. A certificate is
+  `{spiffeId, chain, trustBundle, notBefore, notAfter, renewAfter}`, as
+  `feos.fleet.v1`'s: the chain without the root, the issued certificate
+  first, and the bundle's roots, DER each.
+- **The table.** `Table{seq, whole, more, envs, removed, mesh, self,
+  sentAt}`: `seq` counts from 1 per stream, one per message; `whole`
+  replaces the state; otherwise `envs` are put by ID, `removed` are
+  deleted, and a `mesh` or `self` present replaces the one before
+  (absent: unchanged). An empty table is the heartbeat. A table that
+  takes more than 4 MiB comes in parts: consecutive messages, every one
+  but the last with `more`, the first with `whole`, `mesh` and `self`,
+  the `envs` and then the `removed` spread over them; the receiver
+  applies them together once the last has arrived, and nothing comes
+  between them. A message takes at most 32 MiB, an environment at most
+  2 MiB (a larger one is left out of the table). An `Env` is `{id,
+  tenant, name, hosts, release, hash, routes: [{name, path, service,
+  port, strip, door}], services: [{name, idle, endpoints: [{instance,
+  address, node, ports, groupVersion}], asleep, waking, pending}]}`;
+  `Mesh` is `{version, peers: [{name, publicKey, endpoint, prefix}]}`,
+  the nodes alone; `Self` is `{name, address, appsZone,
+  admittedVersion}`. The receiver keeps the state (`wire.State`,
+  `Apply`): a delta or a part whose `seq` is not the next ends the
+  stream, and the ingress connects again.
+- **Errors.** A refused connection answers every call
+  `PERMISSION_DENIED` with the refusal's text, by which the ingress tells
+  a removal from other refusals ([ingress.md](ingress.md#refusals)).
+  `UNAUTHENTICATED` without an ingress certificate; `FAILED_PRECONDITION`
+  for a Sync before Hello on its connection, a Hello on a cluster that is
+  not meshed, and a Hello with another WireGuard key than the one fixed;
+  `UNAVAILABLE` from a stopping instance, an instance whose table is not
+  ready or cannot read the database, and on database errors;
+  `NOT_FOUND` for a Wake of an environment that is not public or a
+  service that is not routed; `INVALID_ARGUMENT` for a Hold list of more
+  than 10 000 IDs. A Hold refuses an ID by itself, with the reason
+  `gone`, `not public`, `not running`, `busy` or `invalid`.
+- **Compatibility** follows protobuf's rules, kept by hand: a field is
+  added, never renamed, retyped or reused, and its JSON name never
+  changes; a receiver ignores fields it does not know and reads a
+  missing one as its zero value, so a new field means "as before" at
+  that value. A method is added, never changed; an end without it
+  answers `UNIMPLEMENTED`.
 
 ## Compatibility
 

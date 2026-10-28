@@ -123,6 +123,7 @@ TABLE env_instances
   COLUMN detail text NOT NULL DEFAULT ''::text
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN ingress_ports integer[] NOT NULL DEFAULT '{}'::integer[]
   CONSTRAINT CHECK ((kind = ANY (ARRAY['service'::text, 'addon'::text, 'job'::text])))
   CONSTRAINT CHECK ((phase = ANY (ARRAY['starting'::text, 'ready'::text, 'unready'::text, 'exited'::text, 'succeeded'::text, 'failed'::text, 'retiring'::text])))
   CONSTRAINT CHECK ((replica >= 0))
@@ -245,6 +246,11 @@ TABLE environments
   COLUMN gen bigint NOT NULL DEFAULT 0
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN public boolean NOT NULL DEFAULT false
+  COLUMN ingress_group boolean NOT NULL DEFAULT false
+  COLUMN host_label text
+  CONSTRAINT CHECK (((NOT public) OR (ingress_group AND (host_label IS NOT NULL))))
+  CONSTRAINT CHECK (((host_label ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'::text) AND (substr(host_label, 3, 2) <> '--'::text)))
   CONSTRAINT CHECK (((name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'::text) AND (name !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::text)))
   CONSTRAINT CHECK ((realised >= 0))
   CONSTRAINT CHECK ((release >= 0))
@@ -252,6 +258,7 @@ TABLE environments
   CONSTRAINT PRIMARY KEY (id)
   CONSTRAINT UNIQUE (owner, name)
   CREATE INDEX environments_owner ON public.environments USING btree (owner, created_at)
+  CREATE UNIQUE INDEX environments_host_label ON public.environments USING btree (host_label)
   CREATE UNIQUE INDEX environments_owner_name_key ON public.environments USING btree (owner, name)
   CREATE UNIQUE INDEX environments_pkey ON public.environments USING btree (id)
 TABLE event_gaps
@@ -263,6 +270,65 @@ TABLE event_gaps
   CONSTRAINT PRIMARY KEY (node, start_id, from_seq)
   CREATE INDEX event_gaps_detected ON public.event_gaps USING btree (node, start_id, detected_at)
   CREATE UNIQUE INDEX event_gaps_pkey ON public.event_gaps USING btree (node, start_id, from_seq)
+TABLE host_labels
+  COLUMN label text NOT NULL
+  COLUMN owner text NOT NULL
+  COLUMN env_id uuid
+  COLUMN assigned_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT CHECK (((label ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'::text) AND (substr(label, 3, 2) <> '--'::text)))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE SET NULL
+  CONSTRAINT PRIMARY KEY (label)
+  CONSTRAINT UNIQUE (env_id)
+  CREATE UNIQUE INDEX host_labels_env_id_key ON public.host_labels USING btree (env_id)
+  CREATE UNIQUE INDEX host_labels_pkey ON public.host_labels USING btree (label)
+TABLE ingress_certs
+  COLUMN serial text NOT NULL
+  COLUMN ingress text NOT NULL
+  COLUMN kind text NOT NULL
+  COLUMN key_hash text NOT NULL
+  COLUMN previous_serial text NOT NULL DEFAULT ''::text
+  COLUMN token_id uuid
+  COLUMN peer text NOT NULL DEFAULT ''::text
+  COLUMN not_before timestamp with time zone NOT NULL
+  COLUMN not_after timestamp with time zone NOT NULL
+  COLUMN issued_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN revoked_at timestamp with time zone
+  COLUMN revoked_reason text NOT NULL DEFAULT ''::text
+  CONSTRAINT CHECK ((kind = ANY (ARRAY['join'::text, 'rejoin'::text, 'renew'::text])))
+  CONSTRAINT CHECK ((revoked_reason = ANY (ARRAY[''::text, 'rejoined'::text, 'removed'::text, 'superseded'::text])))
+  CONSTRAINT FOREIGN KEY (ingress) REFERENCES ingresses(name)
+  CONSTRAINT PRIMARY KEY (serial)
+  CREATE INDEX ingress_certs_ingress ON public.ingress_certs USING btree (ingress, issued_at)
+  CREATE UNIQUE INDEX ingress_certs_pkey ON public.ingress_certs USING btree (serial)
+TABLE ingresses
+  COLUMN name text NOT NULL
+  COLUMN status text NOT NULL DEFAULT 'joined'::text
+  COLUMN joined_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN removed_at timestamp with time zone
+  COLUMN mesh_subnet integer
+  COLUMN mesh_prefix text NOT NULL DEFAULT ''::text
+  COLUMN mesh_address text NOT NULL DEFAULT ''::text
+  COLUMN mesh_public_key bytea
+  COLUMN previous_mesh_public_key bytea
+  COLUMN mesh_endpoint text NOT NULL DEFAULT ''::text
+  COLUMN group_version bigint NOT NULL DEFAULT 0
+  COLUMN current_serial text NOT NULL DEFAULT ''::text
+  COLUMN version text NOT NULL DEFAULT ''::text
+  COLUMN last_seen timestamp with time zone
+  COLUMN left_at timestamp with time zone
+  CONSTRAINT CHECK (((mesh_prefix = ''::text) = (mesh_address = ''::text)))
+  CONSTRAINT CHECK (((mesh_subnet >= 1) AND (mesh_subnet <= 65535)))
+  CONSTRAINT CHECK (((mesh_subnet IS NULL) = (mesh_prefix = ''::text)))
+  CONSTRAINT CHECK (((status = 'removed'::text) = (removed_at IS NOT NULL)))
+  CONSTRAINT CHECK ((group_version >= 0))
+  CONSTRAINT CHECK ((name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'::text))
+  CONSTRAINT CHECK ((octet_length(mesh_public_key) = 32))
+  CONSTRAINT CHECK ((octet_length(previous_mesh_public_key) = 32))
+  CONSTRAINT CHECK ((status = ANY (ARRAY['joined'::text, 'removed'::text])))
+  CONSTRAINT PRIMARY KEY (name)
+  CONSTRAINT UNIQUE (mesh_subnet)
+  CREATE UNIQUE INDEX ingresses_mesh_subnet_key ON public.ingresses USING btree (mesh_subnet)
+  CREATE UNIQUE INDEX ingresses_pkey ON public.ingresses USING btree (name)
 TABLE instances
   COLUMN id text NOT NULL
   COLUMN address text NOT NULL DEFAULT ''::text
@@ -299,7 +365,9 @@ TABLE join_tokens
   COLUMN used_key_hash text NOT NULL DEFAULT ''::text
   COLUMN used_serial text NOT NULL DEFAULT ''::text
   COLUMN used_peer text NOT NULL DEFAULT ''::text
+  COLUMN kind text NOT NULL DEFAULT 'node'::text
   CONSTRAINT CHECK (((used_at IS NULL) = (used_name = ''::text)))
+  CONSTRAINT CHECK ((kind = ANY (ARRAY['node'::text, 'ingress'::text])))
   CONSTRAINT PRIMARY KEY (hash)
   CONSTRAINT UNIQUE (id)
   CREATE UNIQUE INDEX join_tokens_id_key ON public.join_tokens USING btree (id)
@@ -410,6 +478,7 @@ TABLE nodes
   COLUMN mesh_prefix text NOT NULL DEFAULT ''::text
   COLUMN mesh_public_key bytea
   COLUMN mesh_endpoint text NOT NULL DEFAULT ''::text
+  COLUMN ingress_group_version bigint NOT NULL DEFAULT 0
   CONSTRAINT CHECK (((mesh_subnet >= 1) AND (mesh_subnet <= 65535)))
   CONSTRAINT CHECK ((cpu_overcommit >= (0)::double precision))
   CONSTRAINT CHECK ((mem_headroom_bytes >= 0))
@@ -426,7 +495,9 @@ TABLE pod_network
   COLUMN ula cidr NOT NULL
   COLUMN peers_version bigint NOT NULL DEFAULT 0
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN ingress_group_version bigint NOT NULL DEFAULT 0
   CONSTRAINT CHECK (((family((ula)::inet) = 6) AND (masklen((ula)::inet) = 48) AND ((ula)::inet << ('fd00::/8'::cidr)::inet)))
+  CONSTRAINT CHECK ((ingress_group_version >= 0))
   CONSTRAINT CHECK ((peers_version >= 0))
   CONSTRAINT CHECK (id)
   CONSTRAINT PRIMARY KEY (id)
@@ -570,6 +641,36 @@ TABLE tenants
   CONSTRAINT CHECK ((id ~ '^[a-z0-9][a-z0-9.-]{1,62}$'::text))
   CONSTRAINT PRIMARY KEY (id)
   CREATE UNIQUE INDEX tenants_pkey ON public.tenants USING btree (id)
+TABLE tool_calls
+  COLUMN id uuid NOT NULL DEFAULT gen_random_uuid()
+  COLUMN sandbox_id text COLLATE "C" NOT NULL
+  COLUMN call_key text COLLATE "C" NOT NULL
+  COLUMN tool text NOT NULL
+  COLUMN args_hash bytea NOT NULL
+  COLUMN instance_id text NOT NULL
+  COLUMN state text NOT NULL DEFAULT 'running'::text
+  COLUMN sent boolean NOT NULL DEFAULT false
+  COLUMN lease_until timestamp with time zone NOT NULL
+  COLUMN started_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN finished_at timestamp with time zone
+  COLUMN exit_code integer NOT NULL DEFAULT 0
+  COLUMN output bytea NOT NULL DEFAULT '\x'::bytea
+  COLUMN truncated boolean NOT NULL DEFAULT false
+  COLUMN is_error boolean NOT NULL DEFAULT false
+  COLUMN error text NOT NULL DEFAULT ''::text
+  CONSTRAINT CHECK (((state = 'running'::text) = (finished_at IS NULL)))
+  CONSTRAINT CHECK ((call_key ~ '^[A-Za-z0-9._~:@-]{1,255}$'::text))
+  CONSTRAINT CHECK ((octet_length(args_hash) = 32))
+  CONSTRAINT CHECK ((octet_length(error) <= 8192))
+  CONSTRAINT CHECK ((octet_length(output) <= 65536))
+  CONSTRAINT CHECK ((state = ANY (ARRAY['running'::text, 'done'::text, 'interrupted'::text, 'not_run'::text])))
+  CONSTRAINT FOREIGN KEY (sandbox_id) REFERENCES sandboxes(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (id)
+  CONSTRAINT UNIQUE (sandbox_id, call_key)
+  CREATE INDEX tool_calls_ended ON public.tool_calls USING btree (finished_at) WHERE (state <> 'running'::text)
+  CREATE INDEX tool_calls_running ON public.tool_calls USING btree (lease_until) WHERE (state = 'running'::text)
+  CREATE UNIQUE INDEX tool_calls_key ON public.tool_calls USING btree (sandbox_id, call_key)
+  CREATE UNIQUE INDEX tool_calls_pkey ON public.tool_calls USING btree (id)
 TABLE traffic_records PARTITION BY RANGE (day)
   COLUMN day date NOT NULL DEFAULT ((now() AT TIME ZONE 'utc'::text))::date
   COLUMN id bigint NOT NULL GENERATED ALWAYS AS IDENTITY

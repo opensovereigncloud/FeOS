@@ -768,9 +768,14 @@ func (c *Controller) attachedReadiness(ctx context.Context, p *attachedPlan, l m
 }
 
 // writeAttached writes what the supervisor changed of an attached
-// service onto the row as it is now. A process the look started (with
-// the lease l) whose ID the row does not get (the row moved or went
-// meanwhile, the write failed) is stopped: nothing would know of it.
+// service onto the row as it is now, while the row still names the
+// sandbox and records the process the look read: a row that forgot that
+// process meanwhile (a restart on request, a failed or renewed service)
+// is not the look's to write, and the look's finding (the process gone:
+// an exit) is not about the row's process. A process the look started
+// (with the lease l) whose ID the row does not get (the row moved, went
+// or changed meanwhile, the write failed) is stopped: nothing would know
+// of it.
 func (c *Controller) writeAttached(ctx context.Context, before, after store.EnvAttached, l model.Lease) {
 	if before == after {
 		return
@@ -781,8 +786,8 @@ func (c *Controller) writeAttached(ctx context.Context, before, after store.EnvA
 		if err != nil {
 			return err
 		}
-		if cur.SandboxID != before.SandboxID {
-			return nil // moved meanwhile
+		if cur.SandboxID != before.SandboxID || cur.ProcessID != before.ProcessID {
+			return nil // moved, or its process changed meanwhile
 		}
 		written = true
 		next := cur

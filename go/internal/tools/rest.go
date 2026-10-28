@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gardenlinux/feos/go/internal/apierr"
 	"github.com/gardenlinux/feos/go/internal/auth"
@@ -27,21 +28,57 @@ const maxRequestBody = 32 << 20
 // retrying that says no time of its own.
 const retryAfter = 5
 
+// The headers of the calls with an id (ADR 0023): the request's id, and
+// the answer's state and replay.
+const (
+	idempotencyHeader  = "Idempotency-Key"
+	callStateHeader    = "Ferun-Call-State"
+	callReplayedHeader = "Ferun-Call-Replayed"
+)
+
+// msgBadCallKey is the text of a 400 for a call id outside the alphabet or
+// the length.
+const msgBadCallKey = "Idempotency-Key must be 1 to 255 characters of A-Z a-z 0-9 . _ ~ : @ -"
+
 // REST serves the tool baseline over REST: each handler fills a tool's
-// parameters from its request and makes the same Call that MCP makes. The
-// routes are of the sandbox class: the API has authenticated the sandbox's
-// token and put the sandbox into the request's context.
+// parameters from its request and makes the same call that MCP makes
+// (CallKeyed). The routes are of the sandbox class: the API has
+// authenticated the sandbox's token and put the sandbox into the
+// request's context.
 //
 // A tool that ran is a 200 whatever its exit code, which is a field of the
 // answer: {"exitCode", "output", "truncated"?, "image"?}. A call that
 // failed, the sandbox not prepared or the node not answering, is a 502
 // {"error": "<tool>: <err>"}, with a Retry-After when a retry is worth it
 // (Retryable): the time the error asks for (apierr.RetryAfterOf; 60 for a
-// hibernation in flight), else 5. These routes never map errors to other
-// statuses. A bad
-// request is a 400. A body larger than 32 MiB is a 413, and so is a write,
-// an edit or a command larger than the guest takes (TooLargeError), with
-// its limit in the text. A client that hung up gets nothing.
+// hibernation in flight), else 5. These routes map no other cause of a
+// failed call to another status. A bad request is a 400. A body larger
+// than 32 MiB is a 413, and so is a write, an edit or a command larger
+// than the guest takes (TooLargeError), with its limit in the text. A
+// client that hung up gets nothing.
+//
+// Every tool route takes the call's id in the Idempotency-Key header
+// (ADR 0023): one value of 1 to 255 characters of A-Z a-z 0-9 . _ ~ : @ -,
+// bare or as one quoted sf-string, else a 400 bad_idempotency_key. It is
+// honoured on the tools with a side effect (exec, PUT and PATCH of a file,
+// POST of a process, DELETE of a process) and ignored on the others. The
+// answer of a call with an id carries Ferun-Call-State (done,
+// interrupted, not_run, running), and Ferun-Call-Replayed: true when it
+// is another request's call, attached to or read from its record. Beside
+// the answers above, such a call is:
+//   - 422 call_id_conflict: the id names another call in the sandbox;
+//   - 400 call_timeout_too_long: a bash timeout over MaxKeyedTimeout;
+//   - 503 call_running, Retry-After 1: the call runs on another instance
+//     and this one stops (ask again);
+//   - 502 call_interrupted, without Retry-After: the call may have run and
+//     stopped without a result;
+//   - 502 without Retry-After when it ran (done) and failed; a call that
+//     did not run (not_run) keeps the Retry-After rule above.
+//
+// A concurrent request with the same id attaches to the call, where the
+// IETF Idempotency-Key draft answers 409. GET …/calls/{key} reads a
+// call's record with a wait (Call), DELETE …/calls/{key} cancels it
+// (CancelCall).
 type REST struct {
 	r *Runner
 }
@@ -67,41 +104,101 @@ type toolResult struct {
 	Image     *toolImage `json:"image,omitempty"`
 }
 
-// run makes the call of tool with params (one of the parameter structs)
-// and answers it.
+// idempotencyKey is the request's call id: its Idempotency-Key header,
+// trimmed, with one pair of surrounding quotes taken off (an RFC 8941
+// sf-string, which holds no escape in this alphabet), or "" without the
+// header. More than one value, or one that is not ValidCallKey, is a 400
+// bad_idempotency_key.
+func idempotencyKey(r *http.Request) (string, error) {
+	vs := r.Header.Values(idempotencyHeader)
+	switch len(vs) {
+	case 0:
+		return "", nil
+	case 1:
+	default:
+		return "", apierr.WithCode(http.StatusBadRequest, "bad_idempotency_key", "one Idempotency-Key, got %d", len(vs))
+	}
+	key := strings.TrimSpace(vs[0])
+	if len(key) > 1 && key[0] == '"' && key[len(key)-1] == '"' {
+		key = key[1 : len(key)-1]
+	}
+	if !ValidCallKey(key) {
+		return "", apierr.WithCode(http.StatusBadRequest, "bad_idempotency_key", msgBadCallKey)
+	}
+	return key, nil
+}
+
+// run makes the call of tool with params (one of the parameter structs),
+// with the request's call id, and answers it.
 func (h *REST) run(w http.ResponseWriter, r *http.Request, tool string, params any) {
+	key, err := idempotencyKey(r)
+	if err != nil {
+		apierr.Write(w, err)
+		return
+	}
 	args, err := json.Marshal(params)
 	if err != nil {
 		apierr.Write(w, err)
 		return
 	}
-	h.answer(w, r, tool, func(ctx context.Context, sb auth.Sandbox) (Result, error) {
-		return h.r.Call(ctx, sb, tool, args, nil)
+	h.answer(w, r, tool, func(ctx context.Context, sb auth.Sandbox) (Result, CallInfo, error) {
+		return h.r.CallKeyed(ctx, sb, tool, args, key, nil)
 	})
 }
 
 // answer runs call, a call of tool, for the request's sandbox and answers
-// it.
+// it, with the headers of a call with an id when it is one.
 func (h *REST) answer(w http.ResponseWriter, r *http.Request, tool string,
-	call func(ctx context.Context, sb auth.Sandbox) (Result, error)) {
+	call func(ctx context.Context, sb auth.Sandbox) (Result, CallInfo, error)) {
 	sb, ok := auth.SandboxFrom(r.Context())
 	if !ok {
 		apierr.Write(w, apierr.New(http.StatusUnauthorized, "sandbox token required"))
 		return
 	}
-	res, err := call(r.Context(), sb)
+	res, info, err := call(r.Context(), sb)
 	if r.Context().Err() != nil {
-		// The client hung up; its call was cancelled with its request.
+		// The client hung up. A call without an id was cancelled with its
+		// request; one with an id runs on, and its record tells.
 		return
 	}
-	var tooLarge *TooLargeError
-	if errors.As(err, &tooLarge) {
+	if info.Keyed && info.State != "" {
+		w.Header().Set(callStateHeader, info.State)
+		if info.Replay {
+			w.Header().Set(callReplayedHeader, "true")
+		}
+	}
+	var (
+		conflict *CallIDConflictError
+		tooLong  *KeyedTimeoutError
+		askAgain *AskAgainError
+		tooLarge *TooLargeError
+	)
+	switch {
+	case errors.As(err, &conflict):
+		apierr.Write(w, apierr.WithCode(http.StatusUnprocessableEntity, "call_id_conflict", "%s: %v", tool, err))
+		return
+	case errors.As(err, &tooLong):
+		apierr.Write(w, apierr.WithCode(http.StatusBadRequest, "call_timeout_too_long", "%s: %v", tool, err))
+		return
+	case errors.Is(err, ErrBadCallKey):
+		apierr.Write(w, apierr.WithCode(http.StatusBadRequest, "bad_idempotency_key", msgBadCallKey))
+		return
+	case errors.As(err, &askAgain):
+		apierr.Write(w, apierr.WithCode(http.StatusServiceUnavailable, "call_running", "%s: %v", tool, err).RetryAfter(1))
+		return
+	case errors.As(err, &tooLarge):
 		apierr.Write(w, apierr.New(http.StatusRequestEntityTooLarge, "%s: %v", tool, err))
 		return
-	}
-	if err != nil {
+	case err != nil:
 		e := apierr.New(http.StatusBadGateway, "%s: %v", tool, err)
-		if Retryable(err) {
+		switch {
+		case info.State == CallInterrupted:
+			// It may have run: a retry is the client's decision, after a
+			// look at the sandbox.
+			e.Code = "call_interrupted"
+		case info.State == CallDone:
+			// It ran, and failed: the same id answers the same again.
+		case Retryable(err):
 			e.RetryAfter(apierr.RetryAfterOf(err, retryAfter))
 		}
 		apierr.Write(w, e)
@@ -164,6 +261,11 @@ func (h *REST) WriteFile(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, apierr.New(http.StatusBadRequest, "path is required"))
 		return
 	}
+	key, err := idempotencyKey(r)
+	if err != nil {
+		apierr.Write(w, err)
+		return
+	}
 	body, err := readAtMost(r, maxGuestRequest, func() error {
 		return apierr.New(http.StatusRequestEntityTooLarge, "%s: %v", ToolWrite, &TooLargeError{Tool: ToolWrite})
 	})
@@ -171,8 +273,8 @@ func (h *REST) WriteFile(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, err)
 		return
 	}
-	h.answer(w, r, ToolWrite, func(ctx context.Context, sb auth.Sandbox) (Result, error) {
-		return h.r.writeFile(ctx, sb, path, body)
+	h.answer(w, r, ToolWrite, func(ctx context.Context, sb auth.Sandbox) (Result, CallInfo, error) {
+		return h.r.writeFileKeyed(ctx, sb, path, body, key)
 	})
 }
 
@@ -315,6 +417,129 @@ func (h *REST) ProcessLogs(w http.ResponseWriter, r *http.Request) {
 // process_stop.
 func (h *REST) StopProcess(w http.ResponseWriter, r *http.Request) {
 	h.run(w, r, ToolProcessStop, ProcessStopParams{ID: r.PathValue("pid")})
+}
+
+// callRecord is the answer of the record route: a call with an id, and,
+// once it ended, its outcome.
+type callRecord struct {
+	Key       string `json:"key"`
+	Tool      string `json:"tool"`
+	State     string `json:"state"`
+	Instance  string `json:"instance"`
+	StartedAt string `json:"startedAt"`
+	*callOutcome
+}
+
+// callOutcome is how a call with an id ended, in its record: its result
+// and error as stored, and both as MCP renders them (RenderText), which
+// a client that recovers the call shows in place of the live answer.
+type callOutcome struct {
+	FinishedAt string `json:"finishedAt"`
+	ExitCode   int    `json:"exitCode"`
+	Output     string `json:"output"`
+	Truncated  bool   `json:"truncated"`
+	IsError    bool   `json:"isError"`
+	Error      string `json:"error"`
+	Text       string `json:"text"`
+}
+
+// callKey is the call id a /calls/{key} URL names; one that is not
+// ValidCallKey is a 400 bad_idempotency_key.
+func callKey(r *http.Request) (string, error) {
+	key := r.PathValue("key")
+	if !ValidCallKey(key) {
+		return "", apierr.WithCode(http.StatusBadRequest, "bad_idempotency_key", msgBadCallKey)
+	}
+	return key, nil
+}
+
+// Call is GET /api/v1/sandboxes/{id}/calls/{key}?wait=N: a keyed call's
+// record (ADR 0023); it never runs anything.
+//
+// The record of a call that ended comes at once; of one that runs, when it
+// ends or after N seconds (0 to 60, default 0) with state running, and at
+// once on a stopping instance. It is {key, tool, state, instance,
+// startedAt}, and once the call ended also {finishedAt, exitCode, output,
+// truncated, isError, error, text}, where text and isError are MCP's
+// rendering of the answer (RenderText). A key no call has (never made, or
+// past its retention) is a 404 no_such_call. A wait while the sandbox has
+// as many requests waiting for calls with an id on this instance as it
+// may is a 502 with Retry-After (ErrCallCap). A client that hung up gets
+// nothing.
+func (h *REST) Call(w http.ResponseWriter, r *http.Request) {
+	sb, ok := auth.SandboxFrom(r.Context())
+	if !ok {
+		apierr.Write(w, apierr.New(http.StatusUnauthorized, "sandbox token required"))
+		return
+	}
+	key, err := callKey(r)
+	if err != nil {
+		apierr.Write(w, err)
+		return
+	}
+	wait, err := queryInt(r, "wait")
+	if err != nil {
+		apierr.Write(w, err)
+		return
+	}
+	if most := int(maxRecordWait / time.Second); wait < 0 || wait > most {
+		apierr.Write(w, apierr.New(http.StatusBadRequest, "wait must be 0 to %d seconds, got %d", most, wait))
+		return
+	}
+	rec, err := h.r.WaitCall(r.Context(), sb.ID, key, time.Duration(wait)*time.Second)
+	if r.Context().Err() != nil {
+		return
+	}
+	switch {
+	case errors.Is(err, ErrNoCall):
+		apierr.Write(w, apierr.WithCode(http.StatusNotFound, "no_such_call", "no call with this id in the sandbox"))
+		return
+	case err != nil:
+		apierr.Write(w, apierr.New(http.StatusBadGateway, "the call's record: %v", err).RetryAfter(retryAfter))
+		return
+	}
+	out := callRecord{Key: rec.Key, Tool: rec.Tool, State: rec.State, Instance: rec.Instance,
+		StartedAt: rec.StartedAt.UTC().Format(time.RFC3339Nano)}
+	if rec.State != CallRunning {
+		text, isError := RenderText(rec.Result, storedError(rec.Err))
+		out.callOutcome = &callOutcome{FinishedAt: rec.FinishedAt.UTC().Format(time.RFC3339Nano),
+			ExitCode: rec.Result.ExitCode, Output: rec.Result.Text, Truncated: rec.Result.Truncated,
+			IsError: isError, Error: rec.Err, Text: text}
+	}
+	apierr.WriteJSON(w, http.StatusOK, out)
+}
+
+// CancelCall is DELETE /api/v1/sandboxes/{id}/calls/{key}: cancel the
+// running call of key.
+//
+// It is a 202 {"cancelled": true} when a call of the key runs, on
+// whichever instance: the call ends done with "the call was cancelled by
+// its caller", even when it had not reached the sandbox yet. It is a 404
+// no_such_call when none runs (none was made, or it ended). The cancel
+// does not depend on the request once it arrived: a client that hangs up
+// does not stop it.
+func (h *REST) CancelCall(w http.ResponseWriter, r *http.Request) {
+	sb, ok := auth.SandboxFrom(r.Context())
+	if !ok {
+		apierr.Write(w, apierr.New(http.StatusUnauthorized, "sandbox token required"))
+		return
+	}
+	key, err := callKey(r)
+	if err != nil {
+		apierr.Write(w, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), bookkeepingTimeout)
+	defer cancel()
+	cancelled, err := h.r.CancelCall(ctx, sb.ID, key)
+	switch {
+	case err != nil:
+		apierr.Write(w, apierr.New(http.StatusBadGateway, "cancel the call: %v", err).RetryAfter(retryAfter))
+	case !cancelled:
+		apierr.Write(w, apierr.WithCode(http.StatusNotFound, "no_such_call", "no running call with this id in the sandbox"))
+	default:
+		apierr.WriteJSON(w, http.StatusAccepted, map[string]bool{"cancelled": true})
+	}
 }
 
 // decodeJSON reads a JSON object from the request body into v, one of the

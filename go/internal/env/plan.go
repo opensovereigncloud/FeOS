@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/gardenlinux/feos/go/internal/env/addons"
+	"github.com/gardenlinux/feos/go/internal/env/ctl"
 	"github.com/gardenlinux/feos/go/internal/env/spec"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/podid"
@@ -43,6 +44,11 @@ type validateCtx struct {
 	// deleted hold, by addon name.
 	volumes   map[string]spec.AddonData
 	blueprint func(typ string) (addons.Blueprint, bool)
+	// zone is the apps zone (Deps.AppsZone); host the environment's
+	// default host under it ("" without an environment, or for one never
+	// published), public whether the environment is public.
+	zone, host string
+	public     bool
 }
 
 type imageAnswer struct {
@@ -84,6 +90,13 @@ func (v *validateCtx) Image(image string) (string, error) {
 		return "", errors.New("it was not resolved")
 	}
 	return a.pinned, a.err
+}
+
+// IngressHost is the environment's default host and whether it is public;
+// ok false when the platform has no apps zone, so that no ingress serves
+// any route.
+func (v *validateCtx) IngressHost() (host string, public, ok bool) {
+	return v.host, v.public, v.zone != ""
 }
 
 // BlueprintTypes are the registered addon types.
@@ -151,12 +164,19 @@ func (s *Service) resolveImages(ctx context.Context, images []string) map[string
 // in (with the ports other environments' attached services use there,
 // and the names those environments give them),
 // the environment's secrets (secrets, when not nil, stands in for them:
-// a clone's), what its addon volumes hold, the addon types and the
-// images. env is nil for a spec without an environment.
+// a clone's), what its addon volumes hold, the addon types, the images,
+// and its default host under the apps zone. env is nil for a spec without
+// an environment.
 func (s *Service) loadContext(ctx context.Context, tenant string, env *store.Environment, sp spec.Spec, mode spec.Mode,
 	secrets map[string]spec.SecretInfo) (*validateCtx, spec.Pins, error) {
 	vc := &validateCtx{mode: mode, sandboxes: map[string]spec.SandboxInfo{}, secrets: secrets,
-		volumes: map[string]spec.AddonData{}, blueprint: s.d.Blueprint}
+		volumes: map[string]spec.AddonData{}, blueprint: s.d.Blueprint, zone: s.d.AppsZone}
+	if env != nil {
+		vc.public = env.Public
+		if vc.zone != "" && env.HostLabel != "" {
+			vc.host = env.HostLabel + "." + vc.zone
+		}
+	}
 	pins := spec.Pins{Images: map[string]string{}, Secrets: map[string]int{}, Plans: map[string]string{}}
 
 	vc.images = s.resolveImages(ctx, imagesOf(sp))
@@ -462,7 +482,7 @@ func (s *Service) applyOnce(ctx context.Context, tenant, ref string, a applyArgs
 		if _, err := tx.SupersedeReleases(ctx, e.ID, number, model.ReleasePending, model.ReleaseRolling); err != nil {
 			return err
 		}
-		if err := wake(ctx, tx); err != nil {
+		if err := wake(ctx, tx, ctl.HintReconcile, ctl.HintGroups); err != nil {
 			return err
 		}
 		ans = ApplyAnswer{ReleaseInfo: releaseInfo(r, nil), Diff: nonNilDiff(p.diff), Findings: nonNilFindings(p.findings)}

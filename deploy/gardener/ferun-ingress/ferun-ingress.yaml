@@ -1,0 +1,421 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ferun-ingress on the Gardener shoot (ADR 0021, deploy/gardener/README.md,
+# The ingress): two instances behind a LoadBalancer of their own, beside
+# Traefik, which goes on serving the platform's hosts. Each instance holds
+# ferund's routing table, is a peer on the pods' mesh, and proxies
+# https://<label>.${APPS_ZONE} straight to the pods. Its program ships in
+# ferund's image (/ferun-ingress). The ${...} are the deployment's
+# parameters (config.env.example), which make fills in:
+#
+#   make -C deploy/gardener apply-ferun-ingress
+#
+# Secrets the operator makes in the namespace, before the pods start:
+#   ferun-ingress-join  the keys ferun-ingress-0 and ferun-ingress-1: a
+#                       one-time join token of kind ingress pinned to each
+#                       name, feos-ingress-join-<secret>.<pin> (ferund
+#                       join-token --kind ingress --node <name>). Only the
+#                       init container mounts it, and copies the pod's own
+#                       key into a memory volume that the instance reads:
+#                       no instance sees the other's token. The copy is
+#                       made when the pod starts, so a token put in later
+#                       takes a deletion of the pod (never forced). Read
+#                       only while an instance keeps no valid certificate;
+#                       afterwards its identity is on its volume.
+#   oci-pull            the registry's credentials, as in the namespace
+#                       ferun.
+# cert-manager makes apps-wildcard-tls, the certificate below, through the
+# issuer's DNS-01 (cluster.yaml), whose token must edit the zone that
+# holds ${APPS_ZONE}.
+#
+# DNS records the operator creates, DNS only, at the address of the
+# Service ferun-ingress (kubectl -n ferun-ingress get svc ferun-ingress):
+#   *.${APPS_ZONE}  A <address>
+#   edge.${DOMAIN}  A <address>, reserved for domains later
+#
+# Never force-delete these pods (--force, --grace-period=0): a pod's name
+# is its identity, a mesh key and address, and a second process with it
+# makes WireGuard flap between the two until one dies. A pod on a lost
+# worker comes back when its Node is deleted.
+#
+# Nothing is served until a tenant publishes an environment (PUT
+# /api/v1/environments/<env>/public); an empty apps zone in ferund
+# (FERUN_APPS_ZONE) switches every host off.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ferun-ingress
+---
+# One certificate for every host of the zone; the instances read it again
+# every 30 s, so a renewal arrives within about two minutes.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: apps-wildcard
+  namespace: ferun-ingress
+spec:
+  secretName: apps-wildcard-tls
+  dnsNames:
+    - "*.${APPS_ZONE}"
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+---
+# The StatefulSet's governing Service, which names the pods; its name
+# differs from the balancer's.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferun-ingress-pods
+  namespace: ferun-ingress
+spec:
+  clusterIP: None
+  selector:
+    app: ferun-ingress
+  ports:
+    - name: health
+      port: 9090
+      targetPort: health
+---
+# The public address of the apps zone. IronCore's load balancer checks no
+# node's health (README.md, A lost worker): it sends every worker its
+# share. With externalTrafficPolicy Local, the worker without an instance
+# would drop that share, a third of the new connections on three
+# workers, all the time, and a worker whose instance is restarting or
+# drained another third during every rollout; Cluster lets each worker
+# pass it to a ready instance on any, at the cost of the client's address
+# (X-Forwarded-For carries a worker's) until the PROXY protocol (ADR
+# 0021, open questions). Behind a balancer that checks the nodes'
+# health (healthCheckNodePort), Local keeps the client's address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferun-ingress
+  namespace: ferun-ingress
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster
+  ipFamilyPolicy: SingleStack
+  selector:
+    app: ferun-ingress
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+    - name: https
+      port: 443
+      targetPort: https
+---
+# A drain stops one instance at a time; one that is not ready may always
+# be evicted, so that a broken one never blocks a drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ferun-ingress
+  namespace: ferun-ingress
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app: ferun-ingress
+---
+# Requests from anywhere; the health port (the kubelet's probes) and the
+# mesh (the workers' feos-mesh, UDP) only from the workers' network. What
+# the instances dial: ferun-ingress-egress, below.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ferun-ingress
+  namespace: ferun-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: ferun-ingress
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8443 }
+    - from:
+        - ipBlock:
+            cidr: ${NODE_CIDR}
+      ports:
+        - { protocol: TCP, port: 9090 }
+        - { protocol: UDP, port: 51820 }
+---
+# What the instances dial, and nothing else: DNS, ferund's nodes' port
+# and the workers' feos-mesh. Requests to the apps' pods go inside the
+# mesh device, so the network sees only its UDP to the workers. An
+# instance taken over through the proxy cannot reach the cluster's other
+# services. Calico checks a connection to a Service at the pod and port
+# kube-proxy translated it to; another network may check the Service's
+# address.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ferun-ingress-egress
+  namespace: ferun-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: ferun-ingress
+  policyTypes:
+    - Egress
+  egress:
+    # The cluster's DNS, for a control plane given by name. Gardener's
+    # CoreDNS answers on 8053 behind the Service kube-dns's 53.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+        - { protocol: UDP, port: 8053 }
+        - { protocol: TCP, port: 8053 }
+    # ferund's nodes' port: its pods, and the address of the Service
+    # ferund-nodes (FERUN_INGRESS_CONTROL_PLANE).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ferun
+          podSelector:
+            matchLabels:
+              app: ferund
+        - ipBlock:
+            cidr: ${FERUN_NODES_IP}/32
+      ports:
+        - { protocol: TCP, port: 7443 }
+    # The workers' feos-mesh.
+    - to:
+        - ipBlock:
+            cidr: ${NODE_CIDR}
+      ports:
+        - { protocol: UDP, port: 51820 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ferun-ingress
+  namespace: ferun-ingress
+spec:
+  replicas: 2
+  serviceName: ferun-ingress-pods
+  # Scaling starts and stops the pods together. A rollout replaces one
+  # at a time and goes on once the new one has been ready for 10 s:
+  # /readyz passes once it holds the table and the workers' handshakes
+  # are fresh.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  minReadySeconds: 10
+  selector:
+    matchLabels:
+      app: ferun-ingress
+  template:
+    metadata:
+      labels:
+        app: ferun-ingress
+    spec:
+      # The instances on different workers (at most one more on any than
+      # on another). Workers that take no new pods, cordoned or
+      # unreachable, do not count, so that a drained worker's instance
+      # starts on another. Over every revision: a rollout replaces a pod
+      # in place, and the new one must not join the other on its worker.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app: ferun-ingress
+      automountServiceAccountToken: false
+      # The runtime's default seccomp profile, not Unconfined: the
+      # netlink the instance configures its mesh device with passes;
+      # unshare, setns, keyctl, bpf and userfaultfd do not. The init
+      # container is privileged, and so runs without one.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      imagePullSecrets:
+        - name: oci-pull
+      # On SIGTERM an instance fails /readyz and serves on for
+      # --shutdown-delay (10 s), waits for its requests for up to
+      # --shutdown-grace (40 s) and releases its holds (2 s); this is
+      # above the sum. It delays its own stop, so it needs no preStop.
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        # The mesh device needs IPv6, which the pod's network may leave
+        # off: this writes 0 to net.ipv6.conf.{all,default}.disable_ipv6,
+        # privileged and as root over the image's user (nonroot). It also
+        # copies the pod's own join token, the key $(POD_NAME) of the
+        # Secret, to /join/token, which the instance reads; without that
+        # key it removes the copy.
+        - name: prepare
+          image: ${REGISTRY}/ferund:dev
+          imagePullPolicy: Always
+          command: ["/ferun-ingress", "prepare"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: FERUN_INGRESS_JOIN_TOKEN_SOURCE
+              value: "/join-secret/$(POD_NAME)"
+            - name: FERUN_INGRESS_JOIN_TOKEN_FILE
+              value: /join/token
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            runAsNonRoot: false
+          volumeMounts:
+            - name: join-secret
+              mountPath: /join-secret
+              readOnly: true
+            - name: join
+              mountPath: /join
+      containers:
+        - name: ferun-ingress
+          image: ${REGISTRY}/ferund:dev
+          imagePullPolicy: Always
+          command: ["/ferun-ingress"]
+          args: ["serve"]
+          # Root with NET_ADMIN alone, for the WireGuard device, its
+          # addresses and routes. The proxy shares the process, and so
+          # the capability, until the two are split (ADR 0021, open
+          # questions).
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_ADMIN]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            # The instance's name, its identity at ferund: the pod's.
+            - name: FERUN_INGRESS_NAME
+              value: "$(POD_NAME)"
+            # ferund's nodes' port: the fixed ClusterIP of the service
+            # ferund-nodes (deploy/gardener/ferun), and the name its
+            # certificate carries.
+            - name: FERUN_INGRESS_CONTROL_PLANE
+              value: "${FERUN_NODES_IP}:7443"
+            - name: FERUN_INGRESS_CONTROL_PLANE_NAME
+              value: "ferun.run.${DOMAIN}"
+            - name: FERUN_INGRESS_TRUST_DOMAIN
+              value: "run.${DOMAIN}"
+            # Its own join token alone, copied by the init container; the
+            # Secret of both instances' tokens is not mounted here.
+            - name: FERUN_INGRESS_JOIN_TOKEN_FILE
+              value: /join/token
+            # Listeners on the pod's address, never a wildcard; the
+            # balancer maps 80 and 443 to the first two.
+            - name: FERUN_INGRESS_LISTEN_HTTP
+              value: "$(POD_IP):8080"
+            - name: FERUN_INGRESS_LISTEN_HTTPS
+              value: "$(POD_IP):8443"
+            - name: FERUN_INGRESS_HEALTH_LISTEN
+              value: "$(POD_IP):9090"
+            # Where the workers reach the mesh device.
+            - name: FERUN_INGRESS_MESH_ENDPOINT
+              value: "$(POD_IP):51820"
+            - name: FERUN_INGRESS_TLS_CERT
+              value: /etc/ferun-ingress/tls/tls.crt
+            - name: FERUN_INGRESS_TLS_KEY
+              value: /etc/ferun-ingress/tls/tls.key
+            # The container's memory limit in bytes: the instance sets the
+            # Go runtime's soft limit (GOMEMLIMIT) to 90% of it, so that
+            # garbage collection works harder before the kernel kills it.
+            # GOMEMLIMIT itself cannot be set here: resourceFieldRef gives
+            # the whole limit, and only in fixed units. The default caps
+            # fit 1536Mi: a held request takes at most about 250 KiB and a
+            # forwarded one about 350 KiB (HTTP/2 with its body's window of
+            # 64 KiB full, unread, and 32 KiB of path and headers), so 1024
+            # held (--max-held) take about 250 MiB and 2048 forwarded
+            # (--max-inflight) about 700 MiB, together 950 MiB below the
+            # soft limit of 1.35 GiB with room for the client connections;
+            # raise the caps and this limit together. The window is fixed:
+            # it slows HTTP/2 uploads over long round trips, 64 KiB per
+            # round trip (docs/architecture/ingress.md, Limits).
+            - name: FERUN_INGRESS_MEMORY_LIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: ferun-ingress
+                  resource: limits.memory
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: https
+              containerPort: 8443
+            - name: health
+              containerPort: 9090
+            - name: wireguard
+              containerPort: 51820
+              protocol: UDP
+          # A stopping or broken instance leaves the balancer within 4 s.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { memory: 1536Mi }
+          volumeMounts:
+            # The identity (key and certificate), the mesh key, the
+            # routing table's cache: kept across restarts.
+            - name: state
+              mountPath: /var/lib/ferun-ingress
+            - name: tls
+              mountPath: /etc/ferun-ingress/tls
+              readOnly: true
+            - name: join
+              mountPath: /join
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: apps-wildcard-tls
+            defaultMode: 0400
+        # Both instances' tokens: the init container's alone.
+        - name: join-secret
+          secret:
+            secretName: ferun-ingress-join
+            optional: true
+            defaultMode: 0400
+        # The pod's own token, in memory.
+        - name: join
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi

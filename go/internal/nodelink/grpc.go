@@ -49,8 +49,9 @@ func NodeFromContext(ctx context.Context) (Peer, bool) {
 // servers: the TLS state and what nodelink knows of the connection.
 type authInfo struct {
 	credentials.TLSInfo
-	link    *link  // uplinks
-	refusal string // refusal connections: the refusal's text
+	link    *link        // uplinks
+	refusal string       // refusal connections, of nodes and ingresses: the refusal's text
+	ingress *IngressPeer // registered ingress connections
 }
 
 func tlsInfo(state tls.ConnectionState) credentials.TLSInfo {

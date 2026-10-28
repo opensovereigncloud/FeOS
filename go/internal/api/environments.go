@@ -54,6 +54,7 @@ func (s *server) envRoutes(add func(c class, pattern string, h http.Handler)) {
 	env("POST /api/v1/environments/{env}/jobs/{name}/run", s.runJob)
 	env("POST /api/v1/environments/{env}/route-tokens", s.createRouteToken)
 	env("DELETE /api/v1/environments/{env}/route-tokens", s.revokeRouteTokens)
+	env("PUT /api/v1/environments/{env}/public", s.setEnvPublic)
 	add(classRoute, "/api/v1/environments/{env}/http/{path...}", http.HandlerFunc(e.ServeRoute))
 }
 
@@ -406,4 +407,23 @@ func (s *server) revokeRouteTokens(w http.ResponseWriter, r *http.Request) error
 		return err
 	}
 	return noContent(w, http.StatusNoContent)
+}
+
+// setEnvPublic is PUT …/public {"public": bool}: the field is required
+// (absent or null is a 400), so that an empty body changes nothing by
+// accident.
+func (s *server) setEnvPublic(w http.ResponseWriter, r *http.Request) error {
+	var req envs.PublicRequest
+	sent, err := decodeJSON(r, &req)
+	if err != nil {
+		return err
+	}
+	if raw, ok := sent["public"]; !ok || string(raw) == "null" {
+		return apierr.New(http.StatusBadRequest, "public is required: {\"public\": true} or {\"public\": false}")
+	}
+	a, err := s.deps.Environments.SetPublic(r.Context(), tenantOf(r), r.PathValue("env"), req.Public)
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, http.StatusOK, a)
 }

@@ -9,9 +9,20 @@ metadata:
   name: ferund
   namespace: ferun
 spec:
-  # Instances are identical; one to start with.
+  # Instances are identical and any of them serves any request: one on a
+  # single machine, three on the Gardener shoot (deploy/gardener/ferun).
   replicas: 1
   revisionHistoryLimit: 3
+  # A rolling deploy starts a new instance before it stops an old one and
+  # counts it once it has been ready for 10 s: /readyz passes once the
+  # nodes have dialled it, at the latest 30 s after its start
+  # (docs/architecture/control-plane.md, Stopping).
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: ferund
@@ -27,9 +38,25 @@ spec:
       securityContext:
         runAsNonRoot: true
         fsGroup: 65532
-      # The shutdown grace below and 30 s: a stopping instance lets its tool
-      # calls and operations finish.
-      terminationGracePeriodSeconds: 150
+      # The instances spread over the machines, at most one more on any
+      # than on another (three on three workers: one each). Machines that
+      # take no new pods, cordoned or unreachable, do not count, so that a
+      # lost machine never keeps a replacement from starting on the others;
+      # per revision, so that a rolling deploy spreads the new instances.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app: ferund
+          matchLabelKeys:
+            - pod-template-hash
+      # The shutdown grace below and 60 s: a stopping instance lets its tool
+      # calls (a call with an id runs at most 600 s; ADR 0023) and
+      # operations finish, then closes its node connections.
+      terminationGracePeriodSeconds: 720
       containers:
         - name: ferund
           image: ${REGISTRY}/ferund:dev
@@ -62,7 +89,7 @@ spec:
             - name: FERUN_HIBERNATE_AFTER
               value: 30m
             - name: FERUN_SHUTDOWN_GRACE
-              value: 2m
+              value: 11m
             # For a network that routes no prefix to the nodes: the pods
             # are on a mesh of a ULA /48 that ferund draws once (ADR 0017).
             - name: FERUN_POD_NETWORK
@@ -97,7 +124,11 @@ spec:
               path: /readyz
               port: http
             periodSeconds: 5
-            # /readyz waits up to 30 s for the nodes after a start.
+            # A ready instance leaves the balancer after a minute of failing
+            # /readyz, so that a database failover (under a minute) does not
+            # take every instance out at once. A stopping instance leaves at
+            # once, its pod terminating; a starting one joins when /readyz
+            # first passes.
             failureThreshold: 12
           livenessProbe:
             httpGet:
@@ -135,6 +166,21 @@ spec:
           secret:
             secretName: ferund-secret-key
             defaultMode: 0440
+---
+# A drain stops at most one instance at a time; with a single instance
+# that one may go. An instance that is not ready may always be evicted, so
+# that a broken one never blocks a drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ferund
+  namespace: ferun
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app: ferund
 ---
 apiVersion: v1
 kind: Service

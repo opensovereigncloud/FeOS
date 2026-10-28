@@ -4,9 +4,11 @@
 package db_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -139,6 +141,74 @@ func TestSessionSettings(t *testing.T) {
 	if lock != "5s" || stmt != "30s" || tz != "UTC" {
 		t.Fatalf("lock_timeout %s, statement_timeout %s, TimeZone %s", lock, stmt, tz)
 	}
+
+	// The server's side of the TCP settings, and the end of a session
+	// idle in a transaction. The tcp_* settings read 0 on a Unix socket.
+	var unix bool
+	if err := d.Pool.QueryRow(ctx, "SELECT inet_server_addr() IS NULL").Scan(&unix); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"idle_in_transaction_session_timeout": "60000"}
+	if !unix {
+		want["tcp_keepalives_idle"] = "5"
+		want["tcp_keepalives_interval"] = "5"
+		want["tcp_keepalives_count"] = "3"
+		want["tcp_user_timeout"] = "15000"
+	}
+	rows, err := d.Pool.Query(ctx, `SELECT name, setting FROM pg_settings WHERE name IN
+		('tcp_keepalives_idle', 'tcp_keepalives_interval', 'tcp_keepalives_count', 'tcp_user_timeout', 'idle_in_transaction_session_timeout')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	var name, setting string
+	if _, err := pgx.ForEachRow(rows, []any{&name, &setting}, func() error {
+		got[name] = setting
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// The server's WARNING notices are logged.
+func TestWarningNoticeLogged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var buf syncBuffer
+	d, err := db.Open(ctx, dbtest.NewDatabase(t), slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if _, err := d.Pool.Exec(ctx, "DO $$ BEGIN RAISE WARNING 'ferun-notice-test'; END $$"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "ferun-notice-test") {
+		t.Fatalf("log %q lacks the warning", buf.String())
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger and a reader at once.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 // Tx runs the function again after each of the retryable failures, and
