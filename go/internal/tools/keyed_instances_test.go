@@ -192,7 +192,11 @@ func TestKeyedLeaseRenewed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	const lease = 600 * time.Millisecond
+	// A lease renewed every third of it, as production's 30 s and 10 s,
+	// in a time unit above a loaded machine's scheduler stalls: at a load
+	// of 30 to 50 on 8 cores with -race, renewals stalled for up to 0.9 s,
+	// beyond the two thirds of a lease of 600 ms.
+	const lease = 1800 * time.Millisecond
 	a, _ := twoRunners(env)
 	a.SetCallConfig(CallConfig{Lease: lease})
 	startRun(t, a)
