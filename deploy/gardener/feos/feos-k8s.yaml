@@ -108,6 +108,13 @@ spec:
         app: feos-k8s
     spec:
       serviceAccountName: feos-k8s
+      # The image's user, distroless's nonroot; fsGroup lets it read the
+      # credentials, which the Secret's mode keeps from everyone else.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
       imagePullSecrets:
         - name: oci-pull
       containers:
@@ -140,4 +147,4 @@ spec:
         - name: ferun
           secret:
             secretName: feos-k8s-ferun
-            defaultMode: 0400
+            defaultMode: 0440
