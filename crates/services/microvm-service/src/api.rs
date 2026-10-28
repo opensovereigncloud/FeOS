@@ -57,6 +57,29 @@ impl VmApiHandler {
     }
 }
 
+impl VmApiHandler {
+    /// Why the VM takes no change now, as while Firecracker writes a
+    /// snapshot that its suspend gave up on; None if it does, or if the
+    /// service does not say within `BUSY_TIMEOUT`.
+    pub async fn busy(&self, vm_id: &str) -> Option<String> {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let asked = async {
+            self.dispatcher_tx
+                .send(Command::CheckFree(vm_id.to_string(), answer))
+                .await
+                .ok()?;
+            answered.await.ok()?
+        };
+        tokio::time::timeout(BUSY_TIMEOUT, asked)
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
+/// How long `VmApiHandler::busy` waits for the service.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[tonic::async_trait]
 impl MicroVmService for VmApiHandler {
     type StreamVmEventsStream = Pin<Box<dyn Stream<Item = Result<VmEvent, Status>> + Send>>;

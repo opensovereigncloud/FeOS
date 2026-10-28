@@ -7,6 +7,8 @@
 
 pub mod disk;
 pub mod forward;
+#[cfg(test)]
+mod hung;
 pub mod network;
 mod pods;
 mod spec;
@@ -49,7 +51,7 @@ impl MeshService for Pods {
         &self,
         request: Request<PutMeshPeersRequest>,
     ) -> Result<Response<PutMeshPeersResponse>, Status> {
-        self.network().put_mesh_peers(request.into_inner())?;
+        self.network().put_mesh_peers(request.into_inner()).await?;
         Ok(Response::new(PutMeshPeersResponse {}))
     }
 
@@ -57,7 +59,9 @@ impl MeshService for Pods {
         &self,
         request: Request<UpdateMeshPeersRequest>,
     ) -> Result<Response<UpdateMeshPeersResponse>, Status> {
-        self.network().update_mesh_peers(request.into_inner())?;
+        self.network()
+            .update_mesh_peers(request.into_inner())
+            .await?;
         Ok(Response::new(UpdateMeshPeersResponse {}))
     }
 

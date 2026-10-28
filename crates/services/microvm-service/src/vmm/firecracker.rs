@@ -1150,7 +1150,12 @@ impl Hypervisor for FirecrackerAdapter {
             }
             None => json!({"backend_type": "File", "backend_path": snapshot::JAILED_MEMORY}),
             Some(remote) => {
-                snapshot::receive(vm_id, remote).map_err(internal("take the snapshot in"))?;
+                // It removes an old snapshot, whose memory file may be GiBs,
+                // and may copy the vmstate: on the blocking pool.
+                let (id, received) = (vm_id.to_string(), remote.clone());
+                blocking(move || snapshot::receive(&id, &received))
+                    .await
+                    .map_err(internal("take the snapshot in"))?;
                 json!({"backend_type": "Uffd", "backend_path": format!("/{}", snapshot::MEMORY_SOCKET)})
             }
         };

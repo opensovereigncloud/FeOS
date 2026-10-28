@@ -99,6 +99,16 @@ fn write_record(path: &Path, record: &StopRecord) -> io::Result<()> {
     Ok(())
 }
 
+/// `write_record` on the blocking pool: its fsyncs may take seconds while
+/// the disk writes the snapshots of the stop, and the other suspends go on
+/// meanwhile.
+async fn keep_record(path: &Path, record: &StopRecord) -> io::Result<()> {
+    let (path, record) = (path.to_path_buf(), record.clone());
+    tokio::task::spawn_blocking(move || write_record(&path, &record))
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)))
+}
+
 fn remove_record(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -160,7 +170,7 @@ impl Pods {
             stopped_at: now(),
             pods: stopped.recorded.clone(),
         };
-        if let Err(e) = write_record(record, &entry) {
+        if let Err(e) = keep_record(record, &entry).await {
             error!(
                 "Pods: Failed to record the suspended pods in {}: {e}",
                 record.display()
@@ -208,7 +218,7 @@ impl Pods {
                     if !entry.pods.contains(&pod_id) {
                         entry.pods.push(pod_id);
                     }
-                    if let Err(e) = write_record(record, &entry) {
+                    if let Err(e) = keep_record(record, &entry).await {
                         error!(
                             "Pods: Failed to record the suspended pods in {}: {e}",
                             record.display()
@@ -224,7 +234,7 @@ impl Pods {
                     );
                     if entry.pods.contains(&pod_id) {
                         entry.pods.retain(|recorded| *recorded != pod_id);
-                        if let Err(e) = write_record(record, &entry) {
+                        if let Err(e) = keep_record(record, &entry).await {
                             error!(
                                 "Pods: Failed to record the suspended pods in {}: {e}",
                                 record.display()
@@ -369,7 +379,11 @@ impl Pods {
         if self.stopping() {
             return;
         }
-        if let Err(e) = remove_record(record) {
+        let removed = record.to_path_buf();
+        let removed = tokio::task::spawn_blocking(move || remove_record(&removed))
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e)));
+        if let Err(e) = removed {
             error!("Pods: Failed to remove {}: {e}", record.display());
         }
     }
@@ -456,5 +470,36 @@ mod tests {
         };
         assert_eq!(record.age(160), 60);
         assert_eq!(record.age(40), 0);
+    }
+
+    /// The record is written on the blocking pool: on a runtime of one
+    /// thread, a write that hangs left the other suspends of the stop
+    /// nothing to run on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_record_that_hangs_leaves_the_runtime_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suspended-for-stop.json");
+        let hung = crate::hung::Hung::at(path.with_extension("json.new"));
+        let (moved, watched) = std::sync::mpsc::channel::<()>();
+        let watchdog = {
+            let hung = hung.0.clone();
+            std::thread::spawn(move || {
+                let stalled = watched.recv_timeout(Duration::from_secs(3)).is_err();
+                crate::hung::Hung(hung).open();
+                stalled
+            })
+        };
+        let record = StopRecord {
+            stopped_at: 1,
+            pods: vec!["p".to_string()],
+        };
+        let kept = tokio::spawn({
+            let path = path.clone();
+            async move { keep_record(&path, &record).await }
+        });
+        sleep(Duration::from_millis(100)).await;
+        let _ = moved.send(());
+        assert!(!watchdog.join().unwrap(), "the write held the runtime");
+        assert!(kept.await.unwrap().is_err(), "a FIFO does not sync");
     }
 }

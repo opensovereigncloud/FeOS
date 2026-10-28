@@ -14,6 +14,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tonic::Status;
 
+#[derive(Clone)]
 pub struct Store {
     dir: PathBuf,
     groups: BTreeMap<String, SecurityGroup>,

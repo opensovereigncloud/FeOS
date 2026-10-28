@@ -209,7 +209,8 @@ pub async fn create_container(
 
     if let Err(e) = &result {
         error!("ContainerWorker ({container_id}): Creation failed: {e}");
-        let _ = bundle::remove(&container_id);
+        let removed = container_id.clone();
+        let _ = blocking(move || bundle::remove(&removed)).await;
         if let Err(e) = repository.delete_container(&container_id).await {
             warn!("Failed to clean up the record of {container_id}: {e}");
         }

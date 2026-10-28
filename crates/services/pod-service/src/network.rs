@@ -490,14 +490,14 @@ impl Network {
         self.mesh.as_ref().map(Mesh::info).unwrap_or_default()
     }
 
-    pub fn put_mesh_peers(&self, request: PutMeshPeersRequest) -> Result<(), Status> {
-        self.on_mesh()?.put(request)?;
+    pub async fn put_mesh_peers(&self, request: PutMeshPeersRequest) -> Result<(), Status> {
+        self.on_mesh()?.put(request).await?;
         self.mesh_changes.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }
 
-    pub fn update_mesh_peers(&self, request: UpdateMeshPeersRequest) -> Result<(), Status> {
-        self.on_mesh()?.update(request)?;
+    pub async fn update_mesh_peers(&self, request: UpdateMeshPeersRequest) -> Result<(), Status> {
+        self.on_mesh()?.update(request).await?;
         self.mesh_changes.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }

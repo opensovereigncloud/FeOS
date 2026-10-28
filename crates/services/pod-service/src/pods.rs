@@ -124,6 +124,10 @@ struct Inner {
     stopping: AtomicBool,
     /// Held while the record of a stop is written or removed.
     stop_record: tokio::sync::Mutex<()>,
+    /// Held while a pod is added or given addresses, which are handed out
+    /// and kept on the blocking pool, off the pods' lock, one pod at a
+    /// time.
+    records: tokio::sync::Mutex<()>,
 }
 
 struct Pod {
@@ -138,6 +142,9 @@ struct Pod {
     /// memory only: a late HibernatePod with one of them is answered
     /// ABORTED instead of hibernating the resumed pod.
     abandoned: VecDeque<String>,
+    /// What keeps its microVM from answering now, as a suspend does, for a
+    /// call to its guest that gets no answer.
+    busy: Option<&'static str>,
 }
 
 impl Pod {
@@ -148,7 +155,18 @@ impl Pod {
             bring_up: None,
             hibernation: None,
             abandoned: VecDeque::new(),
+            busy: None,
         }
+    }
+
+    /// Why its microVM may not answer now, as far as the pod knows.
+    fn busy(&self) -> Option<String> {
+        if let Some(busy) = self.busy {
+            return Some(busy.to_string());
+        }
+        self.hibernation.as_ref().map(|hibernation| {
+            format!("the pod hibernates, in {}", hibernation.phase.as_str_name())
+        })
     }
 
     /// Its record, with its hibernation in flight, which is never kept.
@@ -156,6 +174,20 @@ impl Pod {
         let mut info = self.info.clone();
         info.hibernation = self.hibernation.as_ref().map(Hibernation::shown);
         info
+    }
+}
+
+/// Marks the pod busy until it drops.
+struct BusyMark {
+    pods: Pods,
+    pod_id: String,
+}
+
+impl Drop for BusyMark {
+    fn drop(&mut self) {
+        if let Some(pod) = self.pods.pods().get_mut(&self.pod_id) {
+            pod.busy = None;
+        }
     }
 }
 
@@ -256,7 +288,7 @@ impl Pods {
             .partition(|info| info.state() != PodState::Hibernated);
         for pod_id in network.adopt(&mut kept) {
             if let Some(info) = kept.iter().find(|info| info.pod_id == pod_id)
-                && let Err(e) = store.save(info)
+                && let Err(e) = store.save(info).await
             {
                 warn!("Pods: Failed to keep {pod_id}: {e}");
             }
@@ -264,7 +296,7 @@ impl Pods {
         kept.extend(hibernated);
         network.sync(&kept);
         network.serve_dns();
-        volumes.reconcile(&kept);
+        volumes.reconcile(&kept).await;
         let (events, _) = broadcast::channel(256);
         let pods = Self {
             inner: Arc::new(Inner {
@@ -278,6 +310,7 @@ impl Pods {
                 events,
                 stopping: AtomicBool::new(false),
                 stop_record: tokio::sync::Mutex::new(()),
+                records: tokio::sync::Mutex::new(()),
             }),
         };
         let mut pending = Vec::new();
@@ -349,37 +382,16 @@ impl Pods {
             .volumes
             .claim(&pod_id, &spec::volume_ids(&spec))
             .await?;
-        let recorded = {
-            let mut pods = self.pods();
-            match pods.get(&pod_id) {
-                Some(pod) => Err(Ok(pod.info.clone())),
-                None => {
-                    let mut info = PodInfo {
-                        pod_id: pod_id.clone(),
-                        spec: Some(spec.clone()),
-                        state: PodState::Pending as i32,
-                        ..Default::default()
-                    };
-                    let mut allocated = Ok(());
-                    if info.spec.as_ref().is_some_and(spec::has_network) {
-                        let others = pods.values().map(|pod| &pod.info);
-                        allocated = self.inner.network.allocate(others, &mut info);
-                    }
-                    let kept = allocated.and_then(|()| {
-                        self.inner.store.save(&info).map_err(|e| {
-                            self.inner.network.release(&info);
-                            Status::internal(format!("keep pod {pod_id}: {e}"))
-                        })
-                    });
-                    match kept {
-                        Ok(()) => {
-                            pods.insert(pod_id.clone(), Pod::new(info.clone()));
-                            Ok(info)
-                        }
-                        Err(e) => Err(Err(e)),
-                    }
-                }
-            }
+        let info = PodInfo {
+            pod_id: pod_id.clone(),
+            spec: Some(spec.clone()),
+            state: PodState::Pending as i32,
+            ..Default::default()
+        };
+        let recorded = match self.add(info, spec::has_network(&spec)).await {
+            Ok(Ok(info)) => Ok(info),
+            Ok(Err(existing)) => Err(Ok(existing)),
+            Err(e) => Err(Err(e)),
         };
         let info = match recorded {
             Ok(info) => info,
@@ -409,6 +421,64 @@ impl Pods {
         Ok(info)
     }
 
+    /// Adds the pod `info`, unless one with its ID is there, which comes
+    /// back as `Err`: gives it its addresses if `addresses`, keeps it, and
+    /// adds it then, off the pods' lock. It runs in a task of its own under
+    /// `records`: a caller that goes away leaves no pod kept that the pods
+    /// do not have.
+    async fn add(
+        &self,
+        info: PodInfo,
+        addresses: bool,
+    ) -> Result<Result<PodInfo, PodInfo>, Status> {
+        let pods = self.clone();
+        tokio::spawn(async move {
+            let _records = pods.inner.records.lock().await;
+            let pod_id = info.pod_id.clone();
+            if let Some(existing) = pods.pods().get(&pod_id).map(|pod| pod.info.clone()) {
+                return Ok(Err(existing));
+            }
+            let info = match addresses {
+                true => pods.allocate(info).await?,
+                false => info,
+            };
+            if let Err(e) = pods.inner.store.save(&info).await {
+                pods.release_addresses(&info).await;
+                return Err(Status::internal(format!("keep pod {pod_id}: {e}")));
+            }
+            pods.pods().insert(pod_id, Pod::new(info.clone()));
+            Ok(Ok(info))
+        })
+        .await
+        .unwrap_or_else(|e| Err(Status::internal(format!("the pod's adding ended: {e}"))))
+    }
+
+    /// Hands out the pod's addresses, on the blocking pool: they are kept
+    /// before they are handed out. The caller holds `records`.
+    async fn allocate(&self, mut info: PodInfo) -> Result<PodInfo, Status> {
+        let others: Vec<PodInfo> = self
+            .pods()
+            .values()
+            .filter(|pod| pod.info.pod_id != info.pod_id)
+            .map(|pod| pod.info.clone())
+            .collect();
+        let pods = self.clone();
+        tokio::task::spawn_blocking(move || {
+            pods.inner
+                .network
+                .allocate(others.iter(), &mut info)
+                .map(|()| info)
+        })
+        .await
+        .unwrap_or_else(|e| Err(Status::internal(format!("hand out addresses: {e}"))))
+    }
+
+    /// Frees the pod's IPv4 address, on the blocking pool.
+    async fn release_addresses(&self, info: &PodInfo) {
+        let (pods, info) = (self.clone(), info.clone());
+        let _ = tokio::task::spawn_blocking(move || pods.inner.network.release(&info)).await;
+    }
+
     /// Brings a stopped or failed pod up again, on its disk.
     pub async fn start(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.lock(pod_id).await?;
@@ -426,7 +496,7 @@ impl Pods {
             }
             _ => {}
         }
-        self.set_state(pod_id, PodState::Pending, "");
+        self.set_state(pod_id, PodState::Pending, "").await;
         drop(_lock);
         self.spawn_bring_up(pod_id);
         Ok(())
@@ -444,7 +514,8 @@ impl Pods {
                     pod_id,
                     PodState::Stopped,
                     "stopped: its memory is dropped, its disk is its checkpoint's",
-                );
+                )
+                .await;
                 return Ok(());
             }
             _ => {}
@@ -467,7 +538,7 @@ impl Pods {
             Some(_) => self.delete_vm(pod_id).await?,
         }
         self.release_disk(pod_id).await;
-        self.set_state(pod_id, PodState::Stopped, "stopped");
+        self.set_state(pod_id, PodState::Stopped, "stopped").await;
         Ok(())
     }
 
@@ -485,7 +556,8 @@ impl Pods {
                 pod_id,
                 PodState::Failed,
                 &format!("its disk is not deleted: {}", e.message()),
-            );
+            )
+            .await;
             return Err(e);
         }
         let info = self.info(pod_id)?;
@@ -498,6 +570,7 @@ impl Pods {
         self.inner
             .store
             .remove(pod_id)
+            .await
             .map_err(|e| Status::internal(format!("forget pod {pod_id}: {e}")))?;
         if let Some(pod) = self.pods().remove(pod_id) {
             self.announce(&pod.info, true);
@@ -506,7 +579,7 @@ impl Pods {
         if let Err(e) = self.apply_network().await {
             warn!("Pods: Failed to set the pods' rules: {e}");
         }
-        self.inner.network.release(&info);
+        self.release_addresses(&info).await;
         info!("Pods: {pod_id} deleted");
         Ok(())
     }
@@ -532,6 +605,8 @@ impl Pods {
     /// wrote to its disk: Firecracker flushes it first. The disk stops
     /// with the microVM.
     async fn suspend_locked(&self, pod_id: &str) -> Result<u64, Status> {
+        // Its guest does not answer while the snapshot is written.
+        let _busy = self.mark_busy(pod_id, "the pod is being suspended");
         let request = Request::new(SuspendVmRequest {
             vm_id: pod_id.to_string(),
             purge_guest: true,
@@ -539,7 +614,8 @@ impl Pods {
         let response = self.inner.vms.suspend_vm(request).await?.into_inner();
         self.settle(pod_id, VmState::Suspended).await?;
         self.release_disk(pod_id).await;
-        self.set_state(pod_id, PodState::Suspended, "suspended");
+        self.set_state(pod_id, PodState::Suspended, "suspended")
+            .await;
         Ok(response.memory_bytes)
     }
 
@@ -565,7 +641,7 @@ impl Pods {
         });
         self.inner.vms.resume_vm(request).await?;
         self.settle(pod_id, VmState::Running).await?;
-        self.set_state(pod_id, PodState::Running, "");
+        self.set_state(pod_id, PodState::Running, "").await;
         self.check_microvm_network(pod_id, attachment.as_ref())
             .await;
         Ok(())
@@ -710,10 +786,11 @@ impl Pods {
         run.check()?;
         if info.state() == PodState::Running {
             self.set_phase(run, HibernationPhase::Suspending);
-            self.set_state(pod_id, PodState::Running, "hibernating");
+            self.set_state(pod_id, PodState::Running, "hibernating")
+                .await;
             if let Err(e) = self.suspend_locked(pod_id).await {
                 if self.info(pod_id)?.state() == PodState::Running {
-                    self.set_state(pod_id, PodState::Running, "");
+                    self.set_state(pod_id, PodState::Running, "").await;
                 }
                 return Err(e);
             }
@@ -788,10 +865,14 @@ impl Pods {
         info!("Pods: {pod_id} is in {}", checkpoint.head_key);
         // Its volumes are in it, too.
         for (volume_id, volume_checkpoint) in volume_checkpoints {
-            let checkpointed = self.inner.volumes.update(&volume_id, |volume| {
-                volume.state = VolumeState::Checkpointed as i32;
-                volume.checkpoint = Some(volume_checkpoint);
-            });
+            let checkpointed = self
+                .inner
+                .volumes
+                .update(&volume_id, |volume| {
+                    volume.state = VolumeState::Checkpointed as i32;
+                    volume.checkpoint = Some(volume_checkpoint);
+                })
+                .await;
             if let Err(e) = checkpointed {
                 warn!(
                     "Pods: Failed to record that volume {volume_id} is checkpointed: {}",
@@ -810,13 +891,15 @@ impl Pods {
             info.checkpoint = Some(checkpoint.clone());
             info.ipv6_address.clear();
             info.ipv4_address.clear();
-        });
-        self.set_state(pod_id, PodState::Hibernated, "hibernated");
+        })
+        .await;
+        self.set_state(pod_id, PodState::Hibernated, "hibernated")
+            .await;
         self.purge(pod_id).await;
         if let Err(e) = self.apply_network().await {
             warn!("Pods: Failed to set the pods' rules: {e}");
         }
-        self.inner.network.release(&placed);
+        self.release_addresses(&placed).await;
         Ok(HibernatePodResponse {
             checkpoint: Some(checkpoint),
             memory_bytes,
@@ -930,15 +1013,17 @@ impl Pods {
                 .await?;
         }
         self.inner.volumes.take_over(pod_id, volumes).await?;
-        self.place(pod_id)?;
+        self.place(pod_id).await?;
         self.update(pod_id, |info| {
             info.checkpoint = Some(Checkpoint {
                 head_key: key.clone(),
                 epoch: head.epoch,
                 memory: head.memory.is_some(),
             });
-        });
-        self.set_state(pod_id, PodState::Pending, &format!("restoring from {key}"));
+        })
+        .await;
+        self.set_state(pod_id, PodState::Pending, &format!("restoring from {key}"))
+            .await;
         if let Err(e) = self.apply_network().await {
             warn!("Pods: Failed to set the pods' rules: {e}");
         }
@@ -947,7 +1032,7 @@ impl Pods {
             Some(reason) => reason,
             None => match self.restore_memory(pod_id, &head).await {
                 Ok(()) => {
-                    self.set_state(pod_id, PodState::Running, "");
+                    self.set_state(pod_id, PodState::Running, "").await;
                     info!("Pods: {pod_id} is restored from {key}, with its memory");
                     return Ok(RestorePodResponse {
                         pod: Some(self.info(pod_id)?),
@@ -973,7 +1058,8 @@ impl Pods {
             pod_id,
             PodState::Pending,
             &format!("booting anew on its disk: {reason}"),
-        );
+        )
+        .await;
         drop(lock);
         self.spawn_bring_up(pod_id);
         Ok(RestorePodResponse {
@@ -1013,11 +1099,6 @@ impl Pods {
         // volumes leaves nothing on the node.
         self.checkpoint_volumes(pod_id, &spec, &head).await?;
         let info = {
-            let mut pods = self.pods();
-            if pods.contains_key(pod_id) {
-                // Another restore was faster.
-                return Ok(());
-            }
             let info = PodInfo {
                 pod_id: pod_id.to_string(),
                 spec: Some(spec),
@@ -1030,12 +1111,11 @@ impl Pods {
                 }),
                 ..Default::default()
             };
-            self.inner
-                .store
-                .save(&info)
-                .map_err(|e| Status::internal(format!("keep pod {pod_id}: {e}")))?;
-            pods.insert(pod_id.to_string(), Pod::new(info.clone()));
-            info
+            match self.add(info, false).await? {
+                Ok(info) => info,
+                // Another restore was faster.
+                Err(_) => return Ok(()),
+            }
         };
         info!("Pods: {pod_id} comes from {head_key}");
         self.announce(&info, false);
@@ -1105,29 +1185,29 @@ impl Pods {
 
     /// Gives a pod that is to come back onto the node what it gave up when
     /// it hibernated: its addresses.
-    fn place(&self, pod_id: &str) -> Result<(), Status> {
-        let mut pods = self.pods();
-        let Some(pod) = pods.get(pod_id) else {
-            return Err(Status::not_found(format!("no pod {pod_id}")));
-        };
-        let info = &pod.info;
-        if !info.spec.as_ref().is_some_and(spec::has_network) || !info.ipv6_address.is_empty() {
-            return Ok(());
-        }
-        let mut info = info.clone();
-        let others = pods
-            .values()
-            .filter(|pod| pod.info.pod_id != pod_id)
-            .map(|pod| &pod.info);
-        self.inner.network.allocate(others, &mut info)?;
-        self.inner
-            .store
-            .save(&info)
-            .map_err(|e| Status::internal(format!("keep pod {pod_id}: {e}")))?;
-        if let Some(pod) = pods.get_mut(pod_id) {
-            pod.info = info;
-        }
-        Ok(())
+    /// The caller holds the pod's lock: nothing else changes its record.
+    /// It runs in a task of its own under `records`, as `add` does.
+    async fn place(&self, pod_id: &str) -> Result<(), Status> {
+        let (pods, pod_id) = (self.clone(), pod_id.to_string());
+        tokio::spawn(async move {
+            let _records = pods.inner.records.lock().await;
+            let info = pods.info(&pod_id)?;
+            if !info.spec.as_ref().is_some_and(spec::has_network) || !info.ipv6_address.is_empty() {
+                return Ok(());
+            }
+            let info = pods.allocate(info).await?;
+            if let Err(e) = pods.inner.store.save(&info).await {
+                pods.release_addresses(&info).await;
+                return Err(Status::internal(format!("keep pod {pod_id}: {e}")));
+            }
+            if let Some(pod) = pods.pods().get_mut(&pod_id) {
+                pod.info.ipv6_address = info.ipv6_address;
+                pod.info.ipv4_address = info.ipv4_address;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|e| Err(Status::internal(format!("placing the pod ended: {e}"))))
     }
 
     /// Stops the pod's disk and its volumes' when its microVM has ended,
@@ -1204,6 +1284,7 @@ impl Pods {
                     .update(&volume.volume_id, |volume| {
                         volume.state = VolumeState::Attached as i32;
                     })
+                    .await
                     .map_err(failed)?;
             }
             paths.push(path);
@@ -1230,7 +1311,7 @@ impl Pods {
                 format: !volume.formatted,
             });
         }
-        let mut guest = GuestServiceClient::new(guest_channel(pod_id).await?);
+        let mut guest = GuestServiceClient::new(self.guest_channel(pod_id).await?);
         let response = timeout(MOUNT_TIMEOUT, guest.mount_volumes(request))
             .await
             .map_err(|_| {
@@ -1268,7 +1349,8 @@ impl Pods {
             if !self.inner.volumes.get(&wanted.volume_id)?.formatted {
                 self.inner
                     .volumes
-                    .update(&wanted.volume_id, |volume| volume.formatted = true)?;
+                    .update(&wanted.volume_id, |volume| volume.formatted = true)
+                    .await?;
             }
         }
         if !failed.is_empty() {
@@ -1650,6 +1732,41 @@ impl Pods {
         }
     }
 
+    fn mark_busy(&self, pod_id: &str, why: &'static str) -> BusyMark {
+        if let Some(pod) = self.pods().get_mut(pod_id) {
+            pod.busy = Some(why);
+        }
+        BusyMark {
+            pods: self.clone(),
+            pod_id: pod_id.to_string(),
+        }
+    }
+
+    /// Why the pod's microVM may not answer now: what the pod does, or
+    /// else what the microVM service says, such as a snapshot that
+    /// Firecracker still writes.
+    async fn busy(&self, pod_id: &str) -> Option<String> {
+        let busy = self.pods().get(pod_id).and_then(Pod::busy);
+        match busy {
+            Some(busy) => Some(busy),
+            None => self.inner.vms.busy(pod_id).await,
+        }
+    }
+
+    /// A channel to the API of the pod's guest. A guest that does not
+    /// answer the connect within `vsock::CONNECT_TIMEOUT` fails it with
+    /// `UNAVAILABLE`, and why its microVM is busy if that is known; once
+    /// connected, a call has no bound but its caller's.
+    pub(crate) async fn guest_channel(&self, pod_id: &str) -> Result<Channel, Status> {
+        dial_guest(
+            vsock_path(pod_id),
+            pod_id,
+            vsock::CONNECT_TIMEOUT,
+            self.busy(pod_id),
+        )
+        .await
+    }
+
     /// Takes the pod's lock, and makes sure the pod is still there.
     async fn lock(&self, pod_id: &str) -> Result<OwnedMutexGuard<()>, Status> {
         let lock = self
@@ -1772,20 +1889,26 @@ impl Pods {
         self.lock(pod_id).await
     }
 
-    /// Changes the pod's record and keeps it, without an event.
-    fn update(&self, pod_id: &str, change: impl FnOnce(&mut PodInfo)) {
-        let mut pods = self.pods();
-        let Some(pod) = pods.get_mut(pod_id) else {
-            return;
+    /// Changes the pod's record and keeps it, without an event. The change
+    /// is asked to be kept under the pods' lock, in its order, and waited
+    /// for without it (`Store`).
+    async fn update(&self, pod_id: &str, change: impl FnOnce(&mut PodInfo)) {
+        let saved = {
+            let mut pods = self.pods();
+            let Some(pod) = pods.get_mut(pod_id) else {
+                return;
+            };
+            change(&mut pod.info);
+            self.inner.store.save(&pod.info)
         };
-        change(&mut pod.info);
-        if let Err(e) = self.inner.store.save(&pod.info) {
+        if let Err(e) = saved.await {
             warn!("Pods: Failed to keep {pod_id}: {e}");
         }
     }
 
-    fn set_state(&self, pod_id: &str, state: PodState, reason: &str) {
-        let info = {
+    /// Changes the pod's state, and announces it once it is kept.
+    async fn set_state(&self, pod_id: &str, state: PodState, reason: &str) {
+        let (info, saved) = {
             let mut pods = self.pods();
             let Some(pod) = pods.get_mut(pod_id) else {
                 return;
@@ -1795,11 +1918,11 @@ impl Pods {
             }
             pod.info.state = state as i32;
             pod.info.reason = reason.to_string();
-            if let Err(e) = self.inner.store.save(&pod.info) {
-                warn!("Pods: Failed to keep {pod_id}: {e}");
-            }
-            pod.info.clone()
+            (pod.info.clone(), self.inner.store.save(&pod.info))
         };
+        if let Err(e) = saved.await {
+            warn!("Pods: Failed to keep {pod_id}: {e}");
+        }
         if reason.is_empty() {
             info!("Pods: {pod_id} is {}", state.as_str_name());
         } else {
@@ -1831,8 +1954,8 @@ impl Pods {
                 return;
             }
             match pods.bring_up(&id, &info.spec.unwrap_or_default()).await {
-                Ok(()) => pods.set_state(&id, PodState::Running, ""),
-                Err(e) => pods.set_state(&id, PodState::Failed, e.message()),
+                Ok(()) => pods.set_state(&id, PodState::Running, "").await,
+                Err(e) => pods.set_state(&id, PodState::Failed, e.message()).await,
             }
         });
         if let Some(pod) = self.pods().get_mut(pod_id)
@@ -1846,7 +1969,7 @@ impl Pods {
         let booted = self.boot(pod_id, spec).await?;
         self.wait_for_guest(pod_id).await?;
         self.mount_volumes(pod_id, spec).await?;
-        let mut guest = ContainerServiceClient::new(guest_channel(pod_id).await?);
+        let mut guest = ContainerServiceClient::new(self.guest_channel(pod_id).await?);
         for container in &spec.containers {
             run_container(&mut guest, container, booted)
                 .await
@@ -1864,7 +1987,7 @@ impl Pods {
     /// is in. Returns whether it booted it anew.
     async fn boot(&self, pod_id: &str, spec: &PodSpec) -> Result<bool, Status> {
         let vm_id = pod_id.to_string();
-        self.place(pod_id)?;
+        self.place(pod_id).await?;
         let attachment = self.attach(pod_id).await?;
         let disk = self.open_disk(pod_id).await?;
         let volumes = self.open_volumes(pod_id).await?;
@@ -2016,27 +2139,37 @@ impl Pods {
 
     async fn network_came_up(&self) {
         let network = &self.inner.network;
-        let changed: Vec<PodInfo> = {
-            let mut pods = self.pods();
+        {
+            // The addresses are handed out and kept on the blocking pool,
+            // off the pods' lock; the pods take them then.
+            let _records = self.inner.records.lock().await;
             // A hibernated pod has no addresses on the node.
-            let mut kept: Vec<PodInfo> = pods
+            let kept: Vec<PodInfo> = self
+                .pods()
                 .values()
                 .map(|pod| pod.info.clone())
                 .filter(|info| info.state() != PodState::Hibernated)
                 .collect();
-            let changed = network.adopt(&mut kept);
-            kept.into_iter()
-                .filter(|info| changed.contains(&info.pod_id))
-                .inspect(|info| {
-                    if let Some(pod) = pods.get_mut(&info.pod_id) {
-                        pod.info = info.clone();
-                    }
-                })
-                .collect()
-        };
-        for info in &changed {
-            if let Err(e) = self.inner.store.save(info) {
-                warn!("Pods: Failed to keep {}: {e}", info.pod_id);
+            let pods = self.clone();
+            let adopted = tokio::task::spawn_blocking(move || {
+                let mut kept = kept;
+                let changed = pods.inner.network.adopt(&mut kept);
+                kept.retain(|info| changed.contains(&info.pod_id));
+                kept
+            })
+            .await
+            .unwrap_or_default();
+            for info in adopted {
+                let saved = self.pods().get_mut(&info.pod_id).map(|pod| {
+                    pod.info.ipv6_address = info.ipv6_address.clone();
+                    pod.info.ipv4_address = info.ipv4_address.clone();
+                    self.inner.store.save(&pod.info)
+                });
+                if let Some(saved) = saved
+                    && let Err(e) = saved.await
+                {
+                    warn!("Pods: Failed to keep {}: {e}", info.pod_id);
+                }
             }
         }
         network.sync(&self.list());
@@ -2120,7 +2253,8 @@ impl Pods {
 
     async fn container_status(&self, info: &PodInfo) -> Vec<ContainerStatus> {
         let list = timeout(STATUS_TIMEOUT, async {
-            let mut guest = ContainerServiceClient::new(guest_channel(&info.pod_id).await.ok()?);
+            let mut guest =
+                ContainerServiceClient::new(self.guest_channel(&info.pod_id).await.ok()?);
             guest
                 .list_containers(ListContainersRequest {})
                 .await
@@ -2163,7 +2297,7 @@ impl Pods {
                     Ok(stream) => {
                         let mut stream = stream.into_inner();
                         while let Some(Ok(event)) = stream.next().await {
-                            pods.on_vm_event(event);
+                            pods.on_vm_event(event).await;
                         }
                     }
                     Err(e) => warn!("Pods: No events of the microVMs: {}", e.message()),
@@ -2173,7 +2307,7 @@ impl Pods {
         });
     }
 
-    fn on_vm_event(&self, event: VmEvent) {
+    async fn on_vm_event(&self, event: VmEvent) {
         let Some(data) = event.data else {
             return;
         };
@@ -2204,7 +2338,7 @@ impl Pods {
             }
         };
         if let Some((state, reason)) = next {
-            self.set_state(&event.vm_id, state, &reason);
+            self.set_state(&event.vm_id, state, &reason).await;
             // The microVM is gone; its disk keeps what the pod wrote, for
             // the next start.
             let pods = self.clone();
@@ -2526,11 +2660,31 @@ fn same_spec(existing: PodInfo, spec: &PodSpec) -> Result<PodInfo, Status> {
     }
 }
 
-/// A channel to the API of the pod's guest.
-pub(crate) async fn guest_channel(pod_id: &str) -> Result<Channel, Status> {
-    vsock::channel(vsock_path(pod_id), API_PORT)
-        .await
-        .map_err(|e| Status::unavailable(format!("the guest of pod {pod_id}: {e}")))
+/// A channel to the API of the guest of `pod_id` behind `uds`, whose
+/// connect takes `deadline` at most: past it, `UNAVAILABLE`, with what
+/// `busy` says.
+async fn dial_guest(
+    uds: PathBuf,
+    pod_id: &str,
+    deadline: Duration,
+    busy: impl Future<Output = Option<String>>,
+) -> Result<Channel, Status> {
+    match vsock::channel_within(uds, API_PORT, deadline).await {
+        Ok(channel) => Ok(channel),
+        Err(e) if vsock::timed_out(&e) => {
+            let mut message = format!(
+                "the guest of pod {pod_id} did not answer within {}",
+                vsock::seconds(deadline)
+            );
+            if let Some(busy) = busy.await {
+                message.push_str(&format!("; the VM is busy: {busy}"));
+            }
+            Err(Status::unavailable(message))
+        }
+        Err(e) => Err(Status::unavailable(format!(
+            "the guest of pod {pod_id}: {e}"
+        ))),
+    }
 }
 
 /// Gets a container running in the guest, from whatever is there. After a
@@ -2851,6 +3005,50 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// A guest whose microVM does not answer, as while Firecracker writes
+    /// a snapshot: the call fails at its deadline, with why if known.
+    #[tokio::test]
+    async fn a_guest_that_does_not_answer_is_unavailable_with_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let uds = dir.path().join("v.sock");
+        let _vmm = tokio::net::UnixListener::bind(&uds).unwrap();
+        let deadline = Duration::from_millis(200);
+        let dial = |busy: Option<&'static str>| {
+            let uds = uds.clone();
+            async move {
+                timeout(
+                    Duration::from_secs(5),
+                    dial_guest(uds, "p", deadline, async move { busy.map(str::to_string) }),
+                )
+                .await
+                .expect("the call waited past its deadline")
+                .unwrap_err()
+            }
+        };
+        let busy = dial(Some("the pod is being suspended")).await;
+        assert_eq!(busy.code(), Code::Unavailable);
+        assert_eq!(
+            busy.message(),
+            "the guest of pod p did not answer within 0.2s; the VM is busy: the pod is being \
+             suspended"
+        );
+        let unknown = dial(None).await;
+        assert_eq!(unknown.code(), Code::Unavailable);
+        assert_eq!(
+            unknown.message(),
+            "the guest of pod p did not answer within 0.2s"
+        );
+        // No VMM at all: refused at once, as before.
+        let gone = dial_guest(dir.path().join("none"), "p", deadline, async { None })
+            .await
+            .unwrap_err();
+        assert!(
+            gone.message().starts_with("the guest of pod p: "),
+            "{}",
+            gone.message()
+        );
     }
 
     #[tokio::test]

@@ -105,6 +105,20 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
 - With `--suspend-on-stop`, SIGTERM suspends the pods for the next `feosd`
   ([On Kubernetes](#on-kubernetes)); without, with a control plane, it
   tells the control plane that `feosd` stops, and ends.
+- Nothing that blocks runs on its runtime's threads, nor under a lock
+  that a reader takes. The records it keeps are written with fsync(2),
+  which can take seconds while the disk writes back much else, as a
+  snapshot's memory. A pod's record is written on a thread of its own,
+  `pod-records`, in the order of the pod's changes: a change is seen at
+  once, and its call answered and its event sent once it is kept. The
+  volumes, the security groups, the name tables and the mesh are written
+  on the blocking pool, one change at a time, and a change is seen once it
+  is kept: `ListPods`, `GetPod`, a call to a guest and the resolver's
+  lookups never wait for a write. The pods' addresses are handed out and
+  kept on the blocking pool, one pod at a time, before the pod is
+  recorded; so is the record of a stop. Removing a snapshot or a
+  container's directory, clearing a layer a pull unpacked before, and the
+  image store's syncfs(2) run there too.
 
 ## Directories
 
@@ -268,6 +282,16 @@ What changes a pod runs under a lock of the pod's; a call that waited for
 it acts only if the lock is still its pod's, not on a pod created again
 with the ID after a delete. `GetPod` asks the guest for the containers'
 states while the pod runs.
+
+A call to the guest, as an exec, a port forward, `GetPod`'s states or a
+bring-up's, connects to it on vsock within 5 s, its handshake included.
+A guest that does not answer, as while its microVM is paused for a
+snapshot or Firecracker still writes one, fails the call with
+`UNAVAILABLE` "the guest of pod <id> did not answer within 5s", and "; the
+VM is busy: <why>" when that is known: the pod is being suspended, it
+hibernates, or the microVM's snapshot is late (its `check_free`). A
+connected call has no bound but its caller's: a stream lasts as long as
+it lasts.
 
 ## Volumes
 

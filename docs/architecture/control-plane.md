@@ -1450,7 +1450,9 @@ node is unavailable is 503 "the sandbox's node is unavailable", also with
 `Retry-After: 5`. A failed dial is read by its code and feosd's text,
 since both failures that matter come as `UNAVAILABLE`: "127.0.0.1:<port>:
 …", the guest's, means nothing listens on the port (502), "the guest of
-pod …" that the guest does not answer (503), anything else that the node
+pod …" that the guest does not answer (503), as when it does not answer
+feosd's connect within 5 s while its microVM is paused or Firecracker
+writes a snapshot ("…; the VM is busy: <why>"), anything else that the node
 connection failed (503). A refused Kubernetes listener is 403, a pod that
 does not run yet 503 with a retry. A feosd that does not forward this
 service for pods answers `UNIMPLEMENTED`, and the door 502 "node <n> does

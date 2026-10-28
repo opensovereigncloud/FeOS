@@ -107,6 +107,10 @@ pub enum Command {
         GuestNetworkConfig,
         oneshot::Sender<Result<bool, VmServiceError>>,
     ),
+    /// Why a VM takes no change now, if it does not
+    /// (`Hypervisor::check_free`), for a caller in this process: answered
+    /// at once.
+    CheckFree(String, oneshot::Sender<Option<String>>),
 }
 
 impl std::fmt::Debug for Command {
@@ -129,6 +133,7 @@ impl std::fmt::Debug for Command {
                 .field(vm_id)
                 .field(network)
                 .finish(),
+            Command::CheckFree(vm_id, _) => f.debug_tuple("CheckFree").field(vm_id).finish(),
         }
     }
 }
