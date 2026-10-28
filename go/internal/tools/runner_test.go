@@ -436,7 +436,12 @@ func TestCancellation(t *testing.T) {
 	if err := env.DB.WaitListening(bg); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond) // Run has subscribed
+	// Run subscribes to ferun_cancel before it records calls with an id.
+	waitFor(t, "Run to subscribe", func() bool {
+		r.k.mu.Lock()
+		defer r.k.mu.Unlock()
+		return r.k.renewing
+	})
 	calls := make(chan error, 2)
 	for range 2 {
 		go func() {

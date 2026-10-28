@@ -5,6 +5,7 @@ package sandbox
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -141,9 +142,10 @@ func TestEnsurePreemptsACapacityHibernate(t *testing.T) {
 
 // TestEnsurePreemptWaitsForItsCall: a hibernation that an earlier call
 // left on the node is not the row's op's: while the op's own call has not
-// reached it, Ensure does not preempt and asks the node about once per
-// preemptRecheck; once the call joins the hibernation, Ensure preempts,
-// the abandon covers both calls, and no second hibernation runs.
+// reached it, Ensure does not preempt and asks the node again and again,
+// at most once per preemptRecheck; once the call joins the hibernation,
+// Ensure preempts, the abandon covers both calls, and no second
+// hibernation runs.
 func TestEnsurePreemptWaitsForItsCall(t *testing.T) {
 	h := newHarness(t)
 	n := h.addNode("n1")
@@ -167,11 +169,22 @@ func TestEnsurePreemptWaitsForItsCall(t *testing.T) {
 	}
 	waitClosed(t, call.arrived, "the op's call")
 	resumes := h.watchCalls("n1", podv1.PodService_ResumePod_FullMethodName, false)
-	var gets atomic.Int64
+	// Ensure's looks at the pod, as they reach the node: the only GetPods
+	// now (pausedLong's syncs have run, and the op's call is held before
+	// the node).
+	var mu sync.Mutex
+	var looks []time.Time
 	n.Script().SetHook(podv1.PodService_GetPod_FullMethodName, func(context.Context, string, any) error {
-		gets.Add(1)
+		mu.Lock()
+		looks = append(looks, time.Now())
+		mu.Unlock()
 		return nil
 	})
+	looked := func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(looks)
+	}
 	done := make(chan error, 1)
 	go func() {
 		lease, _, err := ensureFor(e, sb.ID, time.Minute)
@@ -180,10 +193,22 @@ func TestEnsurePreemptWaitsForItsCall(t *testing.T) {
 		}
 		done <- err
 	}()
-	const held = 1500 * time.Millisecond
-	never(t, held, "a ResumePod while the op's call had not joined", func() bool { return resumes.count() > 0 || len(done) > 0 })
-	if g := gets.Load(); g < 3 || g > int64(held/e.t.preemptRecheck)+4 {
-		t.Fatalf("%d GetPods in %v", g, held)
+	// While the op's call has not joined, Ensure looks again and again and
+	// begins nothing.
+	eventually(t, 15*time.Second, "three looks of Ensure at the pod", func() bool {
+		if resumes.count() > 0 || len(done) > 0 {
+			t.Fatalf("a ResumePod or Ensure's end while the op's call had not joined, after %d looks", len(looked()))
+		}
+		return len(looked()) >= 3
+	})
+	// At most once per preemptRecheck: a look waits that long after the
+	// answer to the one before, so they reach the node at least that far
+	// apart, however slow the machine.
+	at := looked()
+	for i := 1; i < len(at); i++ {
+		if d := at[i].Sub(at[i-1]); d < e.t.preemptRecheck {
+			t.Fatalf("looks %d and %d reached the node %v apart, less than preemptRecheck (%v)", i, i+1, d, e.t.preemptRecheck)
+		}
 	}
 	h.wantHibernation("n1", sb.ID, podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK, true, "older")
 	call.release()
@@ -257,6 +282,9 @@ func TestEnsurePreemptRefused(t *testing.T) {
 			e := h.eng()
 			e.t.hibernateWait = 1500 * time.Millisecond
 			e.t.preemptRecheck = 100 * time.Millisecond
+			// The fixture's syncs have run, and the hibernation of a
+			// suspended pod sends no event: every GetPod from here on is
+			// Ensure's.
 			sb, hd, upload := h.hibernatingAtUpload("n1")
 			var begins, gets atomic.Int64
 			e.preBeginHook = func(_ context.Context, id podid.ID, kind OpKind) {

@@ -85,10 +85,12 @@ func waitEnded(t *testing.T, env *toolstest.Env, sb auth.Sandbox, key string) st
 
 // A repeat on another instance waits for the row of the call that runs
 // on the first: its request that ends cancels nothing, and a new one gets
-// the stored answer once the call ended.
+// the stored answer once the call ended, woken by ferun_call.
 func TestKeyedAttachOtherInstance(t *testing.T) {
 	env := toolstest.New(t, toolstest.Options{})
 	a, b := twoRunners(env)
+	// b reads the row only when ferun_call names it.
+	b.k.poll = time.Hour
 	startRun(t, a)
 	startRun(t, b)
 	sb := env.NewSandbox()
@@ -125,14 +127,9 @@ func TestKeyedAttachOtherInstance(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 	close(p.release)
-	select {
-	case x := <-again:
-		want := CallInfo{Keyed: true, State: CallDone, Replay: true, Instance: "i1"}
-		if x.err != nil || x.res.Text != "out\n" || x.info != want {
-			t.Errorf("b's answer %+v", x)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("b got no answer within 2 s of the call's end")
+	want := CallInfo{Keyed: true, State: CallDone, Replay: true, Instance: "i1"}
+	if x := await(t, again); x.err != nil || x.res.Text != "out\n" || x.info != want {
+		t.Errorf("b's answer %+v", x)
 	}
 	if s := await(t, starter); s.err != nil || s.res.Text != "out\n" || s.info.Replay || s.info.State != CallDone {
 		t.Errorf("a's starter %+v", s)
@@ -171,25 +168,67 @@ func TestKeyedCancelOtherInstance(t *testing.T) {
 }
 
 // The instance that runs a call keeps its lease ahead of the database's
-// clock.
+// clock: every renewal moves it a lease past the database's now(), and
+// each after the first comes before the lease it renews ran out. (The
+// first term ran from the insert's start, before the instance had the
+// row: the insert's round trip and up to a third of a lease until the
+// first renewal come out of it.)
 func TestKeyedLeaseRenewed(t *testing.T) {
 	env := toolstest.New(t, toolstest.Options{})
+	// Each renewal is recorded in its own transaction, with the lease it
+	// renewed: its now() is the clock the expiry judges by.
+	for _, sql := range []string{
+		`CREATE TABLE renewals (renewed timestamptz NOT NULL, lease_until timestamptz NOT NULL,
+			at timestamptz NOT NULL)`,
+		`CREATE FUNCTION record_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				INSERT INTO renewals VALUES (OLD.lease_until, NEW.lease_until, now());
+				RETURN NEW;
+			END $$`,
+		`CREATE TRIGGER renewal AFTER UPDATE OF lease_until ON tool_calls
+			FOR EACH ROW EXECUTE FUNCTION record_renewal()`,
+	} {
+		if _, err := env.DB.Pool.Exec(bg, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const lease = 600 * time.Millisecond
 	a, _ := twoRunners(env)
-	a.SetCallConfig(CallConfig{Lease: 600 * time.Millisecond})
+	a.SetCallConfig(CallConfig{Lease: lease})
 	startRun(t, a)
 	sb := env.NewSandbox()
 	p := probeExec(env, "")
 
 	starter := callAsync(bg, a, sb, ToolBash, `{"command":"x"}`, "l", nil)
 	waitN(t, p.started, 1)
-	time.Sleep(2 * time.Second)
-	var ahead bool
-	if err := env.DB.Pool.QueryRow(bg, `SELECT lease_until > now() FROM tool_calls WHERE sandbox_id = $1 AND call_key = $2`,
-		sb.ID.String(), "l").Scan(&ahead); err != nil {
+	// Seven renewals, a third of a lease apart: the six terms after the
+	// first cover two leases.
+	waitFor(t, "seven renewals", func() bool {
+		var n int
+		if err := env.DB.Pool.QueryRow(bg, `SELECT count(*) FROM renewals`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n >= 7
+	})
+	rows, err := env.DB.Pool.Query(bg, `SELECT extract(epoch FROM renewed - at)::float8,
+		extract(epoch FROM lease_until - at)::float8 FROM renewals ORDER BY at`)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !ahead {
-		t.Error("the lease ran out while the call ran")
+	for i := 1; rows.Next(); i++ {
+		var left, ahead float64
+		if err := rows.Scan(&left, &ahead); err != nil {
+			t.Fatal(err)
+		}
+		if ahead != lease.Seconds() {
+			t.Errorf("renewal %d moved the lease %.3f s past now(), want %.3f s", i, ahead, lease.Seconds())
+		}
+		if i > 1 && left <= 0 {
+			t.Errorf("renewal %d came %.3f s after the lease it renewed ran out", i, -left)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 	close(p.release)
 	if s := await(t, starter); s.err != nil || s.info.State != CallDone {
@@ -254,21 +293,20 @@ func TestWaiterExpires(t *testing.T) {
 		t.Errorf("logged verdicts %v", got)
 	}
 
-	// A lease that ran out 100 ms ago is left alone for one lease more.
-	t0 := time.Now()
+	// A lease that ran out 100 ms ago is left alone for one lease more, by
+	// the database's clock: the waiter ends the row a lease after its
+	// lease ran out at the earliest.
 	foreignRow(t, env, sb, "recent", args, true, -100*time.Millisecond)
-	ch := callAsync(bg, b, sb, ToolBash, args, "recent", nil)
-	time.Sleep(time.Until(t0.Add(400 * time.Millisecond)))
-	select {
-	case x := <-ch:
-		t.Fatalf("answered within the margin: %+v", x)
-	default:
-	}
-	if row := callRow(t, env, sb.ID, "recent"); row.State != store.ToolCallRunning {
-		t.Errorf("the row ended within the margin: %+v", row)
-	}
-	if x := answer(ch, 3*time.Second); x.info.State != CallInterrupted {
+	if x := answer(callAsync(bg, b, sb, ToolBash, args, "recent", nil), 3*time.Second); x.info.State != CallInterrupted {
 		t.Errorf("the recent call: %+v", x)
+	}
+	var after float64
+	if err := env.DB.Pool.QueryRow(bg, `SELECT extract(epoch FROM finished_at - lease_until)::float8 FROM tool_calls
+		WHERE sandbox_id = $1 AND call_key = $2`, sb.ID.String(), "recent").Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after < (600 * time.Millisecond).Seconds() {
+		t.Errorf("the waiter ended the recent row %.3f s after its lease ran out, within the margin of a lease (0.6 s)", after)
 	}
 	if n := p.n.Load(); n != 0 {
 		t.Errorf("%d Execs", n)
@@ -276,32 +314,68 @@ func TestWaiterExpires(t *testing.T) {
 }
 
 // WaitCall reads a call's record, waiting for its end while it runs, here
-// or on another instance.
+// or on another instance: a wait of 0 or less answers while the call runs,
+// a call that ends within the wait answers at its end (a remote one woken
+// by ferun_call), and a wait that passes answers running, no sooner.
 func TestWaitCall(t *testing.T) {
 	env := toolstest.New(t, toolstest.Options{})
 	a, _ := twoRunners(env)
+	// a reads a remote row only when ferun_call names it.
+	a.k.poll = time.Hour
 	startRun(t, a)
 	sb := env.NewSandbox()
 	p := probeExec(env, "out\n")
 	args := `{"command":"x"}`
 
+	type answered struct {
+		rec  CallRecord
+		err  error
+		took time.Duration
+	}
+	waitCall := func(key string, wait time.Duration) chan answered {
+		ch := make(chan answered, 1)
+		go func() {
+			start := time.Now()
+			rec, err := a.WaitCall(bg, sb.ID, key, wait)
+			ch <- answered{rec, err, time.Since(start)}
+		}()
+		return ch
+	}
+	got := func(ch chan answered) answered {
+		t.Helper()
+		select {
+		case x := <-ch:
+			return x
+		case <-time.After(10 * time.Second):
+			t.Fatal("WaitCall did not answer within 10 s")
+		}
+		return answered{}
+	}
+	// waiting waits until WaitCall waits for the call (attach).
+	waiting := func() {
+		t.Helper()
+		waitFor(t, "WaitCall to wait", func() bool {
+			a.k.mu.Lock()
+			defer a.k.mu.Unlock()
+			return a.k.waiters[sb.ID] == 1
+		})
+	}
+
 	starter := callAsync(bg, a, sb, ToolBash, args, "w", nil)
 	waitN(t, p.started, 1)
-	start := time.Now()
-	rec, err := a.WaitCall(bg, sb.ID, "w", 0)
-	if err != nil || rec.State != CallRunning || rec.Key != "w" || rec.Tool != ToolBash || rec.Instance != "i1" ||
-		rec.StartedAt.IsZero() || time.Since(start) > 200*time.Millisecond {
-		t.Errorf("wait 0: %+v %v after %s", rec, err, time.Since(start))
+	// The call runs until p.release: running is an answer that did not wait
+	// for its end.
+	if x := got(waitCall("w", 0)); x.err != nil || x.rec.State != CallRunning || x.rec.Key != "w" ||
+		x.rec.Tool != ToolBash || x.rec.Instance != "i1" || x.rec.StartedAt.IsZero() {
+		t.Errorf("wait 0: %+v %v", x.rec, x.err)
 	}
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		close(p.release)
-	}()
-	start = time.Now()
-	rec, err = a.WaitCall(bg, sb.ID, "w", 5*time.Second)
-	if err != nil || rec.State != CallDone || rec.Result.Text != "out\n" || rec.FinishedAt.IsZero() || rec.Err != "" ||
-		time.Since(start) > 4*time.Second {
-		t.Errorf("wait 5 s: %+v %v after %s", rec, err, time.Since(start))
+	// Within a wait of a minute, the call's end is the answer.
+	ch := waitCall("w", maxRecordWait)
+	waiting()
+	close(p.release)
+	if x := got(ch); x.err != nil || x.rec.State != CallDone || x.rec.Result.Text != "out\n" || x.rec.FinishedAt.IsZero() ||
+		x.rec.Err != "" {
+		t.Errorf("wait for the end: %+v %v after %s", x.rec, x.err, x.took)
 	}
 	await(t, starter)
 
@@ -312,29 +386,26 @@ func TestWaitCall(t *testing.T) {
 		t.Errorf("a bad key: %v", err)
 	}
 
+	// A remote call that runs on for a minute: a wait passes, and no sooner.
 	foreignRow(t, env, sb, "remote", args, true, time.Minute)
-	start = time.Now()
-	rec, err = a.WaitCall(bg, sb.ID, "remote", 300*time.Millisecond)
-	elapsed := time.Since(start)
-	if err != nil || rec.State != CallRunning || rec.Instance != "i9" || elapsed < 250*time.Millisecond || elapsed > 2*time.Second {
-		t.Errorf("a remote running call: %+v %v after %s", rec, err, elapsed)
+	const wait = 300 * time.Millisecond
+	if x := got(waitCall("remote", wait)); x.err != nil || x.rec.State != CallRunning || x.rec.Instance != "i9" ||
+		x.took < wait {
+		t.Errorf("a remote running call: %+v %v after %s, want running after %s at the earliest", x.rec, x.err, x.took, wait)
 	}
-	// A negative wait does not wait.
-	start = time.Now()
-	if rec, err := a.WaitCall(bg, sb.ID, "remote", -time.Second); err != nil || rec.State != CallRunning ||
-		time.Since(start) > 200*time.Millisecond {
-		t.Errorf("a negative wait: %+v %v after %s", rec, err, time.Since(start))
+	// A negative wait does not wait: running.
+	if x := got(waitCall("remote", -time.Second)); x.err != nil || x.rec.State != CallRunning {
+		t.Errorf("a negative wait: %+v %v", x.rec, x.err)
 	}
 	// A remote call that ends while the record is waited for.
 	row := callRow(t, env, sb.ID, "remote")
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		_, _ = env.Store.FinishToolCall(bg, row.ID, store.ToolCallOutcome{State: store.ToolCallDone, Output: []byte("there")})
-	}()
-	start = time.Now()
-	rec, err = a.WaitCall(bg, sb.ID, "remote", 5*time.Second)
-	if err != nil || rec.State != CallDone || rec.Result.Text != "there" || time.Since(start) > 3*time.Second {
-		t.Errorf("a remote call that ends: %+v %v after %s", rec, err, time.Since(start))
+	ch = waitCall("remote", maxRecordWait)
+	waiting()
+	if _, err := env.Store.FinishToolCall(bg, row.ID, store.ToolCallOutcome{State: store.ToolCallDone, Output: []byte("there")}); err != nil {
+		t.Fatal(err)
+	}
+	if x := got(ch); x.err != nil || x.rec.State != CallDone || x.rec.Result.Text != "there" {
+		t.Errorf("a remote call that ends: %+v %v after %s", x.rec, x.err, x.took)
 	}
 }
 

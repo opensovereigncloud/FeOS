@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -213,25 +214,119 @@ func (h *harness) failNextOp(before func()) {
 	}
 }
 
-// settle waits until the nodes' events are acknowledged and their syncs
+// settle waits until the nodes' events reached the engines and the syncs
+// and tombstone runs of the sandbox that they and the ended ops asked for
 // ran, and syncs the sandbox once more: nothing from earlier ops arrives
-// after it.
+// after it. Ops still in flight are not waited for.
 func (h *harness) settle(id podid.ID) {
 	h.t.Helper()
-	eventually(h.t, 10*time.Second, "events acknowledged", func() bool {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		for _, n := range h.nodes {
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		h.eventsHandedOver(time.Until(deadline))
+		if !h.syncPending(id) {
+			break
+		}
+		// What runs may make more events: wait for it, then look again.
+		eventually(h.t, time.Until(deadline), "the syncs and tombstone runs of sandbox "+id.String(), func() bool {
+			return !h.syncPending(id)
+		})
+	}
+	if err := h.eng().Sync(bg, id); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// eventsHandedOver waits until every event that the nodes sent so far
+// reached an engine. Fleet takes a node's batches one at a time and hands
+// a batch's pod events to the engine (PodChanged) after its ack, before it
+// reads the next batch: a marker acknowledged after another acknowledged
+// marker comes after the PodChanged of every event before the first. A
+// node that no instance is connected to gets no marker; its events must
+// be acknowledged all the same.
+func (h *harness) eventsHandedOver(within time.Duration) {
+	h.t.Helper()
+	h.mu.Lock()
+	nodes := make(map[string]*testnode.Node, len(h.nodes))
+	maps.Copy(nodes, h.nodes)
+	h.mu.Unlock()
+	acked := func() bool {
+		for _, n := range nodes {
 			if n.EventsPending() > 0 {
 				return false
 			}
 		}
 		return true
-	})
-	time.Sleep(200 * time.Millisecond)
-	if err := h.eng().Sync(bg, id); err != nil {
-		h.t.Fatal(err)
 	}
+	for range 2 {
+		for name, n := range nodes {
+			if h.connected(name) {
+				n.Publish(settleMarker())
+			}
+		}
+		eventually(h.t, within, "events acknowledged", acked)
+	}
+}
+
+// settleMarker is the event that settle publishes: fleet stores it as an
+// activity row and does nothing else with it.
+func settleMarker() *fleetv1.Event {
+	return &fleetv1.Event{Body: &fleetv1.Event_Node{Node: &fleetv1.NodeEvent{Kind: "test_settle"}}}
+}
+
+// connected reports whether a running instance is connected to node.
+func (h *harness) connected(node string) bool {
+	for _, in := range h.ins {
+		if !in.eng.ended() && in.srv.Connected(node) {
+			return true
+		}
+	}
+	return false
+}
+
+// syncPending reports whether an engine that runs still has work of the
+// sandbox to do: a sync running or queued, a sync deferred behind an op
+// that has ended (the next look at the deferred runs it), or a run of a
+// tombstone of its pod.
+func (h *harness) syncPending(id podid.ID) bool {
+	h.t.Helper()
+	for _, in := range h.ins {
+		e := in.eng
+		if e.ended() {
+			continue
+		}
+		e.syncs.mu.Lock()
+		_, syncing := e.syncs.m[id]
+		e.syncs.mu.Unlock()
+		e.tombsMu.Lock()
+		tombs := false
+		for k := range e.tombs {
+			tombs = tombs || k.PodID == id
+		}
+		e.tombsMu.Unlock()
+		e.mu.Lock()
+		_, deferred := e.deferred[id]
+		e.mu.Unlock()
+		if syncing || tombs {
+			return true
+		}
+		if deferred {
+			row, err := h.st.GetSandbox(bg, id)
+			if err != nil && !errors.Is(err, model.ErrNotFound) {
+				h.t.Fatal(err)
+			}
+			if err != nil || row.Op == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ended reports whether the engine's Run ended: it runs nothing more.
+func (e *Engine) ended() bool {
+	e.bgMu.Lock()
+	defer e.bgMu.Unlock()
+	return e.bgDone
 }
 
 // eng is the first instance's engine.
@@ -518,11 +613,12 @@ func (h *harness) gate(node, method string) (arrived <-chan struct{}, release fu
 	return in, func() { once.Do(func() { close(out) }) }
 }
 
-// holdPodReads holds every GetPod and ListPods of node until release (or
-// until the call's ctx ends): meanwhile no sync or reconcile observes the
-// node's pods, so a state that they resolve (unknown) can be read before
-// they do. The test's end releases them.
-func (h *harness) holdPodReads(node string) (release func()) {
+// holdPodReads holds every ListPods of node, and its GetPods of pods (of
+// every pod when none is named), until release (or until the call's ctx
+// ends): meanwhile no sync or reconcile observes those pods, so a state
+// that they resolve (unknown) can be read before they do. The test's end
+// releases them.
+func (h *harness) holdPodReads(node string, pods ...podid.ID) (release func()) {
 	out := make(chan struct{})
 	hold := func(ctx context.Context, _ string, _ any) error {
 		select {
@@ -532,8 +628,17 @@ func (h *harness) holdPodReads(node string) (release func()) {
 			return status.FromContextError(ctx.Err()).Err()
 		}
 	}
+	getPod := hold
+	if len(pods) > 0 {
+		getPod = func(ctx context.Context, method string, req any) error {
+			if r, ok := req.(*podv1.GetPodRequest); ok && !slices.Contains(pods, podid.ID(r.GetPodId())) {
+				return nil
+			}
+			return hold(ctx, method, req)
+		}
+	}
 	s := h.node(node).Script()
-	s.SetHook(podv1.PodService_GetPod_FullMethodName, hold)
+	s.SetHook(podv1.PodService_GetPod_FullMethodName, getPod)
 	s.SetHook(podv1.PodService_ListPods_FullMethodName, hold)
 	var once sync.Once
 	release = func() {
@@ -617,7 +722,8 @@ func (c *calls) hibernateRequests() []*podv1.HibernatePodRequest {
 }
 
 // pausedLong makes a running sandbox on node, paused an hour ago: a
-// hibernate-after's recheck passes.
+// hibernate-after's recheck passes. The syncs of the create's and the
+// pause's pod events have run: none comes after it.
 func (h *harness) pausedLong(node string) store.Sandbox {
 	h.t.Helper()
 	sb := h.running(512)
@@ -625,6 +731,7 @@ func (h *harness) pausedLong(node string) store.Sandbox {
 		h.t.Fatalf("placed on %s, not %s", sb.Node, node)
 	}
 	h.startOp(sb.ID, OpIntent{Kind: OpPause, Trigger: TriggerExplicit, Target: node})
+	h.settle(sb.ID)
 	h.exec("UPDATE sandboxes SET paused_at = now() - interval '1 hour' WHERE id = $1", sb.ID)
 	return h.row(sb.ID)
 }

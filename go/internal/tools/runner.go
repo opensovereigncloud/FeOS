@@ -117,7 +117,7 @@ func NewRunner(s Sandboxes, conns nodelink.Conns, rec *activity.Recorder, d *db.
 		execs:          map[podid.ID]int{},
 	}
 	r.k = keyedState{
-		lease: config.CallLease, retention: config.CallRetention, cap: callCap, waiterCap: waiterCap,
+		lease: config.CallLease, retention: config.CallRetention, cap: callCap, waiterCap: waiterCap, poll: callPoll,
 		budget: func(timeout time.Duration) time.Duration {
 			return config.PreparationBudget + timeout + callSlack
 		},

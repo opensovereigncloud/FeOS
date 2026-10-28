@@ -278,6 +278,9 @@ type keyedState struct {
 	leader           Leader
 	cap, waiterCap   int
 	budget           func(timeout time.Duration) time.Duration
+	// poll is how often a request that waits for another run's row reads
+	// it without a notification: callPoll; tests replace it.
+	poll time.Duration
 	// bg ends every call with an id: Run's end (errRunnerStopped) and the
 	// drain's cut (errStopping) cancel it.
 	bg       context.Context
@@ -696,7 +699,7 @@ func (r *Runner) awaitRow(ctx context.Context, ref callRef, row store.ToolCall) 
 		ended = cur
 		return true, false, nil
 	}
-	err := r.d.WaitFor(wctx, db.ChanCall, row.ID.String(), callPoll, func(ctx context.Context) (bool, error) {
+	err := r.d.WaitFor(wctx, db.ChanCall, row.ID.String(), r.k.poll, func(ctx context.Context) (bool, error) {
 		done, running, err := look(ctx)
 		if done || err != nil || !running || !r.mayExpire(lease) {
 			return done, err

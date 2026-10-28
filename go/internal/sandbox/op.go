@@ -475,7 +475,9 @@ func (r *runner) Stop(ctx context.Context) error {
 }
 
 // run is an op's goroutine: call and settle, then finish (or roll back
-// when nothing was sent).
+// when nothing was sent). What the op leaves behind, the processing of
+// its tombstones and the sync it asks for, has begun when its waiters
+// return; neither waits.
 func (r *runner) run(starter context.Context, h *OpHandle) {
 	defer r.wg.Done()
 	ctx, cancel := r.e.detached(starter, h.deadline)
@@ -498,11 +500,11 @@ func (r *runner) run(starter context.Context, h *OpHandle) {
 	}
 	r.mu.Unlock()
 	h.res = result
-	close(h.done)
 	r.e.processAfterCommit(after)
 	if dirty || after.sync {
 		r.e.requestSync(h.id)
 	}
+	close(h.done)
 }
 
 // callResult is what an op's node calls answered.

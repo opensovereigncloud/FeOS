@@ -656,6 +656,11 @@ func TestOrphanedOps(t *testing.T) {
 	}
 	waitClosed(t, arrived, "d's pause at its call")
 	running := h.row(d.ID)
+	// c's release is read before anything resolves it: a sync of c, or a
+	// reconcile of n1, which fleet asks for once the node's inventory hash
+	// has differed from the registry's (c's op is in its row) for
+	// mismatchSettle.
+	releaseReads := h.holdPodReads("n1", c.ID)
 	if err := e.orphans(bg); err != nil {
 		t.Fatal(err)
 	}
@@ -672,6 +677,7 @@ func TestOrphanedOps(t *testing.T) {
 	if rc.Op != "" || rc.Node != "n1" || rc.StatusDescription != "op pause of instance i1 was abandoned" {
 		t.Fatalf("released row %+v", rc)
 	}
+	releaseReads()
 }
 
 // An orphan is found however many ops of the instance run before it in

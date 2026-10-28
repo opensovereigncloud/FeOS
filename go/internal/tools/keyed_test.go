@@ -1196,28 +1196,35 @@ func TestKeyedAbandonHoldsKey(t *testing.T) {
 	}
 }
 
-// A row that another writer ended while the call ran: the renewal misses
-// it and cancels the call; its write is refused, and the starter gets the
-// stored row.
+// A row that another writer ended while the call ran: the next renewal
+// misses it and cancels the call; its write is refused, and the starter
+// gets the stored row.
 func TestKeyedRecordLost(t *testing.T) {
 	env := toolstest.New(t, toolstest.Options{})
 	r := newRunner(env)
-	r.SetCallConfig(CallConfig{Lease: 600 * time.Millisecond})
 	startRun(t, r)
 	sb := env.NewSandbox()
 	p := probeExec(env, "")
 	started := callAsync(bg, r, sb, ToolBash, `{"command":"x"}`, "l", nil)
 	waitN(t, p.started, 1)
 	row := callRow(t, env, sb.ID, "l")
+	r.k.mu.Lock()
+	kc := r.k.calls[callRef{sandbox: sb.ID, key: "l"}]
+	r.k.mu.Unlock()
+	if kc == nil {
+		t.Fatal("the call does not run")
+	}
 	if _, err := env.DB.Pool.Exec(bg, `UPDATE tool_calls SET state = 'interrupted', finished_at = now(), error = 'x'
 		WHERE id = $1`, row.ID); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-p.cancelled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the node's exec was not cancelled after the row ended")
+	// The renewal after the row's end (here the test's; the loop's comes
+	// every third of a lease) cancels the call.
+	r.renewCallsOnce(bg, r.lease())
+	if cause := context.Cause(kc.ctx); !errors.Is(cause, errCallLost) {
+		t.Fatalf("the call after the renewal: %v, want %v", cause, errCallLost)
 	}
+	waitN(t, p.cancelled, 1)
 	a := await(t, started)
 	if a.err == nil || a.err.Error() != "x" || a.info.State != CallInterrupted || a.info.Replay {
 		t.Errorf("the starter %+v", a)
