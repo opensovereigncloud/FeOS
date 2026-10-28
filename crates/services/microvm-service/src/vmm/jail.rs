@@ -429,20 +429,22 @@ fn place(root: &Path, link: &Link, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// Removes a file from the chroot, unmounting it first if it is bind
-/// mounted from another filesystem.
+/// Removes a file from the chroot, unmounting it first if `place` bind
+/// mounted it. A bind mount need not come from another filesystem:
+/// hard_link fails with EXDEV across mounts of one filesystem too (the
+/// feos-node pod's /var/lib/feos/dist, ADR 0020), so the device numbers
+/// cannot tell, and the unmount is always tried. EINVAL: not a mount
+/// point; EPERM: not root, which a test is, and a mount then fails the
+/// removal with EBUSY.
 fn unlink(target: &Path) -> io::Result<()> {
-    let meta = match fs::symlink_metadata(target) {
-        Ok(meta) => meta,
+    match fs::symlink_metadata(target) {
+        Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
-    };
-    let parent = target.parent().unwrap_or(Path::new("/"));
-    if meta.dev() != fs::metadata(parent)?.dev() {
-        match umount2(target, MntFlags::MNT_DETACH) {
-            Ok(()) | Err(nix::Error::EINVAL) => {}
-            Err(e) => return Err(e.into()),
-        }
+    }
+    match umount2(target, MntFlags::MNT_DETACH) {
+        Ok(()) | Err(nix::Error::EINVAL) | Err(nix::Error::EPERM) => {}
+        Err(e) => return Err(e.into()),
     }
     fs::remove_file(target)
 }
@@ -608,5 +610,57 @@ mod tests {
         unlink(&root.join("vmlinuz")).unwrap();
         assert!(!root.join("vmlinuz").exists());
         assert!(source.exists());
+    }
+
+    /// Needs root and a mount namespace of its own:
+    /// `sudo unshare -m cargo test -p microvm-service -- --ignored bind_mounted`.
+    /// The source sits under a bind mount of the chroot's own filesystem,
+    /// as /var/lib/feos/dist does in the feos-node pod: hard_link fails
+    /// with EXDEV, place bind mounts, and the next start must unmount it
+    /// although the devices are the same.
+    #[test]
+    #[ignore = "needs root and a mount namespace (unshare -m)"]
+    fn a_file_bind_mounted_from_the_same_filesystem_is_placed_again() {
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let dist = dir.path().join("dist");
+        let bound = dir.path().join("bound");
+        for d in [&root, &dist, &bound] {
+            fs::create_dir(d).unwrap();
+        }
+        fs::write(dist.join("vmlinuz"), b"kernel").unwrap();
+        mount(
+            Some(&dist),
+            &bound,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .unwrap();
+        let link = Link {
+            source: bound.join("vmlinuz"),
+            name: "vmlinuz".to_string(),
+            disk: false,
+        };
+        place(&root, &link, 0).unwrap();
+        assert_eq!(
+            fs::metadata(root.join("vmlinuz")).unwrap().dev(),
+            fs::metadata(&root).unwrap().dev(),
+            "the bind mount comes from the chroot's own filesystem"
+        );
+        // Again, as every start does: EBUSY before the fix.
+        place(&root, &link, 0).unwrap();
+        assert_eq!(fs::read(root.join("vmlinuz")).unwrap(), b"kernel");
+        unlink(&root.join("vmlinuz")).unwrap();
+        assert!(!root.join("vmlinuz").exists());
+        umount2(&bound, MntFlags::MNT_DETACH).unwrap();
     }
 }
