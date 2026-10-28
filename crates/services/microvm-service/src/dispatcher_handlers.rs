@@ -664,6 +664,7 @@ pub(crate) async fn check_and_cleanup_vms(
 
         if alive {
             info!("VmDispatcher (Sanity Check): Found running VM {vm_id} from previous session. Starting health monitor.");
+            hypervisor.adopt(&vm_id).await;
             let cancel_bus = healthcheck_cancel_bus.subscribe();
             worker::start_healthcheck_monitor(
                 vm_id,

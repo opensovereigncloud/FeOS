@@ -107,6 +107,11 @@ pub trait Hypervisor: Send + Sync {
         Ok(())
     }
 
+    /// Takes on a VM whose VMM process outlived the service that ran it,
+    /// when this service starts: finishes what that service left of it,
+    /// such as a snapshot that its suspend gave up on and its VMM writes.
+    async fn adopt(&self, _vm_id: &str) {}
+
     /// Restores a suspended VM in a new VMM process and resumes it, or with
     /// `remote` a created one from a snapshot written elsewhere, whose
     /// memory a userfaultfd handler serves; returns the process's pid. The

@@ -512,10 +512,20 @@ impl Pods {
     }
 
     /// Writes the running pod to a snapshot; returns the size of its memory.
+    /// It runs in a task of its own that holds the pod's lock: a caller that
+    /// goes away, as one whose deadline passed, leaves it running to its
+    /// end. Cut off between the microVM's suspend and the pod's record, it
+    /// would leave a suspended microVM under a pod that runs.
     pub async fn suspend(&self, pod_id: &str) -> Result<u64, Status> {
-        let _lock = self.lock(pod_id).await?;
-        self.expect_state(pod_id, PodState::Running)?;
-        self.suspend_locked(pod_id).await
+        let pods = self.clone();
+        let pod_id = pod_id.to_string();
+        tokio::spawn(async move {
+            let _lock = pods.lock(&pod_id).await?;
+            pods.expect_state(&pod_id, PodState::Running)?;
+            pods.suspend_locked(&pod_id).await
+        })
+        .await
+        .unwrap_or_else(|e| Err(Status::internal(format!("the suspend ended: {e}"))))
     }
 
     /// `suspend`, under the pod's lock. The snapshot holds what the guest

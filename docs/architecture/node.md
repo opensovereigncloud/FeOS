@@ -241,7 +241,10 @@ every call with any other ID fails with `INVALID_ARGUMENT`.
   are adopted, with what they wrote.
 - **Suspend** and **Resume** suspend and resume the microVM, with
   `purge_guest`; the containers come back as they were. The disk stops
-  with the microVM and starts again before the resume.
+  with the microVM and starts again before the resume. A suspend runs in
+  a task of its own, which holds the pod's lock: a call that goes away,
+  as one past its deadline, leaves it running to its end, so that the
+  pod's record follows its microVM.
 - **Hibernate** and **Restore** take a pod into the object store and
   bring it back, on this node or another, with its memory or on its disk
   alone ([disk.md](disk.md#hibernation)). A hibernated pod is `HIBERNATED`,
@@ -691,7 +694,10 @@ deletion undoes.
   the suspend at once (`UNAVAILABLE`). Firecracker cannot stop in the
   middle of one and writes on; its files stay alone, and the microVM
   refuses suspends and shutdowns as busy. Once Firecracker is done, the
-  microVM resumes if it ran, and the snapshot is discarded. One whose
+  microVM resumes if it ran, and the snapshot is discarded. A marker in
+  the jail, `late-snapshot`, keeps this across a restart of `feosd`: the
+  next one finds it when it takes the microVM on, and waits for
+  Firecracker to answer again before it does the same. One whose
   memory file does not grow for five minutes, as when its memory's
   userfaultfd handler is gone, ends Firecracker: the microVM crashed. The
   first suspend after a restore from another node reads all of the memory
