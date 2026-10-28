@@ -35,8 +35,13 @@ jobs:
         flavor: |
           latest=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
 
-    - name: Install Protobuf Compiler
-      run: sudo apt-get update && sudo apt-get install protobuf-compiler -y
+    - name: Install Build Dependencies
+      # As the release workflow's: the host image carries the guest, whose
+      # kernel builds natively.
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler musl-tools cpio zstd file \
+          flex bison bc libelf-dev libssl-dev
 
     - name: Setup ORAS
       uses: oras-project/setup-oras@v1
@@ -66,17 +71,14 @@ jobs:
         restore-keys: ${{ runner.os }}-cargo-
 
     - name: Run Tests
-      env:
-        RUST_BACKTRACE: 1
-        SUDO_ENV_VARS: "PATH=$PATH:$HOME/.cargo/bin CARGO_HOME=$HOME/.cargo"
+      # The integration tests need root. sudo keeps no environment (the
+      # runner's sudo ignores -E), so the toolchain's is passed on.
       run: |
-        sudo -E bash -c ' \
-          export PATH="$HOME/.cargo/bin:$PATH"; \
-          export CARGO_HOME="$HOME/.cargo"; \
-          export RUSTUP_HOME="$HOME/.rustup"; \
-          make test; \
-          make clean
-        '
+        sudo env "PATH=$HOME/.cargo/bin:$PATH" "CARGO_HOME=$HOME/.cargo" "RUSTUP_HOME=$HOME/.rustup" \
+          RUST_BACKTRACE=1 sh -c 'make test && make clean'
+        # What root unpacked into the registry, the builds below read as the
+        # runner's user.
+        sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo"
 
     - name: Build build-container
       run: make build-container
@@ -127,11 +129,16 @@ jobs:
         sudo losetup -d "$LOOP_DEVICE"
         sudo rmdir "$MOUNT_DIR"
 
-    - name: Push Image with ORAS (Version Tag)
+    - name: Push Image with ORAS
+      # The metadata's tags are references, one a line: oras takes the
+      # first and the others' tags after commas.
+      env:
+        TAGS: ${{ steps.meta.outputs.tags }}
       run: |
-        ROOTFS_IMG=${{ env.ROOTFS_IMG }}
-        oras push ${{ steps.meta.outputs.tags }} \
-        $ROOTFS_IMG:application/io.gardenlinux.squashfs \
-        target/initramfs.zst:application/io.gardenlinux.initrd \
-        target/kernel/vmlinuz:application/io.gardenlinux.kernel \
-        --config config.json:application/vnd.unknown.config.v1+json
+        first=$(printf '%s\n' "$TAGS" | sed -n 1p)
+        others=$(printf '%s\n' "$TAGS" | sed -n '2,$s/.*://p' | paste -sd, -)
+        oras push "$first${others:+,$others}" \
+          "$ROOTFS_IMG:application/io.gardenlinux.squashfs" \
+          target/initramfs.zst:application/io.gardenlinux.initrd \
+          target/kernel/vmlinuz:application/io.gardenlinux.kernel \
+          --config config.json:application/vnd.unknown.config.v1+json
