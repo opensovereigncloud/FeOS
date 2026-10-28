@@ -19,6 +19,10 @@
 //! Firecracker writes, can stall the whole runtime it belongs to: the
 //! reports, the heartbeat, would stop, and the connections' pings would go
 //! unanswered, and the control plane would count the node down.
+//!
+//! A feosd that stands still for longer than `STALL_LIMIT`, though, takes
+//! no calls either: the node stops reporting until it moves again, and the
+//! control plane counts it down.
 
 mod calls;
 mod events;
@@ -43,7 +47,6 @@ use log::{error, info, warn};
 use node::Nodes;
 use rustls::crypto::CryptoProvider;
 use rustls::ClientConfig;
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -51,9 +54,14 @@ use telemetry::Collector;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{sleep, sleep_until, timeout, Instant};
+use tonic::codegen::http::{Request, Response};
+use tonic::codegen::{Bytes, Service, StdError};
+use tonic::service::Routes;
+use tonic::transport::server::Router;
 use tonic::transport::Channel;
 use tonic::Code;
+use tower::Layer;
 use uplink::{describe, Link, Uplink};
 
 /// The join token, `feosd --join-token-file`; read only while the node has
@@ -69,9 +77,14 @@ const REPORT_DEADLINE: Duration = Duration::from_secs(3);
 const JOIN_DEADLINE: Duration = Duration::from_secs(10);
 const RENEW_DEADLINE: Duration = Duration::from_secs(10);
 const JOIN_MESH_DEADLINE: Duration = Duration::from_secs(10);
-/// How long feosd may take to take the mesh's answer, which the next report
-/// waits for; an answer not taken in time is asked for again.
+/// How long feosd may take to take the mesh's answer before that is
+/// logged. The answer is asked for again once feosd took it, or failed to.
 const TAKE_MESH_DEADLINE: Duration = Duration::from_secs(5);
+/// How long feosd's runtime may not move, or its pods not answer, before
+/// the node stops reporting (`Config::stall_limit`): longer than the
+/// stalls that feosd outlasts, such as an unlink(2) that waits a minute
+/// for Firecracker, and well short of what the control plane's calls wait.
+pub const STALL_LIMIT: Duration = Duration::from_secs(90);
 /// The control plane's threads: TLS, HTTP/2 and the reports of a handful of
 /// connections.
 const THREADS: usize = 2;
@@ -106,6 +119,9 @@ pub struct Config {
     pub mesh_address: Option<std::net::IpAddr>,
     /// feosd's version.
     pub version: String,
+    /// How long feosd may stand still before the node stops reporting:
+    /// `STALL_LIMIT`.
+    pub stall_limit: Duration,
 }
 
 impl Config {
@@ -164,6 +180,7 @@ impl Config {
             pod_prefix: String::new(),
             mesh_address: None,
             version: String::new(),
+            stall_limit: STALL_LIMIT,
         })
     }
 }
@@ -184,15 +201,30 @@ impl Fleet {
         &self.events
     }
 
-    /// Runs `future` on the control plane's threads: the server of the
-    /// node connections (`server`), so that they answer the control plane
-    /// whatever feosd's own threads do.
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    /// Serves `router`, made from `server`, on the node connections, on the
+    /// control plane's threads: the connections, their TLS and HTTP/2 and
+    /// their pings, so that they answer the control plane whatever feosd's
+    /// own threads do. The calls run where `server` says. It serves until
+    /// feosd ends, whatever becomes of the dialers.
+    pub fn serve<L, ResBody>(
+        &self,
+        router: Router<L>,
+        incoming: Incoming,
+    ) -> JoinHandle<Result<(), tonic::transport::Error>>
     where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
+        L: Layer<Routes> + Send + 'static,
+        L::Service: Service<Request<tonic::body::Body>, Response = Response<ResBody>>
+            + Clone
+            + Send
+            + 'static,
+        <L::Service as Service<Request<tonic::body::Body>>>::Future: Send + 'static,
+        <L::Service as Service<Request<tonic::body::Body>>>::Error: Into<StdError> + Send,
+        ResBody: hyper::body::Body<Data = Bytes> + Send + 'static,
+        ResBody::Error: Into<StdError>,
     {
-        self.runtime.spawn(future)
+        let incoming = tokio_stream::StreamExt::chain(incoming, tokio_stream::pending());
+        self.runtime
+            .spawn(async move { router.serve_with_incoming(incoming).await })
     }
 
     /// Tells the control plane that feosd stops, for a restart or an
@@ -241,8 +273,12 @@ fn runtime() -> Result<Handle, String> {
 /// Starts the node's side of the control plane on threads of its own: the
 /// join if the node has not joined, then the uplink and the node
 /// connections, which the caller serves its API on (`server`,
-/// `Fleet::spawn`).
+/// `Fleet::serve`). It is called on feosd's runtime, which the reports
+/// watch (`Config::stall_limit`).
 pub fn start<I: Inventory>(config: Config, inventory: I) -> Result<(Fleet, Incoming), String> {
+    if Handle::try_current().is_err() {
+        return Err("the control plane's side starts on feosd's runtime".into());
+    }
     let runtime = runtime()?;
     let link = Arc::new(Link::new(&config.name)?);
     let start_id = uuid::Uuid::new_v4().to_string();
@@ -251,7 +287,13 @@ pub fn start<I: Inventory>(config: Config, inventory: I) -> Result<(Fleet, Incom
     let (nodes, incoming) = Nodes::new(link.name.clone());
     let (uplink, published) = watch::channel(None);
     runtime.spawn(events::publish(events.clone(), published));
-    let collector = Collector::new(inventory, &start_id, &config.version, &config.pod_prefix);
+    let collector = Collector::new(
+        inventory,
+        &start_id,
+        &config.version,
+        &config.pod_prefix,
+        config.stall_limit,
+    );
     info!(
         "Fleet: The control plane is at {} as {}, trust domain {}",
         config.address, config.name, config.trust_domain
@@ -312,7 +354,8 @@ enum JoinError {
 impl<I: Inventory> Runner<I> {
     async fn run(mut self) {
         let dir = loop {
-            match NodeDir::open(&self.config.node_dir) {
+            let path = self.config.node_dir.clone();
+            match blocking(move || NodeDir::open(&path)).await {
                 Ok(dir) => break dir,
                 Err(e) => {
                     error!(
@@ -337,14 +380,16 @@ impl<I: Inventory> Runner<I> {
                          join again with a new join token in {}",
                         self.config.join_token_file.display()
                     );
-                    match dir.set_aside() {
+                    let aside = dir.clone();
+                    match blocking(move || aside.set_aside()).await {
                         Ok(aside) => warn!(
                             "Fleet: The node's refused identity is kept in {}",
                             aside.display()
                         ),
                         Err(e) => error!("Fleet: Failed to set the node's identity aside: {e}"),
                     }
-                    refused = std::fs::read_to_string(&self.config.join_token_file).ok();
+                    let token = self.config.join_token_file.clone();
+                    refused = blocking(move || std::fs::read_to_string(token)).await.ok();
                 }
                 Outcome::Broken(message) => {
                     error!("Fleet: The node's identity does not work: {message}");
@@ -359,7 +404,8 @@ impl<I: Inventory> Runner<I> {
         let mut wait = JOIN_BACKOFF.0;
         let mut said = String::new();
         loop {
-            let error = match dir.load() {
+            let loaded = dir.clone();
+            let error = match blocking(move || loaded.load()).await {
                 Ok(Some(identity)) => return identity,
                 Ok(None) => match self.join(dir, refused.as_deref()).await {
                     Ok(identity) => return identity,
@@ -403,7 +449,8 @@ impl<I: Inventory> Runner<I> {
 
     async fn join(&self, dir: &NodeDir, refused: Option<&str>) -> Result<Identity, JoinError> {
         let file = self.config.join_token_file.display();
-        let text = match std::fs::read_to_string(&self.config.join_token_file) {
+        let token_file = self.config.join_token_file.clone();
+        let text = match blocking(move || std::fs::read_to_string(token_file)).await {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(JoinError::NoToken(format!(
@@ -425,7 +472,8 @@ impl<I: Inventory> Runner<I> {
             .parse()
             .map_err(|e| JoinError::Refused(text.clone(), format!("{file}: {e}")))?;
         let name = self.proposed_name().map_err(JoinError::Failed)?;
-        let key = dir.join_key().map_err(|e| {
+        let keyed = dir.clone();
+        let key = blocking(move || keyed.join_key()).await.map_err(|e| {
             JoinError::Failed(format!("the node's key in {}: {e}", dir.path().display()))
         })?;
         let csr = identity::csr(&key, &name).map_err(JoinError::Failed)?;
@@ -484,12 +532,15 @@ impl<I: Inventory> Runner<I> {
             &self.provider,
         )
         .map_err(|e| JoinError::Failed(format!("the control plane's answer: {e}")))?;
-        dir.store(&identity).map_err(|e| {
-            JoinError::Failed(format!(
-                "keeping the node's identity in {}: {e}",
-                dir.path().display()
-            ))
-        })?;
+        let kept = dir.clone();
+        let identity = blocking(move || kept.store(&identity).map(|()| identity))
+            .await
+            .map_err(|e| {
+                JoinError::Failed(format!(
+                    "keeping the node's identity in {}: {e}",
+                    dir.path().display()
+                ))
+            })?;
         info!(
             "Fleet: Joined the control plane as {}, with a certificate until {}",
             identity.state.spiffe_id, identity.state.not_after
@@ -599,7 +650,13 @@ impl<I: Inventory> Runner<I> {
         // The last JoinMesh the control plane answered: asked again when
         // the node's key or endpoint changes.
         let mut joined: Option<JoinMeshRequest> = None;
+        let mut taking: Option<Taking> = None;
+        // Whether the reports stopped, as feosd stands still.
+        let mut stalled = false;
         loop {
+            // The reports keep their rate, whatever their collection and
+            // the mesh take.
+            let cycle = Instant::now();
             if Utc::now() >= renew_at {
                 match self.renew(dir, &identity, &mut uplink).await {
                     Ok(renewed) => match self.configs(&renewed) {
@@ -637,6 +694,26 @@ impl<I: Inventory> Runner<I> {
                 }
             }
 
+            match (self.collector.stalled(), stalled) {
+                (Some(still), false) => {
+                    error!(
+                        "Fleet: feosd has stood still for {}s; the node stops reporting until \
+                         it moves again, so that the control plane counts it down",
+                        still.as_secs()
+                    );
+                    stalled = true;
+                }
+                (None, true) => {
+                    info!("Fleet: feosd moves again; the node reports again");
+                    stalled = false;
+                }
+                _ => {}
+            }
+            if stalled {
+                let until_renewal = (renew_at - Utc::now()).to_std().unwrap_or_default();
+                sleep_until(cycle + interval.min(until_renewal.max(Duration::from_secs(1)))).await;
+                continue;
+            }
             let report = self.collector.collect().await;
             let answer = uplink
                 .call("ReportTelemetry", REPORT_DEADLINE, |mut client| {
@@ -670,7 +747,9 @@ impl<I: Inventory> Runner<I> {
                         self.nodes.set(&targets);
                     }
                     uplink.set_targets(self.uplink_targets(&identity.state.instances));
-                    if let Err(outcome) = self.join_mesh(&mut uplink, &mut joined).await {
+                    if let Err(outcome) =
+                        self.join_mesh(&mut uplink, &mut joined, &mut taking).await
+                    {
                         return outcome;
                     }
                 }
@@ -681,19 +760,41 @@ impl<I: Inventory> Runner<I> {
                 Err(_) => {}
             }
             let until_renewal = (renew_at - Utc::now()).to_std().unwrap_or_default();
-            sleep(interval.min(until_renewal.max(Duration::from_secs(1)))).await;
+            sleep_until(cycle + interval.min(until_renewal.max(Duration::from_secs(1)))).await;
         }
     }
 
     /// Asks for the node's place on the cluster's mesh (ADR 0017) when it
     /// has not been answered for the node's key and endpoint, and hands the
-    /// answer to feosd. A node with a prefix of its network's sends no key:
-    /// it asks only whether the cluster is meshed.
+    /// answer to feosd, which takes it on its runtime. A node with a prefix
+    /// of its network's sends no key: it asks only whether the cluster is
+    /// meshed. While feosd takes an answer, `taking`, the report neither
+    /// waits for it nor asks again; the next one learns how it went.
     async fn join_mesh(
         &self,
         uplink: &mut Uplink,
         joined: &mut Option<JoinMeshRequest>,
+        taking: &mut Option<Taking>,
     ) -> Result<(), Outcome> {
+        if let Some(mut take) = taking.take() {
+            if !take.task.is_finished() {
+                if !take.said && take.since.elapsed() >= TAKE_MESH_DEADLINE {
+                    warn!(
+                        "Fleet: feosd has not taken the mesh's answer for {}s; it is asked \
+                         for again once it has",
+                        take.since.elapsed().as_secs()
+                    );
+                    take.said = true;
+                }
+                *taking = Some(take);
+                return Ok(());
+            }
+            match take.task.await {
+                Ok(Ok(())) => *joined = Some(take.request),
+                Ok(Err(e)) => error!("Fleet: The mesh's answer is not taken, asking again: {e}"),
+                Err(e) => error!("Fleet: Taking the mesh's answer ended: {e}; asking again"),
+            }
+        }
         let request = match self.collector.inventory().mesh_key() {
             Some((public_key, port)) => match self.mesh_endpoint(port).await {
                 Ok(endpoint) => JoinMeshRequest {
@@ -726,23 +827,18 @@ impl<I: Inventory> Runner<I> {
                         or_none(&answer.pod_network)
                     );
                 }
-                let taken = timeout(
-                    TAKE_MESH_DEADLINE,
-                    self.collector
-                        .inventory()
-                        .joined_mesh(answer.pod_network, answer.pod_prefix),
-                )
-                .await;
-                match taken {
-                    Ok(Ok(())) => *joined = Some(request),
-                    Ok(Err(e)) => {
-                        error!("Fleet: The mesh's answer is not taken, asking again: {e}")
-                    }
-                    Err(_) => warn!(
-                        "Fleet: The mesh's answer was not taken within {}s; asking again",
-                        TAKE_MESH_DEADLINE.as_secs()
-                    ),
-                }
+                let inventory = self.collector.inventory().clone();
+                let task = tokio::spawn(async move {
+                    inventory
+                        .joined_mesh(answer.pod_network, answer.pod_prefix)
+                        .await
+                });
+                *taking = Some(Taking {
+                    request,
+                    task,
+                    since: Instant::now(),
+                    said: false,
+                });
             }
             Err(status) if status.code() == Code::PermissionDenied => {
                 return Err(Outcome::Refused(status.message().to_string()))
@@ -830,6 +926,15 @@ impl<I: Inventory> Runner<I> {
                 ))
             })
     }
+}
+
+/// An answer of JoinMesh that feosd takes.
+struct Taking {
+    request: JoinMeshRequest,
+    task: JoinHandle<Result<(), String>>,
+    since: Instant,
+    /// Whether it was said that it takes long.
+    said: bool,
 }
 
 /// Runs `f` on the blocking pool: the node's files are written and synced,

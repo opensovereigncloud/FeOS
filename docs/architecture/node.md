@@ -199,10 +199,16 @@ does its answer's body; a call that the control plane resets is dropped
 there. A report waits a second at most for the pods and the installed
 versions, which may wait for the pods' records' lock, and reports them as
 they were when they do not answer; the mesh's answer is taken on `feosd`'s
-runtime, and asked for again when it is not taken within 5 s. A tokio
-runtime can stall as a whole while one of its threads blocks, such as on
-an unlink of a file that Firecracker still writes; the reports and the
-node connections go on all the same, and the node stays up.
+runtime, one at a time, and the report after learns whether it was taken
+or has to be asked for again. The reports keep their rate whatever their
+collection takes. A tokio runtime can stall as a whole while one of its
+threads blocks, such as on an unlink of a file that Firecracker still
+writes; the reports and the node connections go on all the same, and the
+node stays up. Not for ever: a task on `feosd`'s runtime ticks every
+second, and while it has not ticked for 90 s, or the pods have not
+answered for as long, the node sends no reports, so that the control
+plane counts it down and its sandboxes move rather than wait on calls
+that hang. It reports again once `feosd` moves.
 
 ## A pod
 

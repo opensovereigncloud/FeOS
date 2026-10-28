@@ -287,11 +287,9 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             match started {
                 // Never ends, whatever becomes of the dialers.
                 Some((fleet, incoming)) => {
-                    let incoming =
-                        tokio_stream::StreamExt::chain(incoming, tokio_stream::pending());
                     // On the control plane's threads, as the rest of it: the
                     // connections answer whatever feosd's own threads do.
-                    let serving = fleet.spawn(router.serve_with_incoming(incoming));
+                    let serving = fleet.serve(router, incoming);
                     let _ = slot.set(fleet);
                     serving
                         .await

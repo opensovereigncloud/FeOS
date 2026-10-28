@@ -551,23 +551,30 @@ impl Inventory for Node {
 /// Starts the node's side with the token in `dir`, serving `Volumes` on
 /// its node connections.
 fn node(address: &str, dir: &Path) -> fleet_client::Fleet {
-    node_with(address, dir, Node)
+    node_with(address, dir, Node, fleet_client::STALL_LIMIT)
 }
 
-/// `node` with another inventory. The node's API runs on the test's
-/// runtime, as feosd's does on feosd's.
-fn node_with<I: Inventory>(address: &str, dir: &Path, inventory: I) -> fleet_client::Fleet {
+/// `node` with another inventory and stall limit. The node's API runs on
+/// the test's runtime, as feosd's does on feosd's, and is served as feosd
+/// serves it.
+fn node_with<I: Inventory>(
+    address: &str,
+    dir: &Path,
+    inventory: I,
+    stall_limit: Duration,
+) -> fleet_client::Fleet {
     let mut config = Config::new(address, Some(NAME), TRUST_DOMAIN).unwrap();
     config.join_token_file = dir.join("join-token");
     config.node_dir = dir.join("node");
     config.node_name = Some(NODE.into());
     config.pod_prefix = "fd00:fe05:1::/64".into();
     config.version = "0.6.0".into();
+    config.stall_limit = stall_limit;
     let (fleet, incoming) = fleet_client::start(config, inventory).unwrap();
-    fleet.spawn(
+    fleet.serve(
         fleet_client::server(tokio::runtime::Handle::current())
-            .add_service(VolumeServiceServer::new(Volumes))
-            .serve_with_incoming(incoming),
+            .add_service(VolumeServiceServer::new(Volumes)),
+        incoming,
     );
     fleet
 }
@@ -801,8 +808,10 @@ impl Inventory for Gated {
 /// went out, the node connections' pings went unanswered, and the control
 /// plane counted the node down. The node's side runs on threads of its
 /// own: a blocked thread of feosd's runtime, which holds what the pods'
-/// read needs, stops neither the reports nor the node connections.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// read needs, stops neither the reports nor the node connections. The
+/// test's runtime, feosd's here, has the one thread: blocking it stalls it
+/// as a whole, its timers and its I/O, as the incident did.
+#[tokio::test(flavor = "current_thread")]
 async fn a_blocked_runtime_stops_neither_the_reports_nor_the_node_connections() {
     let plane = Elsewhere::new();
     let pki = Arc::new(Pki::new());
@@ -815,7 +824,12 @@ async fn a_blocked_runtime_stops_neither_the_reports_nor_the_node_connections() 
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
     let gate = Arc::new(Mutex::new(()));
-    let _fleet = node_with(&address, dir.path(), Gated(gate.clone()));
+    let _fleet = node_with(
+        &address,
+        dir.path(),
+        Gated(gate.clone()),
+        fleet_client::STALL_LIMIT,
+    );
 
     // Settled: renewed, reporting, and serving with the new certificate.
     wait_for(&seen, "reports with the renewed certificate", |seen| {
@@ -867,5 +881,57 @@ async fn a_blocked_runtime_stops_neither_the_reports_nor_the_node_connections() 
     assert_eq!(
         seen.node_connections, connections,
         "a node connection was lost and dialed again"
+    );
+}
+
+/// A feosd that stands still for longer than the stall limit takes no
+/// calls: the node stops reporting, so that the control plane counts it
+/// down, and reports again once feosd moves.
+#[tokio::test(flavor = "current_thread")]
+async fn a_runtime_stalled_past_the_limit_stops_the_reports_until_it_moves() {
+    let plane = Elsewhere::new();
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (token, address) = plane
+        .handle()
+        .spawn(control_plane(pki, seen.clone()))
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    let _fleet = node_with(&address, dir.path(), Node, Duration::from_secs(2));
+    wait_for(&seen, "reports with the renewed certificate", |seen| {
+        seen.reports
+            .iter()
+            .filter(|(cert, _)| *cert == seen.issued)
+            .count()
+            >= 2
+    })
+    .await;
+
+    // feosd's runtime, the test's, stands still for longer than the limit.
+    const BLOCKED: Duration = Duration::from_secs(8);
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(100)).await;
+        std::thread::sleep(BLOCKED);
+    });
+    sleep(BLOCKED + Duration::from_secs(5)).await;
+
+    let seen = seen.lock().unwrap();
+    let between = |from: Duration, to: Duration| {
+        seen.reported_at
+            .iter()
+            .filter(|at| **at > started + from && **at < started + to)
+            .count()
+    };
+    assert_eq!(
+        between(Duration::from_secs(4), BLOCKED - Duration::from_millis(500)),
+        0,
+        "reports while feosd stood still past the limit"
+    );
+    assert!(
+        between(BLOCKED, BLOCKED + Duration::from_secs(5)) >= 2,
+        "no reports once feosd moved again"
     );
 }

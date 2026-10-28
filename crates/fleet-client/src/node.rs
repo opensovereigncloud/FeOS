@@ -47,7 +47,7 @@ const DRAIN: Duration = Duration::from_secs(3600);
 /// calls and streams at once on one, and pings it every 10 s, idle or not,
 /// which h2 answers whatever their rate. Its own pings notice a dead
 /// connection. It is served on the control plane's threads
-/// (`Fleet::spawn`), and its calls run on `calls`, feosd's runtime.
+/// (`Fleet::serve`), and its calls run on `calls`, feosd's runtime.
 pub fn server(calls: Handle) -> Server<Stack<CallsOn, Identity>> {
     Server::builder()
         .max_concurrent_streams(1024)
