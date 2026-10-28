@@ -155,12 +155,15 @@ func TestLostGraceNeverSeen(t *testing.T) {
 	if row.Materialised {
 		t.Fatal("materialised")
 	}
-	// The create made the pod after all.
+	// The create made the pod after all; n1 goes down before a sync of
+	// the pod's events sees it (it would make the row creating).
+	releaseReads := h.holdPodReads("n1")
 	if _, err := h.pods("n1").CreatePod(bg, &podv1.CreatePodRequest{PodId: sb.ID.String(), Spec: podSpec(row)}); err != nil {
 		t.Fatal(err)
 	}
 	n1.Partition(true)
 	eventually(t, 10*time.Second, "n1 disconnected", func() bool { return !h.ins[0].srv.Connected("n1") })
+	releaseReads()
 	h.exec("UPDATE nodes SET status = 'down', down_since = now() - interval '2 minutes' WHERE name = 'n1'")
 	if err := e.lostGrace(bg); err != nil {
 		t.Fatal(err)

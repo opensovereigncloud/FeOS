@@ -518,6 +518,35 @@ func (h *harness) gate(node, method string) (arrived <-chan struct{}, release fu
 	return in, func() { once.Do(func() { close(out) }) }
 }
 
+// holdPodReads holds every GetPod and ListPods of node until release (or
+// until the call's ctx ends): meanwhile no sync or reconcile observes the
+// node's pods, so a state that they resolve (unknown) can be read before
+// they do. The test's end releases them.
+func (h *harness) holdPodReads(node string) (release func()) {
+	out := make(chan struct{})
+	hold := func(ctx context.Context, _ string, _ any) error {
+		select {
+		case <-out:
+			return nil
+		case <-ctx.Done():
+			return status.FromContextError(ctx.Err()).Err()
+		}
+	}
+	s := h.node(node).Script()
+	s.SetHook(podv1.PodService_GetPod_FullMethodName, hold)
+	s.SetHook(podv1.PodService_ListPods_FullMethodName, hold)
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			s.SetHook(podv1.PodService_GetPod_FullMethodName, nil)
+			s.SetHook(podv1.PodService_ListPods_FullMethodName, nil)
+			close(out)
+		})
+	}
+	h.t.Cleanup(release)
+	return release
+}
+
 // waitClosed waits for ch, or fails the test.
 func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
 	t.Helper()

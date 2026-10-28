@@ -358,9 +358,9 @@ func TestEnsurePreemptsAnotherInstancesHibernate(t *testing.T) {
 // TestRolloutThenResumeAbandons: an instance stops while its hibernate's
 // upload runs; its op is released (unknown), and the hibernation goes on
 // at the node, whose dropped call no longer stops it. Ensure on another
-// instance syncs the sandbox (paused: the pod is suspended), resumes it,
-// and the node abandons the hibernation: the sandbox runs from its
-// snapshot, and no hibernation is left.
+// instance finds the sandbox synced or syncs it (paused: the pod is
+// suspended), resumes it, and the node abandons the hibernation: the
+// sandbox runs from its snapshot, and no hibernation is left.
 func TestRolloutThenResumeAbandons(t *testing.T) {
 	h := newHarness(t)
 	i2 := h.addInstance("i2")
@@ -374,6 +374,10 @@ func TestRolloutThenResumeAbandons(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitClosed(t, upload.arrived, "i2's upload")
+	// The released row is read before a sync resolves it: one on i1 (of
+	// the pause's pod event, deferred while i2's op ran) may run as soon
+	// as the release commits.
+	releaseReads := h.holdPodReads("n1")
 	sctx, scancel := context.WithTimeout(bg, 200*time.Millisecond)
 	if err := i2.eng.Stop(sctx); err != nil {
 		t.Fatal(err)
@@ -381,9 +385,10 @@ func TestRolloutThenResumeAbandons(t *testing.T) {
 	scancel()
 	row := h.row(sb.ID)
 	wantState(t, row, model.StateUnknown)
-	if row.StatusDescription != "op hibernate of stopping instance i2 was released" {
+	if row.Op != "" || row.StatusDescription != "op hibernate of stopping instance i2 was released" {
 		t.Fatalf("released row %+v", row)
 	}
+	releaseReads()
 	i2.stop()
 	h.wantHibernation("n1", sb.ID, podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK, true)
 	if lease := h.ensure(sb.ID); lease.Node != "n1" {

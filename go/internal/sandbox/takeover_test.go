@@ -289,7 +289,12 @@ func TestPreemptRollback(t *testing.T) {
 	h := newHarness(t)
 	h.addNode("n1")
 	sb, hd, upload := h.hibernatingAtUpload("n1")
-	h.failNextOp(nil)
+	// The rollback's row is read before a sync resolves it (a sync of the
+	// pause's pod event may come at any time). The pod reads are held
+	// from the resume's look for its connection on, after Ensure's
+	// preempt asked the node.
+	var releaseReads func()
+	h.failNextOp(func() { releaseReads = h.holdPodReads("n1") })
 	ctx, cancel := context.WithTimeout(bg, 30*time.Second)
 	defer cancel()
 	_, err := h.eng().Ensure(ctx, sb.ID)
@@ -303,6 +308,7 @@ func TestPreemptRollback(t *testing.T) {
 	if b, ok := h.booking(sb.ID); !ok || b.Node != "n1" {
 		t.Fatal("the booking went")
 	}
+	releaseReads()
 	h.wantHibernation("n1", sb.ID, podv1.HibernationPhase_HIBERNATION_PHASE_UPLOADING_DISK, true, hd.opID.String())
 	if err := h.eng().Sync(bg, sb.ID); err != nil {
 		t.Fatal(err)

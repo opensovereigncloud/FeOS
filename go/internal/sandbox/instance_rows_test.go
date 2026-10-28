@@ -620,11 +620,12 @@ func TestAddressAndGroupsHint(t *testing.T) {
 	}
 	expectHint(t, hints, store.HintEnvGroups)
 
-	// A sync that finds the pod gone clears it.
+	// A sync that finds the pod gone clears it (this one, or the one that
+	// the deletion's pod event triggers first).
+	drain(hints)
 	if _, err := h.pods("n1").DeletePod(bg, &podv1.DeletePodRequest{PodId: sb.ID.String()}); err != nil {
 		t.Fatal(err)
 	}
-	drain(hints)
 	if err := h.eng().Sync(bg, sb.ID); err != nil {
 		t.Fatal(err)
 	}

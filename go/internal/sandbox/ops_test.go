@@ -333,11 +333,11 @@ func TestOutcomeTAPCollisionPlacesElsewhere(t *testing.T) {
 	if len(row.AvoidNodes) != 0 {
 		t.Fatalf("avoid_nodes after a run %v", row.AvoidNodes)
 	}
-	var avoided int
-	h.scalar(&avoided, "SELECT count(*) FROM activity WHERE sandbox_id = $1 AND kind = 'sandbox_state' AND detail->>'description' LIKE '%placed elsewhere on the next use'", sb.ID)
-	if avoided == 0 {
-		t.Fatal("no pending state with the avoidance recorded")
-	}
+	eventually(t, 10*time.Second, "the pending state with the avoidance recorded", func() bool {
+		var avoided int
+		h.scalar(&avoided, "SELECT count(*) FROM activity WHERE sandbox_id = $1 AND kind = 'sandbox_state' AND detail->>'description' LIKE '%placed elsewhere on the next use'", sb.ID)
+		return avoided > 0
+	})
 }
 
 func TestOutcomeNotFound(t *testing.T) {
@@ -534,6 +534,14 @@ func TestHibernateNoAbandonPerTrigger(t *testing.T) {
 		if _, _, err := ensureFor(e, sb.ID, 30*time.Second); err == nil {
 			t.Fatalf("%s: restored", c.what)
 		}
+		// An op's start reaches the activity log after its begin: wait
+		// until the op of every HibernatePod has its start there.
+		eventually(t, 10*time.Second, c.what+": the hibernate's start recorded", func() bool {
+			var starts int
+			h.scalar(&starts, `SELECT count(*) FROM activity WHERE sandbox_id = $1 AND kind = 'lifecycle_start'
+				AND detail->>'op' = 'hibernate'`, sb.ID)
+			return starts == n+1
+		})
 		var span string
 		h.scalar(&span, `SELECT span_id FROM activity WHERE sandbox_id = $1 AND kind = 'lifecycle_start'
 			AND detail->>'op' = 'hibernate' ORDER BY ts_ns DESC LIMIT 1`, sb.ID)
