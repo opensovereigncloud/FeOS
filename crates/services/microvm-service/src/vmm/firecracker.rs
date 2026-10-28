@@ -28,6 +28,22 @@
 //! snapshot and ends the process; restoring it starts a process that loads
 //! the snapshot, and puts the metadata in again, which a snapshot does not
 //! hold.
+//!
+//! A suspend waits `SNAPSHOT_TIMEOUT` for the snapshot. Firecracker cannot
+//! be stopped in the middle of one, and writing the memory of a VM that a
+//! userfaultfd handler serves from the object store can take minutes: a
+//! snapshot that is late fails its suspend at once, and Firecracker writes
+//! on. Its files stay alone meanwhile, and the VM refuses other changes;
+//! once Firecracker is done, the VM resumes if it ran and the snapshot is
+//! discarded, so that the VM is as the suspend found it. A late snapshot
+//! that makes no progress for `LATE_STALL` ends Firecracker, which the
+//! health check reports as a crash.
+//!
+//! What removes a VM's files runs on the blocking pool, never on a thread
+//! of the runtime: removing a memory file of GiBs takes its time, and one
+//! that Firecracker still writes waits in the kernel until Firecracker is
+//! done. A runtime thread blocked so stalls the whole runtime when it was
+//! the one that drove its timers and its I/O.
 
 use super::{fc_api, installed, jail, snapshot, Hypervisor, VmmError};
 use crate::{jail_dir, vm_dir, vsock_path, VmEventWrapper, VM_DIR};
@@ -41,16 +57,17 @@ use nix::sys::signal::{kill, Signal};
 use nix::sys::stat::Mode;
 use nix::unistd::{self, Pid};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{self, SeekFrom};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
 
 /// `reboot=k`: a guest that reboots ends Firecracker, which cannot reboot
 /// it. The i8042 options let Ctrl-Alt-Del through without probing for a
@@ -65,8 +82,14 @@ const DEFAULT_MEMORY_MIB: u64 = 512;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long writing or loading a snapshot may take: the guest's memory goes
-/// to disk and is synced.
+/// to disk and is synced. A suspend whose snapshot takes longer fails, and
+/// Firecracker writes on (see the module's description).
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often a late snapshot is looked at, and how long it may make no
+/// progress, its memory file not growing, before Firecracker is ended: a
+/// VM whose memory does not come is stuck.
+const LATE_POLL: Duration = Duration::from_secs(10);
+const LATE_STALL: Duration = Duration::from_secs(300);
 const CTRL_ALT_DEL_REPEAT: Duration = Duration::from_secs(3);
 /// How long a killed Firecracker may take to go.
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -97,6 +120,9 @@ pub struct FirecrackerAdapter {
     exits: Mutex<HashMap<String, ExitWatch>>,
     /// Serializes the allocation of the jails' user IDs.
     jails: Mutex<()>,
+    /// The VMs whose late snapshot Firecracker writes on: they refuse
+    /// other changes until it is done.
+    late: Arc<Mutex<HashSet<String>>>,
 }
 
 impl FirecrackerAdapter {
@@ -106,12 +132,22 @@ impl FirecrackerAdapter {
             jailer,
             exits: Mutex::new(HashMap::new()),
             jails: Mutex::new(()),
+            late: Arc::default(),
         }
     }
 
     fn exits(&self) -> MutexGuard<'_, HashMap<String, ExitWatch>> {
         // Every operation on the map is a single insert, lookup or removal.
         self.exits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Marks the VM's snapshot late until the guard goes.
+    fn mark_late(&self, vm_id: &str) -> LateMark {
+        lock(&self.late).insert(vm_id.to_string());
+        LateMark {
+            late: self.late.clone(),
+            vm_id: vm_id.to_string(),
+        }
     }
 
     /// Watches `pid` until it exits; `child` is its handle if this process
@@ -137,6 +173,210 @@ impl FirecrackerAdapter {
                 Ok(self.watch_process(vm_id, pid, None))
             }
             _ => Err(VmmError::VmNotFound(vm_id.to_string())),
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A VM's mark in `FirecrackerAdapter::late`, taken off when it goes.
+struct LateMark {
+    late: Arc<Mutex<HashSet<String>>>,
+    vm_id: String,
+}
+
+impl Drop for LateMark {
+    fn drop(&mut self) {
+        lock(&self.late).remove(&self.vm_id);
+    }
+}
+
+/// Runs `f` on the blocking pool: what removes or creates a VM's files.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)))
+}
+
+/// What Firecracker did with a snapshot it was asked for.
+enum Written {
+    /// It answered: the snapshot is written, or it failed. Either way
+    /// Firecracker writes nothing more.
+    Answered(Result<(), VmmError>),
+    /// Not within the deadline. Firecracker writes on; the request answers
+    /// once it is done.
+    Late(JoinHandle<Result<Option<Value>, VmmError>>),
+}
+
+/// Asks the Firecracker behind `api` for a full snapshot and waits at most
+/// `deadline` for it. The request runs in a task of its own, which outlives
+/// the deadline.
+async fn write_snapshot(api: &Path, deadline: Duration) -> Written {
+    let api = api.to_path_buf();
+    let body = json!({
+        "snapshot_type": "Full",
+        "snapshot_path": snapshot::JAILED_VMSTATE,
+        "mem_file_path": snapshot::JAILED_MEMORY,
+    });
+    let mut create = tokio::spawn(async move {
+        fc_api::request_unbounded(&api, "PUT", "/snapshot/create", Some(&body)).await
+    });
+    match tokio::time::timeout(deadline, &mut create).await {
+        Ok(answer) => Written::Answered(match answer {
+            Ok(answer) => answer.map(drop),
+            Err(e) => Err(VmmError::Internal(format!("the snapshot's request: {e}"))),
+        }),
+        Err(_) => Written::Late(create),
+    }
+}
+
+/// Resumes the paused VM behind `api`. One that does not resume is ended,
+/// unless its Firecracker ended already: a VM left paused would hold its
+/// pod frozen while its record says that it runs. The health check reports
+/// the end as a crash.
+async fn resume_or_end(vm_id: &str, pid: i32, api: &Path, exit: &ExitWatch) -> bool {
+    let body = json!({"state": "Resumed"});
+    match fc_api::request(api, "PATCH", "/vm", Some(&body)).await {
+        Ok(_) => true,
+        Err(e) => {
+            if exit.borrow().is_none() {
+                warn!(
+                    "FirecrackerAdapter ({vm_id}): The VM did not resume ({e}); ending Firecracker \
+                     (pid {pid})"
+                );
+                let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+            }
+            false
+        }
+    }
+}
+
+/// Removes a snapshot that is not kept. What fails is logged: a boot
+/// discards what is left.
+async fn discard_snapshot(vm_id: &str, dir: &Path) {
+    let dir = dir.to_path_buf();
+    if let Err(e) = blocking(move || snapshot::remove_dir(&dir)).await {
+        warn!("FirecrackerAdapter ({vm_id}): Failed to remove the snapshot: {e}");
+    }
+}
+
+/// How a late snapshot ended.
+#[derive(Debug, PartialEq)]
+enum LateEnd {
+    /// Firecracker finished it, and the VM runs again, or stays paused as
+    /// the suspend found it.
+    Finished,
+    /// Firecracker finished it, and the VM did not resume: Firecracker was
+    /// ended.
+    NotResumed,
+    /// Firecracker ended before it was done.
+    Exited,
+    /// It made no progress: Firecracker was ended.
+    Stalled,
+}
+
+/// A snapshot that its suspend gave up on, which Firecracker writes on.
+struct LateSnapshot {
+    vm_id: String,
+    pid: i32,
+    api: PathBuf,
+    /// The snapshot's directory, with its memory file.
+    dir: PathBuf,
+    /// The snapshot's request, which answers once Firecracker is done.
+    create: JoinHandle<Result<Option<Value>, VmmError>>,
+    exit: ExitWatch,
+    /// The VM ran before the suspend paused it.
+    resume: bool,
+}
+
+impl LateSnapshot {
+    /// Waits until Firecracker is done with the snapshot, then leaves the
+    /// VM as the suspend found it and discards the snapshot. A snapshot
+    /// whose memory file does not grow for `stall`, looked at every `poll`,
+    /// ends Firecracker.
+    async fn wait_out(mut self, poll: Duration, stall: Duration) -> LateEnd {
+        let vm_id = self.vm_id.clone();
+        let started = tokio::time::Instant::now();
+        let progress = stalled(self.dir.join("memory"), poll, stall);
+        // Firecracker's answer, or how it ended without one.
+        let answer = tokio::select! {
+            answer = &mut self.create => Ok(answer),
+            _ = self.exit.wait_for(Option::is_some) => Err(LateEnd::Exited),
+            () = progress => Err(LateEnd::Stalled),
+        };
+        let end = match answer {
+            Ok(answer) => {
+                let how = match answer {
+                    Ok(Ok(_)) => "written".to_string(),
+                    Ok(Err(e)) => format!("failed: {e}"),
+                    Err(e) => format!("lost: {e}"),
+                };
+                info!(
+                    "FirecrackerAdapter ({vm_id}): Firecracker finished the late snapshot {}s \
+                     after its suspend gave up ({how}); it is discarded",
+                    started.elapsed().as_secs()
+                );
+                if !self.resume || resume_or_end(&vm_id, self.pid, &self.api, &self.exit).await {
+                    LateEnd::Finished
+                } else {
+                    LateEnd::NotResumed
+                }
+            }
+            Err(LateEnd::Stalled) => {
+                warn!(
+                    "FirecrackerAdapter ({vm_id}): The late snapshot made no progress for {}s; \
+                     ending Firecracker (pid {})",
+                    stall.as_secs(),
+                    self.pid
+                );
+                if self.exit.borrow().is_none() {
+                    let _ = kill(Pid::from_raw(self.pid), Signal::SIGKILL);
+                }
+                LateEnd::Stalled
+            }
+            Err(end) => {
+                info!(
+                    "FirecrackerAdapter ({vm_id}): Firecracker ended before the late snapshot \
+                     was done"
+                );
+                end
+            }
+        };
+        // Firecracker writes no more once it answered; once it is ended,
+        // when it is gone.
+        if end != LateEnd::Finished
+            && tokio::time::timeout(KILL_TIMEOUT, self.exit.wait_for(Option::is_some))
+                .await
+                .is_err()
+        {
+            warn!(
+                "FirecrackerAdapter ({vm_id}): Firecracker (pid {}) outlived SIGKILL",
+                self.pid
+            );
+        }
+        discard_snapshot(&vm_id, &self.dir).await;
+        end
+    }
+}
+
+/// Resolves once the file at `memory` has not grown for `stall`, looked at
+/// every `poll`: what it takes on disk grows while Firecracker writes it.
+async fn stalled(memory: PathBuf, poll: Duration, stall: Duration) {
+    let mut last = None;
+    let mut since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(poll).await;
+        let path = memory.clone();
+        let size = blocking(move || snapshot::disk_usage(&path)).await.ok();
+        if size != last {
+            last = size;
+            since = tokio::time::Instant::now();
+        } else if since.elapsed() >= stall {
+            return;
         }
     }
 }
@@ -613,7 +853,10 @@ impl Hypervisor for FirecrackerAdapter {
             return Err(VmmError::VmNotFound(vm_id.to_string()));
         }
         // A cold boot: the memory in a snapshot is gone for good.
-        snapshot::remove(vm_id).map_err(internal("remove the snapshot"))?;
+        let id = vm_id.to_string();
+        blocking(move || snapshot::remove(&id))
+            .await
+            .map_err(internal("remove the snapshot"))?;
 
         // The newest Firecracker, which a snapshot of this boot needs again.
         let booted = self.vmm_for_boot();
@@ -644,6 +887,7 @@ impl Hypervisor for FirecrackerAdapter {
     }
 
     async fn suspend_vm(&self, vm_id: &str, settle_free_pages: bool) -> Result<u64, VmmError> {
+        self.check_free(vm_id)?;
         let pid = read_pid(vm_id)
             .filter(|&pid| self.is_vmm_process(vm_id, pid.into()))
             .ok_or_else(|| VmmError::VmNotFound(vm_id.to_string()))?;
@@ -661,35 +905,75 @@ impl Hypervisor for FirecrackerAdapter {
             let body = json!({"state": "Paused"});
             fc_api::request(&api, "PATCH", "/vm", Some(&body)).await?;
         }
-        let written = async {
-            snapshot::remove(vm_id).map_err(internal("remove the old snapshot"))?;
-            std::fs::create_dir_all(snapshot::dir(vm_id))
-                .map_err(internal("create the snapshot directory"))?;
-            jail::give(vm_id, &snapshot::dir(vm_id))
-                .map_err(internal("hand the snapshot directory to the VM"))?;
-            let body = json!({
-                "snapshot_type": "Full",
-                "snapshot_path": snapshot::JAILED_VMSTATE,
-                "mem_file_path": snapshot::JAILED_MEMORY,
-            });
-            fc_api::request_within(
-                &api,
-                "PUT",
-                "/snapshot/create",
-                Some(&body),
-                SNAPSHOT_TIMEOUT,
-            )
-            .await?;
-            snapshot::Host::this(&firecracker_version(&api).await?)
-                .save(vm_id)
-                .map_err(internal("record the host"))
-        }
-        .await;
+        let prepared = {
+            let id = vm_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                snapshot::remove(&id).map_err(internal("remove the old snapshot"))?;
+                std::fs::create_dir_all(snapshot::dir(&id))
+                    .map_err(internal("create the snapshot directory"))?;
+                jail::give(&id, &snapshot::dir(&id))
+                    .map_err(internal("hand the snapshot directory to the VM"))
+            })
+            .await
+            .unwrap_or_else(|e| {
+                Err(VmmError::Internal(format!(
+                    "ready the snapshot directory: {e}"
+                )))
+            })
+        };
+        let answered = match prepared {
+            Ok(()) => write_snapshot(&api, SNAPSHOT_TIMEOUT).await,
+            Err(e) => Written::Answered(Err(e)),
+        };
+        let written = match answered {
+            Written::Answered(answer) => answer,
+            Written::Late(create) => {
+                // The snapshot's files stay alone while Firecracker writes
+                // them, and the VM takes no other change.
+                let late = LateSnapshot {
+                    vm_id: vm_id.to_string(),
+                    pid,
+                    api: api.clone(),
+                    dir: snapshot::dir(vm_id),
+                    create,
+                    exit,
+                    resume: was_running,
+                };
+                let mark = self.mark_late(vm_id);
+                tokio::spawn(async move {
+                    let _mark = mark;
+                    late.wait_out(LATE_POLL, LATE_STALL).await;
+                });
+                let message = format!(
+                    "the snapshot was not written within {}s: Firecracker writes it on, and the \
+                     VM {} once it is done",
+                    SNAPSHOT_TIMEOUT.as_secs(),
+                    if was_running {
+                        "resumes"
+                    } else {
+                        "stays paused"
+                    }
+                );
+                warn!("FirecrackerAdapter ({vm_id}): Suspend failed: {message}");
+                return Err(VmmError::Busy(message));
+            }
+        };
+        let written = match written {
+            Ok(()) => {
+                async {
+                    snapshot::Host::this(&firecracker_version(&api).await?)
+                        .save(vm_id)
+                        .map_err(internal("record the host"))
+                }
+                .await
+            }
+            Err(e) => Err(e),
+        };
         if let Err(e) = written {
-            let _ = snapshot::remove(vm_id);
+            // Firecracker answered: it writes the snapshot no more.
+            discard_snapshot(vm_id, &snapshot::dir(vm_id)).await;
             if was_running {
-                let body = json!({"state": "Resumed"});
-                let _ = fc_api::request(&api, "PATCH", "/vm", Some(&body)).await;
+                resume_or_end(vm_id, pid, &api, &exit).await;
             }
             return Err(e);
         }
@@ -830,7 +1114,8 @@ impl Hypervisor for FirecrackerAdapter {
         }
         // The guest ran: its disks moved on from the snapshot. Firecracker
         // keeps the memory file mapped; its blocks go when it exits.
-        if let Err(e) = snapshot::remove(vm_id) {
+        let id = vm_id.to_string();
+        if let Err(e) = blocking(move || snapshot::remove(&id)).await {
             warn!("FirecrackerAdapter ({vm_id}): Failed to remove the restored snapshot: {e}");
         }
         info!("FirecrackerAdapter ({vm_id}): Restored from the snapshot");
@@ -909,6 +1194,16 @@ impl Hypervisor for FirecrackerAdapter {
         .await;
     }
 
+    fn check_free(&self, vm_id: &str) -> Result<(), VmmError> {
+        if lock(&self.late).contains(vm_id) {
+            return Err(VmmError::Busy(format!(
+                "Firecracker still writes the snapshot that the last suspend of VM {vm_id} gave \
+                 up on; the VM is as that suspend found it once it is done"
+            )));
+        }
+        Ok(())
+    }
+
     fn is_vmm_process(&self, vm_id: &str, pid: i64) -> bool {
         // A pid from a record may belong to another process by now. The
         // jailer and the Firecracker it becomes carry the VM's ID.
@@ -944,8 +1239,13 @@ impl Hypervisor for FirecrackerAdapter {
         }
         self.exits().remove(vm_id);
 
-        jail::release(vm_id);
-        match std::fs::remove_dir_all(jail_dir(vm_id)) {
+        let id = vm_id.to_string();
+        let removed = blocking(move || {
+            jail::release(&id);
+            std::fs::remove_dir_all(jail_dir(&id))
+        })
+        .await;
+        match removed {
             Ok(()) => info!("FirecrackerAdapter ({vm_id}): Removed the VM directory"),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => warn!("FirecrackerAdapter ({vm_id}): Failed to remove the VM directory: {e}"),
@@ -1022,6 +1322,7 @@ impl Hypervisor for FirecrackerAdapter {
 
     async fn shutdown_vm(&self, req: ShutdownVmRequest) -> Result<ShutdownVmResponse, VmmError> {
         let vm_id = req.vm_id.as_str();
+        self.check_free(vm_id)?;
         let mut exit = self.exit_watch(vm_id)?;
         // An end that was asked for, which the caller reports: the health
         // check must not report it too. It watches again if the guest
@@ -1285,5 +1586,168 @@ mod tests {
         assert!(is_child(child.id() as i32));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// A Firecracker API on `dir/fc.sock` that answers every request 204,
+    /// `PUT /snapshot/create` only after `create`, or never, and records
+    /// each as "METHOD PATH BODY" once it answers it.
+    fn fake_api(dir: &Path, create: Option<Duration>) -> (PathBuf, Arc<Mutex<Vec<String>>>) {
+        let path = dir.join("fc.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let answered = Arc::new(Mutex::new(Vec::new()));
+        let log = answered.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut text = String::new();
+                    let mut chunk = [0u8; 1024];
+                    let (head, body) = loop {
+                        let n = conn.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        text.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let length = head
+                                .lines()
+                                .find_map(|line| line.strip_prefix("Content-Length: "))
+                                .and_then(|length| length.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if body.len() >= length {
+                                break (head.to_string(), body.to_string());
+                            }
+                        }
+                    };
+                    let request: Vec<&str> = head.split(' ').take(2).collect();
+                    let request = request.join(" ");
+                    if request == "PUT /snapshot/create" {
+                        match create {
+                            Some(after) => tokio::time::sleep(after).await,
+                            None => std::future::pending().await,
+                        }
+                    }
+                    lock(&log).push(format!("{request} {body}"));
+                    let _ = conn
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                });
+            }
+        });
+        (path, answered)
+    }
+
+    /// A snapshot's directory in `dir`, with a memory file.
+    fn snapshot_dir(dir: &Path) -> PathBuf {
+        let snapshot = dir.join("snapshot");
+        std::fs::create_dir(&snapshot).unwrap();
+        std::fs::write(snapshot.join("memory"), [1u8; 8192]).unwrap();
+        snapshot
+    }
+
+    /// A process that stands in for Firecracker, and the watch of its exit.
+    fn vmm_process() -> (i32, ExitWatch) {
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id() as i32;
+        let (tx, exit) = watch::channel(None);
+        tokio::spawn(async move {
+            let _ = tx.send(Some(wait_for_exit(pid, Some(child)).await));
+        });
+        (pid, exit)
+    }
+
+    #[tokio::test]
+    async fn a_late_snapshot_is_left_alone_until_firecracker_is_done_then_the_vm_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, answered) = fake_api(dir.path(), Some(Duration::from_millis(800)));
+        let snapshot = snapshot_dir(dir.path());
+        let (pid, exit) = vmm_process();
+        let Written::Late(create) = write_snapshot(&api, Duration::from_millis(100)).await else {
+            panic!("the snapshot was answered within its deadline");
+        };
+        // Past the deadline, Firecracker still writes: nothing touches the
+        // snapshot, and the VM is not resumed under it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(snapshot.join("memory").exists());
+        assert!(lock(&answered).is_empty());
+
+        let late = LateSnapshot {
+            vm_id: "vm".into(),
+            pid,
+            api,
+            dir: snapshot.clone(),
+            create,
+            exit: exit.clone(),
+            resume: true,
+        };
+        let end = late
+            .wait_out(Duration::from_millis(50), Duration::from_secs(30))
+            .await;
+        assert_eq!(end, LateEnd::Finished);
+        // Resumed once Firecracker answered, and the snapshot discarded.
+        let answered = lock(&answered).clone();
+        assert_eq!(answered.len(), 2, "{answered:?}");
+        assert!(
+            answered[0].starts_with("PUT /snapshot/create {"),
+            "{answered:?}"
+        );
+        assert_eq!(answered[1], r#"PATCH /vm {"state":"Resumed"}"#);
+        assert!(!snapshot.exists());
+        // Firecracker runs on.
+        assert_eq!(*exit.borrow(), None);
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+
+    #[tokio::test]
+    async fn a_late_snapshot_that_makes_no_progress_ends_firecracker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (api, answered) = fake_api(dir.path(), None);
+        let snapshot = snapshot_dir(dir.path());
+        let (pid, exit) = vmm_process();
+        let Written::Late(create) = write_snapshot(&api, Duration::from_millis(50)).await else {
+            panic!("the snapshot was answered");
+        };
+        let late = LateSnapshot {
+            vm_id: "vm".into(),
+            pid,
+            api,
+            dir: snapshot.clone(),
+            create,
+            exit: exit.clone(),
+            resume: true,
+        };
+        let end = late
+            .wait_out(Duration::from_millis(50), Duration::from_millis(300))
+            .await;
+        assert_eq!(end, LateEnd::Stalled);
+        // Ended, never resumed, and the snapshot gone once it was.
+        assert_eq!(*exit.borrow(), Some(Some(128 + Signal::SIGKILL as i32)));
+        assert!(lock(&answered).is_empty());
+        assert!(!snapshot.exists());
+    }
+
+    #[tokio::test]
+    async fn a_vm_with_a_late_snapshot_refuses_changes_until_it_is_done() {
+        let adapter = FirecrackerAdapter::new("firecracker".into(), "jailer".into());
+        let mark = adapter.mark_late("vm");
+        for refused in [
+            adapter.check_free("vm").err(),
+            adapter.suspend_vm("vm", false).await.err(),
+            adapter
+                .shutdown_vm(ShutdownVmRequest { vm_id: "vm".into() })
+                .await
+                .err(),
+        ] {
+            let refused = refused.expect("refused while the snapshot is late");
+            assert!(matches!(refused, VmmError::Busy(_)), "{refused}");
+            assert_eq!(
+                tonic::Status::from(refused).code(),
+                tonic::Code::Unavailable
+            );
+        }
+        assert!(adapter.check_free("other").is_ok());
+        drop(mark);
+        assert!(adapter.check_free("vm").is_ok());
     }
 }

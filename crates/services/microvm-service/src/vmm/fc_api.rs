@@ -47,6 +47,18 @@ pub async fn request_within(
         })?
 }
 
+/// `request` without a deadline, for one that its caller bounds: writing a
+/// snapshot, which Firecracker answers once it is done, however long that
+/// takes, or when it ends.
+pub async fn request_unbounded(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Option<Value>, VmmError> {
+    exchange(socket, method, path, body).await
+}
+
 async fn exchange(
     socket: &Path,
     method: &str,

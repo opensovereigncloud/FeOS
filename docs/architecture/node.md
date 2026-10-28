@@ -681,7 +681,16 @@ deletion undoes.
   exit code 0 makes the microVM stopped, anything else crashed.
 - **Shutdown** sends Ctrl-Alt-Del and waits for the process to end.
 - **Suspend** writes a snapshot, ends the process and punches holes over
-  the pages of zeroes. **Resume** loads the snapshot with the vCPUs
+  the pages of zeroes. A snapshot that is not written within 120 s fails
+  the suspend at once (`UNAVAILABLE`). Firecracker cannot stop in the
+  middle of one and writes on; its files stay alone, and the microVM
+  refuses suspends and shutdowns as busy. Once Firecracker is done, the
+  microVM resumes if it ran, and the snapshot is discarded. One whose
+  memory file does not grow for five minutes, as when its memory's
+  userfaultfd handler is gone, ends Firecracker: the microVM crashed. The
+  first suspend after a restore from another node reads all of the memory
+  through diskd from the object store (ADR 0008), and can take that long.
+  **Resume** loads the snapshot with the vCPUs
   stopped, then resumes them and removes the snapshot. A created microVM
   that never booted resumes from a `RemoteSnapshot`: its vmstate is moved
   into `snapshot/`, and its memory comes from a userfaultfd handler on

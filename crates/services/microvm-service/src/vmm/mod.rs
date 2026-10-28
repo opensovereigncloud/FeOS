@@ -52,6 +52,11 @@ pub enum VmmError {
     #[error("The snapshot cannot be restored: {0}")]
     SnapshotUnusable(String),
 
+    /// The VM cannot take a change now, and can later: Firecracker still
+    /// writes a snapshot that its suspend gave up on.
+    #[error("The VM is busy: {0}")]
+    Busy(String),
+
     #[error("An internal or unexpected error occurred: {0}")]
     Internal(String),
 }
@@ -62,9 +67,9 @@ impl From<VmmError> for Status {
             VmmError::VmNotFound(id) => Status::not_found(id),
             VmmError::InvalidConfig(msg) => Status::invalid_argument(msg),
             VmmError::SnapshotUnusable(msg) => Status::failed_precondition(msg),
-            VmmError::ApiConnectionFailed(msg) | VmmError::ImageServiceFailed(msg) => {
-                Status::unavailable(msg)
-            }
+            VmmError::ApiConnectionFailed(msg)
+            | VmmError::ImageServiceFailed(msg)
+            | VmmError::Busy(msg) => Status::unavailable(msg),
             VmmError::ProcessSpawnFailed(msg)
             | VmmError::ApiOperationFailed(msg)
             | VmmError::Internal(msg) => Status::internal(msg),
@@ -91,8 +96,16 @@ pub trait Hypervisor: Send + Sync {
     /// Writes a snapshot of the running or paused VM and ends its VMM
     /// process; first waits until free page reporting is done, if asked.
     /// Returns what the snapshot's memory takes on disk. A VM that cannot
-    /// be suspended is left running or paused, as it was.
+    /// be suspended is left running or paused, as it was; one whose
+    /// snapshot is not written in time, once the VMM is done with it, and
+    /// until then it is busy (`check_free`).
     async fn suspend_vm(&self, vm_id: &str, settle_free_pages: bool) -> Result<u64, VmmError>;
+
+    /// Fails with `VmmError::Busy` while the VM cannot take a change, such
+    /// as while its VMM writes a snapshot that a suspend gave up on.
+    fn check_free(&self, _vm_id: &str) -> Result<(), VmmError> {
+        Ok(())
+    }
 
     /// Restores a suspended VM in a new VMM process and resumes it, or with
     /// `remote` a created one from a snapshot written elsewhere, whose
