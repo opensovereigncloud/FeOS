@@ -455,8 +455,6 @@ func (s *server) listTools(w http.ResponseWriter, _ *http.Request) error {
 	return writeJSON(w, http.StatusOK, out)
 }
 
-// passOr returns an *apierr.Error of err as it is, and anything else as a
-// 500 "<what>: <err>".
 // checkCredentials refuses image credentials that cannot be kept: half
 // given, too long, or without --secret-key-file to seal them.
 func (s *server) checkCredentials(c *model.RegistryCredentials) error {
@@ -529,6 +527,8 @@ func (s *server) deleteImageCredentials(w http.ResponseWriter, r *http.Request) 
 	return nil
 }
 
+// passOr returns an *apierr.Error of err as it is, and anything else as a
+// 500 "<what>: <err>".
 func passOr(err error, what string) error {
 	var e *apierr.Error
 	if errors.As(err, &e) {
