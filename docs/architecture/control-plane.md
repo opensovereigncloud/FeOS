@@ -2811,7 +2811,10 @@ bundle only when it starts.
 3. The clients take both roots: at their next renewal, with no break,
    or now. A node now: write the bundle of step 2 into its
    `bundle.pem` (write a file beside it and rename it over) and restart
-   it gracefully, one node at a time. An ingress instance now: a token
+   it gracefully, one node at a time. A node renews as soon as it
+   starts when `renew_after` in its `node.json` lies in the past, and
+   the control plane renews a node at any time, so the same restart
+   with an earlier `renew_after` renews it on demand. An ingress instance now: a token
    pinned to its name in its join file, a graceful restart, then
    `DELETE /api/v1/admin/ingresses/{name}`; it joins again and gets the
    bundle.
@@ -2820,9 +2823,11 @@ bundle only when it starts.
    the rest. Join tokens now pin the new root; spend or revoke any
    token issued before.
 5. Once every client presents a certificate of the new issuer (their
-   renewals; the old ones are revoked when a newer one is first shown),
+   renewals, or on demand as in step 3 and a join again of each ingress
+   instance; the old ones are revoked when a newer one is first shown),
    `bundle.crt` = the new root alone, and restart the instances. The
-   clients drop the old root at their next renewal.
+   clients drop the old root at their next renewal; renewing them on
+   demand once more finishes the rotation at once.
 
 Until step 5, rolling the instances back to the old issuer is safe only
 while every node still runs a version from before ADR 0024; roll such
