@@ -1,3 +1,23 @@
+TABLE acme_accounts
+  COLUMN directory text NOT NULL
+  COLUMN key_sealed bytea NOT NULL
+  COLUMN uri text NOT NULL DEFAULT ''::text
+  COLUMN email text NOT NULL DEFAULT ''::text
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  CONSTRAINT PRIMARY KEY (directory)
+  CREATE UNIQUE INDEX acme_accounts_pkey ON public.acme_accounts USING btree (directory)
+TABLE acme_challenges
+  COLUMN token text NOT NULL
+  COLUMN host text NOT NULL
+  COLUMN key_auth text NOT NULL
+  COLUMN domain_id uuid
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN expires_at timestamp with time zone NOT NULL
+  CONSTRAINT CHECK ((token ~ '^[A-Za-z0-9_-]{1,256}$'::text))
+  CONSTRAINT FOREIGN KEY (domain_id) REFERENCES domains(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (token)
+  CREATE INDEX acme_challenges_expires ON public.acme_challenges USING btree (expires_at)
+  CREATE UNIQUE INDEX acme_challenges_pkey ON public.acme_challenges USING btree (token)
 TABLE activity PARTITION BY RANGE (day)
   COLUMN day date NOT NULL DEFAULT ((now() AT TIME ZONE 'utc'::text))::date
   COLUMN id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
@@ -63,6 +83,65 @@ TABLE cluster_secrets
   CONSTRAINT CHECK ((length(value) = 32))
   CONSTRAINT PRIMARY KEY (name)
   CREATE UNIQUE INDEX cluster_secrets_pkey ON public.cluster_secrets USING btree (name)
+TABLE domain_certs
+  COLUMN domain_id uuid NOT NULL
+  COLUMN chain bytea[] NOT NULL
+  COLUMN key_sealed bytea NOT NULL
+  COLUMN not_before timestamp with time zone NOT NULL
+  COLUMN not_after timestamp with time zone NOT NULL
+  COLUMN renew_after timestamp with time zone NOT NULL
+  COLUMN issued_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN serial text NOT NULL
+  CONSTRAINT CHECK ((cardinality(chain) >= 1))
+  CONSTRAINT FOREIGN KEY (domain_id) REFERENCES domains(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (domain_id)
+  CREATE UNIQUE INDEX domain_certs_pkey ON public.domain_certs USING btree (domain_id)
+TABLE domains
+  COLUMN id uuid NOT NULL
+  COLUMN owner text NOT NULL
+  COLUMN name text NOT NULL
+  COLUMN labels jsonb NOT NULL DEFAULT '{}'::jsonb
+  COLUMN token text NOT NULL
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN env_id uuid
+  COLUMN bound_at timestamp with time zone
+  COLUMN verification text NOT NULL DEFAULT 'unverified'::text
+  COLUMN verified_at timestamp with time zone
+  COLUMN superseded_by uuid
+  COLUMN next_check_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN check_backoff_s integer NOT NULL DEFAULT 60
+  COLUMN checked_at timestamp with time zone
+  COLUMN check_error text NOT NULL DEFAULT ''::text
+  COLUMN check_failing_since timestamp with time zone
+  COLUMN apex boolean
+  COLUMN found jsonb NOT NULL DEFAULT '{}'::jsonb
+  COLUMN routed boolean NOT NULL DEFAULT false
+  COLUMN was_routed boolean NOT NULL DEFAULT false
+  COLUMN record_missing_since timestamp with time zone
+  COLUMN dns_moved_since timestamp with time zone
+  COLUMN state text NOT NULL DEFAULT 'unverified'::text
+  COLUMN reason text NOT NULL DEFAULT ''::text
+  COLUMN next_issue_at timestamp with time zone
+  COLUMN issue_backoff_s integer NOT NULL DEFAULT 0
+  COLUMN issue_error text NOT NULL DEFAULT ''::text
+  COLUMN issue_failing_since timestamp with time zone
+  CONSTRAINT CHECK (((env_id IS NULL) OR (bound_at IS NOT NULL)))
+  CONSTRAINT CHECK (((name ~ '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$'::text) AND (length(name) <= 253)))
+  CONSTRAINT CHECK (((verification <> 'verified'::text) OR (verified_at IS NOT NULL)))
+  CONSTRAINT CHECK ((check_backoff_s > 0))
+  CONSTRAINT CHECK ((issue_backoff_s >= 0))
+  CONSTRAINT CHECK ((state = ANY (ARRAY['unverified'::text, 'lapsed'::text, 'superseded'::text, 'unbound'::text, 'unpublished'::text, 'waiting-for-dns'::text, 'issuing'::text, 'served'::text, 'dns-moved'::text, 'inactive'::text, 'failed'::text])))
+  CONSTRAINT CHECK ((token ~ '^[a-z2-7]{32}$'::text))
+  CONSTRAINT CHECK ((verification = ANY (ARRAY['unverified'::text, 'verified'::text, 'lapsed'::text, 'superseded'::text])))
+  CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE SET NULL
+  CONSTRAINT FOREIGN KEY (owner) REFERENCES tenants(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (id)
+  CREATE INDEX domains_env ON public.domains USING btree (env_id, bound_at) WHERE (env_id IS NOT NULL)
+  CREATE INDEX domains_name ON public.domains USING btree (name)
+  CREATE INDEX domains_next_check ON public.domains USING btree (next_check_at)
+  CREATE INDEX domains_owner ON public.domains USING btree (owner, created_at)
+  CREATE UNIQUE INDEX domains_pkey ON public.domains USING btree (id)
+  CREATE UNIQUE INDEX domains_verified_name ON public.domains USING btree (name) WHERE (verification = 'verified'::text)
 TABLE env_attached
   COLUMN env_id uuid NOT NULL
   COLUMN service text NOT NULL
@@ -96,7 +175,7 @@ TABLE env_incidents
   COLUMN closed_at timestamp with time zone
   COLUMN summary text NOT NULL DEFAULT ''::text
   COLUMN evidence jsonb NOT NULL DEFAULT '{}'::jsonb
-  CONSTRAINT CHECK ((condition = ANY (ARRAY['rollout_failed'::text, 'crash_loop'::text, 'job_failed'::text, 'no_capacity'::text, 'addon_unhealthy'::text, 'volume_unavailable'::text, 'attach_failed'::text, 'names_unserved'::text])))
+  CONSTRAINT CHECK ((condition = ANY (ARRAY['rollout_failed'::text, 'crash_loop'::text, 'job_failed'::text, 'no_capacity'::text, 'addon_unhealthy'::text, 'volume_unavailable'::text, 'attach_failed'::text, 'domain_record_wrong'::text, 'domain_deactivated'::text, 'domain_superseded'::text, 'certificate_failing'::text])))
   CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE
   CONSTRAINT PRIMARY KEY (id)
   CREATE INDEX env_incidents_env ON public.env_incidents USING btree (env_id, id)

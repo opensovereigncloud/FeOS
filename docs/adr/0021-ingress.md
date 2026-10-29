@@ -139,24 +139,131 @@ woken by the door, which holds the request until the pod runs.
   environment's name is unique in its tenant, and the tenant's zone is
   the tenant's. A route whose `host` is empty answers on every host of
   its environment.
-- A **domain** is an object of the tenant, bound to one environment:
+- A **domain** is a tenant's claim on one name, made by a call
+  (`POST /api/v1/domains {name}`), and bound to at most one environment
+  of its tenant by another (`PUT /api/v1/domains/{id}/environment`):
   `dashboard.fecore.dev` is a domain of the tenant `fecode` bound to the
-  dashboard's production. It is claimed by a call, moves to another
-  environment of the tenant by a call, and both are recorded; no
-  release moves a domain, since a release is one environment's and a
-  domain's move concerns two. A route's `host` is realised: a route with
-  a host answers on that host, which must be a domain of its environment
-  or its default host, else the write fails with a finding.
-- Before a domain is served, `ferund` verifies that whoever claimed it
-  controls it: the name resolves to the ingress, by a CNAME to the
-  platform's edge name (`edge.<domain>`, which the operator publishes
-  with the balancer's addresses) or by A and AAAA records with those
-  addresses; and, where another tenant holds the name or claimed it
-  before, by a TXT record `_ferun-challenge.<name>` that carries a token
-  of the claim. A name in the apps zone or a tenant's zone cannot be
-  claimed. `ferund` checks again at an interval and marks a domain whose
-  DNS went elsewhere; the environment gets an incident, the domain is
-  served on until its certificate expires.
+  dashboard's production. Claim and binding are apart because they are
+  two facts that live for different times: whose a name is lasts as long
+  as its owner keeps it, while which environment serves it changes with
+  a move, and an environment is deleted and made again. A domain may be
+  claimed before anything serves it and bound before it is verified; it
+  is served when it is both. A move to another environment of the tenant
+  is one call, recorded, and keeps the verification; no release moves a
+  domain, since a release is one environment's and a move concerns two.
+  An environment's deletion ends its bindings and keeps the domains. A
+  route's `host` is realised: a route with a host answers on that host,
+  which must be a domain bound to its environment or its default host,
+  else the write fails with a finding.
+- A name is stored lowercased, as its A-label. A wildcard, an address,
+  a name in the apps zone, in a tenant's zone or under the platform's
+  own domain (where `run`, `id` and `edge` are) cannot be claimed.
+
+### Domains: a record of the claim's token proves whose a name is
+
+- What proves a claim is a TXT record at `_ferun-challenge.<name>` whose
+  value is the claim's token: 32 random characters of base32 that
+  `ferund` makes per claim and keeps in its row. The label is the
+  platform's (`--domain-challenge-label`, so that an installation such
+  as FeCode's has its owners write `_fecode-challenge`). It is a name of
+  its own because nothing else may stand beside a CNAME at the name
+  itself. The record stays as long as the claim.
+- The record that routes a name to the ingress proves nothing about
+  whose it is. Every tenant's domains point at the same edge: a CNAME to
+  `edge.<domain>`, or A records with its addresses, say "the platform
+  serves this name", not "this tenant does". A claim proven by routing
+  would give a name to whoever asked first, and give it again to anyone
+  once its owner removed the domain and left the CNAME in DNS, or kept a
+  wildcard there: the new claimant passes the check, gets a certificate
+  over HTTP-01 and serves under a name not theirs. An apex behind an
+  ALIAS, ANAME or flattened CNAME answers with A records, so not even a
+  routing target per claim would show whose it is.
+- **Claims are not exclusive while unverified.** Any number of claims,
+  of one tenant or of several, may name the same name, each with its own
+  token, so that nobody blocks a name by claiming it first. At most one
+  claim of a name is **verified**: the one whose token DNS shows. If DNS
+  shows several, the one verified before stays so; of new claims, the
+  oldest wins.
+- **A verified claim is lost to another proof at once.** When DNS shows
+  another claim's token and not its own, that claim becomes verified and
+  this one **superseded**: its binding ends, its host leaves the table,
+  its certificate's key is deleted, and its environment gets an
+  incident. Whoever controls a name's DNS decides who holds it, also
+  against a holder. A record that is merely missing takes the name away
+  only after a grace (below).
+- A deleted claim ends its binding and its key. What its owner leaves in
+  DNS, the TXT and the CNAME, gives the name to no other claim, since no
+  other token is in it.
+- `ferund` asks the authoritative servers of the name's zone, found by
+  the zone's SOA and NS records, with a small DNS client of its own on
+  the standard library, and not a cache: a record just set counts at once, and no negative answer
+  cached for an hour holds a claim back. An unverified claim is checked
+  with backoff from a minute to an hour, and at once on
+  `POST /api/v1/domains/{id}/check`; a verified one as the next section
+  says. A tenant holds at most `--domain-unverified-max` unverified
+  claims (default 50).
+
+### Routing a domain
+
+- A domain is **routed** when its name resolves to the ingress: a CNAME
+  chain that reaches `edge.<domain>`, which the operator publishes with
+  the balancer's addresses, or A and AAAA records that are all the
+  edge's addresses. A name below its zone's apex takes a CNAME; an apex,
+  which cannot carry one, takes an ALIAS, ANAME or flattened CNAME to
+  `edge.<domain>` where its DNS provider has one (Cloudflare flattens at
+  the apex), else A and AAAA records with the edge's addresses. The
+  answer to a claim names both records, the TXT and the routing one.
+- Routing proves nothing and gates only the certificate: `ferund` asks
+  for one only for a domain that is verified, bound and routed, so that
+  no challenge is spent on a name that cannot pass it (the CA limits
+  failed validations per name and hour).
+- A domain's verification is `unverified`, `verified`, `lapsed` or
+  `superseded`; a verified domain's state is `unbound`, `unpublished`
+  (bound to an environment that is not public, which the ingress does
+  not serve), `waiting-for-dns` (bound, not routed), `issuing`, `served`,
+  `dns-moved` (served, in its grace), `inactive` or `failed` with a
+  reason (a CAA record that names another CA, a refused challenge, a
+  limit of the CA). Its warnings are `recordMissingSince` and
+  `dnsMovedSince`, each with `deactivatesAt`, and `checkFailing`.
+
+### Keeping a domain: its records are checked for as long as it lives
+
+- `ferund` checks a verified domain's records every hour for as long as
+  the claim exists: the TXT, and once the domain is bound, the routing
+  record; every quarter of an hour while one of them is wrong. Only an
+  answer counts as wrong: a name or record the authoritative servers
+  deny, a TXT without the token, a CNAME or addresses that lead
+  elsewhere. A lookup that fails (a timeout, `SERVFAIL`, no server
+  reached, `ferund`'s own network away) changes nothing and shows as
+  `checkFailing`, so that an outage of DNS or of the platform's own
+  network deactivates no domain.
+- The first wrong answer for a record that was right starts the
+  domain's **grace** (`--domain-grace`, 72 hours by default, which
+  covers a weekend), its start recorded by the database's clock; the
+  first right answer ends it. A bound domain that was never routed stays
+  `waiting-for-dns` and has no grace to run out. During the grace the domain is served as before, but gets no new
+  certificate while its TXT is missing; it shows since when which record
+  is wrong and when it will be deactivated, and its environment gets an
+  incident with that deadline.
+- When the grace runs out the domain is **deactivated**: its host
+  leaves the table, its certificate's key is deleted, and nothing is
+  renewed. Its claim and binding stay, and it is checked on, hourly:
+  - With its TXT missing, its verification **lapses** (`lapsed`). A
+    lapsed claim counts as unverified, so another claim whose token DNS
+    shows is verified from now on; its own token, put back, verifies it
+    again unless another claim was verified meanwhile.
+  - With its routing wrong, it is `inactive` and stays verified. Once
+    its name resolves to the edge again, `ferund` obtains a certificate
+    and serves it again.
+
+  Its environment gets an incident for the deactivation, too.
+- A proof must hold for as long as it is used. A claim that stayed
+  verified without its record would go on holding a name its owner gave
+  up or lost, a registration that lapsed and someone else made, and the
+  platform would answer on that name for the old tenant, and renew its
+  certificate, whenever its DNS pointed here again. A host whose DNS
+  went elsewhere receives no traffic, and keeps a key and a renewal that
+  can only fail.
 
 ### Certificates: ferund is the ACME client
 
@@ -165,7 +272,8 @@ woken by the door, which holds the request until the pod runs.
   of a module `ferund` depends on already). A domain's certificate comes
   over HTTP-01: `ferund` keeps the challenge in the ingress's table, and
   every instance answers `/.well-known/acme-challenge/<token>` for that
-  host on port 80, so that a CNAME is all a tenant's DNS needs. A zone's
+  host on port 80, so that a tenant's DNS needs the claim's TXT and a
+  record to the edge, and `ferund` no credential of it. A zone's
   wildcard certificate comes over DNS-01 where `ferund` holds the zone's
   DNS credential (Cloudflare first, the provider a small interface), or
   from the operator, who puts a certificate and its key in through the
@@ -484,6 +592,28 @@ changed these points:
   the data path altogether: FeCode's ADR 0001 keeps it in FeCode's
   forwarder, which knows the person; previews are a workbench's, not a
   customer's. An authorization hook for a tenant stays open.
+- **Routing as the proof**, as this ADR's draft had it: a CNAME to the
+  edge or A records with its addresses, and a TXT record only where
+  another tenant held the name or had claimed it. The routing record is
+  every tenant's, so it proves no tenant's claim; a CNAME left behind or
+  a wildcard gave a name nobody had claimed to whoever asked, and a
+  caller that is one tenant for many owners, as FeCode is for its
+  projects, got no proof between them at all.
+- **A routing target per claim**, `<id>.edge.<domain>`, in place of the
+  TXT record, as some platforms do: it shows whose a name is for a
+  CNAME, but not for an apex, whose ALIAS or A records show addresses
+  alone.
+- **Exclusive claims**, the first claimant's until it lets go: a name
+  blocked by whoever asked first, and its owner asking the operator to
+  take it back.
+- **A verified claim kept without its record, and a moved domain served
+  until its certificate expires**, as the draft had it: a proof checked
+  once and trusted for good, a name that changed owners still answered
+  for the old tenant, and keys of names that no longer point here.
+- **Deactivating at the first wrong answer**: a record deleted by
+  mistake, a DNS provider's hour of trouble or a zone moved to another
+  provider would take a production off the internet at once. The grace
+  gives the incident time to reach a person.
 
 ## Consequences
 
@@ -517,7 +647,17 @@ changed these points:
   and any instance serves any request already.
 - Operators publish `edge.<domain>` and the apps zone's wildcard, open
   port 80 to the ingress for HTTP-01, and hand `ferund` a DNS credential
-  for the zone's wildcard or a certificate.
+  for the zone's wildcard or a certificate. They keep the balancer's
+  addresses: an apex names them in A records that are its tenant's, so a
+  new address is a change every such tenant makes in its own DNS, and
+  until then its domain is `dns-moved`, after the grace `inactive`. An
+  operator who has to change them names the old addresses beside the
+  new ones (`--edge-address`, repeatable, counted as the edge's beside
+  what `edge.<domain>` resolves to) until the tenants have moved.
+- A tenant's DNS holds two records per domain, the TXT of its claim and
+  the one that routes it, and keeps both for as long as it keeps the
+  domain: without either for longer than the grace, the domain is
+  deactivated.
 - The known limits of this version: HTTP alone, no L4; no authorization
   and no rate limits at the ingress; the ingress block as one prefix in
   every routed service's group; records in PostgreSQL.
@@ -536,8 +676,20 @@ changed these points:
 - **Authorization at the ingress** for a tenant: a signed cookie or a
   forward-auth call to the tenant's service, so that FeCode's previews
   could leave its forwarder, and a stage could be closed to the public.
-- **Rate limits, body limits and timeouts per domain**, and what shields
-  the ACME account from a tenant who claims domains by the hundred.
+- **Rate limits, body limits and timeouts per domain**, and whether the
+  cap on unverified claims and certificates only for verified, routed
+  domains shield the ACME account enough, or a tenant wants a cap on
+  its certificates.
+- **Zones a tenant verified**: one record at `_ferun-challenge.<zone>`
+  that lets the tenant claim every name below it without a record each,
+  and wildcard domains below it, which need DNS-01; and how a caller's
+  organisations, which FeCode does not have yet, map to it.
+- **A certificate before the cutover and behind a proxy**: a CNAME of
+  `_acme-challenge.<name>` to a name in a zone of the platform's, where
+  `ferund` answers DNS-01, for a domain that still points at its old
+  host or stands behind a CDN that answers HTTP itself (Cloudflare's
+  proxy): such a domain is never routed, and HTTP-01 does not reach the
+  ingress.
 - **Certificates a tenant brings**, for a domain whose CA is not
   Let's Encrypt, and DNS-01 providers beyond the first.
 - **A Public Suffix List entry for the apps zone**, so that one
