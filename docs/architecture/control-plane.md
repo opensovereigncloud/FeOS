@@ -2652,6 +2652,17 @@ that dial the instances.
   the nodes' port and the nodes' mesh endpoints, behind a balancer of
   their own; `deploy/gardener/ferun-ingress/` runs two
   ([ingress.md](ingress.md#kubernetes)).
+- **Rollout order.** Roll ferund before the nodes' feosd. A new ferund
+  covers an old feosd: its deadlines are longer than the old feosd's
+  steps, and the old feosd sends no busy marker, so everything reads as
+  before. An old ferund does not cover a new feosd: its pause gives up
+  after 2 min and 4 s/GiB while the new feosd's suspend may take 190 s
+  and 5 s/GiB ([The suspend's budget](node.md#the-suspends-budget)), it
+  records "pause failed" and syncs the late suspend without resetting
+  `paused_at` (so hibernate-after fires at once), and it takes the busy
+  marker for an ordinary failure, so that a guest marked busy is
+  reported unreachable and a repair's busy `StopPod` is followed by a
+  `StartPod`.
 
 ### Requirements
 
