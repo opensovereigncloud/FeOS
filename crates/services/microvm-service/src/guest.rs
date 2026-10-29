@@ -48,8 +48,11 @@ use uuid::Uuid;
 
 /// How long one push may take.
 pub(crate) const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a resumed guest may take to answer. It answers within about
-/// 100 ms unless it is broken.
+/// How long a resumed guest may take to answer, its connect included. It
+/// answers within about 100 ms unless it is broken, or its memory comes
+/// from object storage: a VM restored from a snapshot written elsewhere
+/// has its memory served by the UFFD handler page by page, and its first
+/// answer can take longer than a connect's 5 s (`vsock::CONNECT_TIMEOUT`).
 const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where the VM service listens for the guest's uplink.
@@ -163,18 +166,7 @@ impl Guests {
         if self.info(vm_id).is_none() && !from_elsewhere {
             return;
         }
-        let answered = tokio::time::timeout(RESUME_TIMEOUT, async {
-            let channel = feos_utils::vsock::channel(vsock_path(vm_id), API_PORT)
-                .await
-                .map_err(|e| e.to_string())?;
-            HostServiceClient::new(channel)
-                .ping(PingRequest {})
-                .await
-                .map_err(|status| status.message().to_string())
-        })
-        .await
-        .unwrap_or_else(|_| Err(format!("no answer within {}s", RESUME_TIMEOUT.as_secs())));
-        let result = match answered {
+        let result = match ping_within(vsock_path(vm_id), RESUME_TIMEOUT).await {
             Ok(_) => self.push(vm_id).await,
             Err(e) => Err(format!("the resumed guest does not answer: {e}")),
         };
@@ -213,9 +205,10 @@ impl Guests {
             return;
         }
         let prepared = tokio::time::timeout(PUSH_TIMEOUT, async {
-            let channel = feos_utils::vsock::channel(vsock_path(vm_id), API_PORT)
-                .await
-                .map_err(|e| e.to_string())?;
+            let channel =
+                feos_utils::vsock::channel_within(vsock_path(vm_id), API_PORT, PUSH_TIMEOUT)
+                    .await
+                    .map_err(|e| e.to_string())?;
             HostServiceClient::new(channel)
                 .prepare_pause(PreparePauseRequest {
                     compact: true,
@@ -248,9 +241,10 @@ impl Guests {
             .get(vm_id)
             .and_then(|guest| guest.network.clone());
         tokio::time::timeout(PUSH_TIMEOUT, async {
-            let channel = feos_utils::vsock::channel(vsock_path(vm_id), API_PORT)
-                .await
-                .map_err(|e| format!("connect to the guest: {e}"))?;
+            let channel =
+                feos_utils::vsock::channel_within(vsock_path(vm_id), API_PORT, PUSH_TIMEOUT)
+                    .await
+                    .map_err(|e| format!("connect to the guest: {e}"))?;
             let mut client = HostServiceClient::new(channel);
             client
                 .set_time(SetTimeRequest {
@@ -423,9 +417,59 @@ impl LifecycleService for Uplink {
     }
 }
 
+/// Pings the FeOS guest behind the vsock socket `uds`, within `deadline`,
+/// its connect included: the connect has the whole deadline, not a
+/// connect's 5 s.
+async fn ping_within(uds: PathBuf, deadline: Duration) -> Result<(), String> {
+    tokio::time::timeout(deadline, async {
+        let channel = feos_utils::vsock::channel_within(uds, API_PORT, deadline)
+            .await
+            .map_err(|e| e.to_string())?;
+        HostServiceClient::new(channel)
+            .ping(PingRequest {})
+            .await
+            .map(|_| ())
+            .map_err(|status| status.message().to_string())
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "no answer within {}",
+            feos_utils::vsock::seconds(deadline)
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resumed guest that answers its connect after a connect's 5 s, as
+    /// one whose memory the UFFD handler serves from object storage, is
+    /// still waited for: the resume's bound covers the connect.
+    #[tokio::test]
+    async fn a_resumed_guest_may_take_longer_than_a_connect() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let late = feos_utils::vsock::CONNECT_TIMEOUT + Duration::from_secs(1);
+        let vmm = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            tokio::time::sleep(late).await;
+            // Connected; the guest then goes, which the ping says.
+            stream.get_mut().write_all(b"OK 1\n").await.unwrap();
+        });
+        let err = ping_within(path, RESUME_TIMEOUT).await.unwrap_err();
+        vmm.await.unwrap();
+        assert!(
+            !err.contains("did not answer") && !err.contains("no answer"),
+            "the connect gave up first: {err}"
+        );
+    }
 
     #[test]
     fn the_uplink_is_beside_the_vsock_socket() {

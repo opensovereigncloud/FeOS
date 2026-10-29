@@ -348,7 +348,12 @@ snapshot or Firecracker still writes one, fails the call with
 VM is busy: <why>" when that is known: the pod is being suspended, it
 hibernates, or the microVM's snapshot is late (its `check_free`). A
 connected call has no bound but its caller's: a stream lasts as long as
-it lasts.
+it lasts. The microVM service's own calls to a guest bound their connect
+with their own deadline: the ping of a resumed guest, before the time
+and the network are pushed, waits 30 s, its connect included, since a VM
+restored from a snapshot written elsewhere has its memory served page by
+page from object storage and may answer later than 5 s; a push and the
+request to empty the memory before a snapshot wait 10 s.
 
 ## Volumes
 

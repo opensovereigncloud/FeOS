@@ -13,6 +13,14 @@
 //! the handshake, and a call would hang until its caller gave up. A guest
 //! that answers in time has no bound from then on: a stream, as an exec's
 //! or a port forward's, lasts as long as it lasts.
+//!
+//! A caller that waits for a guest that may answer later takes its own
+//! bound for the connect (`channel_within`): the microVM service's ping of
+//! a resumed guest 30 s, as a VM restored from a snapshot written elsewhere
+//! has its memory served page by page from object storage, and its pushes
+//! of the time and the network and its free-page request before a
+//! snapshot 10 s. The calls to the guest that a pod's callers make (exec,
+//! port forward, GetPod, the bring-up) keep `CONNECT_TIMEOUT`.
 
 use hyper_util::rt::TokioIo;
 use std::io;
