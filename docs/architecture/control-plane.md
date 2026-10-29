@@ -84,6 +84,13 @@ kind ([The ingress](#the-ingress)).
 | `--mcp-allowed-origins` | none | the Origins `/mcp` accepts; empty refuses every request with an Origin |
 | `--pod-network` | empty | the pods' network ([The pods' mesh](#the-pods-mesh)): empty, routed, every node with a prefix of its network's; `mesh`, a ULA /64 drawn at the first start and kept in the database; or such a /64, `fdXX:XXXX:XXXX::/64` (a /48 stands for its /64 of subnet 0) |
 | `--apps-zone` | empty | the DNS zone of public environments' default hosts, `<label>.<zone>`, which `ferun-ingress` serves ([The ingress](#the-ingress)); empty: no hosts, and no environment can be made public |
+| `--edge-name` | empty | the name tenants' domains point at with a CNAME, such as `edge.fecode.dev`, which the operator publishes with the balancer's addresses ([Domains](#domains)); empty: domains are off |
+| `--edge-address` | none | an edge address beside what `--edge-name` resolves to, which a domain's A and AAAA records may name; repeatable |
+| `--domain-challenge-label` | `_ferun-challenge` | the label of a claim's TXT record, `<label>.<name>`; a lowercase DNS label that may hold `_` |
+| `--domain-grace` | `72h` | how long a record of a verified domain may answer wrong before the domain is deactivated |
+| `--domain-unverified-max` | 50 | the most claims a tenant may hold that are not verified |
+| `--domain-reserved` | none | a zone no domain may be or be under (the platform's own domain, where `run`, `id` and `edge` are), beside the apps zone and `--edge-name`; repeatable |
+| `--dns-resolver` | the system's resolvers (`/etc/resolv.conf`) | the DNS resolver, `host:port`, the domains' checks ask |
 | `--default-image` | `ghcr.io/maltej/debian-ai:latest` | the image of a sandbox created without one |
 | `--default-vcpus`, `--default-memory-mib` | 2, 512 | the size of a sandbox created without one |
 | `--placement` | `binpack` | or `spread` |
@@ -145,6 +152,7 @@ of `proto/` is in `go/gen/feos/<api>/v1` (`make go-gen`), the rest in
 | `seal` | AES-256-GCM sealing under `--secret-key-file`'s key: the bindings' credentials, the environments' secrets |
 | `env`, `env/spec`, `env/addons`, `env/ctl`, `env/envdeps` | the environments ([Environments](#environments)) |
 | `ingress/service`, `ingress/table` | ferund's side of the ingress: the API `ferun-ingress` calls, its identity, the table it serves from ([The ingress](#the-ingress)) |
+| `domains` | tenants' domains: claims, bindings, their checks, their states and incidents ([Domains](#domains)) |
 | `ingress/wire`, `routing` | shared with `ferun-ingress`: the ingress's protocol; path matching, which the route door uses too |
 | `api`, `auth`, `apierr` | the REST router, its auth classes and errors, human sign-in |
 | `ui` | the embedded build of `web/` |
@@ -201,7 +209,8 @@ replicate synchronously ([Operations](#operations)).
   caller](#calls-that-outlive-their-caller)); `0010_ingress.sql`, the
   ingress's tables and its columns of `pod_network`, `join_tokens`,
   `nodes`, `env_instances` and `environments` ([The
-  ingress](#the-ingress))) and
+  ingress](#the-ingress)); `0012_domains.sql`, the domains and their
+  incident conditions ([Domains](#domains))) and
   applied under an advisory lock, recorded in `schema_migrations`. The
   same locked section creates the cluster's MCP session key, reconciles
   `--pod-network` with the database's ([The pods'
@@ -224,7 +233,7 @@ replicate synchronously ([Operations](#operations)).
 | `ferun_watch` | a watch ID | a watch's paths, owner or result changed |
 | `ferun_cancel` | JSON | an exec, an MCP call or a keyed call (ADR 0023) is to be cancelled on whichever instance runs it |
 | `ferun_call` | a tool call's ID (`tool_calls.id`), or `*` for more than 256 | a keyed call left running: done, interrupted, not run |
-| `ferun_ingress` | `env:<uuid>`, `ingress:<name>`, `mesh`, or `*` | what the ingress's table shows changed: an environment's publicity, label, releases, deletion (its tenant's too), service instances or their admitted ports; an ingress instance's row or certificates; the mesh's peers; a node's admitted version of `ferun-ingress`, or more than 256 environments (`*`) |
+| `ferun_ingress` | `env:<uuid>`, `ingress:<name>`, `mesh`, or `*` | what the ingress's table shows changed: an environment's publicity, label, releases, deletion (its tenant's too), service instances or their admitted ports, a domain's binding or state (the environment it is or was bound to); an ingress instance's row or certificates; the mesh's peers; a node's admitted version of `ferun-ingress`, or more than 256 environments (`*`) |
 
 The tables: `instances`, `leases`, `cluster_secrets`; `tenants`,
 `tenant_tokens`; `nodes`, `node_telemetry` (the hot row, about a hundred
@@ -243,7 +252,8 @@ that outlive their caller](#calls-that-outlive-their-caller));
 `kube_bindings`, `ssh_bindings`; `auth_logins`, `ui_sessions`;
 `environments`, `env_releases`, `env_tags`, `env_secrets`,
 `env_instances`, `env_job_runs`, `env_attached`, `env_volumes`,
-`env_incidents`, `env_route_tokens` ([Environments](#environments)).
+`env_incidents`, `env_route_tokens` ([Environments](#environments));
+`domains` ([Domains](#domains)).
 Tokens are stored as SHA-256 hashes only, and shown once, at their
 creation.
 `placements`, which held the placement decisions and was written and read
@@ -304,6 +314,7 @@ audit is its activity row.
 | activity partitions | 1 h | keeps partitions for today and the next two days; drops those past retention |
 | sign-in clean-up | 10 min | deletes stale sign-ins and expired UI sessions |
 | `env-reconcile`, `env-probe`, `env-groups`, `env-volumes`, `env-delete` | 2 s, 1 s, 10 s, 30 s, 5 s | the environments' controller ([Environments](#the-controller)) |
+| `domains-check`, `domains-settle` | 5 s, 30 s | checks the domains that are due; settles the states that changed without a write of the domain's own; only while domains are on ([Domains](#domains)) |
 
 An outage or a stall of the database lets the first holds expire 20 s
 in (a hold's lease is 30 s, renewed every 10 s) and every hold after
@@ -1143,7 +1154,7 @@ The routes, bodies, status codes and texts are the sandbox system's;
 | Class | Routes | Credential |
 |---|---|---|
 | admin | `/api/v1/admin/…` | an admin's UI session (cookie), or Basic with `--admin-users` |
-| tenant | `/api/v1/sandboxes`, `/api/v1/sandboxes/{id}` (create, list, get, delete, pause, resume, tokens, access), `/api/v1/tools`, `/api/v1/environments[/…]` but the route door | a tenant's token |
+| tenant | `/api/v1/sandboxes`, `/api/v1/sandboxes/{id}` (create, list, get, delete, pause, resume, tokens, access), `/api/v1/tools`, `/api/v1/environments[/…]` but the route door, `/api/v1/domains[/…]` | a tenant's token |
 | sandbox | `/api/v1/sandboxes/{id}/…`: exec, files, dirs, search, fetch, processes, calls, watches, bindings | the sandbox's own token |
 | mcp | `/mcp` | the sandbox's token, with the door's own answers |
 | forward | `/fwd/…`, `/api/v1/sandboxes/{id}/ports/…` | the sandbox's token in `Authorization` alone ([ports](#ports)) |
@@ -2540,6 +2551,142 @@ port](#the-nodes-port), [api.md](api.md#the-ingresss-api)), from
   mesh's peers and `ferun-ingress`; a token pinned to its name joins it
   again.
 
+### Domains
+
+A domain ([ADR 0021](../adr/0021-ingress.md)) is a tenant's claim on one
+name, proven by a TXT record of the claim's token at
+`<--domain-challenge-label>.<name>`, bound to at most one environment of
+the tenant, and routed to the ingress by a CNAME to `--edge-name`, an
+ALIAS, or A and AAAA records of the edge's addresses. `internal/domains`
+holds the claims, their bindings, their checks, the states derived from
+them and the incidents of their environments. With `--edge-name` empty,
+domains are off: no claim is made, no check runs.
+
+**Not built yet: certificates**, and with them serving a domain. They
+come in a later step with the ingress. Until then a verified, bound and
+routed domain waits in `issuing`, the answer's `certificate` is always
+null, and the states `served`, `dns-moved` and `failed`, which the schema
+allows, do not occur.
+
+**The routes**, tenant class, JSON in camelCase. `{id}` is the domain's
+UUID; a domain of another tenant, or anything that is no UUID, is 404 "no
+such domain". `{env}` resolves as the environments' routes resolve it,
+by UUID or name.
+
+| Method and path | Answers |
+|---|---|
+| `POST /api/v1/domains` `{name, labels?}` | 201 the domain; 400 `invalid_name`; 422 `reserved`; 409 `too_many_unverified`, `domains_off` |
+| `GET /api/v1/domains?environment=<env>&label=k=v` | `{domains: [...]}`, oldest first, the labels ANDed; 404 "no such environment" |
+| `GET /api/v1/domains/{id}` | the domain |
+| `PUT /api/v1/domains/{id}/environment` `{environment}` | the domain, bound or moved; 400 without `environment`; 404 "no such environment"; 409 "environment X is being deleted"; 409 `superseded` |
+| `DELETE /api/v1/domains/{id}/environment` | the domain, unbound |
+| `POST /api/v1/domains/{id}/check` | the domain after one check now (its lookups bounded by 15 s, not cut when the caller leaves; a timeout is a failed lookup); 409 `domains_off` |
+| `DELETE /api/v1/domains/{id}` | 204 |
+
+- **A claim.** The name is trimmed, lowercased, loses one trailing dot,
+  and must be a host name of ASCII letters, digits and hyphens of at
+  least two labels whose last begins with a letter: no wildcard, no
+  address; an internationalized name is given as its A-label, and one in
+  Unicode is refused with that hint. The apps zone, `--edge-name` and
+  every `--domain-reserved` zone, and every name under them, are
+  reserved. Any number of claims may name one name, of one tenant or of
+  several; a tenant holds at most `--domain-unverified-max` claims that
+  are not verified (unverified, lapsed or superseded), counted under its
+  row's lock. The token is 32 characters of lowercase base32 from 160
+  random bits.
+- **A binding** is allowed before verification. A bind or a move sets
+  `bound_at`, clears `was_routed` and `dns_moved_since` (a new binding
+  starts no grace), resets the backoff and has the domain checked at
+  once; binding where it is bound changes nothing. An environment's
+  deletion unbinds its domains (`ON DELETE SET NULL`).
+- **The answer**: `id`, `name`, `labels`, `environment` (its UUID or
+  null), `verification`, `state`, `reason`, `records` (the TXT record's
+  `name` and `value`, the `cname` to set, the edge's `addresses`: what
+  `--edge-name` resolves to plus every `--edge-address`; `apex`, always
+  null, since ferund does not look up a name's zone and the owner picks
+  the CNAME or the addresses), `found` (what the last answer showed:
+  `txt`, `cname`, the canonical name when it differs from the name, for
+  information only, and `addresses`), `warnings` (`recordMissingSince`,
+  `dnsMovedSince`, `deactivatesAt`, the earlier of the two plus the grace,
+  and `checkFailing`, the last lookup's error), `certificate` (always
+  null for now), `createdAt`, `verifiedAt`, `boundAt`, `checkedAt`,
+  `nextCheckAt`. Times are RFC 3339 in seconds; one that is not there is
+  null. The answer's state is derived when it is read; the stored one may
+  lag behind an environment's deletion by a settle.
+
+**The state** is derived in one place (`domains.Derive`), the first rule
+that matches: not verified, its verification (`unverified`, `lapsed`,
+`superseded`); `unbound`; its environment not public or being deleted,
+`unpublished`; its routing grace run out, `inactive`; not routed,
+`waiting-for-dns` (also while a routing grace runs); else `issuing`,
+"certificates are not available yet: the ingress serves custom domains
+in a later step".
+
+**The checks.**
+
+- **The lookups** use Go's own resolver (`net.Resolver` with
+  `PreferGo`) over `--dns-resolver`, or over the system's resolvers
+  without it, with absolute names, so that no search domain is tried:
+  `LookupTXT` of the TXT record's name, `LookupIPAddr` of the name, and
+  `LookupCNAME` for `found.cname`. A recursive resolver answers from its
+  cache for a record's TTL: a record just set or removed, or a negative
+  answer cached before, may take minutes to count, also for `POST
+  …/check`. Nothing asks a zone's authoritative servers.
+- **When.** The loop `domains-check` takes up to 64 due domains
+  (`next_check_at <= now()`, never a superseded one) `FOR UPDATE SKIP
+  LOCKED`, moves their next check 5 minutes ahead as a lease, and checks 8
+  at once; the lookups run outside any transaction, and each result is
+  written in a short transaction that locks every claim of the name,
+  oldest first. An unverified or lapsed claim is checked after a backoff
+  from 60 s, doubling up to 3600 s, which `POST …/check` and a bind reset;
+  a verified one every hour, and every 15 minutes while a grace runs, the
+  last check at the grace's end.
+- **What counts.** Only an answer counts as wrong: NXDOMAIN or no TXT
+  record without the token, addresses that are not all the edge's. A
+  lookup that fails (a timeout, SERVFAIL or another error that is not
+  NotFound, no edge address known for comparing addresses) sets
+  `check_error` and `check_failing_since` and changes nothing else; what
+  it found before stays. A grace that ran out deactivates the domain at
+  its end all the same, since the state follows the time.
+- **The proof.** A claim whose token the TXT record shows is proven.
+  While no claim of the name is verified, or the verified one's token is
+  gone, the oldest unverified or lapsed claim shown becomes verified, and
+  the verified one, if any, `superseded` at once: its binding ends, its
+  environment gets `domain_superseded`. If the record shows the verified
+  claim's token beside others, it stays verified. A verified claim whose
+  token is gone and no other's shown starts its TXT grace
+  (`record_missing_since`); the token back ends it; at the grace's end
+  the claim lapses. A lapsed claim keeps its binding and is verified
+  again by its token unless another claim was verified meanwhile. A
+  superseded claim is not checked and cannot be bound; it is deleted and
+  claimed anew.
+- **The routing** is looked up for every claim but a superseded one: it
+  is routed when its name resolves to at least one address and every one
+  is an edge address, which covers a CNAME, an ALIAS and A records alike.
+  A bound domain routed once since its bind (`was_routed`) that is not
+  routed now starts its routing grace (`dns_moved_since`) when it is
+  verified; routed again ends it; at the grace's end it is `inactive`,
+  and stays verified and bound.
+- **Incidents** on the bound environment, object `domain/<name>`, on its
+  latest release: `domain_record_wrong` when a grace starts (which record
+  since when, and `deactivatesAt`; one incident for both records, its
+  summary rewritten), closed when no grace runs; `domain_deactivated`
+  when a grace ran out, closed when the domain is active again;
+  `domain_superseded`. A domain that leaves an environment closes its
+  open `domain_record_wrong` and `domain_deactivated` there.
+
+**Every write** of a domain goes through one step (settle): a TXT grace
+that ran out lapses the claim, the state is derived, a checked domain is
+rescheduled, the incidents follow, and the row is written. A change of
+the binding or the state sends `ferun_ingress` `env:<id>` for the
+environment before and after. The environments service runs the domains'
+hook in the transaction that changes an environment's publicity or marks
+it deleting, so that its domains' states follow at once. The loop
+`domains-settle` (30 s) settles what changed without a write of the
+domain's own, an environment's deletion or a publicity changed by
+another writer; it leaves a grace's end to the check due then, which
+first looks whether the record is right again.
+
 ## The activity log
 
 `activity` holds ferund's own rows (tool calls, ops, runs, state changes,
@@ -2771,6 +2918,11 @@ that dial the instances.
   ingress tokens and publish environments only once every instance runs
   a version with the ingress: an older instance issues a node's token
   whatever kind is asked, and its writes send no `ferun_ingress`.
+- **For domains**: `--edge-name` on every instance, its A and AAAA
+  records at the ingress's balancer (and `--edge-address` for addresses
+  it does not resolve to), the platform's own domain in
+  `--domain-reserved`; DNS from the instances to `--dns-resolver` (or the
+  system's resolvers), a resolver that resolves names on the internet.
 
 ### The CA ceremony
 

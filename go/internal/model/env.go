@@ -63,6 +63,14 @@ const (
 	// ConditionNamesUnserved: a pod of the object runs on a node whose
 	// feosd serves no names (it predates the NameService).
 	ConditionNamesUnserved = "names_unserved"
+	// The conditions of a domain bound to the environment (ADR 0021), on
+	// the object "domain/<name>": a record of it answers wrong and its
+	// grace runs (DomainRecordWrong), the grace ran out and it is no
+	// longer served (DomainDeactivated), another claim's token took its
+	// name (DomainSuperseded).
+	ConditionDomainRecordWrong = "domain_record_wrong"
+	ConditionDomainDeactivated = "domain_deactivated"
+	ConditionDomainSuperseded  = "domain_superseded"
 )
 
 // The states of an environment in the list (GET /api/v1/environments)

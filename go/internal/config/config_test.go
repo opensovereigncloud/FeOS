@@ -438,3 +438,57 @@ func TestAppsZone(t *testing.T) {
 		t.Fatalf("serve help lacks --apps-zone:\n%s", b.String())
 	}
 }
+
+// The domains' flags (ADR 0021): their defaults (domains off, the label
+// _ferun-challenge, a grace of 72 h, 50 unverified claims), their
+// variables, and what Validate refuses.
+func TestDomainFlags(t *testing.T) {
+	t.Parallel()
+	c, err := Parse([]string{"--database-url", testURL}, env(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.EdgeName != "" || c.EdgeAddresses != nil || c.DomainChallengeLabel != "_ferun-challenge" ||
+		c.DomainGrace != 72*time.Hour || c.DomainUnverifiedMax != 50 || c.DomainReserved != nil || c.DNSResolver != "" {
+		t.Fatalf("defaults %+v", c)
+	}
+	c, err = Parse([]string{"--database-url", testURL, "--edge-address", "194.11.242.65", "--edge-address",
+		"2001:db8::1,::ffff:10.0.0.1", "--domain-reserved", "fecode.dev,fecore.dev"}, env(map[string]string{
+		"FERUN_EDGE_NAME": "edge.fecode.dev", "FERUN_DOMAIN_CHALLENGE_LABEL": "_fecode-challenge",
+		"FERUN_DOMAIN_GRACE": "48h", "FERUN_DOMAIN_UNVERIFIED_MAX": "7", "FERUN_DNS_RESOLVER": "10.0.0.10:53",
+		"FERUN_DOMAIN_RESERVED": "ignored.dev",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantAddrs := []netip.Addr{netip.MustParseAddr("194.11.242.65"), netip.MustParseAddr("2001:db8::1"),
+		netip.MustParseAddr("10.0.0.1")}
+	if c.EdgeName != "edge.fecode.dev" || !reflect.DeepEqual(c.EdgeAddresses, wantAddrs) ||
+		c.DomainChallengeLabel != "_fecode-challenge" || c.DomainGrace != 48*time.Hour || c.DomainUnverifiedMax != 7 ||
+		!reflect.DeepEqual(c.DomainReserved, []string{"fecode.dev", "fecore.dev"}) || c.DNSResolver != "10.0.0.10:53" {
+		t.Fatalf("parsed %+v", c)
+	}
+	for _, bad := range [][]string{
+		{"--edge-name", "Edge.Fecode.Dev"}, {"--edge-name", "10.0.0.1"}, {"--edge-address", "edge.fecode.dev"},
+		{"--edge-address", "fe80::1%eth0"}, {"--domain-challenge-label", ""}, {"--domain-challenge-label", "-x"},
+		{"--domain-challenge-label", "_a.b"}, {"--domain-challenge-label", "_Ferun"}, {"--domain-grace", "0s"},
+		{"--domain-unverified-max", "0"}, {"--domain-reserved", "*.fecode.dev"}, {"--dns-resolver", "10.0.0.10"},
+		{"--dns-resolver", "::1:53"},
+	} {
+		if _, err := Parse(append([]string{"--database-url", testURL}, bad...), env(nil)); err == nil ||
+			!strings.Contains(err.Error(), strings.TrimPrefix(bad[0], "-")) {
+			t.Errorf("%q: %v", bad, err)
+		}
+	}
+	var b strings.Builder
+	Usage(&b, CmdServe)
+	for _, f := range []string{"--edge-name (FERUN_EDGE_NAME)", "--edge-address (FERUN_EDGE_ADDRESS)",
+		`--domain-challenge-label (FERUN_DOMAIN_CHALLENGE_LABEL, default "_ferun-challenge")`,
+		`--domain-grace (FERUN_DOMAIN_GRACE, default "72h0m0s")`,
+		`--domain-unverified-max (FERUN_DOMAIN_UNVERIFIED_MAX, default "50")`, "--domain-reserved (FERUN_DOMAIN_RESERVED)",
+		"--dns-resolver (FERUN_DNS_RESOLVER)"} {
+		if !strings.Contains(b.String(), f) {
+			t.Errorf("serve help lacks %s", f)
+		}
+	}
+}

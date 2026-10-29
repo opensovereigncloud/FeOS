@@ -62,6 +62,9 @@ type envOptions struct {
 	// environments builds the environments service on the test's
 	// database; nil: a fakeEnvs.
 	environments func(d *db.DB, st *store.Store) Environments
+	// domains builds the domains service on the test's database; nil: a
+	// fakeDomains.
+	domains func(d *db.DB, st *store.Store) Domains
 }
 
 // env is a test's API over a fresh database.
@@ -125,6 +128,11 @@ func newEnv(t *testing.T, o envOptions) *env {
 	} else {
 		e.envs = &fakeEnvs{}
 		deps.Environments = e.envs
+	}
+	if o.domains != nil {
+		deps.Domains = o.domains(d, st)
+	} else {
+		deps.Domains = fakeDomains{}
 	}
 	e.srv = newServer(cfg, deps)
 	e.h = e.srv.mux

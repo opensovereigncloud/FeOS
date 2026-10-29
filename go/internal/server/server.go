@@ -49,6 +49,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,6 +64,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/bindings"
 	"github.com/gardenlinux/feos/go/internal/config"
 	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/domains"
 	"github.com/gardenlinux/feos/go/internal/env"
 	"github.com/gardenlinux/feos/go/internal/fleet"
 	ingresssvc "github.com/gardenlinux/feos/go/internal/ingress/service"
@@ -154,6 +156,7 @@ type Instance struct {
 	Engine    *sandbox.Engine
 	Runner    *tools.Runner
 	Env       *env.Service
+	Domains   *domains.Service // ADR 0021
 	mcp       *mcpsrv.Server
 	Bindings  *bindings.Service
 	streams   Streams
@@ -326,6 +329,9 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	if streams != nil {
 		i.streams = streams(i)
 	}
+	if i.Domains, err = i.newDomains(); err != nil {
+		return nil, fmt.Errorf("domains: %w", err)
+	}
 	if i.Env, err = i.newEnvironments(key); err != nil {
 		return nil, fmt.Errorf("environments: %w", err)
 	}
@@ -333,7 +339,8 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	deps := api.Deps{
 		DB: i.DB, Store: i.Store, Engine: i.Engine, Elector: i.Elector, Conns: i.Links, Fleet: fl,
 		Tools: tools.NewREST(i.Runner), Specs: tools.Specs, MCP: i.mcp, Ports: i.streams.Ports,
-		Watches: i.streams.Watches, Bindings: i.Bindings, Environments: i.Env, Ingress: ing, Ready: i.ready,
+		Watches: i.streams.Watches, Bindings: i.Bindings, Environments: i.Env, Ingress: ing, Domains: i.Domains,
+		Ready: i.ready,
 	}
 	if ui.Built() {
 		deps.UI = ui.FS()
@@ -345,6 +352,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.Elector.Register(api.Loops(deps)...)
 	i.Elector.Register(i.streams.Loops...)
 	i.Elector.Register(i.Env.Loops()...)
+	i.Elector.Register(i.Domains.Loops()...)
 	i.Elector.Register(i.Runner.Loops()...)
 	i.handler = api.New(api.Config{
 		AdminUsers: cfg.AdminUsers, InstanceID: i.id, PreparationWaitMs: config.PreparationBudget.Milliseconds(),
@@ -397,13 +405,36 @@ func (i *Instance) newEnvironments(key []byte) (*env.Service, error) {
 	}
 	s, err := env.New(env.Deps{
 		InstanceID: i.id, DB: i.DB, Store: i.Store, Elector: i.Elector, Conns: i.Links, Engine: i.Engine,
-		Runner: runner, Ports: fwd, Sealer: sealer, AppsZone: i.cfg.AppsZone, Log: i.log,
+		Runner: runner, Ports: fwd, Sealer: sealer, AppsZone: i.cfg.AppsZone, EnvChanged: i.Domains.EnvChanged,
+		Log: i.log,
 	})
 	if err != nil {
 		return nil, err
 	}
 	i.Engine.SetSecretResolver(s.ResolveSecret)
 	i.Engine.SetPrepareHook(s.PrepareHook)
+	return s, nil
+}
+
+// newDomains builds the domains' core (ADR 0021): its checks ask
+// --dns-resolver, or the system's resolvers without it; the apps zone,
+// the edge's name and every --domain-reserved zone cannot be claimed.
+func (i *Instance) newDomains() (*domains.Service, error) {
+	cfg := i.cfg
+	reserved := slices.Clone(cfg.DomainReserved)
+	if cfg.AppsZone != "" {
+		reserved = append(reserved, cfg.AppsZone)
+	}
+	s, err := domains.New(domains.Config{
+		EdgeName: cfg.EdgeName, EdgeAddresses: cfg.EdgeAddresses, ChallengeLabel: cfg.DomainChallengeLabel,
+		Grace: cfg.DomainGrace, UnverifiedMax: cfg.DomainUnverifiedMax, Reserved: reserved, Log: i.log,
+	}, domains.Deps{Store: i.Store, Elector: i.Elector, DNS: domains.NewResolver(cfg.DNSResolver, 0)})
+	if err != nil {
+		return nil, err
+	}
+	if cfg.EdgeName == "" {
+		i.log.Info("domains are off: no --edge-name")
+	}
 	return s, nil
 }
 

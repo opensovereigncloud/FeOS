@@ -9,7 +9,8 @@
 //	admin     /api/v1/admin/…            an admin's UI session, or Basic (--admin-users)
 //	tenant    /api/v1/sandboxes[/{id}]   a tenant's token: create, list, delete,
 //	          /api/v1/tools              pause, resume, tokens, access; the
-//	          /api/v1/environments[/…]   environments (ADR 0018) but their door
+//	          /api/v1/environments[/…]   environments (ADR 0018) but their door;
+//	          /api/v1/domains[/…]        the domains (ADR 0021)
 //	sandbox   /api/v1/sandboxes/{id}/…   the sandbox's own token: everything that
 //	                                     acts inside the sandbox
 //	mcp       /mcp                       the MCP door's own class (internal/mcpsrv)
@@ -206,6 +207,8 @@ type Deps struct {
 	// Ingress issues join tokens of kind ingress and serves the ingress
 	// instances' admin routes; nil: they answer 503.
 	Ingress Ingress
+	// Domains serves the domain routes; nil: none are registered.
+	Domains Domains
 	// UI is the built management UI; nil: none.
 	UI fs.FS
 	// Ready is /readyz (§11): server's check of the database, stopping,
@@ -428,6 +431,10 @@ func (s *server) routes() []route {
 
 	// The environments (ADR 0018): the tenant's, and their route door.
 	s.envRoutes(add)
+
+	// The domains (ADR 0021): the tenant's claims on names, and their
+	// bindings to its environments.
+	s.domainRoutes(tenant)
 
 	// The doors with classes of their own: their answers are plain text
 	// (forward) or the MCP door's, not this API's JSON.

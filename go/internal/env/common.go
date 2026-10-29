@@ -93,6 +93,17 @@ func wake(ctx context.Context, tx *store.Store, hints ...string) error {
 	return nil
 }
 
+// envChanged runs the EnvChanged hook in tx, when there is one.
+func (s *Service) envChanged(ctx context.Context, tx *store.Store, id uuid.UUID) error {
+	if s.d.EnvChanged == nil {
+		return nil
+	}
+	if err := s.d.EnvChanged(ctx, tx, id); err != nil {
+		return fmt.Errorf("the domains of environment %s: %w", id, err)
+	}
+	return nil
+}
+
 // parseStored reads a stored (normalised) spec.
 func parseStored(raw json.RawMessage) (*spec.Spec, error) {
 	var sp spec.Spec

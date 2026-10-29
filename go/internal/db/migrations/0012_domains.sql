@@ -15,15 +15,11 @@
 -- --domain-grace has passed deactivates the domain: lapsed, or inactive.
 -- A failed lookup (check_error) is no wrong answer and starts no grace.
 --
--- Certificates come from ACME (HTTP-01 through the ingress's table):
--- domain_certs holds a domain's current certificate with its key sealed
--- under --secret-key-file (additional data: 'domain-cert:' || domain_id),
--- acme_accounts the platform's account per directory, acme_challenges the
--- HTTP-01 answers every ingress instance serves on port 80 while an order
--- is pending.
+-- Certificates, and with them serving a domain, come in a later step
+-- with the ingress: a routed domain waits in issuing until then.
 --
 -- Additive: an instance of the previous version, which a rolling deploy
--- runs beside this one, never reads the new tables; the incident
+-- runs beside this one, never reads the new table; the incident
 -- conditions it writes stay allowed.
 
 CREATE TABLE domains (
@@ -51,24 +47,18 @@ CREATE TABLE domains (
   checked_at timestamptz,                      -- the last check that got an answer
   check_error text NOT NULL DEFAULT '',        -- the last lookup's failure; '' when it got an answer
   check_failing_since timestamptz,             -- lookups have failed since (no answer); NULL: the last one answered
-  apex boolean,                                -- the name is its zone's apex (SOA); NULL: not known yet
+  apex boolean,                                -- unused: ferund does not look up a name's zone
   found jsonb NOT NULL DEFAULT '{}',           -- what the last answer showed: {txt: [...], cname: [...], addresses: [...]}
   routed boolean NOT NULL DEFAULT false,       -- the last answer resolved the name to the edge
   was_routed boolean NOT NULL DEFAULT false,   -- it has resolved to the edge since it was last bound: a wrong answer now starts a grace
   record_missing_since timestamptz,            -- a verified domain's TXT has answered wrong since: its grace
   dns_moved_since timestamptz,                 -- a routed domain's name has resolved elsewhere since: its grace
 
-  -- the serving state, kept by ferund from the columns above and the certificate
+  -- the serving state, kept by ferund from the columns above and the environment
   state text NOT NULL DEFAULT 'unverified'
     CHECK (state IN ('unverified','lapsed','superseded','unbound','unpublished','waiting-for-dns',
                      'issuing','served','dns-moved','inactive','failed')),
   reason text NOT NULL DEFAULT '',             -- why failed, or what a state waits for
-
-  -- issuing
-  next_issue_at timestamptz,                   -- the next order may start then; NULL: now
-  issue_backoff_s integer NOT NULL DEFAULT 0 CHECK (issue_backoff_s >= 0),   -- 0: no failure; else 3600 s doubling to 86400 s
-  issue_error text NOT NULL DEFAULT '',        -- the last order's failure
-  issue_failing_since timestamptz,             -- orders (or renewals) have failed since
 
   CHECK (verification <> 'verified' OR verified_at IS NOT NULL),
   CHECK ((env_id IS NULL) OR (bound_at IS NOT NULL)));
@@ -78,34 +68,8 @@ CREATE INDEX domains_owner ON domains(owner, created_at);
 CREATE INDEX domains_env ON domains(env_id, bound_at) WHERE env_id IS NOT NULL;
 CREATE INDEX domains_next_check ON domains(next_check_at);
 
-CREATE TABLE domain_certs (                    -- a domain's current certificate; replaced on renewal
-  domain_id uuid PRIMARY KEY REFERENCES domains(id) ON DELETE CASCADE,
-  chain bytea[] NOT NULL CHECK (cardinality(chain) >= 1),   -- DER, leaf first
-  key_sealed bytea NOT NULL,                   -- PKCS#8 DER, sealed with aad 'domain-cert:' || domain_id
-  not_before timestamptz NOT NULL,
-  not_after timestamptz NOT NULL,
-  renew_after timestamptz NOT NULL,            -- two thirds of its lifetime
-  issued_at timestamptz NOT NULL DEFAULT now(),
-  serial text NOT NULL);                       -- lowercase hex
-
-CREATE TABLE acme_accounts (                   -- the platform's ACME account, one per directory
-  directory text PRIMARY KEY,                  -- the directory URL
-  key_sealed bytea NOT NULL,                   -- the account key, PKCS#8 DER, sealed with aad 'acme-account:' || directory
-  uri text NOT NULL DEFAULT '',                -- the account's URL at the CA
-  email text NOT NULL DEFAULT '',
-  created_at timestamptz NOT NULL DEFAULT now());
-
-CREATE TABLE acme_challenges (                 -- HTTP-01 answers the ingress serves on port 80
-  token text PRIMARY KEY CHECK (token ~ '^[A-Za-z0-9_-]+$' AND length(token) <= 256),   -- (a regex counts to 255 at most)
-  host text NOT NULL,                          -- the domain's name: the answer is given for this host alone
-  key_auth text NOT NULL,                      -- the body of the answer
-  domain_id uuid REFERENCES domains(id) ON DELETE CASCADE,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  expires_at timestamptz NOT NULL);            -- gone from the table after this, whatever the order did
-CREATE INDEX acme_challenges_expires ON acme_challenges(expires_at);
-
 ALTER TABLE env_incidents DROP CONSTRAINT env_incidents_condition_check;
 ALTER TABLE env_incidents ADD CONSTRAINT env_incidents_condition_check
   CHECK (condition IN ('rollout_failed','crash_loop','job_failed','no_capacity',
      'addon_unhealthy','volume_unavailable','attach_failed','names_unserved',
-     'domain_record_wrong','domain_deactivated','domain_superseded','certificate_failing'));
+     'domain_record_wrong','domain_deactivated','domain_superseded'));

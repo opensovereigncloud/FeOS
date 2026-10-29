@@ -104,6 +104,9 @@ func (s *Service) DeleteEnv(ctx context.Context, tenant, env string) error {
 		if _, err := tx.UpdateEnvironment(ctx, e, after); err != nil {
 			return err
 		}
+		if err := s.envChanged(ctx, tx, e.ID); err != nil {
+			return err
+		}
 		return wake(ctx, tx, ctl.LoopDelete, ctl.HintReconcile)
 	})
 }

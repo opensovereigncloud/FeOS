@@ -164,6 +164,28 @@ type Config struct {
 	// which ferun-ingress serves (ADR 0021); empty: no hosts, and no
 	// environment can be public.
 	AppsZone string
+	// EdgeName is the name tenants' domains point at with a CNAME (ADR
+	// 0021), such as edge.fecode.dev, which the operator publishes with the
+	// balancer's addresses; empty: domains are off.
+	EdgeName string
+	// EdgeAddresses are edge addresses beside what EdgeName resolves to:
+	// what a domain's A and AAAA records may name.
+	EdgeAddresses []netip.Addr
+	// DomainChallengeLabel is the label of a claim's TXT record,
+	// <label>.<name>.
+	DomainChallengeLabel string
+	// DomainGrace is how long a record of a verified domain may answer
+	// wrong before the domain is deactivated.
+	DomainGrace time.Duration
+	// DomainUnverifiedMax is the most claims a tenant may hold that are
+	// not verified.
+	DomainUnverifiedMax int
+	// DomainReserved are zones no domain may be or be under, beside the
+	// apps zone and the edge's name: the platform's own domain.
+	DomainReserved []string
+	// DNSResolver is the resolver (host:port) the domains' checks ask;
+	// empty: the system's resolvers (/etc/resolv.conf).
+	DNSResolver string
 
 	DefaultImage     string
 	DefaultVCPUs     int
@@ -256,6 +278,9 @@ func Default() Config {
 		ShutdownGrace:          11 * time.Minute,
 		ActivityRetention:      720 * time.Hour,
 		TrafficRetention:       168 * time.Hour,
+		DomainChallengeLabel:   "_ferun-challenge",
+		DomainGrace:            72 * time.Hour,
+		DomainUnverifiedMax:    50,
 		LogLevel:               slog.LevelInfo,
 		ReadinessDelay:         ReadinessDelay,
 		ReadyWindow:            ReadyWindow,
@@ -332,6 +357,20 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 		"the pods' network: empty, routed (every node a prefix of its network's); mesh, a ULA /64 drawn once and kept in the database; or such a /64 (fdXX:XXXX:XXXX::/64)")
 	fs.StringVar(&c.AppsZone, "apps-zone", c.AppsZone,
 		"the DNS zone of public environments' default hosts, served by ferun-ingress (ADR 0021); empty: no hosts, and no environment can be public")
+	fs.StringVar(&c.EdgeName, "edge-name", c.EdgeName,
+		"the name tenants' domains point at with a CNAME (ADR 0021), e.g. edge.fecode.dev; empty: domains are off")
+	fs.Var((*addrList)(&c.EdgeAddresses), "edge-address",
+		"an edge address beside what --edge-name resolves to, which a domain's A and AAAA records may name; comma-separated or repeated")
+	fs.StringVar(&c.DomainChallengeLabel, "domain-challenge-label", c.DomainChallengeLabel,
+		"the label of a domain claim's TXT record, <label>.<name>")
+	fs.DurationVar(&c.DomainGrace, "domain-grace", c.DomainGrace,
+		"how long a record of a verified domain may answer wrong before the domain is deactivated")
+	fs.IntVar(&c.DomainUnverifiedMax, "domain-unverified-max", c.DomainUnverifiedMax,
+		"the most domain claims a tenant may hold that are not verified")
+	fs.Var((*listValue)(&c.DomainReserved), "domain-reserved",
+		"a zone no domain may be or be under (the platform's own domain), beside the apps zone and --edge-name; comma-separated or repeated")
+	fs.StringVar(&c.DNSResolver, "dns-resolver", c.DNSResolver,
+		"the DNS resolver (host:port) the domains' checks ask; empty: the system's resolvers (/etc/resolv.conf)")
 	fs.StringVar(&c.DefaultImage, "default-image", c.DefaultImage, "image of a sandbox created without one")
 	fs.IntVar(&c.DefaultVCPUs, "default-vcpus", c.DefaultVCPUs, "vCPUs of a sandbox created without a size")
 	fs.IntVar(&c.DefaultMemoryMiB, "default-memory-mib", c.DefaultMemoryMiB, "memory (MiB) of a sandbox created without a size")
@@ -452,6 +491,28 @@ func (c *Config) Validate() error {
 			bad("--apps-zone: %w", err)
 		}
 	}
+	if c.EdgeName != "" {
+		if err := pki.ValidateDomain(c.EdgeName); err != nil {
+			bad("--edge-name: %w", err)
+		}
+	}
+	for _, z := range c.DomainReserved {
+		if err := pki.ValidateDomain(z); err != nil {
+			bad("--domain-reserved: %w", err)
+		}
+	}
+	if !isChallengeLabel(c.DomainChallengeLabel) {
+		bad("--domain-challenge-label %q is not a DNS label (lowercase letters, digits, '-' and '_', at most 63, "+
+			"not beginning or ending with '-')", c.DomainChallengeLabel)
+	}
+	if c.DomainUnverifiedMax < 1 {
+		bad("--domain-unverified-max must be at least 1")
+	}
+	if c.DNSResolver != "" {
+		if _, _, err := splitHostPort(c.DNSResolver); err != nil {
+			bad("--dns-resolver %q is not host:port: %v", c.DNSResolver, err)
+		}
+	}
 	if c.DefaultImage == "" {
 		bad("--default-image must not be empty")
 	}
@@ -489,6 +550,7 @@ func (c *Config) Validate() error {
 		{"node-cert-ttl", c.NodeCertTTL}, {"pod-cert-ttl", c.PodCertTTL}, {"conn-drain-timeout", c.ConnDrainTimeout},
 		{"hibernate-timeout", c.HibernateTimeout},
 		{"activity-retention", c.ActivityRetention}, {"traffic-retention", c.TrafficRetention},
+		{"domain-grace", c.DomainGrace},
 	}
 	for _, d := range positive {
 		if d.v <= 0 {
@@ -613,6 +675,50 @@ func (l *listValue) Set(v string) error {
 		if s = strings.TrimSpace(s); s != "" {
 			*l = append(*l, s)
 		}
+	}
+	return nil
+}
+
+// isChallengeLabel reports whether s is a label of a TXT record's name:
+// lowercase letters, digits, hyphens and underscores (_ferun-challenge),
+// 1 to 63 of them, not beginning or ending with a hyphen.
+func isChallengeLabel(s string) bool {
+	if len(s) < 1 || len(s) > 63 || s[0] == '-' || s[len(s)-1] == '-' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// addrList is a flag of IP addresses, comma-separated, repeatable.
+type addrList []netip.Addr
+
+func (l *addrList) String() string {
+	out := make([]string, len(*l))
+	for i, a := range *l {
+		out[i] = a.String()
+	}
+	return strings.Join(out, ",")
+}
+
+func (l *addrList) Set(v string) error {
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		a, err := netip.ParseAddr(s)
+		if err != nil {
+			return err
+		}
+		if a.Zone() != "" {
+			return fmt.Errorf("%q has a zone", s)
+		}
+		*l = append(*l, a.Unmap())
 	}
 	return nil
 }

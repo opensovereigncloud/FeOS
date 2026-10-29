@@ -48,6 +48,9 @@ func (s *Service) SetPublic(ctx context.Context, tenant, env string, public bool
 		if err != nil || before.Public == public {
 			return err
 		}
+		if err := s.envChanged(ctx, tx, before.ID); err != nil {
+			return err
+		}
 		return wake(ctx, tx, ctl.HintReconcile, ctl.HintGroups)
 	})
 	if err != nil {

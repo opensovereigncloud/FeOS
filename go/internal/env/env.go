@@ -67,6 +67,11 @@ type Deps struct {
 	// made public.
 	AppsZone string
 	Log      *slog.Logger
+	// EnvChanged runs in the transaction that changed an environment's
+	// publicity or marked it deleting, with its row locked: the domains
+	// bound to it derive their states again (internal/domains). nil:
+	// nothing runs.
+	EnvChanged func(ctx context.Context, tx *store.Store, envID uuid.UUID) error
 }
 
 // Service is the environments service of one instance.
