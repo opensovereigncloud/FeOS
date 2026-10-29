@@ -13,7 +13,7 @@ what FeOS needs (ublk, tun, vhost-vsock, WireGuard, nftables).
 |---|---|---|
 | [`feos/`](feos/) | namespace `feos`, the DaemonSet `feos-node` on every worker of the pool `WORKER_POOL`, and `feos-k8s` | diskd and feosd in a pod per worker, whose microVMs live in it (ADR 0020); feos-k8s joins new workers and drains cordoned ones in FeRun |
 | [`ferun/`](ferun/) | namespace `ferun` | ferund, three instances, one on each worker, and its PostgreSQL `ferun-db`, a CloudNativePG cluster of three instances, one on each worker ([`ferun/postgres.yaml`](ferun/postgres.yaml)); the k3s manifests of ferund ([`../k3s/ferun`](../k3s/ferun)) with the nodes' port at a shoot address; `https://run.<DOMAIN>` by the HTTPRoute [`ferun/route.yaml`](ferun/route.yaml) in place of k3s's Ingress |
-| [`ferun-ingress/`](ferun-ingress/) | namespace `ferun-ingress` | ferun-ingress, two instances on two of the workers, behind a LoadBalancer of their own: `https://<label>.<APPS_ZONE>`, public environments' hosts, straight to their pods over the mesh ([The ingress](#the-ingress)) |
+| [`ferun-ingress/`](ferun-ingress/) | namespace `ferun-ingress` | ferun-ingress, an instance on every worker, behind a LoadBalancer of their own with `externalTrafficPolicy: Local`: `https://<label>.<APPS_ZONE>`, public environments' hosts, straight to their pods over the mesh ([The ingress](#the-ingress)) |
 | [`../k3s/fechat`](../k3s/fechat), [`fechat/`](fechat/) | namespace `fechat` | FeChat, unchanged but for its route: `https://chat.<DOMAIN>` by the HTTPRoute [`fechat/route.yaml`](fechat/route.yaml) in place of k3s's Ingress |
 | [`registry/`](registry/) | namespace `registry` | an image registry, `https://oci.<DOMAIN>`: distribution with its blobs in an object store |
 | [`cluster.yaml`](cluster.yaml) | | the issuer `letsencrypt-prod` the Gateway's certificates and ferun-ingress's name, answering DNS-01 |
@@ -60,7 +60,7 @@ address, ferun-ingress's.
   ([`cluster.yaml`](cluster.yaml) says where another provider goes), and
   the zone that holds `APPS_ZONE` there too, for its wildcard.
 - A second public address, ferun-ingress's LoadBalancer, and a volume
-  of 1 GiB for each of its two instances.
+  of 1 GiB for each of its instances, one per worker.
 - An S3-compatible object store: a bucket for diskd, which the pods
   hibernate into, and one for the registry.
 - An OpenID Connect provider, at which people sign in to ferund and
@@ -213,8 +213,8 @@ ingress](#the-ingress).
 ferun-ingress (ADR 0021) serves public environments' hosts,
 `<label>.<APPS_ZONE>`, straight to their pods: the StatefulSet
 `ferun-ingress` of [`ferun-ingress/`](ferun-ingress/ferun-ingress.yaml),
-two instances on two of the workers, behind a LoadBalancer of their own
-beside Traefik's. An instance joins ferund once, as a node does, and keeps
+an instance on every worker, behind a LoadBalancer of their own beside
+Traefik's. An instance joins ferund once, as a node does, and keeps
 its identity, its mesh key and a copy of the routing table on its volume;
 ferund streams the table to it over the nodes' port, and it reaches the
 pods as a peer on the mesh. Its program ships in ferund's image
@@ -234,10 +234,11 @@ apps zone (an older one issues node tokens whatever kind is asked) and
 `APPS_ZONE` in `config.env` applied (`apply-ferun`). Keep the tokens out
 of the repository.
 
-1. A join token for each instance, one-time, pinned to its name, for
+1. A join token for each instance, one per worker (`replicas` in the
+   manifest, three on the shoot), one-time, pinned to its name, for
    24 h, through ferund's CLI:
 
-       for n in 0 1; do
+       for n in 0 1 2; do
          kubectl -n ferun exec deploy/ferund -- /ferund join-token --kind ingress --node ferun-ingress-$n --ttl 24h
        done
 
@@ -254,7 +255,8 @@ of the repository.
        kubectl create namespace ferun-ingress
        kubectl -n ferun-ingress create secret docker-registry oci-pull ...
        kubectl -n ferun-ingress create secret generic ferun-ingress-join \
-         --from-literal=ferun-ingress-0=<token> --from-literal=ferun-ingress-1=<token>
+         --from-literal=ferun-ingress-0=<token> --from-literal=ferun-ingress-1=<token> \
+         --from-literal=ferun-ingress-2=<token>
 
 3. The manifests. cert-manager issues the wildcard `*.<APPS_ZONE>` into
    `apps-wildcard-tls` through the issuer's DNS-01, whose token must edit
@@ -279,7 +281,7 @@ of the repository.
    runs: the instances may dial only ferund's pods and `FERUN_NODES_IP`
    on 7443 (the NetworkPolicy `ferun-ingress-egress`), so check that
    ferund's pods are `app: ferund` in `ferun`. `GET
-   /api/v1/admin/ingresses` lists both, joined and connected.
+   /api/v1/admin/ingresses` lists them all, joined and connected.
 
 Afterwards:
 
@@ -287,18 +289,30 @@ Afterwards:
   deploy/gardener deploy-ferund`), then `make -C deploy/gardener
   deploy-ferun-ingress`, which replaces one instance at a time, each once
   the new one has been ready for 10 s. A stopping instance serves on for
-  10 s with `/readyz` failing, then finishes its requests.
-- **The balancer** has `externalTrafficPolicy: Cluster`. IronCore's load
-  balancer checks no node's health ([A lost worker](#a-lost-worker)), and
-  with `Local` the worker without an instance would drop its share of
-  connections, a third on three workers, all the time, and a worker
-  whose instance restarts or was drained another third during every
-  rollout. The cost: apps see a worker's address in `X-Forwarded-For`,
-  not the client's, until the PROXY protocol (ADR 0021).
+  10 s with `/readyz` failing, then finishes its requests. While one
+  restarts, its worker's share of new connections waits (the balancer
+  below): about 20 s per instance on 2026-10-29, which the clients' SYN
+  retries bridge as a delay.
+- **The balancer** has `externalTrafficPolicy: Local`, so that a worker
+  passes a connection only to its own instance without rewriting its
+  source: the instances see the client's address and put it into
+  `X-Forwarded-For`. With `Cluster`, kube-proxy would rewrite it to the
+  worker's. IronCore's load balancer is direct server return, so it can
+  add no PROXY protocol, and it checks no node's health ([A lost
+  worker](#a-lost-worker)): it sends every worker its share. Hence an
+  instance on every worker, never two on one (required anti-affinity),
+  and none on a worker with the label
+  `node.kubernetes.io/exclude-from-external-load-balancers`, the label
+  that takes a worker out of the balancer once IronCore's cloud
+  controller honours it; until then no worker may carry it. A worker
+  without an instance drops its share: one more worker takes one more
+  replica and its token (steps 1 and 2) before it serves. Health checks
+  of the balancer (ironcore#1584) would end the gaps of restarts and
+  drains.
 - **Never force-delete a pod** (`--force`, `--grace-period=0`): its name
   is its identity, and two processes with one identity make WireGuard
   flap between them. A lost worker's instance stays Terminating until
-  Gardener deletes the Node; the other instance serves meanwhile, all
+  Gardener deletes the Node; the other instances serve meanwhile, all
   but the lost worker's share of new connections ([A lost
   worker](#a-lost-worker)).
 - **A lost identity** (`identityRemoved` in the status, after `DELETE

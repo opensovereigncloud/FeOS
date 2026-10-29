@@ -807,9 +807,9 @@ larger than the one it sits in has no effect.
 - **HTTP/2**: at most 63 streams per connection (Go's default is 250);
   further streams are refused.
 - **Not bounded yet**, the known limits:
-  - client connections per client address. Behind a balancer with
-    `externalTrafficPolicy: Cluster` the ingress sees a worker's
-    address; a cap per client waits for the PROXY protocol;
+  - client connections per client address. Behind the shoot's
+    balancer, with `externalTrafficPolicy: Local`, the ingress sees the
+    client's address, so a cap per client can be built;
   - the number of environments a tenant may make public. Every instance
     of the ingress holds every entry of the table, up to 2 MiB each
     coded ([What it holds](#what-it-holds)), and every `ferund` with a
@@ -1017,14 +1017,16 @@ On the Gardener shoot
 [README](../../deploy/gardener/README.md#the-ingress)), in the namespace
 `ferun-ingress`:
 
-- **A StatefulSet of 2**, `ferun-ingress-0` and `-1`, with the headless
+- **A StatefulSet of one instance per worker**, `ferun-ingress-0` to
+  `-2` on the shoot's three, with the headless
   Service `ferun-ingress-pods`: a volume of 1 GiB per instance at
   `/var/lib/ferun-ingress`, so that the identity, the /96 and the cache
   survive restarts and no subnet is spent per pod; `Parallel` pod
-  management, rolling one at a time with `minReadySeconds: 10`; the
-  instances on different workers (topology spread, `maxSkew: 1`,
-  `DoNotSchedule`, taints honoured); a PodDisruptionBudget of
-  `maxUnavailable: 1` that lets an unhealthy pod be evicted.
+  management, rolling one at a time with `minReadySeconds: 10`; never
+  two instances on one worker (required pod anti-affinity) and none on a
+  worker labelled `node.kubernetes.io/exclude-from-external-load-balancers`
+  (the balancer below); a PodDisruptionBudget of `maxUnavailable: 1`
+  that lets an unhealthy pod be evicted.
 - **The container** runs `/ferun-ingress serve` from ferund's image as
   root with `NET_ADMIN` alone, a read-only root filesystem, no
   privilege escalation and the runtime's default seccomp profile
@@ -1041,21 +1043,26 @@ On the Gardener shoot
 - **The init container** runs `/ferun-ingress prepare`, privileged and as
   root, since the image's user is not; a privileged container runs
   without a seccomp profile. It alone mounts the optional
-  Secret `ferun-ingress-join` with both instances' tokens, and copies the
+  Secret `ferun-ingress-join` with every instance's token, and copies the
   pod's own, the key `$(POD_NAME)`, to `/join/token`: the instance, which
-  faces the internet, never sees the other's token, which would let it
+  faces the internet, never sees another's token, which would let it
   take that identity over with a join again. The copy is made at the
   pod's start, so a token put into the Secret later takes a deletion of
   the pod.
 - **The certificate** `apps-wildcard`, `*.${APPS_ZONE}`, from
   cert-manager's DNS-01 issuer into the Secret `apps-wildcard-tls`.
 - **The balancer**, the Service `ferun-ingress` of type `LoadBalancer`
-  (80 → 8080, 443 → 8443), with `externalTrafficPolicy: Cluster`:
-  IronCore's balancer checks no node's health, and with `Local` a worker
-  without an instance would drop its share of new connections all the
-  time, and one whose instance restarts during every rollout. Apps
-  therefore see a worker's address in `X-Forwarded-For` until the PROXY
-  protocol (ADR 0021's open question).
+  (80 → 8080, 443 → 8443), with `externalTrafficPolicy: Local`: a
+  worker passes a connection only to its own instance, without
+  rewriting its source, so the instance sees the client's address and
+  `X-Forwarded-For` carries it; `Cluster` would rewrite it to the
+  worker's. IronCore's balancer is direct server return (the packet
+  reaches the worker unchanged, the answer leaves it straight to the
+  client), so it can add no PROXY protocol, and it checks no node's
+  health: it sends every worker its share, which is why every worker
+  runs an instance. A worker whose instance restarts drops its share of
+  new connections until the new one is ready (about 20 s on 2026-10-29),
+  which the clients' SYN retries turn into a delay.
 - **Two NetworkPolicies.** `ferun-ingress` lets 8080 and 8443 in from
   anywhere, and the health port and UDP 51820 only from the workers'
   network (`NODE_CIDR`). `ferun-ingress-egress` lets the instances dial
@@ -1162,7 +1169,7 @@ open question.
 |---|---|---|
 | A `ferund` instance crashes | The stream breaks (a reset, or keepalive after 15 + 5 s). The agent connects to another address or instance and gets a whole table, serving from memory meanwhile. Held requests ask again for a wake every 5 s; another engine takes the op over once its owner is dead. Holds stay valid and renew through the new instance. | stale for about 20 s; no request lost |
 | `ferund` rolls | Stopping instances refuse new ingress connections and end their streams; older instances close the ALPN; the 5 s backstop covers their writes. | seconds |
-| An ingress instance restarts or crashes | Kubernetes takes it out of the balancer by readiness, and the other instance serves. Its identity and /96 persist; its new pod address reaches the nodes through Hello and `mesh-peers`. It serves the cache at once and is ready once the nodes' handshakes are fresh. A crash leaves its holds to lapse (30 s), and without `left_at` the fence keeps public services awake for up to 15 minutes. | the other instance serves |
+| An ingress instance restarts or crashes | Kubernetes takes it out of the endpoints by readiness; its worker's share of new connections waits until it is ready again, since the balancer sends every worker its share and `Local` keeps a worker to its own instance (the clients' SYN retries bridge it), and the other instances serve the other workers' shares. Its identity and /96 persist; its new pod address reaches the nodes through Hello and `mesh-peers`. It serves the cache at once and is ready once the nodes' handshakes are fresh. A crash leaves its holds to lapse (30 s), and without `left_at` the fence keeps public services awake for up to 15 minutes. | its worker's share waits for it, about 20 s |
 | A force-deleted ingress pod | Two processes may use one key and address, and WireGuard flaps between their endpoints. | until one dies |
 | A database failover | The builders' reads fail and the snapshots stay; streams go on. After 30 s unhealthy the streams end and the agents try other instances. Join, Hello, renewal and Hold fail: holds lapse, but the fence starts only 45 s after `last_seen`. | the data path is unaffected |
 | The ingress cut off from `ferund` | The cached table is served. No wakes: held requests time out with 503. Holds lapse after 30 s, but the fence keeps public services from idling for 15 minutes; after that, a request to a paused instance waits until its client gives up. | 15 minutes |

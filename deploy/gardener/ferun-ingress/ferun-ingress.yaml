@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ferun-ingress on the Gardener shoot (ADR 0021, deploy/gardener/README.md,
-# The ingress): two instances behind a LoadBalancer of their own, beside
-# Traefik, which goes on serving the platform's hosts. Each instance holds
+# The ingress): an instance on every worker the balancer sends to, behind
+# a LoadBalancer of their own, beside Traefik, which goes on serving the
+# platform's hosts. Each instance holds
 # ferund's routing table, is a peer on the pods' mesh, and proxies
 # https://<label>.${APPS_ZONE} straight to the pods. Its program ships in
 # ferund's image (/ferun-ingress). The ${...} are the deployment's
@@ -12,13 +13,14 @@
 #   make -C deploy/gardener apply-ferun-ingress
 #
 # Secrets the operator makes in the namespace, before the pods start:
-#   ferun-ingress-join  the keys ferun-ingress-0 and ferun-ingress-1: a
-#                       one-time join token of kind ingress pinned to each
-#                       name, feos-ingress-join-<secret>.<pin> (ferund
+#   ferun-ingress-join  a key per instance, ferun-ingress-0 to
+#                       ferun-ingress-<replicas - 1>: a one-time join
+#                       token of kind ingress pinned to each name,
+#                       feos-ingress-join-<secret>.<pin> (ferund
 #                       join-token --kind ingress --node <name>). Only the
 #                       init container mounts it, and copies the pod's own
 #                       key into a memory volume that the instance reads:
-#                       no instance sees the other's token. The copy is
+#                       no instance sees another's token. The copy is
 #                       made when the pod starts, so a token put in later
 #                       takes a deletion of the pod (never forced). Read
 #                       only while an instance keeps no valid certificate;
@@ -78,16 +80,19 @@ spec:
       port: 9090
       targetPort: health
 ---
-# The public address of the apps zone. IronCore's load balancer checks no
-# node's health (README.md, A lost worker): it sends every worker its
-# share. With externalTrafficPolicy Local, the worker without an instance
-# would drop that share, a third of the new connections on three
-# workers, all the time, and a worker whose instance is restarting or
-# drained another third during every rollout; Cluster lets each worker
-# pass it to a ready instance on any, at the cost of the client's address
-# (X-Forwarded-For carries a worker's) until the PROXY protocol (ADR
-# 0021, open questions). Behind a balancer that checks the nodes'
-# health (healthCheckNodePort), Local keeps the client's address.
+# The public address of the apps zone, with externalTrafficPolicy Local:
+# a worker passes a connection only to an instance of its own, without
+# rewriting its source, so the instance sees the client's address and
+# sets X-Forwarded-For from it. With Cluster, kube-proxy rewrites the
+# source to the worker's address. IronCore's load balancer is direct
+# server return (the packet reaches the worker unchanged, and the answer
+# leaves it straight to the client), so no PROXY protocol can come from
+# it, and it checks no node's health (README.md, A lost worker): it sends
+# every worker of the cluster its share. Hence an instance on every
+# worker it sends to (the StatefulSet below). While one restarts, its
+# worker's share of new connections waits, and the clients' SYN retries
+# reach the instance once it is ready. A balancer that checks the nodes'
+# health (healthCheckNodePort, ironcore#1584) closes that gap.
 apiVersion: v1
 kind: Service
 metadata:
@@ -95,7 +100,7 @@ metadata:
   namespace: ferun-ingress
 spec:
   type: LoadBalancer
-  externalTrafficPolicy: Cluster
+  externalTrafficPolicy: Local
   ipFamilyPolicy: SingleStack
   selector:
     app: ferun-ingress
@@ -205,7 +210,10 @@ metadata:
   name: ferun-ingress
   namespace: ferun-ingress
 spec:
-  replicas: 2
+  # One per worker the balancer sends to: the workers without the label
+  # node.kubernetes.io/exclude-from-external-load-balancers, all three on
+  # the shoot. A worker more takes an instance more, and its join token.
+  replicas: 3
   serviceName: ferun-ingress-pods
   # Scaling starts and stops the pods together. A rollout replaces one
   # at a time and goes on once the new one has been ready for 10 s:
@@ -223,19 +231,29 @@ spec:
       labels:
         app: ferun-ingress
     spec:
-      # The instances on different workers (at most one more on any than
-      # on another). Workers that take no new pods, cordoned or
-      # unreachable, do not count, so that a drained worker's instance
-      # starts on another. Over every revision: a rollout replaces a pod
-      # in place, and the new one must not join the other on its worker.
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: DoNotSchedule
-          nodeTaintsPolicy: Honor
-          labelSelector:
-            matchLabels:
-              app: ferun-ingress
+      # An instance on each worker the balancer sends to, never two on
+      # one: with Local, a worker without one drops its share. No
+      # instance on a worker that carries
+      # node.kubernetes.io/exclude-from-external-load-balancers, the
+      # label that also takes a worker out of the balancer, once
+      # IronCore's cloud controller honours it (cloud-provider-ironcore
+      # #618); until then no worker may carry it. An instance whose
+      # worker is drained or lost waits for it, or its replacement,
+      # rather than join another, where it would serve no one and stay
+      # when the worker comes back.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/exclude-from-external-load-balancers
+                    operator: DoesNotExist
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: ferun-ingress
       automountServiceAccountToken: false
       # The runtime's default seccomp profile, not Unconfined: the
       # netlink the instance configures its mesh device with passes;
@@ -321,7 +339,7 @@ spec:
             - name: FERUN_INGRESS_TRUST_DOMAIN
               value: "run.${DOMAIN}"
             # Its own join token alone, copied by the init container; the
-            # Secret of both instances' tokens is not mounted here.
+            # Secret of every instance's token is not mounted here.
             - name: FERUN_INGRESS_JOIN_TOKEN_FILE
               value: /join/token
             # Listeners on the pod's address, never a wildcard; the
@@ -400,7 +418,7 @@ spec:
           secret:
             secretName: apps-wildcard-tls
             defaultMode: 0400
-        # Both instances' tokens: the init container's alone.
+        # Every instance's token: the init container's alone.
         - name: join-secret
           secret:
             secretName: ferun-ingress-join

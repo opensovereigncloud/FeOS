@@ -526,7 +526,9 @@ changed these points:
     (Go's default of 1 MiB let one request take several MiB), and a
     request that announces trailers is refused. The default caps then
     take at most about 950 MiB, and an instance's limit is 1.5 GiB.
-  - A cap per client address waits for the PROXY protocol.
+  - A cap per client address is not built. Behind the shoot's balancer
+    with `externalTrafficPolicy: Local` the ingress sees the client's
+    address, so one can be.
 - **A change of the table cuts the connections to what is no longer
   routed.** The nodes keep established flows after their rules shrink,
   so the ingress closes the open connections itself, upgraded ones
@@ -542,13 +544,22 @@ changed these points:
     nodes, and one that lets the instances dial only DNS, `ferund`'s
     nodes' port and the nodes' WireGuard, so that an instance taken
     over through its proxy reaches nothing else in the cluster;
-  - the instances on different workers, by topology spread;
-  - a balancer with `externalTrafficPolicy: Cluster`, not `Local`: the
-    IronCore balancer checks no node's health, and with `Local` a worker
-    without an instance drops its share of connections all the time, and
-    one whose instance restarts in every rollout. Applications therefore
-    see a worker's address in `X-Forwarded-For` until the PROXY protocol
-    (open questions).
+  - an instance on every worker the balancer sends to, never two on
+    one (required anti-affinity), and none on a worker that carries
+    `node.kubernetes.io/exclude-from-external-load-balancers`, the label
+    that also takes a worker out of the balancer;
+  - a balancer with `externalTrafficPolicy: Local`, so that the client's
+    address arrives and `X-Forwarded-For` carries it. Until 2026-10-29
+    it was `Cluster`, and applications saw a worker's address, since
+    kube-proxy rewrites the source then. IronCore's balancer is direct
+    server return: the packet reaches the worker unchanged and the answer
+    leaves it straight to the client, so it can add no PROXY protocol.
+    It checks no node's health and sends every worker its share
+    (ironcore#1584), and its cloud controller ignores the label and the
+    node set (cloud-provider-ironcore#618). With `Local` a worker passes
+    its share only to its own instance, so every worker runs one; while
+    one restarts, its worker's share waits, about 20 s, which the
+    clients' SYN retries bridge.
 - **A service must listen on `[::]`.** Its readiness check, through the
   port door on the loopback, does not show it; the ingress answers 502
   with that hint.
@@ -652,10 +663,11 @@ changed these points:
 - The reference deployment runs three instances of `ferund` (ADR 0015)
   with anti-affinity and a disruption budget over a PostgreSQL that is
   replicated synchronously, as `docs/architecture/control-plane.md`
-  requires, in place of today's one instance over one PostgreSQL; two
-  instances of the ingress; and a second `LoadBalancer`. Nothing of
-  `ferund`'s code stands in the way: nodes connect to every instance
-  and any instance serves any request already.
+  requires, in place of today's one instance over one PostgreSQL; an
+  instance of the ingress on every worker its balancer sends to; and a
+  second `LoadBalancer`. Nothing of `ferund`'s code stands in the way:
+  nodes connect to every instance and any instance serves any request
+  already.
 - Operators publish `edge.<domain>` and the apps zone's wildcard, open
   port 80 to the ingress for HTTP-01, and hand `ferund` a DNS credential
   for the zone's wildcard or a certificate. They keep the balancer's
@@ -708,8 +720,14 @@ changed these points:
   ADR 0008, question 8): the ingress makes the cookies of answers
   host-only, not those a page's script sets; domains sidestep it for
   production.
-- **The balancer's client address** where `externalTrafficPolicy: Local`
-  is not available: the PROXY protocol.
+- **Health checks at the balancer, and its node set.** With checks of
+  the nodes' `healthCheckNodePort` (ironcore#1584) the balancer would
+  send only to workers with a ready instance: no gap while one restarts,
+  and fewer instances than workers. With the node set honoured
+  (cloud-provider-ironcore#618) the label
+  `node.kubernetes.io/exclude-from-external-load-balancers` would make
+  an edge pool of some workers. The PROXY protocol is for a balancer
+  that ends TCP itself; a direct server return balancer cannot send it.
 - **The proxy apart from the mesh's privileges.** One process parses
   the internet's requests and holds `NET_ADMIN` as root, confined only
   by the seccomp profile and the egress policy. The shape that removes
