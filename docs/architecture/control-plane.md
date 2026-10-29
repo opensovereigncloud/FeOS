@@ -424,7 +424,8 @@ One TLS 1.3 listener, routed strictly by ALPN:
 - **A node that stops** sends GOAWAY on its node connections, lets the
   calls in flight end up to its bound, and ends the rest with
   `UNAVAILABLE` "the node stops: …" ([node.md](node.md#stopping)). A
-  call that had not reached the node (no stream opened on the connection,
+  call, unary or a stream (an exec, a port forward, a watch), that had
+  not reached the node (no stream opened on the connection,
   which a stats handler on the channel tells) and failed `UNAVAILABLE` on
   a connection that left READY goes to the node's next current
   connection, waiting as `Conn` does, up to the rollout deadline; before,

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -23,7 +24,7 @@ import (
 // reached it waits for the node's next connection, within its rollout
 // deadline, instead of failing UNAVAILABLE "the node's connection is
 // gone", as calls did that took the connection just before the GOAWAY
-// took it out.
+// took it out. Streams, as an exec, do so too.
 func TestGoawayCallsGoToTheNextConnection(t *testing.T) {
 	for round := range 10 {
 		e := newEnv(t)
@@ -48,8 +49,10 @@ func TestGoawayCallsGoToTheNextConnection(t *testing.T) {
 		var failed []error
 		var wg sync.WaitGroup
 		stop := make(chan struct{})
-		for range 8 {
+		for i := range 8 {
 			wg.Add(1)
+			// Half unary calls, half streams.
+			stream := i%2 == 1
 			go func() {
 				defer wg.Done()
 				for {
@@ -59,7 +62,18 @@ func TestGoawayCallsGoToTheNextConnection(t *testing.T) {
 					default:
 					}
 					ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-					_, err := podv1.NewPodServiceClient(cc).GetPod(ctx, &podv1.GetPodRequest{PodId: "p"})
+					var err error
+					if stream {
+						// A stream opened around the GOAWAY: its first
+						// frame comes from one connection or the next.
+						var s grpc.ServerStreamingClient[containerv1.ExecStreamFrame]
+						s, err = containerv1.NewContainerServiceClient(cc).Exec(ctx, &containerv1.ExecRequest{})
+						if err == nil {
+							_, err = s.Recv()
+						}
+					} else {
+						_, err = podv1.NewPodServiceClient(cc).GetPod(ctx, &podv1.GetPodRequest{PodId: "p"})
+					}
 					cancel()
 					if err != nil {
 						mu.Lock()

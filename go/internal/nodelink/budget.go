@@ -208,6 +208,9 @@ func (c *nodeConn) newStream(ctx context.Context, desc *grpc.StreamDesc, method 
 	if err != nil {
 		return nil, false, err
 	}
+	// notStarted looks at the caller's context: the stream's own is
+	// cancelled by cs.done before it is asked.
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	var id uint64
 	if kind == callLong {
@@ -240,7 +243,7 @@ func (c *nodeConn) newStream(ctx context.Context, desc *grpc.StreamDesc, method 
 	stream, err := l.cc.NewStream(tctx, desc, method, opts...)
 	if err != nil {
 		cs.done()
-		if c.s.notStarted(ctx, l, t, err) {
+		if c.s.notStarted(parent, l, t, err) {
 			return nil, true, nil
 		}
 		return nil, false, c.s.cutError(c.node, t, err)
