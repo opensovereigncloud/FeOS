@@ -563,14 +563,34 @@ changed these points:
 - **A service must listen on `[::]`.** Its readiness check, through the
   port door on the loopback, does not show it; the ingress answers 502
   with that hint.
-- **Domains are built without certificates.** Claims, their proof,
-  bindings, the checks with their grace, incidents and
-  `/api/v1/domains` are there; the ingress serves no domain yet, and a
-  domain that is verified, bound, public and routed stays `issuing`
-  ("certificates are not available yet"). Certificates, and serving
-  domains, come with the ingress's proxy in a step of their own. The
+- **Domains were built without certificates first.** Claims, their
+  proof, bindings, the checks with their grace, incidents and
+  `/api/v1/domains` came first, with every routed domain `issuing`. The
   checks ask the zone's servers with the standard library's resolver,
   pointed at them, not with a DNS client of their own.
+- **Certificates are six days long, renewed at half their life.**
+  `ferund` orders in Let's Encrypt's `shortlived` profile
+  (`--acme-profile`, the ACME profiles extension, which
+  `golang.org/x/crypto/acme` supports from v0.58): 160 hours, renewed
+  after 80, a failed order retried after an hour doubling to six, an
+  incident after a day of failures, with two days and more left. Half
+  the life, not two thirds, since three days of failures are what a
+  six-day certificate can afford. A stolen key is worth six days, and
+  revocation does not matter. The price: an outage of `ferund` or the
+  CA longer than about three days leaves the ingress serving an expired
+  certificate from its cache. An order per domain every 80 hours stays
+  well below the CA's limits, so its renewal information (ARI), for
+  which `x/crypto/acme` has no client, is not asked.
+- **The orders' loop is the renewals' reconciler.** One leader loop
+  (`acme-orders`, every 30 s) orders the domains that are due, new ones
+  before renewals; the domains core's settle loop moves a domain from
+  `served` back to `issuing` when its certificate expired. A challenge
+  is accepted only once every connected instance holds it, as a CA
+  validates through the balancer against any one of them.
+- **Tested against Pebble**, Let's Encrypt's test CA in docker
+  (`hack/go/with-pebble`), not a CA of the tests' own; Pebble accepts
+  challenges without fetching them, so the tests check that every
+  instance's port 80 answers before the challenge is accepted.
 
 ## Alternatives considered
 

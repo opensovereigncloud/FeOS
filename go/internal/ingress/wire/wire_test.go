@@ -120,7 +120,7 @@ func TestJSONNames(t *testing.T) {
 		Certificate{}, JoinRequest{}, JoinResponse{}, RenewRequest{}, RenewResponse{},
 		HelloRequest{}, HelloResponse{}, SyncRequest{}, Table{}, Mesh{}, Peer{}, Self{},
 		Env{}, Route{}, Service{}, Endpoint{}, WakeRequest{}, WakeResponse{},
-		HoldRequest{}, HoldRefusal{}, HoldResponse{}, State{},
+		HoldRequest{}, HoldRefusal{}, HoldResponse{}, State{}, Domain{}, Challenges{}, Challenge{},
 	} {
 		typ := reflect.TypeOf(v)
 		seen := map[string]bool{}

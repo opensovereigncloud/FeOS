@@ -377,9 +377,13 @@ func (s *Service) settle(ctx context.Context, tx *store.Store, before, after sto
 	if !env.ok {
 		after.EnvID, after.BoundAt = uuid.Nil, time.Time{} // its environment is gone
 	}
+	iss, err := tx.GetDomainIssuance(ctx, after.ID)
+	if err != nil {
+		return store.Domain{}, err
+	}
 	after.State, after.Reason = Derive(Facts{Verification: after.Verification, Bound: after.EnvID != uuid.Nil,
 		EnvPublic: env.env.Public, EnvDeleting: env.env.Deleting, DNSMovedSince: after.DNSMovedSince, Grace: s.cfg.Grace,
-		Now: now, Routed: after.Routed})
+		Now: now, Routed: after.Routed, CertValid: iss.CertValid(now), IssueError: iss.IssueError})
 	if sched.checked {
 		s.reschedule(&after, sched.manual, now)
 	}

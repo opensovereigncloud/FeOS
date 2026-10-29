@@ -20,6 +20,7 @@ FERUN_ROLLOUT_GRACE ?= 8m
 APPS_ZONE ?= $(if $(DOMAIN),apps.$(DOMAIN))
 EDGE_NAME ?= $(if $(DOMAIN),edge.$(DOMAIN))
 DOMAIN_CHALLENGE_LABEL ?= _ferun-challenge
+ACME_PROFILE ?= shortlived
 # The workers' network, which reaches ferun-ingress's health port and mesh.
 NODE_CIDR ?= 10.250.0.0/16
 # The Gateway that serves run., chat. and oci.<DOMAIN> (config.env.example).
@@ -31,7 +32,7 @@ GATEWAY_NAME ?= platform
 # since a set given replaces the built-in one.
 comma := ,
 FERUN_DENY_PREFIX = $(if $(strip $(DENY_PREFIXES)),default$(comma)$(subst $(eval) ,$(comma),$(strip $(DENY_PREFIXES))))
-export DOMAIN REGISTRY OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL
+export DOMAIN REGISTRY OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE
 DOCKER ?= docker
 TAG ?= dev
 PACKAGES_DIR ?= $(REPO_ROOT)/target/packages
@@ -107,7 +108,7 @@ $(MANIFESTS)/feos-k8s.yaml: FORCE
 # The k3s manifests live outside this directory. An empty APPS_ZONE
 # switches ferund's hosts off.
 $(MANIFESTS)/ferun.yaml: FORCE
-	$(call render,DOMAIN REGISTRY OIDC_ISSUER FERUN_NODES_IP FERUN_ROLLOUT_GRACE FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME,kubectl kustomize --load-restrictor LoadRestrictionsNone ferun,APPS_ZONE EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL)
+	$(call render,DOMAIN REGISTRY OIDC_ISSUER FERUN_NODES_IP FERUN_ROLLOUT_GRACE FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME,kubectl kustomize --load-restrictor LoadRestrictionsNone ferun,APPS_ZONE EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE)
 
 # Once, when ferund moves from the StatefulSet postgres to ferun-db
 # (README.md): ferun-db created from a copy of postgres-0's database.

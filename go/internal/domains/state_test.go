@@ -30,7 +30,7 @@ func TestDerive(t *testing.T) {
 		facts         Facts
 		state, reason string
 	}{
-		{"routed: waits for certificates", routed, StateIssuing, ReasonNoCertificates},
+		{"routed: waits for certificates", routed, StateIssuing, ReasonIssuing},
 		{"unverified", with(func(f *Facts) { f.Verification = store.VerificationUnverified }), StateUnverified, ReasonUnverified},
 		{"lapsed", with(func(f *Facts) { f.Verification = store.VerificationLapsed }), StateLapsed, ReasonLapsed},
 		{"superseded", with(func(f *Facts) { f.Verification = store.VerificationSuperseded; f.Bound = false }),
@@ -50,6 +50,21 @@ func TestDerive(t *testing.T) {
 		{"inactive wins over routed", with(func(f *Facts) { f.DNSMovedSince = now.Add(-grace - time.Second) }),
 			StateInactive, ReasonInactive},
 		{"not routed", with(func(f *Facts) { f.Routed = false }), StateWaitingForDNS, ReasonWaitingForDNS},
+		{"a valid certificate: served", with(func(f *Facts) { f.CertValid = true }), StateServed, ""},
+		{"served while its renewal fails", with(func(f *Facts) { f.CertValid = true; f.IssueError = "rate limited" }),
+			StateServed, ""},
+		{"an order failed, no certificate", with(func(f *Facts) { f.IssueError = "rate limited by the CA: x" }),
+			StateFailed, "rate limited by the CA: x"},
+		{"dns moved within the grace, a valid certificate",
+			with(func(f *Facts) { f.DNSMovedSince = now.Add(-time.Hour); f.Routed = false; f.CertValid = true }),
+			StateDNSMoved, ReasonDNSMoved},
+		{"dns moved at the grace's end, a valid certificate",
+			with(func(f *Facts) { f.DNSMovedSince = now.Add(-grace); f.Routed = false; f.CertValid = true }),
+			StateInactive, ReasonInactive},
+		{"not routed beats a failed order", with(func(f *Facts) { f.Routed = false; f.IssueError = "x" }),
+			StateWaitingForDNS, ReasonWaitingForDNS},
+		{"unpublished beats served", with(func(f *Facts) { f.EnvPublic = false; f.CertValid = true }),
+			StateUnpublished, ReasonNotPublic},
 	} {
 		state, reason := Derive(c.facts)
 		if state != c.state || reason != c.reason {

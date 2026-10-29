@@ -142,30 +142,88 @@ func collectDomains(rows pgx.Rows, err error) ([]Domain, error) {
 
 // DomainView is a domain with what its state is derived from beyond its
 // own row: its environment's publicity, deletion, name and latest
-// release, and the database's now() of the read.
+// release, its certificate and orders, and the database's now() of the
+// read.
 type DomainView struct {
 	Domain
 	// The bound environment; zero while unbound.
 	EnvName                string
 	EnvPublic, EnvDeleting bool
 	EnvRelease             int
+	Issuance               DomainIssuance
 	Now                    time.Time
 }
 
+// DomainIssuance is what ACME keeps of a domain (migration 0015): its
+// certificate's times and serial, zero while it has none, and its
+// orders' last failure and schedule.
+type DomainIssuance struct {
+	CertNotBefore, CertNotAfter, CertRenewAfter, CertIssuedAt time.Time
+	CertSerial                                                string
+	// IssueError is the last order's failure, "" after a success.
+	IssueError                     string
+	IssueFailingSince, NextIssueAt time.Time
+}
+
+// CertValid reports whether the domain has a certificate whose not_after
+// is after now.
+func (i DomainIssuance) CertValid(now time.Time) bool {
+	return !i.CertNotAfter.IsZero() && i.CertNotAfter.After(now)
+}
+
 const domainViewFrom = ` FROM domains d
-	LEFT JOIN environments e ON e.id = d.env_id`
+	LEFT JOIN environments e ON e.id = d.env_id
+	LEFT JOIN domain_certs c ON c.domain_id = d.id`
 
 var domainViewCols = domainColumns("d") + `, coalesce(e.name, ''), coalesce(e.public, false), coalesce(e.deleting, false),
-	coalesce(e.release, 0), now()`
+	coalesce(e.release, 0), ` + issuanceCols + `, now()`
+
+// issuanceCols are a DomainIssuance's columns of domains d and
+// domain_certs c.
+const issuanceCols = `c.not_before, c.not_after, c.renew_after, c.issued_at, coalesce(c.serial, ''),
+	d.issue_error, d.issue_failing_since, d.next_issue_at`
+
+// issuanceScan holds the scan targets of a DomainIssuance.
+type issuanceScan struct{ notBefore, notAfter, renewAfter, issuedAt, failing, next *time.Time }
+
+func (i *DomainIssuance) targets(sc *issuanceScan) []any {
+	return []any{&sc.notBefore, &sc.notAfter, &sc.renewAfter, &sc.issuedAt, &i.CertSerial, &i.IssueError, &sc.failing,
+		&sc.next}
+}
+
+func (i *DomainIssuance) finish(sc *issuanceScan) {
+	i.CertNotBefore, i.CertNotAfter, i.CertRenewAfter = timeOf(sc.notBefore), timeOf(sc.notAfter), timeOf(sc.renewAfter)
+	i.CertIssuedAt, i.IssueFailingSince, i.NextIssueAt = timeOf(sc.issuedAt), timeOf(sc.failing), timeOf(sc.next)
+}
 
 func scanDomainView(row pgx.Row) (DomainView, error) {
 	var v DomainView
 	var sc domainScan
-	targets := append(v.Domain.targets(&sc), &v.EnvName, &v.EnvPublic, &v.EnvDeleting, &v.EnvRelease, &v.Now)
-	if err := row.Scan(targets...); err != nil {
+	var isc issuanceScan
+	targets := append(v.Domain.targets(&sc), &v.EnvName, &v.EnvPublic, &v.EnvDeleting, &v.EnvRelease)
+	targets = append(targets, v.Issuance.targets(&isc)...)
+	if err := row.Scan(append(targets, &v.Now)...); err != nil {
 		return DomainView{}, err
 	}
+	v.Issuance.finish(&isc)
 	return v, v.Domain.finish(&sc)
+}
+
+// GetDomainIssuance reads what ACME keeps of a domain (zero for a domain
+// that is gone).
+func (s *Store) GetDomainIssuance(ctx context.Context, id uuid.UUID) (DomainIssuance, error) {
+	var i DomainIssuance
+	var sc issuanceScan
+	err := s.q.QueryRow(ctx, "SELECT "+issuanceCols+` FROM domains d LEFT JOIN domain_certs c ON c.domain_id = d.id
+		WHERE d.id = $1`, id).Scan(i.targets(&sc)...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DomainIssuance{}, nil
+	}
+	if err != nil {
+		return DomainIssuance{}, fmt.Errorf("read the certificate of domain %s: %w", id, err)
+	}
+	i.finish(&sc)
+	return i, nil
 }
 
 func collectDomainViews(rows pgx.Rows, err error) ([]DomainView, error) {

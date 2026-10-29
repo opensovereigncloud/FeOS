@@ -21,8 +21,10 @@
 //   - service.go: the REST routes' operations, the environments' hook,
 //     the leader's loops (domains-check, domains-settle).
 //
-// Certificates, and serving a domain, come in a later step with the
-// ingress: a verified, bound and routed domain waits in issuing.
+// Certificates are internal/acme's: a verified, bound and routed domain
+// waits in issuing until ACME kept its certificate, is served with it,
+// and failed while orders fail without one. ACME calls Refresh after
+// every order; the settle loop catches a certificate that expired.
 //
 // Every deadline is decided on the database's clock: a transaction's
 // now(). The lookups run outside any transaction; their result is written

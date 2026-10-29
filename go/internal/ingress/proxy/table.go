@@ -4,7 +4,13 @@
 package proxy
 
 import (
+	"bytes"
 	"cmp"
+	"crypto"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net"
@@ -67,6 +73,19 @@ type table struct {
 	addrs  map[string]bool
 	dials  map[string]dialTarget
 	routed map[string]bool
+	// certs are the certificates of the domains (Env.Domains) by
+	// canonical host; a host without one gets the wildcard.
+	certs map[string]*domainCert
+	// challenges are the pending ACME HTTP-01 answers by token.
+	challenges map[string]wire.Challenge
+}
+
+// domainCert is a domain's certificate, parsed, with what it was parsed
+// from, so that the next table reuses it while it is the same.
+type domainCert struct {
+	chain [][]byte
+	key   []byte
+	cert  *tls.Certificate
 }
 
 // dialTarget is what a dial address reaches: an endpoint (its address)
@@ -123,16 +142,24 @@ func canonicalHost(h string) string {
 
 // buildTable builds the routing of a state. Of two environments that
 // claim one host (the control plane never sends that), the one whose ID
-// sorts first serves it.
-func buildTable(s *wire.State, log *slog.Logger) *table {
+// sorts first serves it. A domain's certificate is taken parsed from old
+// (the table before; nil: none) when it did not change.
+func buildTable(s *wire.State, log *slog.Logger, old *table) *table {
 	t := &table{
-		src:      s.Clone(),
-		hosts:    map[string]*envRoutes{},
-		zone:     canonicalHost(s.Self.AppsZone),
-		admitted: s.Self.AdmittedVersion,
-		addrs:    map[string]bool{},
-		dials:    map[string]dialTarget{},
-		routed:   map[string]bool{},
+		src:        s.Clone(),
+		hosts:      map[string]*envRoutes{},
+		zone:       canonicalHost(s.Self.AppsZone),
+		admitted:   s.Self.AdmittedVersion,
+		addrs:      map[string]bool{},
+		dials:      map[string]dialTarget{},
+		routed:     map[string]bool{},
+		certs:      map[string]*domainCert{},
+		challenges: map[string]wire.Challenge{},
+	}
+	for _, c := range s.Challenges {
+		if c.Token != "" {
+			t.challenges[c.Token] = c
+		}
 	}
 	for _, id := range slices.Sorted(maps.Keys(s.Envs)) {
 		e := s.Envs[id]
@@ -153,8 +180,81 @@ func buildTable(s *wire.State, log *slog.Logger) *table {
 		if served {
 			t.add(er)
 		}
+		for _, d := range e.Domains {
+			h := canonicalHost(d.Name)
+			if t.hosts[h] != er || t.certs[h] != nil {
+				continue // not this environment's host, or twice
+			}
+			var prev *domainCert
+			if old != nil {
+				prev = old.certs[h]
+			}
+			dc, err := parseDomain(h, d, prev)
+			if err != nil {
+				log.Warn("a domain's certificate does not load; the host gets the wildcard", "host", h, "env", id, "err", err)
+				continue
+			}
+			t.certs[h] = dc
+		}
 	}
 	return t
+}
+
+// parseDomain parses a domain's certificate for host, or takes prev when
+// it was parsed from the same chain and key.
+func parseDomain(host string, d wire.Domain, prev *domainCert) (*domainCert, error) {
+	if prev != nil && bytes.Equal(prev.key, d.Key) && slices.EqualFunc(prev.chain, d.Chain, bytes.Equal) {
+		return prev, nil
+	}
+	if len(d.Chain) == 0 {
+		return nil, errors.New("no certificate")
+	}
+	leaf, err := x509.ParseCertificate(d.Chain[0])
+	if err != nil {
+		return nil, fmt.Errorf("the certificate: %w", err)
+	}
+	if err := leaf.VerifyHostname(host); err != nil {
+		return nil, err
+	}
+	k, err := x509.ParsePKCS8PrivateKey(d.Key)
+	if err != nil {
+		return nil, fmt.Errorf("the key: %w", err)
+	}
+	signer, ok := k.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("the key is a %T", k)
+	}
+	pub, ok := signer.Public().(interface{ Equal(crypto.PublicKey) bool })
+	if !ok || !pub.Equal(leaf.PublicKey) {
+		return nil, errors.New("the key is not the certificate's")
+	}
+	chain := make([][]byte, len(d.Chain))
+	for i, c := range d.Chain {
+		chain[i] = bytes.Clone(c)
+	}
+	return &domainCert{chain: chain, key: bytes.Clone(d.Key),
+		cert: &tls.Certificate{Certificate: chain, PrivateKey: signer, Leaf: leaf}}, nil
+}
+
+// challenge returns the pending challenge of token.
+func (t *table) challenge(token string) (wire.Challenge, bool) {
+	if t == nil || token == "" {
+		return wire.Challenge{}, false
+	}
+	c, ok := t.challenges[token]
+	return c, ok
+}
+
+// cert returns the certificate of a domain by its canonical host; nil
+// when the host has none (the wildcard serves it).
+func (t *table) cert(host string) *tls.Certificate {
+	if t == nil {
+		return nil
+	}
+	if dc := t.certs[host]; dc != nil {
+		return dc.cert
+	}
+	return nil
 }
 
 // add records the endpoints and services of an environment that serves

@@ -47,7 +47,8 @@ type Domain struct {
 	Records  Records  `json:"records"`
 	Found    Found    `json:"found"`
 	Warnings Warnings `json:"warnings"`
-	// Certificate is always null: certificates come in a later step.
+	// Certificate is the domain's current certificate; null while it has
+	// none.
 	Certificate *Certificate `json:"certificate"`
 	CreatedAt   string       `json:"createdAt"`
 	VerifiedAt  *string      `json:"verifiedAt"`
@@ -91,13 +92,20 @@ type Warnings struct {
 	DeactivatesAt      *string `json:"deactivatesAt"`
 	// CheckFailing is the last lookup's error; "" when it answered.
 	CheckFailing string `json:"checkFailing"`
+	// CertificateFailing is the last order's error while the domain has
+	// a certificate (its renewal fails); "" else, and while it has none
+	// the state is failed with the error as its reason.
+	CertificateFailing string `json:"certificateFailing"`
 }
 
-// Certificate is the domain's certificate.
+// Certificate is the domain's certificate. It is renewed from renewAfter
+// on, half its lifetime.
 type Certificate struct {
-	NotBefore string `json:"notBefore"`
-	NotAfter  string `json:"notAfter"`
-	IssuedAt  string `json:"issuedAt"`
+	NotBefore  string `json:"notBefore"`
+	NotAfter   string `json:"notAfter"`
+	IssuedAt   string `json:"issuedAt"`
+	RenewAfter string `json:"renewAfter"`
+	Serial     string `json:"serial"`
 }
 
 // rfc3339 is a time as the answers write it.
@@ -150,6 +158,11 @@ func (s *Service) answer(v store.DomainView, edge []netip.Addr) Domain {
 			DeactivatesAt: optTime(deactivatesAt(v.Domain, s.cfg.Grace)), CheckFailing: v.CheckError},
 		CreatedAt: rfc3339(v.CreatedAt), VerifiedAt: optTime(v.VerifiedAt), BoundAt: optTime(v.BoundAt),
 		CheckedAt: optTime(v.CheckedAt), NextCheckAt: rfc3339(v.NextCheckAt),
+	}
+	if i := v.Issuance; !i.CertNotAfter.IsZero() {
+		d.Certificate = &Certificate{NotBefore: rfc3339(i.CertNotBefore), NotAfter: rfc3339(i.CertNotAfter),
+			IssuedAt: rfc3339(i.CertIssuedAt), RenewAfter: rfc3339(i.CertRenewAfter), Serial: i.CertSerial}
+		d.Warnings.CertificateFailing = i.IssueError
 	}
 	if d.Labels == nil {
 		d.Labels = map[string]string{}

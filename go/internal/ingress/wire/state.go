@@ -16,13 +16,15 @@ import (
 var ErrSequence = errors.New("wire: table out of sequence")
 
 // State is an ingress's table as the Sync stream built it: the
-// environments by ID, the mesh and the ingress itself, as of message Seq
-// of the current stream. The ingress caches it as JSON.
+// environments by ID, the mesh, the ingress itself and the pending ACME
+// challenges, as of message Seq of the current stream. The ingress caches
+// it as JSON.
 type State struct {
-	Seq  uint64         `json:"seq"`
-	Envs map[string]Env `json:"envs"`
-	Mesh Mesh           `json:"mesh"`
-	Self Self           `json:"self"`
+	Seq        uint64         `json:"seq"`
+	Envs       map[string]Env `json:"envs"`
+	Mesh       Mesh           `json:"mesh"`
+	Self       Self           `json:"self"`
+	Challenges []Challenge    `json:"challenges,omitempty"`
 
 	// parts are the parts of a split message received so far, joined
 	// into one with the last one's Seq; nil: none. Not cached, not
@@ -40,7 +42,8 @@ func NewState() *State {
 // Seq s.Seq+1, else Apply returns an error wrapping ErrSequence and
 // leaves s as it was; its Envs are put by ID, then its Removed are
 // deleted. In either, a non-nil Mesh or Self replaces the state's and a
-// nil one keeps it.
+// nil one keeps it. Challenges, when not nil, replace the state's; a
+// whole table without them leaves none.
 //
 // A message in parts (Table.More) is applied once its last part has
 // arrived, all parts as one message, and not at all before: Apply keeps
@@ -93,6 +96,12 @@ func (s *State) Apply(t *Table) (*Table, error) {
 	if m.Self != nil {
 		s.Self = *m.Self
 	}
+	switch {
+	case m.Challenges != nil:
+		s.Challenges = m.Challenges.Items
+	case m.Whole:
+		s.Challenges = nil
+	}
 	s.Seq = m.Seq
 	return m, nil
 }
@@ -117,6 +126,9 @@ func (t *Table) join(n *Table) *Table {
 	if n.Self != nil {
 		t.Self = n.Self
 	}
+	if n.Challenges != nil {
+		t.Challenges = n.Challenges
+	}
 	return t
 }
 
@@ -127,10 +139,11 @@ func (s *State) Clone() *State {
 		return nil
 	}
 	c := &State{
-		Seq:  s.Seq,
-		Envs: make(map[string]Env, len(s.Envs)),
-		Mesh: s.Mesh.clone(),
-		Self: s.Self,
+		Seq:        s.Seq,
+		Envs:       make(map[string]Env, len(s.Envs)),
+		Mesh:       s.Mesh.clone(),
+		Self:       s.Self,
+		Challenges: slices.Clone(s.Challenges),
 	}
 	for id, e := range s.Envs {
 		c.Envs[id] = e.clone()
@@ -153,6 +166,14 @@ func (m Mesh) clone() Mesh {
 func (e Env) clone() Env {
 	e.Hosts = slices.Clone(e.Hosts)
 	e.Routes = slices.Clone(e.Routes)
+	if e.Domains != nil {
+		ds := make([]Domain, len(e.Domains))
+		for i, d := range e.Domains {
+			d.Chain, d.Key = copyBytesList(d.Chain), slices.Clone(d.Key)
+			ds[i] = d
+		}
+		e.Domains = ds
+	}
 	if e.Services != nil {
 		svcs := make([]Service, len(e.Services))
 		for i, svc := range e.Services {

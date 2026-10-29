@@ -71,6 +71,9 @@ kind ([The ingress](#the-ingress)).
 | `--node-server-names` | the control-plane domain | the DNS names of the instance's certificate on the nodes' port, each under the control-plane domain |
 | `--secret-key-file` | none | 32 bytes (raw, hex or base64) that seal the bindings and the environments' secrets at rest |
 | `--bindings` | off | serve the Kubernetes and SSH bindings; only with `--secret-key-file` |
+| `--acme-directory` | none | the ACME directory, an https URL (`https://acme-v02.api.letsencrypt.org/directory`), from which the domains' certificates are obtained ([Certificates of domains](#certificates-of-domains)); its terms of service are agreed to. Empty: none is obtained, and domains stay `issuing`. Needs `--secret-key-file`, which seals the keys |
+| `--acme-email` | none | the contact of the platform's ACME account, an email address; changing it updates the account |
+| `--acme-profile` | `shortlived` | the certificate profile the orders ask for (ACME profiles), one the directory lists: Let's Encrypt's `shortlived` is six days (160 hours), `classic` 90 days; empty: the CA's default. A profile the directory does not list fails every order |
 | `--deny-prefix` | a built-in set | a destination that preflights, bindings and the image resolver may not reach, repeatable; a set given replaces the built-in one, and `default` stands for it (`default,100.144.0.0/13` adds a network) |
 | `--admin-users` | none | `user:password,...` for the admin API: Basic, beside or instead of OIDC |
 | `--public-url` | none | the front door's external URL, e.g. `https://run.fecode.dev`; required with `--oidc-issuer` |
@@ -153,6 +156,7 @@ of `proto/` is in `go/gen/feos/<api>/v1` (`make go-gen`), the rest in
 | `env`, `env/spec`, `env/addons`, `env/ctl`, `env/envdeps` | the environments ([Environments](#environments)) |
 | `ingress/service`, `ingress/table` | ferund's side of the ingress: the API `ferun-ingress` calls, its identity, the table it serves from ([The ingress](#the-ingress)) |
 | `domains` | tenants' domains: claims, bindings, their checks, their states and incidents ([Domains](#domains)) |
+| `acme` | the ACME client: the platform's account, the orders of the domains' certificates over HTTP-01 through the ingress's table ([Certificates of domains](#certificates-of-domains)) |
 | `ingress/wire`, `routing` | shared with `ferun-ingress`: the ingress's protocol; path matching, which the route door uses too |
 | `api`, `auth`, `apierr` | the REST router, its auth classes and errors, human sign-in |
 | `ui` | the embedded build of `web/` |
@@ -233,7 +237,7 @@ replicate synchronously ([Operations](#operations)).
 | `ferun_watch` | a watch ID | a watch's paths, owner or result changed |
 | `ferun_cancel` | JSON | an exec, an MCP call or a keyed call (ADR 0023) is to be cancelled on whichever instance runs it |
 | `ferun_call` | a tool call's ID (`tool_calls.id`), or `*` for more than 256 | a keyed call left running: done, interrupted, not run |
-| `ferun_ingress` | `env:<uuid>`, `ingress:<name>`, `mesh`, or `*` | what the ingress's table shows changed: an environment's publicity, label, releases, deletion (its tenant's too), service instances or their admitted ports, a domain's binding or state (the environment it is or was bound to); an ingress instance's row or certificates; the mesh's peers; a node's admitted version of `ferun-ingress`, or more than 256 environments (`*`) |
+| `ferun_ingress` | `env:<uuid>`, `ingress:<name>`, `mesh`, `challenges`, or `*` | what the ingress's table shows changed: an environment's publicity, label, releases, deletion (its tenant's too), service instances or their admitted ports, a domain's binding, state or certificate (the environment it is or was bound to); an ingress instance's row or certificates; the mesh's peers; the ACME challenges (`challenges`); a node's admitted version of `ferun-ingress`, or more than 256 environments (`*`) |
 
 The tables: `instances`, `leases`, `cluster_secrets`; `tenants`,
 `tenant_tokens`; `nodes`, `node_telemetry` (the hot row, about a hundred
@@ -253,7 +257,9 @@ that outlive their caller](#calls-that-outlive-their-caller));
 `environments`, `env_releases`, `env_tags`, `env_secrets`,
 `env_instances`, `env_job_runs`, `env_attached`, `env_volumes`,
 `env_incidents`, `env_route_tokens` ([Environments](#environments));
-`domains` ([Domains](#domains)).
+`domains` ([Domains](#domains)); `domain_certs`, `acme_accounts`,
+`acme_challenges` (the domains' certificates, [Certificates of
+domains](#certificates-of-domains)).
 Tokens are stored as SHA-256 hashes only, and shown once, at their
 creation.
 `placements`, which held the placement decisions and was written and read
@@ -315,6 +321,7 @@ audit is its activity row.
 | sign-in clean-up | 10 min | deletes stale sign-ins and expired UI sessions |
 | `env-reconcile`, `env-probe`, `env-groups`, `env-volumes`, `env-delete` | 2 s, 1 s, 10 s, 30 s, 5 s | the environments' controller ([Environments](#the-controller)) |
 | `domains-check`, `domains-settle` | 5 s, 30 s | checks the domains that are due; settles the states that changed without a write of the domain's own; only while domains are on ([Domains](#domains)) |
+| `acme-orders` | 30 s | deletes expired ACME challenges; with `--acme-directory`, orders the certificates of the domains that are due, one at a time, and opens `certificate_failing` for renewals that have failed for a day ([Certificates of domains](#certificates-of-domains)); `ferun_leader` `acme` wakes it |
 
 An outage or a stall of the database lets the first holds expire 20 s
 in (a hold's lease is 30 s, renewed every 10 s) and every hold after
@@ -2500,17 +2507,23 @@ port](#the-nodes-port), [api.md](api.md#the-ingresss-api)), from
 - **Sync** streams the instance's table: whole, then the environments
   put and removed, the mesh's nodes when their version changes, `Self`
   (its address, the apps zone, its admitted version of `ferun-ingress`)
-  when its row changes, and an empty table every 10 s that records the
-  instance as seen. A stream ends `UNAVAILABLE` when its instance's
+  when its row changes, the ACME challenges, all of them, when they
+  change, and an empty table every 10 s that records the instance as
+  seen. Once it has sent the challenges it records their tokens as the
+  instance's (`ingresses.challenge_tokens`), again at a heartbeat when
+  that write failed. A stream ends `UNAVAILABLE` when its instance's
   table builder has not read the database for 30 s.
 - **The table builder** (`internal/ingress/table`) runs on every
   instance that has a stream: it builds each public environment's entry
   from the database (routes of the realised release, else the latest;
   endpoints with their admitted ports; asleep, waking and pending
-  counts), rebuilds an environment on `ferun_ingress` `env:<id>` or
-  `ferun_sandbox` of one of its instances after 50 ms, the mesh on
-  `mesh`, and everything on `*`, a reconnect and every 5 s. A replica's
-  change reaches the ingress about 100 ms after its commit.
+  counts; its served domains with their certificates, the keys opened
+  with `--secret-key-file`'s key), rebuilds an environment on
+  `ferun_ingress` `env:<id>` or `ferun_sandbox` of one of its instances
+  after 50 ms, the mesh on `mesh`, the ACME challenges on `challenges`,
+  and everything on `*`, a reconnect and every 5 s. A replica's change
+  reaches the ingress about 100 ms after its commit, and so do a
+  certificate and a challenge.
 - **Wake** wakes exactly the asleep instances of a routed image service
   of a public environment, each once at a time, in the background
   (`Engine.Sync`, then `Engine.Ensure`, within the preparation budget),
@@ -2529,6 +2542,101 @@ port](#the-nodes-port), [api.md](api.md#the-ingresss-api)), from
 - **Stopping** ([Stopping](#stopping), step 1): new ingress connections
   close, the streams end with `UNAVAILABLE` "instance stopping", Wake and
   Hold answer `UNAVAILABLE`.
+
+### Certificates of domains
+
+`ferund` is the ACME client of the domains' certificates ([ADR
+0021](../adr/0021-ingress.md#certificates-ferund-is-the-acme-client),
+`internal/acme`, `golang.org/x/crypto/acme`). The domains themselves,
+their claims, checks and states, are the domains core's; ACME owns
+`domain_certs`, `acme_accounts`, `acme_challenges` and the columns
+`next_issue_at`, `issue_backoff_s`, `issue_error` and
+`issue_failing_since` of `domains`.
+
+- **The account.** One per directory (`--acme-directory`): an ECDSA
+  P-256 key, made by the first instance that needs it and sealed in
+  `acme_accounts` under `--secret-key-file`'s key with the additional
+  data `acme-account:<directory>`. The directory is the row's primary
+  key and the lock: an instance that loses the insert takes the
+  winner's key, so two instances never register two accounts. It is
+  registered once, agreeing to the CA's terms, with the contact
+  `mailto:<--acme-email>`, which a changed flag updates. An account that
+  cannot be had (the CA unreachable) is tried again after 1 minute,
+  doubling to 30.
+- **The loop** `acme-orders` (leader, every 30 s, and on `ferun_leader`
+  `acme`): expired challenges are deleted; with a directory, the due
+  domains are ordered one at a time, at most 25 a run. A domain is due
+  when it is verified, bound to a public environment that is not
+  deleting (of a tenant that is not), routed, its TXT record not missing
+  (`record_missing_since` NULL), its `next_issue_at` passed or NULL, and
+  either `issuing` or `failed` without a valid certificate, or with a
+  certificate past its `renew_after`; new domains go before renewals.
+  The claim, in a fenced transaction, moves `next_issue_at` 6 minutes
+  ahead, past the order's bound of 5, so that neither a new leader nor
+  a crash runs an order twice at once. No call to the CA runs in a
+  transaction.
+- **An order** is for the one name over HTTP-01, in `--acme-profile`'s
+  profile (`golang.org/x/crypto/acme` v0.58's
+  `WithOrderIssuanceProfile`): a new order, its
+  authorization's `http-01` challenge, whose answer is kept in
+  `acme_challenges` (`expires_at` 10 minutes ahead), which notifies the
+  ingress's table. The challenge is accepted only once **every ingress
+  instance connected now** (joined, on the mesh, not left, seen within
+  45 s) holds its token (`ingresses.challenge_tokens`, which each Sync
+  stream records after it sent the challenges), at most 30 s; with none
+  connected, or one that does not take it, the order fails without the
+  CA validating anything, so that no failed validation counts against
+  the CA's limits. A self-check through the public name instead would
+  reach one instance per request through the balancer, and may not
+  reach the balancer from inside the cluster at all. Then the
+  authorization and the order are awaited, the order finalized with a
+  CSR of a new ECDSA P-256 key, and the chain checked: for the name, for
+  the key. Requests to the CA are retried 3 times (a bad nonce, a 5xx),
+  never on a rate limit.
+- **Success** keeps the chain (DER, leaf first) and the key (PKCS #8,
+  sealed with `domain-cert:<domain id>`) in `domain_certs`, replacing
+  the one before, with `renew_after` at half the certificate's lifetime
+  (80 hours of a six-day certificate, 45 days of a 90-day one); it clears `issue_error`,
+  the backoff, `next_issue_at` and `issue_failing_since`, deletes the
+  domain's challenges, closes its `certificate_failing` and notifies
+  `ferun_ingress` `env:<its environment>`. A certificate obtained for a
+  domain that meanwhile lost its verification or binding is not kept.
+- **A failure** records `issue_error`, readable for the domain's owner:
+  "a CAA record of <name> forbids the CA to issue a certificate: …",
+  "rate limited by the CA: …", "the CA's HTTP-01 challenge for <name>
+  failed: <the CA's detail> (<problem>)", "the ingress instances … did
+  not get the HTTP-01 challenge within 30s", "no ingress instance is
+  connected to answer the HTTP-01 challenge", at most 1 KiB; the backoff
+  `issue_backoff_s`, 3600 s doubling to 21600 s; `next_issue_at` that
+  backoff ahead, or the CA's `Retry-After` when that is later; and
+  `issue_failing_since`, unless set. The domain's challenges are
+  deleted.
+- After every order, successful or not, the domains core's
+  `Refresher.Refresh(ctx, domainID)` (declared in `internal/acme`)
+  re-derives the domain's `state` and `reason`, and notifies the table
+  when they changed.
+- **Renewals.** The loop is their reconciler: a certificate past its
+  `renew_after` is due like a new domain. A six-day certificate is
+  renewed after 80 hours and leaves 80 for failures, which are tried
+  again at least every 6 hours; after 24 of them the incident opens. A
+  domain in `dns-moved` is not routed and so not renewed: HTTP-01 could
+  not succeed. ARI (RFC 9773) is not asked, since `x/crypto/acme` has no
+  client for it; an order per domain every 80 hours stays far below
+  Let's Encrypt's limits (five certificates of one name a week). A
+  `ferund` (or CA) outage longer than a certificate's remaining life
+  leaves the ingress serving an expired certificate from its cache: with
+  six-day certificates that is about three days after the last renewal.
+- **Incidents.** A domain served (`served` or `dns-moved`, its
+  certificate valid) whose orders have failed for 24 hours gets
+  `certificate_failing` on its environment, object `domain/<name>`, the
+  environment's latest release, with the last error and the expiry in
+  its summary; once, whatever the releases; a renewal that succeeds
+  closes it.
+- **The table** carries a served domain (`served` or `dns-moved`,
+  verified, bound to a public environment of its tenant, its
+  certificate's `not_after` ahead) as one more host of its environment
+  with its chain and key, and every pending challenge to every
+  instance ([ingress.md](ingress.md#what-it-holds)).
 
 ### The ingress's admin API
 
@@ -2562,11 +2670,10 @@ holds the claims, their bindings, their checks, the states derived from
 them and the incidents of their environments. With `--edge-name` empty,
 domains are off: no claim is made, no check runs.
 
-**Not built yet: certificates**, and with them serving a domain. They
-come in a later step with the ingress. Until then a verified, bound and
-routed domain waits in `issuing`, the answer's `certificate` is always
-null, and the states `served`, `dns-moved` and `failed`, which the schema
-allows, do not occur.
+**Certificates** are ACME's ([Certificates of
+domains](#certificates-of-domains)): a verified, bound and routed domain
+waits in `issuing` until ACME kept its certificate, and is `served` with
+it from then on.
 
 **The routes**, tenant class, JSON in camelCase. `{id}` is the domain's
 UUID; a domain of another tenant, or anything that is no UUID, is 404 "no
@@ -2608,8 +2715,10 @@ by UUID or name.
   `txt`, `cname`, the canonical name when it differs from the name, for
   information only, and `addresses`), `warnings` (`recordMissingSince`,
   `dnsMovedSince`, `deactivatesAt`, the earlier of the two plus the grace,
-  and `checkFailing`, the last lookup's error), `certificate` (always
-  null for now), `createdAt`, `verifiedAt`, `boundAt`, `checkedAt`,
+  `checkFailing`, the last lookup's error, and `certificateFailing`, the
+  last order's error while the domain has a certificate),
+  `certificate` (`notBefore`, `notAfter`, `issuedAt`, `renewAfter`,
+  `serial` of its current certificate, or null), `createdAt`, `verifiedAt`, `boundAt`, `checkedAt`,
   `nextCheckAt`. Times are RFC 3339 in seconds; one that is not there is
   null. The answer's state is derived when it is read; the stored one may
   lag behind an environment's deletion by a settle.
@@ -2617,10 +2726,13 @@ by UUID or name.
 **The state** is derived in one place (`domains.Derive`), the first rule
 that matches: not verified, its verification (`unverified`, `lapsed`,
 `superseded`); `unbound`; its environment not public or being deleted,
-`unpublished`; its routing grace run out, `inactive`; not routed,
-`waiting-for-dns` (also while a routing grace runs); else `issuing`,
-"certificates are not available yet: the ingress serves custom domains
-in a later step".
+`unpublished`; its routing grace run out, `inactive`; a routing grace
+runs and it has a valid certificate, `dns-moved` (served on, not
+renewed); not routed, `waiting-for-dns` (also while a routing grace runs
+without a valid certificate); a valid certificate, `served`; its last
+order failed, `failed`, the order's error the reason; else `issuing`,
+"waiting for its certificate". A certificate that expires changes the
+state without a write: `domains-settle` catches it.
 
 **The checks.**
 

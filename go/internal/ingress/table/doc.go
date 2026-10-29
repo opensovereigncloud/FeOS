@@ -14,14 +14,18 @@
 // admits to the ingress) and the others counted by why they do not
 // (Asleep: Wake helps; Waking; Pending). An environment without a usable
 // spec (ErrSpec), or whose entry would take more than MaxEnvBytes
-// (ErrTooLarge), cannot be routed and is left out. BuildMesh turns the
-// mesh's peers into the nodes the ingress peers with.
+// (ErrTooLarge), cannot be routed and is left out. Its served domains
+// (store.IngressDomains, the keys opened with the Builder's Sealer) are
+// more hosts with certificates of their own, as many as fit the bound.
+// BuildMesh turns the mesh's peers into the nodes the ingress peers
+// with.
 //
 // The Builder keeps an immutable Snapshot of the whole table up to date
 // while someone uses it (Use): it rebuilds an environment when
 // ferun_ingress names it, or ferun_sandbox names one of its instances'
 // sandboxes, after a short debounce; it reads the mesh's peers again on
-// "mesh"; and it reads everything every few seconds as a backstop
+// "mesh" and the pending ACME challenges on "challenges"; and it reads
+// everything every few seconds as a backstop
 // (writers of an older ferund send no ferun_ingress). An environment
 // whose rows are gone (no longer public, deleting, of a deleting tenant)
 // leaves the snapshot. Diff gives a stream the environments to put and

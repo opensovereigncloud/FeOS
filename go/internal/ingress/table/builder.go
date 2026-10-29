@@ -47,7 +47,16 @@ const (
 	failureLogEvery = time.Minute
 	// maxWarned bounds the environments whose last spec warning is kept.
 	maxWarned = 4096
+	// MaxChallenges bounds the ACME challenges the table carries: orders
+	// run one at a time, so a handful are pending at most.
+	MaxChallenges = 1024
 )
+
+// Opener opens what ferund sealed under --secret-key-file (seal.Sealer):
+// the domains' keys.
+type Opener interface {
+	Open(sealed, aad []byte) ([]byte, error)
+}
 
 // Snapshot is the whole table at one time. It is immutable: the Builder
 // replaces it and never changes it, and its readers must not change it,
@@ -61,6 +70,8 @@ type Snapshot struct {
 	// (pod_network.ingress_group_version) as of the last read of the
 	// whole table or of the mesh.
 	GroupVersion uint64
+	// Challenges are the pending ACME HTTP-01 answers, sorted by token.
+	Challenges []wire.Challenge
 	// At is when the read that made the snapshot ended.
 	At time.Time
 	// Healthy: the Builder's last successful read is younger than its
@@ -123,9 +134,10 @@ func (s *Snapshot) unindex(id uuid.UUID) {
 }
 
 // sameContent reports whether s and o hold the same table: environments,
-// their sandboxes, mesh and group version.
+// their sandboxes, mesh, group version and challenges.
 func (s *Snapshot) sameContent(o *Snapshot) bool {
-	if len(s.Envs) != len(o.Envs) || s.GroupVersion != o.GroupVersion || !sameMesh(s.Mesh, o.Mesh) {
+	if len(s.Envs) != len(o.Envs) || s.GroupVersion != o.GroupVersion || !sameMesh(s.Mesh, o.Mesh) ||
+		!slices.Equal(s.Challenges, o.Challenges) {
 		return false
 	}
 	for id, e := range s.Envs {
@@ -144,17 +156,22 @@ func sameMesh(a, b wire.Mesh) bool {
 
 // Builder keeps the ingress's table up to date while it is used (Use):
 // it reads the whole table at once, then follows ferun_ingress (an
-// environment, the mesh, everything) and ferun_sandbox (an instance's
-// sandbox) and reads what they name after Debounce, and reads the whole
-// table again every Full. An environment whose read returns no rows has
-// left the table: it is not public any more, deleting, of a deleting
-// tenant, or without a release. While no one uses it, it reads nothing.
-// It is safe for concurrent use; Run runs its loop.
+// environment, the mesh, the ACME challenges, everything) and
+// ferun_sandbox (an instance's sandbox) and reads what they name after
+// Debounce, and reads the whole table again every Full. An environment
+// whose read returns no rows has left the table: it is not public any
+// more, deleting, of a deleting tenant, or without a release. The
+// domains' keys are opened with Sealer; without one, no domain is
+// served. While no one uses it, it reads nothing. It is safe for
+// concurrent use; Run runs its loop.
 type Builder struct {
 	// The windows, set before Run (the defaults when zero): changes
 	// collect for Debounce, the whole table is read every Full, and a
 	// snapshot is healthy until Health after the last successful read.
 	Debounce, Full, Health time.Duration
+	// Sealer opens the domains' keys; set before Run. Nil: the table
+	// carries no domain.
+	Sealer Opener
 
 	db    *db.DB
 	st    *store.Store
@@ -163,8 +180,9 @@ type Builder struct {
 	specs *Specs
 
 	// warned is when each environment that cannot be routed was last
-	// warned of; the loop's own.
-	warned map[uuid.UUID]time.Time
+	// warned of, domainWarned each domain left out; the loop's own.
+	warned       map[uuid.UUID]time.Time
+	domainWarned map[uuid.UUID]time.Time
 
 	mu    sync.Mutex
 	users int
@@ -187,7 +205,8 @@ func NewBuilder(d *db.DB, st *store.Store, zone string, log *slog.Logger) *Build
 	}
 	return &Builder{Debounce: DefaultDebounce, Full: DefaultFull, Health: DefaultHealth,
 		db: d, st: st, zone: zone, log: log.With("component", "ingress-table"), specs: NewSpecs(st),
-		warned: map[uuid.UUID]time.Time{}, changed: make(chan struct{}), kick: make(chan struct{}, 1)}
+		warned: map[uuid.UUID]time.Time{}, domainWarned: map[uuid.UUID]time.Time{}, changed: make(chan struct{}),
+		kick: make(chan struct{}, 1)}
 }
 
 // Specs returns the builder's cache of release specs.
@@ -309,11 +328,13 @@ func (b *Builder) Run(ctx context.Context) error {
 type loop struct {
 	// fullAt is when the whole table is read next.
 	fullAt time.Time
-	// dirty are the environments to read and mesh whether to read the
-	// mesh, at batchAt (zero: nothing to read).
-	dirty   map[uuid.UUID]struct{}
-	mesh    bool
-	batchAt time.Time
+	// dirty are the environments to read, mesh whether to read the mesh
+	// and challenges whether to read the challenges, at batchAt (zero:
+	// nothing to read).
+	dirty      map[uuid.UUID]struct{}
+	mesh       bool
+	challenges bool
+	batchAt    time.Time
 	// After a failed read nothing is read before retryAt; backoff is
 	// the wait after the next failure.
 	retryAt time.Time
@@ -389,15 +410,19 @@ func (b *Builder) serve(ctx context.Context) {
 }
 
 // onIngress takes a ferun_ingress payload: "env:<id>" has that
-// environment read, "mesh" the mesh; "" (the listener reconnected) and
-// "*" the whole table; "ingress:<name>" (an ingress's own row, which the
-// table does not hold) and anything else are ignored.
+// environment read, "mesh" the mesh, "challenges" the ACME challenges;
+// "" (the listener reconnected) and "*" the whole table;
+// "ingress:<name>" (an ingress's own row, which the table does not hold)
+// and anything else are ignored.
 func (b *Builder) onIngress(l *loop, p string, now time.Time) {
 	switch {
 	case p == "" || p == store.IngressPayloadAll:
 		l.fullSoon(now, b.Debounce)
 	case p == store.IngressPayloadMesh:
 		l.mesh = true
+		l.soon(now, b.Debounce)
+	case p == store.IngressPayloadChallenges:
+		l.challenges = true
 		l.soon(now, b.Debounce)
 	case strings.HasPrefix(p, "env:"):
 		id, err := uuid.Parse(strings.TrimPrefix(p, "env:"))
@@ -441,7 +466,7 @@ func (b *Builder) step(ctx context.Context, l *loop, now time.Time) {
 	if full {
 		err = b.readAll(rctx)
 	} else {
-		err = b.readSome(rctx, l.dirty, l.mesh)
+		err = b.readSome(rctx, l.dirty, l.mesh, l.challenges)
 	}
 	cancel()
 	if err != nil {
@@ -461,7 +486,7 @@ func (b *Builder) step(ctx context.Context, l *loop, now time.Time) {
 	l.lastOK, l.failedAt, l.loggedAt = done, time.Time{}, time.Time{}
 	l.backoff, l.retryAt = 0, time.Time{}
 	clear(l.dirty)
-	l.mesh, l.batchAt = false, time.Time{}
+	l.mesh, l.challenges, l.batchAt = false, false, time.Time{}
 	if full {
 		l.fullAt = done.Add(b.Full)
 	}
@@ -511,14 +536,22 @@ func (b *Builder) readAll(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	envs := Group(rows)
+	if err := b.addDomains(ctx, envs, nil); err != nil {
+		return err
+	}
 	m, version, err := b.readMesh(ctx)
 	if err != nil {
 		return err
 	}
+	challenges, err := b.readChallenges(ctx)
+	if err != nil {
+		return err
+	}
 	next := newSnapshot()
-	next.Mesh, next.GroupVersion = m, version
-	for _, e := range Group(rows) {
-		env, ids, err := BuildEnv(b.zone, e, b.specs.For(ctx, e))
+	next.Mesh, next.GroupVersion, next.Challenges = m, version, challenges
+	for _, e := range envs {
+		env, ids, err := b.build(ctx, e)
 		if unroutable(err) {
 			b.warnSpec(e.ID, err)
 			continue
@@ -538,12 +571,68 @@ func (b *Builder) readAll(ctx context.Context) error {
 	return nil
 }
 
-// readSome reads the environments of dirty, and the mesh when mesh, into
-// a copy of the current snapshot, and publishes it when anything changed
-// or the current one is unhealthy. A dirty environment without rows
-// leaves the table, and so does one that cannot be routed (no usable
-// spec, too large).
-func (b *Builder) readSome(ctx context.Context, dirty map[uuid.UUID]struct{}, mesh bool) error {
+// build builds an environment's entry (BuildEnv) and warns of the
+// domains it left out.
+func (b *Builder) build(ctx context.Context, e EnvRows) (wire.Env, []podid.ID, error) {
+	env, ids, err := BuildEnv(b.zone, e, b.specs.For(ctx, e))
+	if err == nil && len(env.Domains) < len(e.Domains) {
+		b.warnDomain(e.ID, "ingress table: domains of an environment are left out: its entry cannot take them",
+			"environment", e.ID, "domains", len(e.Domains), "served", len(env.Domains))
+	}
+	return env, ids, err
+}
+
+// addDomains reads the served domains of envs (all of them when ids is
+// nil, else of ids) and adds each to its environment, its key opened. A
+// key that does not open leaves its domain out, with a warning; without
+// a Sealer no domain is read.
+func (b *Builder) addDomains(ctx context.Context, envs []EnvRows, ids []uuid.UUID) error {
+	if b.Sealer == nil || len(envs) == 0 {
+		return nil
+	}
+	ds, err := b.st.IngressDomains(ctx, ids)
+	if err != nil {
+		return err
+	}
+	at := make(map[uuid.UUID]int, len(envs))
+	for i, e := range envs {
+		at[e.ID] = i
+	}
+	for _, d := range ds {
+		i, ok := at[d.EnvID]
+		if !ok {
+			continue
+		}
+		key, err := b.Sealer.Open(d.KeySealed, store.DomainCertAAD(d.DomainID))
+		if err != nil {
+			b.warnDomain(d.DomainID, "ingress table: a domain's key does not open; the ingress does not serve it",
+				"domain", d.Name, "environment", d.EnvID, "err", err)
+			continue
+		}
+		envs[i].Domains = append(envs[i].Domains, wire.Domain{Name: d.Name, Chain: d.Chain, Key: key})
+	}
+	return nil
+}
+
+// readChallenges reads the pending ACME challenges.
+func (b *Builder) readChallenges(ctx context.Context) ([]wire.Challenge, error) {
+	rows, err := b.st.IngressChallenges(ctx, MaxChallenges)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]wire.Challenge, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, wire.Challenge{Token: r.Token, Host: r.Host, KeyAuth: r.KeyAuth})
+	}
+	return out, nil
+}
+
+// readSome reads the environments of dirty, the mesh when mesh and the
+// challenges when challenges into a copy of the current snapshot, and
+// publishes it when anything changed or the current one is unhealthy. A dirty
+// environment without rows leaves the table, and so does one that
+// cannot be routed (no usable spec, too large).
+func (b *Builder) readSome(ctx context.Context, dirty map[uuid.UUID]struct{}, mesh, challenges bool) error {
 	cur := b.Current()
 	next := cur.clone()
 	changed := false
@@ -554,6 +643,15 @@ func (b *Builder) readSome(ctx context.Context, dirty map[uuid.UUID]struct{}, me
 		}
 		if !sameMesh(next.Mesh, m) || next.GroupVersion != version {
 			next.Mesh, next.GroupVersion, changed = m, version, true
+		}
+	}
+	if challenges {
+		cs, err := b.readChallenges(ctx)
+		if err != nil {
+			return err
+		}
+		if !slices.Equal(next.Challenges, cs) {
+			next.Challenges, changed = cs, true
 		}
 	}
 	if len(dirty) > 0 {
@@ -567,8 +665,12 @@ func (b *Builder) readSome(ctx context.Context, dirty map[uuid.UUID]struct{}, me
 			ids []podid.ID
 		}
 		got := map[uuid.UUID]built{}
-		for _, e := range Group(rows) {
-			env, sbs, err := BuildEnv(b.zone, e, b.specs.For(ctx, e))
+		envs := Group(rows)
+		if err := b.addDomains(ctx, envs, ids); err != nil {
+			return err
+		}
+		for _, e := range envs {
+			env, sbs, err := b.build(ctx, e)
 			if unroutable(err) {
 				b.warnSpec(e.ID, err)
 				continue
@@ -612,21 +714,39 @@ func (b *Builder) readMesh(ctx context.Context) (wire.Mesh, uint64, error) {
 // has no usable spec, or it is too large), at most every failureLogEvery
 // per environment.
 func (b *Builder) warnSpec(id uuid.UUID, err error) {
-	now := time.Now()
-	if last, ok := b.warned[id]; ok && now.Sub(last) < failureLogEvery {
+	if !due(b.warned, id) {
 		return
 	}
-	if len(b.warned) >= maxWarned {
-		for k, last := range b.warned {
-			if now.Sub(last) >= failureLogEvery {
-				delete(b.warned, k)
-			}
-		}
-		if len(b.warned) >= maxWarned {
-			clear(b.warned)
-		}
-	}
-	b.warned[id] = now
 	b.log.Warn("ingress table: an environment cannot be routed; the ingress does not serve it",
 		"environment", id, "err", err)
+}
+
+// warnDomain logs msg about a domain or an environment (id), at most
+// every failureLogEvery per ID.
+func (b *Builder) warnDomain(id uuid.UUID, msg string, args ...any) {
+	if due(b.domainWarned, id) {
+		b.log.Warn(msg, args...)
+	}
+}
+
+// due reports whether id was not warned of within failureLogEvery in
+// warned, and notes it as warned of now when so; warned keeps at most
+// maxWarned IDs.
+func due(warned map[uuid.UUID]time.Time, id uuid.UUID) bool {
+	now := time.Now()
+	if last, ok := warned[id]; ok && now.Sub(last) < failureLogEvery {
+		return false
+	}
+	if len(warned) >= maxWarned {
+		for k, last := range warned {
+			if now.Sub(last) >= failureLogEvery {
+				delete(warned, k)
+			}
+		}
+		if len(warned) >= maxWarned {
+			clear(warned)
+		}
+	}
+	warned[id] = now
+	return true
 }

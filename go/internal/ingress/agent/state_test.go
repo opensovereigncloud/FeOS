@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -210,6 +211,30 @@ func TestStateDirFiles(t *testing.T) {
 	got, at, err := d.loadTable()
 	if err != nil || got == nil || !at.Equal(saved) || len(got.Envs) != 1 || got.Mesh.Version != 2 || got.Seq != 1 {
 		t.Errorf("table.json %+v at %v, %v", got, at, err)
+	}
+
+	// The domains' certificates and keys and the ACME challenges are kept
+	// as the rest of the table, in a file its user alone reads.
+	withDomain := testEnv("e2")
+	withDomain.Domains = []wire.Domain{{Name: "dashboard.fecore.dev", Chain: [][]byte{{1, 2}, {3}}, Key: []byte("pkcs8")}}
+	challenges := []wire.Challenge{{Token: "tok", Host: "dashboard.fecore.dev", KeyAuth: "tok.thumb"}}
+	if _, err := s.Apply(&wire.Table{Seq: 2, Envs: []wire.Env{withDomain},
+		Challenges: &wire.Challenges{Items: challenges}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.saveTable(s, saved); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(d.file(tableFile)); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("table.json mode %v, %v", fi.Mode().Perm(), err)
+	}
+	if fi, err := os.Stat(d.path); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("the directory's mode %v, %v", fi.Mode().Perm(), err)
+	}
+	got, _, err = d.loadTable()
+	if err != nil || !reflect.DeepEqual(got.Envs["e2"].Domains, withDomain.Domains) ||
+		!reflect.DeepEqual(got.Challenges, challenges) {
+		t.Errorf("table.json domains %+v challenges %+v, %v", got.Envs["e2"].Domains, got.Challenges, err)
 	}
 }
 

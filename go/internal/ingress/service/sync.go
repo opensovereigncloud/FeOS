@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -82,17 +83,20 @@ func (st *syncStream) markDirty() {
 // tableWait for it (UNAVAILABLE "the table is not ready on this
 // instance"), reads the ingress's row (removed: PERMISSION_DENIED; no
 // address on the pods' mesh: FAILED_PRECONDITION) and sends the whole
-// table, seq 1: every environment, the mesh's nodes and the ingress
-// itself (Self: its address, the apps zone and the version of
-// ferun-ingress at which its address entered the group). Then it sends a
-// delta whenever the table changed, with the mesh when its version
-// changed and Self when it changed: the environments put and removed
+// table, seq 1: every environment, the mesh's nodes, the ingress itself
+// (Self: its address, the apps zone and the version of ferun-ingress at
+// which its address entered the group) and the pending ACME challenges.
+// Then it sends a delta whenever the table changed, with the mesh when
+// its version changed, Self when it changed and the challenges, all of
+// them, when they changed: the environments put and removed
 // since the last message, so that changes during a blocked Send coalesce
 // into one message. A table, whole or delta, that takes more than
 // wire.PartBytes goes in parts (wire.Split), each of its own seq, sent
 // one after the other. Every heartbeat it sends an empty table and
 // records the ingress as seen (SeenIngress), and reads its row again, as
-// it does when ferun_ingress names the ingress (onIngressChanged).
+// it does when ferun_ingress names the ingress (onIngressChanged). It
+// records the tokens of the challenges it sent whenever they change
+// (recordChallenges).
 //
 // The stream ends with UNAVAILABLE "this instance cannot read the
 // database" once the table is unhealthy (no read for 30 s, D18), with
@@ -144,12 +148,15 @@ func (s *Service) serveSync(ctx context.Context, p nodelink.IngressPeer, st *syn
 	}
 	envs, _ := table.Diff(nil, snap)
 	mesh := snap.Mesh
-	first := &wire.Table{Seq: 1, Whole: true, Envs: envs, Mesh: &mesh, Self: &self, SentAt: time.Now()}
+	first := &wire.Table{Seq: 1, Whole: true, Envs: envs, Mesh: &mesh, Self: &self,
+		Challenges: &wire.Challenges{Items: snap.Challenges}, SentAt: time.Now()}
 	last, err := s.send(ctx, stream, first)
 	if err != nil {
 		return err
 	}
-	sent := &syncState{seq: last, sent: table.Hashes(snap.Envs), mesh: snap.Mesh.Version, self: self}
+	sent := &syncState{seq: last, sent: table.Hashes(snap.Envs), mesh: snap.Mesh.Version, self: self,
+		challenges: snap.Challenges}
+	s.recordChallenges(ctx, p.Name, sent)
 	s.log.Debug("ingress stream opened", "ingress", p.Name, "peer", p.Addr, "envs", len(envs), "parts", last)
 	want := self
 	tick := time.NewTicker(s.heartbeat)
@@ -169,6 +176,7 @@ func (s *Service) serveSync(ctx context.Context, p nodelink.IngressPeer, st *syn
 			}
 			sent.record(t, last)
 		}
+		s.recordChallenges(ctx, p.Name, sent)
 		select {
 		case <-ctx.Done():
 			return streamEnded(ctx)
@@ -183,6 +191,7 @@ func (s *Service) serveSync(ctx context.Context, p nodelink.IngressPeer, st *syn
 				return sendFailed(ctx, err)
 			}
 			s.seen(ctx, p.Name)
+			s.recordChallenges(ctx, p.Name, sent)
 			if want, err = s.rereadSelf(ctx, p, want); err != nil {
 				return err
 			}
@@ -191,12 +200,16 @@ func (s *Service) serveSync(ctx context.Context, p nodelink.IngressPeer, st *syn
 }
 
 // syncState is what a stream sent: its last seq, the environments' hashes
-// by ID, the mesh's version and Self.
+// by ID, the mesh's version, Self and the challenges; and the challenges'
+// tokens last recorded as the ingress's (recordChallenges; nil: none
+// yet).
 type syncState struct {
-	seq  uint64
-	sent map[string]string
-	mesh uint64
-	self wire.Self
+	seq        uint64
+	sent       map[string]string
+	mesh       uint64
+	self       wire.Self
+	challenges []wire.Challenge
+	recorded   []string
 }
 
 // delta returns the next message, which brings the ingress from what the
@@ -211,7 +224,10 @@ func (st *syncState) delta(cur *table.Snapshot, self wire.Self) *wire.Table {
 	if self != st.self {
 		t.Self = &self
 	}
-	if len(puts) == 0 && len(removed) == 0 && t.Mesh == nil && t.Self == nil {
+	if !slices.Equal(cur.Challenges, st.challenges) {
+		t.Challenges = &wire.Challenges{Items: cur.Challenges}
+	}
+	if len(puts) == 0 && len(removed) == 0 && t.Mesh == nil && t.Self == nil && t.Challenges == nil {
 		return nil
 	}
 	t.Seq = st.seq + 1
@@ -233,6 +249,34 @@ func (st *syncState) record(t *wire.Table, last uint64) {
 	if t.Self != nil {
 		st.self = *t.Self
 	}
+	if t.Challenges != nil {
+		st.challenges = t.Challenges.Items
+	}
+}
+
+// recordChallenges records the challenges the stream's ingress holds:
+// the tokens of those it sent, when they differ from the ones recorded
+// (store.RecordIngressChallenges), at the stream's start whatever they
+// are. An ACME order accepts its challenge only once every connected
+// ingress holds its token. A failed write is tried again at the next
+// change and at every heartbeat.
+func (s *Service) recordChallenges(ctx context.Context, name string, st *syncState) {
+	tokens := make([]string, 0, len(st.challenges))
+	for _, c := range st.challenges {
+		tokens = append(tokens, c.Token)
+	}
+	if st.recorded != nil && slices.Equal(tokens, st.recorded) {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, s.rowTimeout)
+	defer cancel()
+	if err := s.st.RecordIngressChallenges(rctx, name, tokens); err != nil {
+		if ctx.Err() == nil {
+			s.rl.warn("challenges", "cannot record the challenges an ingress holds", "ingress", name, "err", err)
+		}
+		return
+	}
+	st.recorded = tokens
 }
 
 // send sends t on the stream, in parts of at most s.partBytes when it is

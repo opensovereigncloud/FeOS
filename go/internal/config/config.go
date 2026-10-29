@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/mail"
 	"net/netip"
 	"net/url"
 	"slices"
@@ -128,6 +129,17 @@ type Config struct {
 	// Bindings serves the Kubernetes and SSH binding surfaces; it takes
 	// effect only with SecretKeyFile.
 	Bindings bool
+	// ACMEDirectory is the ACME directory (an https URL) the domains'
+	// certificates are obtained from (ADR 0021); empty: none is
+	// obtained. It needs SecretKeyFile, which seals the keys.
+	ACMEDirectory string
+	// ACMEEmail is the contact of the platform's ACME account; empty:
+	// none.
+	ACMEEmail string
+	// ACMEProfile is the certificate profile the orders ask for (the ACME
+	// profiles extension); empty: the CA's default. The default,
+	// "shortlived", is Let's Encrypt's six-day certificate.
+	ACMEProfile string
 	// DenyPrefixes are the destinations preflights, bindings and the image
 	// resolver may not reach; nil: the built-in set (DefaultDenyPrefixes),
 	// which "default" in --deny-prefix adds to the prefixes given.
@@ -279,6 +291,7 @@ func Default() Config {
 		ActivityRetention:      720 * time.Hour,
 		TrafficRetention:       168 * time.Hour,
 		DomainChallengeLabel:   "_ferun-challenge",
+		ACMEProfile:            DefaultACMEProfile,
 		DomainGrace:            72 * time.Hour,
 		DomainUnverifiedMax:    50,
 		LogLevel:               slog.LevelInfo,
@@ -339,6 +352,11 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 		"DNS names of the instance's certificate on the nodes' port, comma-separated or repeated; each under the control-plane domain (default: the control-plane domain)")
 	fs.StringVar(&c.SecretKeyFile, "secret-key-file", c.SecretKeyFile, "file of the 32-byte key (raw, hex or base64) sealing bindings at rest")
 	fs.BoolVar(&c.Bindings, "bindings", c.Bindings, "serve the Kubernetes and SSH binding surfaces (only with --secret-key-file)")
+	fs.StringVar(&c.ACMEDirectory, "acme-directory", c.ACMEDirectory,
+		"the ACME directory (https URL) of the domains' certificates, e.g. https://acme-v02.api.letsencrypt.org/directory; empty: none is obtained (needs --secret-key-file)")
+	fs.StringVar(&c.ACMEEmail, "acme-email", c.ACMEEmail, "the contact (an email address) of the platform's ACME account; empty: none")
+	fs.StringVar(&c.ACMEProfile, "acme-profile", c.ACMEProfile,
+		"the certificate profile the orders ask for, one the directory lists (Let's Encrypt: shortlived, six days; classic, 90); empty: the CA's default")
 	fs.Var((*prefixList)(&c.DenyPrefixes), "deny-prefix",
 		"a destination prefix preflights, bindings and the image resolver may not reach, comma-separated or repeated; \"default\" is the built-in set (default: the built-in set)")
 	fs.StringVar(&t.adminUsers, "admin-users", "", "user:password,user:password for the admin API: the Basic fallback beside OIDC")
@@ -511,6 +529,22 @@ func (c *Config) Validate() error {
 	if c.DNSResolver != "" {
 		if _, _, err := splitHostPort(c.DNSResolver); err != nil {
 			bad("--dns-resolver %q is not host:port: %v", c.DNSResolver, err)
+		}
+	}
+	if c.ACMEDirectory != "" {
+		if u, err := url.Parse(c.ACMEDirectory); err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+			bad("--acme-directory %q is not an https URL", c.ACMEDirectory)
+		}
+		if c.SecretKeyFile == "" {
+			bad("--acme-directory needs --secret-key-file, which seals the certificates' keys")
+		}
+	}
+	if c.ACMEProfile != "" && !isProfileName(c.ACMEProfile) {
+		bad("--acme-profile %q is not a profile name (letters, digits, '.', '_' and '-', at most 64)", c.ACMEProfile)
+	}
+	if c.ACMEEmail != "" {
+		if a, err := mail.ParseAddress(c.ACMEEmail); err != nil || a.Address != c.ACMEEmail || a.Name != "" {
+			bad("--acme-email %q is not an email address", c.ACMEEmail)
 		}
 	}
 	if c.DefaultImage == "" {
@@ -834,4 +868,22 @@ func ParsePodNetwork(s string) (netip.Prefix, error) {
 		p = mesh.FromLegacy(p)
 	}
 	return p, nil
+}
+
+// DefaultACMEProfile is --acme-profile's default: Let's Encrypt's
+// six-day certificates.
+const DefaultACMEProfile = "shortlived"
+
+// isProfileName reports whether p may name an ACME profile: what the
+// directories in use name them with, and nothing that needs escaping.
+func isProfileName(p string) bool {
+	if len(p) > 64 {
+		return false
+	}
+	for _, r := range p {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return p != ""
 }

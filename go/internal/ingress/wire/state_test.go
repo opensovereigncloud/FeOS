@@ -143,14 +143,44 @@ func TestStateMeshAndSelf(t *testing.T) {
 	}
 }
 
+// Challenges replace the state's when a message carries them, also
+// empty; a delta without them keeps them, a whole table without them
+// leaves none.
+func TestStateChallenges(t *testing.T) {
+	s := NewState()
+	one := []Challenge{{Token: "t1", Host: "a.example", KeyAuth: "t1.k"}}
+	mustApply(t, s, &Table{Seq: 1, Whole: true, Challenges: &Challenges{Items: one}})
+	mustApply(t, s, &Table{Seq: 2, Envs: []Env{env("a", "1")}})
+	if !reflect.DeepEqual(s.Challenges, one) {
+		t.Fatalf("a delta without challenges changed them: %+v", s.Challenges)
+	}
+	two := []Challenge{{Token: "t2", Host: "b.example", KeyAuth: "t2.k"}}
+	mustApply(t, s, &Table{Seq: 3, Challenges: &Challenges{Items: two}})
+	if !reflect.DeepEqual(s.Challenges, two) {
+		t.Fatalf("challenges %+v", s.Challenges)
+	}
+	mustApply(t, s, &Table{Seq: 4, Challenges: &Challenges{}})
+	if len(s.Challenges) != 0 {
+		t.Fatalf("empty challenges kept %+v", s.Challenges)
+	}
+	mustApply(t, s, &Table{Seq: 5, Challenges: &Challenges{Items: two}})
+	mustApply(t, s, &Table{Seq: 1, Whole: true})
+	if s.Challenges != nil {
+		t.Fatalf("a whole table without challenges kept %+v", s.Challenges)
+	}
+}
+
 func TestStateClone(t *testing.T) {
 	if (*State)(nil).Clone() != nil {
 		t.Error("Clone of nil is not nil")
 	}
 	s := NewState()
-	mustApply(t, s, &Table{Seq: 1, Whole: true, Envs: []Env{env("a", "1"), env("b", "1")},
-		Mesh: &Mesh{Version: 2, Peers: []Peer{{Name: "n1", PublicKey: []byte{1, 2}}}},
-		Self: &Self{Name: "ingress-0"}})
+	withDomain := env("a", "1")
+	withDomain.Domains = []Domain{{Name: "a.example", Chain: [][]byte{{1, 2}, {3}}, Key: []byte{4, 5}}}
+	mustApply(t, s, &Table{Seq: 1, Whole: true, Envs: []Env{withDomain, env("b", "1")},
+		Mesh:       &Mesh{Version: 2, Peers: []Peer{{Name: "n1", PublicKey: []byte{1, 2}}}},
+		Self:       &Self{Name: "ingress-0"},
+		Challenges: &Challenges{Items: []Challenge{{Token: "t", Host: "a.example", KeyAuth: "t.k"}}}})
 	orig := s.Clone()
 	c := s.Clone()
 	if !reflect.DeepEqual(c, s) {
@@ -168,9 +198,13 @@ func TestStateClone(t *testing.T) {
 	a.Services[0].Endpoints[0].Address = "changed"
 	a.Services[0].Endpoints[0].Ports["http"] = 1
 	a.Services[0].Endpoints[0].Ports["new"] = 2
+	a.Domains[0].Chain[0][0] = 9
+	a.Domains[0].Key[0] = 9
+	a.Domains[0].Name = "changed"
 	c.Mesh.Peers[0].PublicKey[0] = 9
 	c.Mesh.Peers[0].Name = "changed"
 	c.Self.Name = "changed"
+	c.Challenges[0].KeyAuth = "changed"
 	if !reflect.DeepEqual(s, orig) {
 		t.Errorf("changing the clone changed the state:\n got %+v\nwant %+v", s, orig)
 	}
@@ -185,8 +219,11 @@ func TestStateClone(t *testing.T) {
 
 func TestStateJSON(t *testing.T) {
 	s := NewState()
-	mustApply(t, s, &Table{Seq: 1, Whole: true, Envs: []Env{env("a", "1")},
-		Mesh: &Mesh{Version: 2, Peers: []Peer{{Name: "n1", PublicKey: []byte{1, 2}}}}, Self: &Self{Name: "ingress-0"}})
+	withDomain := env("a", "1")
+	withDomain.Domains = []Domain{{Name: "a.example", Chain: [][]byte{{1, 2}, {3}}, Key: []byte{4, 5}}}
+	mustApply(t, s, &Table{Seq: 1, Whole: true, Envs: []Env{withDomain},
+		Mesh: &Mesh{Version: 2, Peers: []Peer{{Name: "n1", PublicKey: []byte{1, 2}}}}, Self: &Self{Name: "ingress-0"},
+		Challenges: &Challenges{Items: []Challenge{{Token: "t", Host: "a.example", KeyAuth: "t.k"}}}})
 	b, err := json.Marshal(s)
 	if err != nil {
 		t.Fatal(err)

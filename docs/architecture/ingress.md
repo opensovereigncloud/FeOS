@@ -11,15 +11,17 @@ the ingress joins), [ADR 0018](../adr/0018-environments-and-releases.md)
 [control-plane.md](control-plane.md); the deployment on Gardener is in
 [deploy/gardener/README.md](../../deploy/gardener/README.md#the-ingress).
 
-`ferun-ingress` serves `https://<label>.<apps zone>/…` of the
-environments whose tenant made them public, straight to their image
+`ferun-ingress` serves `https://<label>.<apps zone>/…` and the tenants'
+domains of the environments whose tenant made them public, straight to their image
 services' pods over IPv6 on the pods' mesh. It has no REST API, no
 database and no tenant's token: it connects out to `ferund` on the
 nodes' port, as a node does, and serves from the table `ferund` streams
 to it. A rollout or an outage of `ferund` cuts no request.
 
-Not built: domains, ACME, `http` traffic records, tenant zones, L4 routes
-and h2c upstreams.
+Not built: `http` traffic records, tenant zones, certificates over
+DNS-01 (a zone's wildcard), L4 routes and h2c upstreams. The domains'
+claims, checks and states are `ferund`'s domains core; their
+certificates are ACME's ([control-plane.md](control-plane.md#certificates-of-domains)).
 
 ## Overview
 
@@ -28,7 +30,8 @@ and h2c upstreams.
                      │   NetworkPolicy: 8080/8443 from anywhere; 9090, udp/51820 from the workers
                      │   egress: DNS, ferund's 7443, udp/51820 to the workers, nothing else
    StatefulSet ferun-ingress-0/1 (root with NET_ADMIN, seccomp RuntimeDefault, a volume each)
-     ├─ proxy:  TLS (SNI, the wildcard's files) → HTTP/1.1 or HTTP/2
+     ├─ proxy:  TLS (SNI: a domain's certificate from the table, else the wildcard's files) → HTTP/1.1 or HTTP/2
+     │          port 80: ACME HTTP-01 answers from the table, else 308 to https
      │          → host → environment → route → service → endpoint
      │          ├─ usable: port admitted ∧ group version ≥ admitted ∧ node's handshake < 180 s
      │          ├─ idle services: a hold before the first request, renewed every 10 s
@@ -125,7 +128,7 @@ of the directory, so that a crash leaves the old content or the new.
 | `removed` | the refusal that said the ingress was removed, until the next join |
 | `wg.key` | the WireGuard private key, 32 raw bytes |
 | `mesh.json` | the place on the mesh: `{podNetwork, prefix, address}` |
-| `table.json` | the table's cache, `{savedAt, state}`, written 1 s after a change and at least once a minute while heartbeats confirm it |
+| `table.json` | the table's cache, `{savedAt, state}`, written 1 s after a change and at least once a minute while heartbeats confirm it; it holds the domains' certificates and private keys and the ACME challenges |
 
 The certificate is renewed for the same key; a new key is made only
 when the identity is declared lost. A new `wg.key` is made after every
@@ -286,8 +289,17 @@ The table is what the ingress routes, one entry per public environment
 (`wire.Env`, [api.md](api.md#the-ingresss-api)):
 
 - its ID, tenant, name and hosts: `<label>.<apps zone>` while the
-  platform has an apps zone, none otherwise, and then the ingress serves
-  nothing of it;
+  platform has an apps zone, then its served domains; without a zone
+  its domains alone;
+- its **domains** (`domains`): each served domain's name, its
+  certificate's chain (DER, leaf first) and private key (PKCS #8 DER),
+  opened by the builder from `domain_certs`. A domain is served when its
+  state is `served` or `dns-moved`, it is verified and bound to the
+  environment, which is its tenant's, and its certificate's `not_after`
+  is ahead; ordered by when they were bound. A domain takes at most
+  64 KiB (`table.MaxDomainBytes`, a chain takes a few), and the domains
+  that would take the entry past 2 MiB are left out, never the
+  environment;
 - the routes of its routing release, the realised one, else the latest
   while none is realised: name, path prefix, service, port name,
   `strip`, and `door` for a route to an attached service, which the
@@ -308,9 +320,11 @@ The table is what the ingress routes, one entry per public environment
 - a hash of the rest, by which a stream tells a change.
 
 Beside the environments the table holds the mesh, the nodes with their
-keys, endpoints and /96s at the peers' version, and `Self`: the
+keys, endpoints and /96s at the peers' version, `Self`: the
 instance's name, mesh address, the apps zone and its admitted version
-([Admission](#admission)). An environment that is not public, is being
+([Admission](#admission)), and the **challenges**: every pending ACME
+HTTP-01 answer (`acme_challenges` whose `expires_at` is ahead, at most
+1024), each its token, host and key authorization, for every instance. An environment that is not public, is being
 deleted, has no label or no release, or whose tenant is being deleted
 has no entry; nor has one whose routing release's spec does not parse,
 or whose entry would take more than 2 MiB coded (`table.MaxEnvBytes`;
@@ -326,9 +340,15 @@ Every `ferund` instance that has an ingress stream builds the whole table
 from the database (`store.IngressRouting`, one query per environment or
 for all), while a stream uses it, and keeps it as an immutable snapshot:
 
-- `ferun_ingress` `env:<uuid>` rebuilds that environment, `mesh` reads the
-  mesh's peers again, `*` and the listener's reconnect rebuild
-  everything; `ingress:<name>` is the service's, not the builder's;
+- `ferun_ingress` `env:<uuid>` rebuilds that environment (ACME's write of
+  a domain's certificate sends it, as the domains core does for a change
+  of a domain's state or binding), `mesh` reads the mesh's peers again,
+  `challenges` the ACME challenges, `*` and the listener's reconnect
+  rebuild everything; `ingress:<name>` is the service's, not the
+  builder's;
+- the domains' keys are opened with `--secret-key-file`'s key; without
+  it no domain is served, and a key that does not open leaves its
+  domain out, logged at most once a minute;
 - `ferun_sandbox` with the ID of an instance's sandbox rebuilds its
   environment;
 - an environment whose rebuild finds no rows leaves the snapshot;
@@ -355,18 +375,26 @@ Hello first"):
    table is not ready on this instance";
 2. reads the ingress's row: a removed ingress is refused, one without a
    mesh address is told to say Hello first;
-3. sends the whole table (`seq` 1, `whole`);
+3. sends the whole table (`seq` 1, `whole`), the challenges with it;
 4. then sends deltas as the snapshot changes: the environments put and
    removed since what it sent, the mesh when its version changed, `Self`
-   when the row changed; a send that blocks lets changes coalesce;
-5. every 10 s sends an empty table and records the ingress as seen
+   when the row changed, the challenges, all of them, when they changed
+   (absent: unchanged); a send that blocks lets changes coalesce. A
+   renewed certificate changes its environment's hash, so the
+   environment is sent again;
+5. records the tokens of the challenges it sent as the ingress's
+   (`ingresses.challenge_tokens`) when they changed, and at a heartbeat
+   when that write failed: an ACME order accepts its challenge only once
+   every connected instance holds it
+   ([control-plane.md](control-plane.md#certificates-of-domains));
+6. every 10 s sends an empty table and records the ingress as seen
    (`last_seen`), which keeps the [idle fence](#the-idle-fence) off.
 
 A table, whole or delta, that takes more than 4 MiB coded
 (`wire.PartBytes`) goes in **parts** (`wire.Split`): consecutive
 messages, each with its own `seq`, every one but the last with `more`;
-the first carries `whole`, the mesh and `Self`, and the environments,
-then the removals, are spread over the parts. Nothing comes between the
+the first carries `whole`, the mesh, `Self` and the challenges, and the
+environments, then the removals, are spread over the parts. Nothing comes between the
 parts. As an entry takes at most 2 MiB, a part stays far below the
 ingress's 32 MiB however large the table grows; a larger message would
 fail every stream with `RESOURCE_EXHAUSTED`, at every reconnect, and
@@ -392,8 +420,12 @@ nothing expires it.
 At its start the agent loads `table.json`, `mesh.json` and `wg.key`,
 configures the mesh device and hands the cached table to the proxy before
 it contacts `ferund`: an instance that restarts while `ferund` is away
-serves at once what was routable, and nothing new becomes routable until
-`ferund` is back.
+serves at once what was routable, with the domains' certificates, and
+nothing new becomes routable until `ferund` is back. The cache holds the
+domains' private keys, like the state directory's other keys readable
+by the instance's user alone (0600 in a 0700 directory). A whole table
+replaces the challenges; one without them (an older `ferund`) leaves
+none.
 
 ## The mesh
 
@@ -628,7 +660,8 @@ version, within one `env-groups` pass.
 ### Routing
 
 1. **The host**, in lower case, without its port and a trailing dot,
-   names the environment; an unknown host is 404 "no such host".
+   names the environment, a domain as the default host; an unknown host
+   is 404 "no such host".
 2. **The path** may not hold a segment that is, or decodes once or twice
    to, `.` or `..` (400), and must decode (400).
 3. **The route** with the longest prefix, segment by segment, matches;
@@ -644,6 +677,19 @@ version, within one `env-groups` pass.
    ([Holds](#holds-and-the-idle-fence)); an instance whose hold is
    refused is skipped until the table changes.
 6. **None usable**: the request is held ([below](#held-requests-and-wake)).
+
+### Port 80
+
+The HTTP listener answers ACME's HTTP-01 challenges first, on every
+host, whether the table serves it yet or not (a domain's first
+certificate comes before the domain is served): `GET` (or `HEAD`)
+`/.well-known/acme-challenge/<token>` is 200 with the challenge's key
+authorization as `text/plain` (`Cache-Control: no-store`) when the table
+holds the token and the request's host, canonical as above, is the
+challenge's host. Any other request under that path, an unknown token,
+another host, another method, is 404 "no such challenge". Everything
+else of a host the table knows is 308 to `https://`, and of any other
+host 404 "no such host".
 
 ### Forwarding
 
@@ -826,7 +872,9 @@ larger than the one it sits in has no effect.
 
 | Status | Text | When |
 |---|---|---|
+| 200 | the key authorization | port 80: an ACME HTTP-01 challenge the table holds for the host ([Port 80](#port-80)) |
 | 308 | | plain HTTP for a known host: to `https://` |
+| 404 | "no such challenge" | port 80: anything else under `/.well-known/acme-challenge/` |
 | 400 | "the path has a .. segment", "the path has a . segment", "the path is not escaped correctly" | |
 | 400 | "request trailers are not supported" | a request that announces trailers ([Limits](#limits)) |
 | 404 | "no such host" | a host the table does not know, on either listener |
@@ -888,12 +936,22 @@ gone; one that left cleanly never fences.
 
 ### The certificate
 
-The HTTPS listener serves one certificate, the operator's wildcard
-`*.<apps zone>`, from files that cert-manager renews into a Secret and the
-kubelet into the pod. They are read again every 30 s, and a pair that
-changed and loads replaces the one in use; one that does not load keeps
-it. Every SNI, or none, gets it; an unknown host is the proxy's 404. TLS
-1.2 and newer, ALPN `h2` and `http/1.1`.
+The HTTPS listener picks the certificate by SNI. A domain the table
+serves gets its own certificate from the table (its chain and key, which
+`ferund` obtained over ACME, [control-plane.md](control-plane.md#certificates-of-domains)):
+the SNI in lower case without a trailing dot is one of its
+environment's domains. Parsed once per table that changes it, and
+reused while it stays the same, so a renewal is served from the next
+handshake on; a certificate that does not parse, whose key is not its
+own, or that is not for its name is logged and its host gets the
+wildcard.
+
+Every other SNI, or none, gets the operator's wildcard `*.<apps zone>`,
+from files that cert-manager renews into a Secret and the kubelet into
+the pod. They are read again every 30 s, and a pair that changed and
+loads replaces the one in use; one that does not load keeps it. An
+unknown host is the proxy's 404. TLS 1.2 and newer, ALPN `h2` and
+`http/1.1`.
 
 ### The apps zone
 
@@ -916,8 +974,8 @@ host: the cookie becomes host-only. A cookie without `Domain`, or with
 the host as its `Domain`, passes unchanged; the other attributes, their
 spelling and the headers' order are kept. Removals are counted
 (`ferun_ingress_cookie_domains_removed_total`) and logged at debug, once
-per host and minute. Hosts outside the zone (domains, later) are not
-rewritten.
+per host and minute. Hosts outside the zone, the domains, are not
+rewritten: a domain is its tenant's own registrable name.
 
 A proxy cannot stop cookies an app's own JavaScript sets
 (`document.cookie`). The platform's hosts guard against those with
@@ -976,6 +1034,7 @@ expiry.
 | `ferun_ingress_cookie_domains_removed_total` | `Domain` attributes removed |
 | `ferun_ingress_upstream_connections_cut_total` | open connections to instances closed because the table no longer routes to them |
 | `ferun_ingress_upstream_connections`, `ferun_ingress_endpoints`, `ferun_ingress_endpoint_nodes{admitted}`, `ferun_ingress_hosts` | the data path now |
+| `ferun_ingress_domain_certificates`, `ferun_ingress_acme_challenges`, `ferun_ingress_acme_answers_total{result}` | hosts with a certificate of their own; the challenges in the table; requests under `/.well-known/acme-challenge/`, `answered` or `unknown` |
 | `ferun_ingress_table_age_seconds`, `ferun_ingress_mesh_nodes{handshake}`, `ferun_ingress_mesh_handshake_age_seconds{node}`, `ferun_ingress_mesh_peers`, `ferun_ingress_mesh_configured` | the table's age and the mesh's health |
 | `ferun_ingress_info{name,version}`, `ferun_ingress_ready`, `ferun_ingress_draining`, `ferun_ingress_control_connected`, `ferun_ingress_control_refusals_total`, `ferun_ingress_identity_removed`, `ferun_ingress_identity_not_after_seconds`, `ferun_ingress_tls_not_after_seconds` | the instance |
 
@@ -1189,6 +1248,10 @@ open question.
 | An ingress removed | Its certificates are revoked, its connections closed, and it leaves the peers and the group; the agent declares its identity lost and fails readiness. | seconds |
 | A stolen certificate | It cannot change the mesh key, and it is renewed only while it is the instance's newest certificate, for the instance's key, in its renew window: once the instance has renewed and said Hello, the copy lives at most until its own expiry. Before that, it can connect, wake and hold: the operator removes the ingress and joins it again, which revokes every certificate and changes the WireGuard key. | the copy's lifetime, or an operator's action |
 | The wildcard renewed | cert-manager writes the Secret, the kubelet the files (about a minute), the ingress reads them within 30 s. | |
+| A domain's certificate renewed | `ferund` keeps it and notifies its environment; the environment's entry, with a new hash, reaches every instance and is served from the next handshake on. | about 100 ms |
+| An ACME order | Its challenge reaches every instance's port 80 through the table; `ferund` accepts it once every connected instance's stream has sent it, else the order fails without the CA validating. | about 100 ms |
+| The ingress cut off from `ferund` during an order | Its stream records no token; the order fails within 30 s and backs off an hour. A cached instance still in the balancer cannot answer the new challenge: a known limit. | |
+| An ingress of a version without domains behind a `ferund` with them | It routes a domain (it is in the hosts) with the wildcard, which the client refuses, and answers no challenge: roll the ingress before domains are bound. | |
 | A service listening on `127.0.0.1` or `0.0.0.0` alone | It passes readiness through the port door; the ingress's dials are refused: 502 with the `[::]` hint. | a known limit |
 
 ## Tests
@@ -1198,14 +1261,17 @@ open question.
   service and client over an in-memory connection); WireGuard's messages
   against golden bytes, dumps, the peers' diff and RFC 7748's vector; the
   table's build, its classes, an environment too large left out, the
-  diff and the builder against a database; the
+  diff and the builder against a database, the domains in an entry and
+  their bound, the builder's domains and challenges; the Sync stream's
+  challenges and the tokens it records; the
   proxy against `httptest` upstreams (routing, gating, holds, the wake
   bound, a client that goes away, draining, the body limit, retries, the
   idle timeout, cookies, the limits against an app that never answers,
   the shares per tenant and per environment, each wait for a connection,
   HTTP/2's streams, the memory of held HTTP/2 requests with large bodies,
-  the header bounds, and the connections cut when the table changes, a
-  dial under way included); the agent
+  the header bounds, the connections cut when the table changes, a
+  dial under way included, the certificate by SNI with a renewal and
+  the wildcard, the port-80 answers); the agent
   against a fake control plane
   (`agent.NewFakeControlPlane`: join and pin, reconnects over the address
   list, renewal, refusals, the fixed key, a new key after every join and

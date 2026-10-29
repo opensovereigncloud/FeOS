@@ -35,7 +35,16 @@ type EnvRows struct {
 	Release, Realised int
 	CreatedAt         time.Time
 	Instances         []Instance
+	// Domains are the environment's domains the ingress serves, with
+	// their certificates and keys opened (store.IngressDomains), in the
+	// order their entry takes them.
+	Domains []wire.Domain
 }
+
+// MaxDomainBytes is the most one domain takes in an environment's entry
+// coded, its name in the hosts included: a certificate's chain is a few
+// KiB, and a domain beyond this is left out.
+const MaxDomainBytes = 64 << 10
 
 // Instance is one service instance of an environment, with its sandbox
 // and the node it runs on.
@@ -166,7 +175,13 @@ func Asleep(phase, clientState, op string) bool {
 //     the routes' Port and numbered by the instance's own release, else
 //     by the routing release. The others are counted by their Class; a
 //     ready one without an admitted port is pending.
-//   - Its hash identifies the rest of its content.
+//   - Its domains (e.Domains) follow its default host in Hosts, and with
+//     their certificates in Domains, in their order, as long as the entry
+//     stays within MaxEnvBytes and each within MaxDomainBytes: a domain
+//     that does not fit is left out, never the environment. A name twice
+//     is taken once.
+//   - Its hash identifies the rest of its content, the certificates
+//     included, so that a renewed one is sent again.
 //
 // An error wrapping ErrSpec means the routing release has no usable spec,
 // one wrapping ErrTooLarge that the entry would take more than
@@ -249,8 +264,61 @@ func BuildEnv(zone string, e EnvRows, specs SpecFunc) (wire.Env, []podid.ID, err
 		return wire.Env{}, nil, fmt.Errorf("environment %s (%s of tenant %s), routing release %d: %d bytes, at most %d: %w",
 			e.ID, e.Name, e.Tenant, number, size, MaxEnvBytes, ErrTooLarge)
 	}
+	if with, ok, err := withDomains(out, e.Domains, size); err != nil {
+		return wire.Env{}, nil, fmt.Errorf("environment %s: %w", e.ID, err)
+	} else if ok {
+		out = with
+		if h, size, err = digest(out); err != nil {
+			return wire.Env{}, nil, fmt.Errorf("environment %s: %w", e.ID, err)
+		}
+		if size > MaxEnvBytes {
+			// The estimate was short: the domains stay out.
+			out.Hosts, out.Domains = out.Hosts[:len(out.Hosts)-len(out.Domains)], nil
+			if h, _, err = digest(out); err != nil {
+				return wire.Env{}, nil, fmt.Errorf("environment %s: %w", e.ID, err)
+			}
+		}
+	}
 	out.Hash = h
 	return out, referenced, nil
+}
+
+// withDomains returns e, which takes size bytes coded, with the domains
+// of ds that fit added to its Hosts and Domains (BuildEnv), and whether
+// any did.
+func withDomains(e wire.Env, ds []wire.Domain, size int) (wire.Env, bool, error) {
+	if len(ds) == 0 {
+		return e, false, nil
+	}
+	// ,"domains":[] once, then each domain and its host with a comma.
+	budget := MaxEnvBytes - size - len(`,"domains":[]`)
+	hosts := slices.Clone(e.Hosts)
+	var domains []wire.Domain
+	for _, d := range ds {
+		if d.Name == "" || slices.Contains(hosts, d.Name) {
+			continue
+		}
+		dn, err := wire.Size(&d)
+		if err != nil {
+			return wire.Env{}, false, err
+		}
+		hn, err := wire.Size(d.Name)
+		if err != nil {
+			return wire.Env{}, false, err
+		}
+		n := dn + hn + 2
+		if n > MaxDomainBytes || n > budget {
+			continue
+		}
+		budget -= n
+		hosts = append(hosts, d.Name)
+		domains = append(domains, d)
+	}
+	if len(domains) == 0 {
+		return e, false, nil
+	}
+	e.Hosts, e.Domains = hosts, domains
+	return e, true, nil
 }
 
 // admittedPorts returns the ports of an instance of service that its node

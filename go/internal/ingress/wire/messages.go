@@ -107,22 +107,42 @@ type SyncRequest struct{}
 // counts the messages of one stream from 1, so a gap shows a lost
 // message. A message with nothing but Seq and SentAt is a heartbeat.
 //
+// Challenges, when not nil, are every pending ACME HTTP-01 answer, all
+// of them: they replace the ingress's. In a delta nil keeps them; in a
+// whole table nil means none (a control plane that sends none).
+//
 // A table larger than PartBytes goes in parts (Split): consecutive
 // messages of the stream, each with its own Seq, every one but the last
-// with More. The first part carries Whole, Mesh and Self; Envs, then
-// Removed, are spread over the parts. Nothing else comes between the
-// parts, and a receiver applies them together once the last one has
-// arrived, never a part alone (State.Apply).
+// with More. The first part carries Whole, Mesh, Self and Challenges;
+// Envs, then Removed, are spread over the parts. Nothing else comes
+// between the parts, and a receiver applies them together once the last
+// one has arrived, never a part alone (State.Apply).
 type Table struct {
 	Seq   uint64 `json:"seq"`
 	Whole bool   `json:"whole,omitempty"`
 	// More: the message goes on in the next part.
-	More    bool      `json:"more,omitempty"`
-	Envs    []Env     `json:"envs,omitempty"`
-	Removed []string  `json:"removed,omitempty"`
-	Mesh    *Mesh     `json:"mesh,omitempty"` // nil: unchanged
-	Self    *Self     `json:"self,omitempty"` // nil: unchanged
-	SentAt  time.Time `json:"sentAt"`
+	More       bool        `json:"more,omitempty"`
+	Envs       []Env       `json:"envs,omitempty"`
+	Removed    []string    `json:"removed,omitempty"`
+	Mesh       *Mesh       `json:"mesh,omitempty"`       // nil: unchanged
+	Self       *Self       `json:"self,omitempty"`       // nil: unchanged
+	Challenges *Challenges `json:"challenges,omitempty"` // nil: unchanged (in a delta)
+	SentAt     time.Time   `json:"sentAt"`
+}
+
+// Challenges are the ACME HTTP-01 answers every ingress instance gives
+// on port 80 while ferund's orders are pending, sorted by Token.
+type Challenges struct {
+	Items []Challenge `json:"items"`
+}
+
+// Challenge is one HTTP-01 answer: GET
+// /.well-known/acme-challenge/<Token> on port 80 with the Host Host is
+// answered 200 with KeyAuth as text/plain.
+type Challenge struct {
+	Token   string `json:"token"`
+	Host    string `json:"host"`
+	KeyAuth string `json:"keyAuth"`
 }
 
 // Mesh is the ingress's WireGuard peers: the nodes of the pods' mesh, at
@@ -156,6 +176,11 @@ type Self struct {
 // routing release and the services its routes reach. Hash identifies the
 // content, so that the control plane sends an environment again only
 // when it changed.
+//
+// Domains are the hosts of the environment that have a certificate of
+// their own (a tenant's domains, ADR 0021); each one's name is in Hosts
+// too. The default host under the apps zone has none: it takes the
+// ingress's wildcard.
 type Env struct {
 	ID       string    `json:"id"`
 	Tenant   string    `json:"tenant"`
@@ -165,6 +190,16 @@ type Env struct {
 	Hash     string    `json:"hash"`
 	Routes   []Route   `json:"routes"`
 	Services []Service `json:"services"`
+	Domains  []Domain  `json:"domains,omitempty"`
+}
+
+// Domain is a host served with a certificate of its own: its name, the
+// certificate's chain in DER, the issued certificate first, and its
+// private key, PKCS #8 DER.
+type Domain struct {
+	Name  string   `json:"name"`
+	Chain [][]byte `json:"chain"`
+	Key   []byte   `json:"key"`
 }
 
 // Route sends requests under Path to Service, at the port its endpoints

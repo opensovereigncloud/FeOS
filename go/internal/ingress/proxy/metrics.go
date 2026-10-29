@@ -43,6 +43,9 @@ type metrics struct {
 
 	cookieDomains atomic.Uint64
 
+	acmeAnswered atomic.Uint64
+	acmeUnknown  atomic.Uint64
+
 	waitErrors             atomic.Uint64
 	rejectedInflightEnv    atomic.Uint64
 	rejectedInflightTenant atomic.Uint64
@@ -207,9 +210,18 @@ func (p *Proxy) Metrics(w io.Writer) {
 		"Nodes with endpoints, by whether their handshake is fresh and their group version admits the ingress.",
 		Sample{Labels: []string{"admitted", "true"}, Value: float64(len(dp.FreshAdmittedNodes))},
 		Sample{Labels: []string{"admitted", "false"}, Value: float64(len(dp.EndpointNodes) - len(dp.FreshAdmittedNodes))})
-	hosts := 0
+	hosts, domains, challenges := 0, 0, 0
 	if v.t != nil {
-		hosts = len(v.t.hosts)
+		hosts, domains, challenges = len(v.t.hosts), len(v.t.certs), len(v.t.challenges)
 	}
 	WriteMetric(bw, "ferun_ingress_hosts", "gauge", "Hosts in the table.", Sample{Value: float64(hosts)})
+	WriteMetric(bw, "ferun_ingress_domain_certificates", "gauge",
+		"Hosts in the table with a certificate of their own (domains); the others get the wildcard.",
+		Sample{Value: float64(domains)})
+	WriteMetric(bw, "ferun_ingress_acme_challenges", "gauge", "Pending ACME HTTP-01 challenges in the table.",
+		Sample{Value: float64(challenges)})
+	WriteMetric(bw, "ferun_ingress_acme_answers_total", "counter",
+		"Requests under /.well-known/acme-challenge/ on port 80, by whether a challenge was answered.",
+		Sample{Labels: []string{"result", "answered"}, Value: float64(m.acmeAnswered.Load())},
+		Sample{Labels: []string{"result", "unknown"}, Value: float64(m.acmeUnknown.Load())})
 }

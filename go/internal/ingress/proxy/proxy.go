@@ -6,8 +6,10 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"maps"
@@ -18,6 +20,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -291,11 +294,12 @@ func (p *Proxy) SetState(s *wire.State) {
 	p.mu.Lock()
 	p.stateAt = time.Now()
 	old := p.cur.Load()
-	if old.t != nil && old.t.src.Self == s.Self && reflect.DeepEqual(old.t.src.Envs, s.Envs) {
+	if old.t != nil && old.t.src.Self == s.Self && reflect.DeepEqual(old.t.src.Envs, s.Envs) &&
+		slices.Equal(old.t.src.Challenges, s.Challenges) {
 		p.mu.Unlock()
 		return
 	}
-	t := buildTable(s, p.log)
+	t := buildTable(s, p.log, old.t)
 	p.cur.Store(&view{t: t, fresh: old.fresh, changed: make(chan struct{})})
 	clear(p.skipped)
 	left := false
@@ -473,13 +477,18 @@ func (p *Proxy) ServeHTTPS() http.Handler {
 	})
 }
 
-// ServeHTTPRedirect is the handler of the HTTP listener: 308 to https
+// ServeHTTPRedirect is the handler of the HTTP listener: ACME's HTTP-01
+// challenges first (answerChallenge), on every host; then 308 to https
 // for a known host, 404 for any other.
 func (p *Proxy) ServeHTTPRedirect() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := &recorder{ResponseWriter: w}
 		defer func() { p.m.request(rec.class()) }()
 		host := canonicalHost(r.Host)
+		if strings.HasPrefix(r.URL.Path, challengePath) {
+			p.answerChallenge(rec, r, host)
+			return
+		}
 		if t := p.cur.Load().t; t == nil || t.hosts[host] == nil {
 			reply{http.StatusNotFound, textNoHost, 0}.write(rec)
 			return
@@ -488,13 +497,57 @@ func (p *Proxy) ServeHTTPRedirect() http.Handler {
 	})
 }
 
+// challengePath is the path under which ACME's HTTP-01 challenges are
+// asked for (RFC 8555 §8.3).
+const challengePath = "/.well-known/acme-challenge/"
+
+// textNoChallenge answers a challenge the table does not hold for the
+// request's host.
+const textNoChallenge = "no such challenge"
+
+// answerChallenge answers GET (and HEAD) /.well-known/acme-challenge/<token>
+// with the challenge's key authorization, text/plain, when the table
+// holds the token for the request's host; anything else under the path
+// is 404.
+func (p *Proxy) answerChallenge(w http.ResponseWriter, r *http.Request, host string) {
+	token := strings.TrimPrefix(r.URL.Path, challengePath)
+	c, ok := p.cur.Load().t.challenge(token)
+	if !ok || canonicalHost(c.Host) != host || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+		p.m.acmeUnknown.Add(1)
+		reply{http.StatusNotFound, textNoChallenge, 0}.write(w)
+		return
+	}
+	p.m.acmeAnswered.Add(1)
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Length", strconv.Itoa(len(c.KeyAuth)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, c.KeyAuth)
+}
+
+// GetCertificate is the HTTPS listener's choice of certificate: by SNI,
+// a domain's own from the table, else the operator's wildcard of c.
+func (p *Proxy) GetCertificate(c *Certs) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if hello.ServerName != "" {
+			if cert := p.cur.Load().t.cert(canonicalHost(hello.ServerName)); cert != nil {
+				return cert, nil
+			}
+		}
+		return c.GetCertificate(hello)
+	}
+}
+
 // HTTPSServer returns the HTTPS server with its limits, serving
-// ServeHTTPS with the certificates of c. The caller sets the address or
-// serves a listener (ServeTLS with empty file names).
+// ServeHTTPS with the domains' certificates of the table by SNI, else the
+// certificate of c. The caller sets the address or serves a listener
+// (ServeTLS with empty file names).
 func (p *Proxy) HTTPSServer(c *Certs) *http.Server {
+	tc := c.TLSConfig()
+	tc.GetCertificate = p.GetCertificate(c)
 	return &http.Server{
 		Handler:           p.ServeHTTPS(),
-		TLSConfig:         c.TLSConfig(),
+		TLSConfig:         tc,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       serverIdleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,

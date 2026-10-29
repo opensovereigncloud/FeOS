@@ -389,6 +389,74 @@ func TestPodNetwork(t *testing.T) {
 	}
 }
 
+// --acme-directory: empty by default, which obtains no certificate;
+// otherwise an https URL, with --secret-key-file. --acme-email: empty, or
+// an email address. Both from the flag or their variables.
+func TestACME(t *testing.T) {
+	t.Parallel()
+	if EnvName("acme-directory") != "FERUN_ACME_DIRECTORY" || EnvName("acme-email") != "FERUN_ACME_EMAIL" {
+		t.Fatal(EnvName("acme-directory"), EnvName("acme-email"))
+	}
+	const dir = "https://acme.example/directory"
+	c, err := Parse([]string{"--database-url", testURL}, env(nil))
+	if err != nil || c.ACMEDirectory != "" || c.ACMEEmail != "" || Default().ACMEDirectory != "" ||
+		c.ACMEProfile != "shortlived" {
+		t.Fatalf("default %q %q, %v", c.ACMEDirectory, c.ACMEEmail, err)
+	}
+	c, err = Parse([]string{"--database-url", testURL, "--secret-key-file", "/k"},
+		env(map[string]string{"FERUN_ACME_DIRECTORY": dir, "FERUN_ACME_EMAIL": "ops@fecore.dev"}))
+	if err != nil || c.ACMEDirectory != dir || c.ACMEEmail != "ops@fecore.dev" {
+		t.Fatalf("from the variables %q %q, %v", c.ACMEDirectory, c.ACMEEmail, err)
+	}
+	c, err = Parse([]string{"--database-url", testURL, "--secret-key-file", "/k", "--acme-directory", "https://other.example/dir",
+		"--acme-email", ""}, env(map[string]string{"FERUN_ACME_DIRECTORY": dir, "FERUN_ACME_EMAIL": "ops@fecore.dev"}))
+	if err != nil || c.ACMEDirectory != "https://other.example/dir" || c.ACMEEmail != "" {
+		t.Fatalf("from the flags %q %q, %v", c.ACMEDirectory, c.ACMEEmail, err)
+	}
+	if _, err := Parse([]string{"--database-url", testURL, "--acme-directory", dir}, env(nil)); err == nil ||
+		!strings.Contains(err.Error(), "--secret-key-file") {
+		t.Errorf("a directory without --secret-key-file: %v", err)
+	}
+	if c, err := Parse([]string{"--database-url", testURL, "--acme-profile", ""}, env(nil)); err != nil || c.ACMEProfile != "" {
+		t.Fatalf("an empty profile %q, %v", c.ACMEProfile, err)
+	}
+	if c, err := Parse([]string{"--database-url", testURL}, env(map[string]string{"FERUN_ACME_PROFILE": "classic"})); err != nil ||
+		c.ACMEProfile != "classic" {
+		t.Fatalf("a profile from the variable %q, %v", c.ACMEProfile, err)
+	}
+	for _, bad := range []string{"short lived", "a/b", strings.Repeat("x", 65)} {
+		if _, err := Parse([]string{"--database-url", testURL, "--acme-profile", bad}, env(nil)); err == nil ||
+			!strings.Contains(err.Error(), "--acme-profile") {
+			t.Errorf("profile %q: %v", bad, err)
+		}
+	}
+	for _, bad := range []string{"http://acme.example/directory", "acme.example/directory", "https://", "https://u:p@acme.example/d",
+		"ftp://acme.example", " https://acme.example"} {
+		if _, err := Parse([]string{"--database-url", testURL, "--secret-key-file", "/k", "--acme-directory", bad},
+			env(nil)); err == nil || !strings.Contains(err.Error(), "--acme-directory") {
+			t.Errorf("directory %q: %v", bad, err)
+		}
+	}
+	for _, bad := range []string{"ops", "ops@", "Ops <ops@fecore.dev>", "ops@fecore.dev, b@fecore.dev", " ops@fecore.dev",
+		"mailto:ops@fecore.dev"} {
+		if _, err := Parse([]string{"--database-url", testURL, "--acme-email", bad}, env(nil)); err == nil ||
+			!strings.Contains(err.Error(), "--acme-email") {
+			t.Errorf("email %q: %v", bad, err)
+		}
+	}
+	c = Default()
+	c.DatabaseURL, c.ACMEDirectory = testURL, dir
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "--secret-key-file") {
+		t.Fatalf("an instance built in process without a key: %v", err)
+	}
+	var b strings.Builder
+	Usage(&b, CmdServe)
+	if !strings.Contains(b.String(), "--acme-directory (FERUN_ACME_DIRECTORY)") ||
+		!strings.Contains(b.String(), "--acme-email (FERUN_ACME_EMAIL)") {
+		t.Fatalf("serve help lacks the ACME flags:\n%s", b.String())
+	}
+}
+
 // --apps-zone: empty by default, which serves no hosts; otherwise a
 // lowercase DNS name, from the flag or FERUN_APPS_ZONE.
 func TestAppsZone(t *testing.T) {

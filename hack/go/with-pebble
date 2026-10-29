@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Runs a command with FERUN_TEST_ACME_DIRECTORY naming an ACME directory:
+# the one the environment names, or Let's Encrypt's test server Pebble in
+# docker, removed afterwards. Pebble accepts every challenge without
+# fetching it (PEBBLE_VA_ALWAYS_VALID) and refuses no nonce; it lists the
+# profiles default (90 days) and shortlived (six days). The tests trust
+# its TLS certificate without checking it.
+set -euo pipefail
+
+if [ -n "${FERUN_TEST_ACME_DIRECTORY:-}" ]; then
+	exec "$@"
+fi
+
+image=${FERUN_TEST_PEBBLE_IMAGE:-ghcr.io/letsencrypt/pebble@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199}
+name=ferun-test-pebble-$$
+docker run -d --rm --name "$name" -e PEBBLE_VA_ALWAYS_VALID=1 -e PEBBLE_WFE_NONCEREJECT=0 \
+	-p 127.0.0.1::14000 "$image" >/dev/null
+trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+
+port=$(docker port "$name" 14000/tcp | head -1 | sed 's/.*://')
+for _ in $(seq 1 100); do
+	if curl -skf "https://127.0.0.1:${port}/dir" >/dev/null; then
+		break
+	fi
+	sleep 0.2
+done
+
+export FERUN_TEST_ACME_DIRECTORY="https://127.0.0.1:${port}/dir"
+"$@"

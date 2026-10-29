@@ -21,7 +21,8 @@
 //	wg.key                 the WireGuard private key, 32 raw bytes
 //	mesh.json              the place on the mesh: {podNetwork, prefix, address}
 //	table.json             the table cache: {savedAt, state}, written 1 s after a change,
-//	                       and at least once a minute while heartbeats confirm it
+//	                       and at least once a minute while heartbeats confirm it; it holds
+//	                       the domains' certificates and keys and the ACME challenges
 //
 // The certificate is renewed for the same key. A new key is made only
 // when the identity is declared lost, so tls.key and cert.json never

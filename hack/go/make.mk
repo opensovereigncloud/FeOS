@@ -57,8 +57,8 @@ go-lint: go-fmt-check go-vet ## gofmt and go vet.
 go-test-unit: ## The Go tests that need no database: those that do skip.
 	cd $(GO_DIR) && $(GO) test ./...
 
-go-test: ## All Go tests, against a PostgreSQL in docker unless FERUN_TEST_DATABASE_URL names one.
-	hack/go/with-postgres sh -c 'cd $(GO_DIR) && $(GO) test -count=1 ./...'
+go-test: ## All Go tests, against a PostgreSQL and Pebble (ACME) in docker unless FERUN_TEST_DATABASE_URL and FERUN_TEST_ACME_DIRECTORY name them.
+	hack/go/with-postgres hack/go/with-pebble sh -c 'cd $(GO_DIR) && $(GO) test -count=1 ./...'
 
 go-test-netns: ## The WireGuard test of ferun-ingress in network namespaces of its own; needs sudo -n and WireGuard.
 	GO=$(GO) hack/go/netns-test

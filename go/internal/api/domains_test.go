@@ -138,7 +138,7 @@ func TestDomainsEndToEnd(t *testing.T) {
 	for k, want := range map[string]string{"environment": "null", "certificate": "null", "verifiedAt": "null",
 		"boundAt": "null", "checkedAt": "null",
 		"found":    `{"txt":[],"cname":[],"addresses":[]}`,
-		"warnings": `{"recordMissingSince":null,"dnsMovedSince":null,"deactivatesAt":null,"checkFailing":""}`} {
+		"warnings": `{"recordMissingSince":null,"dnsMovedSince":null,"deactivatesAt":null,"checkFailing":"","certificateFailing":""}`} {
 		if string(shape[k]) != want {
 			t.Errorf("%s: %s, want %s", k, shape[k], want)
 		}
@@ -199,7 +199,7 @@ func TestDomainsEndToEnd(t *testing.T) {
 	expect(t, do("PUT", "/api/v1/environments/prod/public", map[string]any{"public": true}), http.StatusOK, "")
 
 	// The records in DNS, a check now: verified and routed; it waits for
-	// certificates, a later step.
+	// its certificate.
 	dns.set("dashboard.fecore.dev", d.Records.TXT.Value, true)
 	w = do("POST", "/api/v1/domains/"+d.ID+"/check", nil)
 	expect(t, w, http.StatusOK, "")
@@ -207,11 +207,33 @@ func TestDomainsEndToEnd(t *testing.T) {
 		t.Fatalf("checked %s", w.Body)
 	}
 	c := decode[domains.Domain](t, w)
-	if c.Verification != "verified" || c.State != "issuing" || c.Reason != domains.ReasonNoCertificates ||
+	if c.Verification != "verified" || c.State != "issuing" || c.Reason != domains.ReasonIssuing ||
 		c.VerifiedAt == nil || c.CheckedAt == nil || !slices.Equal(c.Found.CNAME, []string{"edge.fecode.dev"}) ||
 		!slices.Equal(c.Found.Addresses, []string{"194.11.242.65"}) || c.Records.Apex != nil {
 		t.Fatalf("checked %+v", c)
 	}
+	// ACME keeps its certificate (internal/acme): the next check serves
+	// it, and the answer shows the certificate; a renewal that fails shows
+	// as a warning while it stays served.
+	if _, err := e.st.Q().Exec(t.Context(), `INSERT INTO domain_certs (domain_id, chain, key_sealed, not_before, not_after,
+			renew_after, serial) VALUES ($1, ARRAY['\x01'::bytea], '\x02', now() - interval '1 hour',
+			now() + interval '143 hours', now() + interval '71 hours', 'abc')`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	s := decode[domains.Domain](t, do("POST", "/api/v1/domains/"+d.ID+"/check", nil))
+	if s.State != "served" || s.Reason != "" || s.Certificate == nil || s.Certificate.Serial != "abc" ||
+		s.Certificate.RenewAfter == "" || s.Warnings.CertificateFailing != "" {
+		t.Fatalf("served %+v %+v", s, s.Certificate)
+	}
+	if _, err := e.st.Q().Exec(t.Context(), `UPDATE domains SET issue_error = 'rate limited by the CA: x',
+			issue_failing_since = now() WHERE id = $1`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s := decode[domains.Domain](t, do("GET", "/api/v1/domains/"+d.ID, nil)); s.State != "served" ||
+		s.Warnings.CertificateFailing != "rate limited by the CA: x" {
+		t.Fatalf("a failing renewal %+v", s)
+	}
+
 	// Unpublished through its route: the stored state follows in the same
 	// transaction.
 	expect(t, do("PUT", "/api/v1/environments/prod/public", map[string]any{"public": false}), http.StatusOK, "")

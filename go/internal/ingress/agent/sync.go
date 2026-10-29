@@ -219,7 +219,7 @@ func (a *Agent) apply(part *wire.Table) (*wire.Table, error) {
 	}
 	now := time.Now()
 	a.tableAt = now
-	changed := t.Whole || len(t.Envs) > 0 || len(t.Removed) > 0 || t.Mesh != nil || t.Self != nil
+	changed := t.Whole || len(t.Envs) > 0 || len(t.Removed) > 0 || t.Mesh != nil || t.Self != nil || t.Challenges != nil
 	var clone *wire.State
 	if changed {
 		clone = a.state.Clone()

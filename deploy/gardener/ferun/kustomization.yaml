@@ -106,3 +106,12 @@ patches:
                     value: '${DOMAIN_CHALLENGE_LABEL}'
                   - name: FERUN_DOMAIN_RESERVED
                     value: '${DOMAIN}'
+                  # The domains' certificates (ADR 0021): ferund orders them
+                  # over HTTP-01 through ferun-ingress's port 80. Empty
+                  # directory: none is ordered, domains stay issuing.
+                  - name: FERUN_ACME_DIRECTORY
+                    value: '${ACME_DIRECTORY}'
+                  - name: FERUN_ACME_EMAIL
+                    value: '${ACME_EMAIL}'
+                  - name: FERUN_ACME_PROFILE
+                    value: '${ACME_PROFILE}'

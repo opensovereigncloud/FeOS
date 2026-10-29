@@ -499,6 +499,17 @@ func (s *Service) EnvChanged(ctx context.Context, tx *store.Store, envID uuid.UU
 	return nil
 }
 
+// Refresh derives a domain's state again, in a fenced transaction of its
+// own, after ACME kept its certificate or recorded a failed order
+// (acme.Refresher); a domain that is gone is no error.
+func (s *Service) Refresh(ctx context.Context, id uuid.UUID) error {
+	err := s.inTx(ctx, true, func(tx *store.Store) error { return s.refreshIn(ctx, tx, id) })
+	if errors.Is(err, errGone) {
+		return nil
+	}
+	return err
+}
+
 // refreshIn derives the domain's state again in tx and writes it with what
 // follows from it (settle); the table is told when the state changed.
 func (s *Service) refreshIn(ctx context.Context, tx *store.Store, id uuid.UUID) error {

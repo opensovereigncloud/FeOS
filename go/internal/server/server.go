@@ -13,7 +13,8 @@
 // election with every package's loops; the sandbox engine; the tools'
 // runner; the MCP door; the bindings; the ports and watches (through the
 // streams hook); the environments (ADR 0018) with their controller; the
-// REST API with the UI; and its heartbeat row.
+// ACME client of the domains' certificates (ADR 0021); the REST API with
+// the UI; and its heartbeat row.
 //
 // Its stop, at the end of Run's context:
 //  1. the row says stopping, /readyz fails, the leader resigns, the
@@ -58,6 +59,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	fleetv1 "github.com/gardenlinux/feos/go/gen/feos/fleet/v1"
+	"github.com/gardenlinux/feos/go/internal/acme"
 	"github.com/gardenlinux/feos/go/internal/activity"
 	"github.com/gardenlinux/feos/go/internal/api"
 	"github.com/gardenlinux/feos/go/internal/auth"
@@ -157,6 +159,7 @@ type Instance struct {
 	Runner    *tools.Runner
 	Env       *env.Service
 	Domains   *domains.Service // ADR 0021
+	ACME      *acme.Issuer
 	mcp       *mcpsrv.Server
 	Bindings  *bindings.Service
 	streams   Streams
@@ -224,8 +227,12 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 		}
 	}
 	var key []byte
+	var sealer *seal.Sealer
 	if cfg.SecretKeyFile != "" {
 		if key, err = readSecretKey(cfg.SecretKeyFile); err != nil {
+			return nil, fmt.Errorf("--secret-key-file: %w", err)
+		}
+		if sealer, err = seal.New(key); err != nil {
 			return nil, fmt.Errorf("--secret-key-file: %w", err)
 		}
 	}
@@ -314,11 +321,15 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.Fleet = fl
 	fleetv1.RegisterFleetServiceServer(i.Links.Uplink(), fl.UplinkServer())
 	fleetv1.RegisterFleetServiceServer(i.Links.Join(), fl.JoinServer())
+	tbl := table.NewBuilder(i.DB, i.Store, cfg.AppsZone, i.log)
+	if sealer != nil {
+		tbl.Sealer = sealer
+	}
 	ing = ingresssvc.New(ingresssvc.Config{
 		InstanceID: i.id, TrustDomain: cfg.TrustDomain, AppsZone: cfg.AppsZone, CertTTL: cfg.NodeCertTTL,
 		SupersedeGrace: ingressSupersedeGrace, PodNetwork: i.podNetwork, Log: i.log,
 	}, ingresssvc.Deps{DB: i.DB, Store: i.Store, Issuer: i.Issuer, Links: i.Links, Engine: i.Engine,
-		Builder: table.NewBuilder(i.DB, i.Store, cfg.AppsZone, i.log)})
+		Builder: tbl})
 	i.Ingress = ing
 	ing.Register()
 	i.Runner = tools.NewRunner(i.Engine, i.Links, i.Activity, i.DB, i.id, i.log)
@@ -334,6 +345,9 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	}
 	if i.Env, err = i.newEnvironments(key); err != nil {
 		return nil, fmt.Errorf("environments: %w", err)
+	}
+	if i.ACME, err = i.newACME(sealer); err != nil {
+		return nil, fmt.Errorf("acme: %w", err)
 	}
 
 	deps := api.Deps{
@@ -353,6 +367,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.Elector.Register(i.streams.Loops...)
 	i.Elector.Register(i.Env.Loops()...)
 	i.Elector.Register(i.Domains.Loops()...)
+	i.Elector.Register(i.ACME.Loops()...)
 	i.Elector.Register(i.Runner.Loops()...)
 	i.handler = api.New(api.Config{
 		AdminUsers: cfg.AdminUsers, InstanceID: i.id, PreparationWaitMs: config.PreparationBudget.Milliseconds(),

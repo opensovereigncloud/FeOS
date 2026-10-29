@@ -247,7 +247,7 @@ func (h *harness) routed(name string) (store.DomainView, store.Environment) {
 	h.check(d.ID)
 	h.bind("acme", d.ID, e.ID.String())
 	v := h.check(d.ID)
-	if v.State != StateIssuing || v.Reason != ReasonNoCertificates || !v.WasRouted {
+	if v.State != StateIssuing || v.Reason != ReasonIssuing || !v.WasRouted {
 		h.t.Fatalf("not routed: %+v", v)
 	}
 	return v, e

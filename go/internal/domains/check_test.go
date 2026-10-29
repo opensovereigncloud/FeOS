@@ -65,7 +65,7 @@ func TestVerifyAndBackoff(t *testing.T) {
 }
 
 // A bind starts no grace and has the domain checked at once; routed, it
-// waits for certificates (issuing, a later step); its environment's
+// waits for its certificate (issuing); its environment's
 // changes show through EnvChanged at once and through the settle loop.
 // Every change of the state tells the ingress's table.
 func TestBindRoute(t *testing.T) {
@@ -90,7 +90,7 @@ func TestBindRoute(t *testing.T) {
 	}
 	h.dns.routeTo("shop.example.com", "192.0.2.10", "2001:db8::10") // A and AAAA of the edge
 	v = h.check(d.ID)
-	if !v.Routed || !v.WasRouted || v.State != StateIssuing || v.Reason != ReasonNoCertificates {
+	if !v.Routed || !v.WasRouted || v.State != StateIssuing || v.Reason != ReasonIssuing {
 		t.Fatalf("routed %+v", v)
 	}
 	// Only some of the addresses the edge's: not routed.

@@ -167,24 +167,31 @@ content type `application/grpc+json`. Method names are
   `feos.fleet.v1`'s: the chain without the root, the issued certificate
   first, and the bundle's roots, DER each.
 - **The table.** `Table{seq, whole, more, envs, removed, mesh, self,
-  sentAt}`: `seq` counts from 1 per stream, one per message; `whole`
-  replaces the state; otherwise `envs` are put by ID, `removed` are
-  deleted, and a `mesh` or `self` present replaces the one before
-  (absent: unchanged). An empty table is the heartbeat. A table that
-  takes more than 4 MiB comes in parts: consecutive messages, every one
-  but the last with `more`, the first with `whole`, `mesh` and `self`,
-  the `envs` and then the `removed` spread over them; the receiver
-  applies them together once the last has arrived, and nothing comes
-  between them. A message takes at most 32 MiB, an environment at most
-  2 MiB (a larger one is left out of the table). An `Env` is `{id,
-  tenant, name, hosts, release, hash, routes: [{name, path, service,
-  port, strip, door}], services: [{name, idle, endpoints: [{instance,
-  address, node, ports, groupVersion}], asleep, waking, pending}]}`;
-  `Mesh` is `{version, peers: [{name, publicKey, endpoint, prefix}]}`,
-  the nodes alone; `Self` is `{name, address, appsZone,
-  admittedVersion}`. The receiver keeps the state (`wire.State`,
-  `Apply`): a delta or a part whose `seq` is not the next ends the
-  stream, and the ingress connects again.
+  challenges, sentAt}`: `seq` counts from 1 per stream, one per message;
+  `whole` replaces the state; otherwise `envs` are put by ID, `removed`
+  are deleted, and a `mesh` or `self` present replaces the one before
+  (absent: unchanged). `challenges`, `{items: [{token, host,
+  keyAuth}]}`, present, are every pending ACME HTTP-01 answer and
+  replace the ones before; absent, a delta keeps them and a whole table
+  leaves none. An empty table is the heartbeat. A table that takes more
+  than 4 MiB comes in parts: consecutive messages, every one but the
+  last with `more`, the first with `whole`, `mesh`, `self` and
+  `challenges`, the `envs` and then the `removed` spread over them; the
+  receiver applies them together once the last has arrived, and nothing
+  comes between them. A message takes at most 32 MiB, an environment at
+  most 2 MiB (a larger one is left out of the table; domains that would
+  make it larger are left out of it). An `Env` is `{id, tenant, name,
+  hosts, release, hash, routes: [{name, path, service, port, strip,
+  door}], services: [{name, idle, endpoints: [{instance, address, node,
+  ports, groupVersion}], asleep, waking, pending}], domains: [{name,
+  chain, key}]}`: `domains`, absent without any, are the hosts with a
+  certificate of their own, each its chain (DER, leaf first) and private
+  key (PKCS #8 DER), and each name is in `hosts` too; `Mesh` is
+  `{version, peers: [{name, publicKey, endpoint, prefix}]}`, the nodes
+  alone; `Self` is `{name, address, appsZone, admittedVersion}`. The
+  receiver keeps the state (`wire.State`, `Apply`): a delta or a part
+  whose `seq` is not the next ends the stream, and the ingress connects
+  again.
 - **Errors.** A refused connection answers every call
   `PERMISSION_DENIED` with the refusal's text, by which the ingress tells
   a removal from other refusals ([ingress.md](ingress.md#refusals)).
