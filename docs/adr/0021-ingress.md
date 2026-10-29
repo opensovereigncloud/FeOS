@@ -194,21 +194,22 @@ woken by the door, which holds the request until the pod runs.
 - A deleted claim ends its binding and its key. What its owner leaves in
   DNS, the TXT and the CNAME, gives the name to no other claim, since no
   other token is in it.
-- `ferund` asks the authoritative servers of the name's zone, found by
-  the zone's SOA and NS records, with a small DNS client of its own on
-  the standard library, and not a cache: a record just set counts at once, and no negative answer
-  cached for an hour holds a claim back. An unverified claim is checked
-  with backoff from a minute to an hour, and at once on
-  `POST /api/v1/domains/{id}/check`; a verified one as the next section
-  says. A tenant holds at most `--domain-unverified-max` unverified
-  claims (default 50).
+- `ferund` looks the records up with the standard library's resolver,
+  through `--dns-resolver` or else the system's. A resolver caches an
+  answer for its TTL, so a record just set may count only minutes
+  later; against a grace of days, a cached answer decides nothing. An
+  unverified claim is checked with backoff from a minute to an hour,
+  and at once on `POST /api/v1/domains/{id}/check`; a verified one as
+  the next section says. A tenant holds at most
+  `--domain-unverified-max` unverified claims (default 50).
 
 ### Routing a domain
 
-- A domain is **routed** when its name resolves to the ingress: a CNAME
-  chain that reaches `edge.<domain>`, which the operator publishes with
-  the balancer's addresses, or A and AAAA records that are all the
-  edge's addresses. A name below its zone's apex takes a CNAME; an apex,
+- A domain is **routed** when its name resolves to the ingress: every
+  address it resolves to, and at least one, is an address of the edge,
+  `edge.<domain>`, which the operator publishes with the balancer's
+  addresses. A CNAME, an ALIAS and A and AAAA records all end in
+  addresses, so one lookup covers them. A name below its zone's apex takes a CNAME; an apex,
   which cannot carry one, takes an ALIAS, ANAME or flattened CNAME to
   `edge.<domain>` where its DNS provider has one (Cloudflare flattens at
   the apex), else A and AAAA records with the edge's addresses. The
@@ -231,9 +232,8 @@ woken by the door, which holds the request until the pod runs.
 - `ferund` checks a verified domain's records every hour for as long as
   the claim exists: the TXT, and once the domain is bound, the routing
   record; every quarter of an hour while one of them is wrong. Only an
-  answer counts as wrong: a name or record the authoritative servers
-  deny, a TXT without the token, a CNAME or addresses that lead
-  elsewhere. A lookup that fails (a timeout, `SERVFAIL`, no server
+  answer counts as wrong: a name or record that does not exist, a TXT
+  without the token, addresses that lead elsewhere. A lookup that fails (a timeout, `SERVFAIL`, no server
   reached, `ferund`'s own network away) changes nothing and shows as
   `checkFailing`, so that an outage of DNS or of the platform's own
   network deactivates no domain.
@@ -549,6 +549,15 @@ changed these points:
 - **A service must listen on `[::]`.** Its readiness check, through the
   port door on the loopback, does not show it; the ingress answers 502
   with that hint.
+- **Domains are built without certificates.** Claims, their proof,
+  bindings, the checks with their grace, incidents and
+  `/api/v1/domains` are there; the ingress serves no domain yet, and a
+  domain that is verified, bound, public and routed stays `issuing`
+  ("certificates are not available yet"). Certificates, and serving
+  domains, come with the ingress's proxy in a step of their own. The
+  checks ask a recursive resolver with the standard library's, not the
+  zone's authoritative servers with a client of their own: a cached
+  answer costs minutes, against a grace of days.
 
 ## Alternatives considered
 
