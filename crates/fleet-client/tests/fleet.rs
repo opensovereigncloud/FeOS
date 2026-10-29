@@ -174,6 +174,12 @@ struct Seen {
     refuse: bool,
     /// The JoinMesh calls, with the certificate they came with.
     mesh_joins: Vec<(Vec<u8>, JoinMeshRequest)>,
+    /// When each report came.
+    reported_at: Vec<std::time::Instant>,
+    /// The node connections the node opened.
+    node_connections: usize,
+    /// The channels of the node connections, for the test's calls.
+    channels: Vec<tonic::transport::Channel>,
 }
 
 struct ControlPlane {
@@ -300,11 +306,10 @@ impl FleetService for ControlPlane {
         request: Request<Telemetry>,
     ) -> Result<Response<TelemetryResponse>, Status> {
         let peer = self.peer(&request)?;
-        self.seen
-            .lock()
-            .unwrap()
-            .reports
-            .push((peer, request.into_inner()));
+        let mut seen = self.seen.lock().unwrap();
+        seen.reports.push((peer, request.into_inner()));
+        seen.reported_at.push(std::time::Instant::now());
+        drop(seen);
         Ok(Response::new(TelemetryResponse {
             interval_seconds: 1,
             instances: self.instances(),
@@ -400,7 +405,10 @@ async fn control_plane(pki: Arc<Pki>, seen: Arc<Mutex<Seen>>) -> (String, String
                     Some(b"h2") => {
                         uplinks.send(Ok(Uplink(tls))).await.ok();
                     }
-                    Some(b"feos-node/1") => call_node(tls, seen).await,
+                    Some(b"feos-node/1") => {
+                        seen.lock().unwrap().node_connections += 1;
+                        call_node(tls, seen).await
+                    }
                     _ => {}
                 }
             });
@@ -420,7 +428,12 @@ async fn call_node(tls: TlsStream<TcpStream>, seen: Arc<Mutex<Seen>>) {
         .map(|cert| cert.to_vec())
         .unwrap_or_default();
     let stream = Mutex::new(Some(tls));
+    // A node that does not answer pings within 3 s loses its connection,
+    // as ferund's keepalive drops it.
     let channel = Endpoint::from_static("http://node")
+        .http2_keep_alive_interval(Duration::from_secs(1))
+        .keep_alive_timeout(Duration::from_secs(3))
+        .keep_alive_while_idle(true)
         .connect_with_connector(tower::service_fn(move |_: Uri| {
             let stream = stream.lock().unwrap().take();
             async move {
@@ -431,6 +444,7 @@ async fn call_node(tls: TlsStream<TcpStream>, seen: Arc<Mutex<Seen>>) {
         }))
         .await
         .unwrap();
+    seen.lock().unwrap().channels.push(channel.clone());
     let mut client = VolumeServiceClient::new(channel.clone());
     let volumes = client.list_volumes(ListVolumesRequest {}).await;
     if let Ok(volumes) = volumes {
@@ -449,6 +463,18 @@ async fn call_node(tls: TlsStream<TcpStream>, seen: Arc<Mutex<Seen>>) {
 /// The node's volumes, as its API answers on the node connection.
 struct Volumes;
 
+/// The GetVolume calls that came, and the volumes whose calls may answer.
+#[derive(Default)]
+struct Gates {
+    entered: Vec<String>,
+    opened: Vec<String>,
+}
+
+static GATES: Mutex<Gates> = Mutex::new(Gates {
+    entered: Vec::new(),
+    opened: Vec::new(),
+});
+
 #[tonic::async_trait]
 impl VolumeService for Volumes {
     async fn create_volume(
@@ -465,11 +491,20 @@ impl VolumeService for Volumes {
         Err(Status::unimplemented("not in this test"))
     }
 
+    /// Answers once the test opens the volume's gate (`GATES`).
     async fn get_volume(
         &self,
-        _request: Request<GetVolumeRequest>,
+        request: Request<GetVolumeRequest>,
     ) -> Result<Response<Volume>, Status> {
-        Err(Status::unimplemented("not in this test"))
+        let volume_id = request.into_inner().volume_id;
+        GATES.lock().unwrap().entered.push(volume_id.clone());
+        while !GATES.lock().unwrap().opened.contains(&volume_id) {
+            sleep(Duration::from_millis(10)).await;
+        }
+        Ok(Response::new(Volume {
+            volume_id,
+            ..Default::default()
+        }))
     }
 
     async fn list_volumes(
@@ -540,17 +575,31 @@ impl Inventory for Node {
 /// Starts the node's side with the token in `dir`, serving `Volumes` on
 /// its node connections.
 fn node(address: &str, dir: &Path) -> fleet_client::Fleet {
+    node_with(address, dir, Node, fleet_client::STALL_LIMIT)
+}
+
+/// `node` with another inventory and stall limit. The node's API runs on
+/// the test's runtime, as feosd's does on feosd's, and is served as feosd
+/// serves it.
+fn node_with<I: Inventory>(
+    address: &str,
+    dir: &Path,
+    inventory: I,
+    stall_limit: Duration,
+) -> fleet_client::Fleet {
     let mut config = Config::new(address, Some(NAME), TRUST_DOMAIN).unwrap();
     config.join_token_file = dir.join("join-token");
     config.node_dir = dir.join("node");
     config.node_name = Some(NODE.into());
     config.pod_prefix = "fd00:fe05:1::/64".into();
     config.version = "0.6.0".into();
-    let (fleet, incoming) = fleet_client::start(config, Node).unwrap();
-    tokio::spawn(
-        fleet_client::server()
-            .add_service(VolumeServiceServer::new(Volumes))
-            .serve_with_incoming(incoming),
+    config.stall_limit = stall_limit;
+    let calls = fleet_client::NodeCalls::new();
+    let (fleet, incoming) = fleet_client::start(config, inventory, calls.clone()).unwrap();
+    fleet.serve(
+        fleet_client::server(tokio::runtime::Handle::current(), &calls)
+            .add_service(VolumeServiceServer::new(Volumes)),
+        incoming,
     );
     fleet
 }
@@ -729,4 +778,275 @@ async fn a_refused_node_waits_for_a_new_token() {
     .unwrap();
     wait_for(&seen, "the second join", |seen| seen.joins.len() == 2).await;
     assert_eq!(seen.lock().unwrap().joins[1].token, secret);
+}
+
+/// A runtime of the test's own, as the control plane is another process;
+/// shut down without waiting when the test ends.
+struct Elsewhere(Option<tokio::runtime::Runtime>);
+
+impl Elsewhere {
+    fn new() -> Self {
+        Self(Some(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap(),
+        ))
+    }
+
+    fn handle(&self) -> tokio::runtime::Handle {
+        self.0.as_ref().unwrap().handle().clone()
+    }
+}
+
+impl Drop for Elsewhere {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// The node's pods, which do not answer while the lock is held, as the
+/// pods' records' lock is while one of them is synced.
+struct Gated(Arc<Mutex<()>>);
+
+impl Inventory for Gated {
+    fn pods(&self) -> Vec<PodInfo> {
+        let _held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Node.pods()
+    }
+
+    fn installed(&self) -> Installed {
+        Node.installed()
+    }
+
+    async fn diskd(&self) -> Option<Diskd> {
+        Node.diskd().await
+    }
+}
+
+/// On 2026-10-28 a suspend whose snapshot was late removed the snapshot
+/// while Firecracker still wrote it; the unlink(2) blocked a thread of
+/// feosd's runtime for 50 s, which stalled the whole runtime: no report
+/// went out, the node connections' pings went unanswered, and the control
+/// plane counted the node down. The node's side runs on threads of its
+/// own: a blocked thread of feosd's runtime, which holds what the pods'
+/// read needs, stops neither the reports nor the node connections. The
+/// test's runtime, feosd's here, has the one thread: blocking it stalls it
+/// as a whole, its timers and its I/O, as the incident did.
+#[tokio::test(flavor = "current_thread")]
+async fn a_blocked_runtime_stops_neither_the_reports_nor_the_node_connections() {
+    let plane = Elsewhere::new();
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (token, address) = plane
+        .handle()
+        .spawn(control_plane(pki, seen.clone()))
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    let gate = Arc::new(Mutex::new(()));
+    let _fleet = node_with(
+        &address,
+        dir.path(),
+        Gated(gate.clone()),
+        fleet_client::STALL_LIMIT,
+    );
+
+    // Settled: renewed, reporting, and serving with the new certificate.
+    wait_for(&seen, "reports with the renewed certificate", |seen| {
+        seen.reports
+            .iter()
+            .filter(|(cert, _)| *cert == seen.issued)
+            .count()
+            >= 2
+    })
+    .await;
+    wait_for(&seen, "ListVolumes with the renewed certificate", |seen| {
+        seen.volumes.iter().any(|(cert, _)| *cert == seen.issued)
+    })
+    .await;
+    let connections = seen.lock().unwrap().node_connections;
+
+    // A task of feosd's runtime that a timer woke, as the suspend's
+    // deadline did, blocks its thread and holds the pods' lock meanwhile.
+    const BLOCKED: Duration = Duration::from_secs(8);
+    let held = gate.clone();
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(100)).await;
+        let _held = held.lock().unwrap();
+        std::thread::sleep(BLOCKED);
+    });
+    // The test's own timer waits out the block, and a redial after it.
+    sleep(BLOCKED + Duration::from_secs(5)).await;
+
+    let seen = seen.lock().unwrap();
+    let window = (
+        started + Duration::from_millis(1500),
+        started + BLOCKED - Duration::from_millis(500),
+    );
+    let during: Vec<&Telemetry> = seen
+        .reports
+        .iter()
+        .zip(&seen.reported_at)
+        .filter(|(_, at)| **at > window.0 && **at < window.1)
+        .map(|((_, report), _)| report)
+        .collect();
+    assert!(
+        during.len() >= 2,
+        "{} reports while feosd's runtime was blocked",
+        during.len()
+    );
+    // The pods as they were, since they did not answer.
+    assert!(during.iter().all(|report| report.pods_running == 1));
+    assert_eq!(
+        seen.node_connections, connections,
+        "a node connection was lost and dialed again"
+    );
+}
+
+/// A feosd that stands still for longer than the stall limit takes no
+/// calls: the node stops reporting, so that the control plane counts it
+/// down, and reports again once feosd moves.
+#[tokio::test(flavor = "current_thread")]
+async fn a_runtime_stalled_past_the_limit_stops_the_reports_until_it_moves() {
+    let plane = Elsewhere::new();
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (token, address) = plane
+        .handle()
+        .spawn(control_plane(pki, seen.clone()))
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    let _fleet = node_with(&address, dir.path(), Node, Duration::from_secs(2));
+    wait_for(&seen, "reports with the renewed certificate", |seen| {
+        seen.reports
+            .iter()
+            .filter(|(cert, _)| *cert == seen.issued)
+            .count()
+            >= 2
+    })
+    .await;
+
+    // feosd's runtime, the test's, stands still for longer than the limit.
+    const BLOCKED: Duration = Duration::from_secs(8);
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(100)).await;
+        std::thread::sleep(BLOCKED);
+    });
+    sleep(BLOCKED + Duration::from_secs(5)).await;
+
+    let seen = seen.lock().unwrap();
+    let between = |from: Duration, to: Duration| {
+        seen.reported_at
+            .iter()
+            .filter(|at| **at > started + from && **at < started + to)
+            .count()
+    };
+    assert_eq!(
+        between(Duration::from_secs(4), BLOCKED - Duration::from_millis(500)),
+        0,
+        "reports while feosd stood still past the limit"
+    );
+    assert!(
+        between(BLOCKED, BLOCKED + Duration::from_secs(5)) >= 2,
+        "no reports once feosd moved again"
+    );
+}
+
+/// A drill on 2026-10-28: the feos-node pod restarted while an exec ran,
+/// and the exec ended with "error reading from server: EOF": the stop
+/// dropped the node connections. A stop now sends GOAWAY: the control
+/// plane starts no new call on the connection, and the node dials no
+/// more; a call in flight that ends within the bound answers, and one that
+/// does not ends with UNAVAILABLE "the node stops".
+#[tokio::test]
+async fn a_stop_lets_the_calls_in_flight_end_and_cuts_the_rest() {
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (token, address) = control_plane(pki, seen.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    let fleet = node(&address, dir.path());
+    wait_for(&seen, "a node connection", |seen| !seen.channels.is_empty()).await;
+    let channel = seen.lock().unwrap().channels[0].clone();
+    let get = |id: &'static str| {
+        let mut client = VolumeServiceClient::new(channel.clone());
+        tokio::spawn(async move {
+            client
+                .get_volume(GetVolumeRequest {
+                    volume_id: id.into(),
+                })
+                .await
+                .map(|volume| volume.into_inner().volume_id)
+        })
+    };
+    let entered = |id: &str| GATES.lock().unwrap().entered.iter().any(|e| e == id);
+    let quick = get("stop-quick");
+    let slow = get("stop-slow");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(entered("stop-quick") && entered("stop-slow")) {
+        assert!(Instant::now() < deadline, "the calls did not come");
+        sleep(Duration::from_millis(10)).await;
+    }
+    let connections = seen.lock().unwrap().node_connections;
+
+    let started = Instant::now();
+    let stopping = {
+        let fleet = fleet.clone();
+        tokio::spawn(async move { fleet.stop(Duration::from_secs(1)).await })
+    };
+    sleep(Duration::from_millis(300)).await;
+    // No new call starts on the connection.
+    let late = get("stop-late");
+    GATES.lock().unwrap().opened.push("stop-quick".into());
+    assert_eq!(quick.await.unwrap().unwrap(), "stop-quick");
+    let cut = slow.await.unwrap().expect_err("the slow call answered");
+    assert_eq!(cut.code(), tonic::Code::Unavailable, "{cut:?}");
+    assert!(
+        cut.message().starts_with("the node stops: "),
+        "{}",
+        cut.message()
+    );
+    stopping.await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the stop took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        late.await.unwrap().is_err(),
+        "a call after the stop answered"
+    );
+    assert!(!entered("stop-late"), "a call after the stop came");
+    // The node dials no more.
+    sleep(Duration::from_secs(2)).await;
+    assert_eq!(seen.lock().unwrap().node_connections, connections);
+}
+
+/// A stop without calls in flight does not wait for its bound: the server
+/// lets go of an idle connection at once.
+#[tokio::test]
+async fn a_stop_without_calls_ends_at_once() {
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (token, address) = control_plane(pki, seen.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    let fleet = node(&address, dir.path());
+    wait_for(&seen, "a node connection", |seen| !seen.volumes.is_empty()).await;
+    let started = Instant::now();
+    fleet.stop(Duration::from_secs(20)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the stop took {:?}",
+        started.elapsed()
+    );
 }

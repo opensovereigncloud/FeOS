@@ -18,3 +18,4 @@ pub mod state_lock;
 pub mod version;
 pub mod vsock;
 pub mod wireguard;
+pub mod writer;

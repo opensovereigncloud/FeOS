@@ -11,6 +11,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/gardenlinux/feos/go/internal/nodelink"
 )
 
 // kindError is an error with a text of its own that is one of the
@@ -86,3 +88,14 @@ func callText(err error) string {
 	}
 	return err.Error()
 }
+
+// vmBusyDetail marks feosd's busy VM (nodelink.VMBusyDetail).
+const vmBusyDetail = nodelink.VMBusyDetail
+
+// busyRetry is when a caller told that the sandbox's VM is busy should
+// come back.
+const busyRetry = 30 * time.Second
+
+// vmBusy reports whether a node call's error is feosd's busy VM
+// (nodelink.VMBusy): the call changed nothing, and the same call later may.
+func vmBusy(err error) bool { return nodelink.VMBusy(err) }

@@ -118,6 +118,12 @@ The image comes from the packages:
     make packages FEOS_VERSION=0.6.0~dev.$(date -u +%Y%m%d%H%M).$(git rev-parse --short=7 HEAD)
     make -C deploy/gardener deploy-feos      # build, push and roll feos-node
 
+Roll ferund (`make -C deploy/gardener deploy-ferund`) before feos-node
+when both change: a new ferund covers an old feosd, but an old ferund's
+pause deadline does not cover a new feosd's suspend budget, and it takes
+a new feosd's busy answers for failures
+([control-plane.md](../../docs/architecture/control-plane.md#deployment)).
+
 ## First setup
 
 From the repository's root, with `KUBECONFIG` at the shoot and

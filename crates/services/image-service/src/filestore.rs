@@ -162,9 +162,15 @@ impl FileStore {
         let _ = fs::remove_dir_all(final_dir).await;
         fs::rename(pull_dir, final_dir).await?;
 
-        let store = std::fs::File::open(IMAGE_DIR)?;
-        nix::unistd::syncfs(store.as_fd())?;
-        Ok(())
+        // syncfs(2) writes back the whole filesystem, as the memory of a
+        // snapshot written meanwhile: on the blocking pool.
+        tokio::task::spawn_blocking(|| {
+            let store = std::fs::File::open(IMAGE_DIR)?;
+            nix::unistd::syncfs(store.as_fd())?;
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
     }
 
     async fn scan_images_impl() -> HashMap<String, ImageInfo> {

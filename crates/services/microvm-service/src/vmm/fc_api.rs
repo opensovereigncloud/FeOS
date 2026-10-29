@@ -14,7 +14,7 @@ use tokio::net::UnixStream;
 
 /// Firecracker answers within milliseconds; a request that takes longer is
 /// stuck.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Larger than any answer Firecracker gives.
 const MAX_RESPONSE: usize = 64 * 1024;
 
@@ -45,6 +45,18 @@ pub async fn request_within(
                 timeout.as_secs()
             ))
         })?
+}
+
+/// `request` without a deadline, for one that its caller bounds: writing a
+/// snapshot, which Firecracker answers once it is done, however long that
+/// takes, or when it ends.
+pub async fn request_unbounded(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Option<Value>, VmmError> {
+    exchange(socket, method, path, body).await
 }
 
 async fn exchange(

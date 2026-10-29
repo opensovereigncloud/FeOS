@@ -25,7 +25,8 @@ use std::io::{self, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use tokio::sync::OwnedMutexGuard;
 use tonic::Status;
 
 /// The mesh's device.
@@ -85,10 +86,15 @@ pub struct Mesh {
     config: Config,
     key: Key,
     public_key: Key,
-    state: Mutex<State>,
+    /// What the node keeps, as last kept: a change is written first, on
+    /// the blocking pool, and seen then, so that a reader never waits for
+    /// its fsync.
+    state: Arc<Mutex<State>>,
+    /// Held by a change, one at a time, until it is kept.
+    changing: Arc<tokio::sync::Mutex<()>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     assignment: Option<Assignment>,
     version: u64,
@@ -118,7 +124,8 @@ impl Mesh {
             config,
             key,
             public_key,
-            state: Mutex::new(state),
+            state: Arc::new(Mutex::new(state)),
+            changing: Arc::default(),
         };
         if let Some(assignment) = mesh.assignment() {
             route(handle, assignment.pod_network).await?;
@@ -143,15 +150,13 @@ impl Mesh {
     /// cluster's ULA to the device. Returns whether it changed.
     pub async fn assign(&self, assignment: Assignment, handle: &Handle) -> io::Result<bool> {
         let changed = {
-            let mut state = self.state();
-            if state.assignment == Some(assignment) {
+            let changing = self.changing.clone().lock_owned().await;
+            let mut next = self.state().clone();
+            if next.assignment == Some(assignment) {
                 false
             } else {
-                let before = state.assignment.replace(assignment);
-                if let Err(e) = store_state(&self.config.dir.join(STATE), &state) {
-                    state.assignment = before;
-                    return Err(e);
-                }
+                next.assignment = Some(assignment);
+                self.keep(next, changing).await?;
                 true
             }
         };
@@ -187,7 +192,7 @@ impl Mesh {
     }
 
     /// Replaces the peers, whatever their version.
-    pub fn put(&self, request: PutMeshPeersRequest) -> Result<(), Status> {
+    pub async fn put(&self, request: PutMeshPeersRequest) -> Result<(), Status> {
         let mut peers = BTreeMap::new();
         for peer in request.peers {
             check_peer(&peer)?;
@@ -198,13 +203,14 @@ impl Mesh {
             state.version = request.version;
             state.peers = peers;
             Ok(())
-        })?;
+        })
+        .await?;
         info!("Mesh: {n} peers put at version {}", request.version);
         Ok(())
     }
 
     /// Changes the peers from one version to the next.
-    pub fn update(&self, request: UpdateMeshPeersRequest) -> Result<(), Status> {
+    pub async fn update(&self, request: UpdateMeshPeersRequest) -> Result<(), Status> {
         for peer in &request.put_peers {
             check_peer(peer)?;
         }
@@ -224,7 +230,8 @@ impl Mesh {
                 state.peers.insert(peer.node.clone(), peer);
             }
             Ok(())
-        })?;
+        })
+        .await?;
         info!(
             "Mesh: Peers updated to version {}, {put} put, {removed} removed",
             request.version
@@ -232,31 +239,53 @@ impl Mesh {
         Ok(())
     }
 
-    /// Changes the state, keeps it, and gives the device its peers; a
-    /// change that is not kept is undone.
-    fn change(&self, change: impl FnOnce(&mut State) -> Result<(), Status>) -> Result<(), Status> {
-        {
-            let mut state = self.state();
-            if state.assignment.is_none() {
-                return Err(Status::failed_precondition(
-                    "the node has no /64 of the mesh yet",
-                ));
-            }
-            let before = (state.version, state.peers.clone());
-            change(&mut state)?;
-            if let Err(e) = store_state(&self.config.dir.join(STATE), &state) {
-                (state.version, state.peers) = before;
-                return Err(Status::internal(format!("keeping the mesh's peers: {e}")));
-            }
+    /// Changes the state, keeps it, and gives the device its peers, on the
+    /// blocking pool; a change that is not kept is not seen.
+    async fn change(
+        &self,
+        change: impl FnOnce(&mut State) -> Result<(), Status>,
+    ) -> Result<(), Status> {
+        let changing = self.changing.clone().lock_owned().await;
+        let mut next = self.state().clone();
+        if next.assignment.is_none() {
+            return Err(Status::failed_precondition(
+                "the node has no /64 of the mesh yet",
+            ));
         }
-        self.sync_peers()
+        change(&mut next)?;
+        self.keep(next, changing)
+            .await
+            .map_err(|e| Status::internal(format!("keeping the mesh's peers: {e}")))?;
+        let peers = self.peers();
+        tokio::task::spawn_blocking(move || wireguard::set_peers(DEVICE, &peers))
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e)))
             .map_err(|e| Status::internal(format!("{DEVICE}: {e}")))
+    }
+
+    /// Writes `next` on the blocking pool, and makes it the state once it
+    /// is kept, also when the caller went away meanwhile: the change ends
+    /// with it.
+    async fn keep(&self, next: State, changing: OwnedMutexGuard<()>) -> io::Result<()> {
+        let (path, state) = (self.config.dir.join(STATE), self.state.clone());
+        tokio::task::spawn_blocking(move || {
+            let _changing = changing;
+            store_state(&path, &next)?;
+            *state.lock().unwrap_or_else(|e| e.into_inner()) = next;
+            Ok(())
+        })
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)))
     }
 
     /// Gives the device the peers kept.
     fn sync_peers(&self) -> io::Result<()> {
-        let peers: Vec<Peer> = self
-            .state()
+        wireguard::set_peers(DEVICE, &self.peers())
+    }
+
+    /// The peers kept, as the device takes them.
+    fn peers(&self) -> Vec<Peer> {
+        self.state()
             .peers
             .values()
             .filter_map(|peer| match wireguard_peer(peer) {
@@ -268,8 +297,7 @@ impl Mesh {
             })
             // A peer with the node's own key would take its traffic.
             .filter(|peer| peer.public_key != self.public_key)
-            .collect();
-        wireguard::set_peers(DEVICE, &peers)
+            .collect()
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -285,10 +313,11 @@ impl Mesh {
             },
             key: [1; 32],
             public_key: [2; 32],
-            state: Mutex::new(State {
+            state: Arc::new(Mutex::new(State {
                 assignment,
                 ..Default::default()
-            }),
+            })),
+            changing: Arc::default(),
         }
     }
 }
@@ -550,11 +579,11 @@ mod tests {
     /// Updates start at the version the node has; without a /64, there is
     /// nothing to put peers on. The device is not touched: sync_peers is
     /// left out of these.
-    #[test]
-    fn updates_start_at_the_version_the_node_has() {
+    #[tokio::test]
+    async fn updates_start_at_the_version_the_node_has() {
         let dir = tempfile::tempdir().unwrap();
         let mesh = Mesh::for_tests(dir.path(), None);
-        let error = mesh.change(|_| Ok(())).unwrap_err();
+        let error = mesh.change(|_| Ok(())).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         let mesh = Mesh::for_tests(dir.path(), Some(assignment()));
         {
@@ -568,9 +597,37 @@ mod tests {
             remove_peers: vec!["b".to_string()],
         };
         // A delta from another version is refused before anything changes.
-        let error = mesh.update(update(2)).unwrap_err();
+        let error = mesh.update(update(2)).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert_eq!(mesh.info().version, 3);
         assert_eq!(mesh.endpoints(), Vec::<IpAddr>::new());
+    }
+
+    /// A change is written on the blocking pool and seen once it is kept:
+    /// what reads the mesh, as the rules that deny the peers' endpoints,
+    /// does not wait for its fsync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_mesh_answers_while_a_change_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mesh = Arc::new(Mesh::for_tests(dir.path(), Some(assignment())));
+        let hung = crate::hung::Hung::at(dir.path().join(STATE).with_extension("tmp"));
+        let put = tokio::spawn({
+            let mesh = mesh.clone();
+            async move {
+                let peers = vec![peer("b", 2, "10.0.0.11:51820", 2)];
+                mesh.put(PutMeshPeersRequest { version: 1, peers }).await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let mesh = mesh.clone();
+            move || answer.send(mesh.endpoints())
+        });
+        let endpoints = answered.recv_timeout(std::time::Duration::from_secs(2));
+        hung.open();
+        assert_eq!(endpoints, Ok(Vec::new()), "the read waited for the write");
+        assert!(put.await.unwrap().is_err(), "a FIFO does not sync");
+        assert_eq!(mesh.info().version, 0, "what was not kept is not seen");
     }
 }

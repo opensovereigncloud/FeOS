@@ -20,6 +20,7 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
              [--pod-ipv4-range PREFIX] [--dns-address ADDRESS]
              [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
              [--diskd-socket PATH] [--vms-cgroup PATH] [--suspend-on-stop]
+             [--stop-grace SECONDS]
              [--control-plane HOST:PORT [--control-plane-name NAME]
               [--trust-domain NAME] [--join-token-file PATH] [--node-dir PATH]
               [--mesh-port PORT] [--mesh-address ADDRESS]]
@@ -56,6 +57,12 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
                            the control plane that feosd stops and letting go
                            of it; then feosd exits. The next feosd resumes them
                            before it connects to the control plane
+  --stop-grace SECONDS     how long a stop may take before feosd is killed, as
+                           the pod's terminationGracePeriodSeconds or the
+                           unit's TimeoutStopSec say; 300 by default. The node
+                           connections' calls in flight get a tenth of it, 30 s
+                           at most, and with --suspend-on-stop a pod whose VM
+                           is busy is tried again until 10 s before its end
   --hand-over-vms          move the microVMs below feosd's own cgroup to
                            --vms-cgroup's and exit: feosd.service's
                            ExecStopPost=, so that a feosd from before
@@ -91,6 +98,8 @@ struct Args {
     vms_cgroup: Option<String>,
     hand_over_vms: bool,
     suspend_on_stop: bool,
+    /// How long a stop may take; `main_server::STOP_GRACE` by default.
+    stop_grace: Option<std::time::Duration>,
     /// The control plane, and how the node joins it.
     fleet: Option<fleet_client::Config>,
     /// Passed by feosd itself: the task service, and the process an upgrade
@@ -165,6 +174,19 @@ impl Args {
                 }
                 "--hand-over-vms" => parsed.hand_over_vms = true,
                 "--suspend-on-stop" => parsed.suspend_on_stop = true,
+                "--stop-grace" => {
+                    let seconds = value("seconds")?;
+                    parsed.stop_grace = Some(
+                        seconds
+                            .parse::<u64>()
+                            .ok()
+                            .filter(|seconds| *seconds > 0)
+                            .map(std::time::Duration::from_secs)
+                            .with_context(|| {
+                                format!("--stop-grace {seconds}: a number of seconds above 0")
+                            })?,
+                    );
+                }
                 "--control-plane" => control_plane = Some(value("HOST:PORT")?),
                 "--control-plane-name" => control_plane_name = Some(value("a name")?),
                 "--trust-domain" => trust_domain = Some(value("a name")?),
@@ -316,6 +338,7 @@ async fn serve(dns_sockets: Vec<(std::os::fd::OwnedFd, String)>) -> Result<()> {
         diskd_socket: args.diskd_socket,
         fleet,
         suspend_on_stop: args.suspend_on_stop,
+        stop_grace: args.stop_grace.unwrap_or(main_server::STOP_GRACE),
         ..ServerOptions::new(args.restarted_after_upgrade, args.self_upgrade)
     })
     .await?;
@@ -367,6 +390,14 @@ mod tests {
         assert_eq!(args.diskd_socket, Some("/run/diskd.sock".into()));
         assert!(!args.suspend_on_stop);
         assert!(parse(&["--suspend-on-stop"]).unwrap().suspend_on_stop);
+        assert_eq!(args.stop_grace, None);
+        assert_eq!(
+            parse(&["--stop-grace", "120"]).unwrap().stop_grace,
+            Some(std::time::Duration::from_secs(120))
+        );
+        for bad in ["0", "-1", "2m", ""] {
+            assert!(parse(&["--stop-grace", bad]).is_err(), "{bad}");
+        }
         assert_eq!(parse(&[]).unwrap(), Args::default());
     }
 

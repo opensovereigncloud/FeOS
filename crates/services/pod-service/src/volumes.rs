@@ -126,7 +126,7 @@ impl Volumes {
             state: VolumeState::Available as i32,
             ..Default::default()
         };
-        self.save(&volume)?;
+        self.save(&volume).await?;
         info!("Volumes: {volume_id} created, {size_bytes} bytes");
         Ok(volume)
     }
@@ -143,7 +143,11 @@ impl Volumes {
             )));
         }
         self.inner.disks.remove(&volume_disk(volume_id)).await?;
-        match std::fs::remove_file(self.path(volume_id)) {
+        let path = self.path(volume_id);
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(path))
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e)));
+        match removed {
             Err(e) if e.kind() != io::ErrorKind::NotFound => {
                 return Err(Status::internal(format!("forget volume {volume_id}: {e}")));
             }
@@ -182,7 +186,7 @@ impl Volumes {
             claimed.push(volume);
         }
         for volume in &claimed {
-            self.save(volume)?;
+            self.save(volume).await?;
             info!("Volumes: {} is attached to pod {pod_id}", volume.volume_id);
         }
         Ok(())
@@ -204,7 +208,7 @@ impl Volumes {
             if volume.state() == VolumeState::Attached {
                 volume.state = VolumeState::Available as i32;
             }
-            match self.save(&volume) {
+            match self.save(&volume).await {
                 Ok(()) => info!("Volumes: {} is attached to no pod", volume.volume_id),
                 Err(e) => warn!(
                     "Volumes: Failed to let go of {}: {}",
@@ -226,7 +230,7 @@ impl Volumes {
             }
         }
         for volume in &volumes {
-            self.save(volume)?;
+            self.save(volume).await?;
             info!(
                 "Volumes: {} comes from {}",
                 volume.volume_id,
@@ -239,16 +243,37 @@ impl Volumes {
         Ok(())
     }
 
-    /// Changes a volume's record and keeps it.
-    pub fn update(&self, volume_id: &str, change: impl FnOnce(&mut Volume)) -> Result<(), Status> {
+    /// Changes a volume's record and keeps it, one change at a time.
+    pub async fn update(
+        &self,
+        volume_id: &str,
+        change: impl FnOnce(&mut Volume),
+    ) -> Result<(), Status> {
+        let _changes = self.inner.changes.lock().await;
         let mut volume = self.get(volume_id)?;
         change(&mut volume);
-        self.save(&volume)
+        self.save(&volume).await
     }
 
     /// Makes the records agree with the pods kept, after a crash between a
     /// change of a pod and its volumes'.
-    pub fn reconcile(&self, pods: &[PodInfo]) {
+    pub async fn reconcile(&self, pods: &[PodInfo]) {
+        let changed = self.agree(pods);
+        let _changes = self.inner.changes.lock().await;
+        for volume in changed {
+            if let Err(e) = self.save(&volume).await {
+                warn!(
+                    "Volumes: Failed to keep {}: {}",
+                    volume.volume_id,
+                    e.message()
+                );
+            }
+        }
+    }
+
+    /// Changes the records in the map to agree with the pods; returns
+    /// those changed, to keep.
+    fn agree(&self, pods: &[PodInfo]) -> Vec<Volume> {
         let mut volumes = self.volumes();
         let mut changed = Vec::new();
         for volume in volumes.values_mut() {
@@ -291,31 +316,20 @@ impl Volumes {
                 }
             }
         }
-        drop(volumes);
-        for volume in changed {
-            if let Err(e) = self.save(&volume) {
-                warn!(
-                    "Volumes: Failed to keep {}: {}",
-                    volume.volume_id,
-                    e.message()
-                );
-            }
-        }
+        changed
     }
 
-    /// Keeps the record, replaced by a rename, and puts it in the map. The
-    /// rename is synced too: no container may start on a volume before
-    /// its `formatted` is on disk (ADR 0016).
-    fn save(&self, volume: &Volume) -> Result<(), Status> {
+    /// Keeps the record, replaced by a rename, and then puts it in the
+    /// map. The rename is synced too: no container may start on a volume
+    /// before its `formatted` is on disk (ADR 0016). The write runs on the
+    /// blocking pool, under `changes` and no other lock: its fsyncs may
+    /// take seconds while the disk writes back much else.
+    async fn save(&self, volume: &Volume) -> Result<(), Status> {
         let path = self.path(&volume.volume_id);
-        let temporary = path.with_extension("pb.new");
-        let written = std::fs::File::create(&temporary).and_then(|mut file| {
-            file.write_all(&volume.encode_to_vec())?;
-            file.sync_all()
-        });
-        written
-            .and_then(|()| std::fs::rename(&temporary, &path))
-            .and_then(|()| std::fs::File::open(&self.inner.dir)?.sync_all())
+        let (dir, bytes) = (self.inner.dir.clone(), volume.encode_to_vec());
+        tokio::task::spawn_blocking(move || write(&dir, &path, &bytes))
+            .await
+            .unwrap_or_else(|e| Err(io::Error::other(e)))
             .map_err(|e| Status::internal(format!("keep volume {}: {e}", volume.volume_id)))?;
         self.volumes()
             .insert(volume.volume_id.clone(), volume.clone());
@@ -325,6 +339,17 @@ impl Volumes {
     fn path(&self, volume_id: &str) -> PathBuf {
         self.inner.dir.join(format!("{volume_id}.pb"))
     }
+}
+
+/// Writes `bytes` to `path` in `dir` through a file beside it, synced and
+/// renamed, and syncs the rename.
+fn write(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temporary = path.with_extension("pb.new");
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, path)?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Whether a restore of the pod `pod_id` may take over the volume the node
@@ -375,6 +400,7 @@ mod tests {
     use super::*;
     use feos_proto::pod_service::{PodSpec, PodVolume};
     use feos_proto::volume_service::VolumeCheckpoint;
+    use std::time::Duration;
 
     const A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
     const B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
@@ -478,6 +504,7 @@ mod tests {
                 volume.state = VolumeState::Checkpointed as i32;
                 volume.checkpoint = Some(checkpoint.clone());
             })
+            .await
             .unwrap();
         store.release(POD, &[]).await;
         let a = store.get(A).unwrap();
@@ -514,11 +541,42 @@ mod tests {
             }),
             ..Default::default()
         };
-        store.reconcile(&[pod]);
+        store.reconcile(&[pod]).await;
         let store = volumes(dir.path());
         assert!(store.get(A).unwrap().pod_id.is_empty());
         assert_eq!(store.get(A).unwrap().state(), VolumeState::Available);
         assert_eq!(store.get(B).unwrap().pod_id, POD);
         assert_eq!(store.get(B).unwrap().state(), VolumeState::Attached);
+    }
+
+    /// A volume's record is written off the runtime's threads: on a runtime
+    /// of one thread, a write that hangs left nothing else to run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_that_hangs_leaves_the_runtime_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = volumes(dir.path());
+        let hung = crate::hung::Hung::at(dir.path().join(format!("{A}.pb.new")));
+        // Lets the write go after a while, should it hold the runtime.
+        let (moved, watched) = std::sync::mpsc::channel::<()>();
+        let watchdog = {
+            let hung = hung.0.clone();
+            std::thread::spawn(move || {
+                let stalled = watched.recv_timeout(Duration::from_secs(3)).is_err();
+                crate::hung::Hung(hung).open();
+                stalled
+            })
+        };
+        let create = tokio::spawn({
+            let store = store.clone();
+            async move { store.create(A, 1 << 30, HashMap::new()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The runtime moves while the write hangs; the volume is not there
+        // until it is kept.
+        let _ = moved.send(());
+        assert!(!watchdog.join().unwrap(), "the write held the runtime");
+        assert_eq!(store.get(A).unwrap_err().code(), tonic::Code::NotFound);
+        assert!(create.await.unwrap().is_err(), "a FIFO does not sync");
+        assert!(store.get(A).is_err());
     }
 }

@@ -100,7 +100,7 @@ kind ([The ingress](#the-ingress)).
 | `--node-cert-ttl`, `--pod-cert-ttl` | `168h`, `1h` | the certificates' lifetimes; a node's is renewed at half of it, so that a node switched off for up to half of it needs nothing, a pod's at three quarters |
 | `--node-max-streams` | 1024 | the HTTP/2 stream limit nodes advertise on a node connection; the stream budgets derive from it |
 | `--conn-drain-timeout` | `20m` | a draining node connection is closed after this at the latest |
-| `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
+| `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus a pause's deadline and 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
 | `--shutdown-grace` | `11m` | how long a stopping instance waits for its requests, its tool calls and its ops |
 | `--activity-retention`, `--traffic-retention` | `720h`, `168h` | how long activity and traffic records are kept |
 | `--log-level` | `info` | |
@@ -421,6 +421,21 @@ One TLS 1.3 listener, routed strictly by ALPN:
   clock is not. A lost connection is what tells an instance to fail calls
   for the node fast; it changes nothing in the database. A call into a
   pod's guest carries `feos-pod-id`.
+- **A node that stops** sends GOAWAY on its node connections, lets the
+  calls in flight end up to its bound, and ends the rest with
+  `UNAVAILABLE` "the node stops: …" ([node.md](node.md#stopping)). A
+  call, unary or a stream (an exec, a port forward, a watch), that had
+  not reached the node (no stream opened on the connection,
+  which a stats handler on the channel tells) and failed `UNAVAILABLE` on
+  a connection that left READY goes to the node's next current
+  connection, waiting as `Conn` does, up to the rollout deadline; before,
+  a call that took the connection just before its GOAWAY failed with
+  "the node's connection is gone". A call that had reached the node and
+  whose connection ended without the node's status (an EOF, a reset)
+  reads "node <n> stopped during the call: <error>" when the node had
+  announced its stop, and "node <n>: the connection ended during the
+  call: <error>" otherwise; the node's own status, as "the node stops",
+  is as it sent it.
 - **Stream budgets**, per connection, of `--node-max-streams` N: long
   streams (exec, watch, port forward, console, traffic records, host
   streams) at most N/2, unary tool calls at most N/4; beyond them a call
@@ -784,11 +799,20 @@ finished in another transaction that applies what the node did.
 | start | stopped, failed | creating | StartPod | 7 min 5 s |
 | resume | paused; hibernating, in the place of a hibernate that a resume abandons | resuming | ResumePod | 7 min 5 s + 8 s/GiB |
 | restore | hibernated | creating | RestorePod of the checkpoint | 7 min 5 s + 8 s/GiB |
-| pause | running | pausing | SuspendPod | 2 min + 4 s/GiB |
-| hibernate | paused; stopped, failed and running when draining | hibernating | HibernatePod | `--hibernate-timeout` + 16 s/GiB |
+| pause | running | pausing | SuspendPod | 3 min 40 s + 5 s/GiB |
+| hibernate | paused; stopped, failed and running when draining | hibernating | HibernatePod | a pause's + `--hibernate-timeout` + 16 s/GiB |
 | repair | creating without an op, running with an unreachable guest; running, for an instance whose container exited (`Restart`, [Environments](#probes-exits-and-restarts)) | creating | StopPod and StartPod; for a pod stuck in its restore, DeletePod and RestorePod, never for a pod with volumes | 7 min 5 s + 8 s/GiB |
 
-GiB is the sandbox's memory, rounded up. A hibernation uploads the pod's
+GiB is the sandbox's memory, rounded up. **A caller's deadline covers
+its callee's budget**, so that feosd answers, the change or "the VM is
+busy", before ferund gives up, and a pause never ends at its deadline
+while the node still writes the snapshot. feosd's suspend takes 190 s +
+5 s/GiB at most, of which its wait for the snapshot is 120 s + 4 s/GiB
+([node.md](node.md#the-suspends-budget)); a pause waits that and 30 s
+more, for the call's way there and back and the pod's read after it
+(`feosdSuspendBudget`, `pauseMargin`). A hibernation of a running pod
+begins with that suspend, so a hibernate waits a pause's deadline first.
+A hibernation uploads the pod's
 disk and memory to the object store and takes minutes per GiB, hence its
 own timeout. A feosd that reports its hibernations ([Follow-ups for
 feosd](#follow-ups-for-feosd), item 2) runs one in a task of its own,
@@ -861,6 +885,34 @@ checkpoint inside the call.
   every 5 s, until the deadline. `UNAVAILABLE` and `RESOURCE_EXHAUSTED`
   while waiting are transient. Call errors are never mapped to a state
   directly: the pod read after them decides.
+- **A busy VM.** feosd answers `UNAVAILABLE` "the VM is busy: <why>",
+  marked with the status detail `type.googleapis.com/feos.microvm.v1.VmBusy`
+  (an `Any` without a value; ferund goes by the marker, never by the
+  message), to a
+  `SuspendPod`, `StopPod` or `HibernatePod` whose microVM takes no change
+  now and does later, as while Firecracker still writes a snapshot that a
+  suspend gave up on, and when the snapshot of the suspend itself is
+  late: nothing changed (a `DeletePod` ends such a microVM). The pod read
+  decides the state as for any error, and the description says "<op>
+  postponed: the VM is busy: <why>" (`pause`, `hibernation`, `repair`)
+  where the op did not reach its goal, and a repair's always. A repair
+  whose `StopPod` meets the busy VM calls no `StartPod`: the pod runs on
+  as it was, and its processes keep their holds, since nothing ended
+  them. The op is
+  tried again later: an idle pause or a hibernate-after after its
+  policy's backoff ([Policies](#policies)), a drain or a repair on its
+  next pass; Ensure and
+  the REST pause answer `ErrBusy` "<op> on node <n>: <description>; retry
+  in 30s", with a retry time of 30 s. Another `UNAVAILABLE` is a failure,
+  as before, whatever its message says. A tool call whose guest feosd
+  could not reach because its VM is busy gets the same marker on "the
+  guest of pod <id> did not answer within 5s; the VM is busy: <why>":
+  the runner does not report the guest unreachable (which would have the
+  repair loop restart a pod that is only busy), the call did not run,
+  and it fails as a `NodeError` that asks to come back in 30 s
+  (`tools.BusyError`; REST answers 502 with `Retry-After: 30`). An
+  unmarked "the guest of pod …" of a running pod is reported
+  unreachable, as before.
 - **Finish** is retried until it commits. An op that is no longer the
   row's (taken over, preempted, or the row deleted or re-created
   meanwhile) writes only a tombstone for a pod it may have made, or a
@@ -871,7 +923,7 @@ checkpoint inside the call.
 
 | Observed on the target | Becomes |
 |---|---|
-| ours, running | `running`; a run opens, restored from the checkpoint when a resume brought the pod back from a newer one; a failed pause lands here too |
+| ours, running | `running`; a run opens, restored from the checkpoint when a resume brought the pod back from a newer one; a failed pause lands here too, "pause failed: …", or "pause postponed: the VM is busy: …" |
 | ours, pending at the deadline | `creating`, "still starting on node <n> after <d>" |
 | ours, suspended | `paused`; a failed hibernation lands here too, and one that a resume from elsewhere abandoned ("hibernation abandoned for a resume") |
 | ours, hibernated | `hibernated`, with the checkpoint (never an older one) |
@@ -979,7 +1031,12 @@ what a dial found there.
 ### Sync and reconcile
 
 - **Sync** applies one pod's state to its row, after a pod event or when
-  a caller found the pod not where or not as expected. While an op runs,
+  a caller found the pod not where or not as expected. A pod found
+  suspended under a row that was not `paused`, as one that feosd
+  suspended after a pause gave up on it (feosd's suspend outlives its
+  call, and a pod follows its microVM into suspended:
+  [node.md](node.md#a-pod)), becomes `paused` from now (`paused_at`),
+  not since an earlier pause, so that hibernate-after counts from here. While an op runs,
   the sync is deferred until it ends, never dropped. It reads the pod on
   the row's node and applies it under the row's lock, if nothing changed
   in between. An instance not connected to the node hands the sandbox to
@@ -1001,7 +1058,11 @@ a stale record, an orphan, a fenced-out op. The tombstone is processed by
 an instance connected to the node: it reads the pod and deletes it only
 when its incarnation is the tombstone's (or it has none), and drops the
 tombstone only after the node answered. Processing always runs detached,
-like an op's calls. While a tombstone exists, placement puts no pod of
+like an op's calls. Its `DeletePod` has feosd's suspend budget, 30 s,
+and 2 min and 4 s/GiB as its deadline: feosd's delete waits for the
+pod's lock, which a suspend (an idle pause of a sandbox deleted
+meanwhile) holds up to that budget, and feosd runs the delete to its end
+once it has the lock, whatever its caller does. While a tombstone exists, placement puts no pod of
 that ID on that node. Tombstones of removed nodes are dropped.
 
 ### Policies
@@ -1322,7 +1383,10 @@ marked is not sent, so that every state is exact, whoever writes it:
   `not_run`, and a later read of the key finds no record (404
   `no_such_call`) or the key's earlier `not_run` row. Only an insert
   that committed without its answer leaves a row, which the instance
-  ends `not_run` at once, or its expiry later. An unreachable guest is
+  ends `not_run` at once, or its expiry later. A guest that feosd could
+  not reach because its VM is busy (its marker, [A busy VM](#ops)) is a
+  refusal: feosd gave up on the connect before the call reached the
+  guest. An unreachable guest is otherwise
   no refusal: feosd says so in the same words before and after it hands
   the call to the guest, so the call may have run; it keeps `sent` and
   ends `done` with the error. The same call under the same key replaces
@@ -1450,7 +1514,9 @@ node is unavailable is 503 "the sandbox's node is unavailable", also with
 `Retry-After: 5`. A failed dial is read by its code and feosd's text,
 since both failures that matter come as `UNAVAILABLE`: "127.0.0.1:<port>:
 …", the guest's, means nothing listens on the port (502), "the guest of
-pod …" that the guest does not answer (503), anything else that the node
+pod …" that the guest does not answer (503), as when it does not answer
+feosd's connect within 5 s while its microVM is paused or Firecracker
+writes a snapshot ("…; the VM is busy: <why>"), anything else that the node
 connection failed (503). A refused Kubernetes listener is 403, a pod that
 does not run yet 503 with a retry. A feosd that does not forward this
 service for pods answers `UNIMPLEMENTED`, and the door 502 "node <n> does
@@ -2586,6 +2652,17 @@ that dial the instances.
   the nodes' port and the nodes' mesh endpoints, behind a balancer of
   their own; `deploy/gardener/ferun-ingress/` runs two
   ([ingress.md](ingress.md#kubernetes)).
+- **Rollout order.** Roll ferund before the nodes' feosd. A new ferund
+  covers an old feosd: its deadlines are longer than the old feosd's
+  steps, and the old feosd sends no busy marker, so everything reads as
+  before. An old ferund does not cover a new feosd: its pause gives up
+  after 2 min and 4 s/GiB while the new feosd's suspend may take 190 s
+  and 5 s/GiB ([The suspend's budget](node.md#the-suspends-budget)), it
+  records "pause failed" and syncs the late suspend without resetting
+  `paused_at` (so hibernate-after fires at once), and it takes the busy
+  marker for an ordinary failure, so that a guest marked busy is
+  reported unreachable and a repair's busy `StopPod` is followed by a
+  `StartPod`.
 
 ### Requirements
 

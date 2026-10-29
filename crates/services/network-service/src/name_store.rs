@@ -16,6 +16,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use tonic::Status;
 
+#[derive(Clone)]
 pub struct NameStore {
     dir: PathBuf,
     tables: BTreeMap<String, Table>,

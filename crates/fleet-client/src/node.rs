@@ -7,6 +7,7 @@
 //! that server as its incoming stream, and learn from the connection when
 //! the server dropped it.
 
+use crate::calls::{CallsOn, NodeCalls};
 use crate::tls;
 use log::{debug, info, warn};
 use rustls::pki_types::ServerName;
@@ -21,12 +22,14 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep, Instant};
 use tokio_rustls::client::TlsStream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::{Connected, TcpConnectInfo};
 use tonic::transport::Server;
+use tower::layer::util::{Identity, Stack};
 
 /// The node connections, as the server takes them.
 pub type Incoming = ReceiverStream<Result<NodeConn, Infallible>>;
@@ -43,12 +46,15 @@ const DRAIN: Duration = Duration::from_secs(3600);
 /// The server for node connections: the control plane may run up to 1024
 /// calls and streams at once on one, and pings it every 10 s, idle or not,
 /// which h2 answers whatever their rate. Its own pings notice a dead
-/// connection.
-pub fn server() -> Server {
+/// connection. It is served on the control plane's threads
+/// (`Fleet::serve`), and its calls run on `runtime`, feosd's; `calls` ends
+/// them when feosd stops (`Fleet::stop`).
+pub fn server(runtime: Handle, calls: &NodeCalls) -> Server<Stack<CallsOn, Identity>> {
     Server::builder()
         .max_concurrent_streams(1024)
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+        .layer(CallsOn::new(runtime, calls.clone()))
 }
 
 /// A node connection, as the server serves it. Dropping it tells its
@@ -140,23 +146,30 @@ enum Mode {
 /// certificate, and those of older certificates that drain.
 pub(crate) struct Nodes {
     incoming: mpsc::Sender<Result<NodeConn, Infallible>>,
+    /// Set when feosd stops: every dialer lets its connection drain and
+    /// dials no more, and no dialer starts.
+    retired: watch::Receiver<bool>,
     name: ServerName<'static>,
     config: Option<Arc<ClientConfig>>,
     current: HashMap<String, watch::Sender<Mode>>,
-    retired: Vec<(String, watch::Sender<Mode>)>,
+    draining: Vec<(String, watch::Sender<Mode>)>,
 }
 
 impl Nodes {
     /// Dialers for the control plane `name`, and the server's incoming
-    /// stream they feed.
-    pub(crate) fn new(name: ServerName<'static>) -> (Self, Incoming) {
+    /// stream they feed; all of them retire once `retired` is set.
+    pub(crate) fn new(
+        name: ServerName<'static>,
+        retired: watch::Receiver<bool>,
+    ) -> (Self, Incoming) {
         let (incoming, rx) = mpsc::channel(16);
         let nodes = Self {
             incoming,
+            retired,
             name,
             config: None,
             current: HashMap::new(),
-            retired: Vec::new(),
+            draining: Vec::new(),
         };
         (nodes, ReceiverStream::new(rx))
     }
@@ -165,7 +178,7 @@ impl Nodes {
     /// those to others.
     pub(crate) fn set(&mut self, targets: &[String]) {
         self.current.retain(|target, _| targets.contains(target));
-        self.retired
+        self.draining
             .retain(|(target, mode)| targets.contains(target) && !mode.is_closed());
         for target in targets {
             if !self.current.contains_key(target)
@@ -184,7 +197,7 @@ impl Nodes {
         let targets: Vec<String> = self.current.keys().cloned().collect();
         for (target, mode) in self.current.drain() {
             mode.send_replace(Mode::Retire);
-            self.retired.push((target, mode));
+            self.draining.push((target, mode));
         }
         self.set(&targets);
     }
@@ -193,30 +206,79 @@ impl Nodes {
     pub(crate) fn clear(&mut self) {
         self.config = None;
         self.current.clear();
-        self.retired.clear();
+        self.draining.clear();
     }
 
     fn spawn(&self, target: &str) -> Option<watch::Sender<Mode>> {
+        if *self.retired.borrow() {
+            return None;
+        }
         let config = self.config.clone()?;
         let (mode, rx) = watch::channel(Mode::Hold);
         tokio::spawn(dial(
             target.to_string(),
             self.name.clone(),
             config,
-            rx,
+            Dialer {
+                mode: rx,
+                retired: self.retired.clone(),
+            },
             self.incoming.clone(),
         ));
         Some(mode)
     }
 }
 
+/// What a dialer is told: its own mode, and whether every dialer retires
+/// as feosd stops.
+struct Dialer {
+    mode: watch::Receiver<Mode>,
+    retired: watch::Receiver<bool>,
+}
+
+impl Dialer {
+    /// Whether the dialer is to dial no more.
+    fn retiring(&mut self) -> bool {
+        *self.mode.borrow_and_update() == Mode::Retire || *self.retired.borrow_and_update()
+    }
+
+    /// Resolves when the dialer is to dial no more: stopped, or retired,
+    /// itself or with every dialer.
+    async fn stopped(&mut self) {
+        loop {
+            if self.retiring() {
+                return;
+            }
+            tokio::select! {
+                changed = self.mode.changed() => if changed.is_err() {
+                    return;
+                },
+                () = all_retired(&mut self.retired) => return,
+            }
+        }
+    }
+
+    /// Lets the connection drain: until the server drops it (`gone`), or
+    /// `DRAIN` passed, or the dialer is stopped.
+    async fn drain(&mut self, gone: &mut oneshot::Receiver<()>) {
+        tokio::select! {
+            _ = gone => {}
+            _ = sleep(DRAIN) => {}
+            _ = dropped(&mut self.mode) => {}
+        }
+    }
+}
+
 /// Holds a node connection to `target` until the dialer is stopped, and
-/// dials it again when it is lost.
+/// dials it again when it is lost. A dialer that retires, as every dialer
+/// does when feosd stops, holds its connection until the server lets go
+/// of it, so that the calls on it end as the server lets them, and dials
+/// no more.
 async fn dial(
     target: String,
     name: ServerName<'static>,
     config: Arc<ClientConfig>,
-    mut mode: watch::Receiver<Mode>,
+    mut dialer: Dialer,
     incoming: mpsc::Sender<Result<NodeConn, Infallible>>,
 ) {
     let mut wait = BACKOFF.0;
@@ -224,7 +286,7 @@ async fn dial(
     loop {
         let dialed = tokio::select! {
             dialed = tls::connect(&target, &name, config.clone()) => dialed,
-            _ = stopped(&mut mode) => return,
+            () = dialer.stopped() => return,
         };
         match dialed {
             Ok(stream) => {
@@ -251,19 +313,20 @@ async fn dial(
                 loop {
                     tokio::select! {
                         _ = &mut gone => break,
-                        changed = mode.changed() => {
+                        changed = dialer.mode.changed() => {
                             if changed.is_err() {
                                 return;
                             }
-                            if *mode.borrow() == Mode::Retire {
-                                tokio::select! {
-                                    _ = &mut gone => {}
-                                    _ = sleep(DRAIN) => {}
-                                    _ = dropped(&mut mode) => {}
-                                }
+                            if *dialer.mode.borrow() == Mode::Retire {
+                                dialer.drain(&mut gone).await;
                                 drop(close);
                                 return;
                             }
+                        }
+                        () = all_retired(&mut dialer.retired) => {
+                            dialer.drain(&mut gone).await;
+                            drop(close);
+                            return;
                         }
                     }
                 }
@@ -276,6 +339,9 @@ async fn dial(
                     "Fleet: Node connection to {target} ended after {}s",
                     lived.as_secs()
                 );
+                if dialer.retiring() {
+                    return;
+                }
             }
             Err(e) if failing => debug!("Fleet: Failed to dial {target} again: {e}"),
             Err(e) => {
@@ -285,7 +351,7 @@ async fn dial(
         }
         tokio::select! {
             _ = sleep(wait) => {}
-            _ = stopped(&mut mode) => return,
+            () = dialer.stopped() => return,
         }
         wait = (wait * 2).min(BACKOFF.1);
     }
@@ -296,14 +362,9 @@ async fn dropped(mode: &mut watch::Receiver<Mode>) {
     while mode.changed().await.is_ok() {}
 }
 
-/// Resolves when the dialer is to dial no more: stopped, or retired.
-async fn stopped(mode: &mut watch::Receiver<Mode>) {
-    loop {
-        if *mode.borrow_and_update() == Mode::Retire {
-            return;
-        }
-        if mode.changed().await.is_err() {
-            return;
-        }
+/// Resolves when every dialer retires; never, once nothing can tell them.
+async fn all_retired(retired: &mut watch::Receiver<bool>) {
+    if retired.wait_for(|retired| *retired).await.is_err() {
+        std::future::pending::<()>().await;
     }
 }

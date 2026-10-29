@@ -377,6 +377,32 @@ impl Network {
         }
     }
 
+    /// For tests: a network that is not there, set up without touching
+    /// the node. Pods without a network work; the rules are not written.
+    #[cfg(test)]
+    pub(crate) fn absent(dir: &Path) -> Self {
+        let (records, _) = broadcast::channel(1);
+        Self {
+            config: Config::default(),
+            groups: SecurityGroups::open(dir.join("groups")).unwrap(),
+            names: NameTables::open(dir.join("names")).unwrap(),
+            records,
+            dir: dir.to_path_buf(),
+            parts: OnceLock::new(),
+            unready: Mutex::new("no network in this test".to_string()),
+            ready: watch::Sender::new(false),
+            handed: Mutex::new((None, None)),
+            setting_up: tokio::sync::Mutex::new(()),
+            mesh: None,
+            mesh_changes: watch::Sender::new(0),
+            broken: Mutex::new(None),
+            directory: Arc::default(),
+            applied: tokio::sync::Mutex::new(None),
+            node_addresses: Mutex::new(Vec::new()),
+            collector: Mutex::new(None),
+        }
+    }
+
     pub fn groups(&self) -> &SecurityGroups {
         &self.groups
     }
@@ -490,14 +516,14 @@ impl Network {
         self.mesh.as_ref().map(Mesh::info).unwrap_or_default()
     }
 
-    pub fn put_mesh_peers(&self, request: PutMeshPeersRequest) -> Result<(), Status> {
-        self.on_mesh()?.put(request)?;
+    pub async fn put_mesh_peers(&self, request: PutMeshPeersRequest) -> Result<(), Status> {
+        self.on_mesh()?.put(request).await?;
         self.mesh_changes.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }
 
-    pub fn update_mesh_peers(&self, request: UpdateMeshPeersRequest) -> Result<(), Status> {
-        self.on_mesh()?.update(request)?;
+    pub async fn update_mesh_peers(&self, request: UpdateMeshPeersRequest) -> Result<(), Status> {
+        self.on_mesh()?.update(request).await?;
         self.mesh_changes.send_modify(|n| *n = n.wrapping_add(1));
         Ok(())
     }

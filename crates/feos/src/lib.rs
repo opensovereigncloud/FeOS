@@ -73,9 +73,29 @@ const RESUME_WAIT: Duration = Duration::from_secs(120);
 /// elsewhere.
 #[cfg(feature = "host")]
 const RESUME_WITHIN: Duration = Duration::from_secs(300);
+/// How long a stop may take before feosd is killed, by default
+/// (`feosd --stop-grace`): feos-node's terminationGracePeriodSeconds.
+#[cfg(feature = "host")]
+pub const STOP_GRACE: Duration = Duration::from_secs(300);
+/// How long the node connections' calls in flight may take at most when
+/// feosd stops, before the pods are suspended; and no more than a tenth of
+/// the stop's grace, so that the suspends fit in the rest.
+#[cfg(feature = "host")]
+const CALLS_WAIT: Duration = Duration::from_secs(30);
+/// What a stop leaves of its grace when it gives up on a pod whose VM is
+/// busy: to record the pods it suspended and exit.
+#[cfg(feature = "host")]
+const STOP_MARGIN: Duration = Duration::from_secs(10);
+
+/// How long the calls in flight on the node connections get when feosd
+/// stops, of the stop's `grace`.
+#[cfg(feature = "host")]
+fn calls_wait(grace: Duration) -> Duration {
+    CALLS_WAIT.min(grace / 10)
+}
 
 /// How feosd or feos-guest serves.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ServerOptions {
     /// This process is the one an upgrade exec'd: the one-time setup ran.
     pub restarted_after_upgrade: bool,
@@ -103,6 +123,16 @@ pub struct ServerOptions {
     /// for a feosd whose microVMs end with it (ADR 0020).
     #[cfg(feature = "host")]
     pub suspend_on_stop: bool,
+    /// How long a stop may take before feosd is killed: `STOP_GRACE` by
+    /// default.
+    #[cfg(feature = "host")]
+    pub stop_grace: Duration,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self::new(false, false)
+    }
 }
 
 impl ServerOptions {
@@ -123,6 +153,8 @@ impl ServerOptions {
             fleet: None,
             #[cfg(feature = "host")]
             suspend_on_stop: false,
+            #[cfg(feature = "host")]
+            stop_grace: STOP_GRACE,
         }
     }
 }
@@ -254,9 +286,17 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
     #[cfg(feature = "host")]
     let fleet_slot: Arc<OnceLock<fleet_client::Fleet>> = Arc::default();
     #[cfg(feature = "host")]
+    let node_calls = fleet_client::NodeCalls::new();
+    #[cfg(feature = "host")]
     let node_server = {
         let pods = services.pods.clone();
-        let router = services.router_with(fleet_client::server());
+        // The calls run here, on feosd's runtime; the connections on the
+        // control plane's threads.
+        let router = services.router_with(fleet_client::server(
+            tokio::runtime::Handle::current(),
+            &node_calls,
+        ));
+        let calls = node_calls.clone();
         let slot = fleet_slot.clone();
         let config = options.fleet.clone();
         async move {
@@ -277,37 +317,51 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
             }
             // A stop that came meanwhile: nothing more to connect.
             let started = match config {
-                Some(config) if !pods.stopping() => fleet::start(config, pods.clone())
-                    .map_err(|e| error!("Fleet: Not connecting to the control plane: {e}"))
-                    .ok(),
+                Some(config) if !pods.stopping() => {
+                    fleet::start(config, pods.clone(), calls.clone())
+                        .map_err(|e| error!("Fleet: Not connecting to the control plane: {e}"))
+                        .ok()
+                }
                 _ => None,
             };
             match started {
-                // Never ends, whatever becomes of the dialers.
+                // Ends only with a stop, whatever becomes of the dialers.
                 Some((fleet, incoming)) => {
+                    // On the control plane's threads, as the rest of it: the
+                    // connections answer whatever feosd's own threads do.
+                    let serving = fleet.serve(router, incoming);
                     let _ = slot.set(fleet);
-                    let incoming =
-                        tokio_stream::StreamExt::chain(incoming, tokio_stream::pending());
-                    router.serve_with_incoming(incoming).await
+                    let served = serving
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string());
+                    if calls.stopping() {
+                        // feosd stops: the stop ends it.
+                        return std::future::pending().await;
+                    }
+                    served
                 }
                 None => std::future::pending().await,
             }
         }
     };
     #[cfg(not(feature = "host"))]
-    let node_server = std::future::pending::<Result<(), tonic::transport::Error>>();
+    let node_server = std::future::pending::<Result<(), String>>();
     let mut node_serving = true;
 
     // SIGTERM: with --suspend-on-stop, feosd refuses calls that change
-    // pods, tells the control plane that it stops and lets go of it, and
+    // pods, tells the control plane that it stops, closes the node
+    // connections once their calls are done or a bound passed, and
     // suspends the running pods for the next feosd to resume. Without it,
-    // with a control plane, it tells the control plane that it stops
-    // before it ends; without either, it ends as the signal ends it.
+    // with a control plane, it tells the control plane that it stops and
+    // closes the node connections so before it ends; without either, it
+    // ends as the signal ends it.
     #[cfg(feature = "host")]
     let terminated = {
         let slot = fleet_slot.clone();
         let pods = services.pods.clone();
         let suspend = options.suspend_on_stop;
+        let grace = options.stop_grace;
         let signal = (suspend || options.fleet.is_some()).then(|| {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .map_err(|e| warn!("Main: Failed to handle SIGTERM: {e}"))
@@ -318,18 +372,19 @@ pub async fn run_server(options: ServerOptions) -> Result<()> {
                 return std::future::pending().await;
             };
             signal.recv().await;
-            info!("Main: SIGTERM: feosd stops");
+            let stopped_at = tokio::time::Instant::now();
+            info!("Main: SIGTERM: feosd stops, within {}s", grace.as_secs());
             if suspend {
                 pods.begin_stop();
             }
             if let Some(fleet) = slot.get() {
                 fleet.stopping("feosd stops").await;
-                if suspend {
-                    fleet.disconnect();
-                }
+                fleet.stop(calls_wait(grace)).await;
             }
             if suspend {
-                pods.suspend_for_stop(Path::new(STOP_RECORD)).await;
+                // A pod whose VM is busy is tried again until then.
+                let until = stopped_at + grace.saturating_sub(STOP_MARGIN);
+                pods.suspend_for_stop(Path::new(STOP_RECORD), until).await;
             }
         }
     };
@@ -413,11 +468,13 @@ struct Services {
     guest: guest::GuestServices,
 }
 
-/// feosd forwards the calls for a pod's guest (ADR 0004).
+/// feosd forwards the calls for a pod's guest (ADR 0004), below the layers
+/// `L` of a listener's server.
 #[cfg(feature = "host")]
-type Layers = Stack<ForwardLayer, Identity>;
+type Layered<L> = Stack<ForwardLayer, L>;
 #[cfg(not(feature = "host"))]
-type Layers = Identity;
+type Layered<L> = L;
+type Layers = Layered<Identity>;
 
 impl Services {
     fn router(&self) -> Router<Layers> {
@@ -425,7 +482,7 @@ impl Services {
     }
 
     /// The services on `server`, as a listener configures it.
-    fn router_with(&self, server: Server) -> Router<Layers> {
+    fn router_with<L: Clone>(&self, server: Server<L>) -> Router<Layered<L>> {
         #[cfg(feature = "host")]
         let mut server = server.layer(ForwardLayer::new(self.pods.clone()));
         #[cfg(not(feature = "host"))]
@@ -506,4 +563,18 @@ async fn bind_unix_socket(path: &str) -> Result<UnixListenerStream> {
     fs::remove_file(path).await.ok();
     let listener = UnixListener::bind(path).with_context(|| format!("bind {path}"))?;
     Ok(UnixListenerStream::new(listener))
+}
+
+#[cfg(all(test, feature = "host"))]
+mod tests {
+    use super::*;
+
+    /// The calls in flight get a tenth of the stop's grace, 30 s at most:
+    /// feos-node's 300 s leave the suspends 270 s.
+    #[test]
+    fn the_calls_in_flight_get_a_tenth_of_the_grace() {
+        assert_eq!(calls_wait(STOP_GRACE), Duration::from_secs(30));
+        assert_eq!(calls_wait(Duration::from_secs(90)), Duration::from_secs(9));
+        assert_eq!(calls_wait(Duration::from_secs(3600)), CALLS_WAIT);
+    }
 }

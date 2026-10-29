@@ -5,13 +5,14 @@
 //! `feos.network.v1.NameService`, the resolver's lookups in it, and the
 //! question whether a pod names a table.
 
+use crate::kept::Kept;
 use crate::name_store::NameStore;
 use feos_proto::network_service::{NameTable, UpdateNameTableRequest};
 use log::info;
 use std::io;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use tonic::Status;
 
 type InUse = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -22,7 +23,7 @@ pub struct NameTables {
 }
 
 struct Inner {
-    store: Mutex<NameStore>,
+    store: Kept<NameStore>,
     in_use: Mutex<InUse>,
 }
 
@@ -33,7 +34,7 @@ impl NameTables {
         info!("Name tables: {} kept", store.tables().count());
         Ok(Self {
             inner: Arc::new(Inner {
-                store: Mutex::new(store),
+                store: Kept::new(store),
                 in_use: Mutex::new(Arc::new(|_| false)),
             }),
         })
@@ -80,16 +81,25 @@ impl NameTables {
         self.store().tables().cloned().collect()
     }
 
-    pub fn put(&self, table: NameTable) -> Result<(), Status> {
+    pub async fn put(&self, table: NameTable) -> Result<(), Status> {
         let (id, version, names) = (table.id.clone(), table.version, table.entries.len());
-        if self.store().put(table)? {
+        if self
+            .inner
+            .store
+            .change(move |store| store.put(table))
+            .await?
+        {
             info!("Name tables: {id} put at version {version}, {names} names");
         }
         Ok(())
     }
 
-    pub fn update(&self, request: &UpdateNameTableRequest) -> Result<(), Status> {
-        self.store().update(request)?;
+    pub async fn update(&self, request: UpdateNameTableRequest) -> Result<(), Status> {
+        let changed = request.clone();
+        self.inner
+            .store
+            .change(move |store| store.update(&changed))
+            .await?;
         info!(
             "Name tables: {} updated to version {}, {} names put, {} removed",
             request.id,
@@ -100,7 +110,7 @@ impl NameTables {
         Ok(())
     }
 
-    pub fn delete(&self, id: &str) -> Result<(), Status> {
+    pub async fn delete(&self, id: &str) -> Result<(), Status> {
         let in_use = self
             .inner
             .in_use
@@ -108,13 +118,18 @@ impl NameTables {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let in_use = in_use(id);
-        self.store().delete(id, |_| in_use)?;
+        let deleted = id.to_string();
+        self.inner
+            .store
+            .change(move |store| store.delete(&deleted, |_| in_use))
+            .await?;
         info!("Name tables: {id} deleted");
         Ok(())
     }
 
-    fn store(&self) -> MutexGuard<'_, NameStore> {
-        self.inner.store.lock().unwrap_or_else(|e| e.into_inner())
+    /// The tables as last kept.
+    fn store(&self) -> Arc<NameStore> {
+        self.inner.store.read()
     }
 }
 
@@ -139,11 +154,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lookups_take_any_case() {
+    #[tokio::test]
+    async fn lookups_take_any_case() {
         let dir = tempfile::tempdir().unwrap();
         let tables = NameTables::open(dir.path()).unwrap();
-        tables.put(table("env-1", &[("web", "fd00::1")])).unwrap();
+        tables
+            .put(table("env-1", &[("web", "fd00::1")]))
+            .await
+            .unwrap();
         let ids = ["env-1".to_string()];
         let web = vec!["fd00::1".parse::<IpAddr>().unwrap()];
         assert_eq!(tables.lookup(&ids, "WeB"), Some(web.clone()));
@@ -156,12 +174,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_table_a_pod_names_stays() {
+    #[tokio::test]
+    async fn a_table_a_pod_names_stays() {
         let dir = tempfile::tempdir().unwrap();
         let tables = NameTables::open(dir.path()).unwrap();
-        tables.put(table("env-1", &[])).unwrap();
-        tables.put(table("env-2", &[])).unwrap();
+        tables.put(table("env-1", &[])).await.unwrap();
+        tables.put(table("env-2", &[])).await.unwrap();
         let names = {
             let tables = tables.clone();
             // As the pods would: it may ask the tables.
@@ -169,11 +187,50 @@ mod tests {
         };
         tables.set_in_use(names);
         assert_eq!(
-            tables.delete("env-1").unwrap_err().code(),
+            tables.delete("env-1").await.unwrap_err().code(),
             Code::FailedPrecondition
         );
-        tables.delete("env-2").unwrap();
+        tables.delete("env-2").await.unwrap();
         assert_eq!(tables.get("env-2").unwrap_err().code(), Code::NotFound);
         assert_eq!(tables.list().len(), 1);
+    }
+
+    /// A change writes its file on the blocking pool and is seen once it
+    /// is kept: the resolver's lookups do not wait for its fsync, which
+    /// can take seconds, and the runtime, of one thread, moves meanwhile.
+    #[tokio::test]
+    async fn lookups_answer_while_a_change_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let tables = NameTables::open(dir.path()).unwrap();
+        let ids = vec!["env-1".to_string()];
+        tables
+            .put(table("env-1", &[("web", "fd00::1")]))
+            .await
+            .unwrap();
+        let hung = crate::kept::Hung::at(dir.path().join("env-1.pb.new"));
+        let (moved, watchdog) = hung.watchdog();
+        let put = tokio::spawn({
+            let tables = tables.clone();
+            async move { tables.put(table("env-1", &[("web", "fd00::2")])).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // As the resolver asks, on a thread of its own.
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let (tables, ids) = (tables.clone(), ids.clone());
+            move || answer.send(tables.lookup(&ids, "web"))
+        });
+        let looked_up = answered.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = moved.send(());
+        assert!(!watchdog.join().unwrap(), "the write held the runtime");
+        let old = Some(vec!["fd00::1".parse::<IpAddr>().unwrap()]);
+        assert_eq!(
+            looked_up,
+            Ok(old.clone()),
+            "the lookup waited for the write"
+        );
+        assert!(put.await.unwrap().is_err(), "a FIFO does not sync");
+        // What was not kept is not seen.
+        assert_eq!(tables.lookup(&ids, "web"), old);
     }
 }

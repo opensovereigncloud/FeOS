@@ -587,6 +587,7 @@ pub(crate) async fn handle_suspend_vm_command(
         .balloon
         .is_some_and(|balloon| balloon.free_page_reporting);
 
+    let snapshot_timeout = crate::vmm::budget::snapshot_timeout(memory.size_mib);
     tokio::spawn(worker::handle_suspend_vm(
         req,
         responder,
@@ -594,6 +595,7 @@ pub(crate) async fn handle_suspend_vm_command(
         event_bus_tx,
         guests,
         free_page_reporting,
+        snapshot_timeout,
     ));
 }
 
@@ -664,6 +666,7 @@ pub(crate) async fn check_and_cleanup_vms(
 
         if alive {
             info!("VmDispatcher (Sanity Check): Found running VM {vm_id} from previous session. Starting health monitor.");
+            hypervisor.adopt(&vm_id).await;
             let cancel_bus = healthcheck_cancel_bus.subscribe();
             worker::start_healthcheck_monitor(
                 vm_id,

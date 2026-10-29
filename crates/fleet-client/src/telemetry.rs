@@ -5,13 +5,23 @@
 //! has and how busy it is. What is cheap comes from /proc and statvfs at
 //! every report; what changes rarely, the installed versions and diskd's
 //! object store, once a minute.
+//!
+//! The report goes out whatever feosd does for a while: what it reads of
+//! feosd has a deadline, and what feosd does not answer in time, it reports
+//! as feosd said it before. Not for ever: a feosd whose runtime has not
+//! moved for the stall limit, or whose pods have not answered for as long,
+//! takes no calls either, and the node stops reporting until it moves
+//! again, so that the control plane counts it down (`Collector::stalled`).
 
 use crate::token::sha256_hex;
 use feos_proto::fleet_service::{Telemetry, Versions};
 use feos_proto::pod_service::{PodInfo, PodState};
-use log::warn;
+use log::{info, warn};
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
 /// Of the file system that holds the pods' disks: diskd's state directory,
@@ -20,10 +30,17 @@ const DISK_DIRS: [&str; 2] = ["/var/lib/feos/disk", "/var/lib/feos"];
 /// How long the installed versions and diskd's answer are kept.
 const SLOW: Duration = Duration::from_secs(60);
 const DISKD_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a report waits for feosd's pods and installed versions.
+const INVENTORY_TIMEOUT: Duration = Duration::from_secs(1);
+/// How often feosd's runtime says that it moves.
+const PULSE: Duration = Duration::from_secs(1);
 
-/// What feosd knows of the node that the control plane is told.
+/// What feosd knows of the node that the control plane is told. It is
+/// asked on the control plane's threads: `pods` and `installed` are called
+/// on the blocking pool, and what the others do of feosd's own runs on
+/// feosd's runtime.
 pub trait Inventory: Send + Sync + 'static {
-    /// The node's pods.
+    /// The node's pods. It may block, as on the lock of the pods' records.
     fn pods(&self) -> Vec<PodInfo>;
     /// The Firecracker and guest versions installed side by side.
     fn installed(&self) -> Installed;
@@ -73,14 +90,127 @@ pub struct Diskd {
 }
 
 pub(crate) struct Collector<I> {
-    inventory: I,
+    inventory: Arc<I>,
     /// What stays as long as feosd runs.
     fixed: Telemetry,
     slow: Option<(Instant, Installed, Diskd)>,
+    /// The pods as feosd said them last.
+    pods: Vec<PodInfo>,
+    read_pods: Read<Vec<PodInfo>>,
+    read_installed: Read<Installed>,
+    pulse: Pulse,
+    /// How long feosd may not move before the node stops reporting.
+    stall_limit: Duration,
+}
+
+/// When feosd's runtime last moved: a task on it says so every `PULSE`.
+/// A runtime whose threads all block, or whose timers and I/O no thread
+/// drives, says nothing.
+struct Pulse {
+    started: Instant,
+    /// When it last moved, in milliseconds after `started`.
+    moved: Arc<AtomicU64>,
+}
+
+impl Pulse {
+    /// The pulse of the runtime this is called on, as long as it is kept.
+    fn start() -> Self {
+        let pulse = Self {
+            started: Instant::now(),
+            moved: Arc::default(),
+        };
+        let (started, moved) = (pulse.started, Arc::downgrade(&pulse.moved));
+        tokio::spawn(beat(started, moved));
+        pulse
+    }
+
+    /// How long feosd's runtime has not moved.
+    fn still_for(&self) -> Duration {
+        let moved = Duration::from_millis(self.moved.load(Ordering::Relaxed));
+        self.started.elapsed().saturating_sub(moved)
+    }
+}
+
+async fn beat(started: Instant, moved: Weak<AtomicU64>) {
+    loop {
+        tokio::time::sleep(PULSE).await;
+        let Some(moved) = moved.upgrade() else {
+            return;
+        };
+        let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        moved.store(now, Ordering::Relaxed);
+    }
+}
+
+/// A read of feosd's inventory on the blocking pool, which a report waits
+/// for at most `INVENTORY_TIMEOUT`. One that takes longer is waited for
+/// again by the next report rather than started anew, so that a read that
+/// hangs holds one thread, not one per report.
+struct Read<T> {
+    what: &'static str,
+    /// The read under way, and since when.
+    pending: Option<(Instant, JoinHandle<T>)>,
+    late: bool,
+}
+
+impl<T: Send + 'static> Read<T> {
+    fn new(what: &'static str) -> Self {
+        Self {
+            what,
+            pending: None,
+            late: false,
+        }
+    }
+
+    /// How long the read under way has not answered.
+    fn waited(&self) -> Duration {
+        match &self.pending {
+            Some((since, read)) if !read.is_finished() => since.elapsed(),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// What `read` reads, if it answers in time.
+    async fn get(&mut self, read: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (_, pending) = self
+            .pending
+            .get_or_insert_with(|| (Instant::now(), tokio::task::spawn_blocking(read)));
+        let value = match timeout(INVENTORY_TIMEOUT, pending).await {
+            Err(_) => {
+                if !self.late {
+                    warn!(
+                        "Fleet: feosd's {} do not answer within {}s; the reports carry them as \
+                         they were",
+                        self.what,
+                        INVENTORY_TIMEOUT.as_secs()
+                    );
+                    self.late = true;
+                }
+                return None;
+            }
+            Ok(done) => {
+                self.pending = None;
+                done.ok()
+            }
+        };
+        if self.late {
+            info!("Fleet: feosd's {} answer again", self.what);
+            self.late = false;
+        }
+        value
+    }
 }
 
 impl<I: Inventory> Collector<I> {
-    pub(crate) fn new(inventory: I, start_id: &str, feosd: &str, pod_prefix: &str) -> Self {
+    /// The collector of `inventory`, whose runtime is the one this is
+    /// called on.
+    pub(crate) fn new(
+        inventory: I,
+        start_id: &str,
+        feosd: &str,
+        pod_prefix: &str,
+        stall_limit: Duration,
+    ) -> Self {
         let (cpu_model, cpu_cores) = std::fs::read_to_string("/proc/cpuinfo")
             .map(|text| cpuinfo(&text))
             .unwrap_or_default();
@@ -101,14 +231,28 @@ impl<I: Inventory> Collector<I> {
             ..Default::default()
         };
         Self {
-            inventory,
+            inventory: Arc::new(inventory),
             fixed,
             slow: None,
+            pods: Vec::new(),
+            read_pods: Read::new("pods"),
+            read_installed: Read::new("installed versions"),
+            pulse: Pulse::start(),
+            stall_limit,
         }
     }
 
-    pub(crate) fn inventory(&self) -> &I {
+    pub(crate) fn inventory(&self) -> &Arc<I> {
         &self.inventory
+    }
+
+    /// How long feosd has stood still, if longer than the stall limit: its
+    /// runtime has not moved, or its pods have not answered, for that long.
+    /// A feosd that stands still takes no calls; its last report would
+    /// tell of a node that works.
+    pub(crate) fn stalled(&self) -> Option<Duration> {
+        let still = self.pulse.still_for().max(self.read_pods.waited());
+        (still > self.stall_limit).then_some(still)
     }
 
     pub(crate) async fn collect(&mut self) -> Telemetry {
@@ -127,13 +271,16 @@ impl<I: Inventory> Collector<I> {
         }
         (report.disk_total_bytes, report.disk_available_bytes) = disk();
 
-        let pods = self.inventory.pods();
-        let counts = count(&pods);
+        let inventory = self.inventory.clone();
+        if let Some(pods) = self.read_pods.get(move || inventory.pods()).await {
+            self.pods = pods;
+        }
+        let counts = count(&self.pods);
         report.pods_pending = counts.pending;
         report.pods_running = counts.running;
         report.pods_suspended = counts.suspended;
         report.pods_other = counts.other;
-        report.inventory_hash = inventory_hash(&pods);
+        report.inventory_hash = inventory_hash(&self.pods);
 
         self.refresh().await;
         if let Some((_, installed, diskd)) = &self.slow {
@@ -155,19 +302,27 @@ impl<I: Inventory> Collector<I> {
         {
             return;
         }
-        let installed = self.inventory.installed();
-        // A diskd that does not answer keeps what it said before.
-        let diskd = match timeout(DISKD_TIMEOUT, self.inventory.diskd()).await {
-            Ok(Some(diskd)) => diskd,
-            _ => {
-                warn!("Fleet: diskd does not answer; its object store is reported as before");
-                self.slow
-                    .take()
-                    .map(|(_, _, diskd)| diskd)
-                    .unwrap_or_default()
-            }
-        };
-        self.slow = Some((Instant::now(), installed, diskd));
+        let inventory = self.inventory.clone();
+        let installed = self.read_installed.get(move || inventory.installed()).await;
+        // A diskd that does not answer keeps what it said before, and so do
+        // the installed versions.
+        let diskd = timeout(DISKD_TIMEOUT, self.inventory.diskd())
+            .await
+            .ok()
+            .flatten();
+        if diskd.is_none() {
+            warn!("Fleet: diskd does not answer; its object store is reported as before");
+        }
+        let (before_installed, before_diskd) = self
+            .slow
+            .take()
+            .map(|(_, installed, diskd)| (installed, diskd))
+            .unwrap_or_default();
+        self.slow = Some((
+            Instant::now(),
+            installed.unwrap_or(before_installed),
+            diskd.unwrap_or(before_diskd),
+        ));
     }
 }
 
@@ -267,6 +422,73 @@ pub fn inventory_hash(pods: &[PodInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Pods that do not answer while the lock is held.
+    struct Gated(Arc<Mutex<()>>);
+
+    impl Inventory for Gated {
+        fn pods(&self) -> Vec<PodInfo> {
+            let _held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            Vec::new()
+        }
+
+        fn installed(&self) -> Installed {
+            Installed::default()
+        }
+
+        async fn diskd(&self) -> Option<Diskd> {
+            None
+        }
+    }
+
+    fn collector(gate: &Arc<Mutex<()>>, stall_limit: Duration) -> Collector<Gated> {
+        Collector::new(Gated(gate.clone()), "start", "0.6.0", "", stall_limit)
+    }
+
+    #[tokio::test]
+    async fn pods_that_do_not_answer_past_the_limit_stall_the_node() {
+        let gate = Arc::new(Mutex::new(()));
+        let mut collector = collector(&gate, Duration::from_millis(1500));
+        collector.collect().await;
+        assert_eq!(collector.stalled(), None);
+
+        // Held elsewhere, as the pods' records' lock is while one of them
+        // is synced: feosd's runtime moves on.
+        let held = gate.clone();
+        let (taken, take) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = held.lock().unwrap();
+            taken.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(3000));
+        });
+        take.recv().unwrap();
+        collector.collect().await;
+        assert_eq!(collector.stalled(), None, "within the limit");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(collector.stalled().is_some(), "the pods answer no more");
+
+        // Once they answer, without a report that took their answer.
+        holder.join().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while collector.stalled().is_some() {
+            assert!(Instant::now() < deadline, "still stalled");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_runtime_that_does_not_move_past_the_limit_stalls_the_node() {
+        let gate = Arc::new(Mutex::new(()));
+        let collector = collector(&gate, Duration::from_millis(1500));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(collector.stalled(), None);
+        // The runtime's one thread blocks: its pulse stops.
+        std::thread::sleep(Duration::from_millis(2000));
+        assert!(collector.stalled().is_some());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(collector.stalled(), None, "it moves again");
+    }
 
     fn pod(id: &str, state: PodState) -> PodInfo {
         PodInfo {

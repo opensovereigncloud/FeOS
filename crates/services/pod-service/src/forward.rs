@@ -6,12 +6,15 @@
 //! call without it is for feosd's own services.
 //!
 //! A call that does not reach the guest fails `UNAVAILABLE` with "the
-//! guest of pod <id>: …", or with the pod's state when it does not run;
+//! guest of pod <id>: …", or with the pod's state when it does not run; one
+//! whose guest does not answer the connect within 5 s, as while its
+//! microVM is paused for a snapshot, fails `UNAVAILABLE` with "the guest of
+//! pod <id> did not answer within 5s; the VM is busy: <why>";
 //! what the guest answers comes back as it is. So a port forward to a
 //! port nothing listens on fails `UNAVAILABLE` with "127.0.0.1:<port>: …",
 //! the guest's text, and to a Kubernetes listener `FAILED_PRECONDITION`.
 
-use crate::pods::{guest_channel, Pods};
+use crate::pods::Pods;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -116,7 +119,7 @@ async fn forward(
 ) -> Result<Response<Body>, Status> {
     check_forwarded(request.uri().path())?;
     pods.check_reachable(pod_id)?;
-    let channel = guest_channel(pod_id).await?;
+    let channel = pods.guest_channel(pod_id).await?;
     let response = channel
         .oneshot(request)
         .await

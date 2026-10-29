@@ -73,7 +73,8 @@ impl Dispatcher {
             match record.status.state {
                 ContainerState::PullingImage => {
                     info!("Dispatcher: Removing container {id}, whose creation was cut short");
-                    let _ = bundle::remove(id);
+                    let removed = id.clone();
+                    let _ = tokio::task::spawn_blocking(move || bundle::remove(&removed)).await;
                     let _ = repository.delete_container(id).await;
                 }
                 ContainerState::Created | ContainerState::Running if !runtime_knows(id) => {

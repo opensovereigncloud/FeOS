@@ -104,7 +104,25 @@ nothing of the machine up but the pods' network ([below](#the-pods-network)).
   it. `diskd` holds `/var/lib/feos/disk/diskd.lock` alike.
 - With `--suspend-on-stop`, SIGTERM suspends the pods for the next `feosd`
   ([On Kubernetes](#on-kubernetes)); without, with a control plane, it
-  tells the control plane that `feosd` stops, and ends.
+  tells the control plane that `feosd` stops, closes the node connections
+  once their calls are done ([Stopping](#stopping)), and ends.
+  `--stop-grace SECONDS` (300 by default, feos-node's
+  `terminationGracePeriodSeconds`) is how long a stop may take before
+  `feosd` is killed; it bounds what the stop waits for.
+- Nothing that blocks runs on its runtime's threads, nor under a lock
+  that a reader takes. The records it keeps are written with fsync(2),
+  which can take seconds while the disk writes back much else, as a
+  snapshot's memory. A pod's record is written on a thread of its own,
+  `pod-records`, in the order of the pod's changes: a change is seen at
+  once, and its call answered and its event sent once it is kept. The
+  volumes, the security groups, the name tables and the mesh are written
+  on the blocking pool, one change at a time, and a change is seen once it
+  is kept: `ListPods`, `GetPod`, a call to a guest and the resolver's
+  lookups never wait for a write. The pods' addresses are handed out and
+  kept on the blocking pool, one pod at a time, before the pod is
+  recorded; so is the record of a stop. Removing a snapshot or a
+  container's directory, clearing a layer a pull unpacked before, and the
+  image store's syncfs(2) run there too.
 
 ## Directories
 
@@ -167,7 +185,8 @@ serves on.
 - **Node connections**, ALPN `feos-node/1`, one to every instance the
   control plane lists: on each, `feosd` is the HTTP/2 server of the API it
   serves on its socket, with up to 1024 streams and pings of its own. A
-  lost one is dialed again after 1 s, doubling up to 30 s.
+  lost one is dialed again after 1 s, doubling up to 30 s, until `feosd`
+  stops ([Stopping](#stopping)).
 - **The uplink**, ALPN `h2`, to one instance at a time, moving to the next
   at once when a call fails: telemetry, three seconds per report, as often
   as the control plane asks; the certificate's renewal at its renewal
@@ -190,6 +209,52 @@ All connections are TLS 1.3, without session resumption, and the server is
 always checked for `--control-plane-name` and the URI, later against the
 trust bundle. Their sockets have keepalive and a `TCP_USER_TIMEOUT` of
 20 s.
+
+The control plane's side runs on two threads of its own, on which nothing
+else of `feosd` runs: the join, the reports, the events, the dialers and
+the HTTP/2 of the node connections, their pings included. A call on a node
+connection runs on `feosd`'s runtime, as one on the socket does, and so
+does its answer's body; a call that the control plane resets is dropped
+there. A report waits a second at most for the pods and the installed
+versions, which may wait for the pods' records' lock, and reports them as
+they were when they do not answer; the mesh's answer is taken on `feosd`'s
+runtime, one at a time, and the report after learns whether it was taken
+or has to be asked for again. The reports keep their rate whatever their
+collection takes. A tokio runtime can stall as a whole while one of its
+threads blocks, such as on an unlink of a file that Firecracker still
+writes; the reports and the node connections go on all the same, and the
+node stays up. Not for ever: a task on `feosd`'s runtime ticks every
+second, and while it has not ticked for 90 s, or the pods have not
+answered for as long, the node sends no reports, so that the control
+plane counts it down and its sandboxes move rather than wait on calls
+that hang. It reports again once `feosd` moves.
+
+### Stopping
+
+On SIGTERM, with a control plane, `feosd` tells it that it stops
+(`stopping`, waiting up to 3 s for the acknowledgement) and then closes
+the node connections gracefully (`Fleet::stop`):
+
+1. The server sends HTTP/2 GOAWAY on every node connection and takes no
+   new stream; the dialers dial no more and hold their connections until
+   the server lets go of them. The control plane starts no new call on
+   them: a call that had not reached the node waits for its next
+   connection, up to the node's rollout deadline
+   ([control-plane.md](control-plane.md#the-nodes-port)).
+2. The calls and streams in flight end as they do, up to a tenth of
+   `--stop-grace`, 30 s at most; a connection closes once its last call
+   ended.
+3. Those still running then end with `UNAVAILABLE` "the node stops: the
+   call did not end within <N>s of feosd's stop": a call not answered yet
+   gets it as its answer, and is dropped where it runs; a stream gets it
+   as its trailers, after what it sent. That is done on the control
+   plane's threads, whatever `feosd`'s runtime does. The connections close
+   within 5 s of it.
+4. The reports end, and `feosd` lets go of the control plane for the rest
+   of its life.
+
+So a call in flight when the node restarts either answers, or ends with a
+clear status, never with the connection's EOF.
 
 ## A pod
 
@@ -217,12 +282,28 @@ every call with any other ID fails with `INVALID_ARGUMENT`.
   that exists returns that pod if the spec is the same, and fails with
   `ALREADY_EXISTS` if not.
 - **Stop** ends a bring-up, shuts the microVM down, or removes it if it
-  does not go or is not running, and stops the disk; **Start** brings a
+  does not go or is not running, and stops the disk; a microVM that is
+  busy (its late snapshot) is left alone, and the stop answers
+  `UNAVAILABLE` "the VM is busy: <why>"; **Start** brings a
   stopped or failed pod up anew on its disk: the containers the disk holds
   are adopted, with what they wrote.
 - **Suspend** and **Resume** suspend and resume the microVM, with
   `purge_guest`; the containers come back as they were. The disk stops
-  with the microVM and starts again before the resume.
+  with the microVM and starts again before the resume. A suspend runs in
+  a task of its own, which holds the pod's lock: a call that goes away,
+  as one past its deadline, leaves it running to its end, so that the
+  pod's record follows its microVM. It answers within the suspend's
+  budget ([The suspend's budget](#the-suspends-budget)), the suspend or
+  `UNAVAILABLE` "the VM is busy: <why>", which changed nothing and may be
+  asked again later.
+- A running pod whose microVM is suspended without the pod, as when the
+  microVM's suspend went through and the suspend failed after it (the
+  microVM layer recorded the change later than 10 s), or a `feosd` before
+  this one did not see a suspend to its end, is `SUSPENDED`, its disk
+  stopped: once the pod's lock is free, its microVM's record decides,
+  after the microVM's `Suspended` event and when `feosd` starts. A microVM
+  that runs again after a failed suspend, its late snapshot discarded,
+  finds its pod `RUNNING`, as the suspend left it.
 - **Hibernate** and **Restore** take a pod into the object store and
   bring it back, on this node or another, with its memory or on its disk
   alone ([disk.md](disk.md#hibernation)). A hibernated pod is `HIBERNATED`,
@@ -237,15 +318,45 @@ every call with any other ID fails with `INVALID_ARGUMENT`.
   with `ABORTED`, and the pod resumes from its snapshot on the node.
   Otherwise the resume waits for the hibernation and restores the pod.
 - **Delete** ends a bring-up and removes the microVM, the disk and the
-  record. Its volumes stay, their disks stopped, attached to no pod.
+  record. Its volumes stay, their disks stopped, attached to no pod. The
+  pod leaves the pods and its record's removal is asked for in one step,
+  under the pods' lock, so that no save of the pod (as of the addresses
+  the network gives it when it comes up) lands behind the removal and
+  writes the record back; a removal that fails puts the pod back, to be
+  deleted again.
 - A running pod whose microVM crashes is `FAILED`; one whose microVM stops
   is `STOPPED`. Either keeps its disk, and its disk stops. Volumes go as
   the disk does.
 
 What changes a pod runs under a lock of the pod's; a call that waited for
 it acts only if the lock is still its pod's, not on a pod created again
-with the ID after a delete. `GetPod` asks the guest for the containers'
+with the ID after a delete. Every call that changes a pod (create, start,
+stop, delete, suspend, resume, hibernate, restore) runs in a task of its
+own: a caller that goes away, as one whose deadline passed, whose stream
+ferund reset, or that the node's stop cut, leaves the change running to
+its end. Its steps await the pod's record, the microVM service and
+diskd, and a change cut off between two of them would leave the pod
+half changed, as a pod `PENDING` that nothing brings up, or one deleted
+whose record stays. `GetPod` asks the guest for the containers'
 states while the pod runs.
+
+A call to the guest, as an exec, a port forward, `GetPod`'s states or a
+bring-up's, connects to it on vsock within 5 s, its handshake included.
+A guest that does not answer, as while its microVM is paused for a
+snapshot or Firecracker still writes one, fails the call with
+`UNAVAILABLE` "the guest of pod <id> did not answer within 5s", and "; the
+VM is busy: <why>" when that is known: the pod is being suspended, it
+hibernates, or the microVM's snapshot is late (its `check_free`). Such a
+busy answer carries the busy marker (`vmm::marked_busy`, the status
+detail `VmBusy`), so that ferund takes the guest for busy, not
+unreachable, and does not repair the pod. A
+connected call has no bound but its caller's: a stream lasts as long as
+it lasts. The microVM service's own calls to a guest bound their connect
+with their own deadline: the ping of a resumed guest, before the time
+and the network are pushed, waits 30 s, its connect included, since a VM
+restored from a snapshot written elsewhere has its memory served page by
+page from object storage and may answer later than 5 s; a push and the
+request to empty the memory before a snapshot wait 10 s.
 
 ## Volumes
 
@@ -668,7 +779,30 @@ deletion undoes.
   exit code 0 makes the microVM stopped, anything else crashed.
 - **Shutdown** sends Ctrl-Alt-Del and waits for the process to end.
 - **Suspend** writes a snapshot, ends the process and punches holes over
-  the pages of zeroes. **Resume** loads the snapshot with the vCPUs
+  the pages of zeroes. A snapshot that is not written within its timeout,
+  120 s and 4 s per GiB ([The suspend's budget](#the-suspends-budget)),
+  fails the suspend at once (`UNAVAILABLE` "the VM is busy: <why>").
+  Firecracker cannot stop in the
+  middle of one and writes on; its files stay alone, and the microVM
+  refuses suspends and shutdowns as busy. Once Firecracker is done, the
+  microVM resumes if it ran, and the snapshot is discarded. Until then
+  every suspend and shutdown of the microVM fails with `UNAVAILABLE` "the
+  VM is busy: Firecracker still writes the snapshot …"; a delete ends it.
+  A busy answer carries a marker, which tells it apart from any other
+  `UNAVAILABLE` whatever the message says (`vmm::busy_status`,
+  `vmm::is_busy`): a status detail, a `google.protobuf.Any` of type
+  `type.googleapis.com/feos.microvm.v1.VmBusy` without a value, in the
+  status's `grpc-status-details-bin`. feosd's own stop and FeRun go by
+  it.
+  A marker in
+  the jail, `late-snapshot`, keeps this across a restart of `feosd`: the
+  next one finds it when it takes the microVM on, and waits for
+  Firecracker to answer again before it does the same. One whose
+  memory file does not grow for five minutes, as when its memory's
+  userfaultfd handler is gone, ends Firecracker: the microVM crashed. The
+  first suspend after a restore from another node reads all of the memory
+  through diskd from the object store (ADR 0008), and can take that long.
+  **Resume** loads the snapshot with the vCPUs
   stopped, then resumes them and removes the snapshot. A created microVM
   that never booted resumes from a `RemoteSnapshot`: its vmstate is moved
   into `snapshot/`, and its memory comes from a userfaultfd handler on
@@ -682,6 +816,29 @@ the pod service waits for it. A microVM has one data disk at most and
 its volumes after it, in their order, which Firecracker opens with a
 writeback cache, so that the guest's flushes reach diskd, and no huge
 pages, which Firecracker backs neither an initramfs nor a balloon with.
+
+### The suspend's budget
+
+A `SuspendPod` answers within its budget, which its caller's deadline
+covers, so that the caller hears the suspend's end, or that the VM is
+busy, before it gives up: FeRun's pause waits the budget and 30 s more
+([control-plane.md](control-plane.md#ops)). Both follow from one formula,
+in `microvm_service::vmm::budget` and in ferund's `feosdSuspendBudget`,
+whose tests hold the same table. GiB is the microVM's memory, rounded up.
+
+| Part | Takes at most |
+|---|---|
+| before the snapshot: the guest empties its memory (10 s), free page reporting settles (3 s), Firecracker's API reads and pauses the microVM (10 s each), the snapshot's directory | 40 s |
+| the snapshot | 120 s + 4 s/GiB |
+| after it: Firecracker's version (10 s), its end (5 s), the microVM's record (10 s), the host record, the pod's record and its disk; the zeroes punched out of the memory file | 30 s + 1 s/GiB |
+| **the budget** | **190 s + 5 s/GiB** |
+
+4 s per GiB is a write of 256 MiB/s, which a node's disk sustains while
+it writes back other memory, and 120 s leaves room for a sync behind
+it. A snapshot that is slower is late: its suspend fails as busy at the
+snapshot's timeout, still within the budget, and Firecracker writes on
+(above). The parts before and after the snapshot are bounded by their
+own timeouts but for the file steps, which their slack covers.
 
 ### Jail, user and cgroup
 
@@ -787,16 +944,25 @@ SIGTERM it
 1. refuses every call that changes a pod (`CreatePod`, `StartPod`,
    `StopPod`, `DeletePod`, `SuspendPod`, `ResumePod`, `HibernatePod`,
    `RestorePod`) with `UNAVAILABLE`, "feosd stops";
-2. with a control plane, tells it that `feosd` stops (`stopping`, waiting
-   up to 3 s for the acknowledgement) and then lets go of it for good: the
-   node connections close and the reports end;
+2. with a control plane, tells it that `feosd` stops and closes the node
+   connections as [Stopping](#stopping) says: GOAWAY, the calls in flight
+   up to a tenth of `--stop-grace` (30 s at most), the rest ended with
+   `UNAVAILABLE` "the node stops"; then the reports end, and `feosd` lets
+   go of the control plane for good;
 3. suspends every running pod into its directory as `SuspendPod` does
    ([ADR 0008](../adr/0008-suspend-and-restore.md)), four at a time, and
    records each in `/var/lib/feos/suspended-for-stop.json` (the pods and
    the time of the stop, written whole and synced) as soon as it is
    suspended, so that a stop that is killed keeps what it did. It waits for
    the hibernations in flight, whose pods are not running on the node
-   then. A pod whose suspend fails ends with `feosd`, as on a crash;
+   then. A pod whose microVM is busy (`UNAVAILABLE` marked busy, as while
+   Firecracker still writes a late snapshot: [The suspend's
+   budget](#the-suspends-budget)) is tried again every 5 s after the first
+   pass over all pods, so that it holds none of the four places meanwhile,
+   until it is suspended, or found suspended as its microVM's suspend went
+   through after all (both recorded), or until 10 s before
+   `--stop-grace` ends. A pod whose suspend fails, or that is still busy
+   then, ends with `feosd`, as on a crash;
 4. exits 0.
 
 The next `feosd` on the node resumes the recorded pods that are still
@@ -817,9 +983,10 @@ tombstone acts on. The new start requests a reconcile, which finds the
 pods running as the rows say. A pod event or an inventory hash with the
 pods suspended, a call into a suspended guest that marks it unreachable
 for the repair, or a `ResumePod` racing `feosd`'s own resume cannot
-happen, since the node connections close before the first suspend and
-open after the resumes. An op of FeRun's that the stop cut off reads the
-pod again once the node is back, as after any lost answer.
+happen, since the node connections close, their calls done or ended,
+before the first suspend and open after the resumes. An op of FeRun's
+that the stop cut off reads the pod again once the node is back, as
+after any lost answer.
 
 A stop longer ago than five minutes is not resumed when a control plane
 is configured: FeRun counts the sandboxes of a node that is down past its
@@ -831,9 +998,13 @@ moved on.
 **The budget.** A suspend writes the guest's memory at the disk's speed:
 the snapshot is as large as the guest's memory, less what free page
 reporting gave back, which is written as zeroes and punched out. The pod's
-`terminationGracePeriodSeconds` covers about 60 s plus 4 s per GiB of the
-memory the node gives microVMs, as FeRun's own pause deadline counts it
-(2 min + 4 s/GiB), and FeRun's `--rollout-grace` covers that grace plus
+`terminationGracePeriodSeconds` covers the 3 s of the `stopping`
+acknowledgement, the calls in flight (a tenth of the grace, 30 s at
+most), and about 60 s plus 4 s per GiB of the memory the node gives
+microVMs, as the snapshot's timeout counts it
+([The suspend's budget](#the-suspends-budget)); `feosd --stop-grace`
+says the same grace (300 s by default, feos-node's). FeRun's
+`--rollout-grace` covers that grace plus
 the start of the new pod and its resumes, so that calls wait rather than
 fail. A crash, a kill past the grace or the OOM killer ends the microVMs
 that are not suspended yet: FeRun treats them as on a lost node.

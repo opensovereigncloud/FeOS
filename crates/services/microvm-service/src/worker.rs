@@ -13,6 +13,7 @@ use feos_utils::pod_id::PodId;
 use log::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
     sync::{broadcast, mpsc, oneshot},
@@ -297,14 +298,25 @@ pub async fn handle_suspend_vm(
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
     guests: Arc<Guests>,
     free_page_reporting: bool,
+    snapshot_timeout: Duration,
 ) {
     let vm_id = req.vm_id.clone();
-    if req.purge_guest {
-        guests.prepare_pause(&vm_id, free_page_reporting).await;
-    }
-    let result = hypervisor
-        .suspend_vm(&vm_id, req.purge_guest && free_page_reporting)
-        .await;
+    // A busy VM is refused before its guest is asked for anything.
+    let result = match hypervisor.check_free(&vm_id) {
+        Err(e) => Err(e),
+        Ok(()) => {
+            if req.purge_guest {
+                guests.prepare_pause(&vm_id, free_page_reporting).await;
+            }
+            hypervisor
+                .suspend_vm(
+                    &vm_id,
+                    req.purge_guest && free_page_reporting,
+                    snapshot_timeout,
+                )
+                .await
+        }
+    };
 
     if let Ok(memory_bytes) = result {
         crate::vmm::broadcast_state_change_event(
@@ -324,8 +336,12 @@ pub async fn handle_suspend_vm(
     }
 
     let result = result.map(|memory_bytes| SuspendVmResponse { memory_bytes });
-    if responder.send(result.map_err(Into::into)).is_err() {
-        error!("VmWorker: Failed to send response for SuspendVm.");
+    // An error is logged where the caller turns it into its answer; one
+    // whose caller went is logged here.
+    match responder.send(result.map_err(Into::into)) {
+        Ok(()) => {}
+        Err(Err(e)) => error!("VmWorker ({vm_id}): The suspend failed after its caller went: {e}"),
+        Err(Ok(_)) => error!("VmWorker ({vm_id}): Failed to send response for SuspendVm."),
     }
 }
 

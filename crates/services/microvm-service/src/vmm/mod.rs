@@ -12,11 +12,13 @@ use prost::Message;
 use prost_types::Any;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
 use uuid::Uuid;
 
+pub mod budget;
 pub mod fc_api;
 pub mod firecracker;
 pub mod installed;
@@ -28,6 +30,62 @@ pub const METADATA_ADDRESS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 /// Firecracker's limit of its metadata store, in bytes, by default: its
 /// API's largest request.
 pub const METADATA_LIMIT: usize = 51200;
+
+/// How an `UNAVAILABLE` of a VM that cannot take a change now, and can
+/// later, begins: a busy VM's (`VmmError::Busy`).
+pub const BUSY: &str = "the VM is busy";
+
+/// The type of the status detail that marks a busy VM's `UNAVAILABLE`
+/// (`busy_status`): a `google.protobuf.Any` of this type and no value in
+/// the status's details (`grpc-status-details-bin`, a `google.rpc.Status`).
+/// It tells the answer apart from any other `UNAVAILABLE`, whatever its
+/// message says, here and in the control plane.
+pub const BUSY_DETAIL: &str = "type.googleapis.com/feos.microvm.v1.VmBusy";
+
+/// `google.rpc.Status`, as gRPC carries a status's details.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<Any>,
+}
+
+/// The `UNAVAILABLE` of a VM that is busy: "the VM is busy: <why>", marked
+/// with `BUSY_DETAIL`.
+pub fn busy_status(why: &str) -> Status {
+    marked_busy(format!("{BUSY}: {why}"))
+}
+
+/// An `UNAVAILABLE` with `message`, marked with `BUSY_DETAIL`: what a call
+/// that met a busy VM answers in words of its own, as a call to the guest
+/// of a pod whose microVM writes a snapshot does.
+pub fn marked_busy(message: String) -> Status {
+    let details = RpcStatus {
+        code: tonic::Code::Unavailable as i32,
+        message: message.clone(),
+        details: vec![Any {
+            type_url: BUSY_DETAIL.to_string(),
+            value: Vec::new(),
+        }],
+    }
+    .encode_to_vec();
+    Status::with_details(tonic::Code::Unavailable, message, details.into())
+}
+
+/// Whether a status is a busy VM's (`busy_status`): the call changed
+/// nothing, and the same call later may. The marker decides, not the
+/// message.
+pub fn is_busy(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable
+        && RpcStatus::decode(status.details()).is_ok_and(|rpc| {
+            rpc.details
+                .iter()
+                .any(|detail| detail.type_url == BUSY_DETAIL)
+        })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum VmmError {
@@ -52,6 +110,11 @@ pub enum VmmError {
     #[error("The snapshot cannot be restored: {0}")]
     SnapshotUnusable(String),
 
+    /// The VM cannot take a change now, and can later: Firecracker still
+    /// writes a snapshot that its suspend gave up on.
+    #[error("The VM is busy: {0}")]
+    Busy(String),
+
     #[error("An internal or unexpected error occurred: {0}")]
     Internal(String),
 }
@@ -65,6 +128,9 @@ impl From<VmmError> for Status {
             VmmError::ApiConnectionFailed(msg) | VmmError::ImageServiceFailed(msg) => {
                 Status::unavailable(msg)
             }
+            // The control plane takes it for a VM that takes the change
+            // later, and asks again (control-plane.md, "Ops").
+            VmmError::Busy(why) => busy_status(&why),
             VmmError::ProcessSpawnFailed(msg)
             | VmmError::ApiOperationFailed(msg)
             | VmmError::Internal(msg) => Status::internal(msg),
@@ -91,8 +157,27 @@ pub trait Hypervisor: Send + Sync {
     /// Writes a snapshot of the running or paused VM and ends its VMM
     /// process; first waits until free page reporting is done, if asked.
     /// Returns what the snapshot's memory takes on disk. A VM that cannot
-    /// be suspended is left running or paused, as it was.
-    async fn suspend_vm(&self, vm_id: &str, settle_free_pages: bool) -> Result<u64, VmmError>;
+    /// be suspended is left running or paused, as it was; one whose
+    /// snapshot is not written within `snapshot_timeout`
+    /// (`budget::snapshot_timeout` of its memory), once the VMM is done
+    /// with it, and until then it is busy (`check_free`).
+    async fn suspend_vm(
+        &self,
+        vm_id: &str,
+        settle_free_pages: bool,
+        snapshot_timeout: Duration,
+    ) -> Result<u64, VmmError>;
+
+    /// Fails with `VmmError::Busy` while the VM cannot take a change, such
+    /// as while its VMM writes a snapshot that a suspend gave up on.
+    fn check_free(&self, _vm_id: &str) -> Result<(), VmmError> {
+        Ok(())
+    }
+
+    /// Takes on a VM whose VMM process outlived the service that ran it,
+    /// when this service starts: finishes what that service left of it,
+    /// such as a snapshot that its suspend gave up on and its VMM writes.
+    async fn adopt(&self, _vm_id: &str) {}
 
     /// Restores a suspended VM in a new VMM process and resumes it, or with
     /// `remote` a created one from a snapshot written elsewhere, whose
@@ -302,6 +387,39 @@ mod tests {
             ipv6_cidr: ipv6.0.to_string(),
             ipv6_gateway: ipv6.1.to_string(),
             ..Default::default()
+        }
+    }
+
+    /// A busy VM's answer is told by its marker, which survives the trip
+    /// over gRPC (the status's details), and not by its message: another
+    /// UNAVAILABLE that says the same is not busy, and the busy answer is
+    /// whatever it says.
+    #[test]
+    fn a_busy_answer_is_told_by_its_marker() {
+        let busy = Status::from(VmmError::Busy("Firecracker still writes".into()));
+        assert!(is_busy(&busy), "{busy:?}");
+        assert_eq!(busy.code(), tonic::Code::Unavailable);
+        assert_eq!(busy.message(), "the VM is busy: Firecracker still writes");
+        // As a client reads it back from the answer's headers.
+        let answer = busy.clone().into_http::<tonic::body::Body>();
+        let read = Status::from_header_map(answer.headers()).expect("a status");
+        assert!(is_busy(&read), "{read:?}");
+        let rpc = RpcStatus::decode(read.details()).unwrap();
+        assert_eq!(rpc.code, 14);
+        assert_eq!(rpc.message, busy.message());
+        assert_eq!(rpc.details[0].type_url, BUSY_DETAIL);
+
+        for other in [
+            Status::unavailable("the VM is busy: but says so only"),
+            Status::unavailable("Could not connect to the API socket"),
+            Status::with_details(tonic::Code::Unavailable, "garbage", vec![1, 2, 3].into()),
+            Status::with_details(
+                tonic::Code::Internal,
+                "the VM is busy",
+                busy.details().to_vec().into(),
+            ),
+        ] {
+            assert!(!is_busy(&other), "{other:?}");
         }
     }
 

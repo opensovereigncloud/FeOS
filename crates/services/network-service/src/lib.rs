@@ -8,6 +8,7 @@
 //! from which the resolver answers the pods that name them.
 
 mod group;
+mod kept;
 mod name_service;
 mod name_store;
 mod names;
@@ -56,7 +57,7 @@ impl SecurityGroupService for SecurityGroups {
             .into_inner()
             .group
             .ok_or_else(|| Status::invalid_argument("no security group"))?;
-        self.put(group)?;
+        self.put(group).await?;
         Ok(Response::new(PutSecurityGroupResponse {}))
     }
 
@@ -64,7 +65,7 @@ impl SecurityGroupService for SecurityGroups {
         &self,
         request: Request<UpdateSecurityGroupRequest>,
     ) -> Result<Response<UpdateSecurityGroupResponse>, Status> {
-        self.update(&request.into_inner())?;
+        self.update(request.into_inner()).await?;
         Ok(Response::new(UpdateSecurityGroupResponse {}))
     }
 
@@ -72,7 +73,7 @@ impl SecurityGroupService for SecurityGroups {
         &self,
         request: Request<DeleteSecurityGroupRequest>,
     ) -> Result<Response<DeleteSecurityGroupResponse>, Status> {
-        self.delete(&request.into_inner().id)?;
+        self.delete(&request.into_inner().id).await?;
         Ok(Response::new(DeleteSecurityGroupResponse {}))
     }
 
@@ -103,7 +104,7 @@ impl NameService for NameTables {
             .into_inner()
             .table
             .ok_or_else(|| Status::invalid_argument("no name table"))?;
-        self.put(table)?;
+        self.put(table).await?;
         Ok(Response::new(PutNameTableResponse {}))
     }
 
@@ -111,7 +112,7 @@ impl NameService for NameTables {
         &self,
         request: Request<UpdateNameTableRequest>,
     ) -> Result<Response<UpdateNameTableResponse>, Status> {
-        self.update(&request.into_inner())?;
+        self.update(request.into_inner()).await?;
         Ok(Response::new(UpdateNameTableResponse {}))
     }
 
@@ -119,7 +120,7 @@ impl NameService for NameTables {
         &self,
         request: Request<DeleteNameTableRequest>,
     ) -> Result<Response<DeleteNameTableResponse>, Status> {
-        self.delete(&request.into_inner().id)?;
+        self.delete(&request.into_inner().id).await?;
         Ok(Response::new(DeleteNameTableResponse {}))
     }
 

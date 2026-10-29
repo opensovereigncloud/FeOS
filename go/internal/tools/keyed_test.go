@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
 	toolv1 "github.com/gardenlinux/feos/go/gen/feos/tool/v1"
@@ -963,6 +964,9 @@ func TestKeyedSentResetOnlyForFeosd(t *testing.T) {
 		{status.Errorf(codes.FailedPrecondition, "pod %s is POD_STATE_SUSPENDED", id), true},
 		{status.Errorf(codes.NotFound, "no pod %s", id), true},
 		{status.Errorf(codes.Unavailable, "the guest of pod %s: connection refused", id), false},
+		// Marked busy: feosd gave up on the connect, before the guest.
+		{busyGuest(id), true},
+		{status.Errorf(codes.Unavailable, "the guest of pod %s did not answer within 5s", id), false},
 		{status.Errorf(codes.FailedPrecondition, "pod %s is POD_STATE_STOPPED", podid.Mint()), false},
 		{status.Errorf(codes.NotFound, "no pod %s here", id), false},
 		{status.Error(codes.NotFound, "no container main"), false},
@@ -1415,4 +1419,12 @@ func TestCancelKindCallWaitsForJoin(t *testing.T) {
 	if row := callRow(t, env, sb.ID, "c"); row.State != store.ToolCallDone || row.Error != ErrCancelledByCaller.Error() {
 		t.Errorf("row %+v", row)
 	}
+}
+
+// busyGuest is feosd's answer for a call to the guest of pod id that got
+// no answer because its VM is busy, marked as feosd marks it.
+func busyGuest(id podid.ID) error {
+	p := status.Newf(codes.Unavailable, "the guest of pod %s did not answer within 5s; the VM is busy: the pod is being suspended", id).Proto()
+	p.Details = append(p.Details, &anypb.Any{TypeUrl: nodelink.VMBusyDetail})
+	return status.ErrorProto(p)
 }

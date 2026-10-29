@@ -335,8 +335,15 @@ async fn stream_layer_once(
     layer: &OciDescriptor,
     rootfs: PathBuf,
 ) -> Result<u64, String> {
-    let _ = std::fs::remove_dir_all(&rootfs);
-    std::fs::create_dir_all(&rootfs).map_err(|e| e.to_string())?;
+    // What a try before unpacked: many files, removed on the blocking pool.
+    let cleared = rootfs.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(&cleared);
+        std::fs::create_dir_all(&cleared)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     let (reader, writer) = nix::unistd::pipe().map_err(|e| format!("layer pipe: {e}"))?;
     // A 1 MiB pipe lets the transfer run ahead of the unpacker instead of
     // blocking on almost every chunk, and tokio's pipe sender needs the fd

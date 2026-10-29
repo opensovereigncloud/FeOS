@@ -66,7 +66,15 @@ pub fn exists(vm_id: &str) -> bool {
 }
 
 pub fn remove(vm_id: &str) -> io::Result<()> {
-    match std::fs::remove_dir_all(dir(vm_id)) {
+    remove_dir(&dir(vm_id))
+}
+
+/// Removes a snapshot's directory `dir`, if it is there. This blocks: the
+/// memory file takes its time to go, and one that Firecracker still writes
+/// waits for it in the kernel. The VM service calls it off the runtime's
+/// threads.
+pub fn remove_dir(dir: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
@@ -265,8 +273,7 @@ fn resident_kib(pid: i32) -> Option<u64> {
 /// than 2 % three times in a row, at most 3 s.
 pub async fn settle_free_pages(pid: i32) {
     const INTERVAL: Duration = Duration::from_millis(250);
-    const LIMIT: Duration = Duration::from_secs(3);
-    let deadline = tokio::time::Instant::now() + LIMIT;
+    let deadline = tokio::time::Instant::now() + super::budget::FREE_PAGES_SETTLE;
     let Some(mut last) = resident_kib(pid) else {
         return;
     };

@@ -105,6 +105,14 @@ impl VmServiceDispatcher {
                         Command::ResumeVm(req, responder) => {
                             handle_resume_vm_command(&self.repository, req, responder, hypervisor, event_bus_tx, &self.healthcheck_cancel_bus, guests).await;
                         }
+                        Command::CheckFree(vm_id, responder) => {
+                            let busy = match hypervisor.check_free(&vm_id) {
+                                Ok(()) => None,
+                                Err(crate::vmm::VmmError::Busy(why)) => Some(why),
+                                Err(e) => Some(e.to_string()),
+                            };
+                            let _ = responder.send(busy);
+                        }
                         Command::SetGuestNetwork(vm_id, network, responder) => {
                             handle_set_guest_network_command(&self.repository, vm_id, network, responder, guests).await;
                         }
