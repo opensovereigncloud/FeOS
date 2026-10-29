@@ -3,7 +3,7 @@
 
 # ferun-ingress on the Gardener shoot (ADR 0021, deploy/gardener/README.md,
 # The ingress): an instance on every worker the balancer sends to, behind
-# a LoadBalancer of their own, beside Traefik, which goes on serving the
+# a LoadBalancer of their own, beside Envoy Gateway, which goes on serving the
 # platform's hosts. Each instance holds
 # ferund's routing table, is a peer on the pods' mesh, and proxies
 # https://<label>.${APPS_ZONE} straight to the pods. Its program ships in

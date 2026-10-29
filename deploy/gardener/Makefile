@@ -24,7 +24,7 @@ ACME_PROFILE ?= shortlived
 # The workers' network, which reaches ferun-ingress's health port and mesh.
 NODE_CIDR ?= 10.250.0.0/16
 # The Gateway that serves run., chat. and oci.<DOMAIN> (config.env.example).
-GATEWAY_NAMESPACE ?= traefik
+GATEWAY_NAMESPACE ?= gateway
 GATEWAY_NAME ?= platform
 # DENY_PREFIXES, what the pods may not reach, has no default: the shoot's
 # networks are not every shoot's (config.env.example).

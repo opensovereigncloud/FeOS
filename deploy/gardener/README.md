@@ -19,13 +19,13 @@ what FeOS needs (ublk, tun, vhost-vsock, WireGuard, nftables).
 | [`cluster.yaml`](cluster.yaml) | | the issuer `letsencrypt-prod` the Gateway's certificates and ferun-ingress's name, answering DNS-01 |
 
 Every name under `DOMAIN` points at the shoot's public address, the
-LoadBalancer of Traefik, which serves the cluster's Gateway (Gateway
+LoadBalancer of Envoy Gateway, which serves the cluster's Gateway (Gateway
 API): run., chat. and oci.<DOMAIN> are HTTPRoutes on it, its listeners
 hold their certificates. The apps zone's names point at the second
 address, ferun-ingress's.
 
 ```
- *.<DOMAIN> ───── LoadBalancer ── traefik ── ferund :8100 ──── ferun-db (CNPG, 3)
+ *.<DOMAIN> ───── LoadBalancer ── envoy ──── ferund :8100 ──── ferun-db (CNPG, 3)
                                                │ :7443 (mTLS, through kube-proxy)
    workers: feos-node pod ─────────────────────┤   dials FERUN_NODES_IP:7443,
        │ feos-mesh, UDP 51820 between workers  │   then the instances' pod addresses
@@ -43,9 +43,9 @@ address, ferun-ingress's.
   workers (port 51820, the pods' mesh), and between the workers and the
   pods' network, where ferun-ingress joins the mesh. Kubernetes 1.30 or
   newer.
-- Traefik behind a LoadBalancer, serving the Gateway API (its standard
-  CRDs), and cert-manager. A Gateway, `GATEWAY_NAMESPACE/GATEWAY_NAME`
-  (default `traefik/platform`), with an HTTPS listener for each of
+- A Gateway API implementation behind a LoadBalancer (the standard
+  CRDs; Envoy Gateway on the shoot `fecode`), and cert-manager. A Gateway, `GATEWAY_NAMESPACE/GATEWAY_NAME`
+  (default `gateway/platform`), with an HTTPS listener for each of
   run., chat. and oci.<DOMAIN>: its certificate, from the issuer of
   [`cluster.yaml`](cluster.yaml), and routes admitted from the
   namespace `ferun`, `fechat` or `registry` respectively. FeCode's
@@ -215,7 +215,7 @@ ferun-ingress (ADR 0021) serves public environments' hosts,
 `<label>.<APPS_ZONE>`, straight to their pods: the StatefulSet
 `ferun-ingress` of [`ferun-ingress/`](ferun-ingress/ferun-ingress.yaml),
 an instance on every worker, behind a LoadBalancer of their own beside
-Traefik's. An instance joins ferund once, as a node does, and keeps
+Envoy's. An instance joins ferund once, as a node does, and keeps
 its identity, its mesh key and a copy of the routing table on its volume;
 ferund streams the table to it over the nodes' port, and it reaches the
 pods as a peer on the mesh. Its program ships in ferund's image
