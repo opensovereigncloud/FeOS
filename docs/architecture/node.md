@@ -318,7 +318,12 @@ every call with any other ID fails with `INVALID_ARGUMENT`.
   with `ABORTED`, and the pod resumes from its snapshot on the node.
   Otherwise the resume waits for the hibernation and restores the pod.
 - **Delete** ends a bring-up and removes the microVM, the disk and the
-  record. Its volumes stay, their disks stopped, attached to no pod.
+  record. Its volumes stay, their disks stopped, attached to no pod. The
+  pod leaves the pods and its record's removal is asked for in one step,
+  under the pods' lock, so that no save of the pod (as of the addresses
+  the network gives it when it comes up) lands behind the removal and
+  writes the record back; a removal that fails puts the pod back, to be
+  deleted again.
 - A running pod whose microVM crashes is `FAILED`; one whose microVM stops
   is `STOPPED`. Either keeps its disk, and its disk stops. Volumes go as
   the disk does.

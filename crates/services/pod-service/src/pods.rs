@@ -620,12 +620,7 @@ impl Pods {
             .detach(&info)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
-        self.inner
-            .store
-            .remove(pod_id)
-            .await
-            .map_err(|e| Status::internal(format!("forget pod {pod_id}: {e}")))?;
-        if let Some(pod) = self.pods().remove(pod_id) {
+        if let Some(pod) = self.forget(pod_id).await? {
             self.announce(&pod.info, true);
         }
         self.inner.volumes.release(pod_id, &[]).await;
@@ -635,6 +630,25 @@ impl Pods {
         self.release_addresses(&info).await;
         info!("Pods: {pod_id} deleted");
         Ok(())
+    }
+
+    /// Takes the pod out of the pods and removes its record, under the
+    /// pods' lock in one go: no save of the pod can be queued behind the
+    /// removal, which would write the record back while the removal waits
+    /// for the writer. A removal that fails puts the pod back, to be
+    /// deleted again, unless one with its ID was created meanwhile.
+    async fn forget(&self, pod_id: &str) -> Result<Option<Pod>, Status> {
+        let (pod, removed) = {
+            let mut pods = self.pods();
+            (pods.remove(pod_id), self.inner.store.remove(pod_id))
+        };
+        if let Err(e) = removed.await {
+            if let Some(pod) = pod {
+                self.pods().entry(pod_id.to_string()).or_insert(pod);
+            }
+            return Err(Status::internal(format!("forget pod {pod_id}: {e}")));
+        }
+        Ok(pod)
     }
 
     /// Writes the running pod to a snapshot; returns the size of its memory.
@@ -2211,6 +2225,16 @@ impl Pods {
         });
     }
 
+    /// Gives the pod the addresses of `info` and keeps it, unless it is
+    /// gone; the save is asked for under the pods' lock.
+    fn take_addresses(&self, info: &PodInfo) -> Option<feos_utils::writer::Done<()>> {
+        let mut pods = self.pods();
+        let pod = pods.get_mut(&info.pod_id)?;
+        pod.info.ipv6_address = info.ipv6_address.clone();
+        pod.info.ipv4_address = info.ipv4_address.clone();
+        Some(self.inner.store.save(&pod.info))
+    }
+
     async fn network_came_up(&self) {
         let network = &self.inner.network;
         {
@@ -2234,12 +2258,7 @@ impl Pods {
             .await
             .unwrap_or_default();
             for info in adopted {
-                let saved = self.pods().get_mut(&info.pod_id).map(|pod| {
-                    pod.info.ipv6_address = info.ipv6_address.clone();
-                    pod.info.ipv4_address = info.ipv4_address.clone();
-                    self.inner.store.save(&pod.info)
-                });
-                if let Some(saved) = saved
+                if let Some(saved) = self.take_addresses(&info)
                     && let Err(e) = saved.await
                 {
                     warn!("Pods: Failed to keep {}: {e}", info.pod_id);
@@ -3447,5 +3466,40 @@ mod tests {
             "the pod is {:?} and has no bring-up",
             pods.info(POD).map(|info| info.state())
         );
+    }
+
+    /// A delete takes the pod out and removes its record in one go: a save
+    /// of the pod that comes while the removal waits for the writer, as
+    /// one of the addresses the network gives it when it comes up, finds
+    /// no pod, and does not write the record back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_pod_is_not_kept_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let pods = bare_pods(dir.path());
+        let info = PodInfo {
+            pod_id: POD.to_string(),
+            state: PodState::Stopped as i32,
+            ..Default::default()
+        };
+        pods.inner.store.save(&info).await.unwrap();
+        pods.pods().insert(POD.to_string(), Pod::new(info.clone()));
+        let hung = hold_the_writer(&pods, dir.path());
+        let forget = tokio::spawn({
+            let pods = pods.clone();
+            async move { pods.forget(POD).await.map(|pod| pod.is_some()) }
+        });
+        sleep(Duration::from_millis(200)).await;
+        let late = pods.take_addresses(&PodInfo {
+            ipv6_address: "fd00::2".to_string(),
+            ..info
+        });
+        hung.open();
+        assert!(forget.await.unwrap().unwrap(), "the pod was there");
+        if let Some(late) = late {
+            late.await.unwrap();
+        }
+        let record = dir.path().join(format!("pods/{POD}.pb"));
+        assert!(!record.exists(), "the deleted pod's record is back");
+        assert!(pods.info(POD).is_err());
     }
 }
