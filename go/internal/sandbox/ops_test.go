@@ -463,6 +463,18 @@ func TestPauseCoversFeosdSuspend(t *testing.T) {
 	}
 }
 
+// TestTombstoneCoversASuspend: a tombstone's DeletePod waits behind a
+// suspend that holds the pod's lock in feosd, and has its own steps
+// after it: its deadline is a pause's and the tombstone's base more.
+func TestTombstoneCoversASuspend(t *testing.T) {
+	const base = 2 * time.Minute
+	for _, mem := range []int{1024, 4096, 16384} {
+		if got, pause := tombstoneDeadline(base, mem), OpDeadline(OpPause, mem); got < pause+base {
+			t.Errorf("tombstone of %d MiB: %v, shorter than a pause's %v and %v", mem, got, pause, base)
+		}
+	}
+}
+
 func TestOpDeadlines(t *testing.T) {
 	cases := []struct {
 		kind OpKind

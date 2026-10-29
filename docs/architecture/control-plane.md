@@ -1058,7 +1058,11 @@ a stale record, an orphan, a fenced-out op. The tombstone is processed by
 an instance connected to the node: it reads the pod and deletes it only
 when its incarnation is the tombstone's (or it has none), and drops the
 tombstone only after the node answered. Processing always runs detached,
-like an op's calls. While a tombstone exists, placement puts no pod of
+like an op's calls. Its `DeletePod` has feosd's suspend budget, 30 s,
+and 2 min and 4 s/GiB as its deadline: feosd's delete waits for the
+pod's lock, which a suspend (an idle pause of a sandbox deleted
+meanwhile) holds up to that budget, and feosd runs the delete to its end
+once it has the lock, whatever its caller does. While a tombstone exists, placement puts no pod of
 that ID on that node. Tombstones of removed nodes are dropped.
 
 ### Policies

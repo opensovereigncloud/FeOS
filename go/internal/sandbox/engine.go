@@ -123,8 +123,9 @@ type timings struct {
 	// staleOverdue is how long past its deadline a live owner's op is
 	// released.
 	staleOverdue time.Duration
-	// tombstoneGet bounds a tombstone's GetPod; tombstoneBase is the
-	// deadline of its DeletePod before the per-GiB part.
+	// tombstoneGet bounds a tombstone's GetPod; tombstoneBase is its
+	// DeletePod's own part of the deadline, beside the suspend it may
+	// wait behind and the per-GiB part (tombstoneDeadline).
 	tombstoneGet, tombstoneBase time.Duration
 	// pauseWait is how long the REST pause waits for its op.
 	pauseWait time.Duration
