@@ -299,7 +299,7 @@ func TestUsage(t *testing.T) {
 		`--shutdown-grace (FERUN_SHUTDOWN_GRACE, default "11m0s")`, "--node-advertise-address (FERUN_NODE_ADVERTISE_ADDRESS)",
 		"how long a stopping instance waits for its requests, its tool calls and its ops; set a container's termination grace to at least this plus 60s",
 		`--hibernate-timeout (FERUN_HIBERNATE_TIMEOUT, default "1h0m0s")`,
-		"how long ferund waits for a hibernate (plus 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB, and the node's hibernation goes on after the wait",
+		"how long ferund waits for a hibernate (plus a pause's deadline and 16s per GiB of memory); its upload of the pod's disk and memory to the object store takes minutes per GiB, and the node's hibernation goes on after the wait",
 		"lifetime of node certificates; renewed at half of it, so that a node switched off for up to half of it needs nothing"} {
 		if !strings.Contains(b.String(), s) {
 			t.Errorf("serve help lacks %q", s)

@@ -12,11 +12,13 @@ use prost::Message;
 use prost_types::Any;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::sync::{broadcast, mpsc};
 use tonic::Status;
 use uuid::Uuid;
 
+pub mod budget;
 pub mod fc_api;
 pub mod firecracker;
 pub mod installed;
@@ -28,6 +30,16 @@ pub const METADATA_ADDRESS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
 /// Firecracker's limit of its metadata store, in bytes, by default: its
 /// API's largest request.
 pub const METADATA_LIMIT: usize = 51200;
+
+/// How an `UNAVAILABLE` of a VM that cannot take a change now, and can
+/// later, begins: a busy VM's (`VmmError::Busy`).
+pub const BUSY: &str = "the VM is busy";
+
+/// Whether a status is a busy VM's: the call changed nothing, and the same
+/// call later may.
+pub fn is_busy(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable && status.message().starts_with(BUSY)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum VmmError {
@@ -67,9 +79,12 @@ impl From<VmmError> for Status {
             VmmError::VmNotFound(id) => Status::not_found(id),
             VmmError::InvalidConfig(msg) => Status::invalid_argument(msg),
             VmmError::SnapshotUnusable(msg) => Status::failed_precondition(msg),
-            VmmError::ApiConnectionFailed(msg)
-            | VmmError::ImageServiceFailed(msg)
-            | VmmError::Busy(msg) => Status::unavailable(msg),
+            VmmError::ApiConnectionFailed(msg) | VmmError::ImageServiceFailed(msg) => {
+                Status::unavailable(msg)
+            }
+            // The control plane takes it for a VM that takes the change
+            // later, and asks again (control-plane.md, "Ops").
+            VmmError::Busy(why) => Status::unavailable(format!("{BUSY}: {why}")),
             VmmError::ProcessSpawnFailed(msg)
             | VmmError::ApiOperationFailed(msg)
             | VmmError::Internal(msg) => Status::internal(msg),
@@ -97,9 +112,15 @@ pub trait Hypervisor: Send + Sync {
     /// process; first waits until free page reporting is done, if asked.
     /// Returns what the snapshot's memory takes on disk. A VM that cannot
     /// be suspended is left running or paused, as it was; one whose
-    /// snapshot is not written in time, once the VMM is done with it, and
-    /// until then it is busy (`check_free`).
-    async fn suspend_vm(&self, vm_id: &str, settle_free_pages: bool) -> Result<u64, VmmError>;
+    /// snapshot is not written within `snapshot_timeout`
+    /// (`budget::snapshot_timeout` of its memory), once the VMM is done
+    /// with it, and until then it is busy (`check_free`).
+    async fn suspend_vm(
+        &self,
+        vm_id: &str,
+        settle_free_pages: bool,
+        snapshot_timeout: Duration,
+    ) -> Result<u64, VmmError>;
 
     /// Fails with `VmmError::Busy` while the VM cannot take a change, such
     /// as while its VMM writes a snapshot that a suspend gave up on.

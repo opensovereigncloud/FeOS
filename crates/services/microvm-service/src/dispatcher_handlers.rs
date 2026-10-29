@@ -587,6 +587,7 @@ pub(crate) async fn handle_suspend_vm_command(
         .balloon
         .is_some_and(|balloon| balloon.free_page_reporting);
 
+    let snapshot_timeout = crate::vmm::budget::snapshot_timeout(memory.size_mib);
     tokio::spawn(worker::handle_suspend_vm(
         req,
         responder,
@@ -594,6 +595,7 @@ pub(crate) async fn handle_suspend_vm_command(
         event_bus_tx,
         guests,
         free_page_reporting,
+        snapshot_timeout,
     ));
 }
 

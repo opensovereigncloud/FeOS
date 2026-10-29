@@ -13,6 +13,7 @@ use feos_utils::pod_id::PodId;
 use log::{error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
     sync::{broadcast, mpsc, oneshot},
@@ -297,6 +298,7 @@ pub async fn handle_suspend_vm(
     broadcast_tx: mpsc::Sender<VmEventWrapper>,
     guests: Arc<Guests>,
     free_page_reporting: bool,
+    snapshot_timeout: Duration,
 ) {
     let vm_id = req.vm_id.clone();
     // A busy VM is refused before its guest is asked for anything.
@@ -307,7 +309,11 @@ pub async fn handle_suspend_vm(
                 guests.prepare_pause(&vm_id, free_page_reporting).await;
             }
             hypervisor
-                .suspend_vm(&vm_id, req.purge_guest && free_page_reporting)
+                .suspend_vm(
+                    &vm_id,
+                    req.purge_guest && free_page_reporting,
+                    snapshot_timeout,
+                )
                 .await
         }
     };

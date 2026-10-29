@@ -250,7 +250,9 @@ every call with any other ID fails with `INVALID_ARGUMENT`.
   that exists returns that pod if the spec is the same, and fails with
   `ALREADY_EXISTS` if not.
 - **Stop** ends a bring-up, shuts the microVM down, or removes it if it
-  does not go or is not running, and stops the disk; **Start** brings a
+  does not go or is not running, and stops the disk; a microVM that is
+  busy (its late snapshot) is left alone, and the stop answers
+  `UNAVAILABLE` "the VM is busy: <why>"; **Start** brings a
   stopped or failed pod up anew on its disk: the containers the disk holds
   are adopted, with what they wrote.
 - **Suspend** and **Resume** suspend and resume the microVM, with
@@ -258,7 +260,18 @@ every call with any other ID fails with `INVALID_ARGUMENT`.
   with the microVM and starts again before the resume. A suspend runs in
   a task of its own, which holds the pod's lock: a call that goes away,
   as one past its deadline, leaves it running to its end, so that the
-  pod's record follows its microVM.
+  pod's record follows its microVM. It answers within the suspend's
+  budget ([The suspend's budget](#the-suspends-budget)), the suspend or
+  `UNAVAILABLE` "the VM is busy: <why>", which changed nothing and may be
+  asked again later.
+- A running pod whose microVM is suspended without the pod, as when the
+  microVM's suspend went through and the suspend failed after it (the
+  microVM layer recorded the change later than 10 s), or a `feosd` before
+  this one did not see a suspend to its end, is `SUSPENDED`, its disk
+  stopped: once the pod's lock is free, its microVM's record decides,
+  after the microVM's `Suspended` event and when `feosd` starts. A microVM
+  that runs again after a failed suspend, its late snapshot discarded,
+  finds its pod `RUNNING`, as the suspend left it.
 - **Hibernate** and **Restore** take a pod into the object store and
   bring it back, on this node or another, with its memory or on its disk
   alone ([disk.md](disk.md#hibernation)). A hibernated pod is `HIBERNATED`,
@@ -714,11 +727,16 @@ deletion undoes.
   exit code 0 makes the microVM stopped, anything else crashed.
 - **Shutdown** sends Ctrl-Alt-Del and waits for the process to end.
 - **Suspend** writes a snapshot, ends the process and punches holes over
-  the pages of zeroes. A snapshot that is not written within 120 s fails
-  the suspend at once (`UNAVAILABLE`). Firecracker cannot stop in the
+  the pages of zeroes. A snapshot that is not written within its timeout,
+  120 s and 4 s per GiB ([The suspend's budget](#the-suspends-budget)),
+  fails the suspend at once (`UNAVAILABLE` "the VM is busy: <why>").
+  Firecracker cannot stop in the
   middle of one and writes on; its files stay alone, and the microVM
   refuses suspends and shutdowns as busy. Once Firecracker is done, the
-  microVM resumes if it ran, and the snapshot is discarded. A marker in
+  microVM resumes if it ran, and the snapshot is discarded. Until then
+  every suspend and shutdown of the microVM fails with `UNAVAILABLE` "the
+  VM is busy: Firecracker still writes the snapshot …"; a delete ends it.
+  A marker in
   the jail, `late-snapshot`, keeps this across a restart of `feosd`: the
   next one finds it when it takes the microVM on, and waits for
   Firecracker to answer again before it does the same. One whose
@@ -740,6 +758,29 @@ the pod service waits for it. A microVM has one data disk at most and
 its volumes after it, in their order, which Firecracker opens with a
 writeback cache, so that the guest's flushes reach diskd, and no huge
 pages, which Firecracker backs neither an initramfs nor a balloon with.
+
+### The suspend's budget
+
+A `SuspendPod` answers within its budget, which its caller's deadline
+covers, so that the caller hears the suspend's end, or that the VM is
+busy, before it gives up: FeRun's pause waits the budget and 30 s more
+([control-plane.md](control-plane.md#ops)). Both follow from one formula,
+in `microvm_service::vmm::budget` and in ferund's `feosdSuspendBudget`,
+whose tests hold the same table. GiB is the microVM's memory, rounded up.
+
+| Part | Takes at most |
+|---|---|
+| before the snapshot: the guest empties its memory (10 s), free page reporting settles (3 s), Firecracker's API reads and pauses the microVM (10 s each), the snapshot's directory | 40 s |
+| the snapshot | 120 s + 4 s/GiB |
+| after it: Firecracker's version (10 s), its end (5 s), the microVM's record (10 s), the host record, the pod's record and its disk; the zeroes punched out of the memory file | 30 s + 1 s/GiB |
+| **the budget** | **190 s + 5 s/GiB** |
+
+4 s per GiB is a write of 256 MiB/s, which a node's disk sustains while
+it writes back other memory, and 120 s leaves room for a sync behind
+it. A snapshot that is slower is late: its suspend fails as busy at the
+snapshot's timeout, still within the budget, and Firecracker writes on
+(above). The parts before and after the snapshot are bounded by their
+own timeouts but for the file steps, which their slack covers.
 
 ### Jail, user and cgroup
 
@@ -890,8 +931,9 @@ moved on.
 the snapshot is as large as the guest's memory, less what free page
 reporting gave back, which is written as zeroes and punched out. The pod's
 `terminationGracePeriodSeconds` covers about 60 s plus 4 s per GiB of the
-memory the node gives microVMs, as FeRun's own pause deadline counts it
-(2 min + 4 s/GiB), and FeRun's `--rollout-grace` covers that grace plus
+memory the node gives microVMs, as the snapshot's timeout counts it
+([The suspend's budget](#the-suspends-budget)), and FeRun's
+`--rollout-grace` covers that grace plus
 the start of the new pod and its resumes, so that calls wait rather than
 fail. A crash, a kill past the grace or the OOM killer ends the microVMs
 that are not suspended yet: FeRun treats them as on a lost node.

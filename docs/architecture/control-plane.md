@@ -100,7 +100,7 @@ kind ([The ingress](#the-ingress)).
 | `--node-cert-ttl`, `--pod-cert-ttl` | `168h`, `1h` | the certificates' lifetimes; a node's is renewed at half of it, so that a node switched off for up to half of it needs nothing, a pod's at three quarters |
 | `--node-max-streams` | 1024 | the HTTP/2 stream limit nodes advertise on a node connection; the stream budgets derive from it |
 | `--conn-drain-timeout` | `20m` | a draining node connection is closed after this at the latest |
-| `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
+| `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus a pause's deadline and 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
 | `--shutdown-grace` | `11m` | how long a stopping instance waits for its requests, its tool calls and its ops |
 | `--activity-retention`, `--traffic-retention` | `720h`, `168h` | how long activity and traffic records are kept |
 | `--log-level` | `info` | |
@@ -784,11 +784,20 @@ finished in another transaction that applies what the node did.
 | start | stopped, failed | creating | StartPod | 7 min 5 s |
 | resume | paused; hibernating, in the place of a hibernate that a resume abandons | resuming | ResumePod | 7 min 5 s + 8 s/GiB |
 | restore | hibernated | creating | RestorePod of the checkpoint | 7 min 5 s + 8 s/GiB |
-| pause | running | pausing | SuspendPod | 2 min + 4 s/GiB |
-| hibernate | paused; stopped, failed and running when draining | hibernating | HibernatePod | `--hibernate-timeout` + 16 s/GiB |
+| pause | running | pausing | SuspendPod | 3 min 40 s + 5 s/GiB |
+| hibernate | paused; stopped, failed and running when draining | hibernating | HibernatePod | a pause's + `--hibernate-timeout` + 16 s/GiB |
 | repair | creating without an op, running with an unreachable guest; running, for an instance whose container exited (`Restart`, [Environments](#probes-exits-and-restarts)) | creating | StopPod and StartPod; for a pod stuck in its restore, DeletePod and RestorePod, never for a pod with volumes | 7 min 5 s + 8 s/GiB |
 
-GiB is the sandbox's memory, rounded up. A hibernation uploads the pod's
+GiB is the sandbox's memory, rounded up. **A caller's deadline covers
+its callee's budget**, so that feosd answers, the change or "the VM is
+busy", before ferund gives up, and a pause never ends at its deadline
+while the node still writes the snapshot. feosd's suspend takes 190 s +
+5 s/GiB at most, of which its wait for the snapshot is 120 s + 4 s/GiB
+([node.md](node.md#the-suspends-budget)); a pause waits that and 30 s
+more, for the call's way there and back and the pod's read after it
+(`feosdSuspendBudget`, `pauseMargin`). A hibernation of a running pod
+begins with that suspend, so a hibernate waits a pause's deadline first.
+A hibernation uploads the pod's
 disk and memory to the object store and takes minutes per GiB, hence its
 own timeout. A feosd that reports its hibernations ([Follow-ups for
 feosd](#follow-ups-for-feosd), item 2) runs one in a task of its own,
@@ -861,6 +870,20 @@ checkpoint inside the call.
   every 5 s, until the deadline. `UNAVAILABLE` and `RESOURCE_EXHAUSTED`
   while waiting are transient. Call errors are never mapped to a state
   directly: the pod read after them decides.
+- **A busy VM.** feosd answers `UNAVAILABLE` "the VM is busy: <why>" to a
+  `SuspendPod`, `StopPod` or `HibernatePod` whose microVM takes no change
+  now and does later, as while Firecracker still writes a snapshot that a
+  suspend gave up on, and when the snapshot of the suspend itself is
+  late: nothing changed (a `DeletePod` ends such a microVM). The pod read
+  decides the state as for any error, and the description says "<op>
+  postponed: the VM is busy: <why>" (`pause`, `hibernation`, `repair`)
+  where the op did not reach its goal, and a repair's always. The op is
+  tried again later: an idle pause or a hibernate-after after its
+  policy's backoff ([Policies](#policies)), a drain or a repair on its
+  next pass; Ensure and
+  the REST pause answer `ErrBusy` "<op> on node <n>: <description>; retry
+  in 30s", with a retry time of 30 s. Another `UNAVAILABLE` is a failure,
+  as before.
 - **Finish** is retried until it commits. An op that is no longer the
   row's (taken over, preempted, or the row deleted or re-created
   meanwhile) writes only a tombstone for a pod it may have made, or a
@@ -871,7 +894,7 @@ checkpoint inside the call.
 
 | Observed on the target | Becomes |
 |---|---|
-| ours, running | `running`; a run opens, restored from the checkpoint when a resume brought the pod back from a newer one; a failed pause lands here too |
+| ours, running | `running`; a run opens, restored from the checkpoint when a resume brought the pod back from a newer one; a failed pause lands here too, "pause failed: …", or "pause postponed: the VM is busy: …" |
 | ours, pending at the deadline | `creating`, "still starting on node <n> after <d>" |
 | ours, suspended | `paused`; a failed hibernation lands here too, and one that a resume from elsewhere abandoned ("hibernation abandoned for a resume") |
 | ours, hibernated | `hibernated`, with the checkpoint (never an older one) |
@@ -979,7 +1002,12 @@ what a dial found there.
 ### Sync and reconcile
 
 - **Sync** applies one pod's state to its row, after a pod event or when
-  a caller found the pod not where or not as expected. While an op runs,
+  a caller found the pod not where or not as expected. A pod found
+  suspended under a row that was not `paused`, as one that feosd
+  suspended after a pause gave up on it (feosd's suspend outlives its
+  call, and a pod follows its microVM into suspended:
+  [node.md](node.md#a-pod)), becomes `paused` from now (`paused_at`),
+  not since an earlier pause, so that hibernate-after counts from here. While an op runs,
   the sync is deferred until it ends, never dropped. It reads the pod on
   the row's node and applies it under the row's lock, if nothing changed
   in between. An instance not connected to the node hands the sandbox to

@@ -753,6 +753,12 @@ func (en *ensurer) await(ctx context.Context, h *OpHandle) error {
 		return errContinue
 	}
 	en.ops[opKey(h.kind, h.target)] = res
+	if res.busy {
+		// The node's VM takes the op later: a later call does it.
+		en.last = laterf(busyRetry, model.ErrBusy, "%s on node %s: %s; retry in %s", h.kind, h.target, res.Description,
+			busyRetry)
+		return en.last
+	}
 	if res.Err != nil {
 		en.last = fmt.Errorf("%s on node %s failed: %w", h.kind, h.target, res.Err)
 		return en.last
@@ -853,6 +859,10 @@ func (e *Engine) Pause(ctx context.Context, id podid.ID) error {
 		}
 		if res.Err != nil {
 			return res.Err
+		}
+		if res.busy {
+			return laterf(busyRetry, model.ErrBusy, "pause on node %s: %s; retry in %s", h.target, res.Description,
+				busyRetry)
 		}
 		if !res.fenced && h.kind == OpPause && res.State != model.StatePaused {
 			return fmt.Errorf("pause on node %s failed: %s", h.target, describe(res))

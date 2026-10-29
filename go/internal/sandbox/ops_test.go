@@ -438,6 +438,31 @@ func TestOutcomeUnknown(t *testing.T) {
 	h.ensure(sb.ID)
 }
 
+// TestPauseCoversFeosdSuspend: a pause waits feosd's whole suspend
+// budget and 30 s more, so that feosd answers, the suspend or "the VM is
+// busy", before the pause gives up; a hibernate, whose feosd suspends a
+// running pod first, as long and its upload's time more. The budget is
+// feosd's (microvm_service::vmm::budget, whose test has the same table):
+// 190 s and 5 s per GiB, of which the snapshot's wait is 120 s and 4 s per
+// GiB.
+func TestPauseCoversFeosdSuspend(t *testing.T) {
+	for _, c := range []struct {
+		mem    int
+		budget time.Duration
+	}{{512, 195 * time.Second}, {1024, 195 * time.Second}, {1025, 200 * time.Second}, {4096, 210 * time.Second},
+		{16384, 270 * time.Second}} {
+		if got := feosdSuspendBudget(c.mem); got != c.budget {
+			t.Errorf("feosd's suspend of %d MiB: %v, want %v", c.mem, got, c.budget)
+		}
+		if got := OpDeadline(OpPause, c.mem); got != c.budget+30*time.Second {
+			t.Errorf("pause of %d MiB: %v, want feosd's %v and 30s", c.mem, got, c.budget)
+		}
+		if got := OpDeadline(OpHibernate, c.mem); got < OpDeadline(OpPause, c.mem)+DefaultHibernateTimeout {
+			t.Errorf("hibernate of %d MiB: %v, shorter than a pause and the hibernate timeout", c.mem, got)
+		}
+	}
+}
+
 func TestOpDeadlines(t *testing.T) {
 	cases := []struct {
 		kind OpKind
@@ -448,8 +473,9 @@ func TestOpDeadlines(t *testing.T) {
 		{OpStart, 65536, 7*time.Minute + 5*time.Second},
 		{OpResume, 1025, 7*time.Minute + 5*time.Second + 16*time.Second},
 		{OpRestore, 2048, 7*time.Minute + 5*time.Second + 16*time.Second},
-		{OpPause, 512, 2*time.Minute + 4*time.Second},
-		{OpHibernate, 65536, time.Hour + 64*16*time.Second},
+		{OpPause, 512, 3*time.Minute + 40*time.Second + 5*time.Second},
+		{OpPause, 4096, 3*time.Minute + 40*time.Second + 20*time.Second},
+		{OpHibernate, 65536, 3*time.Minute + 40*time.Second + 64*5*time.Second + time.Hour + 64*16*time.Second},
 		{OpRepair, 1024, 7*time.Minute + 5*time.Second + 8*time.Second},
 	}
 	for _, c := range cases {
@@ -558,14 +584,15 @@ func TestHibernateNoAbandonPerTrigger(t *testing.T) {
 	}
 }
 
-// TestHibernateDeadline: a hibernate op's deadline is the instance's
-// hibernate timeout plus 16 s per GiB, in a fresh begin and in a takeover;
-// the other kinds keep theirs, and an engine without one has the default.
+// TestHibernateDeadline: a hibernate op's deadline is a pause's plus the
+// instance's hibernate timeout and 16 s per GiB, in a fresh begin and in a
+// takeover; the other kinds keep theirs, and an engine without one has the
+// default.
 func TestHibernateDeadline(t *testing.T) {
 	h := newHarness(t, func(c *Config) { c.HibernateTimeout = 2 * time.Hour })
 	h.addNode("n1")
 	e := h.eng()
-	want := 2*time.Hour + 16*time.Second
+	want := OpDeadline(OpPause, 1024) + 2*time.Hour + 16*time.Second
 	if got := e.t.opDeadline(OpHibernate, 1024); got != want {
 		t.Fatalf("hibernate of 1 GiB: %v, want %v", got, want)
 	}
@@ -578,7 +605,8 @@ func TestHibernateDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := def.t.opDeadline(OpHibernate, 1024); got != DefaultHibernateTimeout+16*time.Second || got != OpDeadline(OpHibernate, 1024) {
+	if got := def.t.opDeadline(OpHibernate, 1024); got != OpDeadline(OpPause, 1024)+DefaultHibernateTimeout+16*time.Second ||
+		got != OpDeadline(OpHibernate, 1024) {
 		t.Fatalf("default hibernate deadline %v", got)
 	}
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -85,4 +86,20 @@ func callText(err error) string {
 		return st.Message()
 	}
 	return err.Error()
+}
+
+// vmBusyText is what feosd's UNAVAILABLE of a microVM that takes no change
+// now, and does later, says: "the VM is busy: <why>", as while Firecracker
+// still writes a snapshot that a suspend gave up on (node.md, "The
+// suspend's budget").
+const vmBusyText = "the VM is busy"
+
+// busyRetry is when a caller told that the sandbox's VM is busy should
+// come back.
+const busyRetry = 30 * time.Second
+
+// vmBusy reports whether a node call's error is feosd's busy VM: the call
+// changed nothing, and the same call later may.
+func vmBusy(err error) bool {
+	return grpcCode(err) == codes.Unavailable && strings.Contains(callText(err), vmBusyText)
 }

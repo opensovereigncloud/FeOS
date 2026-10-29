@@ -29,7 +29,9 @@
 //! the snapshot, and puts the metadata in again, which a snapshot does not
 //! hold.
 //!
-//! A suspend waits `SNAPSHOT_TIMEOUT` for the snapshot. Firecracker cannot
+//! A suspend waits `budget::snapshot_timeout` for the snapshot, 120 s and
+//! 4 s per GiB of the VM's memory, inside the suspend's whole budget that
+//! its caller waits for (`budget`). Firecracker cannot
 //! be stopped in the middle of one, and writing the memory of a VM that a
 //! userfaultfd handler serves from the object store can take minutes: a
 //! snapshot that is late fails its suspend at once, and Firecracker writes
@@ -83,10 +85,10 @@ const DEFAULT_MEMORY_MIB: u64 = 512;
 /// How long Firecracker may take to boot the VM and answer on its socket.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long writing or loading a snapshot may take: the guest's memory goes
-/// to disk and is synced. A suspend whose snapshot takes longer fails, and
-/// Firecracker writes on (see the module's description).
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long loading a snapshot may take. Writing one may take
+/// `budget::snapshot_timeout`: a suspend whose snapshot takes longer
+/// fails, and Firecracker writes on (see the module's description).
+const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often a late snapshot is looked at, and how long it may make no
 /// progress, its memory file not growing, before Firecracker is ended: a
 /// VM whose memory does not come is stuck.
@@ -97,7 +99,7 @@ const LATE_STALL: Duration = Duration::from_secs(300);
 const LATE_MARKER: &str = "late-snapshot";
 const CTRL_ALT_DEL_REPEAT: Duration = Duration::from_secs(3);
 /// How long a killed Firecracker may take to go.
-const KILL_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 const CONSOLE_POLL: Duration = Duration::from_millis(50);
 /// How much of Firecracker's log an error carries.
 const LOG_TAIL_LINES: usize = 5;
@@ -1047,7 +1049,12 @@ impl Hypervisor for FirecrackerAdapter {
         Ok(vmm.pid.into())
     }
 
-    async fn suspend_vm(&self, vm_id: &str, settle_free_pages: bool) -> Result<u64, VmmError> {
+    async fn suspend_vm(
+        &self,
+        vm_id: &str,
+        settle_free_pages: bool,
+        snapshot_timeout: Duration,
+    ) -> Result<u64, VmmError> {
         self.check_free(vm_id)?;
         let pid = read_pid(vm_id)
             .filter(|&pid| self.is_vmm_process(vm_id, pid.into()))
@@ -1095,7 +1102,7 @@ impl Hypervisor for FirecrackerAdapter {
             paused.undo().await;
             return Err(e);
         }
-        self.write_or_leave(&paused, SNAPSHOT_TIMEOUT).await?;
+        self.write_or_leave(&paused, snapshot_timeout).await?;
         let recorded = async {
             snapshot::Host::this(&firecracker_version(&api).await?)
                 .save(vm_id)
@@ -1219,7 +1226,7 @@ impl Hypervisor for FirecrackerAdapter {
                 "mem_backend": memory_backend,
                 "resume_vm": false,
             });
-            fc_api::request_within(&api, "PUT", "/snapshot/load", Some(&body), SNAPSHOT_TIMEOUT)
+            fc_api::request_within(&api, "PUT", "/snapshot/load", Some(&body), LOAD_TIMEOUT)
                 .await
                 .map(drop)
         }
@@ -1922,7 +1929,10 @@ mod tests {
         let mark = adapter.mark_late("vm");
         for refused in [
             adapter.check_free("vm").err(),
-            adapter.suspend_vm("vm", false).await.err(),
+            adapter
+                .suspend_vm("vm", false, Duration::from_secs(1))
+                .await
+                .err(),
             adapter
                 .shutdown_vm(ShutdownVmRequest { vm_id: "vm".into() })
                 .await
@@ -1930,9 +1940,16 @@ mod tests {
         ] {
             let refused = refused.expect("refused while the snapshot is late");
             assert!(matches!(refused, VmmError::Busy(_)), "{refused}");
-            assert_eq!(
-                tonic::Status::from(refused).code(),
-                tonic::Code::Unavailable
+            // The control plane knows it by its code and its beginning.
+            let status = tonic::Status::from(refused);
+            assert!(super::super::is_busy(&status), "{status:?}");
+            assert_eq!(status.code(), tonic::Code::Unavailable);
+            assert!(
+                status
+                    .message()
+                    .starts_with("the VM is busy: Firecracker still writes"),
+                "{}",
+                status.message()
             );
         }
         assert!(adapter.check_free("other").is_ok());

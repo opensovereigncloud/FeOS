@@ -217,7 +217,11 @@ func (c *change) observeOurs(node string, info *podv1.PodInfo) {
 		}
 	case podv1.PodState_POD_STATE_SUSPENDED:
 		a.ClientState = model.StatePaused
-		if a.PausedAt.IsZero() {
+		// Paused now, unless the row was paused already: a pod that
+		// feosd suspended after a pause gave up on it, or a node that
+		// came back, does not keep the paused_at of an earlier pause,
+		// which would hibernate it at once.
+		if a.PausedAt.IsZero() || c.before.ClientState != model.StatePaused {
 			a.PausedAt = c.now
 		}
 		if c.before.ClientState != model.StatePaused {

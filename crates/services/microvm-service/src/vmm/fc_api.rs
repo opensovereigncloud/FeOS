@@ -14,7 +14,7 @@ use tokio::net::UnixStream;
 
 /// Firecracker answers within milliseconds; a request that takes longer is
 /// stuck.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Larger than any answer Firecracker gives.
 const MAX_RESPONSE: usize = 64 * 1024;
 

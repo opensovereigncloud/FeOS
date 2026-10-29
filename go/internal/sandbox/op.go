@@ -98,6 +98,9 @@ type OpResult struct {
 	// fenced: the op was no longer the row's when it finished (taken
 	// over, released, the row deleted); it wrote nothing of its outcome.
 	fenced bool
+	// busy: the node's VM was busy (vmBusy), the pod read after it
+	// answered, and the op did not reach its goal; the same op later may.
+	busy bool
 }
 
 // OpHandle is an op in flight on this instance.

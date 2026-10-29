@@ -98,7 +98,8 @@ func (r *runner) finishOnce(ctx context.Context, h *OpHandle, res callResult, ob
 			return err
 		}
 		w := c.written
-		result = OpResult{State: w.ClientState, Node: w.Node, Description: w.StatusDescription}
+		result = OpResult{State: w.ClientState, Node: w.Node, Description: w.StatusDescription,
+			busy: vmBusy(res.err) && w.ClientState != model.StateUnknown && w.ClientState != opGoal(h.kind)}
 		ac.tombstones = append(c.tombstoneKeys(), h.tombstones...)
 		events = append(c.events, h.endEvent(w, res))
 		return nil
@@ -421,6 +422,20 @@ func applyOurs(c *change, h *OpHandle, res callResult, info *podv1.PodInfo) {
 		a.ClientState = model.StateUnknown
 		a.StatusDescription = fmt.Sprintf("%s on node %s: the pod is in state %s", h.kind, h.target, info.GetState())
 	}
+	if vmBusy(res.err) && a.ClientState != model.StateUnknown && (a.ClientState != opGoal(h.kind) || h.kind == OpRepair) {
+		// The VM took no change and takes it later: the op is tried
+		// again, by its policy after its backoff, by a drain or a repair
+		// on its next pass, by a caller after busyRetry.
+		a.StatusDescription = fmt.Sprintf("%s postponed: %s", opNoun(h.kind), callText(res.err))
+	}
+}
+
+// opNoun names an op in a description.
+func opNoun(kind OpKind) string {
+	if kind == OpHibernate {
+		return "hibernation"
+	}
+	return string(kind)
 }
 
 // newerCheckpoint reports whether cp is newer than the checkpoint of row.

@@ -67,7 +67,7 @@ use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
 use log::{info, warn};
 use microvm_service::api::VmApiHandler;
-use microvm_service::vmm::snapshot;
+use microvm_service::vmm::{budget, snapshot};
 use microvm_service::{memory_socket_path, vsock_path};
 use prost::Message;
 use std::collections::{HashMap, VecDeque};
@@ -89,8 +89,9 @@ use tonic::{Code, Request, Status};
 const GUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often a step looks again while it waits.
 const POLL: Duration = Duration::from_millis(250);
-/// How long the VM service may take to record a change it made.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the VM service may take to record a change it made: a part of
+/// the suspend's budget (`budget`).
+const SETTLE_TIMEOUT: Duration = budget::RECORD_SETTLE;
 /// How long GetPod waits for the guest's view of the containers.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the guest may take to mount the pod's volumes, formatting new
@@ -344,6 +345,11 @@ impl Pods {
                 .is_some_and(|inner| Pods { inner }.names_table(id))
         });
         for pod_id in running {
+            // Suspended by a suspend that a feosd before this one did not
+            // see to its end.
+            if pods.follow_vm(&pod_id).await {
+                continue;
+            }
             if let Err(e) = pods.reattach(&pod_id).await {
                 warn!("Pods: {pod_id} runs without its network: {}", e.message());
             }
@@ -528,6 +534,10 @@ impl Pods {
                 });
                 match self.inner.vms.shutdown_vm(request).await {
                     Ok(_) => self.settle(pod_id, VmState::Stopped).await?,
+                    // A microVM whose late snapshot Firecracker still
+                    // writes is not ended under it: the caller stops the
+                    // pod later.
+                    Err(e) if !ends_after_failed_shutdown(&e) => return Err(e),
                     Err(e) => {
                         // A guest that does not go is ended.
                         warn!("Pods: {pod_id} did not shut down: {}", e.message());
@@ -2287,7 +2297,10 @@ impl Pods {
 
     /// Follows the microVMs' states: a running pod whose microVM crashed
     /// failed, and one whose microVM stopped is stopped. While an operation
-    /// or a bring-up holds the pod, it sees to that itself.
+    /// or a bring-up holds the pod, it sees to that itself. A running pod
+    /// whose microVM was suspended is suspended once what holds it is done
+    /// (`follow_vm`): the suspend that suspended the microVM failed after
+    /// it, or it would have seen to it.
     fn follow_vms(&self) {
         let pods = self.clone();
         tokio::spawn(async move {
@@ -2325,6 +2338,12 @@ impl Pods {
             let Some(pod) = pods.get(&event.vm_id) else {
                 return;
             };
+            if changed.new_state() == VmState::Suspended && pod.info.state() == PodState::Running {
+                let pods = self.clone();
+                let pod_id = event.vm_id.clone();
+                tokio::spawn(async move { pods.follow_vm(&pod_id).await });
+                return;
+            }
             if pod.lock.try_lock().is_err() || pod.info.state() != PodState::Running {
                 return;
             }
@@ -2353,6 +2372,59 @@ impl Pods {
                 }
             });
         }
+    }
+}
+
+impl Pods {
+    /// Brings the pod in line with its microVM's record, under the pod's
+    /// lock, once what holds it is done: a running pod whose microVM was
+    /// suspended is suspended, and its disk stopped, as a suspend that ends
+    /// leaves it. That is a SuspendPod whose microVM's suspend went through
+    /// and that failed after it, as when the microVM service recorded the
+    /// suspend later than `SETTLE_TIMEOUT`, or that a feosd before this one
+    /// did not see to its end. Returns whether the pod changed.
+    async fn follow_vm(&self, pod_id: &str) -> bool {
+        let Ok(_lock) = self.lock(pod_id).await else {
+            return false;
+        };
+        let Ok(info) = self.info(pod_id) else {
+            return false;
+        };
+        let vm = match self.vm(pod_id).await {
+            Ok(vm) => vm.map(|vm| vm.state()),
+            Err(e) => {
+                warn!("Pods: No record of {pod_id}'s microVM: {}", e.message());
+                return false;
+            }
+        };
+        let Some((state, reason)) = follows(info.state(), vm) else {
+            return false;
+        };
+        self.release_disk(pod_id).await;
+        self.set_state(pod_id, state, reason).await;
+        true
+    }
+}
+
+/// Whether a stop whose shutdown of the microVM failed with `error` ends
+/// the microVM: not when the microVM is busy (`vmm::is_busy`), which the
+/// stop answers instead.
+fn ends_after_failed_shutdown(error: &Status) -> bool {
+    !microvm_service::vmm::is_busy(error)
+}
+
+/// What a pod in `pod` becomes whose microVM's record is `vm`, when no call
+/// of the pod's saw to it (`Pods::follow_vm`): a running pod whose microVM
+/// is suspended is suspended. A microVM that runs again after a suspend
+/// that failed, its late snapshot discarded, finds its pod running, as the
+/// suspend left it; nothing else changes here.
+fn follows(pod: PodState, vm: Option<VmState>) -> Option<(PodState, &'static str)> {
+    match (pod, vm) {
+        (PodState::Running, Some(VmState::Suspended)) => Some((
+            PodState::Suspended,
+            "suspended: the microVM was suspended after its suspend failed",
+        )),
+        _ => None,
     }
 }
 
@@ -2777,6 +2849,45 @@ mod tests {
         let mut unknown = memory("0.0.0-none");
         unknown.cpu_model.clear();
         assert!(why_cold(false, Some(&unknown)).is_some());
+    }
+
+    /// A running pod follows its microVM into suspended, as a suspend that
+    /// failed after the microVM's suspend went through leaves them; the
+    /// control plane then finds it suspended. Nothing else follows.
+    #[test]
+    fn a_running_pod_follows_its_microvm_into_suspended() {
+        let (state, reason) =
+            follows(PodState::Running, Some(VmState::Suspended)).expect("it stays running");
+        assert_eq!(state, PodState::Suspended);
+        assert!(reason.starts_with("suspended"), "{reason}");
+        for (pod, vm) in [
+            (PodState::Running, Some(VmState::Running)),
+            (PodState::Running, None),
+            (PodState::Suspended, Some(VmState::Suspended)),
+            (PodState::Suspended, Some(VmState::Running)),
+            (PodState::Pending, Some(VmState::Suspended)),
+            (PodState::Stopped, Some(VmState::Suspended)),
+            (PodState::Hibernated, Some(VmState::Suspended)),
+        ] {
+            assert_eq!(follows(pod, vm), None, "{pod:?} and a microVM {vm:?}");
+        }
+    }
+
+    /// A stop ends a microVM that does not shut down, but not a busy one:
+    /// it answers busy, and the control plane stops the pod later.
+    #[test]
+    fn a_stop_leaves_a_busy_microvm_alone() {
+        let busy = Status::from(microvm_service::vmm::VmmError::Busy(
+            "Firecracker still writes the snapshot".into(),
+        ));
+        assert!(!ends_after_failed_shutdown(&busy), "{busy:?}");
+        for other in [
+            Status::unavailable("Could not connect to the API socket"),
+            Status::internal("the guest did not go"),
+            Status::deadline_exceeded("no answer"),
+        ] {
+            assert!(ends_after_failed_shutdown(&other), "{other:?}");
+        }
     }
 
     #[test]

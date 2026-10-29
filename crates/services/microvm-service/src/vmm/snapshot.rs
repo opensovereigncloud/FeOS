@@ -273,8 +273,7 @@ fn resident_kib(pid: i32) -> Option<u64> {
 /// than 2 % three times in a row, at most 3 s.
 pub async fn settle_free_pages(pid: i32) {
     const INTERVAL: Duration = Duration::from_millis(250);
-    const LIMIT: Duration = Duration::from_secs(3);
-    let deadline = tokio::time::Instant::now() + LIMIT;
+    let deadline = tokio::time::Instant::now() + super::budget::FREE_PAGES_SETTLE;
     let Some(mut last) = resident_kib(pid) else {
         return;
     };

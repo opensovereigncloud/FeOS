@@ -47,7 +47,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 /// How long one push may take.
-const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a resumed guest may take to answer. It answers within about
 /// 100 ms unless it is broken.
 const RESUME_TIMEOUT: Duration = Duration::from_secs(30);
