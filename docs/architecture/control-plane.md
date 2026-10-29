@@ -895,7 +895,10 @@ checkpoint inside the call.
   late: nothing changed (a `DeletePod` ends such a microVM). The pod read
   decides the state as for any error, and the description says "<op>
   postponed: the VM is busy: <why>" (`pause`, `hibernation`, `repair`)
-  where the op did not reach its goal, and a repair's always. The op is
+  where the op did not reach its goal, and a repair's always. A repair
+  whose `StopPod` meets the busy VM calls no `StartPod`: the pod runs on
+  as it was, and its processes keep their holds, since nothing ended
+  them. The op is
   tried again later: an idle pause or a hibernate-after after its
   policy's backoff ([Policies](#policies)), a drain or a repair on its
   next pass; Ensure and

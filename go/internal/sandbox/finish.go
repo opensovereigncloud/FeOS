@@ -341,9 +341,10 @@ func applyOurs(c *change, h *OpHandle, res callResult, info *podv1.PodInfo) {
 	a.Address = podAddress(info)
 	c.mergeCheckpoint(info.GetCheckpoint(), h.target)
 	// A repair restarts the pod and ends its processes, unless it made no
-	// call (it found the pod healthy, or its prepare hook failed first); a
-	// takeover cannot know what the first owner did.
-	if h.kind == OpRepair && (!res.skipped || h.takeover) {
+	// call (it found the pod healthy, or its prepare hook failed first) or
+	// its StopPod met the VM busy and left the pod as it was; a takeover
+	// cannot know what the first owner did.
+	if h.kind == OpRepair && ((!res.skipped && !res.postponed) || h.takeover) {
 		c.endsProcesses = true
 	}
 	switch info.GetState() {

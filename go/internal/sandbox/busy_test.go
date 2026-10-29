@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -121,15 +122,34 @@ func TestBusyVM(t *testing.T) {
 		t.Fatalf("backoff %q %d", row.PolicyFailed, row.PolicyFailures)
 	}
 
-	// A repair whose StopPod meets a busy VM leaves the pod running.
+	// A repair whose StopPod meets a busy VM leaves the pod running, and
+	// its processes with their holds: it starts nothing.
 	h.node("n1").Script().SetHook(podv1.PodService_HibernatePod_FullMethodName, nil)
 	h.ensure(sb.ID)
+	if err := e.HoldProcess(bg, sb.ID, "job", 0); err != nil {
+		t.Fatal(err)
+	}
 	h.failWith("n1", podv1.PodService_StopPod_FullMethodName, errVMBusy)
+	var starts atomic.Int32
+	h.node("n1").Script().SetHook(podv1.PodService_StartPod_FullMethodName, func(context.Context, string, any) error {
+		starts.Add(1)
+		return nil
+	})
 	res := h.startOp(sb.ID, OpIntent{Kind: OpRepair, Trigger: TriggerRestart, Target: "n1"})
 	if res.State != model.StateRunning {
 		t.Fatalf("repair: %+v", res)
 	}
 	wantPostponed(t, h.row(sb.ID), model.StateRunning, "repair")
+	if hs := h.holds(sb.ID); len(hs) != 1 {
+		t.Fatalf("process holds after a postponed repair %+v", hs)
+	}
+	if n := starts.Load(); n != 0 {
+		t.Fatalf("a postponed repair called StartPod %d times", n)
+	}
+	h.node("n1").Script().SetHook(podv1.PodService_StartPod_FullMethodName, nil)
+	if err := e.ReleaseProcess(bg, sb.ID, "job"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Ensure of a stopped sandbox on a draining node, whose hibernation
 	// meets a busy VM: ErrBusy, and the sandbox stays.

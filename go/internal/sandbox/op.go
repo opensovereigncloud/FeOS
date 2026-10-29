@@ -515,6 +515,9 @@ type callResult struct {
 	// state it was begun for, or its prepare hook failed before its first
 	// call (err is then the *prepareError); the observation decides alone.
 	skipped bool
+	// postponed: a repair whose StopPod met the VM busy (vmBusy): it left
+	// the pod as it was and did not start it; err is the busy answer.
+	postponed bool
 	// restored: a restore's RestorePodResponse arrived; memoryRestored
 	// and reason are its fields.
 	restored       bool
@@ -618,7 +621,8 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 // longer in the state the repair was begun for (it came up, or was
 // stopped, meanwhile), so that a healthy pod is never restarted. A
 // takeover may find the pod stopped halfway by the first owner and starts
-// it; it leaves one that the first owner brought up running. A row with a
+// it; it leaves one that the first owner brought up running. A StopPod
+// that meets the VM busy postpones the repair: no StartPod follows. A row with a
 // template has the node prepared before the pod calls; a failure there
 // makes none (skipped), and the observation decides.
 func (e *Engine) callRepair(ctx context.Context, pc podv1.PodServiceClient, h *OpHandle) callResult {
@@ -669,6 +673,12 @@ func (e *Engine) callRepair(ctx context.Context, pc podv1.PodServiceClient, h *O
 	}
 	if _, err := pc.StopPod(ctx, &podv1.StopPodRequest{PodId: id}); err != nil {
 		res.err = err
+		if vmBusy(err) {
+			// The VM took no change (a late snapshot): the pod runs on as
+			// it was, its processes too, and the repair is tried again.
+			res.postponed = true
+			return res
+		}
 	}
 	if _, err := pc.StartPod(ctx, &podv1.StartPodRequest{PodId: id}); err != nil {
 		res.err = err
