@@ -2831,10 +2831,15 @@ async fn dial_guest(
                 "the guest of pod {pod_id} did not answer within {}",
                 vsock::seconds(deadline)
             );
-            if let Some(busy) = busy.await {
-                message.push_str(&format!("; the VM is busy: {busy}"));
+            match busy.await {
+                // Marked busy: the caller tries again later, and takes
+                // the guest for neither gone nor broken.
+                Some(busy) => {
+                    message.push_str(&format!("; the VM is busy: {busy}"));
+                    Err(microvm_service::vmm::marked_busy(message))
+                }
+                None => Err(Status::unavailable(message)),
             }
-            Err(Status::unavailable(message))
         }
         Err(e) => Err(Status::unavailable(format!(
             "the guest of pod {pod_id}: {e}"
@@ -3228,12 +3233,14 @@ mod tests {
             "the guest of pod p did not answer within 0.2s; the VM is busy: the pod is being \
              suspended"
         );
+        assert!(microvm_service::vmm::is_busy(&busy), "{busy:?}");
         let unknown = dial(None).await;
         assert_eq!(unknown.code(), Code::Unavailable);
         assert_eq!(
             unknown.message(),
             "the guest of pod p did not answer within 0.2s"
         );
+        assert!(!microvm_service::vmm::is_busy(&unknown));
         // No VMM at all: refused at once, as before.
         let gone = dial_guest(dir.path().join("none"), "p", deadline, async { None })
             .await

@@ -346,7 +346,10 @@ A guest that does not answer, as while its microVM is paused for a
 snapshot or Firecracker still writes one, fails the call with
 `UNAVAILABLE` "the guest of pod <id> did not answer within 5s", and "; the
 VM is busy: <why>" when that is known: the pod is being suspended, it
-hibernates, or the microVM's snapshot is late (its `check_free`). A
+hibernates, or the microVM's snapshot is late (its `check_free`). Such a
+busy answer carries the busy marker (`vmm::marked_busy`, the status
+detail `VmBusy`), so that ferund takes the guest for busy, not
+unreachable, and does not repair the pod. A
 connected call has no bound but its caller's: a stream lasts as long as
 it lasts. The microVM service's own calls to a guest bound their connect
 with their own deadline: the ping of a resumed guest, before the time

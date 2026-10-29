@@ -144,8 +144,13 @@ func localRefusal(err error) bool {
 // (guest_channel, pods.rs:2520-2524) and when the call fails after it
 // handed the request to the guest (forward.rs:118-124), as when the guest
 // agent or the VM dies while the command runs. The two texts are the same,
-// so such a call may have run.
+// so such a call may have run. One marked busy (nodelink.VMBusy) is a
+// refusal: feosd gave up on the connect to the guest of a VM that writes
+// a snapshot, before the call reached the guest.
 func feosdRefusal(err error, id podid.ID) bool {
+	if nodelink.VMBusy(err) {
+		return true
+	}
 	s, ok := status.FromError(err)
 	if !ok {
 		return false
@@ -187,6 +192,23 @@ func Retryable(err error) bool {
 	}
 	return false
 }
+
+// busyRetry is when a caller told that the sandbox's VM is busy should
+// come back, as the sandbox engine tells it.
+const busyRetry = 30 * time.Second
+
+// BusyError is a call that feosd could not hand to the guest because the
+// pod's VM is busy, as while Firecracker writes a snapshot (feosd's marker,
+// nodelink.VMBusy): the guest is not unreachable, the call did not run,
+// and the caller comes back after busyRetry. It reads as the NodeError it
+// wraps.
+type BusyError struct{ Err error }
+
+func (e *BusyError) Error() string { return e.Err.Error() }
+func (e *BusyError) Unwrap() error { return e.Err }
+
+// RetryAfter is when to come back (apierr.RetryAfterOf).
+func (e *BusyError) RetryAfter() time.Duration { return busyRetry }
 
 // guestUnreachable reports whether err is feosd's answer for a pod whose
 // guest does not answer: UNAVAILABLE "the guest of pod <id>: ...".

@@ -11,6 +11,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/gardenlinux/feos/go/internal/nodelink"
 )
 
 // kindError is an error with a text of its own that is one of the
@@ -87,32 +89,13 @@ func callText(err error) string {
 	return err.Error()
 }
 
-// vmBusyDetail is the type of the status detail that marks feosd's
-// UNAVAILABLE of a microVM that takes no change now, and does later
-// ("the VM is busy: <why>", as while Firecracker still writes a snapshot
-// that a suspend gave up on; node.md, "The suspend's budget"): an Any of
-// this type without a value (microvm_service::vmm::BUSY_DETAIL).
-const vmBusyDetail = "type.googleapis.com/feos.microvm.v1.VmBusy"
+// vmBusyDetail marks feosd's busy VM (nodelink.VMBusyDetail).
+const vmBusyDetail = nodelink.VMBusyDetail
 
 // busyRetry is when a caller told that the sandbox's VM is busy should
 // come back.
 const busyRetry = 30 * time.Second
 
-// vmBusy reports whether a node call's error is feosd's busy VM: the call
-// changed nothing, and the same call later may. The marker decides, not
-// the message.
-func vmBusy(err error) bool {
-	if grpcCode(err) != codes.Unavailable {
-		return false
-	}
-	st, ok := status.FromError(err)
-	if !ok {
-		return false
-	}
-	for _, detail := range st.Proto().GetDetails() {
-		if detail.GetTypeUrl() == vmBusyDetail {
-			return true
-		}
-	}
-	return false
-}
+// vmBusy reports whether a node call's error is feosd's busy VM
+// (nodelink.VMBusy): the call changed nothing, and the same call later may.
+func vmBusy(err error) bool { return nodelink.VMBusy(err) }

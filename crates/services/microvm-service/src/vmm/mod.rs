@@ -56,7 +56,13 @@ struct RpcStatus {
 /// The `UNAVAILABLE` of a VM that is busy: "the VM is busy: <why>", marked
 /// with `BUSY_DETAIL`.
 pub fn busy_status(why: &str) -> Status {
-    let message = format!("{BUSY}: {why}");
+    marked_busy(format!("{BUSY}: {why}"))
+}
+
+/// An `UNAVAILABLE` with `message`, marked with `BUSY_DETAIL`: what a call
+/// that met a busy VM answers in words of its own, as a call to the guest
+/// of a pod whose microVM writes a snapshot does.
+pub fn marked_busy(message: String) -> Status {
     let details = RpcStatus {
         code: tonic::Code::Unavailable as i32,
         message: message.clone(),

@@ -900,7 +900,15 @@ checkpoint inside the call.
   next pass; Ensure and
   the REST pause answer `ErrBusy` "<op> on node <n>: <description>; retry
   in 30s", with a retry time of 30 s. Another `UNAVAILABLE` is a failure,
-  as before, whatever its message says.
+  as before, whatever its message says. A tool call whose guest feosd
+  could not reach because its VM is busy gets the same marker on "the
+  guest of pod <id> did not answer within 5s; the VM is busy: <why>":
+  the runner does not report the guest unreachable (which would have the
+  repair loop restart a pod that is only busy), the call did not run,
+  and it fails as a `NodeError` that asks to come back in 30 s
+  (`tools.BusyError`; REST answers 502 with `Retry-After: 30`). An
+  unmarked "the guest of pod …" of a running pod is reported
+  unreachable, as before.
 - **Finish** is retried until it commits. An op that is no longer the
   row's (taken over, preempted, or the row deleted or re-created
   meanwhile) writes only a tombstone for a pod it may have made, or a
@@ -1367,7 +1375,10 @@ marked is not sent, so that every state is exact, whoever writes it:
   `not_run`, and a later read of the key finds no record (404
   `no_such_call`) or the key's earlier `not_run` row. Only an insert
   that committed without its answer leaves a row, which the instance
-  ends `not_run` at once, or its expiry later. An unreachable guest is
+  ends `not_run` at once, or its expiry later. A guest that feosd could
+  not reach because its VM is busy (its marker, [A busy VM](#ops)) is a
+  refusal: feosd gave up on the connect before the call reached the
+  guest. An unreachable guest is otherwise
   no refusal: feosd says so in the same words before and after it hands
   the call to the guest, so the call may have run; it keeps `sent` and
   ends `done` with the error. The same call under the same key replaces

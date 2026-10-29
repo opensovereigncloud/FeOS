@@ -413,6 +413,12 @@ func (r *Runner) attempts(cctx context.Context, id podid.ID, lease *model.Lease,
 		if cctx.Err() != nil {
 			return -1, r.callError(lease.Node, err)
 		}
+		if nodelink.VMBusy(err) {
+			// The guest did not answer because its VM is busy (a late
+			// snapshot): it is not unreachable, and a repair would
+			// restart a pod that is only busy. The caller comes back.
+			return -1, &BusyError{Err: r.callError(lease.Node, err)}
+		}
 		if attempt > 0 || received {
 			// Not made again; a running pod whose guest stopped answering
 			// is still reported, so that the engine repairs it.

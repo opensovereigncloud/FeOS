@@ -703,3 +703,48 @@ func TestProcessTools(t *testing.T) {
 		t.Errorf("RunningProcesses without python: %v", err)
 	}
 }
+
+// A guest that feosd could not reach because its VM is busy (its marker,
+// as while Firecracker writes a late snapshot) is not reported
+// unreachable, which would have the engine repair, and so restart, a pod
+// that is only busy: the call did not run, and the caller comes back
+// after busyRetry. An unmarked guest timeout of a running pod is still
+// reported.
+func TestBusyGuestIsNotUnreachable(t *testing.T) {
+	env := toolstest.New(t, toolstest.Options{})
+	r := newRunner(env)
+	sb := env.NewSandbox()
+	msg := fmt.Sprintf("the guest of pod %s did not answer within 5s; the VM is busy: the pod is being suspended", sb.ID)
+	busy := busyGuest(sb.ID)
+	env.Node.Script().SetExec(func(context.Context, podid.ID, *containerv1.ExecRequest, testnode.ExecOutput) (int32, bool, error) {
+		return 0, false, busy
+	})
+	_, err := r.Call(bg, sb, ToolBash, json.RawMessage(`{"command":"x"}`), nil)
+	var later interface{ RetryAfter() time.Duration }
+	if err == nil || err.Error() != "node n1: "+msg || !errors.As(err, &later) || later.RetryAfter() != 30*time.Second {
+		t.Fatalf("busy guest: %v, want %q with a retry after 30s", err, "node n1: "+msg)
+	}
+	if !Retryable(err) {
+		t.Error("a busy guest is worth a retry")
+	}
+	if n := env.Engine.Calls("Unreachable", sb.ID); n != 0 {
+		t.Errorf("a busy guest reported unreachable %d times", n)
+	}
+
+	// The same timeout without the marker: unreachable, as before.
+	env.Node.Script().SetExec(func(context.Context, podid.ID, *containerv1.ExecRequest, testnode.ExecOutput) (int32, bool, error) {
+		return 0, false, status.Error(codes.Unavailable, fmt.Sprintf("the guest of pod %s did not answer within 5s", sb.ID))
+	})
+	_, err = r.Call(bg, sb, ToolBash, json.RawMessage(`{"command":"x"}`), nil)
+	var be *BusyError
+	if err == nil || errors.As(err, &be) {
+		t.Fatalf("unmarked timeout: %v", err)
+	}
+	if n := env.Engine.Calls("Unreachable", sb.ID); n != 1 {
+		t.Errorf("an unmarked timeout reported unreachable %d times", n)
+	}
+	env.Node.Script().SetExec(nil)
+	if env.Engine.Holds(sb.ID) != 0 {
+		t.Errorf("%d holds left", env.Engine.Holds(sb.ID))
+	}
+}
