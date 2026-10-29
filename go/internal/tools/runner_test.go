@@ -182,6 +182,20 @@ func TestRetryNotOnPod(t *testing.T) {
 	}
 }
 
+// upOnWait ends the bring-up of the sandbox's pod (closes up) once the
+// runner, having found the pod still starting, waits for it to run
+// (WaitRunning). A runner that does not wait gets the pod after 10 s, and
+// the test's count of the waits fails.
+func upOnWait(env *toolstest.Env, id podid.ID, up chan struct{}) {
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for env.Engine.Calls("WaitRunning", id) == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		close(up)
+	}()
+}
+
 // A guest that does not answer while its pod starts is waited for and the
 // call made once more; one that does not answer while the pod runs is
 // reported unreachable and fails the call.
@@ -210,10 +224,7 @@ func TestGuestUnreachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.Engine.Stale(sb.ID, 1)
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		close(up)
-	}()
+	upOnWait(env, sb.ID, up)
 	res, err := r.Call(bg, sb, ToolBash, json.RawMessage(`{"command":"echo up"}`), nil)
 	if err != nil || res.Text != "up\n" {
 		t.Fatalf("%+v %v", res, err)
@@ -281,10 +292,7 @@ func TestGuestUnreachable(t *testing.T) {
 	}
 	env.Engine.Stale(other.ID, 1)
 	env.Node.Script().SetGuestUnreachable(other.ID, true)
-	go func() {
-		time.Sleep(300 * time.Millisecond)
-		close(up)
-	}()
+	upOnWait(env, other.ID, up)
 	_, err = r.Call(bg, other, ToolRead, json.RawMessage(`{"path":"/a"}`), nil)
 	want = fmt.Sprintf("node n1: the guest of pod %s: connection reset by peer", other.ID)
 	if err == nil || err.Error() != want {
