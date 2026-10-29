@@ -96,7 +96,7 @@ CREATE TABLE acme_accounts (                   -- the platform's ACME account, o
   created_at timestamptz NOT NULL DEFAULT now());
 
 CREATE TABLE acme_challenges (                 -- HTTP-01 answers the ingress serves on port 80
-  token text PRIMARY KEY CHECK (token ~ '^[A-Za-z0-9_-]{1,256}$'),
+  token text PRIMARY KEY CHECK (token ~ '^[A-Za-z0-9_-]+$' AND length(token) <= 256),   -- (a regex counts to 255 at most)
   host text NOT NULL,                          -- the domain's name: the answer is given for this host alone
   key_auth text NOT NULL,                      -- the body of the answer
   domain_id uuid REFERENCES domains(id) ON DELETE CASCADE,
@@ -107,5 +107,5 @@ CREATE INDEX acme_challenges_expires ON acme_challenges(expires_at);
 ALTER TABLE env_incidents DROP CONSTRAINT env_incidents_condition_check;
 ALTER TABLE env_incidents ADD CONSTRAINT env_incidents_condition_check
   CHECK (condition IN ('rollout_failed','crash_loop','job_failed','no_capacity',
-     'addon_unhealthy','volume_unavailable','attach_failed',
+     'addon_unhealthy','volume_unavailable','attach_failed','names_unserved',
      'domain_record_wrong','domain_deactivated','domain_superseded','certificate_failing'));
