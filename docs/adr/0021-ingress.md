@@ -460,7 +460,9 @@ changed these points:
 - **The node's vsock door from a sidecar** (`/run/feos/api.sock`): the
   same-node pods alone, no groups and no records, and vsock's limits.
 - **Kubernetes's ingress**, the cluster's controller with cert-manager
-  and an `Ingress` object per domain that `ferund` writes. The routes
+  and an object per domain that `ferund` writes: an `HTTPRoute` and a
+  listener on the cluster's Gateway, as the platform's own hosts have
+  had since 2026-10-29 in place of `Ingress` objects. The routes
   and certificates of the platform as Kubernetes objects, a second
   owner of the edge, and a platform that runs without Kubernetes
   (ADR 0001, ADR 0017) tied to it on the one path every customer uses.

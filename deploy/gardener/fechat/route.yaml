@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# https://chat.<DOMAIN> on the cluster's Gateway, whose HTTPS listener for
+# the host holds the certificate and admits this namespace's routes
+# (README.md, Prerequisites): /api to the backend, the rest to the SPA.
+# It takes the place of k3s's fechat/ingress.yaml here.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: fechat
+  namespace: fechat
+spec:
+  parentRefs:
+    - name: ${GATEWAY_NAME}
+      namespace: ${GATEWAY_NAMESPACE}
+  hostnames:
+    - chat.${DOMAIN}
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /api}}]
+      backendRefs: [{name: fechat-backend, port: 8080}]
+    - backendRefs: [{name: fechat-app, port: 8080}]

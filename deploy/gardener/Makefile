@@ -6,7 +6,8 @@
 # <target>, with KUBECONFIG at the shoot. The parameters come from
 # config.env (config.env.example). Pushing needs `docker login` at
 # REGISTRY. ferund's image and FeChat's manifests are deploy/k3s's, built
-# and filled in with this directory's parameters.
+# and filled in with this directory's parameters; their routes are this
+# directory's HTTPRoutes in place of k3s's Ingresses.
 
 REPO_ROOT := $(abspath ../..)
 -include config.env
@@ -19,13 +20,16 @@ FERUN_ROLLOUT_GRACE ?= 8m
 APPS_ZONE ?= $(if $(DOMAIN),apps.$(DOMAIN))
 # The workers' network, which reaches ferun-ingress's health port and mesh.
 NODE_CIDR ?= 10.250.0.0/16
+# The Gateway that serves run., chat. and oci.<DOMAIN> (config.env.example).
+GATEWAY_NAMESPACE ?= traefik
+GATEWAY_NAME ?= platform
 # DENY_PREFIXES, what the pods may not reach, has no default: the shoot's
 # networks are not every shoot's (config.env.example).
 # ferund's --deny-prefix: its built-in set ("default") and DENY_PREFIXES,
 # since a set given replaces the built-in one.
 comma := ,
 FERUN_DENY_PREFIX = $(if $(strip $(DENY_PREFIXES)),default$(comma)$(subst $(eval) ,$(comma),$(strip $(DENY_PREFIXES))))
-export DOMAIN REGISTRY OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX
+export DOMAIN REGISTRY OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME
 DOCKER ?= docker
 TAG ?= dev
 PACKAGES_DIR ?= $(REPO_ROOT)/target/packages
@@ -101,7 +105,7 @@ $(MANIFESTS)/feos-k8s.yaml: FORCE
 # The k3s manifests live outside this directory. An empty APPS_ZONE
 # switches ferund's hosts off.
 $(MANIFESTS)/ferun.yaml: FORCE
-	$(call render,DOMAIN REGISTRY OIDC_ISSUER FERUN_NODES_IP FERUN_ROLLOUT_GRACE FERUN_DENY_PREFIX,kubectl kustomize --load-restrictor LoadRestrictionsNone ferun,APPS_ZONE)
+	$(call render,DOMAIN REGISTRY OIDC_ISSUER FERUN_NODES_IP FERUN_ROLLOUT_GRACE FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME,kubectl kustomize --load-restrictor LoadRestrictionsNone ferun,APPS_ZONE)
 
 # Once, when ferund moves from the StatefulSet postgres to ferun-db
 # (README.md): ferun-db created from a copy of postgres-0's database.
@@ -110,10 +114,10 @@ $(MANIFESTS)/ferun-db-import.yaml: FORCE
 	kubectl kustomize --load-restrictor LoadRestrictionsNone ferun/import >$@
 
 $(MANIFESTS)/fechat.yaml: FORCE
-	$(call render,DOMAIN REGISTRY OIDC_ISSUER FECHAT_MODEL,$(call cat-yaml,$(addprefix ../k3s/fechat/,namespace.yaml config.yaml app.yaml backend.yaml ingress.yaml)))
+	$(call render,DOMAIN REGISTRY OIDC_ISSUER FECHAT_MODEL GATEWAY_NAMESPACE GATEWAY_NAME,$(call cat-yaml,$(addprefix ../k3s/fechat/,namespace.yaml config.yaml app.yaml backend.yaml) fechat/route.yaml))
 
 $(MANIFESTS)/registry.yaml: FORCE
-	$(call render,DOMAIN,cat registry/registry.yaml)
+	$(call render,DOMAIN GATEWAY_NAMESPACE GATEWAY_NAME,cat registry/registry.yaml)
 
 # Only with an apps zone: without one there is nothing to serve.
 $(MANIFESTS)/ferun-ingress.yaml: FORCE

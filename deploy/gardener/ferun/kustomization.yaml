@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ferund and its PostgreSQL on the Gardener shoot: the k3s manifests of
-# ferund (deploy/k3s/ferun), three instances, over ferun-db, a
+# ferund (deploy/k3s/ferun) with route.yaml, an HTTPRoute on the cluster's
+# Gateway, in place of k3s's Ingress, three instances, over ferun-db, a
 # CloudNativePG cluster of three instances (postgres.yaml), with the nodes'
 # port at FERUN_NODES_IP, an address of the shoot's service network. They
 # live outside this directory, and make fills in their parameters
@@ -19,7 +20,7 @@ resources:
   - ../../k3s/ferun/namespace.yaml
   - postgres.yaml
   - ../../k3s/ferun/ferund.yaml
-  - ../../k3s/ferun/ingress.yaml
+  - route.yaml
 patches:
   - target:
       kind: Deployment

@@ -12,15 +12,17 @@ what FeOS needs (ublk, tun, vhost-vsock, WireGuard, nftables).
 | Part | Where | What |
 |---|---|---|
 | [`feos/`](feos/) | namespace `feos`, the DaemonSet `feos-node` on every worker of the pool `WORKER_POOL`, and `feos-k8s` | diskd and feosd in a pod per worker, whose microVMs live in it (ADR 0020); feos-k8s joins new workers and drains cordoned ones in FeRun |
-| [`ferun/`](ferun/) | namespace `ferun` | ferund, three instances, one on each worker, and its PostgreSQL `ferun-db`, a CloudNativePG cluster of three instances, one on each worker ([`ferun/postgres.yaml`](ferun/postgres.yaml)); the k3s manifests of ferund ([`../k3s/ferun`](../k3s/ferun)) with the nodes' port at a shoot address; `https://run.<DOMAIN>` |
+| [`ferun/`](ferun/) | namespace `ferun` | ferund, three instances, one on each worker, and its PostgreSQL `ferun-db`, a CloudNativePG cluster of three instances, one on each worker ([`ferun/postgres.yaml`](ferun/postgres.yaml)); the k3s manifests of ferund ([`../k3s/ferun`](../k3s/ferun)) with the nodes' port at a shoot address; `https://run.<DOMAIN>` by the HTTPRoute [`ferun/route.yaml`](ferun/route.yaml) in place of k3s's Ingress |
 | [`ferun-ingress/`](ferun-ingress/) | namespace `ferun-ingress` | ferun-ingress, two instances on two of the workers, behind a LoadBalancer of their own: `https://<label>.<APPS_ZONE>`, public environments' hosts, straight to their pods over the mesh ([The ingress](#the-ingress)) |
-| [`../k3s/fechat`](../k3s/fechat) | namespace `fechat` | FeChat, unchanged; `https://chat.<DOMAIN>` |
+| [`../k3s/fechat`](../k3s/fechat), [`fechat/`](fechat/) | namespace `fechat` | FeChat, unchanged but for its route: `https://chat.<DOMAIN>` by the HTTPRoute [`fechat/route.yaml`](fechat/route.yaml) in place of k3s's Ingress |
 | [`registry/`](registry/) | namespace `registry` | an image registry, `https://oci.<DOMAIN>`: distribution with its blobs in an object store |
-| [`cluster.yaml`](cluster.yaml) | | the issuer `letsencrypt-prod` the manifests name, answering DNS-01 |
+| [`cluster.yaml`](cluster.yaml) | | the issuer `letsencrypt-prod` the Gateway's certificates and ferun-ingress's name, answering DNS-01 |
 
 Every name under `DOMAIN` points at the shoot's public address, the
-LoadBalancer of the ingress controller Traefik; the apps zone's names
-point at the second, ferun-ingress's.
+LoadBalancer of Traefik, which serves the cluster's Gateway (Gateway
+API): run., chat. and oci.<DOMAIN> are HTTPRoutes on it, its listeners
+hold their certificates. The apps zone's names point at the second
+address, ferun-ingress's.
 
 ```
  *.<DOMAIN> ───── LoadBalancer ── traefik ── ferund :8100 ──── ferun-db (CNPG, 3)
@@ -41,8 +43,15 @@ point at the second, ferun-ingress's.
   workers (port 51820, the pods' mesh), and between the workers and the
   pods' network, where ferun-ingress joins the mesh. Kubernetes 1.30 or
   newer.
-- Traefik as the ingress controller (class `traefik`), behind a
-  LoadBalancer, and cert-manager.
+- Traefik behind a LoadBalancer, serving the Gateway API (its standard
+  CRDs), and cert-manager. A Gateway, `GATEWAY_NAMESPACE/GATEWAY_NAME`
+  (default `traefik/platform`), with an HTTPS listener for each of
+  run., chat. and oci.<DOMAIN>: its certificate, from the issuer of
+  [`cluster.yaml`](cluster.yaml), and routes admitted from the
+  namespace `ferun`, `fechat` or `registry` respectively. FeCode's
+  `deploy/fecode/gateway.yaml` is that Gateway on the shoot `fecode`.
+  No Ingress is used here; deploy/k3s keeps its Ingresses for k3s's
+  Traefik.
 - CloudNativePG 1.30 or newer in the shoot, run with two operator
   replicas: chart `cloudnative-pg` with `replicaCount` 2 and a topology
   spread over `kubernetes.io/hostname`, and a PodDisruptionBudget
