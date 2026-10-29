@@ -2625,13 +2625,21 @@ in a later step".
 **The checks.**
 
 - **The lookups** use Go's own resolver (`net.Resolver` with
-  `PreferGo`) over `--dns-resolver`, or over the system's resolvers
-  without it, with absolute names, so that no search domain is tried:
-  `LookupTXT` of the TXT record's name, `LookupIPAddr` of the name, and
-  `LookupCNAME` for `found.cname`. A recursive resolver answers from its
-  cache for a record's TTL: a record just set or removed, or a negative
-  answer cached before, may take minutes to count, also for `POST
-  …/check`. Nothing asks a zone's authoritative servers.
+  `PreferGo`), with absolute names, so that no search domain is tried,
+  and ask the servers of the zone that holds a name, so that a record
+  just set counts at once, also for `POST …/check`, and no cached
+  negative answer delays it. The zone is the nearest of the name and its
+  parents that has NS records and owns no CNAME (an NS query for a
+  CNAME's owner answers with its target's NS records); its NS records
+  and their addresses come from the recursive resolver, `--dns-resolver`
+  or else the system's, and a resolver whose dial goes to those servers
+  (IPv4 ones when there are any, the next one at every dial) asks
+  `LookupTXT` of the TXT record's name and `LookupCNAME` of the name. A
+  CNAME is followed at its target's zone (at most 8); where the chain
+  ends, `LookupIPAddr` gives the addresses, and the chain is
+  `found.cname`. The edge's own addresses come from the recursive
+  resolver. `TestResolverLive` (`FERUN_TEST_LIVE_DNS=1`) runs it against
+  the internet.
 - **When.** The loop `domains-check` takes up to 64 due domains
   (`next_check_at <= now()`, never a superseded one) `FOR UPDATE SKIP
   LOCKED`, moves their next check 5 minutes ahead as a lease, and checks 8

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"testing"
 	"time"
 )
@@ -54,5 +55,28 @@ func TestResolverAsksItsServer(t *testing.T) {
 	_ = dead.SetReadDeadline(time.Now().Add(time.Second))
 	if n, _, err := dead.ReadFromUDP(buf); err != nil || n == 0 {
 		t.Fatalf("the server got no query: %v", err)
+	}
+}
+
+// Against the internet, with FERUN_TEST_LIVE_DNS=1: a name's records come
+// from its zone's servers, a CNAME into another zone is followed there,
+// and a missing TXT record is an answer, not a failure.
+func TestResolverLive(t *testing.T) {
+	if os.Getenv("FERUN_TEST_LIVE_DNS") == "" {
+		t.Skip("set FERUN_TEST_LIVE_DNS=1 to ask the internet's DNS")
+	}
+	r := NewResolver(os.Getenv("FERUN_TEST_DNS_RESOLVER"), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := r.Lookup(ctx, Query{Name: "www.github.com", TXTName: "_ferun-challenge-none.github.com"})
+	if a.TXTErr != nil || len(a.TXT) != 0 {
+		t.Fatalf("a missing TXT record: %v %v", a.TXT, a.TXTErr)
+	}
+	if a.RouteErr != nil || len(a.Addresses) == 0 || len(a.CNAME) != 1 || a.CNAME[0] != "github.com" {
+		t.Fatalf("www.github.com: %v %v %v", a.Addresses, a.CNAME, a.RouteErr)
+	}
+	a = r.Lookup(ctx, Query{Name: "pages.github.com", TXTName: "_ferun-challenge-none.pages.github.com"})
+	if a.RouteErr != nil || len(a.Addresses) == 0 || len(a.CNAME) == 0 || a.CNAME[0] != "github.github.io" {
+		t.Fatalf("a CNAME into another zone: %v %v %v", a.Addresses, a.CNAME, a.RouteErr)
 	}
 }

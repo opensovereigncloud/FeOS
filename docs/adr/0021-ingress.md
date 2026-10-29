@@ -194,10 +194,13 @@ woken by the door, which holds the request until the pod runs.
 - A deleted claim ends its binding and its key. What its owner leaves in
   DNS, the TXT and the CNAME, gives the name to no other claim, since no
   other token is in it.
-- `ferund` looks the records up with the standard library's resolver,
-  through `--dns-resolver` or else the system's. A resolver caches an
-  answer for its TTL, so a record just set may count only minutes
-  later; against a grace of days, a cached answer decides nothing. An
+- `ferund` asks the servers of the zone that holds a record, not a
+  cache, so that a record just set counts at once and no negative
+  answer a resolver keeps for up to an hour holds a claim back. The
+  standard library's resolver does it: the zone's NS records and their
+  addresses come through `--dns-resolver` or else the system's, and the
+  records themselves from those servers; a CNAME into another zone is
+  followed at that zone's servers. An
   unverified claim is checked with backoff from a minute to an hour,
   and at once on `POST /api/v1/domains/{id}/check`; a verified one as
   the next section says. A tenant holds at most
@@ -555,9 +558,8 @@ changed these points:
   domain that is verified, bound, public and routed stays `issuing`
   ("certificates are not available yet"). Certificates, and serving
   domains, come with the ingress's proxy in a step of their own. The
-  checks ask a recursive resolver with the standard library's, not the
-  zone's authoritative servers with a client of their own: a cached
-  answer costs minutes, against a grace of days.
+  checks ask the zone's servers with the standard library's resolver,
+  pointed at them, not with a DNS client of their own.
 
 ## Alternatives considered
 
