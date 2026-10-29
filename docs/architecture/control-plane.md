@@ -483,22 +483,33 @@ secrets.
 
 - **`ferund init-ca`** makes both. The root: ECDSA P-256, 10 years, path
   length 1, written to `--root-dir` (`root.crt`, `root.key`). The issuer:
-  ECDSA P-256, 5 years, path length 0, written to `--dir` with
-  `bundle.crt` (the root) and `issuer.json` (the control-plane domain,
-  `ferun.<first --dns-domain>` by default). Both carry the same critical
-  name constraints: DNS names only under `--dns-domain`, no IP address,
-  URIs only in the trust domain. The two directories must differ, and no
+  ECDSA P-256, 5 years but not past the root, path length 0, written to
+  `--dir` with `bundle.crt` (the root) and `issuer.json` (the
+  control-plane domain, `ferun.<first --dns-domain>` by default, and the
+  trust domain). Both carry the same critical name constraints: DNS names
+  only under `--dns-domain`, no IP address. No URI constraint (ADR 0024):
+  rustls-webpki, which `feosd` checks the control plane with, refuses
+  every URI name beneath one. The two directories must differ, and no
   file is ever overwritten.
+- **`ferund new-issuer`** makes a new issuer under the root in
+  `--root-dir` (`root.crt`, `root.key`), with the same flags as
+  `init-ca`, into a new `--dir`, and loads it before it returns. The
+  root, the bundle and the join tokens' pin stay. It replaces an issuer
+  that constrains URIs, as `init-ca` made them before ADR 0024, and an
+  issuer near its end ([The CA ceremony](#the-ca-ceremony)).
 - **At start**, `serve` verifies the issuer's chain to a root of the
-  bundle, requires the control-plane domain to lie within the issuer's
-  DNS domains and every `--node-server-names` under it, and refuses to
-  start when `root.key` is in `--ca-dir`.
+  bundle, requires the trust domain of `issuer.json`, when it names one,
+  to be `--trust-domain` (an issuer of before is bound by its URI
+  constraint instead), the control-plane domain to lie within the
+  issuer's DNS domains and every `--node-server-names` under it, and
+  refuses to start when `root.key` is in `--ca-dir`. It warns when the
+  issuer constrains URIs: nodes of this version refuse the nodes' port's
+  certificate under such an issuer.
 - **Separating pods from the control plane.** The name constraints keep
   every certificate inside the platform's domains and away from IP
   addresses, but the control-plane domain lies beneath the same platform
-  domain, and a URI constraint binds only the trust domain, never the
-  path (Go's verifier enforces URI constraints; rustls-webpki ignores
-  them). The separation is therefore in software, on two lines: issuance
+  domain, and no name constraint tells a pod's URI from the control
+  plane's. The separation is therefore in software, on two lines: issuance
   (a pod never gets a wildcard, a name in the control-plane domain, the
   control plane's URI or an ID under `/ingress`; a node and an ingress
   instance get only their URIs; only the instances'
@@ -2775,6 +2786,16 @@ handshake. A node whose certificate expired, that lost its key, or that
 was removed joins again with a token pinned to its name. `bundle.crt`
 may hold several roots, for a rotation; a join token's pin is always the
 root that anchors the issuer.
+
+**Replacing the issuer.** On the offline machine, `ferund new-issuer
+--root-dir ROOT --dir NEW --dns-domain example.com --trust-domain
+run.example.com` (the domains of `init-ca`); `NEW` replaces every
+instance's `--ca-dir`, and a rolling restart of the instances takes it.
+Node and pod certificates of the old issuer stay valid until they are
+renewed; the instances' certificates on the nodes' port come from the new
+issuer from their start. An issuer that constrains URIs must be replaced
+this way before nodes of ADR 0024's version roll: they refuse the nodes'
+port's certificate under it, and nodes of before accept both.
 
 ### Moving from the sandbox system
 

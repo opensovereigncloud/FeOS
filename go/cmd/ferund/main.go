@@ -7,6 +7,7 @@
 //
 //	ferund [serve] [flags]          run an instance (the default)
 //	ferund init-ca --root-dir R --dir D --dns-domain X ...
+//	ferund new-issuer --root-dir R --dir D --dns-domain X ...
 //	ferund join-token --database-url URL [--kind node|ingress] [--ttl 1h] [--node NAME]
 //	ferund migrate --database-url URL
 //
@@ -61,6 +62,8 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		err = serve(args, getenv, stderr)
 	case config.CmdInitCA:
 		err = initCA(args, getenv, stdout)
+	case config.CmdNewIssuer:
+		err = newIssuer(args, getenv, stdout)
 	case config.CmdJoinToken:
 		err = joinToken(args, getenv, stdout, stderr)
 	case config.CmdMigrate:
@@ -156,6 +159,20 @@ func initCA(args []string, getenv func(string) string, stdout io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "made the root in %s (keep its key offline) and the issuer in %s (an instance's --ca-dir)\n", c.RootDir, c.Dir)
+	return nil
+}
+
+// newIssuer makes a new issuer under the platform CA's root.
+func newIssuer(args []string, getenv func(string) string, stdout io.Writer) error {
+	c, err := config.ParseNewIssuer(args, getenv)
+	if err != nil {
+		return flagErr(err)
+	}
+	if err := pki.NewIssuer(pki.InitCAOptions{RootDir: c.RootDir, Dir: c.Dir, TrustDomain: c.TrustDomain,
+		ControlPlaneDomain: c.ControlPlaneDomain, DNSDomains: c.DNSDomains}); err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "made a new issuer under the root in %s, in %s (an instance's --ca-dir)\n", c.RootDir, c.Dir)
 	return nil
 }
 

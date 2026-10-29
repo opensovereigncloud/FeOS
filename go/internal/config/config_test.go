@@ -258,6 +258,15 @@ func TestSubcommands(t *testing.T) {
 		!strings.Contains(err.Error(), "--dir is required") || !strings.Contains(err.Error(), "--dns-domain is required") {
 		t.Fatalf("init-ca refusal: %v", err)
 	}
+	ni, err := ParseNewIssuer([]string{"--root-dir", "/r", "--dir", "/n", "--dns-domain", "a.example"},
+		env(map[string]string{"FERUN_TRUST_DOMAIN": "feos.test"}))
+	if err != nil || ni.RootDir != "/r" || ni.Dir != "/n" || ni.TrustDomain != "feos.test" || strings.Join(ni.DNSDomains, ",") != "a.example" {
+		t.Fatalf("new-issuer %+v %v", ni, err)
+	}
+	if _, err := ParseNewIssuer([]string{"--dir", "/n"}, env(nil)); err == nil ||
+		!strings.Contains(err.Error(), "--root-dir is required") || !strings.Contains(err.Error(), "--dns-domain is required") {
+		t.Fatalf("new-issuer refusal: %v", err)
+	}
 
 	jt, err := ParseJoinToken([]string{"--node", "n7", "--ttl", "30m"},
 		env(map[string]string{"FERUN_DATABASE_URL": testURL, "FERUN_TRUST_DOMAIN": "run.fecode.dev"}))
@@ -305,7 +314,7 @@ func TestUsage(t *testing.T) {
 			t.Errorf("serve help lacks %q", s)
 		}
 	}
-	for _, cmd := range []string{"", CmdInitCA, CmdJoinToken, CmdMigrate} {
+	for _, cmd := range []string{"", CmdInitCA, CmdNewIssuer, CmdJoinToken, CmdMigrate} {
 		b.Reset()
 		Usage(&b, cmd)
 		if !strings.Contains(b.String(), "Usage: ferund") {

@@ -207,7 +207,11 @@ serves on.
 
 All connections are TLS 1.3, without session resumption, and the server is
 always checked for `--control-plane-name` and the URI, later against the
-trust bundle. Their sockets have keepalive and a `TCP_USER_TIMEOUT` of
+trust bundle. A root, of the bundle or pinned, is trusted for its key,
+without its name constraints (ADR 0024): rustls-webpki refuses every URI
+name beneath a URI constraint, which the roots of `ferund init-ca` carried
+before. The issuer's constraints still hold, and an issuer that
+constrains URIs is refused. Their sockets have keepalive and a `TCP_USER_TIMEOUT` of
 20 s.
 
 The control plane's side runs on two threads of its own, on which nothing

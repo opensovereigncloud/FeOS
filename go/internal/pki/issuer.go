@@ -53,8 +53,9 @@ type Issuer struct {
 // LoadIssuer reads the issuer from dir (issuer.crt, issuer.key, bundle.crt,
 // issuer.json) for trust domain td. It refuses a dir that holds root.key,
 // an issuer that does not verify to a root of the bundle, an issuer whose
-// URI name constraints do not permit td, and a control-plane domain that
-// does not lie within the issuer's permitted DNS domains.
+// URI name constraints do not permit td, an issuer.json that names another
+// trust domain, and a control-plane domain that does not lie within the
+// issuer's permitted DNS domains.
 func LoadIssuer(dir, trustDomain string) (*Issuer, error) {
 	if err := ValidateTrustDomain(trustDomain); err != nil {
 		return nil, err
@@ -120,6 +121,9 @@ func LoadIssuer(dir, trustDomain string) (*Issuer, error) {
 	if err := json.Unmarshal(raw, &meta); err != nil {
 		return nil, fmt.Errorf("%s: %w", IssuerJSONFile, err)
 	}
+	if meta.TrustDomain != "" && meta.TrustDomain != trustDomain {
+		return nil, fmt.Errorf("%s names trust domain %s, not %s", IssuerJSONFile, meta.TrustDomain, trustDomain)
+	}
 	cp := meta.ControlPlaneDomain
 	if err := validateDomain(cp); err != nil {
 		return nil, fmt.Errorf("%s: control-plane domain: %w", IssuerJSONFile, err)
@@ -143,6 +147,14 @@ func LoadIssuer(dir, trustDomain string) (*Issuer, error) {
 
 // TrustDomain is the SPIFFE trust domain the issuer issues for.
 func (i *Issuer) TrustDomain() string { return i.td }
+
+// ConstrainsURIs reports whether the issuer has URI name constraints, as
+// `ferund init-ca` gave them before ADR 0024. feosd's TLS (rustls-webpki)
+// refuses every URI name beneath one, so a node of this version refuses
+// the nodes' port's certificate; `ferund new-issuer` replaces the issuer.
+func (i *Issuer) ConstrainsURIs() bool {
+	return len(i.cert.PermittedURIDomains) > 0 || len(i.cert.ExcludedURIDomains) > 0
+}
 
 // Bundle is the trust bundle: the roots of bundle.crt.
 func (i *Issuer) Bundle() *x509.CertPool { return i.bundle }

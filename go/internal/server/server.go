@@ -241,6 +241,10 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	if i.Issuer, err = pki.LoadIssuer(cfg.CADir, cfg.TrustDomain); err != nil {
 		return nil, fmt.Errorf("load the issuer from %s: %w", cfg.CADir, err)
 	}
+	if i.Issuer.ConstrainsURIs() {
+		i.log.Warn("the issuer constrains URIs, and nodes since ADR 0024 refuse the nodes' port's certificate under it; "+
+			"make a new issuer under the same root with ferund new-issuer", "ca_dir", cfg.CADir)
+	}
 	names := cfg.NodeServerNames
 	if len(names) == 0 {
 		names = []string{i.Issuer.ControlPlaneDomain()}

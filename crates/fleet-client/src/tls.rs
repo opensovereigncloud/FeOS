@@ -11,6 +11,12 @@
 //! plane alike, and that URI is what tells them apart. A join checks the
 //! chain against the root that the join token pins; later connections
 //! check it against the trust bundle.
+//!
+//! A root is trusted for its key, without its name constraints
+//! ([`anchors`], ADR 0024): rustls-webpki refuses every URI name under a
+//! CA's URI constraint, and the platform's roots carry one. The issuer's
+//! own name constraints still hold, and the control plane's certificate
+//! is held to its exact names.
 
 use crate::identity::Identity;
 use crate::token;
@@ -78,21 +84,38 @@ pub fn node_config(
     trust_domain: &str,
     alpn: &[u8],
 ) -> Result<Arc<ClientConfig>, Error> {
-    let mut roots = RootCertStore::empty();
-    for root in &identity.bundle {
-        roots.add(root.clone())?;
-    }
-    let verifier = Arc::new(ControlPlaneVerifier {
-        inner: WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-            .build()
-            .map_err(|e| Error::General(format!("the trust bundle: {e}")))?,
-        trust_domain: trust_domain.to_string(),
-    });
+    let verifier = Arc::new(ControlPlaneVerifier::new(
+        provider,
+        &identity.bundle,
+        trust_domain,
+    )?);
     let config = builder(provider)?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(identity.chain.clone(), identity.private_key())?;
     Ok(finish(config, alpn))
+}
+
+/// The trust anchors of `roots`: each root's subject and key, without its
+/// name constraints. rustls-webpki checks no URI name constraint and
+/// refuses every URI name beneath one (fail closed), and the roots that
+/// `ferund init-ca` made before ADR 0024 constrain URIs to the trust
+/// domain; a chain from such a root to the control plane's certificate,
+/// which carries a URI name, would never verify. The constraints of the
+/// certificates between the root and the leaf, the issuer's, still hold,
+/// and [`check_control_plane_leaf`] holds the leaf to the exact URI and to
+/// no IP address, more than the root's constraints asked.
+fn anchors<'a, 'b: 'a>(
+    roots: impl IntoIterator<Item = &'a CertificateDer<'b>>,
+) -> Result<RootCertStore, Error> {
+    let mut store = RootCertStore::empty();
+    for root in roots {
+        store.add(root.clone().into_owned())?;
+    }
+    for anchor in &mut store.roots {
+        anchor.name_constraints = None;
+    }
+    Ok(store)
 }
 
 fn builder(
@@ -225,7 +248,7 @@ impl ServerCertVerifier for JoinVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        let mut roots = RootCertStore::empty();
+        let mut pinned = Vec::new();
         for cert in intermediates {
             if token::pin(cert).map_err(refused)? != self.pin {
                 continue;
@@ -235,8 +258,9 @@ impl ServerCertVerifier for JoinVerifier {
                     "the certificate matching the join token's pin is not a CA",
                 ));
             }
-            roots.add(cert.clone().into_owned())?;
+            pinned.push(cert);
         }
+        let roots = anchors(pinned)?;
         if roots.is_empty() {
             return Err(refused(
                 "the control plane's chain holds no root matching the join token's pin",
@@ -302,6 +326,25 @@ fn is_ca(cert: &[u8]) -> Result<bool, Error> {
 struct ControlPlaneVerifier {
     inner: Arc<WebPkiServerVerifier>,
     trust_domain: String,
+}
+
+impl ControlPlaneVerifier {
+    /// The check against the roots of `bundle`, as [`anchors`] trusts them.
+    fn new(
+        provider: &Arc<CryptoProvider>,
+        bundle: &[CertificateDer<'_>],
+        trust_domain: &str,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            inner: WebPkiServerVerifier::builder_with_provider(
+                Arc::new(anchors(bundle)?),
+                provider.clone(),
+            )
+            .build()
+            .map_err(|e| Error::General(format!("the trust bundle: {e}")))?,
+            trust_domain: trust_domain.to_string(),
+        })
+    }
 }
 
 impl ServerCertVerifier for ControlPlaneVerifier {
@@ -409,6 +452,69 @@ pub(crate) mod tests {
         params.distinguished_name.push(DnType::CommonName, name);
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params
+    }
+
+    impl Ca {
+        /// A root with the name constraints `ferund init-ca` gives: DNS
+        /// names under `dns`, URIs in `uris`, no IP address.
+        fn constrained_root(name: &str, dns: &[&str], uris: &[&str]) -> Self {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = ca_params(name);
+            params.custom_extensions.push(name_constraints(dns, uris));
+            let cert = params.self_signed(&key).unwrap();
+            Self {
+                cert,
+                issuer: Issuer::new(params, key),
+            }
+        }
+
+        /// An intermediate with those name constraints.
+        fn constrained_intermediate(&self, name: &str, dns: &[&str], uris: &[&str]) -> Self {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = ca_params(name);
+            params.custom_extensions.push(name_constraints(dns, uris));
+            let cert = params.signed_by(&key, &self.issuer).unwrap();
+            Self {
+                cert,
+                issuer: Issuer::new(params, key),
+            }
+        }
+    }
+
+    /// A critical name constraints extension (RFC 5280 4.2.1.10) that
+    /// permits the DNS domains `dns` and the URI hosts `uris` and excludes
+    /// every IPv4 and IPv6 address, written by hand: rcgen has no URI
+    /// subtree.
+    fn name_constraints(dns: &[&str], uris: &[&str]) -> rcgen::CustomExtension {
+        fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            let len = content.len();
+            if len < 0x80 {
+                out.push(len as u8);
+            } else {
+                out.push(0x82);
+                out.extend((len as u16).to_be_bytes());
+            }
+            out.extend_from_slice(content);
+            out
+        }
+        // GeneralSubtree: SEQUENCE { base GeneralName }; dNSName is [2],
+        // uniformResourceIdentifier [6], iPAddress [7], all implicit.
+        let mut permitted = Vec::new();
+        for d in dns {
+            permitted.extend(tlv(0x30, &tlv(0x82, d.as_bytes())));
+        }
+        for u in uris {
+            permitted.extend(tlv(0x30, &tlv(0x86, u.as_bytes())));
+        }
+        let mut excluded = tlv(0x30, &tlv(0x87, &[0; 8]));
+        excluded.extend(tlv(0x30, &tlv(0x87, &[0; 32])));
+        let mut subtrees = tlv(0xa0, &permitted);
+        subtrees.extend(tlv(0xa1, &excluded));
+        let mut ext =
+            rcgen::CustomExtension::from_oid_content(&[2, 5, 29, 30], tlv(0x30, &subtrees));
+        ext.set_criticality(true);
+        ext
     }
 
     pub fn key() -> KeyPair {
@@ -606,14 +712,9 @@ pub(crate) mod tests {
         let root = Ca::root("root");
         let issuer = root.intermediate("issuer");
         let key = key();
-        let mut roots = RootCertStore::empty();
-        roots.add(root.cert.der().clone()).unwrap();
-        let verifier = ControlPlaneVerifier {
-            inner: WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider())
-                .build()
-                .unwrap(),
-            trust_domain: "feos.local".into(),
-        };
+        let verifier =
+            ControlPlaneVerifier::new(&provider(), &[root.cert.der().clone()], "feos.local")
+                .unwrap();
         let leaf = issuer.leaf(
             &["ferun.feos.test"],
             &["spiffe://feos.local/ferun"],
@@ -645,6 +746,94 @@ pub(crate) mod tests {
         refused(
             verify(&verifier, &[&foreign, &other.cert], "ferun.feos.test"),
             "UnknownIssuer",
+        );
+    }
+
+    /// The roots `ferund init-ca` made before ADR 0024 constrain URIs to
+    /// the trust domain, which rustls-webpki cannot check: the root is
+    /// trusted for its key, and an issuer without a URI constraint, as
+    /// `ferund new-issuer` makes, anchors the control plane, on a join and
+    /// after it.
+    #[test]
+    fn a_root_that_constrains_uris_still_anchors_the_control_plane() {
+        let root = Ca::constrained_root("root", &["feos.test"], &["feos.local"]);
+        let issuer = root.constrained_intermediate("issuer", &["feos.test"], &[]);
+        let key = key();
+        let leaf = issuer.leaf(
+            &["ferun.feos.test"],
+            &["spiffe://feos.local/ferun"],
+            ExtendedKeyUsagePurpose::ServerAuth,
+            &key,
+        );
+        let bundle =
+            ControlPlaneVerifier::new(&provider(), &[root.cert.der().clone()], "feos.local")
+                .unwrap();
+        verify(&bundle, &[&leaf, &issuer.cert], "ferun.feos.test").unwrap();
+        let join = join_verifier(&root.cert);
+        verify(&join, &[&leaf, &issuer.cert, &root.cert], "ferun.feos.test").unwrap();
+        // A pod's certificate of the same issuer is still refused.
+        let pod = issuer.leaf(
+            &["ferun.feos.test"],
+            &["spiffe://feos.local/tenant/t/sandbox/s"],
+            ExtendedKeyUsagePurpose::ServerAuth,
+            &key,
+        );
+        refused(
+            verify(&bundle, &[&pod, &issuer.cert], "ferun.feos.test"),
+            "not the control plane",
+        );
+    }
+
+    /// An issuer that constrains URIs, as `ferund init-ca` made before ADR
+    /// 0024, fails every chain to the control plane's URI name: that is
+    /// rustls-webpki's rule, and why such an issuer is replaced.
+    #[test]
+    fn an_issuer_that_constrains_uris_is_refused() {
+        let root = Ca::constrained_root("root", &["feos.test"], &["feos.local"]);
+        let issuer = root.constrained_intermediate("issuer", &["feos.test"], &["feos.local"]);
+        let key = key();
+        let leaf = issuer.leaf(
+            &["ferun.feos.test"],
+            &["spiffe://feos.local/ferun"],
+            ExtendedKeyUsagePurpose::ServerAuth,
+            &key,
+        );
+        let bundle =
+            ControlPlaneVerifier::new(&provider(), &[root.cert.der().clone()], "feos.local")
+                .unwrap();
+        refused(
+            verify(&bundle, &[&leaf, &issuer.cert], "ferun.feos.test"),
+            "NameConstraintViolation",
+        );
+        refused(
+            verify(
+                &join_verifier(&root.cert),
+                &[&leaf, &issuer.cert, &root.cert],
+                "ferun.feos.test",
+            ),
+            "NameConstraintViolation",
+        );
+    }
+
+    /// Only the root's constraints are left out: the issuer's DNS and IP
+    /// constraints still bind the control plane's certificate.
+    #[test]
+    fn the_issuers_name_constraints_still_hold() {
+        let root = Ca::constrained_root("root", &["feos.test"], &["feos.local"]);
+        let issuer = root.constrained_intermediate("issuer", &["feos.test"], &[]);
+        let key = key();
+        let outside = issuer.leaf(
+            &["ferun.other.test"],
+            &["spiffe://feos.local/ferun"],
+            ExtendedKeyUsagePurpose::ServerAuth,
+            &key,
+        );
+        let bundle =
+            ControlPlaneVerifier::new(&provider(), &[root.cert.der().clone()], "feos.local")
+                .unwrap();
+        refused(
+            verify(&bundle, &[&outside, &issuer.cert], "ferun.other.test"),
+            "NameConstraintViolation",
         );
     }
 }

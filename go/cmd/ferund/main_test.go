@@ -65,6 +65,42 @@ func TestInitCA(t *testing.T) {
 	}
 }
 
+// new-issuer makes a new issuer under init-ca's root, which an instance
+// loads with the same pin; it never overwrites.
+func TestNewIssuer(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	root, dir, next := filepath.Join(base, "root"), filepath.Join(base, "ca"), filepath.Join(base, "next")
+	args := []string{"--trust-domain", "feos.test", "--dns-domain", "example.test"}
+	if code, _, errOut := runCmd(append([]string{"init-ca", "--root-dir", root, "--dir", dir}, args...), noEnv); code != 0 {
+		t.Fatalf("init-ca: exit %d: %s", code, errOut)
+	}
+	code, out, errOut := runCmd(append([]string{"new-issuer", "--root-dir", root, "--dir", next}, args...), noEnv)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if !strings.Contains(out, "made a new issuer under the root in "+root) {
+		t.Fatalf("output %q", out)
+	}
+	old, err := pki.LoadIssuer(dir, "feos.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iss, err := pki.LoadIssuer(next, "feos.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if iss.JoinPin() != old.JoinPin() || iss.Certificate().Equal(old.Certificate()) {
+		t.Fatal("the new issuer is not a new one under the same root")
+	}
+	if code, _, errOut := runCmd(append([]string{"new-issuer", "--root-dir", root, "--dir", next}, args...), noEnv); code != 1 || errOut == "" {
+		t.Fatalf("overwrite: exit %d %s", code, errOut)
+	}
+	if code, _, errOut := runCmd([]string{"new-issuer", "--root-dir", root}, noEnv); code != 2 || !strings.Contains(errOut, "--dir is required") {
+		t.Fatalf("usage: exit %d %s", code, errOut)
+	}
+}
+
 // migrate applies the migrations to an empty database; join-token issues
 // a token pinned to the issuer's root, with the trust domain of
 // --trust-domain, straight into the database.

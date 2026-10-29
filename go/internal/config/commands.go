@@ -20,6 +20,7 @@ import (
 const (
 	CmdServe     = "serve"
 	CmdInitCA    = "init-ca"
+	CmdNewIssuer = "new-issuer"
 	CmdJoinToken = "join-token"
 	CmdMigrate   = "migrate"
 )
@@ -33,9 +34,19 @@ type InitCA struct {
 
 // ParseInitCA reads the flags of init-ca (and their variables).
 func ParseInitCA(args []string, getenv func(string) string) (InitCA, error) {
+	return parseCA(CmdInitCA, args, getenv)
+}
+
+// ParseNewIssuer reads the flags of new-issuer, init-ca's: the root's
+// directory is read instead of written.
+func ParseNewIssuer(args []string, getenv func(string) string) (InitCA, error) {
+	return parseCA(CmdNewIssuer, args, getenv)
+}
+
+func parseCA(cmd string, args []string, getenv func(string) string) (InitCA, error) {
 	c := InitCA{TrustDomain: Default().TrustDomain}
-	fs := newFlagSet(CmdInitCA)
-	registerInitCA(fs, &c)
+	fs := newFlagSet(cmd)
+	registerCA(fs, cmd, &c)
 	if err := parseFlags(fs, args, getenv); err != nil {
 		return InitCA{}, err
 	}
@@ -55,8 +66,12 @@ func ParseInitCA(args []string, getenv func(string) string) (InitCA, error) {
 	return c, errors.Join(errs...)
 }
 
-func registerInitCA(fs *flag.FlagSet, c *InitCA) {
-	fs.StringVar(&c.RootDir, "root-dir", c.RootDir, "directory for the root's certificate and key (keep it offline; required)")
+func registerCA(fs *flag.FlagSet, cmd string, c *InitCA) {
+	root := "directory for the root's certificate and key (keep it offline; required)"
+	if cmd == CmdNewIssuer {
+		root = "directory holding the root's certificate and key, root.crt and root.key (keep it offline; required)"
+	}
+	fs.StringVar(&c.RootDir, "root-dir", c.RootDir, root)
 	fs.StringVar(&c.Dir, "dir", c.Dir, "directory for the issuer, issuer.json and bundle.crt: an instance's --ca-dir (required)")
 	fs.StringVar(&c.TrustDomain, "trust-domain", c.TrustDomain, "SPIFFE trust domain")
 	fs.Var((*listValue)(&c.DNSDomains), "dns-domain", "the platform's DNS domain the CA may issue under, repeatable (required)")
@@ -167,8 +182,12 @@ func Usage(w io.Writer, cmd string) {
 		fmt.Fprintln(w, "Usage: ferund [serve] [flags]\n\nRuns an instance of the control plane: the front doors (REST, MCP, the UI, the\nports) and the nodes' port, on the shared PostgreSQL database.")
 	case CmdInitCA:
 		fs = newFlagSet(cmd)
-		registerInitCA(fs, &InitCA{TrustDomain: Default().TrustDomain})
+		registerCA(fs, cmd, &InitCA{TrustDomain: Default().TrustDomain})
 		fmt.Fprintln(w, "Usage: ferund init-ca --root-dir R --dir D --dns-domain X [--dns-domain Y ...] [flags]\n\nMakes the platform CA: the root (its key stays in R, offline) and the issuer\nevery instance holds in its --ca-dir (D). Existing files are never overwritten.")
+	case CmdNewIssuer:
+		fs = newFlagSet(cmd)
+		registerCA(fs, cmd, &InitCA{TrustDomain: Default().TrustDomain})
+		fmt.Fprintln(w, "Usage: ferund new-issuer --root-dir R --dir D --dns-domain X [--dns-domain Y ...] [flags]\n\nMakes a new issuer under the root in R (root.crt, root.key) into D, an instance's\n--ca-dir: issuer.crt, issuer.key, issuer.json and bundle.crt, without a URI\nconstraint (ADR 0024). The root and the join tokens' pin stay. Existing files are\nnever overwritten.")
 	case CmdJoinToken:
 		fs = newFlagSet(cmd)
 		registerJoinToken(fs, &JoinToken{CADir: Default().CADir, TrustDomain: Default().TrustDomain, TTL: JoinTokenTTL,
@@ -186,6 +205,7 @@ FeRun, the control plane of FeOS (ADR 0015).
 Commands:
   serve        run an instance (the default when no command is given)
   init-ca      make the platform CA's root and issuer
+  new-issuer   make a new issuer under the platform CA's root
   join-token   issue a join token for a node or an ingress instance
   migrate      apply the database migrations and exit
 

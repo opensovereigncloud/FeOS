@@ -18,6 +18,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/url"
 	"os"
@@ -149,8 +150,10 @@ func TestInitCAConstraints(t *testing.T) {
 		if len(c.PermittedDNSDomains) != 1 || c.PermittedDNSDomains[0] != testDomain {
 			t.Errorf("%s: permitted DNS %v", c.Subject.CommonName, c.PermittedDNSDomains)
 		}
-		if len(c.PermittedURIDomains) != 1 || c.PermittedURIDomains[0] != testTD {
-			t.Errorf("%s: permitted URI %v", c.Subject.CommonName, c.PermittedURIDomains)
+		// No URI constraint: rustls-webpki fails every URI name beneath
+		// one (ADR 0024).
+		if len(c.PermittedURIDomains) != 0 || len(c.ExcludedURIDomains) != 0 {
+			t.Errorf("%s: URI constraints %v %v", c.Subject.CommonName, c.PermittedURIDomains, c.ExcludedURIDomains)
 		}
 		if len(c.ExcludedIPRanges) != 2 {
 			t.Errorf("%s: excluded IP ranges %v", c.Subject.CommonName, c.ExcludedIPRanges)
@@ -158,6 +161,9 @@ func TestInitCAConstraints(t *testing.T) {
 		if _, ok := c.PublicKey.(*ecdsa.PublicKey); !ok {
 			t.Errorf("%s: key %T, want ECDSA", c.Subject.CommonName, c.PublicKey)
 		}
+	}
+	if iss.ConstrainsURIs() {
+		t.Error("the issuer constrains URIs")
 	}
 	if iss.ControlPlaneDomain() != "ferun."+testDomain {
 		t.Errorf("control-plane domain %q", iss.ControlPlaneDomain())
@@ -167,7 +173,7 @@ func TestInitCAConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	var meta map[string]string
-	if err := json.Unmarshal(raw, &meta); err != nil || meta["controlPlaneDomain"] != "ferun."+testDomain {
+	if err := json.Unmarshal(raw, &meta); err != nil || meta["controlPlaneDomain"] != "ferun."+testDomain || meta["trustDomain"] != testTD {
 		t.Errorf("issuer.json = %s (%v)", raw, err)
 	}
 	for _, f := range []string{filepath.Join(base, "root", RootKeyFile), filepath.Join(base, "ca", IssuerKeyFile)} {
@@ -195,7 +201,10 @@ func TestInitCAConstraints(t *testing.T) {
 		{"DNS outside", &x509.Certificate{DNSNames: []string{"evil.example.com"}}, false},
 		{"IPv4", &x509.Certificate{IPAddresses: []net.IP{net.ParseIP("10.0.0.1")}}, false},
 		{"IPv6", &x509.Certificate{IPAddresses: []net.IP{net.ParseIP("2001:db8::1")}}, false},
-		{"URI outside", &x509.Certificate{URIs: u("spiffe://other.test/x")}, false},
+		// The chain admits a URI of another trust domain since ADR 0024;
+		// issuance never makes one, and every identity is read for the
+		// exact trust domain (ParseNodeID, ParseIngressID, verifyServer).
+		{"URI outside", &x509.Certificate{URIs: u("spiffe://other.test/x")}, true},
 	}
 	for _, c := range checks {
 		c.tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
@@ -204,6 +213,199 @@ func TestInitCAConstraints(t *testing.T) {
 		if (err == nil) != c.ok {
 			t.Errorf("%s: verify err %v, want ok %v", c.name, err, c.ok)
 		}
+	}
+}
+
+// oldRoot writes a root as init-ca made it before ADR 0024, with a URI
+// constraint to the trust domain, into dir, and an issuer of the same
+// kind into caDir; it returns the root.
+func oldRoot(t *testing.T, dir, caDir string) *x509.Certificate {
+	t.Helper()
+	old := func(c *x509.Certificate) {
+		constrain(c, []string{testDomain})
+		c.PermittedURIDomains = []string{testTD}
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber: newSerialT(t), Subject: pkix.Name{CommonName: "old root"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(rootLifetime),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true, IsCA: true, MaxPathLen: 1,
+	}
+	old(tmpl)
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ikey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	itmpl := &x509.Certificate{
+		SerialNumber: newSerialT(t), Subject: pkix.Name{CommonName: "old issuer"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(issuerLifetime),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true, IsCA: true, MaxPathLenZero: true,
+	}
+	old(itmpl)
+	ider, err := x509.CreateCertificate(rand.Reader, itmpl, root, &ikey.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ikeyDER, err := x509.MarshalPKCS8PrivateKey(ikey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{dir, caDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := writeAll([]newFile{
+		{filepath.Join(dir, RootKeyFile), 0o600, pemBlock("PRIVATE KEY", keyDER)},
+		{filepath.Join(dir, RootCertFile), 0o644, pemBlock("CERTIFICATE", der)},
+		{filepath.Join(caDir, IssuerKeyFile), 0o600, pemBlock("PRIVATE KEY", ikeyDER)},
+		{filepath.Join(caDir, IssuerCertFile), 0o644, pemBlock("CERTIFICATE", ider)},
+		{filepath.Join(caDir, BundleFile), 0o644, pemBlock("CERTIFICATE", der)},
+		{filepath.Join(caDir, IssuerJSONFile), 0o644, []byte(`{"controlPlaneDomain":"ferun.` + testDomain + `"}` + "\n")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func newSerialT(t *testing.T) *big.Int {
+	t.Helper()
+	n, err := newSerial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// new-issuer replaces an issuer that constrains URIs with one under the
+// same root that does not: the bundle and the join tokens' pin stay.
+func TestNewIssuer(t *testing.T) {
+	base := t.TempDir()
+	rootDir, oldDir, newDir := filepath.Join(base, "root"), filepath.Join(base, "old"), filepath.Join(base, "new")
+	root := oldRoot(t, rootDir, oldDir)
+	old, err := LoadIssuer(oldDir, testTD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !old.ConstrainsURIs() {
+		t.Fatal("the old issuer does not constrain URIs")
+	}
+	o := InitCAOptions{RootDir: rootDir, Dir: newDir, TrustDomain: testTD, DNSDomains: []string{testDomain}}
+	if err := NewIssuer(o); err != nil {
+		t.Fatal(err)
+	}
+	iss, err := LoadIssuer(newDir, testTD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := iss.Certificate()
+	if iss.ConstrainsURIs() {
+		t.Errorf("the new issuer constrains URIs: %v", c.PermittedURIDomains)
+	}
+	if !nameConstraintsCritical(c) || len(c.PermittedDNSDomains) != 1 || c.PermittedDNSDomains[0] != testDomain ||
+		len(c.ExcludedIPRanges) != 2 {
+		t.Errorf("new issuer's constraints: DNS %v, IP %v", c.PermittedDNSDomains, c.ExcludedIPRanges)
+	}
+	if !c.IsCA || c.MaxPathLen != 0 || !c.MaxPathLenZero || c.NotAfter.After(root.NotAfter) {
+		t.Errorf("new issuer: IsCA %v MaxPathLen %d until %v (root until %v)", c.IsCA, c.MaxPathLen, c.NotAfter, root.NotAfter)
+	}
+	if !iss.Root().Equal(root) || iss.JoinPin() != old.JoinPin() {
+		t.Errorf("the root or the pin changed: %s, want %s", iss.JoinPin(), old.JoinPin())
+	}
+	if c.Equal(old.Certificate()) || publicKeysEqual(c.PublicKey, old.Certificate().PublicKey) {
+		t.Error("the new issuer is the old one")
+	}
+	if iss.ControlPlaneDomain() != "ferun."+testDomain {
+		t.Errorf("control-plane domain %q", iss.ControlPlaneDomain())
+	}
+	if st, err := os.Stat(filepath.Join(newDir, IssuerKeyFile)); err != nil || st.Mode().Perm() != 0o600 {
+		t.Errorf("issuer.key: %v %v", st, err)
+	}
+	if _, err := os.Stat(filepath.Join(newDir, RootKeyFile)); err == nil {
+		t.Error("root.key in the new CA directory")
+	}
+	// The nodes' port's certificate under it verifies against the old
+	// bundle, as a node of either version holds it.
+	cert, err := iss.IssueServer([]string{"ferun." + testDomain}, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyControlPlane(old.Bundle(), "ferun."+testDomain, testTD, cert.Certificate); err != nil {
+		t.Errorf("the control plane under the new issuer: %v", err)
+	}
+
+	// Refusals.
+	if err := NewIssuer(o); err == nil || !strings.Contains(err.Error(), "never overwrites") {
+		t.Errorf("again: %v", err)
+	}
+	same := o
+	same.Dir = rootDir
+	if err := NewIssuer(same); err == nil || !strings.Contains(err.Error(), "must not be the CA directory") {
+		t.Errorf("same directory: %v", err)
+	}
+	outside := o
+	outside.Dir, outside.DNSDomains = filepath.Join(base, "outside"), []string{"other.example"}
+	if err := NewIssuer(outside); err == nil || !strings.Contains(err.Error(), "outside the root's permitted DNS domains") {
+		t.Errorf("DNS domain outside: %v", err)
+	}
+	td := o
+	td.Dir, td.TrustDomain = filepath.Join(base, "td"), "other.test"
+	if err := NewIssuer(td); err == nil || !strings.Contains(err.Error(), "do not permit trust domain") {
+		t.Errorf("trust domain outside: %v", err)
+	}
+	none := o
+	none.RootDir, none.Dir = filepath.Join(base, "nothing"), filepath.Join(base, "none")
+	if err := NewIssuer(none); err == nil {
+		t.Error("a root directory without a root")
+	}
+	// A key that is not the root's.
+	wrongRoot, wrongDir := filepath.Join(base, "wrong-root"), filepath.Join(base, "wrong")
+	if err := os.MkdirAll(wrongRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(rootDir, RootCertFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherDER, err := x509.MarshalPKCS8PrivateKey(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeAll([]newFile{
+		{filepath.Join(wrongRoot, RootCertFile), 0o644, raw},
+		{filepath.Join(wrongRoot, RootKeyFile), 0o600, pemBlock("PRIVATE KEY", otherDER)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wrong := o
+	wrong.RootDir, wrong.Dir = wrongRoot, wrongDir
+	if err := NewIssuer(wrong); err == nil || !strings.Contains(err.Error(), "does not belong") {
+		t.Errorf("wrong key: %v", err)
+	}
+	if entries, _ := os.ReadDir(wrongDir); len(entries) != 0 {
+		t.Errorf("a refused new-issuer left %d files", len(entries))
 	}
 }
 
@@ -397,8 +599,16 @@ func TestLoadIssuerRefusals(t *testing.T) {
 		}
 	})
 	t.Run("trust domain not permitted", func(t *testing.T) {
-		if _, err := LoadIssuer(copyDir(t), "other.test"); err == nil {
-			t.Error("LoadIssuer accepted a trust domain outside the URI constraints")
+		// issuer.json binds the trust domain since ADR 0024.
+		if _, err := LoadIssuer(copyDir(t), "other.test"); err == nil || !strings.Contains(err.Error(), "names trust domain") {
+			t.Errorf("LoadIssuer accepted another trust domain than issuer.json's: %v", err)
+		}
+		// An issuer of before, without the trust domain in issuer.json,
+		// is bound by its URI constraint.
+		base := t.TempDir()
+		oldRoot(t, filepath.Join(base, "root"), filepath.Join(base, "ca"))
+		if _, err := LoadIssuer(filepath.Join(base, "ca"), "other.test"); err == nil || !strings.Contains(err.Error(), "do not permit trust domain") {
+			t.Errorf("LoadIssuer accepted a trust domain outside the URI constraints: %v", err)
 		}
 	})
 	t.Run("key of another issuer", func(t *testing.T) {
