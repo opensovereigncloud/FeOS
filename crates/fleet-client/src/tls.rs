@@ -836,4 +836,60 @@ pub(crate) mod tests {
             "NameConstraintViolation",
         );
     }
+
+    /// A rotation puts a new root beside the old one, under the same name
+    /// (`ferund init-ca` names every root after the trust domain): the
+    /// bundle anchors chains from either, and a chain whose issuer claims
+    /// the name without the key is still refused.
+    #[test]
+    fn a_bundle_of_two_roots_with_one_name_anchors_either() {
+        let old = Ca::constrained_root("root", &["feos.test"], &["feos.local"]);
+        let new = Ca::constrained_root("root", &["feos.test"], &[]);
+        let old_issuer = old.constrained_intermediate("issuer", &["feos.test"], &[]);
+        let new_issuer = new.constrained_intermediate("issuer", &["feos.test"], &[]);
+        let key = key();
+        let ferun = "spiffe://feos.local/ferun";
+        let bundle = ControlPlaneVerifier::new(
+            &provider(),
+            &[old.cert.der().clone(), new.cert.der().clone()],
+            "feos.local",
+        )
+        .unwrap();
+        for issuer in [&old_issuer, &new_issuer] {
+            let leaf = issuer.leaf(
+                &["ferun.feos.test"],
+                &[ferun],
+                ExtendedKeyUsagePurpose::ServerAuth,
+                &key,
+            );
+            verify(&bundle, &[&leaf, &issuer.cert], "ferun.feos.test").unwrap();
+        }
+        // The new root alone: the old issuer's chain has no anchor.
+        let only_new =
+            ControlPlaneVerifier::new(&provider(), &[new.cert.der().clone()], "feos.local")
+                .unwrap();
+        let old_leaf = old_issuer.leaf(
+            &["ferun.feos.test"],
+            &[ferun],
+            ExtendedKeyUsagePurpose::ServerAuth,
+            &key,
+        );
+        refused(
+            verify(&only_new, &[&old_leaf, &old_issuer.cert], "ferun.feos.test"),
+            "BadSignature",
+        );
+        // A join pinned to the new root takes the new chain.
+        let new_leaf = new_issuer.leaf(
+            &["ferun.feos.test"],
+            &[ferun],
+            ExtendedKeyUsagePurpose::ServerAuth,
+            &key,
+        );
+        verify(
+            &join_verifier(&new.cert),
+            &[&new_leaf, &new_issuer.cert, &new.cert],
+            "ferun.feos.test",
+        )
+        .unwrap();
+    }
 }

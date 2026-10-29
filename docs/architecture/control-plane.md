@@ -2797,6 +2797,37 @@ issuer from their start. An issuer that constrains URIs must be replaced
 this way before nodes of ADR 0024's version roll: they refuse the nodes'
 port's certificate under it, and nodes of before accept both.
 
+**Replacing the root**, when its key is lost or it must go: every client
+has to trust the new root before an instance serves under it. A join and
+a renewal answer carry the whole of `bundle.crt`, and `feosd` and
+`ferun-ingress` replace their stored bundle with it; a node reads its
+bundle only when it starts.
+
+1. `ferund init-ca` into new directories. The new root and issuer bear
+   the same names as the old ones; every verifier tries each root of a
+   name, so a bundle may hold both.
+2. `bundle.crt` = the old root and the new one, the issuer still the
+   old; restart the instances. Nothing else changes yet.
+3. The clients take both roots: at their next renewal, with no break,
+   or now. A node now: write the bundle of step 2 into its
+   `bundle.pem` (write a file beside it and rename it over) and restart
+   it gracefully, one node at a time. An ingress instance now: a token
+   pinned to its name in its join file, a graceful restart, then
+   `DELETE /api/v1/admin/ingresses/{name}`; it joins again and gets the
+   bundle.
+4. The new issuer with the bundle of step 2; delete one instance's pod
+   and check that the nodes connect to its replacement, then restart
+   the rest. Join tokens now pin the new root; spend or revoke any
+   token issued before.
+5. Once every client presents a certificate of the new issuer (their
+   renewals; the old ones are revoked when a newer one is first shown),
+   `bundle.crt` = the new root alone, and restart the instances. The
+   clients drop the old root at their next renewal.
+
+Until step 5, rolling the instances back to the old issuer is safe only
+while every node still runs a version from before ADR 0024; roll such
+nodes back first.
+
 ### Moving from the sandbox system
 
 - The front doors stay on port 8100, with the same paths and texts;

@@ -79,7 +79,10 @@ certificate.
   own on the node's most sensitive connection, kept only until
   rustls-webpki checks URI constraints.
 - **A new root without the constraint**: the cleanest result, but every
-  node needs the new root in its bundle, which today means a new join,
-  and every pod and ingress certificate is issued again.
+  node and ingress instance must trust the new root before the instances
+  serve under it, which takes a renewal of every client or a restart and a
+  join again, and every pod and ingress certificate is issued again.
+  Where the old root's key is lost, it is the only way, as on shoot
+  `fecode` ([Replacing the root](../architecture/control-plane.md#the-ca-ceremony)).
 - **Pinning rustls-webpki below 0.103.16**: it would take back a
   security update.
