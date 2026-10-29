@@ -1464,9 +1464,10 @@ func (x *ListNameTablesResponse) GetTables() []*NameTable {
 
 type Mesh struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The cluster's ULA, a /48; empty on a node that is not on a mesh.
+	// The cluster's ULA, a /64 (a /48 as given before ADR 0017's /96s);
+	// empty on a node that is not on a mesh.
 	PodNetwork string `protobuf:"bytes,1,opt,name=pod_network,json=podNetwork,proto3" json:"pod_network,omitempty"`
-	// The node's /64 of it.
+	// The node's /96 of it (a /64 of a /48).
 	PodPrefix string `protobuf:"bytes,2,opt,name=pod_prefix,json=podPrefix,proto3" json:"pod_prefix,omitempty"`
 	// The node's WireGuard public key, 32 bytes.
 	PublicKey []byte `protobuf:"bytes,3,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
@@ -1560,7 +1561,8 @@ type MeshPeer struct {
 	PublicKey []byte `protobuf:"bytes,2,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"`
 	// "host:port" of its device, e.g. "10.0.0.11:51820".
 	Endpoint string `protobuf:"bytes,3,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
-	// Its /64 of the cluster's ULA: the one prefix allowed for it.
+	// Its /96 of the cluster's ULA (a /64 of a /48): the one prefix
+	// allowed for it.
 	PodPrefix     string `protobuf:"bytes,4,opt,name=pod_prefix,json=podPrefix,proto3" json:"pod_prefix,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

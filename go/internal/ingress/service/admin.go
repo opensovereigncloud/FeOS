@@ -58,7 +58,7 @@ type IngressInfo struct {
 	Status    string // model.IngressJoined, model.IngressRemoved
 	JoinedAt  time.Time
 	RemovedAt time.Time
-	// Its place on the pods' mesh: its /64, its address, its WireGuard
+	// Its place on the pods' mesh: its /96, its address, its WireGuard
 	// endpoint and public key (nil: none since its last join).
 	MeshPrefix   string
 	MeshAddress  string

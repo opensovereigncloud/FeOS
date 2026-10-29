@@ -24,7 +24,7 @@ import (
 // form), and a signing request become the instance's name and its first
 // certificate. A token pinned to a name joins that name, created or again
 // (store.RejoinIngress: every older certificate revoked, the WireGuard key
-// cleared and retired, the /64 kept); an unpinned one creates the
+// cleared and retired, the /96 kept); an unpinned one creates the
 // proposed name, or fails ALREADY_EXISTS. A used token answers again, with
 // a new certificate for the name it gave, a Join with the same key within
 // 10 minutes whose first answer may have been lost, as long as nothing

@@ -121,9 +121,9 @@ A pod's network ([ADR 0010](../adr/0010-pod-network.md),
   the mesh whole, at a version; `UpdateMeshPeers` puts and removes peers
   from `from_version` to `version`, and fails with `FAILED_PRECONDITION`
   unless the node has them at `from_version`; both fail with
-  `FAILED_PRECONDITION` on a node that is not on a mesh or has no /64 of
+  `FAILED_PRECONDITION` on a node that is not on a mesh or has no /96 of
   it yet. A peer is a node's name, its WireGuard public key, its endpoint
-  and its /64. `GetMesh` shows the node's ULA, /64, key, port, version and
+  and its /96. `GetMesh` shows the node's ULA, /96, key, port, version and
   peers ([node.md](node.md#the-mesh)).
 - `TrafficService.StreamTrafficRecords` streams flows, drops, DNS queries
   and server names as `feosd` makes them, of one pod or of all; what a

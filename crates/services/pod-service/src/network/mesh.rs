@@ -3,9 +3,9 @@
 
 //! The cluster's mesh (ADR 0017), for a node whose network routes it no
 //! prefix: a WireGuard device, `feos-mesh`, with a key of the node's own,
-//! whose peers are the other nodes, each with its /64 of the cluster's ULA
-//! as the one prefix allowed for it. The control plane gives the node its
-//! /64 and sends it the peers; both are kept in the mesh's directory, the
+//! whose peers are the other nodes, each with its /96 of the cluster's ULA
+//! /64 as the one prefix allowed for it. The control plane gives the node
+//! its /96 and sends it the peers; both are kept in the mesh's directory, the
 //! key too, so that the mesh comes up at feosd's start without the control
 //! plane.
 
@@ -14,10 +14,11 @@ use feos_proto::network_service::{
     Mesh as MeshInfo, MeshPeer, PutMeshPeersRequest, UpdateMeshPeersRequest,
 };
 use feos_utils::wireguard::{self, Key, Peer};
+use futures::TryStreamExt;
 use log::{info, warn};
 use network_service::Prefix;
 use prost::Message;
-use rtnetlink::packet_route::route::RouteType;
+use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteType};
 use rtnetlink::{Handle, LinkWireguard, RouteMessageBuilder};
 use std::collections::BTreeMap;
 use std::fs;
@@ -39,7 +40,7 @@ pub const MTU: u32 = 1420;
 /// The node's private key, 32 bytes, readable by root alone.
 const KEY: &str = "key";
 /// What the control plane gave the node and sent it, as a `Mesh` in
-/// protobuf: the cluster's ULA, the node's /64, the peers' version and
+/// protobuf: the cluster's ULA, the node's prefix, the peers' version and
 /// the peers.
 const STATE: &str = "mesh.pb";
 
@@ -52,27 +53,41 @@ pub struct Config {
     pub port: u16,
 }
 
-/// The cluster's ULA and the node's /64 of it.
+/// The cluster's ULA and the node's prefix of it: a /96 of a /64, or a
+/// /64 of a /48 as the control plane gave them before ADR 0017's /96s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Assignment {
     pub pod_network: (Ipv6Addr, u8),
     pub pod_prefix: (Ipv6Addr, u8),
 }
 
+/// The length of a node's prefix in a cluster's ULA of `network_len`:
+/// a /96 of a /64, a /64 of a /48.
+fn prefix_len(network_len: u8) -> u8 {
+    if network_len == 48 {
+        64
+    } else {
+        96
+    }
+}
+
 impl Assignment {
-    /// What the control plane answered: a /48 of fd00::/8 and a /64 of it.
+    /// What the control plane answered: a /64 of fd00::/8 and a /96 of
+    /// it, or a /48 and a /64 of it.
     pub fn parse(pod_network: &str, pod_prefix: &str) -> Result<Self, String> {
         let network = match pod_network.parse::<Prefix>()? {
-            Prefix::V6(address, 48) if address.octets()[0] == 0xfd => (address, 48),
-            _ => return Err(format!("{pod_network} is not a /48 of fd00::/8")),
+            Prefix::V6(address, len @ (48 | 64)) if address.octets()[0] == 0xfd => (address, len),
+            _ => return Err(format!("{pod_network} is not a /64 or /48 of fd00::/8")),
         };
+        let len = prefix_len(network.1);
         let prefix = match pod_prefix.parse::<Prefix>()? {
-            Prefix::V6(address, 64)
-                if Prefix::V6(network.0, 48).contains(&Prefix::V6(address, 64)) =>
+            Prefix::V6(address, l)
+                if l == len
+                    && Prefix::V6(network.0, network.1).contains(&Prefix::V6(address, l)) =>
             {
-                (address, 64)
+                (address, l)
             }
-            _ => return Err(format!("{pod_prefix} is not a /64 of {pod_network}")),
+            _ => return Err(format!("{pod_prefix} is not a /{len} of {pod_network}")),
         };
         Ok(Self {
             pod_network: network,
@@ -129,6 +144,7 @@ impl Mesh {
         };
         if let Some(assignment) = mesh.assignment() {
             route(handle, assignment.pod_network).await?;
+            remove_stale_routes(handle, assignment).await;
         }
         mesh.sync_peers()?;
         Ok(mesh)
@@ -249,7 +265,7 @@ impl Mesh {
         let mut next = self.state().clone();
         if next.assignment.is_none() {
             return Err(Status::failed_precondition(
-                "the node has no /64 of the mesh yet",
+                "the node has no prefix of the mesh yet",
             ));
         }
         change(&mut next)?;
@@ -349,9 +365,11 @@ fn wireguard_peer(peer: &MeshPeer) -> Result<Peer, String> {
         .endpoint
         .parse::<SocketAddr>()
         .map_err(|_| format!("endpoint {:?} is not host:port", peer.endpoint))?;
+    // A /96, or a /64 as the control plane sent them before ADR 0017's
+    // /96s: peers of both lengths meet while a cluster moves.
     let allowed = match peer.pod_prefix.parse::<Prefix>()? {
-        Prefix::V6(address, 64) => (IpAddr::V6(address), 64),
-        _ => return Err(format!("{} is not a /64", peer.pod_prefix)),
+        Prefix::V6(address, len @ (64 | 96)) => (IpAddr::V6(address), len),
+        _ => return Err(format!("{} is not a /96 or /64", peer.pod_prefix)),
     };
     Ok(Peer {
         public_key,
@@ -379,7 +397,7 @@ async fn device(handle: &Handle) -> io::Result<()> {
     devices::up(handle, index, DEVICE).await
 }
 
-/// Routes the cluster's ULA to the device: the node's own /64 stays
+/// Routes the cluster's ULA to the device: the node's own prefix stays
 /// unreachable but for its pods' addresses, which are longer.
 async fn route(handle: &Handle, (network, len): (Ipv6Addr, u8)) -> io::Result<()> {
     let index = devices::index(handle, DEVICE).await?;
@@ -397,6 +415,73 @@ async fn route(handle: &Handle, (network, len): (Ipv6Addr, u8)) -> io::Result<()
         .map_err(devices::netlink_error(&format!(
             "route {network}/{len} to {DEVICE}"
         )))
+}
+
+/// Removes what an earlier assignment left, at feosd's start, with the
+/// assignment kept, which the network is set up for: routes of the main
+/// table to the device but the cluster's ULA, and unreachable routes in the /48 of
+/// the ULA's Global ID but the node's prefix, as a cluster's /48 and a
+/// node's /64 of before ADR 0017's /96s. A failure is logged.
+async fn remove_stale_routes(handle: &Handle, assignment: Assignment) {
+    if let Err(e) = try_remove_stale_routes(handle, assignment).await {
+        warn!("Mesh: Failed to remove the routes of an earlier prefix: {e}");
+    }
+}
+
+async fn try_remove_stale_routes(handle: &Handle, assignment: Assignment) -> io::Result<()> {
+    const MAIN: u8 = 254;
+    let index = devices::index(handle, DEVICE).await?;
+    let site = Prefix::V6(
+        Ipv6Addr::from(u128::from(assignment.pod_network.0) & !(u128::MAX >> 48)),
+        48,
+    );
+    let routes: Vec<RouteMessage> = handle
+        .route()
+        .get(RouteMessageBuilder::<Ipv6Addr>::new().build())
+        .execute()
+        .try_collect()
+        .await
+        .map_err(devices::netlink_error("list the IPv6 routes"))?;
+    for route in routes {
+        let Some(destination) = destination(&route) else {
+            continue;
+        };
+        let len = route.header.destination_prefix_length;
+        let stale = route.header.table == MAIN
+            && match route.header.kind {
+                RouteType::Unicast => {
+                    route.attributes.contains(&RouteAttribute::Oif(index))
+                        && (destination, len) != assignment.pod_network
+                }
+                RouteType::Unreachable => {
+                    site.contains(&Prefix::V6(destination, len))
+                        && (destination, len) != assignment.pod_prefix
+                }
+                _ => false,
+            };
+        if stale {
+            handle
+                .route()
+                .del(route)
+                .execute()
+                .await
+                .map_err(devices::netlink_error(&format!(
+                    "remove the route {destination}/{len}"
+                )))?;
+            info!("Mesh: Removed the route {destination}/{len} of an earlier prefix");
+        }
+    }
+    Ok(())
+}
+
+fn destination(route: &RouteMessage) -> Option<Ipv6Addr> {
+    route
+        .attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            RouteAttribute::Destination(RouteAddress::Inet6(address)) => Some(*address),
+            _ => None,
+        })
 }
 
 /// The key in `path`, or a new one, written there first.
@@ -487,25 +572,30 @@ mod tests {
             node: node.to_string(),
             public_key: vec![n; 32],
             endpoint: endpoint.to_string(),
-            pod_prefix: format!("fd5e:1b2c:93a0:{subnet:x}::/64"),
+            pod_prefix: format!("fd5e:1b2c:93a0::{subnet:x}:0:0/96"),
         }
     }
 
     fn assignment() -> Assignment {
-        Assignment::parse("fd5e:1b2c:93a0::/48", "fd5e:1b2c:93a0:7::/64").unwrap()
+        Assignment::parse("fd5e:1b2c:93a0::/64", "fd5e:1b2c:93a0::7:0:0/96").unwrap()
     }
 
     #[test]
-    fn assignments_are_a_48_and_a_64_of_it() {
+    fn assignments_are_a_64_and_a_96_of_it() {
         let a = assignment();
-        assert_eq!(a.pod_network, ("fd5e:1b2c:93a0::".parse().unwrap(), 48));
-        assert_eq!(a.pod_prefix, ("fd5e:1b2c:93a0:7::".parse().unwrap(), 64));
+        assert_eq!(a.pod_network, ("fd5e:1b2c:93a0::".parse().unwrap(), 64));
+        assert_eq!(a.pod_prefix, ("fd5e:1b2c:93a0::7:0:0".parse().unwrap(), 96));
         for (network, prefix) in [
+            ("fd5e:1b2c:93a0::/64", "fd5e:1b2c:93a0:1:0:7::/96"),
+            ("fd5e:1b2c:93a0::/64", "fd5e:1b2c:93a0::7:0:0/112"),
+            ("fd5e:1b2c:93a0::/64", "fd5e:1b2c:93a0:0::/64"),
+            ("fd5e:1b2c:93a0::/48", "fd5e:1b2c:93a0::7:0:0/96"),
             ("fd5e:1b2c:93a0::/48", "fd5e:1b2c:93a1:7::/64"),
             ("fd5e:1b2c:93a0::/48", "fd5e:1b2c:93a0::/56"),
             ("fd5e:1b2c::/32", "fd5e:1b2c:93a0:7::/64"),
             ("fc5e:1b2c:93a0::/48", "fc5e:1b2c:93a0:7::/64"),
             ("2001:db8:1::/48", "2001:db8:1:7::/64"),
+            ("fd5e:1b2c:93a0::/56", "fd5e:1b2c:93a0::7:0:0/96"),
             ("", ""),
         ] {
             assert!(
@@ -515,10 +605,23 @@ mod tests {
         }
     }
 
+    /// What the control plane gave before ADR 0017's /96s, and a node kept.
+    #[test]
+    fn a_48_and_a_64_of_it_are_still_taken() {
+        let a = Assignment::parse("fd5e:1b2c:93a0::/48", "fd5e:1b2c:93a0:7::/64").unwrap();
+        assert_eq!(a.pod_network, ("fd5e:1b2c:93a0::".parse().unwrap(), 48));
+        assert_eq!(a.pod_prefix, ("fd5e:1b2c:93a0:7::".parse().unwrap(), 64));
+    }
+
     #[test]
     fn peers_are_checked() {
         assert!(check_peer(&peer("b", 2, "10.0.0.11:51820", 2)).is_ok());
         assert!(check_peer(&peer("b", 2, "[2001:db8::11]:51820", 2)).is_ok());
+        assert!(check_peer(&MeshPeer {
+            pod_prefix: "fd5e:1b2c:93a0:2::/64".to_string(),
+            ..peer("b", 2, "10.0.0.11:51820", 2)
+        })
+        .is_ok());
         let bad = [
             MeshPeer {
                 public_key: vec![2; 31],
@@ -529,6 +632,10 @@ mod tests {
             peer("b", 2, "node-b:51820", 2),
             MeshPeer {
                 pod_prefix: "fd5e:1b2c:93a0::/48".to_string(),
+                ..peer("b", 2, "10.0.0.11:51820", 2)
+            },
+            MeshPeer {
+                pod_prefix: "fd5e:1b2c:93a0::2:0:0/112".to_string(),
                 ..peer("b", 2, "10.0.0.11:51820", 2)
             },
         ];
@@ -576,7 +683,7 @@ mod tests {
         assert!(load_or_make_key(&path).is_err());
     }
 
-    /// Updates start at the version the node has; without a /64, there is
+    /// Updates start at the version the node has; without a prefix, there is
     /// nothing to put peers on. The device is not touched: sync_peers is
     /// left out of these.
     #[tokio::test]

@@ -36,7 +36,7 @@ const (
 )
 
 // joinMesh is JoinMesh (ADR 0017): the node, named by its certificate,
-// which must pass CheckNode's conditions, gets its /64 of the cluster's
+// which must pass CheckNode's conditions, gets its /96 of the cluster's
 // ULA, the next subnet ID at its first call and the same one after it, and
 // its key and endpoint make it a peer of the others. A key of small order
 // is INVALID_ARGUMENT, a new key that another node or an ingress holds
@@ -89,9 +89,9 @@ func (s *Service) joinMesh(ctx context.Context, req *fleetv1.JoinMeshRequest) (*
 		return err
 	})
 	if errors.Is(err, store.ErrMeshExhausted) {
-		s.log.Error("a node cannot join the pods' mesh: every /64 of it has been handed out", "node", p.Node,
+		s.log.Error("a node cannot join the pods' mesh: every /96 of it has been handed out", "node", p.Node,
 			"pod_network", ula.String())
-		return nil, status.Errorf(codes.ResourceExhausted, "every /64 of the pod network %s has been handed out", ula)
+		return nil, status.Errorf(codes.ResourceExhausted, "every /96 of the pod network %s has been handed out", ula)
 	}
 	if errors.Is(err, store.ErrMeshKeyTaken) {
 		s.rl.warn("mesh-key", "JoinMesh refused: the node's key is another peer's", "node", p.Node)

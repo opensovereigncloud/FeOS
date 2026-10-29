@@ -1,6 +1,6 @@
 # ADR 0017: A WireGuard mesh carries pods' IPv6 between nodes that their network routes no prefix to
 
-**Status:** Proposed · **Date:** 2026-10-17
+**Status:** Proposed · **Date:** 2026-10-17 · a /96 per node of a /64 per cluster since 2026-10-29
 
 ## Context
 
@@ -30,26 +30,40 @@ nothing but a pod's own node put the pod's address on a packet.
 
 ## Decision
 
-### A ULA /48 per cluster, a /64 per node
+### A ULA /64 per cluster, a /96 per node
 
 - A cluster's pod network is routed, every node with a prefix that its
-  network routes to it (ADR 0010), or a mesh, every node with a /64 of the
+  network routes to it (ADR 0010), or a mesh, every node with a /96 of the
   cluster's own ULA. The control plane is set up for one of the two, for
   all its nodes.
-- A meshed cluster's ULA is a /48: `fd` and a Global ID of 40 random bits
-  (RFC 4193, section 3.2). The control plane draws it when its database
-  is created and keeps it there; an operator may give one instead, such
-  as to keep apart two clusters that will be joined.
-- The control plane gives every node a /64 of it, the next subnet ID,
-  when the node first connects after its join, and never gives a subnet
+- A meshed cluster's ULA is a /64: `fd`, a Global ID of 40 random bits
+  (RFC 4193, section 3.2) and subnet ID 0. The control plane draws it
+  when its database is created and keeps it there; an operator may give
+  one instead, any /64 of `fd00::/8`, such as to keep apart two clusters
+  that will be joined.
+- The control plane gives every node a /96 of it, the next ID, in bits 64
+  to 95, when the node first connects after its join, and never gives an
   ID out twice: a member set that still names a removed node's pods
-  (ADR 0012) never lets in the pods of another node. Subnet 0 is not
-  given to a node. A cluster has room for 65,535 joins.
-- The /64 is the node's pod prefix, as `--pod-prefix` names it in ADR
+  (ADR 0012) never lets in the pods of another node. ID 0 is not given to
+  a node. A cluster has room for 4,294,967,295 joins, and a node for as
+  many pods' addresses, which it never hands out twice either.
+- The shape is a cloud's: GCP gives every VM's interface a /96 of its
+  subnet's /64, and AWS delegates /80s. A cluster is one /64, which a
+  network routes, filters or peers as one subnet, and a node's prefix
+  has the same length on a mesh as on GCP's routed network.
+- The /96 is the node's pod prefix, as `--pod-prefix` names it in ADR
   0010: `feosd` keeps it in its state directory and hands out its
   addresses as before, across restarts and renewals of its certificate,
   for as long as the node is in the fleet. A node that joins anew gets a
   new one. A node of a meshed cluster refuses `--pod-prefix`.
+- A cluster meshed on a /48 before keeps its Global ID: its ULA becomes
+  the /64 of subnet 0 of the /48, which was never given to a node, and
+  every node and ingress instance keeps its number, now an ID of a /96.
+  The new prefixes share no address with the old /64s, so a member set
+  that still names an old address lets in nobody. A node takes its new
+  /96 at `feosd`'s next start, as it takes any changed prefix; its kept
+  pods get addresses of it as ADR 0010's kept pods of an earlier network
+  do. `feosd` takes both shapes, so it is rolled first.
 
 ### A WireGuard device on every node
 
@@ -62,17 +76,17 @@ nothing but a pod's own node put the pod's address on a packet.
   reaches the control plane, or the one it is configured with where the
   nodes reach each other at another.
 - Every other node of the cluster is a peer: its public key, its endpoint
-  and its /64 as the one prefix allowed for it. WireGuard routes by these
-  prefixes: a packet leaves for the peer whose /64 holds its destination,
+  and its /96 as the one prefix allowed for it. WireGuard routes by these
+  prefixes: a packet leaves for the peer whose /96 holds its destination,
   and a packet that comes in counts only when that peer's key
-  authenticated it and its source lies in that peer's /64. A node speaks
+  authenticated it and its source lies in that peer's /96. A node speaks
   for its own pods alone, and nothing without a node's key speaks at all,
   a pod that sends to another node's port through its own node's
   masquerade included.
-- The node routes the cluster's /48 to the device. Its own /64 stays as
+- The node routes the cluster's /64 to the device. Its own /96 stays as
   ADR 0010 has it: unreachable, but for the pods' /128s on their TAPs.
 - The reverse path rule of ADR 0010 holds for the mesh: a packet with a
-  source in the cluster's /48 comes in through the mesh or through its
+  source in the cluster's /64 comes in through the mesh or through its
   pod's TAP, or it is dropped.
 - The device's MTU is 1420, WireGuard's, which leaves room for its
   headers over either family on a network of 1500.
@@ -128,7 +142,7 @@ nothing but a pod's own node put the pod's address on a packet.
   delivers an inner packet of any source, a pod's own too, sent through
   its node's masquerade with the node's address as its source. The mesh
   would need rules of its own: VXLAN from peers alone, pods kept off the
-  peers' addresses, and each peer's inner sources checked against its /64,
+  peers' addresses, and each peer's inner sources checked against its /96,
   with nftables' matching of inner headers (Linux 6.2). Its packets are
   not encrypted, and an Ethernet overlay needs a forwarding entry, a
   neighbor entry and a route per peer, where WireGuard needs a prefix.
@@ -155,8 +169,13 @@ nothing but a pod's own node put the pod's address on a packet.
   octet>::/64`: not random, so every cluster that copies the scheme has
   the same addresses, and an address the network gives a node again
   brings back the prefix of the node that had it.
-- **A /80 per node**, as ADR 0010 allows: room for 2^32 joins, but a /64
-  is what ADR 0010 calls best, and 65,535 joins are enough.
+- **A /48 per cluster and a /64 per node**, as this ADR first decided:
+  a /64 is what ADR 0010 calls best, but a cluster takes 65,536 /64s
+  that no network routes as one subnet, and 65,535 joins are few for
+  nodes that come and go with a cloud's autoscaler.
+- **A /80 per node**, as AWS delegates: 32 bits of joins from a /48, or
+  16 bits from a /64. A /96 of a /64 has the same 32 bits of joins, the
+  cluster in one /64, and the length that GCP gives a VM.
 - **No IPv6 in pods**: security groups and pods reaching each other would
   lose the address they rest on (ADR 0010, ADR 0012).
 - **IPv4 first in `/etc/gai.conf`**: glibc alone reads it, not musl or
@@ -174,19 +193,19 @@ nothing but a pod's own node put the pod's address on a packet.
   where their security groups allow, at addresses unique in the cluster.
   They reach the internet over IPv4 alone, at once.
 - ADR 0010's every node needing a prefix routed to it becomes a prefix
-  routed to it, or a /64 of its cluster's mesh.
+  routed to it, or a /96 of its cluster's mesh.
 - `feosd` gains the mesh's device and key, the peers on disk with their
   versions, the peers' endpoints among the denied addresses, and the
   guest's routes. `feos.fleet.v1` carries a node's key and endpoint and
-  hands it its /64; `feos.network.v1` gets the peers.
-- The control plane keeps the cluster's /48, the subnet IDs it gave out,
+  hands it its /96; `feos.network.v1` gets the peers.
+- The control plane keeps the cluster's /64, the IDs it gave out,
   and the nodes' keys and endpoints in their rows, and sends the peers
   over the node connections.
 - The kernel needs WireGuard: Debian's has it as a module; the kernel of
   `feos-host-init` needs `CONFIG_WIREGUARD`.
 - The nodes' network has to pass UDP on the mesh's port between them, and
   every packet between nodes costs encryption.
-- Nodes that took a ULA by hand, as the lab's, move to a /64 of their
+- Nodes that took a ULA by hand, as the lab's, move to a /96 of their
   cluster's; their kept pods get addresses of it as ADR 0010's kept pods
   of an earlier network do.
 - A node without a control plane, as a lab with `feosctl` alone, has no
@@ -201,9 +220,9 @@ nothing but a pod's own node put the pod's address on a packet.
   meshed nodes' pods.
 - **Peers that are not nodes**: the control plane's front doors and load
   balancers reaching pods' ports over IPv6 (ADR 0010), at addresses of
-  subnet 0. Answered by ADR 0021: the ingress's instances are the
-  first peers that are not nodes. They take /64s of the same counter, so
-  nodes need no other kind of peer. Subnet 0 stays reserved.
+  ID 0. Answered by ADR 0021: the ingress's instances are the
+  first peers that are not nodes. They take /96s of the same counter, so
+  nodes need no other kind of peer. ID 0 stays reserved.
 - **Nodes that cannot reach each other's endpoints**, both behind NAT: a
   relay.
 - **NAT66** for meshed nodes that have IPv6 of their own.

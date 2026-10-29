@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package mesh is the arithmetic of the pods' mesh (ADR 0017): the
-// cluster's ULA, a /48 with a Global ID of 40 random bits (RFC 4193,
-// section 3.2); a node's /64 of it, the subnet ID in bits 48 to 63; the
-// endpoints of the nodes' WireGuard devices; and the deltas of the peers
-// that the leader sends every node.
+// cluster's ULA, a /64 with a Global ID of 40 random bits (RFC 4193,
+// section 3.2) and subnet ID 0; a node's /96 of it, its ID in bits 64 to
+// 95, as GCP gives a VM a /96 of its subnet's /64; the endpoints of the
+// nodes' WireGuard devices; and the deltas of the peers that the leader
+// sends every node.
 package mesh
 
 import (
@@ -19,10 +20,17 @@ import (
 	"strings"
 )
 
-// The subnet IDs a node can get: 0 is never given to a node.
+// The IDs a node or an ingress instance can get, of its /96 of the
+// ULA: 0 is never given out.
 const (
 	FirstSubnet = 1
-	LastSubnet  = 65535
+	LastSubnet  = 1<<32 - 1
+)
+
+// The lengths of the cluster's ULA and of a node's prefix of it.
+const (
+	NetworkBits = 64
+	PrefixBits  = 96
 )
 
 // KeyLen is the length of a WireGuard public key.
@@ -56,24 +64,31 @@ func CheckKey(key []byte) error {
 	return nil
 }
 
-// Draw returns a new ULA /48: fd and a Global ID of 40 random bits.
+// Draw returns a new ULA /64: fd, a Global ID of 40 random bits and
+// subnet ID 0.
 func Draw() (netip.Prefix, error) {
 	var a [16]byte
 	a[0] = 0xfd
 	if _, err := rand.Read(a[1:6]); err != nil {
 		return netip.Prefix{}, fmt.Errorf("draw the pod network's Global ID: %w", err)
 	}
-	return netip.PrefixFrom(netip.AddrFrom16(a), 48), nil
+	return netip.PrefixFrom(netip.AddrFrom16(a), NetworkBits), nil
 }
 
-// NodePrefix is the /64 of subnet in ula.
-func NodePrefix(ula netip.Prefix, subnet int) netip.Prefix {
+// FromLegacy is the ULA /64 of a cluster that was meshed on a /48 before
+// nodes got /96s: subnet 0 of the /48, which was never given to a node.
+func FromLegacy(ula48 netip.Prefix) netip.Prefix {
+	return netip.PrefixFrom(ula48.Masked().Addr(), NetworkBits)
+}
+
+// NodePrefix is the /96 of id in ula, the ID in bits 64 to 95.
+func NodePrefix(ula netip.Prefix, id int) netip.Prefix {
 	a := ula.Masked().Addr().As16()
-	a[6], a[7] = byte(subnet>>8), byte(subnet)
-	return netip.PrefixFrom(netip.AddrFrom16(a), 64)
+	a[8], a[9], a[10], a[11] = byte(id>>24), byte(id>>16), byte(id>>8), byte(id)
+	return netip.PrefixFrom(netip.AddrFrom16(a), PrefixBits)
 }
 
-// HostAddress is a peer's own address on its /64: the prefix's network
+// HostAddress is a peer's own address on its prefix: the prefix's network
 // address with its last byte 1, <prefix>::1 (an IPv4 prefix's in its own
 // family; an invalid prefix has the zero Addr). An ingress instance's
 // address is the HostAddress of its prefix.
@@ -99,7 +114,7 @@ const ingressPeerPrefix = "ingress."
 
 // IngressPeerName is the key of ingress instance name among the mesh's
 // peers (Peer.Node and the keys of Peers.Nodes): "ingress.<name>". Nodes
-// see an ingress instance as one more peer with a /64.
+// see an ingress instance as one more peer with a /96.
 func IngressPeerName(name string) string { return ingressPeerPrefix + name }
 
 // IsIngressPeer reports whether key, a key of the mesh's peers, is an

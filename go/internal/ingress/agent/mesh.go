@@ -137,7 +137,7 @@ func (a *Agent) syncPeers() {
 	}
 }
 
-// wgPeers are the device's peers for a mesh: each node with its /64 as
+// wgPeers are the device's peers for a mesh: each node with its /96 as
 // its only allowed prefix, its endpoint and keepalive 25 s. Nodes that
 // cannot be peers are left out and described in problems.
 func wgPeers(m wire.Mesh) (peers []wg.Peer, problems []string) {

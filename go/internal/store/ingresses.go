@@ -20,7 +20,7 @@ import (
 
 // The ingress's instances (ADR 0021): ferun-ingress joins with a join token
 // of kind model.JoinKindIngress, holds certificates of its own
-// (ingress_certs), and is a peer of the pods' mesh with a /64 from the
+// (ingress_certs), and is a peer of the pods' mesh with a /96 from the
 // nodes' sequence. Its address, <prefix>::1, is a member of the security
 // group model.IngressPeersGroup, whose version is
 // pod_network.ingress_group_version: bumped under that row's lock in the
@@ -74,7 +74,7 @@ type Ingress struct {
 	JoinedAt  time.Time
 	RemovedAt time.Time
 
-	// The instance on the pods' mesh: its subnet ID (0: none yet), its /64
+	// The instance on the pods' mesh: its ID (0: none yet), its /96
 	// and its address there, <prefix>::1 (both "" without a subnet), and
 	// its WireGuard key (nil: none since the last join) and endpoint.
 	MeshSubnet    int
@@ -98,7 +98,7 @@ type Ingress struct {
 }
 
 // MeshPeer reports whether the ingress is a peer of the mesh: it has its
-// /64, a key and an endpoint. A removed ingress is nobody's peer, whatever
+// /96, a key and an endpoint. A removed ingress is nobody's peer, whatever
 // this says.
 func (g *Ingress) MeshPeer() bool {
 	return g.MeshSubnet != 0 && len(g.MeshPublicKey) == mesh.KeyLen && g.MeshEndpoint != ""
@@ -116,7 +116,7 @@ const ingressCols = `name, status, joined_at, removed_at, mesh_subnet, mesh_pref
 func scanIngress(row pgx.Row) (Ingress, error) {
 	var g Ingress
 	var removed, seen, left *time.Time
-	var subnet *int32
+	var subnet *int64
 	if err := row.Scan(&g.Name, &g.Status, &g.JoinedAt, &removed, &subnet, &g.MeshPrefix, &g.MeshAddress,
 		&g.MeshPublicKey, &g.MeshEndpoint, &g.PreviousMeshPublicKey, &g.GroupVersion, &g.CurrentSerial, &g.Version, &seen,
 		&left); err != nil {
@@ -224,7 +224,7 @@ func (s *Store) RejoinIngress(ctx context.Context, name string) error {
 // RemoveIngress marks an ingress removed (status, removed_at) and revokes
 // every certificate of it ("removed"). An ingress that was not removed yet
 // leaves model.IngressPeersGroup (its group version is bumped, when it had
-// an address) and stops being a peer of the mesh; its /64 is never given
+// an address) and stops being a peer of the mesh; its /96 is never given
 // out again. ferun_ingress "ingress:<name>" is sent. It reports whether
 // the ingress exists. It runs in a transaction of its own unless the Store
 // is in one.
@@ -264,7 +264,7 @@ func (s *Store) RemoveIngress(ctx context.Context, name string) (bool, error) {
 }
 
 // IngressMeshJoin is what JoinIngressMesh made of an ingress: its subnet
-// ID, /64 and address; Changed when its subnet, prefix, key or endpoint
+// ID, /96 and address; Changed when its subnet, prefix, key or endpoint
 // changed, which bumped the peers' version; AddressChanged when its
 // address entered model.IngressPeersGroup (or moved), which bumped the
 // group's version.
@@ -283,7 +283,7 @@ type IngressMeshJoin struct {
 // cleared is ErrIngressKeyRetired, and a key that a node or another
 // ingress holds is ErrMeshKeyTaken (checkMeshKey). An
 // ingress without a subnet ID gets the next one of the nodes' sequence
-// (ErrMeshExhausted when none is left); its prefix is the subnet's /64 of
+// (ErrMeshExhausted when none is left); its prefix is the subnet's /96 of
 // ula and its address the prefix's mesh.HostAddress. When its address
 // enters model.IngressPeersGroup, the group's version goes up and becomes
 // the row's group_version. When the subnet, prefix, key or endpoint

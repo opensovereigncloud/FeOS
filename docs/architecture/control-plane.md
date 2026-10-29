@@ -82,7 +82,7 @@ kind ([The ingress](#the-ingress)).
 | `--session-ttl` | `12h` | the absolute lifetime of a UI session |
 | `--bootstrap-token` | none | becomes a token of the tenant `operator` while no tenant exists |
 | `--mcp-allowed-origins` | none | the Origins `/mcp` accepts; empty refuses every request with an Origin |
-| `--pod-network` | empty | the pods' network ([The pods' mesh](#the-pods-mesh)): empty, routed, every node with a prefix of its network's; `mesh`, a ULA /48 drawn at the first start and kept in the database; or such a /48, `fdXX:XXXX:XXXX::/48` |
+| `--pod-network` | empty | the pods' network ([The pods' mesh](#the-pods-mesh)): empty, routed, every node with a prefix of its network's; `mesh`, a ULA /64 drawn at the first start and kept in the database; or such a /64, `fdXX:XXXX:XXXX::/64` (a /48 stands for its /64 of subnet 0) |
 | `--apps-zone` | empty | the DNS zone of public environments' default hosts, `<label>.<zone>`, which `ferun-ingress` serves ([The ingress](#the-ingress)); empty: no hosts, and no environment can be made public |
 | `--default-image` | `ghcr.io/maltej/debian-ai:latest` | the image of a sandbox created without one |
 | `--default-vcpus`, `--default-memory-mib` | 2, 512 | the size of a sandbox created without one |
@@ -132,7 +132,7 @@ of `proto/` is in `go/gen/feos/<api>/v1` (`make go-gen`), the rest in
 | `model` | value types and errors that several packages share |
 | `activity` | ferund's rows of the activity log, written in batches; the partitions of the log |
 | `pki` | the CA: issuer, certificates, signing requests, SPIFFE IDs, join tokens and pins, HPKE |
-| `mesh` | the pods' mesh: the ULA, a node's /64, endpoints, the peers' deltas |
+| `mesh` | the pods' mesh: the ULA, a node's /96, endpoints, the peers' deltas |
 | `nodelink` | the nodes' port: TLS, ALPN, the node connections and their budgets, the uplink, join and refusal servers |
 | `fleet` | `feos.fleet.v1`: joins, renewals, telemetry, events, pods' credentials, the mesh, the nodes' liveness; the mesh's peers to the nodes |
 | `leader` | the leader lease and the leader's loops, the instance's heartbeat |
@@ -646,14 +646,18 @@ row is never deleted: removal is a status. Its statuses: `joined`, `ready`
 Where the network routes no prefix to the nodes, their pods' IPv6 goes
 over a WireGuard mesh between them
 ([ADR 0017](../adr/0017-pod-mesh.md)); the node's side is in
-[node.md](node.md). The control plane gives every node its /64 and sends
+[node.md](node.md). The control plane gives every node its /96 and sends
 every node the others as its peers.
 
-- **The ULA.** `--pod-network mesh` draws a /48, `fd` and a Global ID of
-  40 random bits, when the database has none, and keeps it in
-  `pod_network`; `--pod-network fdXX:XXXX:XXXX::/48` keeps that one. Every
-  later start keeps the database's: an instance whose `--pod-network` is
-  empty while the database is meshed, or names another /48, does not
+- **The ULA.** `--pod-network mesh` draws a /64, `fd`, a Global ID of
+  40 random bits and subnet ID 0, when the database has none, and keeps it
+  in `pod_network`; `--pod-network fdXX:XXXX:XXXX::/64` keeps that one,
+  and a /48 stands for its /64 of subnet 0. Migration `0011` moved a
+  database meshed on a /48 to that /64, every node and ingress keeping
+  its number, and counted the peers' and `ferun-ingress`'s versions up.
+  Every later start keeps the database's: an instance whose
+  `--pod-network` is empty while the database is meshed, or names another
+  /64, does not
   start ("the database's cluster is meshed on …"). A cluster does not
   move between a routed network and a mesh, nor between meshes.
 - **`JoinMesh`**, on the uplink, takes the node's name from its
@@ -670,16 +674,17 @@ every node the others as its peers.
   its own row's and before it checks, since feosd keeps one device peer
   per key and two peers with one key would take each other's prefix.
   Under the node's row lock, a node without a
-  subnet ID gets the next of the sequence `mesh_subnets`, 1 to 65535,
+  subnet ID gets the next of the sequence `mesh_subnets`, 1 to 2^32 - 1,
   which never hands one out twice (`RESOURCE_EXHAUSTED` once it ends), and
-  its /64 is the ULA with the ID in bits 48 to 63; the same node gets the
-  same one on every call. The key and the endpoint are stored beside it,
+  its /96 is the ULA with the ID in bits 64 to 95; the same node gets the
+  same one on every call, computed anew from the ULA, so that a row of a
+  /48 gets its /96. The key and the endpoint are stored beside it,
   in `nodes`.
 - **The peers' version.** Every change of who the peers are counts up
   `pod_network.peers_version` in its transaction and sends the hint
   `mesh-peers` on `ferun_leader`: a node's first subnet, a new key or
   endpoint, a peer's removal, and a pinned re-join, which takes the node
-  off the mesh until it asks again, for a new /64. A removed node keeps
+  off the mesh until it asks again, for a new /96. A removed node keeps
   its subnet ID, which is never given to another. Down nodes stay peers.
 - **Distribution.** The leader's loop `mesh-peers` reads the peers and
   their version in one statement, every 15 s and when the hint or a
@@ -697,11 +702,11 @@ every node the others as its peers.
   connection to it gone, it is forgotten.
 - **Ingress peers.** The instances of `ferun-ingress` are the first peers
   that are not nodes ([ADR 0021](../adr/0021-ingress.md)): each takes a
-  /64 of the same sequence at its first Hello after its first join, keeps
+  /96 of the same sequence at its first Hello after its first join, keeps
   it across joins, and uses `<prefix>::1`. The peers are the nodes and
   the ingress instances that are not removed and have a subnet, a key and
   an endpoint, an instance under the name `ingress.<name>`, so that
-  `feosd`, which takes /64 peers alone, needs nothing new. An instance's
+  `feosd`, which takes peers of a node's length, needs nothing new. An instance's
   first subnet, a new key or endpoint, a re-join and a removal count the
   peers' version up. A change of the peers also sends `ferun_ingress`
   `mesh`, and the ingress gets the nodes in its table
@@ -709,7 +714,7 @@ every node the others as its peers.
   fixed from its first Hello after a join; a join again clears it and
   refuses it at the next Hello, so that every join brings a new key, and
   no other peer may hold it.
-- **The admin API** shows a node's /64 and endpoint as `meshPrefix` and
+- **The admin API** shows a node's /96 and endpoint as `meshPrefix` and
   `meshEndpoint`, and an ingress instance's in `GET
   /api/v1/admin/ingresses`.
 
@@ -2471,7 +2476,7 @@ port](#the-nodes-port), [api.md](api.md#the-ingresss-api)), from
   `feos-ingress-join-<secret>`, into the instance's name and first
   certificate, `spiffe://<td>/ingress/<name>`; a token pinned to a name
   joins it again (its certificates revoked, its WireGuard key cleared and
-  retired, its /64 kept). **RenewCertificate** renews only the
+  retired, its /96 kept). **RenewCertificate** renews only the
   instance's newest certificate (the current one, or, while none is, the
   newest not revoked), never one revoked, also from a time ahead, for its
   own key alone, and not before its renew time less 10 minutes, so that a
@@ -2479,7 +2484,7 @@ port](#the-nodes-port), [api.md](api.md#the-ingresss-api)), from
   makes the presenting certificate current, superseding the older ones
   10 minutes ahead, and puts the instance on the mesh with its fixed key
   ([The pods' mesh](#the-pods-mesh)); its answer is the ULA, the
-  instance's /64 and address, the apps zone and the answering instance.
+  instance's /96 and address, the apps zone and the answering instance.
   `ingress_certs` records every certificate.
 - **Sync** streams the instance's table: whole, then the environments
   put and removed, the mesh's nodes when their version changes, `Self`
@@ -2674,6 +2679,12 @@ that dial the instances.
   marker for an ordinary failure, so that a guest marked busy is
   reported unreachable and a repair's busy `StopPod` is followed by a
   `StartPod`.
+  The one exception is migration `0011`, the mesh's /96s
+  ([The pods' mesh](#the-pods-mesh)): a feosd of before refuses a /96 and
+  every list of peers that holds one, so roll feos-node first, where its
+  ferund is already of 0011's base, then ferund, then restart feos-node's
+  pods, at which each node takes its /96. Until that restart, pods on
+  different nodes do not reach each other over the mesh.
 
 ### Requirements
 

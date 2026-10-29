@@ -51,8 +51,8 @@ type Node struct {
 	ReconciledAt         time.Time
 	ReconcileRequestedAt time.Time
 
-	// The node on the pods' mesh (ADR 0017): its subnet ID (0: none yet),
-	// its /64, and its WireGuard key and endpoint (none before JoinMesh).
+	// The node on the pods' mesh (ADR 0017): its ID (0: none yet),
+	// its /96, and its WireGuard key and endpoint (none before JoinMesh).
 	MeshSubnet    int
 	MeshPrefix    string
 	MeshPublicKey []byte
@@ -103,7 +103,7 @@ func nodeScanTargets(n *Node) ([]any, func()) {
 	var downSince, removedAt, drainStarted, stoppingUntil, forkedAt, reconciledAt, requestedAt *time.Time
 	var startID *uuid.UUID
 	var overcommit float32
-	var subnet *int32
+	var subnet *int64
 	targets := []any{&n.Name, &n.Status, &n.StatusDescription, &downSince, &removedAt, &n.Draining, &drainStarted,
 		&n.Slots, &n.MemHeadroomBytes, &overcommit, &n.Hostname, &n.Arch, &n.CPUModel, &n.CPUCores,
 		&n.MemoryTotalBytes, &n.DiskTotalBytes, &n.Versions, &n.ObjectStore, &n.ObjectStoreID, &n.PodPrefix,
@@ -162,7 +162,7 @@ func (s *Store) InsertNode(ctx context.Context, name string) (bool, error) {
 // RejoinNode resets a node for a join with a token pinned to its name: the
 // row (inserted if missing, then locked) becomes joined, not removed, not
 // forked, without a current serial or description (draining stays), off
-// the pods' mesh, whose /64 it gets anew (ADR 0017), and holding no
+// the pods' mesh, whose /96 it gets anew (ADR 0017), and holding no
 // version of model.IngressPeersGroup (ferun_ingress "*" when it held one);
 // every earlier certificate of the node is revoked ("rejoined");
 // ferun_node is sent, so that the old connections close everywhere.
@@ -396,7 +396,7 @@ func (s *Store) SetNodeDescription(ctx context.Context, name, description string
 
 // RemoveNode marks a node removed (status, removed_at), revokes every
 // certificate of it ("removed") and sends ferun_node. A node on the pods'
-// mesh stops being the others' peer; its /64 is never given out again.
+// mesh stops being the others' peer; its /96 is never given out again.
 // The caller holds the row FOR UPDATE and has checked the node's
 // sandboxes.
 func (s *Store) RemoveNode(ctx context.Context, name string) (Node, error) {

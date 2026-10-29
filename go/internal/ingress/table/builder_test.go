@@ -425,10 +425,10 @@ func TestBuilderMesh(t *testing.T) {
 		t.Fatalf("peers before the mesh %+v", s.Mesh)
 	}
 	if _, err := f.d.Pool.Exec(bg, `INSERT INTO pod_network (id, ula, peers_version, ingress_group_version)
-		VALUES (true, 'fd12:3456:789a::/48', 1, 4)`); err != nil {
+		VALUES (true, 'fd12:3456:789a::/64', 1, 4)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.d.Pool.Exec(bg, `UPDATE nodes SET mesh_subnet = 1, mesh_prefix = 'fd12:3456:789a:1::/64',
+	if _, err := f.d.Pool.Exec(bg, `UPDATE nodes SET mesh_subnet = 1, mesh_prefix = 'fd12:3456:789a::1:0:0/96',
 		mesh_public_key = $1, mesh_endpoint = '10.0.0.1:51820' WHERE name = 'n1'`, make([]byte, 32)); err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +436,7 @@ func TestBuilderMesh(t *testing.T) {
 		t.Fatal(err)
 	}
 	s = await(t, b, time.Second, "the node peer", func(s *Snapshot) bool { return len(s.Mesh.Peers) == 1 })
-	if p := s.Mesh.Peers[0]; p.Name != "n1" || p.Endpoint != "10.0.0.1:51820" || p.Prefix != "fd12:3456:789a:1::/64" ||
+	if p := s.Mesh.Peers[0]; p.Name != "n1" || p.Endpoint != "10.0.0.1:51820" || p.Prefix != "fd12:3456:789a::1:0:0/96" ||
 		s.Mesh.Version != 1 || s.GroupVersion != 4 {
 		t.Fatalf("mesh %+v, group version %d", s.Mesh, s.GroupVersion)
 	}

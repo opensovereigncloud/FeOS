@@ -161,7 +161,7 @@ func TestJoinAgainAfterRemoval(t *testing.T) {
 	wantCode(t, "a repeat after the removal", err, codes.PermissionDenied, "already used")
 }
 
-// A join again keeps the ingress's /64, revokes its older certificates
+// A join again keeps the ingress's /96, revokes its older certificates
 // and closes their connections within 5 s of the notification; the new
 // certificate may bring a new WireGuard key.
 func TestRejoin(t *testing.T) {
@@ -198,7 +198,7 @@ func TestRejoin(t *testing.T) {
 		t.Fatalf("a refused Hello changed the row %+v or the peers", g)
 	}
 
-	// The same /64, a new key.
+	// The same /96, a new key.
 	resp, err := nc.hello(wgKey(2), "10.0.0.1:51820")
 	if err != nil {
 		t.Fatal(err)
@@ -409,7 +409,7 @@ func TestHelloKeyTaken(t *testing.T) {
 	}
 }
 
-// Hello allocates the ingress's /64 at its first call and changes nothing
+// Hello allocates the ingress's /96 at its first call and changes nothing
 // when repeated; a new endpoint bumps the mesh's peers; the key is fixed.
 func TestHello(t *testing.T) {
 	h := newHarness(t, harnessOpts{})
@@ -436,7 +436,7 @@ func TestHello(t *testing.T) {
 		t.Fatal("a repeated Hello bumped a version")
 	}
 
-	// A new endpoint: the same /64, the peers bumped.
+	// A new endpoint: the same /96, the peers bumped.
 	moved, err := c.hello(wgKey(1), "[2001:db8::7]:51820")
 	if err != nil || moved.Prefix != resp.Prefix {
 		t.Fatalf("moved %+v %v", moved, err)

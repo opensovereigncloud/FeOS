@@ -307,7 +307,7 @@ type nodeInfo struct {
 	ObjectStoreID string          `json:"objectStoreId"`
 	PodPrefix     string          `json:"podPrefix"`
 	// MeshPrefix and MeshEndpoint: the node on the pods' mesh (ADR 0017),
-	// its /64 of the cluster's ULA and its WireGuard device's address;
+	// its /96 of the cluster's ULA and its WireGuard device's address;
 	// empty off the mesh.
 	MeshPrefix   string `json:"meshPrefix"`
 	MeshEndpoint string `json:"meshEndpoint"`

@@ -355,31 +355,37 @@ func TestHibernateTimeout(t *testing.T) {
 	}
 }
 
-// --pod-network: routed by default, mesh, or a ULA /48 of fd00::/8 without
-// host bits.
+// --pod-network: routed by default, mesh, or a ULA /64 of fd00::/8 without
+// host bits (a /48 of before for its /64 of subnet 0).
 func TestPodNetwork(t *testing.T) {
 	t.Parallel()
 	c, err := Parse([]string{"--database-url", testURL}, env(nil))
 	if err != nil || c.PodNetwork != PodNetworkRouted {
 		t.Fatalf("default %q, %v", c.PodNetwork, err)
 	}
-	for _, ok := range []string{"mesh", "fd5e:1b2c:93a0::/48", "fdff:ffff:ffff::/48"} {
+	for _, ok := range []string{"mesh", "fd5e:1b2c:93a0::/64", "fdff:ffff:ffff:ffff::/64", "fd5e:1b2c:93a0::/48"} {
 		c, err := Parse([]string{"--database-url", testURL}, env(map[string]string{"FERUN_POD_NETWORK": ok}))
 		if err != nil || c.PodNetwork != ok {
 			t.Errorf("%q: %q, %v", ok, c.PodNetwork, err)
 		}
 	}
 	for _, bad := range []string{
-		"Mesh", "routed", "fd5e:1b2c:93a0::/64", "fd5e:1b2c:93a0::1/48", "fc00:1:2::/48", "2001:db8:1::/48",
+		"Mesh", "routed", "fd5e:1b2c:93a0::/56", "fd5e:1b2c:93a0::/96", "fd5e:1b2c:93a0::1/64", "fd5e:1b2c:93a0::1/48",
+		"fc00:1:2::/64", "2001:db8:1::/64",
 		"10.0.0.0/8", "fd5e:1b2c:93a0::", "::ffff:10.0.0.0/120",
 	} {
 		if _, err := Parse([]string{"--database-url", testURL, "--pod-network", bad}, env(nil)); err == nil {
 			t.Errorf("%q was taken", bad)
 		}
 	}
-	p, err := ParsePodNetwork("fd5e:1b2c:93a0::/48")
-	if err != nil || p != netip.MustParsePrefix("fd5e:1b2c:93a0::/48") {
-		t.Fatalf("%v %v", p, err)
+	for in, want := range map[string]string{
+		"fd5e:1b2c:93a0:7::/64": "fd5e:1b2c:93a0:7::/64",
+		"fd5e:1b2c:93a0::/48":   "fd5e:1b2c:93a0::/64",
+	} {
+		p, err := ParsePodNetwork(in)
+		if err != nil || p != netip.MustParsePrefix(want) {
+			t.Errorf("%s: %v %v", in, p, err)
+		}
 	}
 }
 

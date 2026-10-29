@@ -47,7 +47,7 @@ func newIngressWorld(t *testing.T) *ingressWorld {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ula := netip.MustParsePrefix("fd00:1:2::/48")
+	ula := netip.MustParsePrefix("fd00:1:2::/64")
 	fl := fleet.New(fleet.Config{TrustDomain: "feos.test"}, fleet.Deps{DB: d, Issuer: iss})
 	svc := ingresssvc.New(ingresssvc.Config{InstanceID: testInstance, TrustDomain: "feos.test", PodNetwork: ula,
 		Log: dbtest.Logger(t)}, ingresssvc.Deps{DB: d, Issuer: iss})
@@ -196,7 +196,7 @@ func TestIngressesAdmin(t *testing.T) {
 	}](t, r)
 	g0, g1 := list.Ingresses[0], list.Ingresses[1]
 	if g0.Name != "in-0" || g0.Status != model.IngressJoined || g0.JoinedAt == "" || g0.RemovedAt != "" ||
-		g0.MeshPrefix != "fd00:1:2:1::/64" || g0.MeshAddress != "fd00:1:2:1::1" || g0.MeshEndpoint != "10.0.0.9:51820" ||
+		g0.MeshPrefix != "fd00:1:2::1:0:0/96" || g0.MeshAddress != "fd00:1:2::1:0:1" || g0.MeshEndpoint != "10.0.0.9:51820" ||
 		g0.PublicKey != base64.StdEncoding.EncodeToString(wg) || g0.Version != "v1" || g0.LastSeen == "" || g0.LeftAt != "" ||
 		!g0.Connected || g0.AdmittedVersion != 1 || g0.CertNotAfter != leaf.NotAfter.UTC().Format(time.RFC3339) {
 		t.Errorf("in-0 %+v", g0)

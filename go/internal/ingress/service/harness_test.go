@@ -46,7 +46,7 @@ const (
 )
 
 // testULA is the pods' mesh of a meshed harness.
-var testULA = netip.MustParsePrefix("fd12:3456:789a::/48")
+var testULA = netip.MustParsePrefix("fd12:3456:789a::/64")
 
 // issuerDir holds one platform CA for every test of the package, made by
 // TestMain.

@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gardenlinux/feos/go/internal/mesh"
 	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
@@ -73,7 +74,7 @@ const (
 // EnvPrefix starts every environment variable of a flag.
 const EnvPrefix = "FERUN_"
 
-// The pod networks of a cluster (--pod-network), besides a ULA /48 itself.
+// The pod networks of a cluster (--pod-network), besides a ULA /64 itself.
 const (
 	PodNetworkRouted = ""
 	PodNetworkMesh   = "mesh"
@@ -155,9 +156,9 @@ type Config struct {
 	// with an Origin is refused.
 	MCPAllowedOrigins []string
 	// PodNetwork is the cluster's pod network (ADR 0017): PodNetworkRouted,
-	// every node with a prefix of its network's; PodNetworkMesh, a ULA /48
-	// drawn at random once and kept in the database; or such a /48 itself,
-	// "fdXX:XXXX:XXXX::/48".
+	// every node with a prefix of its network's; PodNetworkMesh, a ULA /64
+	// drawn at random once and kept in the database; or such a /64 itself,
+	// "fdXX:XXXX:XXXX::/64" (a /48 stands for its /64 of subnet 0).
 	PodNetwork string
 	// AppsZone is the DNS zone of public environments' default hosts,
 	// which ferun-ingress serves (ADR 0021); empty: no hosts, and no
@@ -328,7 +329,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.Var((*listValue)(&c.MCPAllowedOrigins), "mcp-allowed-origins",
 		"comma-separated Origin allowlist of /mcp; empty: every request with an Origin is refused")
 	fs.StringVar(&c.PodNetwork, "pod-network", c.PodNetwork,
-		"the pods' network: empty, routed (every node a prefix of its network's); mesh, a ULA /48 drawn once and kept in the database; or such a /48 (fdXX:XXXX:XXXX::/48)")
+		"the pods' network: empty, routed (every node a prefix of its network's); mesh, a ULA /64 drawn once and kept in the database; or such a /64 (fdXX:XXXX:XXXX::/64)")
 	fs.StringVar(&c.AppsZone, "apps-zone", c.AppsZone,
 		"the DNS zone of public environments' default hosts, served by ferun-ingress (ADR 0021); empty: no hosts, and no environment can be public")
 	fs.StringVar(&c.DefaultImage, "default-image", c.DefaultImage, "image of a sandbox created without one")
@@ -703,22 +704,28 @@ func ParseByteSize(s string) (int64, error) {
 	return n << shift, nil
 }
 
-// ParsePodNetwork parses a cluster's ULA as --pod-network names it: a /48
-// of fd00::/8 without host bits (RFC 4193), such as "fd5e:1b2c:93a0::/48".
+// ParsePodNetwork parses a cluster's ULA as --pod-network names it: a /64
+// of fd00::/8 without host bits (RFC 4193), such as "fd5e:1b2c:93a0::/64".
+// A /48, as the flag named one before nodes got /96s (ADR 0017), is its
+// /64 of subnet 0.
 func ParsePodNetwork(s string) (netip.Prefix, error) {
 	p, err := netip.ParsePrefix(s)
 	if err != nil {
-		return netip.Prefix{}, fmt.Errorf("%q is neither empty, mesh nor a ULA /48: %w", s, err)
+		return netip.Prefix{}, fmt.Errorf("%q is neither empty, mesh nor a ULA /64: %w", s, err)
 	}
 	switch {
 	case !p.Addr().Is6() || p.Addr().Is4In6() || p.Addr().Zone() != "":
 		return netip.Prefix{}, fmt.Errorf("%q is not an IPv6 prefix", s)
-	case p.Bits() != 48:
-		return netip.Prefix{}, fmt.Errorf("%q is not a /48", s)
+	case p.Bits() != mesh.NetworkBits && p.Bits() != 48:
+		return netip.Prefix{}, fmt.Errorf("%q is not a /64", s)
 	case p.Masked() != p:
 		return netip.Prefix{}, fmt.Errorf("%q has host bits set", s)
 	case p.Addr().As16()[0] != 0xfd:
 		return netip.Prefix{}, fmt.Errorf("%q is not a ULA of fd00::/8", s)
+	}
+	if p.Bits() == 48 {
+		// A /48 as given before nodes got /96s: its subnet 0.
+		p = mesh.FromLegacy(p)
 	}
 	return p, nil
 }

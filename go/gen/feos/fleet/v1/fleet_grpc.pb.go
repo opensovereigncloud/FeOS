@@ -97,13 +97,13 @@ type FleetServiceClient interface {
 	// The node's place on the cluster's mesh (ADR 0017), asked for whenever
 	// the uplink comes up and whenever the node's key or endpoint changes:
 	// its WireGuard key and endpoint in, the cluster's ULA and the node's
-	// /64 of it out. The control plane gives a node its /64 at its first
+	// /96 of it out. The control plane gives a node its /96 at its first
 	// call, the next of the ULA, never one twice, and the same one on every
 	// call after it, until the node is removed; the other nodes get the key
 	// and the endpoint as a peer (feos.network.v1.MeshService). In a
 	// cluster whose network is routed, the answer is empty. A request
 	// without a key, from a node with a prefix of its network's, asks only
-	// whether the cluster is meshed: its answer has the ULA and no /64.
+	// whether the cluster is meshed: its answer has the ULA and no /96.
 	JoinMesh(ctx context.Context, in *JoinMeshRequest, opts ...grpc.CallOption) (*JoinMeshResponse, error)
 }
 
@@ -248,13 +248,13 @@ type FleetServiceServer interface {
 	// The node's place on the cluster's mesh (ADR 0017), asked for whenever
 	// the uplink comes up and whenever the node's key or endpoint changes:
 	// its WireGuard key and endpoint in, the cluster's ULA and the node's
-	// /64 of it out. The control plane gives a node its /64 at its first
+	// /96 of it out. The control plane gives a node its /96 at its first
 	// call, the next of the ULA, never one twice, and the same one on every
 	// call after it, until the node is removed; the other nodes get the key
 	// and the endpoint as a peer (feos.network.v1.MeshService). In a
 	// cluster whose network is routed, the answer is empty. A request
 	// without a key, from a node with a prefix of its network's, asks only
-	// whether the cluster is meshed: its answer has the ULA and no /64.
+	// whether the cluster is meshed: its answer has the ULA and no /96.
 	JoinMesh(context.Context, *JoinMeshRequest) (*JoinMeshResponse, error)
 	mustEmbedUnimplementedFleetServiceServer()
 }

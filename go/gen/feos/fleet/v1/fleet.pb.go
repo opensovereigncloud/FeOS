@@ -1668,10 +1668,10 @@ func (x *JoinMeshRequest) GetEndpoint() string {
 
 type JoinMeshResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The cluster's ULA, a /48, e.g. "fd5e:1b2c:93a0::/48"; empty in a
+	// The cluster's ULA, a /64, e.g. "fd5e:1b2c:93a0::/64"; empty in a
 	// cluster whose network is routed.
 	PodNetwork string `protobuf:"bytes,1,opt,name=pod_network,json=podNetwork,proto3" json:"pod_network,omitempty"`
-	// The node's /64 of it, e.g. "fd5e:1b2c:93a0:7::/64"; empty for a
+	// The node's /96 of it, e.g. "fd5e:1b2c:93a0::7:0:0/96"; empty for a
 	// request without a key.
 	PodPrefix     string `protobuf:"bytes,2,opt,name=pod_prefix,json=podPrefix,proto3" json:"pod_prefix,omitempty"`
 	unknownFields protoimpl.UnknownFields

@@ -429,7 +429,8 @@ func (i *Instance) bootstrap(ctx context.Context, tx pgx.Tx) error {
 
 // bootstrapPodNetwork reconciles --pod-network with the database's
 // (ADR 0017): mesh draws the ULA unless the database has one, and keeps
-// it; a /48 is kept unless the database has another. A database that is
+// it; a /64 is kept unless the database has another (a /48 of before
+// names its /64 of subnet 0, as migration 0011 made of the database's). A database that is
 // meshed does not become routed, nor another mesh, by a flag: the nodes'
 // addresses are of its ULA.
 func (i *Instance) bootstrapPodNetwork(ctx context.Context, st *store.Store) error {
@@ -445,7 +446,7 @@ func (i *Instance) bootstrapPodNetwork(ctx context.Context, st *store.Store) err
 			have, have)
 	case want == config.PodNetworkRouted:
 		return nil
-	case meshed && want != config.PodNetworkMesh && want != have.String():
+	case meshed && want != config.PodNetworkMesh && !samePodNetwork(want, have):
 		return fmt.Errorf("the database's cluster is meshed on %s, not on --pod-network %s", have, want)
 	case meshed:
 		i.podNetwork = have
@@ -466,6 +467,12 @@ func (i *Instance) bootstrapPodNetwork(ctx context.Context, st *store.Store) err
 	i.log.Info("the pods are on the mesh of a new ULA", "pod_network", ula.String())
 	i.podNetwork = ula
 	return nil
+}
+
+// samePodNetwork reports whether --pod-network's ULA, want, is have.
+func samePodNetwork(want string, have netip.Prefix) bool {
+	p, err := config.ParsePodNetwork(want)
+	return err == nil && p == have
 }
 
 // close releases what New opened, when New fails or Run never runs.

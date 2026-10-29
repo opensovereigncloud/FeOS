@@ -72,13 +72,13 @@ service FleetService {
   // The node's place on the cluster's mesh (ADR 0017), asked for whenever
   // the uplink comes up and whenever the node's key or endpoint changes:
   // its WireGuard key and endpoint in, the cluster's ULA and the node's
-  // /64 of it out. The control plane gives a node its /64 at its first
+  // /96 of it out. The control plane gives a node its /96 at its first
   // call, the next of the ULA, never one twice, and the same one on every
   // call after it, until the node is removed; the other nodes get the key
   // and the endpoint as a peer (feos.network.v1.MeshService). In a
   // cluster whose network is routed, the answer is empty. A request
   // without a key, from a node with a prefix of its network's, asks only
-  // whether the cluster is meshed: its answer has the ULA and no /64.
+  // whether the cluster is meshed: its answer has the ULA and no /96.
   rpc JoinMesh(JoinMeshRequest) returns (JoinMeshResponse);
 }
 
@@ -339,10 +339,10 @@ message JoinMeshRequest {
 }
 
 message JoinMeshResponse {
-  // The cluster's ULA, a /48, e.g. "fd5e:1b2c:93a0::/48"; empty in a
+  // The cluster's ULA, a /64, e.g. "fd5e:1b2c:93a0::/64"; empty in a
   // cluster whose network is routed.
   string pod_network = 1;
-  // The node's /64 of it, e.g. "fd5e:1b2c:93a0:7::/64"; empty for a
+  // The node's /96 of it, e.g. "fd5e:1b2c:93a0::7:0:0/96"; empty for a
   // request without a key.
   string pod_prefix = 2;
 }

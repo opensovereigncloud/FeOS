@@ -47,7 +47,7 @@ pub trait Inventory: Send + Sync + 'static {
     /// diskd's object store and version, or None when diskd does not
     /// answer.
     fn diskd(&self) -> impl Future<Output = Option<Diskd>> + Send;
-    /// The node's prefix for pods, such as "fd5e:1b2c:93a0:7::/64", once
+    /// The node's prefix for pods, such as "fd5e:1b2c:93a0::7:0:0/96", once
     /// it has one; the configured one is reported until then.
     fn pod_prefix(&self) -> Option<String> {
         None
@@ -59,7 +59,7 @@ pub trait Inventory: Send + Sync + 'static {
         None
     }
     /// Takes what the control plane answered to the node's JoinMesh: the
-    /// cluster's ULA and the node's /64 of it, both empty in a cluster
+    /// cluster's ULA and the node's /96 of it, both empty in a cluster
     /// whose network is routed. An answer that is not taken is asked for
     /// again.
     fn joined_mesh(

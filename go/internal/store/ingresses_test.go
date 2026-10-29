@@ -82,7 +82,7 @@ func presentIngressCert(t *testing.T, s *store.Store, name, serial string) int64
 }
 
 // Nodes and ingresses take their subnets from one sequence, so no two get
-// the same /64; an ingress's address is <prefix>::1.
+// the same /96; an ingress's address is <prefix>::1.
 func TestIngressSubnets(t *testing.T) {
 	s, _ := newStore(t)
 	if members, v, err := s.IngressGroup(bg); err != nil || members != nil || v != 0 {
@@ -117,8 +117,8 @@ func TestIngressSubnets(t *testing.T) {
 	if !slices.Equal(got, []int{1, 2, 3, 4}) {
 		t.Fatalf("subnets %v", got)
 	}
-	if g1.Prefix != "fd5e:1b2c:93a0:2::/64" || g1.Address != "fd5e:1b2c:93a0:2::1" || !g1.Changed || !g1.AddressChanged ||
-		g2.Prefix != "fd5e:1b2c:93a0:4::/64" || g2.Address != "fd5e:1b2c:93a0:4::1" {
+	if g1.Prefix != "fd5e:1b2c:93a0::2:0:0/96" || g1.Address != "fd5e:1b2c:93a0::2:0:1" || !g1.Changed || !g1.AddressChanged ||
+		g2.Prefix != "fd5e:1b2c:93a0::4:0:0/96" || g2.Address != "fd5e:1b2c:93a0::4:0:1" {
 		t.Fatalf("ingress joins %+v %+v", g1, g2)
 	}
 	if a := mesh.HostAddress(netip.MustParsePrefix(g2.Prefix)).String(); a != g2.Address {
@@ -137,7 +137,7 @@ func TestIngressSubnets(t *testing.T) {
 		t.Fatalf("unknown ingress: %v", err)
 	}
 	// The sequence is shared up to its end.
-	exec(t, s, "SELECT setval('mesh_subnets', 65535)")
+	exec(t, s, "SELECT setval('mesh_subnets', 4294967295)")
 	if _, err := joinIngressMesh(t, s, "g0", key(9), "10.0.1.9:51820"); !errors.Is(err, store.ErrMeshExhausted) {
 		t.Fatalf("past the last subnet: %v", err)
 	}

@@ -150,7 +150,7 @@ pushes and rolls the image, a node at a time.
 
 The manifests assume a network that routes no IPv6 to the nodes. With
 the control plane, ferund runs with `FERUN_POD_NETWORK=mesh`: each node
-gets a /64 of the cluster's ULA from it and reaches the other nodes' pods
+gets a /96 of the cluster's ULA from it and reaches the other nodes' pods
 through the WireGuard device `feos-mesh`, UDP port 51820 between the
 nodes (ADR 0017). Without, each node takes `fd00:fe05:<last octet of its
 address, hex>::/64`, which no other node reaches. Either way pods leave

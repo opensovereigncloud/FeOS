@@ -23,7 +23,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/store"
 )
 
-var testULA = netip.MustParsePrefix("fd5e:1b2c:93a0::/48")
+var testULA = netip.MustParsePrefix("fd5e:1b2c:93a0::/64")
 
 // meshed makes the harness's cluster meshed on testULA.
 func (h *harness) meshed() {
@@ -89,11 +89,11 @@ func TestJoinMesh(t *testing.T) {
 	}
 
 	r1, err := h.joinMesh("n1", s1, meshKey(1), "10.0.0.1:51820")
-	if err != nil || r1.GetPodNetwork() != "fd5e:1b2c:93a0::/48" || r1.GetPodPrefix() != "fd5e:1b2c:93a0:1::/64" {
+	if err != nil || r1.GetPodNetwork() != "fd5e:1b2c:93a0::/64" || r1.GetPodPrefix() != "fd5e:1b2c:93a0::1:0:0/96" {
 		t.Fatalf("n1: %v, %v", r1, err)
 	}
 	r2, err := h.joinMesh("n2", s2, meshKey(2), "[2001:db8::2]:51820")
-	if err != nil || r2.GetPodPrefix() != "fd5e:1b2c:93a0:2::/64" {
+	if err != nil || r2.GetPodPrefix() != "fd5e:1b2c:93a0::2:0:0/96" {
 		t.Fatalf("n2: %v, %v", r2, err)
 	}
 	again, err := h.joinMesh("n1", s1, meshKey(3), "10.0.0.1:51820")
@@ -128,7 +128,7 @@ func TestJoinMeshExhausted(t *testing.T) {
 	h := newHarness(t)
 	h.meshed()
 	serial := h.joined("n1")
-	h.exec("SELECT setval('mesh_subnets', 65535)")
+	h.exec("SELECT setval('mesh_subnets', 4294967295)")
 	_, err := h.joinMesh("n1", serial, meshKey(1), "10.0.0.1:51820")
 	wantCode(t, err, codes.ResourceExhausted, "")
 }

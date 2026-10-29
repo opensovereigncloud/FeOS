@@ -311,7 +311,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // The node's place on its cluster's mesh (ADR 0017): a WireGuard device
-// whose peers are the other nodes, each with its /64 of the cluster's ULA
+// whose peers are the other nodes, each with its /96 of the cluster's ULA
 // as the one prefix allowed for it. The control plane sends every node the
 // others as its peers: whole, or as a delta from one version to the next.
 // feosd keeps them on disk.
@@ -371,7 +371,7 @@ func (c *meshServiceClient) GetMesh(ctx context.Context, in *GetMeshRequest, opt
 // for forward compatibility.
 //
 // The node's place on its cluster's mesh (ADR 0017): a WireGuard device
-// whose peers are the other nodes, each with its /64 of the cluster's ULA
+// whose peers are the other nodes, each with its /96 of the cluster's ULA
 // as the one prefix allowed for it. The control plane sends every node the
 // others as its peers: whole, or as a delta from one version to the next.
 // feosd keeps them on disk.

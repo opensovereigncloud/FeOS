@@ -432,7 +432,7 @@ func (h *hammering) stopAndCheck(t *testing.T, least int) map[podid.ID]int {
 }
 
 // Scenario: two ingress instances join a cluster of two instances with
-// tokens of kind ingress, take /64s of the pods' mesh and become peers of
+// tokens of kind ingress, take /96s of the pods' mesh and become peers of
 // every node, and every node theirs; ferun-ingress's version counts their
 // entries. The admin API lists them connected. A restart on the same
 // state directory keeps the identity and the place on the mesh without a
@@ -475,7 +475,7 @@ func TestIngressJoinAndMesh(t *testing.T) {
 		prefix, err := netip.ParsePrefix(g.MeshPrefix)
 		st := p.status()
 		switch {
-		case g.Status != model.IngressJoined || err != nil || prefix.Bits() != 64 || !ula.Contains(prefix.Addr()) || prefixes[g.MeshPrefix]:
+		case g.Status != model.IngressJoined || err != nil || prefix.Bits() != mesh.PrefixBits || !ula.Contains(prefix.Addr()) || prefixes[g.MeshPrefix]:
 			t.Fatalf("%s: row %+v (%v); the ULA %v", p.name, g, err, ula)
 		case g.MeshAddress != mesh.HostAddress(prefix).String() || mc.Address != netip.PrefixFrom(mesh.HostAddress(prefix), 128):
 			t.Fatalf("%s: address %s, the device's %v, in %s", p.name, g.MeshAddress, mc.Address, g.MeshPrefix)
@@ -506,7 +506,7 @@ func TestIngressJoinAndMesh(t *testing.T) {
 		t.Fatalf("ferun-ingress %v at %d (%v); want %v", members, version, err, want)
 	}
 
-	// Every node has both as peers, with their keys, endpoints and /64s,
+	// Every node has both as peers, with their keys, endpoints and /96s,
 	// beside the other node.
 	eventually(t, 60*time.Second, "the nodes' peers", func() bool {
 		for _, n := range nodes {
@@ -528,7 +528,7 @@ func TestIngressJoinAndMesh(t *testing.T) {
 		}
 		return true
 	})
-	// Each ingress's device has both nodes, with their keys and /64s, and
+	// Each ingress's device has both nodes, with their keys and /96s, and
 	// counts them fresh.
 	eventually(t, 30*time.Second, "the ingresses' peers", func() bool {
 		for _, p := range procs {
@@ -581,7 +581,7 @@ func TestIngressJoinAndMesh(t *testing.T) {
 	}
 
 	// A restart keeps the certificate and the place on the mesh: no join,
-	// the same /64 and address, and it is ready again.
+	// the same /96 and address, and it is ready again.
 	serial := p0.status().CertSerial
 	p0.restart()
 	p0.waitReady(60 * time.Second)

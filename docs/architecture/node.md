@@ -414,7 +414,7 @@ resolver) and `traffic-service` (the records).
 
 | Option | Default | What it is |
 |---|---|---|
-| `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120; a /64 is best. Without, a node with `--control-plane` takes a /64 of its cluster's [mesh](#the-mesh) |
+| `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120, such as a /64, AWS's /80 or GCP's /96. Without, a node with `--control-plane` takes a /96 of its cluster's [mesh](#the-mesh) |
 | `--pod-ipv4-range PREFIX` | `169.254.16.0/20` | the pods' IPv4 addresses, a /32 each; /1 to /30, with neither the resolver's address nor `169.254.0.1` in it |
 | `--dns-address ADDRESS` | `169.254.0.53` | the pods' resolver, an IPv4 address that the node holds, the same on every node; never `169.254.0.1` |
 | `--dns-upstream ADDRESS` | Google's and Cloudflare's, IPv6 first | the upstreams of pods that name none (repeatable) |
@@ -426,7 +426,7 @@ Without `--pod-prefix` or a mesh, or when the network cannot be set up,
 `feosd` logs the error and runs on: creating a pod with a network fails
 with `FAILED_PRECONDITION` and the reason, and a kept pod with a network
 fails when it boots or resumes. Pods without a network and the rest of
-the API work as before. On a mesh whose /64 the node does not have yet,
+the API work as before. On a mesh whose /96 the node does not have yet,
 the same holds until the control plane gives it one; the network comes up
 then, as at a start: kept pods get the addresses they lack, the resolver
 answers, the rules are written, and running pods get their TAP devices.
@@ -544,14 +544,19 @@ without `--pod-prefix`, is on its cluster's mesh
   `<node dir>/mesh/key` (0600); the kernel derives the public key from it.
   It listens on `--mesh-port`. `feosd` sets it up over WireGuard's generic
   netlink family (`feos_utils::wireguard`), without `wg`.
-- **The node's /64.** The fleet client calls `JoinMesh` with the public
+- **The node's /96.** The fleet client calls `JoinMesh` with the public
   key and the endpoint, `--mesh-address` or the address from which the
   node reaches the control plane, at `--mesh-port`. The answer, the
-  cluster's ULA /48 and the node's /64 of it, is kept in `mesh.pb`; the
-  /64 is the node's pod prefix from then on, and the /48 is routed to
-  `feos-mesh`. The node's own /64 stays routed as unreachable but for its
-  pods' /128s, which are longer. Another /64 than the network was set up
-  with takes effect at the next start. A node with `--pod-prefix` in a
+  cluster's ULA /64 and the node's /96 of it, is kept in `mesh.pb`; the
+  /96 is the node's pod prefix from then on, and the /64 is routed to
+  `feos-mesh`. The node's own /96 stays routed as unreachable but for its
+  pods' /128s, which are longer. Another /96 than the network was set up
+  with takes effect at the next start. `feosd` still takes a /48 and a
+  /64 of it, as the control plane gave them before, and peers of both
+  lengths. At its start it removes, for the prefix kept, the routes an earlier
+  prefix left: those of the main table
+  to `feos-mesh` but the ULA's, and the unreachable ones in the /48 of
+  the ULA's Global ID but its own prefix. A node with `--pod-prefix` in a
   meshed cluster fails its pods with a network: the two exclude each
   other.
 - **The peers** come from the control plane over the node connection,
@@ -560,13 +565,13 @@ without `--pod-prefix`, is on its cluster's mesh
   with `FAILED_PRECONDITION` from any other. They are kept in `mesh.pb`
   and given to the device as they change: a peer that stays keeps its
   session, one that goes is removed, one that is new or changed is set
-  with its endpoint and its /64 as its one allowed prefix. WireGuard sends
-  a packet to the peer whose /64 holds its destination and takes one from
-  a peer only with that peer's key and a source in its /64. `GetMesh`
+  with its endpoint and its /96 as its one allowed prefix. WireGuard sends
+  a packet to the peer whose /96 holds its destination and takes one from
+  a peer only with that peer's key and a source in its /96. `GetMesh`
   shows the node's prefixes, key, port, version and peers.
 - **The rules.** The peers' endpoints are denied to pods, as the node's
   own addresses are, and `prerouting` drops what comes from an address of
-  the cluster's /48 through another device than the one it is routed to.
+  the cluster's ULA through another device than the one it is routed to.
 
 Without a control plane the mesh, its peers and its rules stay untouched;
 pods reach each other across nodes only where their security groups allow
@@ -658,7 +663,7 @@ traffic is not theirs:
 
 | Chain | What it does |
 |---|---|
-| `prerouting` (filter, -150) | from a pod's TAP: drops packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), of either family, logged as `spoofed`, and router advertisements and redirects of both families; on a mesh, the same for a source in the cluster's /48 through any device |
+| `prerouting` (filter, -150) | from a pod's TAP: drops packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), of either family, logged as `spoofed`, and router advertisements and redirects of both families; on a mesh, the same for a source in the cluster's ULA through any device |
 | `input` | from pods takes neighbor solicitations and advertisements and DNS to the resolver's address over UDP and TCP, and drops the rest |
 | `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), of both families, before anything else; accepts what belongs to a connection; drops invalid packets from and to pods; then jumps to `from-pods` what comes from a TAP and to `to-pods` what goes to one |
 | `from-pods`, `to-pods` | go through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) to the pod's chains, and drop and log (`no-rule`) what a TAP the maps do not have sends or receives, such as one whose rules failed to be written |

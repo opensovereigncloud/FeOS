@@ -28,13 +28,13 @@ const notMeshedText = "the cluster is not meshed; the ingress needs the pods' me
 // presenting certificate becomes current when it is newer than the
 // current one, and the older ones are superseded, revoked one grace ahead
 // (store.PresentIngressCert); the ingress takes its place on the pods'
-// mesh with its WireGuard key and endpoint (store.JoinIngressMesh: its /64
+// mesh with its WireGuard key and endpoint (store.JoinIngressMesh: its /96
 // at the first Hello after a join, the same one after; the key is fixed
 // until a join again, FAILED_PRECONDITION otherwise); and it is seen with
 // its version. The key must not be a point of small order
 // (INVALID_ARGUMENT); at the first Hello after a join it must not be the
 // one the join again retired, nor another peer's (FAILED_PRECONDITION
-// "…; make a new one"). The answer is the cluster's ULA, the ingress's /64
+// "…; make a new one"). The answer is the cluster's ULA, the ingress's /96
 // and address, the apps zone and the answering instance. A Hello changes
 // nothing when repeated.
 func (s *Service) Hello(ctx context.Context, req *wire.HelloRequest) (*wire.HelloResponse, error) {
@@ -106,9 +106,9 @@ func (s *Service) Hello(ctx context.Context, req *wire.HelloRequest) (*wire.Hell
 			"peer", p.Addr)
 		return nil, status.Errorf(codes.FailedPrecondition, "the mesh key of ingress %s is another peer's; make a new one", p.Name)
 	case errors.Is(err, store.ErrMeshExhausted):
-		s.log.Error("an ingress cannot join the pods' mesh: every /64 of it has been handed out", "ingress", p.Name,
+		s.log.Error("an ingress cannot join the pods' mesh: every /96 of it has been handed out", "ingress", p.Name,
 			"pod_network", ula.String())
-		return nil, status.Errorf(codes.ResourceExhausted, "every /64 of the pod network %s has been handed out", ula)
+		return nil, status.Errorf(codes.ResourceExhausted, "every /96 of the pod network %s has been handed out", ula)
 	case errors.Is(err, store.ErrNotMeshed):
 		return nil, status.Error(codes.FailedPrecondition, notMeshedText)
 	case err != nil:

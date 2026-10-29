@@ -9,7 +9,7 @@
 //! by proxy. Names go through feosd's resolver, which answers those of the
 //! pods' name tables itself; the pods' security groups become nftables
 //! rules; and their traffic becomes records. Where the
-//! network routes the node no prefix, the node's prefix is a /64 of the
+//! network routes the node no prefix, the node's prefix is a /96 of the
 //! cluster's mesh (ADR 0017), which the control plane gives it, maybe after
 //! feosd started: the network comes up then.
 
@@ -87,7 +87,7 @@ pub struct Config {
     /// The prefix the network routes to the node (`--pod-prefix`).
     /// Without it or a mesh, pods with a network fail.
     pub pod_prefix: Option<(Ipv6Addr, u8)>,
-    /// The cluster's mesh, whose /64 is the node's prefix when it has no
+    /// The cluster's mesh, whose /96 is the node's prefix when it has no
     /// `--pod-prefix`: with a control plane.
     pub mesh: Option<MeshConfig>,
     /// The pods' IPv4 addresses, a /32 of it each (`--pod-ipv4-range`).
@@ -287,7 +287,7 @@ impl Network {
     /// address and sockets: those of `sockets` that are bound to its
     /// address, which systemd or `feos-host-init` hold across restarts of
     /// `feosd` (ADR 0010), or new ones. On a mesh, the device comes up
-    /// first, and the prefix is the /64 the control plane gave the node: a
+    /// first, and the prefix is the /96 the control plane gave the node: a
     /// node that has none yet sets the rest up when it gets one
     /// ([`Network::join_mesh`]). A failure is logged, and fails the pods
     /// with a network from then on: feosd goes on serving the others.
@@ -316,7 +316,7 @@ impl Network {
             match opened {
                 Ok(opened) => {
                     prefix = opened.assignment().map(|a| a.pod_prefix);
-                    unready = "the node waits for the control plane to give it its /64 of the \
+                    unready = "the node waits for the control plane to give it its /96 of the \
                                mesh: pods with a network cannot run yet"
                         .to_string();
                     mesh = Some(opened);
@@ -349,7 +349,7 @@ impl Network {
                 }
                 match &mesh {
                     Some(_) => info!(
-                        "Network: Waiting for the control plane to give the node its /64 of the mesh"
+                        "Network: Waiting for the control plane to give the node its /96 of the mesh"
                     ),
                     None => warn!("Network: No --pod-prefix: pods with a network fail"),
                 }
@@ -439,8 +439,8 @@ impl Network {
     }
 
     /// Takes what the control plane answered to the node's JoinMesh: the
-    /// cluster's ULA and the node's /64 of it, which become the node's
-    /// prefix and the route to the other nodes. The first /64 sets the
+    /// cluster's ULA and the node's /96 of it, which become the node's
+    /// prefix and the route to the other nodes. The first /96 sets the
     /// network up, if it is not yet; another one than the network has
     /// takes effect at feosd's next start. A node with `--pod-prefix`
     /// asks only whether the cluster is meshed, and refuses the prefix if

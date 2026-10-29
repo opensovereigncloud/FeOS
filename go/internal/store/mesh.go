@@ -22,7 +22,7 @@ const HintMeshPeers = "mesh-peers"
 
 // ErrMeshExhausted is JoinMesh's and JoinIngressMesh's error when every
 // subnet ID of the pod network has been handed out.
-var ErrMeshExhausted = errors.New("every /64 of the pod network has been handed out")
+var ErrMeshExhausted = errors.New("every /96 of the pod network has been handed out")
 
 // ErrMeshKeyTaken is JoinMesh's and JoinIngressMesh's error for a
 // WireGuard key that another node or ingress holds: a key is one peer's,
@@ -30,7 +30,7 @@ var ErrMeshExhausted = errors.New("every /64 of the pod network has been handed 
 // key would take each other's prefix and endpoint there.
 var ErrMeshKeyTaken = errors.New("the WireGuard key is another peer's")
 
-// MeshPeer reports whether the node is a peer of the mesh: it has its /64,
+// MeshPeer reports whether the node is a peer of the mesh: it has its /96,
 // a key and an endpoint.
 func (n *Node) MeshPeer() bool {
 	return n.MeshSubnet != 0 && len(n.MeshPublicKey) == mesh.KeyLen && n.MeshEndpoint != ""
@@ -50,13 +50,13 @@ func (s *Store) PodNetwork(ctx context.Context) (netip.Prefix, bool, error) {
 	return ula, true, nil
 }
 
-// InsertPodNetwork makes the cluster meshed with ula, a /48 of fd00::/8.
+// InsertPodNetwork makes the cluster meshed with ula, a /64 of fd00::/8.
 func (s *Store) InsertPodNetwork(ctx context.Context, ula netip.Prefix) error {
 	_, err := s.q.Exec(ctx, "INSERT INTO pod_network (ula) VALUES ($1)", ula)
 	return err
 }
 
-// MeshJoin is what JoinMesh made of a node: its subnet ID and /64, and
+// MeshJoin is what JoinMesh made of a node: its subnet ID and /96, and
 // whether its subnet, key or endpoint changed, which bumped the peers'
 // version.
 type MeshJoin struct {
@@ -78,15 +78,20 @@ func (s *Store) JoinMesh(ctx context.Context, n Node, ula netip.Prefix, key []by
 			return MeshJoin{}, err
 		}
 	}
-	j := MeshJoin{Subnet: n.MeshSubnet, Prefix: n.MeshPrefix}
+	j := MeshJoin{Subnet: n.MeshSubnet}
 	if j.Subnet == 0 {
 		next, err := s.nextMeshSubnet(ctx)
 		if err != nil {
 			return MeshJoin{}, err
 		}
-		j.Subnet, j.Prefix = next, mesh.NodePrefix(ula, next).String()
+		j.Subnet = next
 	}
-	j.Changed = j.Subnet != n.MeshSubnet || !bytes.Equal(key, n.MeshPublicKey) || endpoint != n.MeshEndpoint
+	// The prefix follows from ula and the ID; it differs from the row's
+	// only for a new ID, or after the ULA changed, as from a /48 to its
+	// /64 (ADR 0017).
+	j.Prefix = mesh.NodePrefix(ula, j.Subnet).String()
+	j.Changed = j.Subnet != n.MeshSubnet || j.Prefix != n.MeshPrefix || !bytes.Equal(key, n.MeshPublicKey) ||
+		endpoint != n.MeshEndpoint
 	if !j.Changed {
 		return j, nil
 	}
@@ -159,7 +164,7 @@ func (s *Store) bumpMeshPeers(ctx context.Context) (uint64, error) {
 // MeshPeers returns the mesh's peers at their version, in one snapshot:
 // every node that is a peer (MeshPeer) and not removed, down ones too, by
 // its name, and every ingress that is a peer (Ingress.MeshPeer) and not
-// removed, by mesh.IngressPeerName, with its /64 as the pod prefix. A
+// removed, by mesh.IngressPeerName, with its /96 as the pod prefix. A
 // cluster that is not meshed has none, at version 0.
 func (s *Store) MeshPeers(ctx context.Context) (mesh.Peers, error) {
 	rows, err := s.q.Query(ctx, `SELECT p.peers_version, m.ingress, m.name, m.mesh_public_key, m.mesh_endpoint, m.mesh_prefix

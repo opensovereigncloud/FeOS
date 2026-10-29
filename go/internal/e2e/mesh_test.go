@@ -12,12 +12,13 @@ import (
 	"time"
 
 	"github.com/gardenlinux/feos/go/internal/config"
+	"github.com/gardenlinux/feos/go/internal/mesh"
 	"github.com/gardenlinux/feos/go/internal/server"
 	"github.com/gardenlinux/feos/go/internal/testnode"
 )
 
 // peersOf is a node's peers on the mesh, by name, with their endpoints and
-// /64s.
+// /96s.
 func peersOf(n *node) map[string]string {
 	out := map[string]string{}
 	for _, p := range n.Mesh().GetPeers() {
@@ -28,7 +29,7 @@ func peersOf(n *node) map[string]string {
 
 // Scenario: the pods' mesh (ADR 0017). The first instance draws the
 // cluster's ULA, which every later start keeps; nodes on the mesh get
-// distinct /64s of it, on whichever instance they ask, and end up with the
+// distinct /96s of it, on whichever instance they ask, and end up with the
 // others as their peers. A node that moves reaches the others with its new
 // endpoint, a node that joins later is added, a removed one leaves their
 // peers. An instance whose --pod-network says otherwise does not start.
@@ -38,7 +39,7 @@ func TestMesh(t *testing.T) {
 	c.start("a")
 	c.start("b")
 	ula, meshed, err := c.st.PodNetwork(bg)
-	if err != nil || !meshed || ula.Bits() != 48 || ula.Addr().As16()[0] != 0xfd {
+	if err != nil || !meshed || ula.Bits() != mesh.NetworkBits || ula.Addr().As16()[0] != 0xfd {
 		t.Fatalf("the cluster's ULA %v, meshed %v: %v", ula, meshed, err)
 	}
 
@@ -82,7 +83,7 @@ func TestMesh(t *testing.T) {
 	seen := map[string]bool{}
 	for name, p := range prefixes {
 		prefix, err := netip.ParsePrefix(p)
-		if err != nil || prefix.Bits() != 64 || !ula.Contains(prefix.Addr()) || seen[p] {
+		if err != nil || prefix.Bits() != mesh.PrefixBits || !ula.Contains(prefix.Addr()) || seen[p] {
 			t.Fatalf("%s got %s of %s: %v (seen %v)", name, p, ula, err, seen)
 		}
 		seen[p] = true
@@ -115,7 +116,7 @@ func TestMesh(t *testing.T) {
 	}
 
 	// The cluster stays on its ULA: another one, or none, refuses to start.
-	for _, other := range []string{config.PodNetworkRouted, "fd00:1:2::/48"} {
+	for _, other := range []string{config.PodNetworkRouted, "fd00:1:2::/64"} {
 		cfg := c.cfg
 		cfg.InstanceID, cfg.PodNetwork = "e2e-other", other
 		cfg.NodeListen = "127.0.0.1:0"

@@ -24,7 +24,7 @@ import (
 )
 
 // testULA is the cluster's pod network in the ingress tests.
-var testULA = netip.MustParsePrefix("fd5e:1b2c:93a0::/48")
+var testULA = netip.MustParsePrefix("fd5e:1b2c:93a0::/64")
 
 // The routes of ingressSpec: web's http port at /, and its admin port at
 // /admin.

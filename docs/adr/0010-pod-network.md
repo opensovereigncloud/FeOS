@@ -49,13 +49,15 @@ from node to node would need a route per pod, changed with every move.
 ### IPv6: a prefix routed to the node
 
 - Every node has a prefix that its network routes to it, by a static
-  route or BGP, and that `feosd` is given (`--pod-prefix`). A /64 is
-  best; a smaller one, such as the /80 that AWS delegates to a network
-  interface, is enough. A prefix that is only on-link, for which the node
+  route or BGP, and that `feosd` is given (`--pod-prefix`): a /64, or a
+  smaller one, such as the /80 that AWS delegates to a network interface
+  or the /96 that GCP routes to every VM's interface.
+  A /96 holds 2^32 addresses, which is enough for addresses never handed
+  out twice. A prefix that is only on-link, for which the node
   would answer neighbor discovery on behalf of every pod, is not
   supported.
 - Where the network routes no prefix to its nodes, a node's prefix is a
-  /64 of its cluster's ULA, and a WireGuard mesh carries the pods' IPv6
+  /96 of its cluster's ULA /64, and a WireGuard mesh carries the pods' IPv6
   between the nodes (ADR 0017).
 - `feosd` gives a pod an address of the node's prefix when the pod comes
   to the node, keeps it in the pod's record while the pod is there, and
@@ -244,7 +246,7 @@ from node to node would need a route per pod, changed with every move.
   that speak only IPv4 work. A program that listens only on `0.0.0.0`
   cannot be reached from outside; listeners bind to `[::]`.
 - A pod's connections do not survive a resume on another node.
-- Every node needs a prefix routed to it, or a /64 of its cluster's mesh
+- Every node needs a prefix routed to it, or a /96 of its cluster's mesh
   (ADR 0017), and IPv4 of its own, through which its pods leave. A node whose operating system is FeOS takes its
   IPv4 by DHCPv4, as a distribution does, and its prefix by DHCPv6
   delegation or, where it is routed statically, from the kernel's

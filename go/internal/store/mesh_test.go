@@ -14,7 +14,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/store"
 )
 
-var testULA = netip.MustParsePrefix("fd5e:1b2c:93a0::/48")
+var testULA = netip.MustParsePrefix("fd5e:1b2c:93a0::/64")
 
 func key(b byte) []byte { return bytes.Repeat([]byte{b}, 32) }
 
@@ -56,7 +56,7 @@ func TestJoinMesh(t *testing.T) {
 	if ula, ok, err := s.PodNetwork(bg); !ok || err != nil || ula != testULA {
 		t.Fatalf("pod network %v %v %v", ula, ok, err)
 	}
-	if err := s.InsertPodNetwork(bg, netip.MustParsePrefix("fd00:1:2::/48")); err == nil {
+	if err := s.InsertPodNetwork(bg, netip.MustParsePrefix("fd00:1:2::/64")); err == nil {
 		t.Fatal("a second pod network")
 	}
 	for _, n := range []string{"n1", "n2", "n3"} {
@@ -67,8 +67,8 @@ func TestJoinMesh(t *testing.T) {
 	must(t, err)
 	j2, err := joinMesh(t, s, "n2", key(2), "10.0.0.2:51820")
 	must(t, err)
-	if j1.Subnet != 1 || j1.Prefix != "fd5e:1b2c:93a0:1::/64" || !j1.Changed ||
-		j2.Subnet != 2 || j2.Prefix != "fd5e:1b2c:93a0:2::/64" {
+	if j1.Subnet != 1 || j1.Prefix != "fd5e:1b2c:93a0::1:0:0/96" || !j1.Changed ||
+		j2.Subnet != 2 || j2.Prefix != "fd5e:1b2c:93a0::2:0:0/96" {
 		t.Fatalf("joins %+v %+v", j1, j2)
 	}
 	if v := version(t, s); v != 2 {
@@ -87,7 +87,7 @@ func TestJoinMesh(t *testing.T) {
 	p, err := s.MeshPeers(bg)
 	must(t, err)
 	if len(p.Nodes) != 2 || p.Nodes["n1"].Endpoint != "10.0.0.11:51820" || !bytes.Equal(p.Nodes["n2"].PublicKey, key(2)) ||
-		p.Nodes["n2"].PodPrefix != "fd5e:1b2c:93a0:2::/64" {
+		p.Nodes["n2"].PodPrefix != "fd5e:1b2c:93a0::2:0:0/96" {
 		t.Fatalf("peers %+v", p)
 	}
 
@@ -134,29 +134,29 @@ func TestJoinMesh(t *testing.T) {
 	}
 }
 
-// The sequence ends at 65535 and never starts again.
+// The sequence ends at 2^32 - 1 and never starts again.
 func TestJoinMeshExhausted(t *testing.T) {
 	s, _ := newStore(t)
 	must(t, s.InsertPodNetwork(bg, testULA))
 	mkNode(t, s, "n1")
 	mkNode(t, s, "n2")
-	exec(t, s, "SELECT setval('mesh_subnets', 65534)")
+	exec(t, s, "SELECT setval('mesh_subnets', 4294967294)")
 	j, err := joinMesh(t, s, "n1", key(1), "10.0.0.1:51820")
 	must(t, err)
-	if j.Subnet != 65535 || j.Prefix != "fd5e:1b2c:93a0:ffff::/64" {
+	if j.Subnet != 4294967295 || j.Prefix != "fd5e:1b2c:93a0:0:ffff:ffff::/96" {
 		t.Fatalf("the last subnet: %+v", j)
 	}
 	if _, err := joinMesh(t, s, "n2", key(2), "10.0.0.2:51820"); !errors.Is(err, store.ErrMeshExhausted) {
 		t.Fatalf("past the last subnet: %v", err)
 	}
 	// The one that has its subnet keeps it.
-	if j, err := joinMesh(t, s, "n1", key(1), "10.0.0.1:51821"); err != nil || j.Subnet != 65535 {
+	if j, err := joinMesh(t, s, "n1", key(1), "10.0.0.1:51821"); err != nil || j.Subnet != 4294967295 {
 		t.Fatalf("%+v %v", j, err)
 	}
 }
 
 // The mesh's peers are the nodes and the ingresses that are peers, an
-// ingress by mesh.IngressPeerName with its /64; removed and keyless ones
+// ingress by mesh.IngressPeerName with its /96; removed and keyless ones
 // are nobody's peer.
 func TestMeshPeersIngresses(t *testing.T) {
 	s, _ := newStore(t)

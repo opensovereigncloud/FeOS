@@ -35,7 +35,7 @@ and h2c upstreams.
      │          └─ HTTP/1.1, pooled (idle 4 s), to [<pod address>]:<port>
      ├─ agent:  state directory, join, renewal, Hello, Sync with its cache, Wake, Hold
      │          └─ gRPC + JSON, mTLS, ALPN ferun-ingress/1 ──▶ one --control-plane address at a time
-     └─ mesh:   WireGuard ferun-mesh, <its /64>::1/128, route <ULA>/48, the nodes as peers
+     └─ mesh:   WireGuard ferun-mesh, <its /96>::1/128, route <ULA>/64, the nodes as peers
                   └─ UDP 51820 ⇄ the workers' feos-mesh
  node:  feos-mesh → forward chain → the pod's group ing-<sandbox id>: tcp <port> from ferun-ingress → pod
  ferund (every instance): the ingress service (Join, RenewCertificate, Hello, Sync, Wake, Hold), the table builder
@@ -171,7 +171,7 @@ instance, then, in one transaction:
   earlier certificate is revoked (`rejoined`), a removal is cleared, the
   WireGuard key and endpoint are cleared, the key is kept as the retired
   one (`previous_mesh_public_key`), which the next Hello may not bring
-  back, and its /64 is kept;
+  back, and its /96 is kept;
 - an unpinned token creates the proposed name only, and a name that
   exists is `ALREADY_EXISTS` "ingress <name> exists; join it with a token
   pinned to its name".
@@ -239,7 +239,7 @@ comes.
 
 On a connection the agent says `Hello` first: its WireGuard public key,
 its endpoint and its version. Hello takes the instance's place on the
-mesh and answers the cluster's ULA, its /64 and address, the apps zone
+mesh and answers the cluster's ULA, its /96 and address, the apps zone
 and the answering instance; the agent keeps `mesh.json` and configures
 the device ([The mesh](#the-mesh)). `Sync` then streams the table. A
 message out of sequence, or a stream that ends or stays silent for 45 s,
@@ -308,7 +308,7 @@ The table is what the ingress routes, one entry per public environment
 - a hash of the rest, by which a stream tells a change.
 
 Beside the environments the table holds the mesh, the nodes with their
-keys, endpoints and /64s at the peers' version, and `Self`: the
+keys, endpoints and /96s at the peers' version, and `Self`: the
 instance's name, mesh address, the apps zone and its admitted version
 ([Admission](#admission)). An environment that is not public, is being
 deleted, has no label or no release, or whose tenant is being deleted
@@ -399,17 +399,17 @@ serves at once what was routable, and nothing new becomes routable until
 
 ### Address and peers
 
-Each instance has a /64 of the cluster's ULA, from the nodes' sequence
-`mesh_subnets`, which never hands a subnet ID out twice; subnet 0 stays
+Each instance has a /96 of the cluster's ULA, from the nodes' sequence
+`mesh_subnets`, which never hands an ID out twice; ID 0 stays
 reserved. It is given at the first Hello after the ingress's first join
 and kept across joins; the instance's address is `<prefix>::1`, its member
 of the security group `ferun-ingress`. Nodes see the instance as one more
-/64 peer, `ingress.<name>` (node names are DNS labels, so the dot never
+/96 peer, `ingress.<name>` (node names are DNS labels, so the dot never
 collides), in the same peer list as the nodes, with the same versions and
 deltas ([control-plane.md](control-plane.md#the-pods-mesh)). A
 first subnet, a new key or endpoint, a re-join and a removal count the
 peers' version up and wake `mesh-peers`. The instance gets the nodes in
-its table and sets them as its device's peers: each node's /64 its only
+its table and sets them as its device's peers: each node's /96 its only
 allowed prefix, its endpoint, persistent keepalive 25 s.
 
 **The key is fixed** from the first Hello after a join: a Hello with
@@ -444,7 +444,7 @@ generic netlink, with stdlib `syscall` alone (`internal/ingress/wg`):
 4. up, with the address `<prefix>::1/128` (no duplicate address
    detection), and every other address on the device deleted, such as an
    old prefix;
-5. a route for the ULA /48 through the device, from that address;
+5. a route for the ULA /64 through the device, from that address;
 6. the key and the port; then the peers, as a diff that leaves unchanged
    peers and their sessions alone.
 
@@ -1019,7 +1019,7 @@ On the Gardener shoot
 
 - **A StatefulSet of 2**, `ferun-ingress-0` and `-1`, with the headless
   Service `ferun-ingress-pods`: a volume of 1 GiB per instance at
-  `/var/lib/ferun-ingress`, so that the identity, the /64 and the cache
+  `/var/lib/ferun-ingress`, so that the identity, the /96 and the cache
   survive restarts and no subnet is spent per pod; `Parallel` pod
   management, rolling one at a time with `minReadySeconds: 10`; the
   instances on different workers (topology spread, `maxSkew: 1`,
@@ -1133,7 +1133,7 @@ open question.
   one (204, or 404): its certificates are revoked, its streams and
   connections closed on every instance, and it leaves the mesh's peers
   and `ferun-ingress`; a token pinned to its name joins it again, with its
-  /64.
+  /96.
 - **Join tokens**: `POST /api/v1/admin/join-tokens` takes `kind` (`node`,
   the default, or `ingress`) and `name` (`node` is its older alias; both
   given and different is 400), and answers `{id, token, expiresAt, kind,
@@ -1162,7 +1162,7 @@ open question.
 |---|---|---|
 | A `ferund` instance crashes | The stream breaks (a reset, or keepalive after 15 + 5 s). The agent connects to another address or instance and gets a whole table, serving from memory meanwhile. Held requests ask again for a wake every 5 s; another engine takes the op over once its owner is dead. Holds stay valid and renew through the new instance. | stale for about 20 s; no request lost |
 | `ferund` rolls | Stopping instances refuse new ingress connections and end their streams; older instances close the ALPN; the 5 s backstop covers their writes. | seconds |
-| An ingress instance restarts or crashes | Kubernetes takes it out of the balancer by readiness, and the other instance serves. Its identity and /64 persist; its new pod address reaches the nodes through Hello and `mesh-peers`. It serves the cache at once and is ready once the nodes' handshakes are fresh. A crash leaves its holds to lapse (30 s), and without `left_at` the fence keeps public services awake for up to 15 minutes. | the other instance serves |
+| An ingress instance restarts or crashes | Kubernetes takes it out of the balancer by readiness, and the other instance serves. Its identity and /96 persist; its new pod address reaches the nodes through Hello and `mesh-peers`. It serves the cache at once and is ready once the nodes' handshakes are fresh. A crash leaves its holds to lapse (30 s), and without `left_at` the fence keeps public services awake for up to 15 minutes. | the other instance serves |
 | A force-deleted ingress pod | Two processes may use one key and address, and WireGuard flaps between their endpoints. | until one dies |
 | A database failover | The builders' reads fail and the snapshots stay; streams go on. After 30 s unhealthy the streams end and the agents try other instances. Join, Hello, renewal and Hold fail: holds lapse, but the fence starts only 45 s after `last_seen`. | the data path is unaffected |
 | The ingress cut off from `ferund` | The cached table is served. No wakes: held requests time out with 503. Holds lapse after 30 s, but the fence keeps public services from idling for 15 minutes; after that, a request to a paused instance waits until its client gives up. | 15 minutes |

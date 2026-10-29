@@ -305,7 +305,7 @@ TABLE ingresses
   COLUMN status text NOT NULL DEFAULT 'joined'::text
   COLUMN joined_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN removed_at timestamp with time zone
-  COLUMN mesh_subnet integer
+  COLUMN mesh_subnet bigint
   COLUMN mesh_prefix text NOT NULL DEFAULT ''::text
   COLUMN mesh_address text NOT NULL DEFAULT ''::text
   COLUMN mesh_public_key bytea
@@ -317,7 +317,7 @@ TABLE ingresses
   COLUMN last_seen timestamp with time zone
   COLUMN left_at timestamp with time zone
   CONSTRAINT CHECK (((mesh_prefix = ''::text) = (mesh_address = ''::text)))
-  CONSTRAINT CHECK (((mesh_subnet >= 1) AND (mesh_subnet <= 65535)))
+  CONSTRAINT CHECK (((mesh_subnet >= 1) AND (mesh_subnet <= '4294967295'::bigint)))
   CONSTRAINT CHECK (((mesh_subnet IS NULL) = (mesh_prefix = ''::text)))
   CONSTRAINT CHECK (((status = 'removed'::text) = (removed_at IS NOT NULL)))
   CONSTRAINT CHECK ((group_version >= 0))
@@ -474,12 +474,12 @@ TABLE nodes
   COLUMN joined_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN reconciled_at timestamp with time zone
   COLUMN reconcile_requested_at timestamp with time zone
-  COLUMN mesh_subnet integer
+  COLUMN mesh_subnet bigint
   COLUMN mesh_prefix text NOT NULL DEFAULT ''::text
   COLUMN mesh_public_key bytea
   COLUMN mesh_endpoint text NOT NULL DEFAULT ''::text
   COLUMN ingress_group_version bigint NOT NULL DEFAULT 0
-  CONSTRAINT CHECK (((mesh_subnet >= 1) AND (mesh_subnet <= 65535)))
+  CONSTRAINT CHECK (((mesh_subnet >= 1) AND (mesh_subnet <= '4294967295'::bigint)))
   CONSTRAINT CHECK ((cpu_overcommit >= (0)::double precision))
   CONSTRAINT CHECK ((mem_headroom_bytes >= 0))
   CONSTRAINT CHECK ((name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'::text))
@@ -496,7 +496,7 @@ TABLE pod_network
   COLUMN peers_version bigint NOT NULL DEFAULT 0
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN ingress_group_version bigint NOT NULL DEFAULT 0
-  CONSTRAINT CHECK (((family((ula)::inet) = 6) AND (masklen((ula)::inet) = 48) AND ((ula)::inet << ('fd00::/8'::cidr)::inet)))
+  CONSTRAINT CHECK (((family((ula)::inet) = 6) AND (masklen((ula)::inet) = 64) AND ((ula)::inet << ('fd00::/8'::cidr)::inet)))
   CONSTRAINT CHECK ((ingress_group_version >= 0))
   CONSTRAINT CHECK ((peers_version >= 0))
   CONSTRAINT CHECK (id)

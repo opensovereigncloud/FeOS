@@ -22,7 +22,7 @@ func TestDraw(t *testing.T) {
 			t.Fatal(err)
 		}
 		a := p.Addr().As16()
-		if p.Bits() != 48 || a[0] != 0xfd || p.Masked() != p {
+		if p.Bits() != 64 || a[0] != 0xfd || a[6] != 0 || a[7] != 0 || p.Masked() != p {
 			t.Fatalf("drew %v", p)
 		}
 		seen[p] = true
@@ -82,10 +82,11 @@ func TestCheckKey(t *testing.T) {
 
 func TestNodePrefix(t *testing.T) {
 	t.Parallel()
-	ula := netip.MustParsePrefix("fd5e:1b2c:93a0::/48")
+	ula := netip.MustParsePrefix("fd5e:1b2c:93a0::/64")
 	for subnet, want := range map[int]string{
-		1: "fd5e:1b2c:93a0:1::/64", 7: "fd5e:1b2c:93a0:7::/64", 0x1234: "fd5e:1b2c:93a0:1234::/64",
-		65535: "fd5e:1b2c:93a0:ffff::/64",
+		1: "fd5e:1b2c:93a0::1:0:0/96", 7: "fd5e:1b2c:93a0::7:0:0/96", 0x1234: "fd5e:1b2c:93a0::1234:0:0/96",
+		65535: "fd5e:1b2c:93a0::ffff:0:0/96", 65536: "fd5e:1b2c:93a0:0:1::/96",
+		0x12345678: "fd5e:1b2c:93a0:0:1234:5678::/96", LastSubnet: "fd5e:1b2c:93a0:0:ffff:ffff::/96",
 	} {
 		if got := NodePrefix(ula, subnet).String(); got != want {
 			t.Errorf("subnet %d: %s, want %s", subnet, got, want)
@@ -93,14 +94,14 @@ func TestNodePrefix(t *testing.T) {
 	}
 }
 
-// An ingress instance's address is <prefix>::1 of its /64, whatever host
+// An ingress instance's address is <prefix>::1 of its /96, whatever host
 // bits the prefix carries.
 func TestHostAddress(t *testing.T) {
 	t.Parallel()
-	ula := netip.MustParsePrefix("fd5e:1b2c:93a0::/48")
+	ula := netip.MustParsePrefix("fd5e:1b2c:93a0::/64")
 	for in, want := range map[netip.Prefix]string{
-		NodePrefix(ula, 7):                                  "fd5e:1b2c:93a0:7::1",
-		NodePrefix(ula, 65535):                              "fd5e:1b2c:93a0:ffff::1",
+		NodePrefix(ula, 7):                                  "fd5e:1b2c:93a0::7:0:1",
+		NodePrefix(ula, 65535):                              "fd5e:1b2c:93a0::ffff:0:1",
 		netip.MustParsePrefix("fd5e:1b2c:93a0:12::/64"):     "fd5e:1b2c:93a0:12::1",
 		netip.MustParsePrefix("fd5e:1b2c:93a0:12:ab::9/64"): "fd5e:1b2c:93a0:12::1",
 		netip.MustParsePrefix("10.20.30.40/24"):             "10.20.30.1",
@@ -109,6 +110,21 @@ func TestHostAddress(t *testing.T) {
 		if got.String() != want || !in.Contains(got) {
 			t.Errorf("%v: %v, want %s", in, got, want)
 		}
+	}
+	if got := HostAddress(netip.Prefix{}); got.IsValid() {
+		t.Errorf("the zero prefix: %v", got)
+	}
+}
+
+// A cluster meshed on a /48 keeps its Global ID, on its /64 of subnet 0.
+func TestFromLegacy(t *testing.T) {
+	t.Parallel()
+	got := FromLegacy(netip.MustParsePrefix("fd5e:1b2c:93a0::/48"))
+	if got != netip.MustParsePrefix("fd5e:1b2c:93a0::/64") {
+		t.Fatalf("%v", got)
+	}
+	if NodePrefix(got, 3).Overlaps(netip.MustParsePrefix("fd5e:1b2c:93a0:3::/64")) {
+		t.Fatal("a new prefix overlaps an old one")
 	}
 	if got := HostAddress(netip.Prefix{}); got.IsValid() {
 		t.Errorf("the zero prefix: %v", got)

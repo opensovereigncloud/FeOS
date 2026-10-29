@@ -10,9 +10,10 @@ clients" as the first thing CaaS needs that the sandboxes ruled out.
 ADR 0010 says load balancers "are the control plane's front doors and
 get an ADR of their own". ADR 0015 keeps them out of `ferund`: "Inbound
 traffic to services, CaaS's ingress, is not a front door of `ferund`".
-ADR 0017 reserves subnet 0 of a meshed cluster's ULA and asks about
-"peers that are not nodes: the control plane's front doors and load
-balancers reaching pods' ports over IPv6, at addresses of subnet 0".
+ADR 0017 reserved subnet 0 of a meshed cluster's ULA (ID 0 since its
+/96s) and asked about "peers that are not nodes: the control plane's
+front doors and load balancers reaching pods' ports over IPv6, at
+addresses of subnet 0".
 ADR 0018 built the route door "until an ingress does" and lists hosts,
 ACME and the way in for IPv4 clients as its open question. This ADR is
 that ADR.
@@ -42,7 +43,7 @@ stay up while FeCode and `ferund` roll, run in two replicas, and be
 reached over IPv4, because that is what its users have.
 
 The network gives the ingress what it needs. Every pod has an IPv6
-address of its node's prefix, a /64 of the cluster's ULA on a meshed
+address of its node's prefix, a /96 of the cluster's ULA on a meshed
 cluster (ADR 0010, ADR 0017); a packet reaches it through its node's
 `forward` chain, where its security groups allow or drop it by the
 source address the mesh vouches for (ADR 0012); its flows are recorded
@@ -89,7 +90,7 @@ woken by the door, which holds the request until the pod runs.
 - `ferund` sends every node the instances as peers, each with its /128
   as the one prefix allowed for it, in the same table as the nodes and
   with the same versions and deltas; and it sends every instance the
-  nodes as its peers, with their /64s. A node speaks for its /64, an
+  nodes as its peers, with their /96s. A node speaks for its /96, an
   instance for its /128, and nothing else comes through the mesh
   (ADR 0017). A packet from the ingress reaches a pod through the pod's
   node's `forward` chain like a packet from another node's pod: the
@@ -102,7 +103,7 @@ woken by the door, which holds the request until the pod runs.
   the instances and names to `ferund`; the groups do not care which.
 - On Kubernetes an instance is an ordinary pod with `NET_ADMIN` and a
   network namespace of its own, so that its WireGuard device and its
-  route for the cluster's /48 never meet a node's on one host; its
+  route for the cluster's /64 never meet a node's on one host; its
   endpoint is its pod address, which the nodes' hosts reach, and which
   `ferund` sends anew when the pod is replaced. On one machine, where
   the ingress runs beside `feosd` (ADR 0015), it runs in a network
@@ -268,11 +269,11 @@ changed these points:
   environment only after its tenant makes it public (`PUT
   /api/v1/environments/{env}/public`). An empty apps zone switches every
   host off.
-- **A /64 per instance from the nodes' counter, not subnet 0.** Every
-  instance takes the next subnet ID of `mesh_subnets` and uses
-  `<prefix>::1`. Nodes take it as an ordinary /64 peer `ingress.<name>`,
-  so `feosd`, which accepts only /64 peers, changes nothing. Subnet 0
-  stays reserved. A re-join keeps the /64.
+- **A prefix per instance from the nodes' counter, not subnet 0.** Every
+  instance takes the next ID of `mesh_subnets` and uses `<prefix>::1`:
+  a /96 since ADR 0017 gives nodes /96s, a /64 before. Nodes take it as
+  an ordinary peer `ingress.<name>` of a node's length, so `feosd`
+  changes nothing. ID 0 stays reserved. A re-join keeps the prefix.
 - **Groups: `ing-<sandbox id>` per pod and `ferun-ingress`, not
   `in-<environment>-<service>`.** The proposed ID is longer than
   `feosd`'s 64 characters, and a pod names its groups at its creation.
