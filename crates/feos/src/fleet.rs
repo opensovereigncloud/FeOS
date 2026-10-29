@@ -63,14 +63,18 @@ impl Inventory for Node {
 
 /// Starts the node's side of the control plane, with the pods' events. It
 /// runs on threads of its own; what it asks of the node runs on this
-/// runtime.
-pub(crate) fn start(config: fleet_client::Config, pods: Pods) -> Result<(Fleet, Incoming), String> {
+/// runtime. `calls` are those of the node connections' server.
+pub(crate) fn start(
+    config: fleet_client::Config,
+    pods: Pods,
+    calls: fleet_client::NodeCalls,
+) -> Result<(Fleet, Incoming), String> {
     let mut events = pods.subscribe();
     let node = Node {
         pods,
         runtime: Handle::current(),
     };
-    let (fleet, incoming) = fleet_client::start(config, node)?;
+    let (fleet, incoming) = fleet_client::start(config, node, calls)?;
     let sink = fleet.events().clone();
     tokio::spawn(async move {
         loop {

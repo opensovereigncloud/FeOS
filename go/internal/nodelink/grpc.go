@@ -126,6 +126,8 @@ func (s *Server) dial(l *link, conn net.Conn, state tls.ConnectionState) error {
 		grpc.WithIdleTimeout(s.idleTimeout),
 		grpc.WithDisableServiceConfig(),
 		grpc.WithKeepaliveParams(s.clientKeepalive),
+		// What each call reached (started.go).
+		grpc.WithStatsHandler(trackStats{}),
 	)
 	if err != nil {
 		return err

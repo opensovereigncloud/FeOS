@@ -458,16 +458,7 @@ func (s *Server) watchState(l *link) {
 	for {
 		state := l.cc.GetState()
 		if state != connectivity.Ready {
-			var d deferred
-			s.mu.Lock()
-			if !l.closed && !l.notReady {
-				l.notReady = true
-				if st := s.nodes[l.node]; st != nil {
-					s.updateCurrentLocked(st, &d)
-				}
-			}
-			s.mu.Unlock()
-			d.run()
+			s.markNotReady(l)
 			return
 		}
 		if !l.cc.WaitForStateChange(s.ctx, state) {

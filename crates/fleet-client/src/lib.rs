@@ -23,6 +23,11 @@
 //! A feosd that stands still for longer than `STALL_LIMIT`, though, takes
 //! no calls either: the node stops reporting until it moves again, and the
 //! control plane counts it down.
+//!
+//! When feosd stops, it closes the node connections gracefully
+//! (`Fleet::stop`): GOAWAY, so that no new call starts, the calls in
+//! flight up to a bound, and those still running end with UNAVAILABLE "the
+//! node stops".
 
 mod calls;
 mod events;
@@ -33,7 +38,7 @@ mod tls;
 mod token;
 mod uplink;
 
-pub use calls::{CallsOn, OnRuntime};
+pub use calls::{CallsOn, NodeCalls, OnRuntime};
 pub use events::Events;
 pub use identity::NODE_DIR;
 pub use node::{server, Incoming, NodeConn};
@@ -95,6 +100,9 @@ const RENEW_BACKOFF: (Duration, Duration) = (Duration::from_secs(10), Duration::
 /// How long feosd waits for the control plane to acknowledge that it
 /// stops.
 const STOPPING_WAIT: Duration = Duration::from_secs(3);
+/// How long the node connections may take to close once the calls still
+/// running at the stop's bound are ended.
+const CUT_WAIT: Duration = Duration::from_secs(5);
 
 /// How feosd reaches the control plane.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +201,10 @@ pub struct Fleet {
     runner: tokio::task::AbortHandle,
     /// The control plane's threads.
     runtime: Handle,
+    /// The calls on the node connections.
+    calls: NodeCalls,
+    /// Retires every dialer of a node connection when feosd stops.
+    retire: Arc<watch::Sender<bool>>,
 }
 
 impl Fleet {
@@ -201,11 +213,12 @@ impl Fleet {
         &self.events
     }
 
-    /// Serves `router`, made from `server`, on the node connections, on the
-    /// control plane's threads: the connections, their TLS and HTTP/2 and
-    /// their pings, so that they answer the control plane whatever feosd's
-    /// own threads do. The calls run where `server` says. It serves until
-    /// feosd ends, whatever becomes of the dialers.
+    /// Serves `router`, made from `server` with the calls given to `start`,
+    /// on the node connections, on the control plane's threads: the
+    /// connections, their TLS and HTTP/2 and their pings, so that they
+    /// answer the control plane whatever feosd's own threads do. The calls
+    /// run where `server` says. It serves until feosd stops (`stop`),
+    /// whatever becomes of the dialers.
     pub fn serve<L, ResBody>(
         &self,
         router: Router<L>,
@@ -223,8 +236,15 @@ impl Fleet {
         ResBody::Error: Into<StdError>,
     {
         let incoming = tokio_stream::StreamExt::chain(incoming, tokio_stream::pending());
-        self.runtime
-            .spawn(async move { router.serve_with_incoming(incoming).await })
+        let calls = self.calls.clone();
+        calls.serving();
+        self.runtime.spawn(async move {
+            let served = router
+                .serve_with_incoming_shutdown(incoming, calls.goaway_requested())
+                .await;
+            calls.served();
+            served
+        })
     }
 
     /// Tells the control plane that feosd stops, for a restart or an
@@ -237,13 +257,41 @@ impl Fleet {
         }
     }
 
-    /// Lets go of the control plane for the rest of this feosd's life: the
-    /// node connections close and the reports end, so that the control
-    /// plane neither calls the node nor sees its pods until the next
-    /// feosd connects. For a stop that suspends the pods: the control plane
-    /// waits for the node it announced the restart of, and finds the pods
-    /// as it left them.
-    pub fn disconnect(&self) {
+    /// Lets go of the control plane for the rest of this feosd's life, as
+    /// gracefully as `wait` allows: the server sends GOAWAY on every node
+    /// connection, so that the control plane starts no new call on it, and
+    /// the dialers dial no more. The calls in flight end as they do, up to
+    /// `wait`; those still running then end with UNAVAILABLE "the node
+    /// stops: …", a stream with it as its trailers. Once the server let go
+    /// of the connections, or `CUT_WAIT` after the cut, the reports end.
+    /// For a stop that suspends the pods: the control plane waits for the
+    /// node it announced the restart of, and finds the pods as it left them.
+    pub async fn stop(&self, wait: Duration) {
+        self.retire.send_replace(true);
+        self.calls.goaway();
+        info!(
+            "Fleet: Closing the node connections: no new calls; {} in flight get up to {}s",
+            self.calls.in_flight(),
+            wait.as_secs()
+        );
+        if !self.calls.wait_served(wait).await {
+            warn!(
+                "Fleet: {} calls still run after {}s; they end: the node stops",
+                self.calls.in_flight(),
+                wait.as_secs()
+            );
+            self.calls.cut(format!(
+                "the node stops: the call did not end within {}s of feosd's stop",
+                wait.as_secs()
+            ));
+            if !self.calls.wait_served(CUT_WAIT).await {
+                warn!(
+                    "Fleet: The node connections did not close within {}s of the end of their \
+                     calls",
+                    CUT_WAIT.as_secs()
+                );
+            }
+        }
         self.runner.abort();
         info!("Fleet: Disconnected from the control plane");
     }
@@ -272,10 +320,14 @@ fn runtime() -> Result<Handle, String> {
 
 /// Starts the node's side of the control plane on threads of its own: the
 /// join if the node has not joined, then the uplink and the node
-/// connections, which the caller serves its API on (`server`,
-/// `Fleet::serve`). It is called on feosd's runtime, which the reports
-/// watch (`Config::stall_limit`).
-pub fn start<I: Inventory>(config: Config, inventory: I) -> Result<(Fleet, Incoming), String> {
+/// connections, which the caller serves its API on (`server` with the same
+/// `calls`, `Fleet::serve`). It is called on feosd's runtime, which the
+/// reports watch (`Config::stall_limit`).
+pub fn start<I: Inventory>(
+    config: Config,
+    inventory: I,
+    calls: NodeCalls,
+) -> Result<(Fleet, Incoming), String> {
     if Handle::try_current().is_err() {
         return Err("the control plane's side starts on feosd's runtime".into());
     }
@@ -284,7 +336,8 @@ pub fn start<I: Inventory>(config: Config, inventory: I) -> Result<(Fleet, Incom
     let start_id = uuid::Uuid::new_v4().to_string();
     let events = Events::new(&start_id);
     events.node("started", &format!("feosd {}", config.version));
-    let (nodes, incoming) = Nodes::new(link.name.clone());
+    let (retire, retired) = watch::channel(false);
+    let (nodes, incoming) = Nodes::new(link.name.clone(), retired);
     let (uplink, published) = watch::channel(None);
     runtime.spawn(events::publish(events.clone(), published));
     let collector = Collector::new(
@@ -316,6 +369,8 @@ pub fn start<I: Inventory>(config: Config, inventory: I) -> Result<(Fleet, Incom
             events,
             runner,
             runtime,
+            calls,
+            retire: Arc::new(retire),
         },
         incoming,
     ))

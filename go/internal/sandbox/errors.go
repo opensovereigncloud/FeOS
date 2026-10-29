@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -88,18 +87,32 @@ func callText(err error) string {
 	return err.Error()
 }
 
-// vmBusyText is what feosd's UNAVAILABLE of a microVM that takes no change
-// now, and does later, says: "the VM is busy: <why>", as while Firecracker
-// still writes a snapshot that a suspend gave up on (node.md, "The
-// suspend's budget").
-const vmBusyText = "the VM is busy"
+// vmBusyDetail is the type of the status detail that marks feosd's
+// UNAVAILABLE of a microVM that takes no change now, and does later
+// ("the VM is busy: <why>", as while Firecracker still writes a snapshot
+// that a suspend gave up on; node.md, "The suspend's budget"): an Any of
+// this type without a value (microvm_service::vmm::BUSY_DETAIL).
+const vmBusyDetail = "type.googleapis.com/feos.microvm.v1.VmBusy"
 
 // busyRetry is when a caller told that the sandbox's VM is busy should
 // come back.
 const busyRetry = 30 * time.Second
 
 // vmBusy reports whether a node call's error is feosd's busy VM: the call
-// changed nothing, and the same call later may.
+// changed nothing, and the same call later may. The marker decides, not
+// the message.
 func vmBusy(err error) bool {
-	return grpcCode(err) == codes.Unavailable && strings.Contains(callText(err), vmBusyText)
+	if grpcCode(err) != codes.Unavailable {
+		return false
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	for _, detail := range st.Proto().GetDetails() {
+		if detail.GetTypeUrl() == vmBusyDetail {
+			return true
+		}
+	}
+	return false
 }

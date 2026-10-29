@@ -35,10 +35,50 @@ pub const METADATA_LIMIT: usize = 51200;
 /// later, begins: a busy VM's (`VmmError::Busy`).
 pub const BUSY: &str = "the VM is busy";
 
-/// Whether a status is a busy VM's: the call changed nothing, and the same
-/// call later may.
+/// The type of the status detail that marks a busy VM's `UNAVAILABLE`
+/// (`busy_status`): a `google.protobuf.Any` of this type and no value in
+/// the status's details (`grpc-status-details-bin`, a `google.rpc.Status`).
+/// It tells the answer apart from any other `UNAVAILABLE`, whatever its
+/// message says, here and in the control plane.
+pub const BUSY_DETAIL: &str = "type.googleapis.com/feos.microvm.v1.VmBusy";
+
+/// `google.rpc.Status`, as gRPC carries a status's details.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<Any>,
+}
+
+/// The `UNAVAILABLE` of a VM that is busy: "the VM is busy: <why>", marked
+/// with `BUSY_DETAIL`.
+pub fn busy_status(why: &str) -> Status {
+    let message = format!("{BUSY}: {why}");
+    let details = RpcStatus {
+        code: tonic::Code::Unavailable as i32,
+        message: message.clone(),
+        details: vec![Any {
+            type_url: BUSY_DETAIL.to_string(),
+            value: Vec::new(),
+        }],
+    }
+    .encode_to_vec();
+    Status::with_details(tonic::Code::Unavailable, message, details.into())
+}
+
+/// Whether a status is a busy VM's (`busy_status`): the call changed
+/// nothing, and the same call later may. The marker decides, not the
+/// message.
 pub fn is_busy(status: &Status) -> bool {
-    status.code() == tonic::Code::Unavailable && status.message().starts_with(BUSY)
+    status.code() == tonic::Code::Unavailable
+        && RpcStatus::decode(status.details()).is_ok_and(|rpc| {
+            rpc.details
+                .iter()
+                .any(|detail| detail.type_url == BUSY_DETAIL)
+        })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,7 +124,7 @@ impl From<VmmError> for Status {
             }
             // The control plane takes it for a VM that takes the change
             // later, and asks again (control-plane.md, "Ops").
-            VmmError::Busy(why) => Status::unavailable(format!("{BUSY}: {why}")),
+            VmmError::Busy(why) => busy_status(&why),
             VmmError::ProcessSpawnFailed(msg)
             | VmmError::ApiOperationFailed(msg)
             | VmmError::Internal(msg) => Status::internal(msg),
@@ -341,6 +381,39 @@ mod tests {
             ipv6_cidr: ipv6.0.to_string(),
             ipv6_gateway: ipv6.1.to_string(),
             ..Default::default()
+        }
+    }
+
+    /// A busy VM's answer is told by its marker, which survives the trip
+    /// over gRPC (the status's details), and not by its message: another
+    /// UNAVAILABLE that says the same is not busy, and the busy answer is
+    /// whatever it says.
+    #[test]
+    fn a_busy_answer_is_told_by_its_marker() {
+        let busy = Status::from(VmmError::Busy("Firecracker still writes".into()));
+        assert!(is_busy(&busy), "{busy:?}");
+        assert_eq!(busy.code(), tonic::Code::Unavailable);
+        assert_eq!(busy.message(), "the VM is busy: Firecracker still writes");
+        // As a client reads it back from the answer's headers.
+        let answer = busy.clone().into_http::<tonic::body::Body>();
+        let read = Status::from_header_map(answer.headers()).expect("a status");
+        assert!(is_busy(&read), "{read:?}");
+        let rpc = RpcStatus::decode(read.details()).unwrap();
+        assert_eq!(rpc.code, 14);
+        assert_eq!(rpc.message, busy.message());
+        assert_eq!(rpc.details[0].type_url, BUSY_DETAIL);
+
+        for other in [
+            Status::unavailable("the VM is busy: but says so only"),
+            Status::unavailable("Could not connect to the API socket"),
+            Status::with_details(tonic::Code::Unavailable, "garbage", vec![1, 2, 3].into()),
+            Status::with_details(
+                tonic::Code::Internal,
+                "the VM is busy",
+                busy.details().to_vec().into(),
+            ),
+        ] {
+            assert!(!is_busy(&other), "{other:?}");
         }
     }
 

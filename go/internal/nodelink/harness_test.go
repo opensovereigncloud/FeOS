@@ -698,11 +698,13 @@ func (p *podStub) StreamPodEvents(req *podv1.StreamPodEventsRequest, s grpc.Serv
 	return nil
 }
 
-// toolStub is the in-test node's ToolService: Read waits for its gate.
+// toolStub is the in-test node's ToolService: Read waits for its gate,
+// then answers fail when set.
 type toolStub struct {
 	toolv1.UnimplementedToolServiceServer
 	gate    chan struct{}
 	entered chan struct{}
+	fail    error
 }
 
 func newToolStub() *toolStub {
@@ -715,6 +717,9 @@ func (s *toolStub) Read(ctx context.Context, req *toolv1.ReadRequest) (*toolv1.R
 	case <-s.gate:
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+	if s.fail != nil {
+		return nil, s.fail
 	}
 	return &toolv1.ReadResponse{Text: req.Path}, nil
 }

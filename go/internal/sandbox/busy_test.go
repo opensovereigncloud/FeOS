@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
 	"github.com/gardenlinux/feos/go/internal/model"
@@ -19,9 +20,16 @@ import (
 )
 
 // errVMBusy is feosd's answer while Firecracker still writes a snapshot
-// that a suspend gave up on.
-var errVMBusy = status.Error(codes.Unavailable, "the VM is busy: Firecracker still writes the snapshot that "+
+// that a suspend gave up on, marked as feosd marks it.
+var errVMBusy = busyStatus("the VM is busy: Firecracker still writes the snapshot that " +
 	"the last suspend of VM x gave up on; the VM is as that suspend found it once it is done")
+
+// busyStatus is an UNAVAILABLE with msg and feosd's busy marker.
+func busyStatus(msg string) error {
+	p := status.New(codes.Unavailable, msg).Proto()
+	p.Details = append(p.Details, &anypb.Any{TypeUrl: vmBusyDetail})
+	return status.ErrorProto(p)
+}
 
 // failWith makes every call of method on node fail with err until the
 // test sets another hook.
@@ -50,11 +58,11 @@ func wantPostponed(t *testing.T, sb store.Sandbox, state, op string) {
 	}
 }
 
-// TestBusyVM: a node call that feosd answers UNAVAILABLE "the VM is busy"
-// changed nothing and is tried again later: the sandbox says so ("<op>
+// TestBusyVM: a node call that feosd answers UNAVAILABLE "the VM is busy",
+// marked with its status detail, changed nothing and is tried again later: the sandbox says so ("<op>
 // postponed: the VM is busy: …"), a policy backs off as after any failure,
 // and a caller gets ErrBusy with a retry time. Any other UNAVAILABLE is a
-// failure, as before.
+// failure, as before, whatever its message says.
 func TestBusyVM(t *testing.T) {
 	h := newHarness(t, func(c *Config) {
 		c.IdlePause = 50 * time.Millisecond
@@ -81,10 +89,16 @@ func TestBusyVM(t *testing.T) {
 	// The explicit pause: ErrBusy, to be asked again.
 	wantBusy(t, e.Pause(bg, sb.ID))
 	wantPostponed(t, h.row(sb.ID), model.StateRunning, "pause")
-	// Another UNAVAILABLE is a failure.
+	// Another UNAVAILABLE is a failure, and so is one that says the VM is
+	// busy without feosd's marker.
 	h.failWith("n1", suspend, status.Error(codes.Unavailable, "diskd does not answer"))
 	err := e.Pause(bg, sb.ID)
 	if err == nil || errors.Is(err, model.ErrBusy) || !strings.Contains(err.Error(), "pause failed: diskd does not answer") {
+		t.Fatalf("pause: %v", err)
+	}
+	h.failWith("n1", suspend, status.Error(codes.Unavailable, "the VM is busy: or so it says"))
+	err = e.Pause(bg, sb.ID)
+	if err == nil || errors.Is(err, model.ErrBusy) || !strings.Contains(err.Error(), "pause failed: the VM is busy: or so it says") {
 		t.Fatalf("pause: %v", err)
 	}
 	// Free again, it pauses.

@@ -178,6 +178,8 @@ struct Seen {
     reported_at: Vec<std::time::Instant>,
     /// The node connections the node opened.
     node_connections: usize,
+    /// The channels of the node connections, for the test's calls.
+    channels: Vec<tonic::transport::Channel>,
 }
 
 struct ControlPlane {
@@ -442,6 +444,7 @@ async fn call_node(tls: TlsStream<TcpStream>, seen: Arc<Mutex<Seen>>) {
         }))
         .await
         .unwrap();
+    seen.lock().unwrap().channels.push(channel.clone());
     let mut client = VolumeServiceClient::new(channel.clone());
     let volumes = client.list_volumes(ListVolumesRequest {}).await;
     if let Ok(volumes) = volumes {
@@ -460,6 +463,18 @@ async fn call_node(tls: TlsStream<TcpStream>, seen: Arc<Mutex<Seen>>) {
 /// The node's volumes, as its API answers on the node connection.
 struct Volumes;
 
+/// The GetVolume calls that came, and the volumes whose calls may answer.
+#[derive(Default)]
+struct Gates {
+    entered: Vec<String>,
+    opened: Vec<String>,
+}
+
+static GATES: Mutex<Gates> = Mutex::new(Gates {
+    entered: Vec::new(),
+    opened: Vec::new(),
+});
+
 #[tonic::async_trait]
 impl VolumeService for Volumes {
     async fn create_volume(
@@ -476,11 +491,20 @@ impl VolumeService for Volumes {
         Err(Status::unimplemented("not in this test"))
     }
 
+    /// Answers once the test opens the volume's gate (`GATES`).
     async fn get_volume(
         &self,
-        _request: Request<GetVolumeRequest>,
+        request: Request<GetVolumeRequest>,
     ) -> Result<Response<Volume>, Status> {
-        Err(Status::unimplemented("not in this test"))
+        let volume_id = request.into_inner().volume_id;
+        GATES.lock().unwrap().entered.push(volume_id.clone());
+        while !GATES.lock().unwrap().opened.contains(&volume_id) {
+            sleep(Duration::from_millis(10)).await;
+        }
+        Ok(Response::new(Volume {
+            volume_id,
+            ..Default::default()
+        }))
     }
 
     async fn list_volumes(
@@ -570,9 +594,10 @@ fn node_with<I: Inventory>(
     config.pod_prefix = "fd00:fe05:1::/64".into();
     config.version = "0.6.0".into();
     config.stall_limit = stall_limit;
-    let (fleet, incoming) = fleet_client::start(config, inventory).unwrap();
+    let calls = fleet_client::NodeCalls::new();
+    let (fleet, incoming) = fleet_client::start(config, inventory, calls.clone()).unwrap();
     fleet.serve(
-        fleet_client::server(tokio::runtime::Handle::current())
+        fleet_client::server(tokio::runtime::Handle::current(), &calls)
             .add_service(VolumeServiceServer::new(Volumes)),
         incoming,
     );
@@ -933,5 +958,95 @@ async fn a_runtime_stalled_past_the_limit_stops_the_reports_until_it_moves() {
     assert!(
         between(BLOCKED, BLOCKED + Duration::from_secs(5)) >= 2,
         "no reports once feosd moved again"
+    );
+}
+
+/// A drill on 2026-10-28: the feos-node pod restarted while an exec ran,
+/// and the exec ended with "error reading from server: EOF": the stop
+/// dropped the node connections. A stop now sends GOAWAY: the control
+/// plane starts no new call on the connection, and the node dials no
+/// more; a call in flight that ends within the bound answers, and one that
+/// does not ends with UNAVAILABLE "the node stops".
+#[tokio::test]
+async fn a_stop_lets_the_calls_in_flight_end_and_cuts_the_rest() {
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (token, address) = control_plane(pki, seen.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    let fleet = node(&address, dir.path());
+    wait_for(&seen, "a node connection", |seen| !seen.channels.is_empty()).await;
+    let channel = seen.lock().unwrap().channels[0].clone();
+    let get = |id: &'static str| {
+        let mut client = VolumeServiceClient::new(channel.clone());
+        tokio::spawn(async move {
+            client
+                .get_volume(GetVolumeRequest {
+                    volume_id: id.into(),
+                })
+                .await
+                .map(|volume| volume.into_inner().volume_id)
+        })
+    };
+    let entered = |id: &str| GATES.lock().unwrap().entered.iter().any(|e| e == id);
+    let quick = get("stop-quick");
+    let slow = get("stop-slow");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(entered("stop-quick") && entered("stop-slow")) {
+        assert!(Instant::now() < deadline, "the calls did not come");
+        sleep(Duration::from_millis(10)).await;
+    }
+    let connections = seen.lock().unwrap().node_connections;
+
+    let started = Instant::now();
+    let stopping = {
+        let fleet = fleet.clone();
+        tokio::spawn(async move { fleet.stop(Duration::from_secs(1)).await })
+    };
+    sleep(Duration::from_millis(300)).await;
+    // No new call starts on the connection.
+    let late = get("stop-late");
+    GATES.lock().unwrap().opened.push("stop-quick".into());
+    assert_eq!(quick.await.unwrap().unwrap(), "stop-quick");
+    let cut = slow.await.unwrap().expect_err("the slow call answered");
+    assert_eq!(cut.code(), tonic::Code::Unavailable, "{cut:?}");
+    assert!(
+        cut.message().starts_with("the node stops: "),
+        "{}",
+        cut.message()
+    );
+    stopping.await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the stop took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        late.await.unwrap().is_err(),
+        "a call after the stop answered"
+    );
+    assert!(!entered("stop-late"), "a call after the stop came");
+    // The node dials no more.
+    sleep(Duration::from_secs(2)).await;
+    assert_eq!(seen.lock().unwrap().node_connections, connections);
+}
+
+/// A stop without calls in flight does not wait for its bound: the server
+/// lets go of an idle connection at once.
+#[tokio::test]
+async fn a_stop_without_calls_ends_at_once() {
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (token, address) = control_plane(pki, seen.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    let fleet = node(&address, dir.path());
+    wait_for(&seen, "a node connection", |seen| !seen.volumes.is_empty()).await;
+    let started = Instant::now();
+    fleet.stop(Duration::from_secs(20)).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the stop took {:?}",
+        started.elapsed()
     );
 }

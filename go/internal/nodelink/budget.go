@@ -5,6 +5,7 @@ package nodelink
 
 import (
 	"context"
+	"io"
 	"strings"
 	"sync"
 
@@ -173,19 +174,39 @@ type nodeConn struct {
 
 func (c *nodeConn) Invoke(ctx context.Context, method string, args, reply any, opts ...grpc.CallOption) error {
 	kind := unaryKind(method)
-	l, err := c.s.waitCurrent(ctx, c.node, true, kind)
-	if err != nil {
-		return err
+	for {
+		l, err := c.s.waitCurrent(ctx, c.node, true, kind)
+		if err != nil {
+			return err
+		}
+		tctx, t := withTrack(ctx)
+		err = l.cc.Invoke(tctx, method, args, reply, opts...)
+		c.s.release(l, kind)
+		if err != nil && c.s.notStarted(ctx, l, t, err) {
+			// The node never saw it: on its next connection.
+			continue
+		}
+		return c.s.cutError(c.node, t, err)
 	}
-	defer c.s.release(l, kind)
-	return l.cc.Invoke(ctx, method, args, reply, opts...)
 }
 
 func (c *nodeConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	for {
+		stream, again, err := c.newStream(ctx, desc, method, opts...)
+		if !again {
+			return stream, err
+		}
+	}
+}
+
+// newStream opens a stream on the node's current connection; again
+// reports a stream that the node never saw, as its connection was going,
+// which goes to the next connection.
+func (c *nodeConn) newStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (_ grpc.ClientStream, again bool, _ error) {
 	kind := streamKind(method)
 	l, err := c.s.waitCurrent(ctx, c.node, true, kind)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	var id uint64
@@ -195,7 +216,7 @@ func (c *nodeConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method 
 			c.s.mu.Unlock()
 			cancel()
 			c.s.release(l, kind)
-			return nil, refusef(codes.Unavailable, "node %s: connection is closing", c.node)
+			return nil, false, refusef(codes.Unavailable, "node %s: connection is closing", c.node)
 		}
 		l.streamSeq++
 		id = l.streamSeq
@@ -215,16 +236,21 @@ func (c *nodeConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method 
 		cancel()
 		c.s.release(l, kind)
 	}
-	stream, err := l.cc.NewStream(ctx, desc, method, opts...)
+	tctx, t := withTrack(ctx)
+	stream, err := l.cc.NewStream(tctx, desc, method, opts...)
 	if err != nil {
 		cs.done()
-		return nil, err
+		if c.s.notStarted(ctx, l, t, err) {
+			return nil, true, nil
+		}
+		return nil, false, c.s.cutError(c.node, t, err)
 	}
 	cs.ClientStream = stream
+	cs.cut = func(err error) error { return c.s.cutError(c.node, t, err) }
 	// The slot is given back when the stream's context ends; end cancels
 	// that context too, so this runs once in every case.
 	context.AfterFunc(ctx, cs.done)
-	return cs, nil
+	return cs, false, nil
 }
 
 // countedStream holds its slot until RecvMsg returns an error or its
@@ -233,12 +259,17 @@ type countedStream struct {
 	grpc.ClientStream
 	once sync.Once
 	end  func()
+	// cut is how a failed stream's error reads (Server.cutError).
+	cut func(error) error
 }
 
 func (s *countedStream) RecvMsg(m any) error {
 	err := s.ClientStream.RecvMsg(m)
 	if err != nil {
 		s.done()
+		if err != io.EOF {
+			err = s.cut(err)
+		}
 	}
 	return err
 }

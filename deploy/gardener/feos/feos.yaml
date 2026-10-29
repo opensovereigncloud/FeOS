@@ -67,8 +67,10 @@ spec:
       # The pause container is PID 1; feosd is not.
       shareProcessNamespace: true
       priorityClassName: system-node-critical
-      # A stop suspends the node's pods into their directories: 60 s and
-      # 4 s per GiB of the microVMs' 40 GiB, with room.
+      # A stop lets the node connections' calls in flight end (30 s at
+      # most), then suspends the node's pods into their directories: 60 s
+      # and 4 s per GiB of the microVMs' 40 GiB, with room. feosd's
+      # --stop-grace says the same, 300 s by default.
       terminationGracePeriodSeconds: 300
       imagePullSecrets:
         - name: oci-pull

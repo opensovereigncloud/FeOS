@@ -421,6 +421,20 @@ One TLS 1.3 listener, routed strictly by ALPN:
   clock is not. A lost connection is what tells an instance to fail calls
   for the node fast; it changes nothing in the database. A call into a
   pod's guest carries `feos-pod-id`.
+- **A node that stops** sends GOAWAY on its node connections, lets the
+  calls in flight end up to its bound, and ends the rest with
+  `UNAVAILABLE` "the node stops: …" ([node.md](node.md#stopping)). A
+  call that had not reached the node (no stream opened on the connection,
+  which a stats handler on the channel tells) and failed `UNAVAILABLE` on
+  a connection that left READY goes to the node's next current
+  connection, waiting as `Conn` does, up to the rollout deadline; before,
+  a call that took the connection just before its GOAWAY failed with
+  "the node's connection is gone". A call that had reached the node and
+  whose connection ended without the node's status (an EOF, a reset)
+  reads "node <n> stopped during the call: <error>" when the node had
+  announced its stop, and "node <n>: the connection ended during the
+  call: <error>" otherwise; the node's own status, as "the node stops",
+  is as it sent it.
 - **Stream budgets**, per connection, of `--node-max-streams` N: long
   streams (exec, watch, port forward, console, traffic records, host
   streams) at most N/2, unary tool calls at most N/4; beyond them a call
@@ -870,7 +884,10 @@ checkpoint inside the call.
   every 5 s, until the deadline. `UNAVAILABLE` and `RESOURCE_EXHAUSTED`
   while waiting are transient. Call errors are never mapped to a state
   directly: the pod read after them decides.
-- **A busy VM.** feosd answers `UNAVAILABLE` "the VM is busy: <why>" to a
+- **A busy VM.** feosd answers `UNAVAILABLE` "the VM is busy: <why>",
+  marked with the status detail `type.googleapis.com/feos.microvm.v1.VmBusy`
+  (an `Any` without a value; ferund goes by the marker, never by the
+  message), to a
   `SuspendPod`, `StopPod` or `HibernatePod` whose microVM takes no change
   now and does later, as while Firecracker still writes a snapshot that a
   suspend gave up on, and when the snapshot of the suspend itself is
@@ -883,7 +900,7 @@ checkpoint inside the call.
   next pass; Ensure and
   the REST pause answer `ErrBusy` "<op> on node <n>: <description>; retry
   in 30s", with a retry time of 30 s. Another `UNAVAILABLE` is a failure,
-  as before.
+  as before, whatever its message says.
 - **Finish** is retried until it commits. An op that is no longer the
   row's (taken over, preempted, or the row deleted or re-created
   meanwhile) writes only a tombstone for a pod it may have made, or a
