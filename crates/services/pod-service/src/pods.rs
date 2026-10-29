@@ -376,7 +376,13 @@ impl Pods {
         Ok(pods)
     }
 
+    /// Creates the pod and brings it up, in a task of its own (`detached`).
     pub async fn create(&self, pod_id: String, spec: PodSpec) -> Result<PodInfo, Status> {
+        self.detached(move |pods| async move { pods.create_detached(pod_id, spec).await })
+            .await
+    }
+
+    async fn create_detached(&self, pod_id: String, spec: PodSpec) -> Result<PodInfo, Status> {
         spec::check_id(&pod_id)?;
         let spec = spec::normalize(spec)?;
         self.inner.network.check(&spec)?;
@@ -485,8 +491,31 @@ impl Pods {
         let _ = tokio::task::spawn_blocking(move || pods.inner.network.release(&info)).await;
     }
 
-    /// Brings a stopped or failed pod up again, on its disk.
+    /// Runs a change of a pod in a task of its own, and waits for it: a
+    /// caller that goes away, as one whose deadline passed, whose stream
+    /// ferund reset, or that the node's stop cut, leaves the change running
+    /// to its end. Cut off between two of its steps, which await records,
+    /// the microVM service and diskd, a change would leave the pod half
+    /// changed: pending with no bring-up, or deleted with its record kept.
+    async fn detached<T, F>(&self, change: impl FnOnce(Pods) -> F) -> Result<T, Status>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, Status>> + Send + 'static,
+    {
+        tokio::spawn(change(self.clone()))
+            .await
+            .unwrap_or_else(|e| Err(Status::internal(format!("the change ended: {e}"))))
+    }
+
+    /// Brings a stopped or failed pod up again, on its disk, in a task of
+    /// its own (`detached`).
     pub async fn start(&self, pod_id: &str) -> Result<(), Status> {
+        let pod_id = pod_id.to_string();
+        self.detached(move |pods| async move { pods.start_detached(&pod_id).await })
+            .await
+    }
+
+    async fn start_detached(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.lock(pod_id).await?;
         match self.info(pod_id)?.state() {
             PodState::Pending | PodState::Running => return Ok(()),
@@ -510,8 +539,14 @@ impl Pods {
 
     /// Ends the pod's microVM and stops its disk. Whatever state it is in,
     /// the next start boots it anew on its disk; a hibernated pod's is the
-    /// one of its checkpoint.
+    /// one of its checkpoint. It runs in a task of its own (`detached`).
     pub async fn stop(&self, pod_id: &str) -> Result<(), Status> {
+        let pod_id = pod_id.to_string();
+        self.detached(move |pods| async move { pods.stop_detached(&pod_id).await })
+            .await
+    }
+
+    async fn stop_detached(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         match self.info(pod_id)?.state() {
             PodState::Stopped => return Ok(()),
@@ -554,8 +589,16 @@ impl Pods {
 
     /// Deletes the pod: its microVM, its disk, its place on the network,
     /// its record and its rules, and then frees its IPv4 address. Its
-    /// volumes stay, stopped, and are attached to no pod then.
+    /// volumes stay, stopped, and are attached to no pod then. It runs in a
+    /// task of its own (`detached`): a delete that waits for the pod's
+    /// lock behind a suspend is not cut off once it has it.
     pub async fn delete(&self, pod_id: &str) -> Result<(), Status> {
+        let pod_id = pod_id.to_string();
+        self.detached(move |pods| async move { pods.delete_detached(&pod_id).await })
+            .await
+    }
+
+    async fn delete_detached(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         self.delete_vm(pod_id).await?;
         // A pod whose disk cannot go stays, to be deleted again: diskd
@@ -633,12 +676,19 @@ impl Pods {
     /// its checkpoint. A resume that comes while the pod hibernates
     /// abandons the hibernation if it may, and resumes the pod from its
     /// snapshot once the hibernation stopped; otherwise it waits for the
-    /// hibernation, and finds the pod hibernated.
+    /// hibernation, and finds the pod hibernated. It runs in a task of its
+    /// own (`detached`).
     pub async fn resume(&self, pod_id: &str) -> Result<(), Status> {
+        let pod_id = pod_id.to_string();
+        self.detached(move |pods| async move { pods.resume_detached(&pod_id).await })
+            .await
+    }
+
+    async fn resume_detached(&self, pod_id: &str) -> Result<(), Status> {
         let lock = self.lock_for_resume(pod_id).await?;
         if self.info(pod_id)?.state() == PodState::Hibernated {
             drop(lock);
-            self.restore(pod_id, "", false).await?;
+            self.restore_detached(pod_id, "", false).await?;
             return Ok(());
         }
         self.expect_state(pod_id, PodState::Suspended)?;
@@ -962,8 +1012,22 @@ impl Pods {
     /// takes its spec from the checkpoint. The memory is restored where
     /// the node can load the snapshot, unless `cold`; otherwise, and if the
     /// restore of the memory fails before the guest ran, the pod boots
-    /// anew on the checkpoint's disk.
+    /// anew on the checkpoint's disk. It runs in a task of its own
+    /// (`detached`).
     pub async fn restore(
+        &self,
+        pod_id: &str,
+        head_key: &str,
+        cold: bool,
+    ) -> Result<RestorePodResponse, Status> {
+        let (pod_id, head_key) = (pod_id.to_string(), head_key.to_string());
+        self.detached(
+            move |pods| async move { pods.restore_detached(&pod_id, &head_key, cold).await },
+        )
+        .await
+    }
+
+    async fn restore_detached(
         &self,
         pod_id: &str,
         head_key: &str,
@@ -3260,5 +3324,128 @@ mod tests {
             .await
             .unwrap();
         assert!(!path.exists());
+    }
+
+    /// Pods kept in `dir/pods`, without a network, diskd or microVM
+    /// service: what calls them fails.
+    fn bare_pods(dir: &Path) -> Pods {
+        let (vms, _) = tokio::sync::mpsc::channel(1);
+        let disks = Disks::new(dir.join("no-diskd.sock"));
+        Pods {
+            inner: Arc::new(Inner {
+                vms: VmApiHandler::new(vms),
+                store: Store::open(dir.join("pods")).unwrap(),
+                dir: dir.join("pods"),
+                network: Network::absent(dir),
+                disks: disks.clone(),
+                volumes: Volumes::open(dir.join("volumes"), disks).unwrap(),
+                pods: Mutex::new(HashMap::new()),
+                events: broadcast::channel(16).0,
+                stopping: AtomicBool::new(false),
+                stop_record: tokio::sync::Mutex::new(()),
+                records: tokio::sync::Mutex::new(()),
+            }),
+        }
+    }
+
+    /// Holds the pods' writer on the record of another pod, which hangs
+    /// as an fsync behind a snapshot's memory does: what is kept behind it
+    /// waits, and lands once the FIFO is opened.
+    fn hold_the_writer(pods: &Pods, dir: &Path) -> crate::hung::Hung {
+        let hung = crate::hung::Hung::at(dir.join("pods/other.pb.new"));
+        drop(pods.inner.store.save(&PodInfo {
+            pod_id: "other".to_string(),
+            ..Default::default()
+        }));
+        hung
+    }
+
+    const POD: &str = "11111111-2222-3333-4444-555555555555";
+
+    /// Waits up to 5 s for `done`.
+    async fn within_5s(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..50 {
+            if done() {
+                return true;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        done()
+    }
+
+    /// Whether the pod's bring-up was started.
+    fn brought_up(pods: &Pods) -> bool {
+        pods.pods()
+            .get(POD)
+            .is_some_and(|pod| pod.bring_up.is_some())
+    }
+
+    /// A StartPod whose caller goes away while the pod's record waits for
+    /// its fsync, as when ferund resets the stream at its deadline, still
+    /// brings the pod up: it is not left pending with nothing to bring it
+    /// up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_whose_caller_goes_away_brings_the_pod_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let pods = bare_pods(dir.path());
+        pods.pods().insert(
+            POD.to_string(),
+            Pod::new(PodInfo {
+                pod_id: POD.to_string(),
+                state: PodState::Stopped as i32,
+                spec: Some(PodSpec::default()),
+                ..Default::default()
+            }),
+        );
+        let hung = hold_the_writer(&pods, dir.path());
+        let start = tokio::spawn({
+            let pods = pods.clone();
+            async move { pods.start(POD).await }
+        });
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(pods.info(POD).unwrap().state(), PodState::Pending);
+        start.abort();
+        assert!(start.await.unwrap_err().is_cancelled());
+        hung.open();
+        assert!(
+            within_5s(|| brought_up(&pods)).await,
+            "the pod is {:?} and has no bring-up",
+            pods.info(POD).unwrap().state()
+        );
+    }
+
+    /// A CreatePod whose caller goes away while the pod's record waits for
+    /// its fsync still brings the pod up once it is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_create_whose_caller_goes_away_brings_the_pod_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let pods = bare_pods(dir.path());
+        let hung = hold_the_writer(&pods, dir.path());
+        let spec = PodSpec {
+            containers: vec![ContainerSpec {
+                name: "main".to_string(),
+                image_ref: "test".to_string(),
+                ..Default::default()
+            }],
+            network: Some(feos_proto::pod_service::PodNetwork {
+                none: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let create = tokio::spawn({
+            let pods = pods.clone();
+            async move { pods.create(POD.to_string(), spec).await }
+        });
+        sleep(Duration::from_millis(200)).await;
+        assert!(pods.info(POD).is_err(), "added before it is kept");
+        create.abort();
+        assert!(create.await.unwrap_err().is_cancelled());
+        hung.open();
+        assert!(
+            within_5s(|| brought_up(&pods)).await,
+            "the pod is {:?} and has no bring-up",
+            pods.info(POD).map(|info| info.state())
+        );
     }
 }

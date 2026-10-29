@@ -325,7 +325,14 @@ every call with any other ID fails with `INVALID_ARGUMENT`.
 
 What changes a pod runs under a lock of the pod's; a call that waited for
 it acts only if the lock is still its pod's, not on a pod created again
-with the ID after a delete. `GetPod` asks the guest for the containers'
+with the ID after a delete. Every call that changes a pod (create, start,
+stop, delete, suspend, resume, hibernate, restore) runs in a task of its
+own: a caller that goes away, as one whose deadline passed, whose stream
+ferund reset, or that the node's stop cut, leaves the change running to
+its end. Its steps await the pod's record, the microVM service and
+diskd, and a change cut off between two of them would leave the pod
+half changed, as a pod `PENDING` that nothing brings up, or one deleted
+whose record stays. `GetPod` asks the guest for the containers'
 states while the pod runs.
 
 A call to the guest, as an exec, a port forward, `GetPod`'s states or a

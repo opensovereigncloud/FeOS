@@ -377,6 +377,32 @@ impl Network {
         }
     }
 
+    /// For tests: a network that is not there, set up without touching
+    /// the node. Pods without a network work; the rules are not written.
+    #[cfg(test)]
+    pub(crate) fn absent(dir: &Path) -> Self {
+        let (records, _) = broadcast::channel(1);
+        Self {
+            config: Config::default(),
+            groups: SecurityGroups::open(dir.join("groups")).unwrap(),
+            names: NameTables::open(dir.join("names")).unwrap(),
+            records,
+            dir: dir.to_path_buf(),
+            parts: OnceLock::new(),
+            unready: Mutex::new("no network in this test".to_string()),
+            ready: watch::Sender::new(false),
+            handed: Mutex::new((None, None)),
+            setting_up: tokio::sync::Mutex::new(()),
+            mesh: None,
+            mesh_changes: watch::Sender::new(0),
+            broken: Mutex::new(None),
+            directory: Arc::default(),
+            applied: tokio::sync::Mutex::new(None),
+            node_addresses: Mutex::new(Vec::new()),
+            collector: Mutex::new(None),
+        }
+    }
+
     pub fn groups(&self) -> &SecurityGroups {
         &self.groups
     }
