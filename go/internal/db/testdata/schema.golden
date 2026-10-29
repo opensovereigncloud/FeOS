@@ -1,3 +1,34 @@
+TABLE access_logs PARTITION BY RANGE (day)
+  COLUMN day date NOT NULL DEFAULT ((now() AT TIME ZONE 'utc'::text))::date
+  COLUMN id bigint NOT NULL GENERATED ALWAYS AS IDENTITY
+  COLUMN ts_ns bigint NOT NULL
+  COLUMN ingress text NOT NULL
+  COLUMN start_id uuid NOT NULL
+  COLUMN seq bigint NOT NULL
+  COLUMN env_id uuid NOT NULL
+  COLUMN owner text NOT NULL
+  COLUMN service text NOT NULL
+  COLUMN instance text NOT NULL
+  COLUMN host text NOT NULL
+  COLUMN method text NOT NULL
+  COLUMN path text NOT NULL
+  COLUMN proto text NOT NULL
+  COLUMN status integer NOT NULL
+  COLUMN outcome text NOT NULL
+  COLUMN duration_ns bigint NOT NULL
+  COLUMN held_ns bigint NOT NULL
+  COLUMN attempts integer NOT NULL
+  COLUMN bytes_in bigint NOT NULL
+  COLUMN bytes_out bigint NOT NULL
+  COLUMN client_ip text NOT NULL
+  COLUMN user_agent text NOT NULL
+  COLUMN trace_id text NOT NULL
+  COLUMN span_id text NOT NULL
+  COLUMN parent_span_id text NOT NULL
+  CONSTRAINT PRIMARY KEY (day, id)
+  CREATE INDEX access_logs_env ON ONLY public.access_logs USING btree (env_id, ts_ns)
+  CREATE UNIQUE INDEX access_logs_pkey ON ONLY public.access_logs USING btree (day, id)
+  CREATE UNIQUE INDEX access_logs_seq ON ONLY public.access_logs USING btree (ingress, start_id, seq, day)
 TABLE acme_accounts
   COLUMN directory text NOT NULL
   COLUMN key_sealed bytea NOT NULL

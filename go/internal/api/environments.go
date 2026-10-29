@@ -50,6 +50,7 @@ func (s *server) envRoutes(add func(c class, pattern string, h http.Handler)) {
 	env("DELETE /api/v1/environments/{env}/secrets/{name}", s.deleteSecret)
 	env("GET /api/v1/environments/{env}/incidents", s.listIncidents)
 	env("GET /api/v1/environments/{env}/incidents/{id}", s.getIncident)
+	env("GET /api/v1/environments/{env}/access-logs", s.accessLogs)
 	env("POST /api/v1/environments/{env}/services/{name}/restart", s.restartService)
 	env("POST /api/v1/environments/{env}/jobs/{name}/run", s.runJob)
 	env("POST /api/v1/environments/{env}/route-tokens", s.createRouteToken)
@@ -378,6 +379,43 @@ func (s *server) getIncident(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	return writeJSON(w, http.StatusOK, inc)
+}
+
+// accessLogs is GET …/access-logs[?limit=&beforeTsNs=&traceId=]: a page
+// of the ingress's access log of the environment (ADR 0021).
+func (s *server) accessLogs(w http.ResponseWriter, r *http.Request) error {
+	limit, err := queryInt(r, "limit")
+	if err != nil {
+		return err
+	}
+	before, err := queryInt64(r, "beforeTsNs")
+	if err != nil {
+		return err
+	}
+	trace := r.URL.Query().Get("traceId")
+	if trace != "" && !isTraceID(trace) {
+		return apierr.New(http.StatusBadRequest, "traceId must be 32 lower case hex digits, got %q", trace)
+	}
+	list, err := s.deps.Environments.AccessLogs(r.Context(), tenantOf(r), r.PathValue("env"),
+		envs.AccessLogQuery{Limit: limit, BeforeTsNs: before, TraceID: trace})
+	if err != nil {
+		return err
+	}
+	return writeJSON(w, http.StatusOK, list)
+}
+
+// isTraceID reports whether s is a trace ID of W3C Trace Context: 32
+// lower case hex digits.
+func isTraceID(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *server) restartService(w http.ResponseWriter, r *http.Request) error {

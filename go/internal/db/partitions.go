@@ -15,12 +15,13 @@ import (
 // The tables partitioned by the day (UTC, DB clock) a row was recorded.
 // Each has one partition per day, named <table>_YYYYMMDD.
 const (
-	TableActivity = "activity"
-	TableTraffic  = "traffic_records"
+	TableActivity   = "activity"
+	TableTraffic    = "traffic_records"
+	TableAccessLogs = "access_logs"
 )
 
 // PartitionedTables lists the tables with daily partitions.
-var PartitionedTables = []string{TableActivity, TableTraffic}
+var PartitionedTables = []string{TableActivity, TableTraffic, TableAccessLogs}
 
 // partitionLockKey serialises the creation and dropping of partitions
 // across instances ("ferun" and a 2).

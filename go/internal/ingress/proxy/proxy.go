@@ -197,13 +197,16 @@ type Holder interface {
 }
 
 // Deps is what the proxy uses. Without a Waker nothing is woken; without
-// a Holder no instance is held. Dial defaults to a net.Dialer; tests map
-// endpoint addresses with it.
+// a Holder no instance is held; without an AccessLog nothing is
+// recorded. Dial defaults to a net.Dialer; tests map endpoint addresses
+// with it.
 type Deps struct {
 	Waker  Waker
 	Holder Holder
-	Dial   func(ctx context.Context, network, addr string) (net.Conn, error)
-	Log    *slog.Logger
+	// AccessLog takes a record of each request routed to an environment.
+	AccessLog AccessLog
+	Dial      func(ctx context.Context, network, addr string) (net.Conn, error)
+	Log       *slog.Logger
 }
 
 // DataPath is what the routing offers, for readiness: the nodes that run
@@ -583,6 +586,16 @@ type request struct {
 	wait waiter
 	// inflight is its place among the forwarded requests.
 	inflight slot
+	// trace is its server span (W3C Trace Context); env and service are
+	// where it was routed, "" before; instance is the last attempt's,
+	// attempts counts them, held is how long it waited for an instance.
+	// They make its access log record.
+	trace    trace
+	env      string
+	service  string
+	instance string
+	attempts int
+	held     time.Duration
 }
 
 // serve routes a request, holds it while no endpoint is usable, and
@@ -615,6 +628,8 @@ func (p *Proxy) serve(w *recorder, r *http.Request) {
 		rep.write(w)
 		return
 	}
+	q.env, q.service, q.trace = tg.env.id, tg.svc.name, newTrace(r.Header)
+	defer q.record()
 	if r.ContentLength != 0 && r.Body != nil && r.Body != http.NoBody {
 		if p.cfg.MaxBody > 0 && r.ContentLength > p.cfg.MaxBody {
 			q.tooLarge()
@@ -671,8 +686,13 @@ func (q *request) run(v *view, tg target) {
 			} else {
 				p.skip(ep.instance)
 			}
-		} else if !q.hold(v, tg, info) {
-			return
+		} else {
+			t0 := time.Now()
+			goOn := q.hold(v, tg, info)
+			q.held += time.Since(t0)
+			if !goOn {
+				return
+			}
 		}
 		v = p.cur.Load()
 		var rep *reply
@@ -680,6 +700,7 @@ func (q *request) run(v *view, tg target) {
 			rep.write(q.w)
 			return
 		}
+		q.service = tg.svc.name
 	}
 }
 
@@ -804,6 +825,8 @@ func (p *Proxy) candidates(v *view, tg target, exclude map[string]bool) (eps []*
 func (q *request) forward(v *view, tg target, ep *endpoint, port int, exclude map[string]bool,
 	mayRetry bool, release func()) (again bool) {
 	p := q.p
+	q.attempts++
+	q.instance = ep.instance
 	returned := false
 	defer func() {
 		release()
@@ -838,7 +861,8 @@ func (q *request) forward(v *view, tg target, ep *endpoint, port int, exclude ma
 			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
 			// The app sees the host the client named.
 			pr.Out.Host = pr.In.Host
-			pr.SetXForwarded()
+			setForwarded(pr)
+			q.trace.set(pr.Out.Header)
 		},
 		Transport:     p.up.tr,
 		FlushInterval: -1, // event streams and long polls stream
@@ -1060,7 +1084,8 @@ func (r reply) write(w http.ResponseWriter) {
 	http.Error(w, r.text, r.status)
 }
 
-// recorder notes a response's status for the metrics.
+// recorder notes a response's status and size for the metrics and the
+// access log.
 type recorder struct {
 	http.ResponseWriter
 	status int
@@ -1068,6 +1093,8 @@ type recorder struct {
 	// and the switch reached the client as far as the proxy knows.
 	hijacked, upgraded bool
 	aborted            bool
+	// written counts the body's bytes written to the client.
+	written int64
 	// informational filters the header of a 1xx response that the
 	// upstream sent before its final one (ReverseProxy passes those on
 	// without ModifyResponse).
@@ -1088,7 +1115,9 @@ func (r *recorder) Write(b []byte) (int, error) {
 	if r.status == 0 {
 		r.status = http.StatusOK
 	}
-	return r.ResponseWriter.Write(b)
+	n, err := r.ResponseWriter.Write(b)
+	r.written += int64(n)
+	return n, err
 }
 
 // Unwrap lets http.ResponseController flush.

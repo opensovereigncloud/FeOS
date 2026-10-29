@@ -37,6 +37,8 @@ const (
 	readyWindow = 60 * time.Second
 	// leaveTimeout bounds the final Hold{Leaving} of a shutdown.
 	leaveTimeout = 2 * time.Second
+	// flushTimeout bounds the last sends of the access log.
+	flushTimeout = 3 * time.Second
 	// healthCloseTimeout bounds the health server's shutdown, the last
 	// step.
 	healthCloseTimeout = time.Second
@@ -155,7 +157,7 @@ func New(cfg Config, deps Deps) (*Program, error) {
 		ConnWaitTimeout:      cfg.UpstreamWaitTimeout,
 		MaxBody:              cfg.MaxRequestBody,
 		MaxConnsPerEndpoint:  cfg.MaxConnsPerEndpoint,
-	}, proxy.Deps{Waker: a, Holder: a, Dial: deps.Dial, Log: log})
+	}, proxy.Deps{Waker: a, Holder: a, AccessLog: a, Dial: deps.Dial, Log: log})
 
 	if err := p.listen(); err != nil {
 		return nil, err
@@ -330,8 +332,10 @@ func (p *Program) Run(ctx context.Context) error {
 	p.shutdownServers(base)
 	// 4. Cut what is left towards the instances.
 	p.proxy.CloseUpstreams()
-	// 5. Release every hold of the instance at once.
+	// 5. Send the rest of the access log, then release every hold of
+	// the instance at once.
 	if !agentEnded {
+		p.flushAccessLog(base)
 		p.leave(base)
 	}
 	// 6. Close the control connection.
@@ -390,6 +394,17 @@ func (p *Program) shutdownServers(base context.Context) {
 		})
 	}
 	wg.Wait()
+}
+
+// flushAccessLog sends what the access log holds still; what it cannot
+// send within flushTimeout is lost.
+func (p *Program) flushAccessLog(base context.Context) {
+	ctx, cancel := context.WithTimeout(base, flushTimeout)
+	defer cancel()
+	if err := p.agent.FlushAccessLog(ctx); err != nil {
+		_, _, pending := p.agent.AccessLogCounts()
+		p.log.Warn("ferun-ingress: could not send the rest of the access log", "err", err, "records", pending)
+	}
 }
 
 // leave sends the final Hold{Leaving}: the control plane releases every

@@ -74,6 +74,8 @@ type FakeControlPlane struct {
 	wakeDelay  time.Duration
 	partBytes  int               // a table larger goes in parts (wire.Split)
 	holdRefuse map[string]string // instance → reason
+	accessLogs []wire.AccessLogBatch
+	accessErr  error             // PublishAccessLogs's answer; nil stores the batch
 	keys       map[string][]byte // ingress name → its fixed mesh key
 	retired    map[string][]byte // ingress name → the key its last join cleared
 	subnets    map[string]int
@@ -366,6 +368,21 @@ func (f *FakeControlPlane) RefuseHold(instance, reason string) {
 		return
 	}
 	f.holdRefuse[instance] = reason
+}
+
+// FailAccessLogs makes PublishAccessLogs answer err; nil stores batches
+// again.
+func (f *FakeControlPlane) FailAccessLogs(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.accessErr = err
+}
+
+// AccessLogs returns the batches of the access log stored, in order.
+func (f *FakeControlPlane) AccessLogs() []wire.AccessLogBatch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.accessLogs)
 }
 
 // PutEnv puts environments into the table and sends them to every
@@ -890,6 +907,19 @@ func (s *fakeService) Hold(ctx context.Context, req *wire.HoldRequest) (*wire.Ho
 		resp.Held = append(resp.Held, id)
 	}
 	return resp, nil
+}
+
+func (s *fakeService) PublishAccessLogs(_ context.Context, b *wire.AccessLogBatch) (*wire.AccessLogAck, error) {
+	f := s.f
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.accessErr != nil {
+		return nil, f.accessErr
+	}
+	c := *b
+	c.Records = slices.Clone(b.Records)
+	f.accessLogs = append(f.accessLogs, c)
+	return &wire.AccessLogAck{}, nil
 }
 
 func cloneHello(r wire.HelloRequest) wire.HelloRequest {

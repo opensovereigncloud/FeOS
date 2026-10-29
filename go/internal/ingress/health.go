@@ -198,6 +198,13 @@ func (p *Program) Metrics(w io.Writer) {
 	gauge("ferun_ingress_draining", "1 while the instance shuts down.", boolValue(p.draining.Load()))
 	gauge("ferun_ingress_control_connected", "1 while the instance holds a connection to the control plane.", boolValue(as.Connected))
 	gauge("ferun_ingress_identity_removed", "1 when the control plane removed the ingress.", boolValue(as.IdentityRemoved))
+	sent, dropped, pending := p.agent.AccessLogCounts()
+	proxy.WriteMetric(bw, "ferun_ingress_access_log_sent_total", "counter",
+		"Access log records the control plane took.", proxy.Sample{Value: float64(sent)})
+	proxy.WriteMetric(bw, "ferun_ingress_access_log_dropped_total", "counter",
+		"Access log records dropped: the buffer was full, or the control plane refused them or takes none.",
+		proxy.Sample{Value: float64(dropped)})
+	gauge("ferun_ingress_access_log_pending", "Access log records waiting to be sent.", float64(pending))
 	proxy.WriteMetric(bw, "ferun_ingress_control_refusals_total", "counter",
 		"Connection attempts the control plane refused (PERMISSION_DENIED).", proxy.Sample{Value: float64(as.RefusalsTotal)})
 	if !as.CertNotAfter.IsZero() {

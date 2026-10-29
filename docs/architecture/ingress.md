@@ -695,9 +695,14 @@ host 404 "no such host".
 
 - The upstream is `http://[<pod address>]:<port>`, the path stripped of
   the route's prefix only with `strip`, the query kept. The upstream sees
-  the `Host` the client sent, and `X-Forwarded-For`, `X-Forwarded-Host`
-  and `X-Forwarded-Proto` set by the ingress; the client's own are
-  dropped.
+  the `Host` the client sent, and `X-Forwarded-For`, `X-Forwarded-Host`,
+  `X-Forwarded-Proto` and `X-Real-IP` set by the ingress from the
+  connection; the client's own are dropped, and so are `Forwarded` and
+  `True-Client-IP`, which frameworks also read for the client's address.
+  Under `externalTrafficPolicy: Local` the connection's address is the
+  client's ([Kubernetes](#kubernetes)).
+- The upstream gets `traceparent` (and `tracestate`) of the request's
+  span at the ingress ([Trace context](#trace-context)).
 - HTTP/1.1 to the upstream, HTTP/1.1 or HTTP/2 from the client.
   Responses stream unbuffered; upgrades such as WebSockets pass through;
   the encodings pass as they are.
@@ -732,6 +737,57 @@ host 404 "no such host".
   that streams and long polls live.
 - On a host under the apps zone, every cookie of a response is made
   host-only ([Cookies](#cookies)).
+
+### Trace context
+
+Each request routed to an environment is a server span of the ingress
+in [W3C Trace Context](https://www.w3.org/TR/trace-context/), without a
+tracing SDK:
+
+- A valid `traceparent` is continued: exactly one field, version `00`
+  at 55 characters or a later version at least as long, lower case hex,
+  neither ID all zeros, version `ff` invalid. Its trace ID and flags are
+  kept, its span ID becomes the parent, and `tracestate` is passed on
+  when it is printable ASCII of at most 512 characters.
+- Otherwise the ingress starts a trace: a random trace ID, sampled
+  (`01`), since every request is recorded; a client's `tracestate` is
+  dropped with its invalid `traceparent`.
+- The span ID is always the ingress's own, random; the upstream gets
+  `traceparent: 00-<trace>-<span>-<flags>`, so the application's spans
+  are its children. A retry to another instance keeps the span.
+- The span's data is the request's access log record
+  ([Access log](#access-log)); nothing is exported over OTLP.
+
+### Access log
+
+- After its response, each request routed to an environment becomes a
+  record: its start and duration, the environment, the service, the
+  instance of the last attempt, host, method, the escaped path without
+  the query, protocol, status (101 for an upgrade, 0 when none was
+  written), outcome (the status class, `upgraded`, `aborted`), bytes in
+  and out, attempts, how long it was held, client address, user agent,
+  and the span's IDs. The path is cut to 1 KiB, the user agent to 256
+  bytes, other text to 256 bytes. Requests that reach no environment
+  (unknown host, a refusal before routing, port 80) are only counted in
+  the metrics.
+- The agent keeps up to 10 000 records unsent (at most about 15 MiB)
+  and sends them every second, or as soon as 500 wait, with
+  `PublishAccessLogs` on its connection: a batch of at most 500, the
+  run's ID (drawn when the instance starts), the first record's number
+  and the count of records dropped since the last batch. `ferund` stores
+  each (ingress, run, number) once, so a batch sent again after a lost
+  answer is harmless.
+- A full buffer drops the new record; a batch `ferund` refuses as
+  invalid is dropped; a `ferund` without the method (`UNIMPLEMENTED`)
+  has everything pending dropped and is asked again after a minute; a
+  failed store (`UNAVAILABLE`) keeps the batch for the next send. Drops
+  are counted (`ferun_ingress_access_log_dropped_total`) and reported in
+  the next batch, which `ferund` logs.
+- `ferund` stores the records of environments that exist in
+  `access_logs`, each with its environment's owner, partitioned by day
+  and dropped after `--access-log-retention`
+  ([control-plane.md](control-plane.md)); the owner reads them with
+  `GET /api/v1/environments/{env}/access-logs`.
 
 ### Retries
 
@@ -1035,6 +1091,7 @@ expiry.
 | `ferun_ingress_upstream_connections_cut_total` | open connections to instances closed because the table no longer routes to them |
 | `ferun_ingress_upstream_connections`, `ferun_ingress_endpoints`, `ferun_ingress_endpoint_nodes{admitted}`, `ferun_ingress_hosts` | the data path now |
 | `ferun_ingress_domain_certificates`, `ferun_ingress_acme_challenges`, `ferun_ingress_acme_answers_total{result}` | hosts with a certificate of their own; the challenges in the table; requests under `/.well-known/acme-challenge/`, `answered` or `unknown` |
+| `ferun_ingress_access_log_sent_total`, `…_dropped_total`, `ferun_ingress_access_log_pending` | access log records `ferund` took, those dropped, those waiting |
 | `ferun_ingress_table_age_seconds`, `ferun_ingress_mesh_nodes{handshake}`, `ferun_ingress_mesh_handshake_age_seconds{node}`, `ferun_ingress_mesh_peers`, `ferun_ingress_mesh_configured` | the table's age and the mesh's health |
 | `ferun_ingress_info{name,version}`, `ferun_ingress_ready`, `ferun_ingress_draining`, `ferun_ingress_control_connected`, `ferun_ingress_control_refusals_total`, `ferun_ingress_identity_removed`, `ferun_ingress_identity_not_after_seconds`, `ferun_ingress_tls_not_after_seconds` | the instance |
 
@@ -1052,7 +1109,8 @@ On SIGTERM or SIGINT:
    up to `--shutdown-grace` (40 s), then cut what is left;
 4. the connections to the instances are closed, which ends upgraded
    connections and long polls;
-5. `Hold{leaving: true}` releases its holds (within 2 s);
+5. it sends what the access log holds (within 3 s), then
+   `Hold{leaving: true}` releases its holds (within 2 s);
 6. the connection to `ferund` closes;
 7. the health listener closes last.
 
@@ -1064,7 +1122,7 @@ At step 1 of an instance's stop
 ([control-plane.md](control-plane.md#stopping)), the ingress's side
 stops: the nodes' port closes every new `ferun-ingress/1` connection
 before any check, the Sync streams end with `UNAVAILABLE` "instance
-stopping", and Wake and Hold answer `UNAVAILABLE`. The agents reconnect
+stopping", and Wake, Hold and PublishAccessLogs answer `UNAVAILABLE`. The agents reconnect
 to another instance and get a whole table there. Instances of a version
 without the ingress do not know the ALPN and close the connection, and
 send no `ferun_ingress`, which the builders' 5 s backstop covers.

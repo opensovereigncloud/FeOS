@@ -112,7 +112,7 @@ kind ([The ingress](#the-ingress)).
 | `--conn-drain-timeout` | `20m` | a draining node connection is closed after this at the latest |
 | `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus a pause's deadline and 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
 | `--shutdown-grace` | `11m` | how long a stopping instance waits for its requests, its tool calls and its ops |
-| `--activity-retention`, `--traffic-retention` | `720h`, `168h` | how long activity and traffic records are kept |
+| `--activity-retention`, `--traffic-retention`, `--access-log-retention` | `720h`, `168h`, `168h` | how long activity, traffic records and the ingress's access log are kept |
 | `--log-level` | `info` | |
 
 Fixed timings, not flags (`internal/config`): an instance's heartbeat every
@@ -214,7 +214,10 @@ replicate synchronously ([Operations](#operations)).
   ingress's tables and its columns of `pod_network`, `join_tokens`,
   `nodes`, `env_instances` and `environments` ([The
   ingress](#the-ingress)); `0012_domains.sql`, the domains and their
-  incident conditions ([Domains](#domains))) and
+  incident conditions ([Domains](#domains)); `0015_domain_certs.sql`,
+  the domains' certificates and ACME's tables ([Certificates of
+  domains](#certificates-of-domains)); `0016_access_logs.sql`, the
+  ingress's access log ([The ingress service](#the-ingress-service))) and
   applied under an advisory lock, recorded in `schema_migrations`. The
   same locked section creates the cluster's MCP session key, reconciles
   `--pod-network` with the database's ([The pods'
@@ -251,7 +254,8 @@ certificate issued), `host_labels` (every default host label ever given,
 and its tenant); `sandboxes`, `sandbox_tokens`, `sandbox_holds`,
 `pod_tombstones`, `bookings`; `tool_calls` (the keyed tool calls, [Calls
 that outlive their caller](#calls-that-outlive-their-caller));
-`activity` and `traffic_records`, partitioned by day; `issued_certs`
+`activity`, `traffic_records` and `access_logs` (the ingress's access
+log), partitioned by day; `issued_certs`
 (pods' certificates); `watches`;
 `kube_bindings`, `ssh_bindings`; `auth_logins`, `ui_sessions`;
 `environments`, `env_releases`, `env_tags`, `env_secrets`,
@@ -348,8 +352,8 @@ request, tool call or op:
    resume does not fail. From now on other instances may take its ops
    over. The ingress's side stops too: the nodes' port closes every new
    `ferun-ingress/1` connection before any check, the Sync streams end
-   with `UNAVAILABLE` "instance stopping", and Wake and Hold answer
-   `UNAVAILABLE`; the ingress's instances move to another instance
+   with `UNAVAILABLE` "instance stopping", and Wake, Hold and
+   PublishAccessLogs answer `UNAVAILABLE`; the ingress's instances move to another instance
    ([The ingress](#the-ingress)).
 2. It serves on for 5 s, so that balancers see `/readyz`, then stops
    accepting requests and waits for those in flight, until
@@ -2418,6 +2422,7 @@ name; one the tenant does not have is 404 "no such environment".
 | `POST …/{env}/clone` `{name, id?, release?, spec?, labels?, secrets?, author?, data?}` | 201 the new environment's status; 409 `id_taken` before the spec is planned, `name_taken`; 422 findings |
 | `GET …/{env}/secrets`, `PUT`, `DELETE …/secrets/{name}` | the names with their latest versions; `{name, version}`; 204, 409 while pinned |
 | `GET …/{env}/incidents[?open=1]`, `…/incidents/{id}` | newest first; one |
+| `GET …/{env}/access-logs[?limit=200&beforeTsNs=&traceId=]` | `{records}`: the newest page of the ingress's access log before `beforeTsNs` (a record's `tsNs`, a string), at most 1000, ascending, of the trace `traceId` (32 lower case hex digits; else 400) when given; each `{tsNs, time, durationNs, ingress, service, instance, host, method, path, proto, status, outcome, attempts, heldNs, bytesIn, bytesOut, clientIp, userAgent, traceId, spanId, parentSpanId}` ([ingress.md](ingress.md#access-log)) |
 | `GET …/{env}/objects/{kind}/{name}/logs?lines=200&replica=0` | `{lines, source}`, the source `container` or `process`; 501; 409 "paused", `not_running` (also for a replica without an instance yet, or none at all); 404 for a replica beyond the object's ([Logs](#probes-exits-and-restarts)) |
 | `POST …/{env}/services/{name}/restart` | 202: an image service's replicas one at a time, each waited for until it is live again, up to 5 minutes, or an attached service's process |
 | `POST …/{env}/jobs/{name}/run` | 202; 409 `busy` "job X runs already (release N, attempt M)" with `Retry-After: 30` while a run of the job runs, of any release; 409 `not_ready` |
@@ -2535,13 +2540,21 @@ port](#the-nodes-port), [api.md](api.md#the-ingresss-api)), from
   sets `ingresses.left_at`. The holds keep idle services from pausing
   under a request; the [idle fence](ingress.md#the-idle-fence) covers an
   instance cut off from `ferund`.
+- **PublishAccessLogs** stores a batch of the instance's access log
+  ([ingress.md](ingress.md#access-log)) in `access_logs`: each record
+  of an environment that exists, with its owner, numbered `seq` and on
+  from the batch's, once per (ingress, run, number); a record whose
+  environment is not a UUID or does not exist is skipped, text is cut to
+  the wire's bounds, and the count of records the ingress dropped is
+  logged. The partitions' loop keeps the table's days and drops those
+  past `--access-log-retention`.
 - **Following the others' writes.** `ferun_ingress` `ingress:<name>`
   re-checks that instance's connections and has its streams read its
   row (a removal ends them with `PERMISSION_DENIED`); `*` and a
   reconnect re-check every connected instance.
 - **Stopping** ([Stopping](#stopping), step 1): new ingress connections
-  close, the streams end with `UNAVAILABLE` "instance stopping", Wake and
-  Hold answer `UNAVAILABLE`.
+  close, the streams end with `UNAVAILABLE` "instance stopping", Wake,
+  Hold and PublishAccessLogs answer `UNAVAILABLE`.
 
 ### Certificates of domains
 

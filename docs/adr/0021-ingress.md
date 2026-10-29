@@ -314,11 +314,19 @@ woken by the door, which holds the request until the pod runs.
   HTTP/1.1 and HTTP/2 from clients, and speaks HTTP/1.1 to the service,
   or h2c where the port's protocol says so (gRPC). Upgrades and
   WebSockets pass; answers stream unbuffered. It sets `X-Forwarded-For`,
-  `X-Forwarded-Proto` and `X-Forwarded-Host` from the connection and
-  drops a client's own, and keeps the `Host`; an application behind the
-  ingress sees who called it, which no application behind the door does.
-  Plain HTTP on port 80 answers ACME challenges and redirects everything
-  else to HTTPS.
+  `X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Real-IP` from the
+  connection and drops a client's own, `Forwarded` and `True-Client-IP`
+  too, and keeps the `Host`; an application behind the ingress sees who
+  called it, which no application behind the door does. Plain HTTP on
+  port 80 answers ACME challenges and redirects everything else to
+  HTTPS.
+- **Trace context.** Every request is a server span of the ingress in
+  W3C Trace Context: a valid `traceparent` the client sent is continued
+  (its trace, its span as the parent, its `tracestate`), else the ingress
+  starts a sampled trace; the instance gets `traceparent` with the
+  ingress's span as its parent. No tracing SDK and no exporter: the span
+  is the request's access log record, and an OTLP export can start from
+  there later.
 - A request goes to a ready instance of the route's service, round robin
   per ingress instance, over kept connections; a connection that fails
   before a byte of the answer is tried once more on another ready
@@ -591,6 +599,26 @@ changed these points:
   (`hack/go/with-pebble`), not a CA of the tests' own; Pebble accepts
   challenges without fetching them, so the tests check that every
   instance's port 80 answers before the challenge is accepted.
+- **An access log of its own, not `http` traffic records.** The records
+  of the draft became the ingress's access log: one row per request
+  routed to an environment in `access_logs`, partitioned by day and kept
+  for `--access-log-retention` (seven days), with the environment and
+  its owner as columns and read by the owner per environment
+  (`GET /api/v1/environments/{env}/access-logs`, also by trace). Traffic
+  records name a pod and a node and keep their detail as JSON; these
+  name an environment and are read by it, so they share the partitions'
+  loop, not the table. The ingress keeps up to 10 000 records unsent,
+  sends batches of 500 over `PublishAccessLogs`, numbered per run so a
+  batch sent again is stored once, drops and counts what overflows, and
+  sends the rest before it stops. A request that reaches no environment
+  is counted, not recorded. The path is kept without its query, which
+  often carries tokens.
+- **Each record is the request's span.** The ingress continues a
+  client's W3C `traceparent` or starts a sampled trace, and the instance
+  gets the ingress's span as its parent; the span's IDs are columns of
+  the record. No tracing SDK and no OTLP exporter yet, as the platform
+  runs no collector: the dependencies would come before anything reads
+  the spans, and an export can start from the records later.
 
 ## Alternatives considered
 

@@ -1,0 +1,62 @@
+{
+  "method": "GET",
+  "path": "/api/v1/environments/expensa-stage/access-logs",
+  "query": {
+    "limit": [
+      "2"
+    ]
+  },
+  "status": 200,
+  "request": null,
+  "response": {
+    "records": [
+      {
+        "tsNs": "1761739200125000000",
+        "time": "2025-10-29T12:00:00.125Z",
+        "durationNs": 18250000,
+        "ingress": "ferun-ingress-1",
+        "service": "web",
+        "instance": "01a18687-bb8a-7348-b59e-9fcf2e6f5250-web-0",
+        "host": "dashboard.fecore.dev",
+        "method": "GET",
+        "path": "/api/clusters",
+        "proto": "HTTP/2.0",
+        "status": 200,
+        "outcome": "2xx",
+        "attempts": 1,
+        "heldNs": 0,
+        "bytesIn": 0,
+        "bytesOut": 5120,
+        "clientIp": "203.0.113.9",
+        "userAgent": "Mozilla/5.0 (X11; Linux x86_64)",
+        "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+        "spanId": "53995c3f42cd8ad8",
+        "parentSpanId": "00f067aa0ba902b7"
+      },
+      {
+        "tsNs": "1761739201500000000",
+        "time": "2025-10-29T12:00:01.5Z",
+        "durationNs": 2400000000,
+        "ingress": "ferun-ingress-0",
+        "service": "web",
+        "instance": "01a18687-bb8a-7348-b59e-9fcf2e6f5250-web-0",
+        "host": "dashboard.fecore.dev",
+        "method": "POST",
+        "path": "/api/login",
+        "proto": "HTTP/1.1",
+        "status": 503,
+        "outcome": "5xx",
+        "attempts": 0,
+        "heldNs": 2400000000,
+        "bytesIn": 64,
+        "bytesOut": 41,
+        "clientIp": "2001:db8::7",
+        "userAgent": "curl/8.11.1",
+        "traceId": "0af7651916cd43dd8448eb211c80319c",
+        "spanId": "b7ad6b7169203331",
+        "parentSpanId": ""
+      }
+    ]
+  },
+  "note": "the newest page, ascending; the second was held 2.4 s while the service woke, then answered 503 by the ingress"
+}

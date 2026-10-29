@@ -171,7 +171,7 @@ func TestMigrationSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantTables := []string{"acme_accounts", "acme_challenges", "activity", "auth_logins", "bookings", "cluster_secrets",
+	wantTables := []string{"access_logs", "acme_accounts", "acme_challenges", "activity", "auth_logins", "bookings", "cluster_secrets",
 		"domain_certs", "domains", "env_attached", "env_incidents",
 		"env_instances", "env_job_runs", "env_releases", "env_route_tokens", "env_secrets", "env_tags", "env_volumes",
 		"environments", "event_gaps", "host_labels", "ingress_certs", "ingresses", "instances",

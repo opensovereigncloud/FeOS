@@ -176,6 +176,8 @@ type Agent struct {
 	// connection, a session) failed since Run started.
 	reachFailed bool
 	wakes       map[wakeKey]*wakeEntry
+	// alog is the access log's buffer; it has its own lock.
+	alog *accessLog
 }
 
 // New checks cfg and makes an agent; Run starts it.
@@ -234,6 +236,7 @@ func New(cfg Config, deps Deps) (*Agent, error) {
 		order:     shuffled,
 		tried:     map[string]bool{},
 		wakes:     map[wakeKey]*wakeEntry{},
+		alog:      newAccessLog(),
 		cacheKick: make(chan struct{}, 1),
 		meshKick:  make(chan struct{}, 1),
 	}, nil
@@ -265,10 +268,14 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.runCtx = ctx
 	a.mu.Unlock()
 	var loops sync.WaitGroup
-	loops.Add(2)
+	loops.Add(3)
 	go func() {
 		defer loops.Done()
 		a.cacheLoop(ctx)
+	}()
+	go func() {
+		defer loops.Done()
+		a.accessLogLoop(ctx)
 	}()
 	go func() {
 		defer loops.Done()

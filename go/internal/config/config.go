@@ -238,7 +238,10 @@ type Config struct {
 	ShutdownGrace     time.Duration
 	ActivityRetention time.Duration
 	TrafficRetention  time.Duration
-	LogLevel          slog.Level
+	// AccessLogRetention is how long the ingress's access log is kept
+	// (ADR 0021).
+	AccessLogRetention time.Duration
+	LogLevel           slog.Level
 
 	// Version is the build's version, shown to nodes, MCP clients and the
 	// admin API. Not a flag.
@@ -290,6 +293,7 @@ func Default() Config {
 		ShutdownGrace:          11 * time.Minute,
 		ActivityRetention:      720 * time.Hour,
 		TrafficRetention:       168 * time.Hour,
+		AccessLogRetention:     168 * time.Hour,
 		DomainChallengeLabel:   "_ferun-challenge",
 		ACMEProfile:            DefaultACMEProfile,
 		DomainGrace:            72 * time.Hour,
@@ -414,6 +418,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 		"how long a stopping instance waits for its requests, its tool calls and its ops; set a container's termination grace to at least this plus 60s")
 	fs.DurationVar(&c.ActivityRetention, "activity-retention", c.ActivityRetention, "how long activity is kept")
 	fs.DurationVar(&c.TrafficRetention, "traffic-retention", c.TrafficRetention, "how long traffic records are kept")
+	fs.DurationVar(&c.AccessLogRetention, "access-log-retention", c.AccessLogRetention, "how long the ingress's access log is kept")
 	fs.StringVar(&t.logLevel, "log-level", t.logLevel, "debug, info, warn or error")
 	return t
 }
@@ -584,6 +589,7 @@ func (c *Config) Validate() error {
 		{"node-cert-ttl", c.NodeCertTTL}, {"pod-cert-ttl", c.PodCertTTL}, {"conn-drain-timeout", c.ConnDrainTimeout},
 		{"hibernate-timeout", c.HibernateTimeout},
 		{"activity-retention", c.ActivityRetention}, {"traffic-retention", c.TrafficRetention},
+		{"access-log-retention", c.AccessLogRetention},
 		{"domain-grace", c.DomainGrace},
 	}
 	for _, d := range positive {
