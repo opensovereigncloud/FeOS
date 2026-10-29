@@ -98,3 +98,11 @@ patches:
                 env:
                   - name: FERUN_APPS_ZONE
                     value: '${APPS_ZONE}'
+                  - name: FERUN_EDGE_NAME
+                    value: '${EDGE_NAME}'
+                  - name: FERUN_EDGE_ADDRESS
+                    value: '${EDGE_ADDRESSES}'
+                  - name: FERUN_DOMAIN_CHALLENGE_LABEL
+                    value: '${DOMAIN_CHALLENGE_LABEL}'
+                  - name: FERUN_DOMAIN_RESERVED
+                    value: '${DOMAIN}'
