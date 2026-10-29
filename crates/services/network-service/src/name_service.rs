@@ -197,7 +197,7 @@ mod tests {
 
     /// A change writes its file on the blocking pool and is seen once it
     /// is kept: the resolver's lookups do not wait for its fsync, which
-    /// can take seconds.
+    /// can take seconds, and the runtime, of one thread, moves meanwhile.
     #[tokio::test]
     async fn lookups_answer_while_a_change_is_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -208,6 +208,7 @@ mod tests {
             .await
             .unwrap();
         let hung = crate::kept::Hung::at(dir.path().join("env-1.pb.new"));
+        let (moved, watchdog) = hung.watchdog();
         let put = tokio::spawn({
             let tables = tables.clone();
             async move { tables.put(table("env-1", &[("web", "fd00::2")])).await }
@@ -220,7 +221,8 @@ mod tests {
             move || answer.send(tables.lookup(&ids, "web"))
         });
         let looked_up = answered.recv_timeout(std::time::Duration::from_secs(2));
-        hung.open();
+        let _ = moved.send(());
+        assert!(!watchdog.join().unwrap(), "the write held the runtime");
         let old = Some(vec!["fd00::1".parse::<IpAddr>().unwrap()]);
         assert_eq!(
             looked_up,

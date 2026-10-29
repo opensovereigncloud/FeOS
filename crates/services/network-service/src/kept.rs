@@ -74,4 +74,21 @@ impl Hung {
             let _ = std::io::copy(&mut reader, &mut std::io::sink());
         });
     }
+
+    /// Lets the write go once the test says that its runtime moved, or
+    /// after 3 s, should the write hold the runtime's thread: a test on a
+    /// runtime of one thread fails then instead of hanging. The thread
+    /// tells whether the write held the runtime.
+    pub(crate) fn watchdog(&self) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+        let (moved, watched) = std::sync::mpsc::channel::<()>();
+        let path = self.0.clone();
+        let watchdog = std::thread::spawn(move || {
+            let stalled = watched
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err();
+            Hung(path).open();
+            stalled
+        });
+        (moved, watchdog)
+    }
 }

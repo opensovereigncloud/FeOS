@@ -243,12 +243,14 @@ mod tests {
     }
 
     /// A change writes its file on the blocking pool and is seen once it
-    /// is kept: what reads the groups does not wait for its fsync.
+    /// is kept: what reads the groups does not wait for its fsync, and the
+    /// runtime, of one thread, moves meanwhile.
     #[tokio::test]
     async fn the_groups_answer_while_a_change_is_written() {
         let dir = tempfile::tempdir().unwrap();
         let groups = SecurityGroups::open(dir.path()).unwrap();
         let hung = crate::kept::Hung::at(dir.path().join("web.pb.new"));
+        let (moved, watchdog) = hung.watchdog();
         let put = tokio::spawn({
             let groups = groups.clone();
             async move { groups.put(group("web", 1, &[])).await }
@@ -260,7 +262,8 @@ mod tests {
             move || answer.send(groups.missing(&["web".to_string()]))
         });
         let missing = answered.recv_timeout(std::time::Duration::from_secs(2));
-        hung.open();
+        let _ = moved.send(());
+        assert!(!watchdog.join().unwrap(), "the write held the runtime");
         assert_eq!(missing, Ok(vec!["web".to_string()]), "the read waited");
         assert!(put.await.unwrap().is_err(), "a FIFO does not sync");
         assert_eq!(groups.get("web").unwrap_err().code(), Code::NotFound);
