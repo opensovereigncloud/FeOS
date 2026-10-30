@@ -459,6 +459,13 @@ message RestorePodRequest {
   // Boot the pod anew on its disk even where its memory could be
   // restored.
   bool cold = 3;
+  // The pod's log labels and the values its shipped lines are redacted of
+  // (ADR 0026), as CreatePodRequest has them: a node that does not have
+  // the pod's record takes them from here; one that has it replaces its
+  // own with them when log_labels is not empty. The control plane sends
+  // both with every restore.
+  map<string, string> log_labels = 4;
+  repeated string log_redact = 5;
 }
 
 message RestorePodResponse {

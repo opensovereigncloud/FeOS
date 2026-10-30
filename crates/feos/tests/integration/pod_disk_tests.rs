@@ -429,6 +429,7 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
             pod_id: pod_id.clone(),
             head_key: head_key.clone(),
             cold: false,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -484,6 +485,7 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
             pod_id: pod_id.clone(),
             head_key: String::new(),
             cold: true,
+            ..Default::default()
         })
         .await?
         .into_inner();

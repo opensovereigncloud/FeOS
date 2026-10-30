@@ -289,6 +289,7 @@ pub async fn handle_pod_command(args: PodArgs) -> Result<()> {
                     pod_id: pod_id.clone(),
                     head_key: head.unwrap_or_default(),
                     cold,
+                    ..Default::default()
                 })
                 .await?
                 .into_inner();

@@ -2191,7 +2191,14 @@ type RestorePodRequest struct {
 	HeadKey string `protobuf:"bytes,2,opt,name=head_key,json=headKey,proto3" json:"head_key,omitempty"`
 	// Boot the pod anew on its disk even where its memory could be
 	// restored.
-	Cold          bool `protobuf:"varint,3,opt,name=cold,proto3" json:"cold,omitempty"`
+	Cold bool `protobuf:"varint,3,opt,name=cold,proto3" json:"cold,omitempty"`
+	// The pod's log labels and the values its shipped lines are redacted of
+	// (ADR 0026), as CreatePodRequest has them: a node that does not have
+	// the pod's record takes them from here; one that has it replaces its
+	// own with them when log_labels is not empty. The control plane sends
+	// both with every restore.
+	LogLabels     map[string]string `protobuf:"bytes,4,rep,name=log_labels,json=logLabels,proto3" json:"log_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	LogRedact     []string          `protobuf:"bytes,5,rep,name=log_redact,json=logRedact,proto3" json:"log_redact,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2245,6 +2252,20 @@ func (x *RestorePodRequest) GetCold() bool {
 		return x.Cold
 	}
 	return false
+}
+
+func (x *RestorePodRequest) GetLogLabels() map[string]string {
+	if x != nil {
+		return x.LogLabels
+	}
+	return nil
+}
+
+func (x *RestorePodRequest) GetLogRedact() []string {
+	if x != nil {
+		return x.LogRedact
+	}
+	return nil
 }
 
 type RestorePodResponse struct {
@@ -2566,11 +2587,18 @@ const file_feos_pod_v1_pod_proto_rawDesc = "" +
 	"checkpoint\x12!\n" +
 	"\fmemory_bytes\x18\x02 \x01(\x04R\vmemoryBytes\x12\x1d\n" +
 	"\n" +
-	"disk_bytes\x18\x03 \x01(\x04R\tdiskBytes\"Y\n" +
+	"disk_bytes\x18\x03 \x01(\x04R\tdiskBytes\"\x84\x02\n" +
 	"\x11RestorePodRequest\x12\x15\n" +
 	"\x06pod_id\x18\x01 \x01(\tR\x05podId\x12\x19\n" +
 	"\bhead_key\x18\x02 \x01(\tR\aheadKey\x12\x12\n" +
-	"\x04cold\x18\x03 \x01(\bR\x04cold\"}\n" +
+	"\x04cold\x18\x03 \x01(\bR\x04cold\x12L\n" +
+	"\n" +
+	"log_labels\x18\x04 \x03(\v2-.feos.pod.v1.RestorePodRequest.LogLabelsEntryR\tlogLabels\x12\x1d\n" +
+	"\n" +
+	"log_redact\x18\x05 \x03(\tR\tlogRedact\x1a<\n" +
+	"\x0eLogLabelsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"}\n" +
 	"\x12RestorePodResponse\x12&\n" +
 	"\x03pod\x18\x01 \x01(\v2\x14.feos.pod.v1.PodInfoR\x03pod\x12'\n" +
 	"\x0fmemory_restored\x18\x02 \x01(\bR\x0ememoryRestored\x12\x16\n" +
@@ -2634,7 +2662,7 @@ func file_feos_pod_v1_pod_proto_rawDescGZIP() []byte {
 }
 
 var file_feos_pod_v1_pod_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_feos_pod_v1_pod_proto_msgTypes = make([]protoimpl.MessageInfo, 41)
+var file_feos_pod_v1_pod_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
 var file_feos_pod_v1_pod_proto_goTypes = []any{
 	(PodState)(0),                  // 0: feos.pod.v1.PodState
 	(HibernationPhase)(0),          // 1: feos.pod.v1.HibernationPhase
@@ -2680,6 +2708,7 @@ var file_feos_pod_v1_pod_proto_goTypes = []any{
 	nil,                            // 41: feos.pod.v1.ContainerSpec.EnvEntry
 	nil,                            // 42: feos.pod.v1.PodInfo.LogLabelsEntry
 	nil,                            // 43: feos.pod.v1.CreatePodRequest.LogLabelsEntry
+	nil,                            // 44: feos.pod.v1.RestorePodRequest.LogLabelsEntry
 }
 var file_feos_pod_v1_pod_proto_depIdxs = []int32{
 	5,  // 0: feos.pod.v1.PodSpec.resources:type_name -> feos.pod.v1.Resources
@@ -2710,36 +2739,37 @@ var file_feos_pod_v1_pod_proto_depIdxs = []int32{
 	9,  // 25: feos.pod.v1.ListPodsResponse.pods:type_name -> feos.pod.v1.PodInfo
 	0,  // 26: feos.pod.v1.PodEvent.state:type_name -> feos.pod.v1.PodState
 	11, // 27: feos.pod.v1.HibernatePodResponse.checkpoint:type_name -> feos.pod.v1.Checkpoint
-	9,  // 28: feos.pod.v1.RestorePodResponse.pod:type_name -> feos.pod.v1.PodInfo
-	14, // 29: feos.pod.v1.PodService.CreatePod:input_type -> feos.pod.v1.CreatePodRequest
-	18, // 30: feos.pod.v1.PodService.StartPod:input_type -> feos.pod.v1.StartPodRequest
-	20, // 31: feos.pod.v1.PodService.StopPod:input_type -> feos.pod.v1.StopPodRequest
-	22, // 32: feos.pod.v1.PodService.DeletePod:input_type -> feos.pod.v1.DeletePodRequest
-	24, // 33: feos.pod.v1.PodService.GetPod:input_type -> feos.pod.v1.GetPodRequest
-	25, // 34: feos.pod.v1.PodService.ListPods:input_type -> feos.pod.v1.ListPodsRequest
-	27, // 35: feos.pod.v1.PodService.StreamPodEvents:input_type -> feos.pod.v1.StreamPodEventsRequest
-	29, // 36: feos.pod.v1.PodService.SuspendPod:input_type -> feos.pod.v1.SuspendPodRequest
-	31, // 37: feos.pod.v1.PodService.ResumePod:input_type -> feos.pod.v1.ResumePodRequest
-	33, // 38: feos.pod.v1.PodService.HibernatePod:input_type -> feos.pod.v1.HibernatePodRequest
-	35, // 39: feos.pod.v1.PodService.RestorePod:input_type -> feos.pod.v1.RestorePodRequest
-	37, // 40: feos.pod.v1.PodService.StreamPodConsole:input_type -> feos.pod.v1.PodConsoleInput
-	17, // 41: feos.pod.v1.PodService.CreatePod:output_type -> feos.pod.v1.CreatePodResponse
-	19, // 42: feos.pod.v1.PodService.StartPod:output_type -> feos.pod.v1.StartPodResponse
-	21, // 43: feos.pod.v1.PodService.StopPod:output_type -> feos.pod.v1.StopPodResponse
-	23, // 44: feos.pod.v1.PodService.DeletePod:output_type -> feos.pod.v1.DeletePodResponse
-	9,  // 45: feos.pod.v1.PodService.GetPod:output_type -> feos.pod.v1.PodInfo
-	26, // 46: feos.pod.v1.PodService.ListPods:output_type -> feos.pod.v1.ListPodsResponse
-	28, // 47: feos.pod.v1.PodService.StreamPodEvents:output_type -> feos.pod.v1.PodEvent
-	30, // 48: feos.pod.v1.PodService.SuspendPod:output_type -> feos.pod.v1.SuspendPodResponse
-	32, // 49: feos.pod.v1.PodService.ResumePod:output_type -> feos.pod.v1.ResumePodResponse
-	34, // 50: feos.pod.v1.PodService.HibernatePod:output_type -> feos.pod.v1.HibernatePodResponse
-	36, // 51: feos.pod.v1.PodService.RestorePod:output_type -> feos.pod.v1.RestorePodResponse
-	38, // 52: feos.pod.v1.PodService.StreamPodConsole:output_type -> feos.pod.v1.PodConsoleOutput
-	41, // [41:53] is the sub-list for method output_type
-	29, // [29:41] is the sub-list for method input_type
-	29, // [29:29] is the sub-list for extension type_name
-	29, // [29:29] is the sub-list for extension extendee
-	0,  // [0:29] is the sub-list for field type_name
+	44, // 28: feos.pod.v1.RestorePodRequest.log_labels:type_name -> feos.pod.v1.RestorePodRequest.LogLabelsEntry
+	9,  // 29: feos.pod.v1.RestorePodResponse.pod:type_name -> feos.pod.v1.PodInfo
+	14, // 30: feos.pod.v1.PodService.CreatePod:input_type -> feos.pod.v1.CreatePodRequest
+	18, // 31: feos.pod.v1.PodService.StartPod:input_type -> feos.pod.v1.StartPodRequest
+	20, // 32: feos.pod.v1.PodService.StopPod:input_type -> feos.pod.v1.StopPodRequest
+	22, // 33: feos.pod.v1.PodService.DeletePod:input_type -> feos.pod.v1.DeletePodRequest
+	24, // 34: feos.pod.v1.PodService.GetPod:input_type -> feos.pod.v1.GetPodRequest
+	25, // 35: feos.pod.v1.PodService.ListPods:input_type -> feos.pod.v1.ListPodsRequest
+	27, // 36: feos.pod.v1.PodService.StreamPodEvents:input_type -> feos.pod.v1.StreamPodEventsRequest
+	29, // 37: feos.pod.v1.PodService.SuspendPod:input_type -> feos.pod.v1.SuspendPodRequest
+	31, // 38: feos.pod.v1.PodService.ResumePod:input_type -> feos.pod.v1.ResumePodRequest
+	33, // 39: feos.pod.v1.PodService.HibernatePod:input_type -> feos.pod.v1.HibernatePodRequest
+	35, // 40: feos.pod.v1.PodService.RestorePod:input_type -> feos.pod.v1.RestorePodRequest
+	37, // 41: feos.pod.v1.PodService.StreamPodConsole:input_type -> feos.pod.v1.PodConsoleInput
+	17, // 42: feos.pod.v1.PodService.CreatePod:output_type -> feos.pod.v1.CreatePodResponse
+	19, // 43: feos.pod.v1.PodService.StartPod:output_type -> feos.pod.v1.StartPodResponse
+	21, // 44: feos.pod.v1.PodService.StopPod:output_type -> feos.pod.v1.StopPodResponse
+	23, // 45: feos.pod.v1.PodService.DeletePod:output_type -> feos.pod.v1.DeletePodResponse
+	9,  // 46: feos.pod.v1.PodService.GetPod:output_type -> feos.pod.v1.PodInfo
+	26, // 47: feos.pod.v1.PodService.ListPods:output_type -> feos.pod.v1.ListPodsResponse
+	28, // 48: feos.pod.v1.PodService.StreamPodEvents:output_type -> feos.pod.v1.PodEvent
+	30, // 49: feos.pod.v1.PodService.SuspendPod:output_type -> feos.pod.v1.SuspendPodResponse
+	32, // 50: feos.pod.v1.PodService.ResumePod:output_type -> feos.pod.v1.ResumePodResponse
+	34, // 51: feos.pod.v1.PodService.HibernatePod:output_type -> feos.pod.v1.HibernatePodResponse
+	36, // 52: feos.pod.v1.PodService.RestorePod:output_type -> feos.pod.v1.RestorePodResponse
+	38, // 53: feos.pod.v1.PodService.StreamPodConsole:output_type -> feos.pod.v1.PodConsoleOutput
+	42, // [42:54] is the sub-list for method output_type
+	30, // [30:42] is the sub-list for method input_type
+	30, // [30:30] is the sub-list for extension type_name
+	30, // [30:30] is the sub-list for extension extendee
+	0,  // [0:30] is the sub-list for field type_name
 }
 
 func init() { file_feos_pod_v1_pod_proto_init() }
@@ -2754,7 +2784,7 @@ func file_feos_pod_v1_pod_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_feos_pod_v1_pod_proto_rawDesc), len(file_feos_pod_v1_pod_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   41,
+			NumMessages:   42,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

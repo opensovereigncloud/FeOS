@@ -545,6 +545,7 @@ async fn test_volume_hibernates_with_its_pod() -> Result<()> {
             pod_id: pod_id.clone(),
             head_key: checkpoint.head_key.clone(),
             cold: false,
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -587,6 +588,7 @@ async fn test_volume_hibernates_with_its_pod() -> Result<()> {
             pod_id: pod_id.clone(),
             head_key: String::new(),
             cold: true,
+            ..Default::default()
         })
         .await?
         .into_inner();
