@@ -129,7 +129,8 @@ database (`sink`, migrations of its own), two ports:
   `LogsService/Export` and `SinkService`, nodes only, from the first
   certificate on. A batch is stored in one transaction and then
   answered; a line is stored once per (stream, offset), and one at or
-  below the stream's last chunked offset counts as stored. A tenant over
+  below the last offset stored counts as stored: a node sends a stream's
+  lines in the order of their offsets. A tenant over
   its quota (`--log-quota`, bytes of text a day, UTC, 0: none; reached by
   what is stored, so the batch that crosses it is stored) is refused with
   `RESOURCE_EXHAUSTED`, which names it; the other tenants' streams of the
@@ -163,13 +164,15 @@ by the token's SHA-256.
 
 **Stages.** `log_streams` (one row per stream key: labels, first and last
 time, next offset, ended; its ID `s_` and 16 random hex digits),
-`log_lines` (hot: stream, offset, time, source, level, partial, text;
-partitioned by the day it arrived), `log_chunks` (stream,
+`log_lines` (hot: stream, offset, time, source, level, partial, text,
+and `cont`: the line goes on with the last of its source, which was
+partial; partitioned by the day it arrived), `log_chunks` (stream,
 first and last offset and time, lines, bytes, levels as a bit set, the
 object's key), `log_traces` (trace ID, stream, time). A stream's lines
 become a chunk at 1 MiB, when the oldest is 10 min old, or when the
 stream ends: gzip NDJSON (`{"o":offset,"t":ns,"s":"stdout","l":"error","p":true,"x":"text"}`
-a line; `s`, `l` and `p` left out when empty or false) at
+a line, `"c":true` for `cont`; `s`, `l`, `p` and `c` left out when empty
+or false) at
 `<prefix>logs/<tenant>/<stream id>/<first offset>.ndjson.gz`, at most 16
 MiB of text a chunk, claimed with `FOR UPDATE SKIP LOCKED` and a lease of
 two minutes (the database's clock), the row written and the lines
@@ -228,6 +231,18 @@ All routes need a tenant's token and answer only its streams.
   "partial": false
 }
 ```
+
+A line the node sent in parts (`log.partial`: a 64 KiB part of a longer
+line, or one left unfinished for a second) is answered once, joined with
+the following lines of its stream and source up to and including the
+first that is not partial, with the first part's `ts`, `offset` and
+`level`; `partial` is `true` when its rest is not there yet or when it
+was cut at 1 MiB. The filters see the joined text. A page holds whole
+lines only and its cursor goes on after the last line it considered, so
+a page may hold fewer lines than `limit` and still have a cursor. A
+follow holds a partial line for its rest for at most 5 s, then gives it
+`partial`; a part whose line the follow's first page gave is given on its
+own.
 
 A page's lines are oldest first in either direction; a backward page's
 `cursor` leads to older lines, a forward page's to newer. `cursor` is

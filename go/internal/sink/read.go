@@ -177,7 +177,7 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 		dir, cmp = "ASC", ">"
 	}
 	sql := `SELECT stream_id, off, ts, source, level, partial, text FROM log_lines
-		WHERE stream_id = ANY($1) AND ts >= $2 AND ts <= $3 AND (level & $4) <> 0`
+		WHERE stream_id = ANY($1) AND ts >= $2 AND ts <= $3 AND (level & $4) <> 0 AND NOT cont`
 	args := []any{ids, q.Since, q.Until, q.Levels}
 	if q.Cursor != nil {
 		sql += " AND (ts, stream_id, off) " + cmp + " ($5, $6, $7)"
@@ -197,7 +197,7 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 		}
 		l.Level = int(lvl)
 		scanned += int64(len(l.Text))
-		if q.match(&l) {
+		if l.Partial || q.match(&l) {
 			hot = append(hot, l)
 		}
 		if len(hot) >= q.Limit || scanned >= s.cfg.ScanLimit {
@@ -297,7 +297,7 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 		}
 		scanned += c.bytes
 		for i := range lines {
-			if q.inRange(&lines[i]) && q.match(&lines[i]) {
+			if !lines[i].Cont && q.inRange(&lines[i]) && (lines[i].Partial || q.match(&lines[i])) {
 				found = append(found, lines[i])
 			}
 		}
@@ -315,13 +315,29 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 		}
 		found = found[:n]
 	}
-	res.lines = found
 	switch {
 	case len(found) >= q.Limit:
 		p := found[len(found)-1].pos()
 		res.cursor, res.partial = &p, false
 	case through != nil:
 		res.cursor = through
+	}
+	// A partial line is answered joined with its rest, as far as the
+	// snapshot has it, and filtered as a whole: a page may then hold fewer
+	// lines than its limit, and its cursor goes on after the last line it
+	// considered.
+	upTo := map[int64]int64{}
+	for id, st := range res.streams {
+		upTo[id] = st.LastOff
+	}
+	if err := s.joinParts(ctx, found, upTo); err != nil {
+		return scanResult{}, err
+	}
+	res.lines = found[:0]
+	for i := range found {
+		if q.match(&found[i]) {
+			res.lines = append(res.lines, found[i])
+		}
 	}
 	return res, nil
 }

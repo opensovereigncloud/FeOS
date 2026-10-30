@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"time"
 
@@ -78,15 +79,17 @@ type Labels struct {
 }
 
 // Line is one stored line. Stream is the stream's row ID; Level a bit;
-// Trace the trace ID the text names (filled at ingest only).
+// Partial says the next line of its source goes on with it, Cont that it
+// goes on with the last one; Trace the trace ID the text names (filled at
+// ingest only).
 type Line struct {
-	Stream  int64
-	Off, TS int64
-	Source  string
-	Level   int
-	Partial bool
-	Text    string
-	Trace   string
+	Stream        int64
+	Off, TS       int64
+	Source        string
+	Level         int
+	Partial, Cont bool
+	Text          string
+	Trace         string
 }
 
 // StreamBatch is one stream's part of an Export: its key, labels and
@@ -194,25 +197,38 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 		l.Kind, l.Object, l.Replica, l.Release, l.Job, l.Attempt, retention, l.Attrs); err != nil {
 		return 0, fmt.Errorf("stream: %w", err)
 	}
-	var id, chunkedLast int64
-	if err := tx.QueryRow(ctx, `SELECT id, chunked_last FROM log_streams WHERE pod = $1 AND container = $2 AND log_id = $3 FOR UPDATE`,
-		b.Key.Pod, b.Key.Container, b.Key.LogID).Scan(&id, &chunkedLast); err != nil {
+	var id, chunkedLast, lastOff int64
+	var open int16
+	if err := tx.QueryRow(ctx, `SELECT id, chunked_last, last_off, open_sources FROM log_streams
+		WHERE pod = $1 AND container = $2 AND log_id = $3 FOR UPDATE`,
+		b.Key.Pod, b.Key.Container, b.Key.LogID).Scan(&id, &chunkedLast, &lastOff, &open); err != nil {
 		return 0, fmt.Errorf("lock stream: %w", err)
 	}
+	// A node sends a stream's lines in the order of their offsets, so a
+	// line at or below the last stored is stored; a line goes on with the
+	// last of its source when that is partial.
+	slices.SortStableFunc(b.Lines, func(x, y Line) int { return cmpInt(x.Off, y.Off) })
 	next, last := b.Next, int64(-1)
-	seen := map[int64]bool{}
+	from := max(chunkedLast, lastOff)
 	var offs, tss []int64
 	var sources, texts []string
 	var levels []int16
-	var partials []bool
+	var partials, conts []bool
 	traces := map[int64]Line{}
 	for _, ln := range b.Lines {
 		next = max(next, ln.Off)
 		last = max(last, ln.Off)
-		if ln.Off <= chunkedLast || seen[ln.Off] {
+		if ln.Off <= from {
 			continue
 		}
-		seen[ln.Off] = true
+		from = ln.Off
+		bit := sourceBit(ln.Source)
+		conts = append(conts, open&bit != 0)
+		if ln.Partial {
+			open |= bit
+		} else {
+			open &^= bit
+		}
 		offs = append(offs, ln.Off)
 		tss = append(tss, ln.TS)
 		sources = append(sources, ln.Source)
@@ -228,13 +244,13 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 	var trIDs []string
 	var trOffs, trTS []int64
 	if len(offs) > 0 {
-		rows, err := tx.Query(ctx, `INSERT INTO log_lines (stream_id, off, ts, source, level, partial, text)
-			SELECT $1, x.off, x.ts, x.source, x.level, x.partial, x.text
-			FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::smallint[], $6::boolean[], $7::text[])
-				AS x(off, ts, source, level, partial, text)
+		rows, err := tx.Query(ctx, `INSERT INTO log_lines (stream_id, off, ts, source, level, partial, cont, text)
+			SELECT $1, x.off, x.ts, x.source, x.level, x.partial, x.cont, x.text
+			FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::smallint[], $6::boolean[], $7::boolean[], $8::text[])
+				AS x(off, ts, source, level, partial, cont, text)
 			WHERE NOT EXISTS (SELECT 1 FROM log_lines l WHERE l.stream_id = $1 AND l.off = x.off)
 			ON CONFLICT DO NOTHING
-			RETURNING off, ts, octet_length(text)`, id, offs, tss, sources, levels, partials, texts)
+			RETURNING off, ts, octet_length(text)`, id, offs, tss, sources, levels, partials, conts, texts)
 		if err != nil {
 			return 0, fmt.Errorf("lines: %w", err)
 		}
@@ -272,11 +288,22 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 			lines = lines + $2, bytes = bytes + $3, hot_lines = hot_lines + $2, hot_bytes = hot_bytes + $3,
 			hot_since = CASE WHEN $2 > 0 THEN coalesce(hot_since, now()) ELSE hot_since END,
 			first_ns = least(first_ns, $4), last_ns = greatest(last_ns, $5),
-			next_offset = greatest(next_offset, $6), last_off = greatest(last_off, $7)
-		WHERE id = $1`, id, n, bytes, minTS, maxTS, next, last); err != nil {
+			next_offset = greatest(next_offset, $6), last_off = greatest(last_off, $7), open_sources = $8
+		WHERE id = $1`, id, n, bytes, minTS, maxTS, next, last, open); err != nil {
 		return 0, fmt.Errorf("stream counters: %w", err)
 	}
 	return bytes, nil
+}
+
+// sourceBit is a source's bit in log_streams.open_sources.
+func sourceBit(source string) int16 {
+	switch source {
+	case "stdout":
+		return 1
+	case "stderr":
+		return 2
+	}
+	return 4
 }
 
 // Positions returns each stream's next offset, 0 for one not known, in

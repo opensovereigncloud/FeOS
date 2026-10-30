@@ -637,7 +637,19 @@ func TestFollow(t *testing.T) {
 		lines(0, base+int64(3*time.Second), 1, text("second")), lines(10, base+int64(4*time.Second), 1, text("skip"))...))); err != nil {
 		t.Fatal(err)
 	}
-	want := "old0|old1|old2|new0|new1|new2|hot0|hot1|second0"
+	// A line in two parts, in two batches: given once, joined.
+	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), []Line{
+		{Off: 300, TS: base + int64(5*time.Second), Source: "stdout", Level: LevelUnknown, Partial: true, Text: "part1 "}}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * cfg.FollowPoll)
+	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), []Line{
+		{Off: 310, TS: base + int64(6*time.Second), Source: "stdout", Level: LevelUnknown, Text: "part2"}}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	want := "old0|old1|old2|new0|new1|new2|hot0|hot1|second0|part1 part2"
 	waitFor(t, func() bool { l, _ := rec.snapshot(); return strings.Join(l, "|") == want })
 	waitFor(t, func() bool { _, b := rec.snapshot(); return b > 0 })
 	cancel()

@@ -36,6 +36,7 @@ type chunkLine struct {
 	S string `json:"s,omitempty"`
 	L string `json:"l,omitempty"`
 	P bool   `json:"p,omitempty"`
+	C bool   `json:"c,omitempty"`
 	X string `json:"x"`
 }
 
@@ -46,7 +47,7 @@ func encodeChunk(lines []Line) ([]byte, error) {
 	enc := json.NewEncoder(zw)
 	enc.SetEscapeHTML(false)
 	for _, l := range lines {
-		if err := enc.Encode(chunkLine{O: l.Off, T: l.TS, S: l.Source, L: LevelName(l.Level), P: l.Partial, X: l.Text}); err != nil {
+		if err := enc.Encode(chunkLine{O: l.Off, T: l.TS, S: l.Source, L: LevelName(l.Level), P: l.Partial, C: l.Cont, X: l.Text}); err != nil {
 			return nil, err
 		}
 	}
@@ -75,7 +76,7 @@ func decodeChunk(data []byte, stream int64, limit int64) ([]Line, error) {
 		if lvl == 0 {
 			lvl = LevelUnknown
 		}
-		out = append(out, Line{Stream: stream, Off: c.O, TS: c.T, Source: c.S, Level: lvl, Partial: c.P, Text: c.X})
+		out = append(out, Line{Stream: stream, Off: c.O, TS: c.T, Source: c.S, Level: lvl, Partial: c.P, Cont: c.C, Text: c.X})
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("chunk: %w", err)
@@ -158,7 +159,7 @@ func (s *Store) chunkRound(ctx context.Context) (int, error) {
 // deleted meanwhile has its object deleted. A failure leaves the claim to
 // run out, which is the retry's backoff.
 func (s *Store) makeChunk(ctx context.Context, c claimed) error {
-	rows, err := s.db.Pool.Query(ctx, `SELECT off, ts, source, level, partial, text FROM log_lines
+	rows, err := s.db.Pool.Query(ctx, `SELECT off, ts, source, level, partial, cont, text FROM log_lines
 		WHERE stream_id = $1 ORDER BY off LIMIT 200000`, c.id)
 	if err != nil {
 		return err
@@ -168,7 +169,7 @@ func (s *Store) makeChunk(ctx context.Context, c claimed) error {
 	for rows.Next() {
 		l := Line{Stream: c.id}
 		var lvl int16
-		if err := rows.Scan(&l.Off, &l.TS, &l.Source, &lvl, &l.Partial, &l.Text); err != nil {
+		if err := rows.Scan(&l.Off, &l.TS, &l.Source, &lvl, &l.Partial, &l.Cont, &l.Text); err != nil {
 			rows.Close()
 			return err
 		}

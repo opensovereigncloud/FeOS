@@ -139,7 +139,7 @@ func TestCursor(t *testing.T) {
 func TestChunkCodec(t *testing.T) {
 	in := []Line{
 		{Stream: 7, Off: 0, TS: 100, Source: "stdout", Level: LevelError, Text: `{"level":"error"} <&>`},
-		{Stream: 7, Off: 50, TS: 101, Source: "stderr", Level: LevelUnknown, Partial: true, Text: strings.Repeat("x", 70000)},
+		{Stream: 7, Off: 50, TS: 101, Source: "stderr", Level: LevelUnknown, Partial: true, Cont: true, Text: strings.Repeat("x", 70000)},
 		{Stream: 7, Off: 70100, TS: 102, Level: LevelDebug, Text: ""},
 	}
 	data, err := encodeChunk(in)

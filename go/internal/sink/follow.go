@@ -58,6 +58,7 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 			return err
 		}
 	}
+	joins := followJoins{open: map[joinKey]*followJoin{}, cut: map[joinKey]bool{}}
 	lastWrite := time.Now()
 	t := time.NewTimer(s.cfg.FollowPoll)
 	defer t.Stop()
@@ -67,11 +68,16 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 			return nil
 		case <-t.C:
 		}
-		lines, known, more, err := s.followPoll(ctx, tenant, live, q, after)
+		lines, known, more, err := s.followPoll(ctx, tenant, live, after)
 		if err != nil {
 			return err
 		}
-		for _, l := range lines {
+		lines = joins.take(lines, time.Now())
+		for i := range lines {
+			l := lines[i]
+			if !q.match(&l) {
+				continue
+			}
 			if err := out.Line(l, known[l.Stream]); err != nil {
 				return err
 			}
@@ -91,11 +97,80 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 	}
 }
 
+// joinKey is a stream's source, whose lines a partial one joins.
+type joinKey struct {
+	stream int64
+	source string
+}
+
+type followJoin struct {
+	j     *joiner
+	since time.Time
+}
+
+// followJoins joins a follow's partial lines with their rest across polls
+// (as joiner does for a read): an open one waits for its rest at most
+// joinWait, then is given partial. A line that goes on with one the page
+// gave is given on its own; the rest of one cut at maxJoined is dropped.
+type followJoins struct {
+	open map[joinKey]*followJoin
+	cut  map[joinKey]bool
+}
+
+// joinWait is how long a follow holds a partial line for its rest.
+const joinWait = 5 * time.Second
+
+// take joins the lines of a poll, in each stream's offset order, and
+// returns those complete, and those held past joinWait, in time order.
+func (f *followJoins) take(lines []Line, now time.Time) []Line {
+	var done []Line
+	for i := range lines {
+		l := lines[i]
+		k := joinKey{l.Stream, l.Source}
+		if l.Cont {
+			if o := f.open[k]; o != nil {
+				if o.j.add(&l) {
+					done = append(done, *o.j.head)
+					delete(f.open, k)
+					f.cut[k] = l.Partial
+				}
+				continue
+			}
+			if f.cut[k] {
+				f.cut[k] = l.Partial
+				continue
+			}
+			done = append(done, l)
+			continue
+		}
+		if o := f.open[k]; o != nil {
+			o.j.add(&l)
+			done = append(done, *o.j.head)
+			delete(f.open, k)
+		}
+		delete(f.cut, k)
+		if l.Partial {
+			head := l
+			f.open[k] = &followJoin{j: newJoiner(&head), since: now}
+			continue
+		}
+		done = append(done, l)
+	}
+	for k, o := range f.open {
+		if now.Sub(o.since) >= joinWait {
+			o.j.finish(true)
+			done = append(done, *o.j.head)
+			delete(f.open, k)
+		}
+	}
+	slices.SortStableFunc(done, func(a, b Line) int { return cmpPos(a.pos(), b.pos()) })
+	return done
+}
+
 // followPoll reads the lines after each stream's place in after, in one
-// snapshot with the chunks made since, advances after, and returns the
-// lines that pass q's filters in time order; more says a poll should
-// follow at once.
-func (s *Store) followPoll(ctx context.Context, tenant string, live streamFilter, q Query, after map[int64]int64) (
+// snapshot with the chunks made since, advances after, and returns them in
+// each stream's offset order; more says a poll should follow at once.
+func (s *Store) followPoll(ctx context.Context, tenant string, live streamFilter, after map[int64]int64) (
 	[]Line, map[int64]*streamRow, bool, error) {
 	tx, err := s.db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
@@ -139,7 +214,7 @@ func (s *Store) followPoll(ctx context.Context, tenant string, live streamFilter
 	}
 	var hot []Line
 	if len(ids) > 0 {
-		rows, err := tx.Query(ctx, `SELECT l.stream_id, l.off, l.ts, l.source, l.level, l.partial, l.text
+		rows, err := tx.Query(ctx, `SELECT l.stream_id, l.off, l.ts, l.source, l.level, l.partial, l.cont, l.text
 			FROM log_lines l JOIN unnest($1::bigint[], $2::bigint[]) AS k(id, after) ON l.stream_id = k.id AND l.off > k.after
 			ORDER BY l.stream_id, l.off LIMIT $3`, ids, from, followBatch)
 		if err != nil {
@@ -148,7 +223,7 @@ func (s *Store) followPoll(ctx context.Context, tenant string, live streamFilter
 		for rows.Next() {
 			var l Line
 			var lvl int16
-			if err := rows.Scan(&l.Stream, &l.Off, &l.TS, &l.Source, &lvl, &l.Partial, &l.Text); err != nil {
+			if err := rows.Scan(&l.Stream, &l.Off, &l.TS, &l.Source, &lvl, &l.Partial, &l.Cont, &l.Text); err != nil {
 				rows.Close()
 				return nil, nil, false, err
 			}
@@ -179,12 +254,11 @@ func (s *Store) followPoll(ctx context.Context, tenant string, live streamFilter
 	for _, l := range all {
 		after[l.Stream] = max(after[l.Stream], l.Off)
 	}
-	out := all[:0]
-	for i := range all {
-		if q.match(&all[i]) {
-			out = append(out, all[i])
+	slices.SortStableFunc(all, func(a, b Line) int {
+		if c := cmpInt(a.Stream, b.Stream); c != 0 {
+			return c
 		}
-	}
-	slices.SortStableFunc(out, func(a, b Line) int { return cmpPos(a.pos(), b.pos()) })
-	return out, known, len(hot) >= followBatch, nil
+		return cmpInt(a.Off, b.Off)
+	})
+	return all, known, len(hot) >= followBatch, nil
 }
