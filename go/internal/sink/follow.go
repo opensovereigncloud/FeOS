@@ -30,6 +30,9 @@ type followSink interface {
 // missed while the cold stage moves it.
 func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSink) error {
 	q.Forward, q.Cursor = false, nil
+	if !q.SinceSet {
+		q.Since = q.Until - int64(time.Hour)
+	}
 	live := streamFilter{sel: q.Sel, trace: q.Trace, live: true, limit: maxStreamsRead}
 	// Where each stream is: the open ones' before the page, then the
 	// page's own, whose snapshot holds its lines; a line stored after it
