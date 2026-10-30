@@ -58,3 +58,46 @@ pub mod volume_service {
 pub mod fleet_service {
     include!(concat!(env!("OUT_DIR"), "/fleet/feos.fleet.v1.rs"));
 }
+/// The sink's ingest beside OTLP (ADR 0026): positions and ended streams.
+pub mod sink_service {
+    tonic::include_proto!("feos.sink.v1");
+}
+/// OpenTelemetry's protocol, as far as the node exports logs (ADR 0026).
+pub mod opentelemetry {
+    pub mod proto {
+        pub mod common {
+            pub mod v1 {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/otlp/opentelemetry.proto.common.v1.rs"
+                ));
+            }
+        }
+        pub mod resource {
+            pub mod v1 {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/otlp/opentelemetry.proto.resource.v1.rs"
+                ));
+            }
+        }
+        pub mod logs {
+            pub mod v1 {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/otlp/opentelemetry.proto.logs.v1.rs"
+                ));
+            }
+        }
+        pub mod collector {
+            pub mod logs {
+                pub mod v1 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/otlp/opentelemetry.proto.collector.logs.v1.rs"
+                    ));
+                }
+            }
+        }
+    }
+}

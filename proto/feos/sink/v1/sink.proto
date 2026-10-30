@@ -1,0 +1,52 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package feos.sink.v1;
+
+// The sink's ingest beside OTLP's LogsService (ADR 0026): what a node asks
+// before it ships a stream, and says when a stream has ended. Served by
+// ferun-sink on its ingest port, to nodes with their node certificates.
+//
+// A stream is one log of one container of one pod: its key is the pod's
+// ID on its node (ferun.pod), the container's name (ferun.container) and
+// the guest's ID of the log file (ferun.log_id), resource attributes of
+// its OTLP ResourceLogs. A LogRecord's attribute log.offset is the byte
+// offset of its line's start in that log; the sink stores a line once per
+// (stream, offset).
+service SinkService {
+  // Where the sink is with each stream: the offset just past the last line
+  // it stored, from which the node goes on; 0 for a stream it does not
+  // know.
+  rpc Positions(PositionsRequest) returns (PositionsResponse);
+  // Streams that have ended: their pod is deleted and the node sent what
+  // their logs had. The sink closes them and makes their last chunk. A
+  // stream it does not know is ignored.
+  rpc EndStreams(EndStreamsRequest) returns (EndStreamsResponse);
+}
+
+message StreamKey {
+  string pod = 1;
+  string container = 2;
+  string log_id = 3;
+}
+
+message PositionsRequest {
+  // At most 1000.
+  repeated StreamKey streams = 1;
+}
+
+message PositionsResponse {
+  // In the order of the request's streams.
+  repeated uint64 next_offsets = 1;
+}
+
+message EndStreamsRequest {
+  // At most 1000.
+  repeated StreamKey streams = 1;
+  // When they ended, in Unix nanoseconds; 0: when the sink got this.
+  int64 time_unix_nano = 2;
+}
+
+message EndStreamsResponse {}

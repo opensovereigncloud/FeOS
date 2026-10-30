@@ -975,7 +975,16 @@ type StreamContainerLogsRequest struct {
 	// says; 0: tail decides. ferund reads a log tail this way, without
 	// follow. A node that predates this field ignores it; one that predates
 	// the 4 MiB cap sends up to 10000 lines of 64 KiB.
-	TailLines     uint32 `protobuf:"varint,4,opt,name=tail_lines,json=tailLines,proto3" json:"tail_lines,omitempty"`
+	TailLines uint32 `protobuf:"varint,4,opt,name=tail_lines,json=tailLines,proto3" json:"tail_lines,omitempty"`
+	// With follow, start at this byte offset of the log (ADR 0026): an
+	// offset an entry named before (a line's start), or 0. Wins over tail
+	// and tail_lines. An offset past the log's end, or into a log other than
+	// log_id names, starts at 0 of the log there is. Ignored without
+	// follow.
+	FromOffset uint64 `protobuf:"varint,5,opt,name=from_offset,json=fromOffset,proto3" json:"from_offset,omitempty"`
+	// The log from_offset belongs to (LogEntry.log_id); empty: whichever
+	// log the container has.
+	LogId         string `protobuf:"bytes,6,opt,name=log_id,json=logId,proto3" json:"log_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1038,11 +1047,41 @@ func (x *StreamContainerLogsRequest) GetTailLines() uint32 {
 	return 0
 }
 
+func (x *StreamContainerLogsRequest) GetFromOffset() uint64 {
+	if x != nil {
+		return x.FromOffset
+	}
+	return 0
+}
+
+func (x *StreamContainerLogsRequest) GetLogId() string {
+	if x != nil {
+		return x.LogId
+	}
+	return ""
+}
+
 type LogEntry struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The raw log line from either stdout or stderr.
-	Line          []byte          `protobuf:"bytes,1,opt,name=line,proto3" json:"line,omitempty"`
-	Source        LogEntry_Source `protobuf:"varint,2,opt,name=source,proto3,enum=feos.container.v1.LogEntry_Source" json:"source,omitempty"`
+	Line   []byte          `protobuf:"bytes,1,opt,name=line,proto3" json:"line,omitempty"`
+	Source LogEntry_Source `protobuf:"varint,2,opt,name=source,proto3,enum=feos.container.v1.LogEntry_Source" json:"source,omitempty"`
+	// The byte offset of the line's start in the log (ADR 0026), and the
+	// offset just past it: the next line's start, from_offset to continue
+	// after this entry. A line the guest wrote before ADR 0026 has its
+	// offset too, but no time and an unspecified source.
+	Offset     uint64 `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
+	NextOffset uint64 `protobuf:"varint,4,opt,name=next_offset,json=nextOffset,proto3" json:"next_offset,omitempty"`
+	// When the guest read the line from the container, in Unix nanoseconds;
+	// 0 when the log does not say (a line written before ADR 0026).
+	TimeUnixNano int64 `protobuf:"varint,5,opt,name=time_unix_nano,json=timeUnixNano,proto3" json:"time_unix_nano,omitempty"`
+	// A part of a line longer than the guest's longest part (64 KiB), not
+	// its last: the line goes on in the next entry.
+	Partial bool `protobuf:"varint,6,opt,name=partial,proto3" json:"partial,omitempty"`
+	// Which log the offsets count in: a value the guest gives each log file
+	// when it makes it, so that a log made again (a container created anew
+	// under its name) starts its offsets anew under another ID.
+	LogId         string `protobuf:"bytes,7,opt,name=log_id,json=logId,proto3" json:"log_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1089,6 +1128,41 @@ func (x *LogEntry) GetSource() LogEntry_Source {
 		return x.Source
 	}
 	return LogEntry_SOURCE_UNSPECIFIED
+}
+
+func (x *LogEntry) GetOffset() uint64 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
+func (x *LogEntry) GetNextOffset() uint64 {
+	if x != nil {
+		return x.NextOffset
+	}
+	return 0
+}
+
+func (x *LogEntry) GetTimeUnixNano() int64 {
+	if x != nil {
+		return x.TimeUnixNano
+	}
+	return 0
+}
+
+func (x *LogEntry) GetPartial() bool {
+	if x != nil {
+		return x.Partial
+	}
+	return false
+}
+
+func (x *LogEntry) GetLogId() string {
+	if x != nil {
+		return x.LogId
+	}
+	return ""
 }
 
 // Represents information about a single container.
@@ -1391,16 +1465,25 @@ const file_feos_container_v1_container_proto_rawDesc = "" +
 	"containers\";\n" +
 	"\x16DeleteContainerRequest\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\"\x19\n" +
-	"\x17DeleteContainerResponse\"\x8a\x01\n" +
+	"\x17DeleteContainerResponse\"\xc2\x01\n" +
 	"\x1aStreamContainerLogsRequest\x12!\n" +
 	"\fcontainer_id\x18\x01 \x01(\tR\vcontainerId\x12\x16\n" +
 	"\x06follow\x18\x02 \x01(\bR\x06follow\x12\x12\n" +
 	"\x04tail\x18\x03 \x01(\bR\x04tail\x12\x1d\n" +
 	"\n" +
-	"tail_lines\x18\x04 \x01(\rR\ttailLines\"\x94\x01\n" +
+	"tail_lines\x18\x04 \x01(\rR\ttailLines\x12\x1f\n" +
+	"\vfrom_offset\x18\x05 \x01(\x04R\n" +
+	"fromOffset\x12\x15\n" +
+	"\x06log_id\x18\x06 \x01(\tR\x05logId\"\xa4\x02\n" +
 	"\bLogEntry\x12\x12\n" +
 	"\x04line\x18\x01 \x01(\fR\x04line\x12:\n" +
-	"\x06source\x18\x02 \x01(\x0e2\".feos.container.v1.LogEntry.SourceR\x06source\"8\n" +
+	"\x06source\x18\x02 \x01(\x0e2\".feos.container.v1.LogEntry.SourceR\x06source\x12\x16\n" +
+	"\x06offset\x18\x03 \x01(\x04R\x06offset\x12\x1f\n" +
+	"\vnext_offset\x18\x04 \x01(\x04R\n" +
+	"nextOffset\x12$\n" +
+	"\x0etime_unix_nano\x18\x05 \x01(\x03R\ftimeUnixNano\x12\x18\n" +
+	"\apartial\x18\x06 \x01(\bR\apartial\x12\x15\n" +
+	"\x06log_id\x18\a \x01(\tR\x05logId\"8\n" +
 	"\x06Source\x12\x16\n" +
 	"\x12SOURCE_UNSPECIFIED\x10\x00\x12\n" +
 	"\n" +

@@ -221,6 +221,7 @@ async fn test_pod_disk_survives_stop_and_crash() -> Result<()> {
         spec: Some(spec()),
         image_layers: None,
         pull_token: String::new(),
+        log_labels: Default::default(),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());
@@ -376,6 +377,7 @@ async fn test_pod_hibernate_and_restore() -> Result<()> {
         spec: Some(networked.clone()),
         image_layers: None,
         pull_token: String::new(),
+        log_labels: Default::default(),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());
@@ -710,6 +712,7 @@ async fn up_pod(pods: &mut PodServiceClient<Channel>) -> Result<(String, PodGuar
         spec: Some(spec()),
         image_layers: None,
         pull_token: String::new(),
+        log_labels: Default::default(),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());

@@ -687,7 +687,13 @@ type TelemetryResponse struct {
 	// The instances of the control plane, as in JoinResponse: the node
 	// dials the ones it has no node connection to, and drops those that
 	// are no longer listed.
-	Instances     []*ControlPlaneInstance `protobuf:"bytes,2,rep,name=instances,proto3" json:"instances,omitempty"`
+	Instances []*ControlPlaneInstance `protobuf:"bytes,2,rep,name=instances,proto3" json:"instances,omitempty"`
+	// Where the sink takes the node's container logs (ADR 0026): host:port
+	// of ferun-sink's ingest, which serves feos.sink.v1.SinkService and
+	// OTLP's LogsService over TLS with a certificate of the platform's CA
+	// naming spiffe://<trust domain>/sink/<name>; the node presents its
+	// node certificate. Empty: no sink, the node ships nothing.
+	SinkEndpoint  string `protobuf:"bytes,3,opt,name=sink_endpoint,json=sinkEndpoint,proto3" json:"sink_endpoint,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -734,6 +740,13 @@ func (x *TelemetryResponse) GetInstances() []*ControlPlaneInstance {
 		return x.Instances
 	}
 	return nil
+}
+
+func (x *TelemetryResponse) GetSinkEndpoint() string {
+	if x != nil {
+		return x.SinkEndpoint
+	}
+	return ""
 }
 
 type EventBatch struct {
@@ -1779,10 +1792,11 @@ const file_feos_fleet_v1_fleet_proto_rawDesc = "" +
 	"\x06kernel\x18\x02 \x01(\tR\x06kernel\x12 \n" +
 	"\vfirecracker\x18\x03 \x03(\tR\vfirecracker\x12\x14\n" +
 	"\x05guest\x18\x04 \x03(\tR\x05guest\x12\x14\n" +
-	"\x05diskd\x18\x05 \x01(\tR\x05diskd\"\x81\x01\n" +
+	"\x05diskd\x18\x05 \x01(\tR\x05diskd\"\xa6\x01\n" +
 	"\x11TelemetryResponse\x12)\n" +
 	"\x10interval_seconds\x18\x01 \x01(\rR\x0fintervalSeconds\x12A\n" +
-	"\tinstances\x18\x02 \x03(\v2#.feos.fleet.v1.ControlPlaneInstanceR\tinstances\"o\n" +
+	"\tinstances\x18\x02 \x03(\v2#.feos.fleet.v1.ControlPlaneInstanceR\tinstances\x12#\n" +
+	"\rsink_endpoint\x18\x03 \x01(\tR\fsinkEndpoint\"o\n" +
 	"\n" +
 	"EventBatch\x12\x19\n" +
 	"\bstart_id\x18\x01 \x01(\tR\astartId\x12,\n" +

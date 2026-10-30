@@ -201,6 +201,12 @@ message TelemetryResponse {
   // dials the ones it has no node connection to, and drops those that
   // are no longer listed.
   repeated ControlPlaneInstance instances = 2;
+  // Where the sink takes the node's container logs (ADR 0026): host:port
+  // of ferun-sink's ingest, which serves feos.sink.v1.SinkService and
+  // OTLP's LogsService over TLS with a certificate of the platform's CA
+  // naming spiffe://<trust domain>/sink/<name>; the node presents its
+  // node certificate. Empty: no sink, the node ships nothing.
+  string sink_endpoint = 3;
 }
 
 message EventBatch {

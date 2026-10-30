@@ -129,6 +129,7 @@ async fn create_pod(
         spec: Some(spec(volume_id, container)),
         image_layers: None,
         pull_token: String::new(),
+        log_labels: Default::default(),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());
@@ -229,6 +230,7 @@ async fn test_volume_outlives_its_pods() -> Result<()> {
             spec: Some(spec(&volume_id, true)),
             image_layers: None,
             pull_token: String::new(),
+            log_labels: Default::default(),
         })
         .await
         .expect_err("a second pod with an attached volume");
@@ -499,6 +501,7 @@ async fn test_volume_hibernates_with_its_pod() -> Result<()> {
             spec: Some(spec(&volume_id, true)),
             image_layers: None,
             pull_token: String::new(),
+            log_labels: Default::default(),
         })
         .await
         .expect_err("another pod with a hibernated pod's volume");

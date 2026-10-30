@@ -14,6 +14,13 @@ GO_MODULE := github.com/gardenlinux/feos/go
 # package of their own, so the mapping is given to protoc here.
 GO_PROTOS := $(sort $(wildcard proto/feos/*/v1/*.proto))
 GO_PROTO_MAP := $(foreach p,$(GO_PROTOS),M$(patsubst proto/%,%,$(p))=$(GO_MODULE)/gen/$(patsubst proto/%/,%,$(dir $(p)));$(word 2,$(subst /, ,$(patsubst proto/%,%,$(p))))v1)
+# OpenTelemetry's protos (ADR 0026, the sink takes OTLP) become
+# $(GO_MODULE)/gen/otlp/<path>, named as OpenTelemetry's own Go module
+# names them: otlp<signal>v1 for collector/<signal>/v1, else <dir>v1.
+OTLP_PROTOS := $(sort $(shell find proto/opentelemetry -name '*.proto'))
+OTLP_PROTO_MAP := $(foreach p,$(OTLP_PROTOS),M$(patsubst proto/%,%,$(p))=$(GO_MODULE)/gen/otlp/$(patsubst proto/opentelemetry/proto/%/,%,$(dir $(p)));$(if $(findstring /collector/,$(p)),otlp$(word 5,$(subst /, ,$(p)))v1,$(word 4,$(subst /, ,$(p)))v1))
+GO_PROTOS += $(OTLP_PROTOS)
+GO_PROTO_MAP += $(OTLP_PROTO_MAP)
 
 .PHONY: go-gen go-build feos-k8s go-fmt-check go-vet go-lint go-test go-test-unit go-test-netns web
 
@@ -24,7 +31,7 @@ $(LOCALBIN)/protoc-gen-go-grpc: | $(LOCALBIN)
 	GOBIN=$(LOCALBIN) $(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 
 go-gen: $(LOCALBIN)/protoc-gen-go $(LOCALBIN)/protoc-gen-go-grpc ## Generate go/gen from proto/.
-	rm -rf $(GO_DIR)/gen/feos
+	rm -rf $(GO_DIR)/gen/feos $(GO_DIR)/gen/otlp
 	mkdir -p $(GO_DIR)/gen
 	protoc -I proto \
 		--plugin=protoc-gen-go=$(LOCALBIN)/protoc-gen-go \

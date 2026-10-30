@@ -312,6 +312,15 @@ message CreatePodRequest {
   // pod's record or on its disk, and hands it to the guest's pull only.
   // Empty: the guest pulls anonymously.
   string pull_token = 4;
+  // The labels of the pod's container logs (ADR 0026), set by the control
+  // plane and beside the spec, not compared with it: feosd keeps them in
+  // the pod's record and sends them with each of its containers' log
+  // streams to the sink as OTLP resource attributes, as they are
+  // (ferun.tenant, ferun.instance, ferun.environment, ferun.kind,
+  // ferun.object, ferun.replica, ferun.release, ferun.job, ferun.attempt,
+  // ferun.retention_days; docs/architecture/sink.md). Taken by a new pod only. Empty: the pod's logs
+  // are not shipped.
+  map<string, string> log_labels = 5;
 }
 
 // The baked layers of a pod's image that its create names (ADR 0025): a

@@ -67,6 +67,7 @@ async fn create(
             bake: true,
         }),
         pull_token: String::new(),
+        log_labels: Default::default(),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());
@@ -248,6 +249,7 @@ async fn create_with_token(
         spec: Some(spec()),
         image_layers: None,
         pull_token: pull_token.to_string(),
+        log_labels: Default::default(),
     })
     .await?;
     let guard = PodGuard::new(pod_id.clone());

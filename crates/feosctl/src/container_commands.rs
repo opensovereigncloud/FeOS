@@ -190,6 +190,7 @@ pub async fn handle_container_command(args: ContainerArgs) -> Result<()> {
                 follow,
                 tail: tail.is_none(),
                 tail_lines: tail.unwrap_or(0),
+                ..Default::default()
             };
             print_logs(&mut client, request).await?
         }

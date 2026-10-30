@@ -330,6 +330,7 @@ async fn send(tx: &LogSender, entries: Vec<Vec<u8>>) -> Result<(), End> {
         let entry = LogEntry {
             line,
             source: Source::Unspecified as i32,
+            ..Default::default()
         };
         tx.send(Ok(entry)).await.map_err(|_| End::Gone)?;
     }

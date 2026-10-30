@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{proto_dir}/feos/network/v1/network.proto"),
                 format!("{proto_dir}/feos/guest/v1/guest.proto"),
                 format!("{proto_dir}/feos/volume/v1/volume.proto"),
+                format!("{proto_dir}/feos/sink/v1/sink.proto"),
             ],
             &[proto_dir],
         )?;
@@ -38,6 +39,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".feos.network.v1", "crate::network_service")
         .compile_protos(
             &[format!("{proto_dir}/feos/fleet/v1/fleet.proto")],
+            &[proto_dir],
+        )?;
+    // OpenTelemetry's protocol (ADR 0026): the node exports its pods' logs
+    // to the sink over OTLP's LogsService. Its packages nest, so they get
+    // a directory and a module tree of their own (lib.rs).
+    let otlp_dir = format!("{}/otlp", std::env::var("OUT_DIR")?);
+    std::fs::create_dir_all(&otlp_dir)?;
+    tonic_build::configure()
+        .out_dir(&otlp_dir)
+        .build_server(false)
+        .compile_protos(
+            &[format!(
+                "{proto_dir}/opentelemetry/proto/collector/logs/v1/logs_service.proto"
+            )],
             &[proto_dir],
         )?;
     Ok(())

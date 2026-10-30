@@ -313,6 +313,7 @@ impl FleetService for ControlPlane {
         Ok(Response::new(TelemetryResponse {
             interval_seconds: 1,
             instances: self.instances(),
+            sink_endpoint: String::new(),
         }))
     }
 
