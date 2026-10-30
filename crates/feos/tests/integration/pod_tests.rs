@@ -310,6 +310,7 @@ async fn test_pod_lifecycle() -> Result<()> {
         image_layers: None,
         pull_token: String::new(),
         log_labels: Default::default(),
+        log_redact: Vec::new(),
     };
     pods.create_pod(create.clone()).await?;
     let mut guard = PodGuard::new(pod_id.clone());
@@ -329,6 +330,7 @@ async fn test_pod_lifecycle() -> Result<()> {
             image_layers: None,
             pull_token: String::new(),
             log_labels: Default::default(),
+            log_redact: Vec::new(),
         })
         .await
         .expect_err("a create with another spec");
@@ -629,6 +631,7 @@ async fn test_pod_crash() -> Result<()> {
         image_layers: None,
         pull_token: String::new(),
         log_labels: Default::default(),
+        log_redact: Vec::new(),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());
@@ -706,6 +709,7 @@ async fn test_pod_suspend_and_resume() -> Result<()> {
         image_layers: None,
         pull_token: String::new(),
         log_labels: Default::default(),
+        log_redact: Vec::new(),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());

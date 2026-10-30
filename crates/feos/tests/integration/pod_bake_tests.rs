@@ -68,6 +68,7 @@ async fn create(
         }),
         pull_token: String::new(),
         log_labels: Default::default(),
+        log_redact: Vec::new(),
     })
     .await?;
     let mut guard = PodGuard::new(pod_id.clone());
@@ -250,6 +251,7 @@ async fn create_with_token(
         image_layers: None,
         pull_token: pull_token.to_string(),
         log_labels: Default::default(),
+        log_redact: Vec::new(),
     })
     .await?;
     let guard = PodGuard::new(pod_id.clone());
