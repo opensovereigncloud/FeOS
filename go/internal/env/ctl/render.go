@@ -95,8 +95,11 @@ type attachedPlan struct {
 	env     map[string]model.TemplateValue
 	check   check
 	hash    string
-	wait    string
-	err     error
+	// idle is the service's claim on its sandbox once it runs:
+	// idle_after_s (0: never), nil for none (attachedIdleOf).
+	idle *int
+	wait string
+	err  error
 }
 
 func (p *attachedPlan) ok() bool { return p.wait == "" && p.err == nil }
@@ -275,7 +278,7 @@ func (c *Controller) planJob(v *view, name string, j spec.Job) *podPlan {
 
 // planAttached renders an attached service of the target: its process.
 func (c *Controller) planAttached(v *view, name string, s spec.Service) *attachedPlan {
-	p := &attachedPlan{name: name, argv: slices.Clone(s.Command), cwd: s.Cwd, check: checkOf(s)}
+	p := &attachedPlan{name: name, argv: slices.Clone(s.Command), cwd: s.Cwd, check: checkOf(s), idle: attachedIdleOf(s)}
 	id, err := podid.Parse(s.Sandbox)
 	if err != nil {
 		p.err = fmt.Errorf("service %s: sandbox %q is not a sandbox ID", name, s.Sandbox)

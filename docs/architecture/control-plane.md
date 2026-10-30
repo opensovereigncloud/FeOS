@@ -313,7 +313,7 @@ audit is its activity row.
 | mesh peers | 15 s | sends every node on the pods' mesh that the leader is connected to its peers, the ingress's instances among them ([The pods' mesh](#the-pods-mesh)) |
 | down sweep | 5 s | sandboxes of down and removed nodes become `unknown` |
 | lost grace | 30 s | `unknown` sandboxes of nodes down past `--lost-grace` become `hibernated`, `lost`, or `pending` when their pod was never seen |
-| idle pause | 1 s | pauses running sandboxes idle for `--idle-pause` (a row's own `idle_after_s` when set; 0 never), unless a failed pause backs off; only while the leader has led for 15 s and the database has not failed for as long (every instance renews its holds first); never a public environment's service instance while an ingress instance may be cut off (the [idle fence](ingress.md#the-idle-fence)) |
+| idle pause | 1 s | pauses running sandboxes idle for `--idle-pause` (a row's own `idle_after_s` when set; 0 never), unless a failed pause backs off or an attached service keeps the sandbox running (`env_attached.awake_until` while its process starts, `idle_after_s` once it runs; ADR 0018); only while the leader has led for 15 s and the database has not failed for as long (every instance renews its holds first); never a public environment's service instance while an ingress instance may be cut off (the [idle fence](ingress.md#the-idle-fence)) |
 | hibernate-after | 5 s | hibernates sandboxes paused for `--hibernate-after`, unless a failed hibernation backs off |
 | drain | 5 s | moves sandboxes off draining nodes |
 | tombstones | 10 s | deletes pods that belong to no sandbox |
@@ -1807,8 +1807,10 @@ shapes:
   tcp or exec with an initial delay (0s), a period of at least 1 s (2s)
   and a failure threshold (3), `idle` of at least 1m only on a route's
   target ("nothing would wake it"), `rollout.timeout` (10m). Or they run
-  `attached`: a sandbox of the tenant, a command, an absolute `cwd`, and
-  none of image, replicas, resources, idle and rollout. Port names are
+  `attached`: a sandbox of the tenant, a command, an absolute `cwd`,
+  `idle` of at least 1m or `never` (no route needed: the sandbox's own
+  activity wakes it), and none of image, replicas, resources and
+  rollout. Port names are
   required DNS labels; two attached services in one sandbox, in any
   environment, do not share a port number. A service and an addon do not
   share a name: both are names of the env table. Two environments with

@@ -69,8 +69,12 @@ type Service struct {
 	// it still runs 2 s after it was first seen running.
 	Readiness *Readiness `json:"readiness,omitempty"`
 	// Idle is how long a replica without traffic runs before it is paused
-	// (at least 1m; a route wakes it); "": never. Image runtime, route
-	// targets only.
+	// (at least 1m; a route wakes it); "": never. Image runtime: route
+	// targets only. Attached runtime: how long the sandbox it runs in
+	// stays awake after its last activity once the service runs, "never"
+	// (IdleNever) for as long as it runs, "": no claim, the sandbox's own
+	// idle interval applies (ADR 0018, "An attached service idles as an
+	// image service does").
 	Idle string `json:"idle,omitempty"`
 	// Rollout bounds a release's rollout of the service. Image runtime
 	// only.
@@ -467,10 +471,12 @@ const (
 	DefaultMemoryMib = 512
 	MaxRetries       = 5
 
-	DefaultRolloutTimeout   = "10m0s"
-	DefaultJobTimeout       = "10m0s"
-	MaxJobTimeout           = "2h0m0s"
-	MinIdle                 = "1m0s"
+	DefaultRolloutTimeout = "10m0s"
+	DefaultJobTimeout     = "10m0s"
+	MaxJobTimeout         = "2h0m0s"
+	MinIdle               = "1m0s"
+	// IdleNever keeps an attached service's sandbox awake while it runs.
+	IdleNever               = "never"
 	DefaultInitialDelay     = "0s"
 	DefaultPeriod           = "2s"
 	DefaultFailureThreshold = 3

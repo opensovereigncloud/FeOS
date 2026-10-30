@@ -298,19 +298,31 @@ func TestValidateRules(t *testing.T) {
 				v.Command = nil
 				v.Replicas = intp(2)
 				v.Resources = &Resources{VCPUs: 1}
-				v.Idle = "15m"
+				v.Idle = "30s"
 				v.Rollout = &Rollout{}
 				v.Image = "img"
 				v.Cwd = "relative"
 			})
 		}, []expect{e("services.web.command", "an attached service needs a command"),
-			e("services.web.cwd", "not an absolute path"), e("services.web.idle", "does not idle"),
+			e("services.web.cwd", "not an absolute path"), e("services.web.idle", "shorter than 1m"),
 			e("services.web.image", "runs no image"), e("services.web.replicas", "an attached service runs once"),
 			e("services.web.resources", "sandbox's resources"), e("services.web.rollout", "no rollout")}},
 		{"attached replicas 1", ModePlan, func(s *Spec) {
 			approval(s)
 			svc(s, "web", func(v *Service) { v.Replicas = intp(1) })
 		}, nil},
+		{"attached idle", ModePlan, func(s *Spec) {
+			// A duration of 1m or more, or never; no route needed: the
+			// sandbox's own activity wakes it.
+			approval(s)
+			svc(s, "web", func(v *Service) { v.Idle = "15m" })
+			s.Services["web2"] = Service{Runtime: RuntimeAttached, Command: []string{"x"}, Sandbox: webSandbox, Idle: IdleNever}
+			s.Services["web3"] = Service{Runtime: RuntimeAttached, Command: []string{"x"}, Sandbox: webSandbox, Idle: "soon"}
+		}, []expect{e("services.web3.idle", `"soon" is not a duration`)}},
+		{"never is for attached services", ModeSpec, func(s *Spec) {
+			approval(s)
+			svc(s, "expense-service", func(v *Service) { v.Idle = IdleNever })
+		}, []expect{e("services.expense-service.idle", `"never" is not a duration`)}},
 		{"attached sandbox", ModePlan, func(s *Spec) {
 			approval(s)
 			s.Services["web2"] = Service{Runtime: RuntimeAttached, Command: []string{"x"}}

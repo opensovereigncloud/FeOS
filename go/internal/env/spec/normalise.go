@@ -152,7 +152,10 @@ func normService(svc Service, p Pins) Service {
 	}
 	if out.Runtime == RuntimeAttached {
 		out.Image, out.ImageAsWritten, out.ImageCredentials = "", "", nil
-		out.Replicas, out.Resources, out.Idle, out.Rollout = nil, nil, "", nil
+		out.Replicas, out.Resources, out.Rollout = nil, nil, nil
+		if svc.Idle != "" && svc.Idle != IdleNever {
+			out.Idle = normDuration(svc.Idle, "")
+		}
 		return out
 	}
 	out.Image, out.ImageAsWritten = pin(svc.Image, svc.ImageAsWritten, p)

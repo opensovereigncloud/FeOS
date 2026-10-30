@@ -190,6 +190,9 @@ TABLE env_attached
   COLUMN detail text NOT NULL DEFAULT ''::text
   COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
   COLUMN updated_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN awake_until timestamp with time zone
+  COLUMN idle_after_s integer
+  CONSTRAINT CHECK ((idle_after_s >= 0))
   CONSTRAINT CHECK ((phase = ANY (ARRAY['starting'::text, 'ready'::text, 'unready'::text, 'exited'::text, 'failed'::text])))
   CONSTRAINT CHECK ((sandbox_id ~ '^([a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::text))
   CONSTRAINT FOREIGN KEY (env_id) REFERENCES environments(id) ON DELETE CASCADE

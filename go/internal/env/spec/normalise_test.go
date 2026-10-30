@@ -75,7 +75,8 @@ func TestNormaliseRules(t *testing.T) {
 		Resources: &Resources{MemoryMib: 1024}, Idle: "1h30m", Rollout: &Rollout{Timeout: "90s"},
 		Readiness: &Readiness{TCP: &TCPCheck{Port: PortRef{Number: 80}}, Period: "5000ms", FailureThreshold: 5}}
 	s.Services["attached"] = Service{Runtime: RuntimeAttached, Sandbox: webSandbox, Command: []string{"x"},
-		Replicas: intp(1), Readiness: &Readiness{Exec: &ExecCheck{Command: []string{"true"}}}}
+		Replicas: intp(1), Readiness: &Readiness{Exec: &ExecCheck{Command: []string{"true"}}}, Idle: "900s"}
+	s.Services["attached-never"] = Service{Runtime: RuntimeAttached, Sandbox: webSandbox, Command: []string{"x"}, Idle: IdleNever}
 	s.Jobs["seed"] = Job{Image: "ghcr.io/acme/expense:1.4", On: JobOnManual, Timeout: "1h"}
 	s.Volumes = []byte(`{}`)
 	pins := stagePins()
@@ -101,8 +102,11 @@ func TestNormaliseRules(t *testing.T) {
 		t.Fatalf("tuned %+v", tuned)
 	}
 	att := got.Services["attached"]
-	if att.Replicas != nil || att.Resources != nil || att.Rollout != nil || att.Readiness.Period != "2s" {
+	if att.Replicas != nil || att.Resources != nil || att.Rollout != nil || att.Readiness.Period != "2s" || att.Idle != "15m0s" {
 		t.Fatalf("attached %+v", att)
+	}
+	if n := got.Services["attached-never"]; n.Idle != IdleNever {
+		t.Fatalf("attached never %+v", n)
 	}
 	if web := got.Services["web"]; web.Runtime != RuntimeAttached || web.Replicas != nil {
 		t.Fatalf("web %+v", web)

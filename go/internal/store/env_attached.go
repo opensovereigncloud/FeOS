@@ -34,22 +34,29 @@ type EnvAttached struct {
 	ProbeFailures      int
 	NextRestartAt      time.Time
 	Detail             string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// AwakeUntil keeps the sandbox running while a started process is not
+	// ready yet, until its rollout budget is spent; zero: no claim.
+	// IdleAfterS is the service's idle once it runs, in seconds (0:
+	// never); nil: no claim, the sandbox's own interval applies (ADR
+	// 0018, "An attached service idles as an image service does").
+	AwakeUntil time.Time
+	IdleAfterS *int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 const attachedCols = `env_id, service, sandbox_id, sandbox_incarnation, template_hash, process_id, phase, ready_since,
-	restarts, last_exit, probe_failures, next_restart_at, detail, created_at, updated_at`
+	restarts, last_exit, probe_failures, next_restart_at, detail, awake_until, idle_after_s, created_at, updated_at`
 
 func scanAttached(row pgx.Row) (EnvAttached, error) {
 	var a EnvAttached
 	var inc *uuid.UUID
-	var ready, next *time.Time
+	var ready, next, awake *time.Time
 	if err := row.Scan(&a.EnvID, &a.Service, &a.SandboxID, &inc, &a.TemplateHash, &a.ProcessID, &a.Phase, &ready,
-		&a.Restarts, &a.LastExit, &a.ProbeFailures, &next, &a.Detail, &a.CreatedAt, &a.UpdatedAt); err != nil {
+		&a.Restarts, &a.LastExit, &a.ProbeFailures, &next, &a.Detail, &awake, &a.IdleAfterS, &a.CreatedAt, &a.UpdatedAt); err != nil {
 		return EnvAttached{}, err
 	}
-	a.SandboxIncarnation, a.ReadySince, a.NextRestartAt = uuidOf(inc), timeOf(ready), timeOf(next)
+	a.SandboxIncarnation, a.ReadySince, a.NextRestartAt, a.AwakeUntil = uuidOf(inc), timeOf(ready), timeOf(next), timeOf(awake)
 	return a, nil
 }
 
@@ -67,10 +74,12 @@ func (s *Store) InsertAttached(ctx context.Context, a EnvAttached) (EnvAttached,
 		a.Phase = model.PhaseStarting
 	}
 	out, err := scanAttached(s.q.QueryRow(ctx, `INSERT INTO env_attached (env_id, service, sandbox_id, sandbox_incarnation,
-			template_hash, process_id, phase, ready_since, restarts, last_exit, probe_failures, next_restart_at, detail)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING `+attachedCols,
+			template_hash, process_id, phase, ready_since, restarts, last_exit, probe_failures, next_restart_at, detail,
+			awake_until, idle_after_s)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING `+attachedCols,
 		a.EnvID, a.Service, a.SandboxID, nullUUID(a.SandboxIncarnation), a.TemplateHash, a.ProcessID, a.Phase,
-		nullTime(a.ReadySince), a.Restarts, nullInt(a.LastExit), a.ProbeFailures, nullTime(a.NextRestartAt), a.Detail))
+		nullTime(a.ReadySince), a.Restarts, nullInt(a.LastExit), a.ProbeFailures, nullTime(a.NextRestartAt), a.Detail,
+		nullTime(a.AwakeUntil), nullInt(a.IdleAfterS)))
 	if err != nil {
 		return EnvAttached{}, insertError("insert attached service "+a.Service, err)
 	}
@@ -126,6 +135,8 @@ func (s *Store) UpdateAttached(ctx context.Context, before, after EnvAttached) (
 	u.set("probe_failures", before.ProbeFailures != after.ProbeFailures, after.ProbeFailures)
 	u.set("next_restart_at", !before.NextRestartAt.Equal(after.NextRestartAt), nullTime(after.NextRestartAt))
 	u.set("detail", before.Detail != after.Detail, after.Detail)
+	u.set("awake_until", !before.AwakeUntil.Equal(after.AwakeUntil), nullTime(after.AwakeUntil))
+	u.set("idle_after_s", !sameIntPtr(before.IdleAfterS, after.IdleAfterS), nullInt(after.IdleAfterS))
 	if u.empty() {
 		return before, nil
 	}
