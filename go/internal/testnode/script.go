@@ -230,6 +230,13 @@ func (s *Script) AppendLog(pod podid.ID, container, line string) error {
 	return s.n.pods.appendLog(pod, container, line)
 }
 
+// AppendLogEntry adds an entry of source to the log of a container of a
+// pod (ADR 0026): partial, a part of a line that the next entry of its
+// source goes on with, as the guest's P entries.
+func (s *Script) AppendLogEntry(pod podid.ID, container, text string, source containerv1.LogEntry_Source, partial bool) error {
+	return s.n.pods.appendLog(pod, container, encodeEntry(text, source, partial))
+}
+
 // SetKubePorts sets the pod's Kubernetes listener ports, which its guest
 // never forwards.
 func (s *Script) SetKubePorts(pod podid.ID, ports ...uint32) {

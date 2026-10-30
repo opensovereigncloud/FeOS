@@ -13,10 +13,12 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	containerv1 "github.com/gardenlinux/feos/go/gen/feos/container/v1"
 	"github.com/gardenlinux/feos/go/internal/auth"
 	"github.com/gardenlinux/feos/go/internal/env/spec"
 	"github.com/gardenlinux/feos/go/internal/model"
@@ -127,11 +129,54 @@ func TestLogRedact(t *testing.T) {
 	}
 }
 
+// A log's partial entries are joined with the next entries of their
+// source up to one that is not partial, the joined line cut to the
+// line budget; a line still open at the end goes in as far as it came.
+func TestLogTailParts(t *testing.T) {
+	tl := logTail{b: logBudget{line: 16, total: 1 << 10}, max: 10}
+	tl.addPart("a1 ", "stdout", true)
+	tl.addPart("b", "stderr", false)
+	tl.addPart("a2 ", "stdout", true)
+	tl.addPart("c1 ", "stderr", true)
+	tl.addPart("a3", "stdout", false)
+	tl.addPart(strings.Repeat("y", 20), "stdout", true)
+	tl.addPart(strings.Repeat("y", 20), "stdout", false)
+	tl.addPart("c2", "stderr", true)
+	want := []string{"b", "a1 a2 a3", "yyyyyyy" + cutMark, "c1 c2"}
+	if got := tl.result(); !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// The node's partial entries are joined as the sink's are.
+func TestNodeLogParts(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	r1 := h.apply(env.ID, serviceSpec(1, "1", ""))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	id := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "ready", ready)[0].Sandbox.ID
+	for _, e := range []struct {
+		text    string
+		source  containerv1.LogEntry_Source
+		partial bool
+	}{{"GET / ", containerv1.LogEntry_STDOUT, true}, {"oops", containerv1.LogEntry_STDERR, false},
+		{"200", containerv1.LogEntry_STDOUT, false}} {
+		if err := n1.Script().AppendLogEntry(id, "main", e.text, e.source, e.partial); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _, err := h.c.LogTail(bg, env.ID, spec.KindService, "web", 0, 10)
+	if err != nil || !slices.Equal(got[len(got)-2:], []string{"oops", "GET / 200"}) {
+		t.Fatalf("logs %q %v", got, err)
+	}
+}
+
 // fakeSink is the sink's GET /api/v1/logs: lines (oldest first) per
 // selector, pages of at most limit, newest first; down answers 503.
 type fakeSink struct {
 	mu    sync.Mutex
-	lines map[string][]string
+	lines map[string][]sinkLine
 	down  bool
 	asked []string
 }
@@ -146,7 +191,7 @@ func (f *fakeSink) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no", http.StatusServiceUnavailable)
 		return
 	}
-	var all []string
+	var all []sinkLine
 	for _, k := range []string{"instance", "job"} {
 		if v := q.Get(k); v != "" {
 			all = f.lines[k+"="+v]
@@ -158,23 +203,26 @@ func (f *fakeSink) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	start := max(end-limit, 0)
-	type line struct {
-		Text string `json:"text"`
-	}
 	out := struct {
-		Lines  []line `json:"lines"`
-		Cursor string `json:"cursor"`
-	}{Lines: []line{}}
-	for _, l := range all[start:end] {
-		out.Lines = append(out.Lines, line{l})
-	}
+		Lines  []sinkLine `json:"lines"`
+		Cursor string     `json:"cursor"`
+	}{Lines: append([]sinkLine{}, all[start:end]...)}
 	if start > 0 {
 		out.Cursor = strconv.Itoa(start)
 	}
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// set gives the stream of key whole stdout lines.
 func (f *fakeSink) set(key string, lines []string, down bool) {
+	var ls []sinkLine
+	for _, l := range lines {
+		ls = append(ls, sinkLine{Text: l, Source: "stdout"})
+	}
+	f.setLines(key, ls, down)
+}
+
+func (f *fakeSink) setLines(key string, lines []sinkLine, down bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lines[key], f.down = lines, down
@@ -187,7 +235,7 @@ func (f *fakeSink) set(key string, lines []string, down bool) {
 func TestSinkLogs(t *testing.T) {
 	h := newHarness(t, options{})
 	n1 := h.addNode("n1")
-	sink := &fakeSink{lines: map[string][]string{}}
+	sink := &fakeSink{lines: map[string][]sinkLine{}}
 	srv := httptest.NewServer(sink)
 	t.Cleanup(srv.Close)
 	h.c.d.SinkURL = srv.URL + "/"
@@ -221,6 +269,16 @@ func TestSinkLogs(t *testing.T) {
 	}
 	if got := logs(ctx, "web", 2); !slices.Equal(got, []string{"line 1198", "line 1199"}) {
 		t.Fatalf("a short tail: %q", got)
+	}
+	// A line's partial parts are joined, across pages too, with other
+	// sources' lines between them.
+	sink.setLines("instance="+web.String(), append([]sinkLine{
+		{Text: "first ", Source: "stdout", Partial: true}, {Text: "an error", Source: "stderr"},
+		{Text: "second ", Source: "stdout", Partial: true}}, append(slices.Repeat([]sinkLine{{Text: "x", Source: "stdout",
+		Partial: true}}, sinkPage), sinkLine{Text: "end", Source: "stdout"})...), false)
+	if got := logs(ctx, "web", 2); len(got) != 2 || got[0] != "an error" ||
+		got[1] != "first second "+strings.Repeat("x", sinkPage)+"end" {
+		t.Fatalf("joined: %q", got)
 	}
 	// Without the caller's token, or with the sink down: the node's.
 	if got := logs(bg, "web", 10); !slices.Equal(got, []string{"from the node"}) {
@@ -285,7 +343,7 @@ func TestSinkLogs(t *testing.T) {
 func TestSinkJobRunLog(t *testing.T) {
 	h := newHarness(t, options{})
 	n1 := h.addNode("n1")
-	sink := &fakeSink{lines: map[string][]string{}}
+	sink := &fakeSink{lines: map[string][]sinkLine{}}
 	srv := httptest.NewServer(sink)
 	t.Cleanup(srv.Close)
 	h.c.d.SinkURL = srv.URL
