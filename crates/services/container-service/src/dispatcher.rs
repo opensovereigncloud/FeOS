@@ -3,6 +3,7 @@
 
 use crate::{
     error::ContainerServiceError,
+    output::Outputs,
     persistence::{repository::ContainerRepository, ContainerRecord},
     runtime::{adapter::ContainerAdapter, bundle},
     worker, Command,
@@ -18,6 +19,7 @@ pub struct Dispatcher {
     rx: mpsc::Receiver<Command>,
     repository: ContainerRepository,
     adapter: Arc<ContainerAdapter>,
+    outputs: Outputs,
 }
 
 /// Container IDs name directories: 1 to 64 letters, digits, "-", "_" and
@@ -48,19 +50,22 @@ pub(crate) fn runtime_knows(id: &str) -> bool {
 impl Dispatcher {
     pub async fn new(rx: mpsc::Receiver<Command>) -> Result<Self, ContainerServiceError> {
         let repository = ContainerRepository::connect(CONTAINERS_DIR).await?;
-        Self::reconcile(&repository).await;
+        let outputs = Outputs::default();
+        Self::reconcile(&repository, &outputs).await;
         let adapter = Arc::new(ContainerAdapter::new());
         Ok(Self {
             rx,
             repository,
             adapter,
+            outputs,
         })
     }
 
     /// Records from before a reboot: on a data volume they survive it, the
     /// containers do not. A container the runtime does not know is stopped;
-    /// one whose creation was cut short is removed.
-    async fn reconcile(repository: &ContainerRepository) {
+    /// one whose creation was cut short is removed. The output of one it
+    /// knows, which outlived this process, is read again (crate::output).
+    async fn reconcile(repository: &ContainerRepository, outputs: &Outputs) {
         let records = match repository.list_all_containers().await {
             Ok(records) => records,
             Err(e) => {
@@ -83,6 +88,11 @@ impl Dispatcher {
                         .update_container_state(id, ContainerState::Stopped)
                         .await;
                 }
+                ContainerState::Created | ContainerState::Running => {
+                    if let Err(e) = outputs.start(id).await {
+                        warn!("Dispatcher: Not reading the output of container {id}: {e}");
+                    }
+                }
                 _ => {}
             }
         }
@@ -93,8 +103,9 @@ impl Dispatcher {
         while let Some(cmd) = self.rx.recv().await {
             let repo = self.repository.clone();
             let adapter = self.adapter.clone();
+            let outputs = self.outputs.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_command(cmd, repo, adapter).await {
+                if let Err(e) = Self::handle_command(cmd, repo, adapter, outputs).await {
                     warn!("Dispatcher: Error handling command: {e}");
                 }
             });
@@ -116,10 +127,12 @@ impl Dispatcher {
         cmd: Command,
         repository: ContainerRepository,
         adapter: Arc<ContainerAdapter>,
+        outputs: Outputs,
     ) -> Result<(), ContainerServiceError> {
         match cmd {
             Command::CreateContainer(req, token, responder) => {
-                let result = worker::create_container(req, &token, &repository, &adapter).await;
+                let result =
+                    worker::create_container(req, &token, &repository, &adapter, &outputs).await;
                 let _ = responder.send(result);
             }
             Command::StartContainer(req, responder) => {
@@ -127,7 +140,7 @@ impl Dispatcher {
                 match record {
                     Ok(rec) if rec.status.state == ContainerState::Created => {
                         tokio::spawn(worker::handle_start_container(
-                            req, responder, repository, adapter,
+                            req, responder, repository, adapter, outputs,
                         ));
                     }
                     Ok(rec) => {
@@ -165,7 +178,7 @@ impl Dispatcher {
                     // The runtime kills a running container first.
                     Ok(_) => {
                         tokio::spawn(worker::handle_delete_container(
-                            req, responder, repository, adapter,
+                            req, responder, repository, adapter, outputs,
                         ));
                     }
                     Err(e) => {

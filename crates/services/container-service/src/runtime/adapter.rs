@@ -57,7 +57,8 @@ impl ContainerAdapter {
         &self,
         container_id: &str,
         bundle_path: &Path,
-        log_path: &Path,
+        stdout: &Path,
+        stderr: &Path,
     ) -> Result<i64, AdapterError> {
         info!("Adapter: Connecting to TaskService for container {container_id}");
         let mut task_client = Self::get_task_service_client().await?;
@@ -68,13 +69,12 @@ impl ContainerAdapter {
             .to_string();
 
         info!("Adapter: Calling Create RPC on TaskService for container {container_id}");
-        let log_path = log_path.to_string_lossy().into_owned();
         let request = CreateRequest {
             container_id: container_id.to_string(),
             bundle_path: bundle_path_str,
             stdin_path: "".to_string(),
-            stdout_path: log_path.clone(),
-            stderr_path: log_path,
+            stdout_path: stdout.to_string_lossy().into_owned(),
+            stderr_path: stderr.to_string_lossy().into_owned(),
         };
 
         let response = task_client.create(request).await?;

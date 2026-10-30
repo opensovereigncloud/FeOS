@@ -1075,8 +1075,9 @@ type LogEntry struct {
 	// When the guest read the line from the container, in Unix nanoseconds;
 	// 0 when the log does not say (a line written before ADR 0026).
 	TimeUnixNano int64 `protobuf:"varint,5,opt,name=time_unix_nano,json=timeUnixNano,proto3" json:"time_unix_nano,omitempty"`
-	// A part of a line longer than the guest's longest part (64 KiB), not
-	// its last: the line goes on in the next entry.
+	// A part of a line, not its last: of one longer than the guest's longest
+	// part (64 KiB), or what came of one that stayed unfinished for a
+	// second. The line goes on in the next entry of its source.
 	Partial bool `protobuf:"varint,6,opt,name=partial,proto3" json:"partial,omitempty"`
 	// Which log the offsets count in: a value the guest gives each log file
 	// when it makes it, so that a log made again (a container created anew

@@ -61,6 +61,7 @@ impl Dispatcher {
                         bundle_path: req.bundle_path.clone(),
                         exit_code: None,
                         wait_responder: None,
+                        outputs: Vec::new(),
                     },
                 );
 
@@ -173,10 +174,11 @@ impl Dispatcher {
     async fn handle_event(&mut self, event: Event) {
         info!("Dispatcher: Handling event: {event:?}");
         match event {
-            Event::ContainerCreated { id, pid } => {
+            Event::ContainerCreated { id, pid, outputs } => {
                 if let Some(container) = self.containers.get_mut(&id) {
                     container.status = Status::Created;
                     container.pid = Some(pid);
+                    container.outputs = outputs;
                 }
             }
             Event::ContainerCreateFailed { id, error: _ } => {

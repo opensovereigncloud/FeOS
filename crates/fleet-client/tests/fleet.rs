@@ -6,6 +6,7 @@
 //! when given. The uplink (`h2`) serves feos.fleet.v1, and on a node
 //! connection (`feos-node/1`) the test calls the node's API.
 
+use feos_proto::container_service::{log_entry::Source, LogEntry, StreamContainerLogsRequest};
 use feos_proto::fleet_service::fleet_service_server::{FleetService, FleetServiceServer};
 use feos_proto::fleet_service::{
     event, Certificate, ControlPlaneInstance, Event, EventAck, EventBatch,
@@ -13,14 +14,22 @@ use feos_proto::fleet_service::{
     JoinRequest, JoinResponse, RenewCertificateRequest, RenewCertificateResponse, Telemetry,
     TelemetryResponse,
 };
+use feos_proto::opentelemetry::proto::collector::logs::v1::{
+    ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
+use feos_proto::opentelemetry::proto::common::v1::{any_value, AnyValue};
 use feos_proto::pod_service::{PodEvent, PodInfo, PodState};
+use feos_proto::sink_service::sink_service_server::{SinkService, SinkServiceServer};
+use feos_proto::sink_service::{
+    EndStreamsRequest, EndStreamsResponse, PositionsRequest, PositionsResponse, StreamKey,
+};
 use feos_proto::volume_service::volume_service_client::VolumeServiceClient;
 use feos_proto::volume_service::volume_service_server::{VolumeService, VolumeServiceServer};
 use feos_proto::volume_service::{
     CreateVolumeRequest, DeleteVolumeRequest, DeleteVolumeResponse, GetVolumeRequest,
     ListVolumesRequest, ListVolumesResponse, Volume,
 };
-use fleet_client::{Config, Diskd, Installed, Inventory};
+use fleet_client::{Config, Diskd, Installed, Inventory, LogStream, Logs, ShippedPod, Shipper};
 use hyper_util::rt::TokioIo;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType,
@@ -138,6 +147,38 @@ impl Pki {
         Arc::new(config)
     }
 
+    /// A sink's server configuration (ADR 0026): its URI, no name the node
+    /// dials, and the node's certificate required.
+    fn sink_config(&self) -> Arc<rustls::ServerConfig> {
+        let key = key();
+        let mut params = CertificateParams::new(vec!["sink.feos.test".to_string()]).unwrap();
+        params.subject_alt_names.push(SanType::URI(
+            format!("spiffe://{TRUST_DOMAIN}/sink/sink-0")
+                .try_into()
+                .unwrap(),
+        ));
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = params.signed_by(&key, &self.issuer).unwrap().der().clone();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = RootCertStore::empty();
+        roots.add(self.root.clone()).unwrap();
+        let clients =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                .build()
+                .unwrap();
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(clients)
+            .with_single_cert(
+                vec![leaf, self.issuer_cert.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        Arc::new(config)
+    }
+
     /// A node's certificate for the key of `csr`.
     fn issue(&self, csr: &[u8], name: &str, renew_after: SystemTime) -> Certificate {
         let mut csr = CertificateSigningRequestParams::from_der(&csr.to_vec().into()).unwrap();
@@ -180,6 +221,8 @@ struct Seen {
     node_connections: usize,
     /// The channels of the node connections, for the test's calls.
     channels: Vec<tonic::transport::Channel>,
+    /// The sink the control plane names.
+    sink_endpoint: String,
 }
 
 struct ControlPlane {
@@ -310,10 +353,11 @@ impl FleetService for ControlPlane {
         seen.reports.push((peer, request.into_inner()));
         seen.reported_at.push(std::time::Instant::now());
         drop(seen);
+        let sink_endpoint = self.seen.lock().unwrap().sink_endpoint.clone();
         Ok(Response::new(TelemetryResponse {
             interval_seconds: 1,
             instances: self.instances(),
-            sink_endpoint: String::new(),
+            sink_endpoint,
         }))
     }
 
@@ -1050,4 +1094,360 @@ async fn a_stop_without_calls_ends_at_once() {
         "the stop took {:?}",
         started.elapsed()
     );
+}
+
+/// What the test's sink saw (ADR 0026).
+#[derive(Default)]
+struct SinkSeen {
+    /// Where it is with each stream, (pod, container, log ID).
+    positions: std::collections::HashMap<(String, String, String), u64>,
+    /// Each export, with the certificate it came with.
+    exports: Vec<(Vec<u8>, ExportLogsServiceRequest)>,
+    ended: Vec<StreamKey>,
+    /// Exports to refuse, UNAVAILABLE, before it takes one.
+    refuse: usize,
+}
+
+#[derive(Clone)]
+struct Sink(Arc<Mutex<SinkSeen>>);
+
+fn peer_of<T>(request: &Request<T>) -> Result<Vec<u8>, Status> {
+    request
+        .extensions()
+        .get::<Peer>()
+        .and_then(|peer| peer.0.clone())
+        .ok_or_else(|| Status::unauthenticated("no client certificate"))
+}
+
+#[tonic::async_trait]
+impl SinkService for Sink {
+    async fn positions(
+        &self,
+        request: Request<PositionsRequest>,
+    ) -> Result<Response<PositionsResponse>, Status> {
+        peer_of(&request)?;
+        let seen = self.0.lock().unwrap();
+        let next_offsets = request
+            .into_inner()
+            .streams
+            .into_iter()
+            .map(|key| {
+                let key = (key.pod, key.container, key.log_id);
+                seen.positions.get(&key).copied().unwrap_or(0)
+            })
+            .collect();
+        Ok(Response::new(PositionsResponse { next_offsets }))
+    }
+
+    async fn end_streams(
+        &self,
+        request: Request<EndStreamsRequest>,
+    ) -> Result<Response<EndStreamsResponse>, Status> {
+        peer_of(&request)?;
+        let mut seen = self.0.lock().unwrap();
+        seen.ended.extend(request.into_inner().streams);
+        Ok(Response::new(EndStreamsResponse {}))
+    }
+}
+
+/// OTLP's LogsService of the test's sink, by hand: feos-proto generates
+/// its client only.
+#[derive(Clone)]
+struct Otlp(Sink);
+
+impl tonic::server::NamedService for Otlp {
+    const NAME: &'static str = "opentelemetry.proto.collector.logs.v1.LogsService";
+}
+
+impl tonic::server::UnaryService<ExportLogsServiceRequest> for Otlp {
+    type Response = ExportLogsServiceResponse;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Response<Self::Response>, Status>> + Send>>;
+
+    fn call(&mut self, request: Request<ExportLogsServiceRequest>) -> Self::Future {
+        let sink = self.0.clone();
+        Box::pin(async move {
+            let peer = peer_of(&request)?;
+            let mut seen = sink.0.lock().unwrap();
+            if seen.refuse > 0 {
+                seen.refuse -= 1;
+                return Err(Status::unavailable("the sink's database is away"));
+            }
+            seen.exports.push((peer, request.into_inner()));
+            Ok(Response::new(ExportLogsServiceResponse::default()))
+        })
+    }
+}
+
+impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for Otlp {
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+        let otlp = self.clone();
+        Box::pin(async move {
+            if request.uri().path() != "/opentelemetry.proto.collector.logs.v1.LogsService/Export" {
+                return Ok(Status::unimplemented("").into_http());
+            }
+            let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+            Ok(grpc.unary(otlp, request).await)
+        })
+    }
+}
+
+/// The test's sink, on a port of its own; returns its address.
+async fn sink(pki: &Pki, seen: Arc<Mutex<SinkSeen>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let sink = Sink(seen);
+    let (connections, incoming) = mpsc::channel::<Result<Uplink, std::io::Error>>(16);
+    tokio::spawn(
+        Server::builder()
+            .add_service(SinkServiceServer::new(sink.clone()))
+            .add_service(Otlp(sink))
+            .serve_with_incoming(ReceiverStream::new(incoming)),
+    );
+    let acceptor = TlsAcceptor::from(pki.sink_config());
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(tcp).await {
+                    connections.send(Ok(Uplink(tls))).await.ok();
+                }
+            });
+        }
+    });
+    address
+}
+
+/// A guest's log of one container, in memory, that grows as the test says.
+#[derive(Clone, Default)]
+struct GuestLog {
+    entries: Arc<Mutex<Vec<LogEntry>>>,
+    grown: Arc<tokio::sync::Notify>,
+}
+
+impl GuestLog {
+    fn append(&self, text: &str) {
+        let mut entries = self.entries.lock().unwrap();
+        let offset = entries.last().map_or(0, |e| e.next_offset);
+        entries.push(LogEntry {
+            line: text.as_bytes().to_vec(),
+            source: Source::Stdout as i32,
+            offset,
+            next_offset: offset + 41 + text.len() as u64,
+            time_unix_nano: 1_000 + offset as i64,
+            partial: false,
+            log_id: "log-1".into(),
+        });
+        self.grown.notify_waiters();
+    }
+}
+
+struct Pods(GuestLog);
+
+impl Logs for Pods {
+    fn pods(&self) -> Vec<ShippedPod> {
+        vec![ShippedPod {
+            id: POD.into(),
+            labels: [("ferun.tenant".to_string(), "acme".to_string())].into(),
+            redact: vec!["hunter2".into()],
+            containers: vec!["main".into()],
+        }]
+    }
+
+    async fn logs(
+        &self,
+        pod_id: &str,
+        request: StreamContainerLogsRequest,
+    ) -> Result<LogStream, Status> {
+        assert_eq!((pod_id, request.container_id.as_str()), (POD, "main"));
+        let log = self.0.clone();
+        if !request.follow {
+            // The probe: the last entry.
+            let last = log.entries.lock().unwrap().last().cloned();
+            assert_eq!(request.tail_lines, 1);
+            return Ok(Box::pin(tokio_stream::iter(last.map(Ok))));
+        }
+        assert_eq!(request.log_id, "log-1");
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut from = request.from_offset;
+            loop {
+                let grown = log.grown.notified();
+                let next: Vec<LogEntry> = log
+                    .entries
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.offset >= from)
+                    .cloned()
+                    .collect();
+                for entry in next {
+                    from = entry.next_offset;
+                    if tx.send(Ok(entry)).await.is_err() {
+                        return;
+                    }
+                }
+                tokio::select! {
+                    () = grown => {}
+                    () = tx.closed() => return,
+                }
+            }
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+}
+
+/// The offsets of the records the sink took, and the resource of the last.
+fn exported(seen: &SinkSeen) -> Vec<i64> {
+    seen.exports
+        .iter()
+        .flat_map(|(_, request)| &request.resource_logs)
+        .flat_map(|logs| &logs.scope_logs)
+        .flat_map(|scope| &scope.log_records)
+        .filter_map(|record| {
+            record.attributes.iter().find_map(|kv| match &kv.value {
+                Some(AnyValue {
+                    value: Some(any_value::Value::IntValue(offset)),
+                }) if kv.key == "log.offset" => Some(*offset),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+async fn wait_for_sink(seen: &Mutex<SinkSeen>, what: &str, done: impl Fn(&SinkSeen) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done(&seen.lock().unwrap()) {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_node_ships_its_pods_logs_to_the_sink_it_is_told_of() {
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let sink_seen = Arc::new(Mutex::new(SinkSeen::default()));
+    let sink_address = sink(&pki, sink_seen.clone()).await;
+    let (token, address) = control_plane(pki, seen.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    let fleet = node(&address, dir.path());
+    let log = GuestLog::default();
+    for text in ["first", "second", "third hunter2"] {
+        log.append(text);
+    }
+    let shipper = Shipper::start(Pods(log.clone()), fleet.sink());
+
+    // Without a sink, nothing is shipped.
+    wait_for(&seen, "a report", |seen| seen.reports.len() >= 2).await;
+    assert!(fleet.sink().borrow().is_none());
+    assert!(sink_seen.lock().unwrap().exports.is_empty());
+
+    // The sink has the first line already; it refuses the first export.
+    let second = log.entries.lock().unwrap()[1].offset;
+    {
+        let mut sink = sink_seen.lock().unwrap();
+        let key = (POD.to_string(), "main".to_string(), "log-1".to_string());
+        sink.positions.insert(key, second);
+        sink.refuse = 1;
+    }
+    seen.lock().unwrap().sink_endpoint = sink_address.clone();
+    wait_for_sink(&sink_seen, "the export", |seen| !seen.exports.is_empty()).await;
+    let third = log.entries.lock().unwrap()[2].offset;
+    {
+        let sink = sink_seen.lock().unwrap();
+        assert_eq!(sink.refuse, 0, "the refused export is sent again");
+        assert_eq!(exported(&sink), [second as i64, third as i64]);
+        let (cert, request) = &sink.exports[0];
+        assert_eq!(
+            uri_of(cert),
+            [format!("spiffe://{TRUST_DOMAIN}/node/{NODE}")]
+        );
+        assert_eq!(request.resource_logs.len(), 1);
+        let resource = request.resource_logs[0].resource.as_ref().unwrap();
+        let attributes: Vec<(String, String)> = resource
+            .attributes
+            .iter()
+            .map(|kv| match &kv.value {
+                Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(value)),
+                }) => (kv.key.clone(), value.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let want: Vec<(String, String)> = [
+            ("ferun.container", "main"),
+            ("ferun.log_id", "log-1"),
+            ("ferun.node", NODE),
+            ("ferun.pod", POD),
+            ("ferun.tenant", "acme"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(attributes, want);
+        let record = &request.resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(record.time_unix_nano, 1_000 + second);
+        assert!(record.observed_time_unix_nano > 0);
+        assert_eq!(
+            record.body,
+            Some(AnyValue {
+                value: Some(any_value::Value::StringValue("second".into())),
+            })
+        );
+        // A secret goes redacted.
+        let record = &request.resource_logs[0].scope_logs[0].log_records[1];
+        assert_eq!(
+            record.body,
+            Some(AnyValue {
+                value: Some(any_value::Value::StringValue("third [redacted]".into())),
+            })
+        );
+    }
+
+    // A drain sends what the container wrote since, before it returns.
+    log.append("fourth");
+    let fourth = log.entries.lock().unwrap()[3].offset;
+    tokio::time::timeout(Duration::from_secs(5), shipper.drain(POD))
+        .await
+        .expect("the drain did not end");
+    assert_eq!(
+        exported(&sink_seen.lock().unwrap()),
+        [second as i64, third as i64, fourth as i64]
+    );
+
+    // A deleted pod's streams end.
+    shipper.deleted(POD);
+    wait_for_sink(&sink_seen, "the end of the stream", |seen| {
+        !seen.ended.is_empty()
+    })
+    .await;
+    assert_eq!(
+        sink_seen.lock().unwrap().ended,
+        [StreamKey {
+            pod: POD.into(),
+            container: "main".into(),
+            log_id: "log-1".into(),
+        }]
+    );
+
+    // Without a sink again, the node lets go of it.
+    seen.lock().unwrap().sink_endpoint.clear();
+    let mut sink = fleet.sink();
+    tokio::time::timeout(Duration::from_secs(10), sink.wait_for(|t| t.is_none()))
+        .await
+        .expect("the sink stays")
+        .unwrap();
 }

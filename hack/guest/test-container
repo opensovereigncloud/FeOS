@@ -261,8 +261,10 @@ wait_exit() {
   done
   fail "container $1 did not exit with $2: $(ctl container info "$1")"
 }
+# stdout and stderr go through pipes of their own (ADR 0026): the pauses
+# order their lines in the log.
 ctl container create --image-ref "${IMAGE}" --id exits \
-  -- sh -c 'echo one; echo two >&2; printf "three\nfour"; exit 7' >/dev/null
+  -- sh -c 'echo one; sleep 0.2; echo two >&2; sleep 0.2; printf "three\nfour"; exit 7' >/dev/null
 ctl container start exits >/dev/null
 wait_exit exits 7
 grep -q "State: Stopped" <<<"$(ctl container info exits)" || fail "exited, not stopped"

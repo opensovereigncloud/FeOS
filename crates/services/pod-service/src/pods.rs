@@ -44,7 +44,8 @@ use crate::volumes::{self, Volumes};
 use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, ContainerConfig,
     ContainerState as GuestContainerState, CreateContainerRequest, GetContainerRequest,
-    ListContainersRequest, StartContainerRequest, VolumeMount as GuestVolumeMount,
+    ListContainersRequest, LogEntry, StartContainerRequest, StreamContainerLogsRequest,
+    VolumeMount as GuestVolumeMount,
 };
 use feos_proto::disk_service::{Head, MemoryRef};
 use feos_proto::guest_service::{
@@ -82,7 +83,7 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, watch, OwnedMutexGuard};
@@ -108,9 +109,26 @@ const MOUNT_TIMEOUT: Duration = Duration::from_secs(300);
 /// their groups: the node's own addresses, which no pod reaches, may have
 /// changed.
 const REFRESH: Duration = Duration::from_secs(60);
+/// How long a pod's logs may take to be sent before it is suspended,
+/// hibernates or is deleted (ADR 0026).
+pub const LOG_DRAIN: Duration = Duration::from_secs(5);
 /// How many request ids a hibernation keeps of the calls that started or
 /// joined it, and a pod of its abandoned hibernations: the last ones.
 const REQUEST_IDS: usize = 16;
+
+/// What a create brings beside the pod's spec, which is not compared with
+/// it: a create delivered twice with others is the same create.
+#[derive(Clone, Debug, Default)]
+pub struct Beside {
+    /// The baked layers of its image that the caller knows (ADR 0025).
+    pub image_layers: Option<ImageLayers>,
+    /// The token of its image's registry, for its bring-up; empty: none.
+    pub pull_token: String,
+    /// The labels of its containers' logs (ADR 0026).
+    pub log_labels: HashMap<String, String>,
+    /// The values its shipped log lines are redacted of: secrets.
+    pub log_redact: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct Pods {
@@ -136,7 +154,14 @@ struct Inner {
     /// and kept on the blocking pool, off the pods' lock, one pod at a
     /// time.
     records: tokio::sync::Mutex<()>,
+    /// What sends a pod's logs before it pauses (ADR 0026).
+    log_drain: OnceLock<LogDrain>,
 }
+
+/// Sends what the containers of a running pod wrote to its logs, before
+/// the pod is suspended, hibernates or is deleted (ADR 0026): feosd's log
+/// shipper. It is given [`LOG_DRAIN`] at most.
+pub type LogDrain = Arc<dyn Fn(String) -> BoxFuture<'static, ()> + Send + Sync>;
 
 struct Pod {
     info: PodInfo,
@@ -182,9 +207,10 @@ impl Pod {
         })
     }
 
-    /// Its record, with its hibernation in flight, which is never kept.
+    /// Its record, with its hibernation in flight, which is never kept,
+    /// and without the values its logs are redacted of.
     fn shown(&self) -> PodInfo {
-        let mut info = self.info.clone();
+        let mut info = shown(self.info.clone());
         info.hibernation = self.hibernation.as_ref().map(Hibernation::shown);
         info
     }
@@ -324,6 +350,7 @@ impl Pods {
                 stopping: AtomicBool::new(false),
                 stop_record: tokio::sync::Mutex::new(()),
                 records: tokio::sync::Mutex::new(()),
+                log_drain: OnceLock::new(),
             }),
         };
         let mut pending = Vec::new();
@@ -390,29 +417,31 @@ impl Pods {
 
     /// Creates the pod and brings it up, in a task of its own (`detached`).
     /// Creates a pod, with what its caller knows of baked layers of its
-    /// image (ADR 0025): kept for its bring-up, and not compared when the
-    /// pod is there already.
+    /// image (ADR 0025): kept for its bring-up, and its logs' labels (ADR
+    /// 0026): kept in its record. Neither is compared when the pod is there
+    /// already.
     pub async fn create(
         &self,
         pod_id: String,
         spec: PodSpec,
-        image_layers: Option<ImageLayers>,
-        pull_token: String,
+        beside: Beside,
     ) -> Result<PodInfo, Status> {
-        self.detached(move |pods| async move {
-            pods.create_detached(pod_id, spec, image_layers, pull_token)
-                .await
-        })
-        .await
+        self.detached(move |pods| async move { pods.create_detached(pod_id, spec, beside).await })
+            .await
     }
 
     async fn create_detached(
         &self,
         pod_id: String,
         spec: PodSpec,
-        image_layers: Option<ImageLayers>,
-        pull_token: String,
+        beside: Beside,
     ) -> Result<PodInfo, Status> {
+        let Beside {
+            image_layers,
+            pull_token,
+            log_labels,
+            log_redact,
+        } = beside;
         spec::check_id(&pod_id)?;
         let spec = spec::normalize(spec)?;
         self.inner.network.check(&spec)?;
@@ -429,6 +458,8 @@ impl Pods {
             spec: Some(spec.clone()),
             state: PodState::Pending as i32,
             image_layers,
+            log_labels,
+            log_redact,
             ..Default::default()
         };
         let recorded = match self.add(info, spec::has_network(&spec)).await {
@@ -462,7 +493,7 @@ impl Pods {
         }
         self.announce(&info, false);
         self.spawn_bring_up(&pod_id);
-        Ok(info)
+        Ok(shown(info))
     }
 
     /// Adds the pod `info`, unless one with its ID is there, which comes
@@ -646,6 +677,9 @@ impl Pods {
 
     async fn delete_detached(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
+        if self.info(pod_id)?.state() == PodState::Running {
+            self.drain_logs(pod_id).await;
+        }
         self.delete_vm(pod_id).await?;
         // A pod whose disk cannot go stays, to be deleted again: diskd
         // would keep what it wrote for ever.
@@ -708,6 +742,7 @@ impl Pods {
         tokio::spawn(async move {
             let _lock = pods.lock(&pod_id).await?;
             pods.expect_state(&pod_id, PodState::Running)?;
+            pods.drain_logs(&pod_id).await;
             pods.suspend_locked(&pod_id).await
         })
         .await
@@ -908,6 +943,7 @@ impl Pods {
             self.set_phase(run, HibernationPhase::Suspending);
             self.set_state(pod_id, PodState::Running, "hibernating")
                 .await;
+            self.drain_logs(pod_id).await;
             if let Err(e) = self.suspend_locked(pod_id).await {
                 if self.info(pod_id)?.state() == PodState::Running {
                     self.set_state(pod_id, PodState::Running, "").await;
@@ -1820,6 +1856,53 @@ impl Pods {
     /// client reach through the pods.
     pub fn network(&self) -> &Network {
         &self.inner.network
+    }
+
+    /// Sets what sends a pod's logs before it pauses (ADR 0026); once.
+    pub fn set_log_drain(&self, drain: LogDrain) {
+        if self.inner.log_drain.set(drain).is_err() {
+            warn!("Pods: The pods' logs are drained already");
+        }
+    }
+
+    /// Sends what the pod's containers wrote to their logs, for
+    /// [`LOG_DRAIN`] at most.
+    async fn drain_logs(&self, pod_id: &str) {
+        let Some(drain) = self.inner.log_drain.get() else {
+            return;
+        };
+        if timeout(LOG_DRAIN, drain(pod_id.to_string())).await.is_err() {
+            warn!(
+                "Pods: {pod_id}'s logs were not sent within {}s; it goes on",
+                LOG_DRAIN.as_secs()
+            );
+        }
+    }
+
+    /// The log of a container in the pod's guest, as its StreamContainerLogs
+    /// answers it: for feosd's log shipper (ADR 0026).
+    pub async fn container_logs(
+        &self,
+        pod_id: &str,
+        request: StreamContainerLogsRequest,
+    ) -> Result<tonic::Streaming<LogEntry>, Status> {
+        self.check_reachable(pod_id)?;
+        let mut guest = ContainerServiceClient::new(self.guest_channel(pod_id).await?);
+        Ok(guest.stream_container_logs(request).await?.into_inner())
+    }
+
+    /// The running pods whose logs are shipped, those with log labels, as
+    /// they are kept: with the values their lines are redacted of (ADR
+    /// 0026). For feosd's log shipper alone.
+    pub fn shipping_logs(&self) -> Vec<PodInfo> {
+        let mut pods: Vec<PodInfo> = self
+            .pods()
+            .values()
+            .filter(|pod| pod.info.state() == PodState::Running && !pod.info.log_labels.is_empty())
+            .map(|pod| pod.info.clone())
+            .collect();
+        pods.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
+        pods
     }
 
     pub fn list(&self) -> Vec<PodInfo> {
@@ -3023,9 +3106,16 @@ fn stale(vm: &VmInfo, wanted: &VmConfig) -> bool {
 }
 
 /// A create of a pod that exists finds it if the spec is the same.
+/// A pod's record as the API answers it: without the values its logs are
+/// redacted of, which are secrets.
+fn shown(mut info: PodInfo) -> PodInfo {
+    info.log_redact.clear();
+    info
+}
+
 fn same_spec(existing: PodInfo, spec: &PodSpec) -> Result<PodInfo, Status> {
     if existing.spec.as_ref() == Some(spec) {
-        Ok(existing)
+        Ok(shown(existing))
     } else {
         Err(Status::already_exists(format!(
             "pod {} exists with another spec",
@@ -3656,6 +3746,7 @@ mod tests {
                 stopping: AtomicBool::new(false),
                 stop_record: tokio::sync::Mutex::new(()),
                 records: tokio::sync::Mutex::new(()),
+                log_drain: OnceLock::new(),
             }),
         }
     }
@@ -3747,10 +3838,7 @@ mod tests {
         };
         let create = tokio::spawn({
             let pods = pods.clone();
-            async move {
-                pods.create(POD.to_string(), spec, None, String::new())
-                    .await
-            }
+            async move { pods.create(POD.to_string(), spec, Beside::default()).await }
         });
         sleep(Duration::from_millis(200)).await;
         assert!(pods.info(POD).is_err(), "added before it is kept");
@@ -3762,6 +3850,61 @@ mod tests {
             "the pod is {:?} and has no bring-up",
             pods.info(POD).map(|info| info.state())
         );
+    }
+
+    /// A create's log labels are kept in the pod's record, across a
+    /// restart of feosd, and a create delivered again with others is the
+    /// same create.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pods_log_labels_are_kept_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pods = bare_pods(dir.path());
+        let spec = PodSpec {
+            containers: vec![ContainerSpec {
+                name: "main".to_string(),
+                image_ref: "test".to_string(),
+                ..Default::default()
+            }],
+            network: Some(feos_proto::pod_service::PodNetwork {
+                none: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let labels = |tenant: &str| -> HashMap<String, String> {
+            [("ferun.tenant", tenant), ("ferun.instance", "i-1")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let beside = |tenant: &str| Beside {
+            log_labels: labels(tenant),
+            log_redact: vec![format!("{tenant}-secret")],
+            ..Default::default()
+        };
+        let created = pods
+            .create(POD.to_string(), spec.clone(), beside("acme"))
+            .await
+            .unwrap();
+        assert_eq!(created.log_labels, labels("acme"));
+        // The secrets are kept, and in no answer.
+        assert!(created.log_redact.is_empty());
+        let again = pods
+            .create(POD.to_string(), spec, beside("other"))
+            .await
+            .unwrap();
+        assert_eq!(again.log_labels, labels("acme"));
+        assert!(again.log_redact.is_empty());
+        assert!(pods.list()[0].log_redact.is_empty());
+        assert!(pods.get(POD).await.unwrap().log_redact.is_empty());
+        assert_eq!(pods.info(POD).unwrap().log_redact, ["acme-secret"]);
+        let kept = Store::open(dir.path().join("pods"))
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].log_labels, labels("acme"));
+        assert_eq!(kept[0].log_redact, ["acme-secret"]);
     }
 
     /// A delete takes the pod out and removes its record in one go: a save

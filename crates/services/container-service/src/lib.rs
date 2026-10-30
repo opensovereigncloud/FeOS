@@ -14,9 +14,11 @@ use tokio::sync::{mpsc, oneshot};
 use tonic::{Status, Streaming};
 
 pub mod api;
+pub mod cri;
 pub mod dispatcher;
 pub mod error;
 pub mod logs;
+pub mod output;
 pub mod persistence;
 pub mod runtime;
 pub mod worker;

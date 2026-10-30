@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! feosd and the control plane (ADR 0015): what the node reports of its
-//! pods, diskd and installed versions, and its pods' events.
+//! pods, diskd and installed versions, and its pods' events; and its pods'
+//! logs, which go to the sink the control plane names (ADR 0026).
 
+use feos_proto::container_service::StreamContainerLogsRequest;
 use feos_proto::pod_service::PodInfo;
-use fleet_client::{Diskd, Fleet, Incoming, Installed, Inventory};
+use fleet_client::{
+    Diskd, Fleet, Incoming, Installed, Inventory, LogStream, Logs, ShippedPod, Shipper,
+};
 use log::warn;
 use microvm_service::vmm::installed;
 use pod_service::Pods;
+use std::sync::Arc;
 use tokio::runtime::Handle;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -61,6 +66,61 @@ impl Inventory for Node {
     }
 }
 
+/// The pods' logs, as the shipper reads them.
+struct PodLogs(Pods);
+
+impl Logs for PodLogs {
+    fn pods(&self) -> Vec<ShippedPod> {
+        self.0
+            .shipping_logs()
+            .into_iter()
+            .map(|pod| ShippedPod {
+                containers: pod
+                    .spec
+                    .map(|spec| spec.containers.into_iter().map(|c| c.name).collect())
+                    .unwrap_or_default(),
+                id: pod.pod_id,
+                labels: pod.log_labels,
+                redact: pod.log_redact,
+            })
+            .collect()
+    }
+
+    async fn logs(
+        &self,
+        pod_id: &str,
+        request: StreamContainerLogsRequest,
+    ) -> Result<LogStream, tonic::Status> {
+        Ok(Box::pin(self.0.container_logs(pod_id, request).await?))
+    }
+}
+
+/// Ships the pods' logs to the sink the control plane names, and drains
+/// a pod's before it pauses, hibernates or is deleted.
+fn ship_logs(fleet: &Fleet, pods: &Pods) {
+    let shipper = Shipper::start(PodLogs(pods.clone()), fleet.sink());
+    let drain = shipper.clone();
+    pods.set_log_drain(Arc::new(move |pod_id| {
+        let shipper = drain.clone();
+        Box::pin(async move { shipper.drain(&pod_id).await })
+    }));
+    let mut events = pods.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event.deleted {
+                        shipper.deleted(&event.pod_id);
+                    }
+                    shipper.changed();
+                }
+                Err(RecvError::Lagged(_)) => shipper.changed(),
+                Err(RecvError::Closed) => return,
+            }
+        }
+    });
+}
+
 /// Starts the node's side of the control plane, with the pods' events. It
 /// runs on threads of its own; what it asks of the node runs on this
 /// runtime. `calls` are those of the node connections' server.
@@ -71,10 +131,11 @@ pub(crate) fn start(
 ) -> Result<(Fleet, Incoming), String> {
     let mut events = pods.subscribe();
     let node = Node {
-        pods,
+        pods: pods.clone(),
         runtime: Handle::current(),
     };
     let (fleet, incoming) = fleet_client::start(config, node, calls)?;
+    ship_logs(&fleet, &pods);
     let sink = fleet.events().clone();
     tokio::spawn(async move {
         loop {

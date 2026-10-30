@@ -26,13 +26,20 @@ writes each line to `logs/container.log` in the CRI log format:
 ```
 
 The time is when the guest read the line, UTC, nanoseconds; `F` a full
-line, `P` a part of a line over 64 KiB that the next entry goes on with.
-A log file gets an ID when the guest makes it (`log_id`), so that offsets
-of a log made anew start again under a new ID. `StreamContainerLogs`
-answers the text without the prefix, with `offset`, `next_offset`,
-`time_unix_nano`, `source`, `partial` and `log_id`; with `follow` and
-`from_offset` it starts there. Lines of a log written before (no prefix)
-are answered as they are, without a time.
+line, `P` a part that the next entry of its stream goes on with: the
+first 64 KiB of a longer line, or what came of a line that stayed
+unfinished for a second. A part and the rest of its line are two entries,
+the rest possibly empty. A log file gets an ID when the guest makes it
+(`log_id`, 32 lowercase hex digits, kept beside it in
+`container.log.id`), so that offsets of a log made anew start again under
+a new ID; the ID stays with the file across the guest's restarts,
+upgrades, reboots (an adopted container keeps its log) and suspends.
+`StreamContainerLogs` answers the text without the prefix, with
+`offset`, `next_offset`, `time_unix_nano`, `source`, `partial` and
+`log_id`; with `follow` and `from_offset` it starts there. Lines of a log
+written before (no prefix) are answered as they are, without a time.
+docs/architecture/guest.md says how the guest reads the containers'
+output.
 
 ## The node
 
@@ -42,23 +49,45 @@ are answered as they are, without a time.
 (`sink_endpoint`, `--sink-endpoint`); empty: nothing is shipped.
 
 For every running pod with labels and every container of it, `feosd`
-asks the sink where the stream is (`SinkService/Positions`), follows the
-container's log from there and exports batches over OTLP
-(`LogsService/Export`): at most 1 MiB or 1,000 lines a batch, sent once
-full or after 500 ms. A batch is kept until the sink answers; on an
-error it is sent again after a backoff (1 s to 30 s), to whichever
-address the endpoint resolves to. Before a pod pauses, hibernates or is
-deleted, `feosd` sends what its containers wrote, for at most 5 s; after
-a delete it calls `SinkService/EndStreams` for its streams.
+learns the log's ID from its last entry, asks the sink where the stream
+is (`SinkService/Positions`), follows the container's log from there and
+exports batches over OTLP (`LogsService/Export`): at most 1 MiB or 1,000
+lines a batch, sent once full or after 500 ms. An empty log is followed
+from its start, and its first entry names its ID; if the sink has that
+stream further on, the node starts again from there. A batch is kept
+until the sink answers; on an error it is sent again after a backoff (1 s
+to 30 s), to whichever address the endpoint resolves to, and the stream
+reads nothing meanwhile: the guest's log is the buffer, and the node
+holds a batch and a few entries a stream. `RESOURCE_EXHAUSTED` drops the
+batch, counted as the limit's drops are. Before a pod is suspended,
+hibernates or is deleted, `feosd` sends what its containers wrote: each
+stream that follows its log reads until the log was quiet for 400 ms and
+the sink took what it read, for at most 5 s in all; a stream that does
+not follow now (no sink, a backoff) is not waited for. A stop of `feosd`
+that suspends its pods does not drain them: the next `feosd` goes on
+from the sink's positions. After a delete it calls
+`SinkService/EndStreams` for the streams whose log it knew, asked again
+until the sink answers. A guest of before ADR 0026 (entries without
+`log_id`) is not shipped.
+
+**Redaction**: `CreatePodRequest.log_redact` names values (the pod's
+secrets) that `feosd` replaces in every line's text with `[redacted]`,
+the longest first, before the line counts against the limit and is
+sent. They are kept in the pod's record (`PodInfo.log_redact`, empty in
+every answer of the API), and never sent or logged. A value cut across
+two parts of a line is not found.
 
 **Limit**: 1 MiB/s per stream with a burst of 8 MiB (a token bucket on
 bytes). Lines beyond it are dropped; once the bucket allows, the node
 sends a record of its own, `[ferun] dropped N lines (B bytes)`, source
 `stderr`, at the offset of the first line it dropped.
 
-**TLS**: the node presents its node certificate
+**TLS**: TLS 1.3, ALPN `h2`. The node presents its node certificate
 (`spiffe://<td>/node/<name>`) and accepts a server certificate of the
-platform's CA whose one URI is `spiffe://<td>/sink/<name>`.
+platform's CA (its trust bundle) for server authentication, without an
+IP address, whose one URI is `spiffe://<td>/sink/<name>` (a DNS label);
+the name the node dials is not checked, so the endpoint may be an
+address.
 
 ### The OTLP shape
 
@@ -84,10 +113,12 @@ old line: the sink uses `observed_time_unix_nano`, when the node read
 it), `body` the text as a string (invalid UTF-8 replaced), attributes
 `log.offset` (int), `log.next_offset` (int, the entry's `next_offset`:
 the offset just past the line), `log.iostream` (`stdout`, `stderr`, or
-none), and `log.partial` (bool, only when true). `Positions` answers the
-greatest `log.next_offset` stored; from a node that sends none, the
-offset of the last line stored, which the node then sends again and the
-sink stores once.
+none), and `log.partial` (bool, only when true). The node's record of
+dropped lines has `log.offset` of the first line it dropped and
+`log.next_offset` past the last. `Positions` answers the greatest
+`log.next_offset` stored; from a node that sends none, the offset of the
+last line stored, which the node then sends again and the sink stores
+once.
 
 ## The sink
 
