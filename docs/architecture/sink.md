@@ -286,6 +286,14 @@ Deletes the streams, their lines and chunks. 204.
   tenant secrets (latest versions and those its releases pin) and those
   its template names; a tenant's job's: its secrets and image
   credentials. A failure to compute them fails the create, so that no
-  pod ships unredacted lines. `ferund` redacts a running tenant job's
+  pod ships unredacted lines. Every restore sends the row's labels and
+  the redactions, asked anew, as well (`RestorePodRequest`), with the
+  same failure, so that a hibernated pod restored on another node goes on
+  shipping.
+- **Parts**: where `ferund` answers lines of a tail, from the node or the
+  sink, a partial entry is joined with the next entries of its source up
+  to one that is not partial, the line cut to its budget (8 KiB in an
+  answer); a line still open at the end goes in as far as it came. From
+  the sink it pages back until `lines` + 1 lines have ended. `ferund` redacts a running tenant job's
   sink lines again; an ended job's (its secrets are gone) are the node's
   redaction alone.

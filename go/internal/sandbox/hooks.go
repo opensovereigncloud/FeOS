@@ -193,6 +193,9 @@ func (e *prepareError) Error() string {
 	if e.hook {
 		return fmt.Sprintf("prepare node %s for %s: %v", e.node, e.kind, e.err)
 	}
+	if e.kind == OpRestore {
+		return fmt.Sprintf("prepare the restore: %v", e.err)
+	}
 	return fmt.Sprintf("build the pod spec for %s: %v", e.kind, e.err)
 }
 
@@ -213,8 +216,15 @@ func prepares(k OpKind) bool {
 // connection before the hook, so that a node that is not connected is a
 // rollback without a cause and never the hook's failure.
 
-// prepareSpec builds a create's pod spec.
+// prepareSpec builds a create's pod spec, and the log's redactions of a
+// create and a restore.
 func (e *Engine) prepareSpec(ctx context.Context, h *OpHandle) error {
+	if h.kind == OpRestore {
+		if err := e.prepareRedact(ctx, h); err != nil {
+			return &prepareError{node: h.target, kind: h.kind, err: err}
+		}
+		return nil
+	}
 	if h.kind != OpCreate {
 		return nil
 	}
@@ -223,12 +233,8 @@ func (e *Engine) prepareSpec(ctx context.Context, h *OpHandle) error {
 		return &prepareError{node: h.target, kind: h.kind, err: err}
 	}
 	h.spec = spec
-	// The values its node redacts of the lines it ships: asked anew at
-	// every create, as the spec's secrets are.
-	if r := e.logRedactor(); r != nil && len(h.row.LogLabels) > 0 {
-		if h.logRedact, err = r(ctx, h.row); err != nil {
-			return &prepareError{node: h.target, kind: h.kind, err: fmt.Errorf("the log's redactions: %w", err)}
-		}
+	if err := e.prepareRedact(ctx, h); err != nil {
+		return &prepareError{node: h.target, kind: h.kind, err: err}
 	}
 	h.layers = e.imageLayers(ctx, h.row.ImageRef)
 	// The guest's pull token, for a sandbox with image credentials: asked
@@ -239,6 +245,22 @@ func (e *Engine) prepareSpec(ctx context.Context, h *OpHandle) error {
 	}
 	if h.pullToken, err = e.imagePullToken()(ctx, h.row.ImageRef, auth); err != nil {
 		return &prepareError{node: h.target, kind: h.kind, err: fmt.Errorf("the image's pull token: %w", err)}
+	}
+	return nil
+}
+
+// prepareRedact asks for the values the node redacts of the lines it
+// ships of a row with log labels (ADR 0026), anew at every create and
+// restore, as the spec's secrets are.
+func (e *Engine) prepareRedact(ctx context.Context, h *OpHandle) error {
+	h.logRedact = nil
+	r := e.logRedactor()
+	if r == nil || len(h.row.LogLabels) == 0 {
+		return nil
+	}
+	var err error
+	if h.logRedact, err = r(ctx, h.row); err != nil {
+		return fmt.Errorf("the log's redactions: %w", err)
 	}
 	return nil
 }

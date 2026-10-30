@@ -38,41 +38,54 @@ func (c *Controller) sinkLog(ctx context.Context, key, value string, since time.
 	if !since.IsZero() {
 		q.Set("since", since.UTC().Format(time.RFC3339Nano))
 	}
-	var pages [][]string
-	got, bytes := 0, 0
-	for got < lines && bytes <= answerLog.total {
-		q.Set("limit", strconv.Itoa(min(lines-got, sinkPage)))
+	// Pages back until lines+1 lines have ended there (a line's parts
+	// may begin on an older page; the oldest line, which may lack its
+	// start, is dropped by the tail), the first sized to that.
+	var pages [][]sinkLine
+	ended, bytes, limit := 0, 0, min(lines+1, sinkPage)
+	for ended <= lines && bytes <= answerLog.total {
+		q.Set("limit", strconv.Itoa(limit))
+		limit = sinkPage
 		page, cursor, err := c.sinkPage(ctx, t.Token, q)
 		if err != nil {
 			c.rl.warn("sink-logs", "cannot read a log from the sink; reading the node", key, value, "err", err)
 			return nil, false
 		}
-		for i, l := range page {
-			page[i] = answerLog.cut(l)
-			bytes += len(page[i])
+		for _, l := range page {
+			bytes += min(len(l.Text), answerLog.line)
+			if !l.Partial {
+				ended++
+			}
 		}
 		pages = append(pages, page)
-		got += len(page)
 		if cursor == "" || len(page) == 0 {
 			break
 		}
 		q.Set("cursor", cursor)
 	}
-	if got == 0 {
+	if len(pages) == 0 || len(pages[0]) == 0 {
 		return nil, false
 	}
+	// Oldest first, a line's partial parts joined.
 	tail := logTail{b: answerLog, max: lines}
 	for i := len(pages) - 1; i >= 0; i-- {
 		for _, l := range pages[i] {
-			tail.add(l)
+			tail.addPart(strings.TrimRight(l.Text, "\r\n"), l.Source, l.Partial)
 		}
 	}
 	return tail.result(), true
 }
 
-// sinkPage asks the sink for one page: its lines' texts, oldest first,
-// and the cursor to the older page ("": none).
-func (c *Controller) sinkPage(ctx context.Context, token string, q url.Values) ([]string, string, error) {
+// sinkLine is a line of the sink's answer, as far as sinkLog reads it.
+type sinkLine struct {
+	Text    string `json:"text"`
+	Source  string `json:"source"`
+	Partial bool   `json:"partial"`
+}
+
+// sinkPage asks the sink for one page: its lines, oldest first, and the
+// cursor to the older page ("": none).
+func (c *Controller) sinkPage(ctx context.Context, token string, q url.Values) ([]sinkLine, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(c.d.SinkURL, "/")+"/api/v1/logs?"+q.Encode(), nil)
 	if err != nil {
 		return nil, "", err
@@ -88,19 +101,13 @@ func (c *Controller) sinkPage(ctx context.Context, token string, q url.Values) (
 		return nil, "", fmt.Errorf("the sink answered %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	var page struct {
-		Lines []struct {
-			Text string `json:"text"`
-		} `json:"lines"`
-		Cursor string `json:"cursor"`
+		Lines  []sinkLine `json:"lines"`
+		Cursor string     `json:"cursor"`
 	}
 	// sinkPage lines of the sink's longest part (64 KiB), twice for their
 	// escapes and fields.
 	if err := json.NewDecoder(io.LimitReader(resp.Body, (2*sinkPage)<<16)).Decode(&page); err != nil {
 		return nil, "", fmt.Errorf("the sink's answer: %w", err)
 	}
-	out := make([]string, len(page.Lines))
-	for i, l := range page.Lines {
-		out[i] = strings.TrimRight(l.Text, "\r\n")
-	}
-	return out, page.Cursor, nil
+	return page.Lines, page.Cursor, nil
 }

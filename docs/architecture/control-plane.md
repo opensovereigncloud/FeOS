@@ -2992,7 +2992,14 @@ nor waits for. `ferund`'s part:
   and stored nowhere, the secret values a stored tail is redacted of
   ([Logs](#probes-exits-and-restarts); a tenant's job's secrets and image
   credentials) with their userinfo escaping. A failure there fails the
-  create before any pod call.
+  create before any pod call. Every restore (`RestorePodRequest`, also
+  a repair's) sends the labels and the redactions too, with the same
+  failure: a node without the pod's record, where a hibernated pod is
+  restored, takes them from there.
+- **Parts.** A tail read from the node or the sink joins a partial
+  entry (a 64 KiB part of a longer line, or one the guest left
+  unfinished for a second) with the next entries of its source up to one
+  that is not partial, cut to the line budget.
 - **The nodes.** Every `TelemetryResponse` names `--sink-endpoint`
   (`sink_endpoint`); empty, the nodes ship nothing.
 - **Reads.** With `--sink-url`, the objects' logs call (a replica's or an

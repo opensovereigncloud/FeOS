@@ -146,8 +146,8 @@ type OpHandle struct {
 	// pullToken is the guest's pull token of a create with image
 	// credentials (prepare, ADR 0025); "": anonymous.
 	pullToken string
-	// logRedact are the values a create's node redacts of the lines it
-	// ships (prepare, ADR 0026).
+	// logRedact are the values a create's or a restore's node redacts of
+	// the lines it ships (prepareRedact, ADR 0026).
 	logRedact []string
 
 	mu sync.Mutex
@@ -602,7 +602,8 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 	case OpResume:
 		_, res.err = pc.ResumePod(ctx, &podv1.ResumePodRequest{PodId: id})
 	case OpRestore:
-		resp, err := pc.RestorePod(ctx, &podv1.RestorePodRequest{PodId: id, HeadKey: h.row.CheckpointHead})
+		resp, err := pc.RestorePod(ctx, &podv1.RestorePodRequest{PodId: id, HeadKey: h.row.CheckpointHead,
+			LogLabels: h.row.LogLabels, LogRedact: h.logRedact})
 		res.err = err
 		if err == nil {
 			res.restored, res.memoryRestored, res.reason = true, resp.GetMemoryRestored(), resp.GetReason()
@@ -674,10 +675,14 @@ func (e *Engine) callRepair(ctx context.Context, pc podv1.PodServiceClient, h *O
 	}
 	if info.GetState() == podv1.PodState_POD_STATE_PENDING && strings.HasPrefix(info.GetReason(), "restoring from") &&
 		h.row.CheckpointHead != "" && !hasVolumes(h.row) {
+		if err := e.prepareRedact(ctx, h); err != nil {
+			return callResult{err: err, skipped: true}
+		}
 		if _, err := pc.DeletePod(ctx, &podv1.DeletePodRequest{PodId: id}); err != nil && grpcCode(err) != codes.NotFound {
 			res.err = err
 		}
-		resp, err := pc.RestorePod(ctx, &podv1.RestorePodRequest{PodId: id, HeadKey: h.row.CheckpointHead})
+		resp, err := pc.RestorePod(ctx, &podv1.RestorePodRequest{PodId: id, HeadKey: h.row.CheckpointHead,
+			LogLabels: h.row.LogLabels, LogRedact: h.logRedact})
 		if err != nil {
 			res.err = err
 		} else {

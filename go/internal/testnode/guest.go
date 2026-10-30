@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -328,7 +329,7 @@ func (c *containerService) StreamContainerLogs(req *containerv1.StreamContainerL
 		lines = nil
 	}
 	for _, l := range lines {
-		if err := stream.Send(&containerv1.LogEntry{Line: []byte(l)}); err != nil {
+		if err := stream.Send(decodeEntry(l)); err != nil {
 			return err
 		}
 	}
@@ -337,6 +338,28 @@ func (c *containerService) StreamContainerLogs(req *containerv1.StreamContainerL
 		return status.FromContextError(ctx.Err()).Err()
 	}
 	return nil
+}
+
+// entryMark starts a log line that Script.AppendLogEntry stored with its
+// source and partial flag: the mark, 'P' or 'F', the source's number,
+// the text. A line of AppendLog is sent as it is, without a source.
+const entryMark = "\x00"
+
+func encodeEntry(text string, source containerv1.LogEntry_Source, partial bool) string {
+	flag := "F"
+	if partial {
+		flag = "P"
+	}
+	return entryMark + flag + strconv.Itoa(int(source)) + text
+}
+
+// decodeEntry is the entry a stored log line is sent as.
+func decodeEntry(l string) *containerv1.LogEntry {
+	if !strings.HasPrefix(l, entryMark) || len(l) < 3 {
+		return &containerv1.LogEntry{Line: []byte(l)}
+	}
+	src, _ := strconv.Atoi(l[2:3])
+	return &containerv1.LogEntry{Line: []byte(l[3:]), Source: containerv1.LogEntry_Source(src), Partial: l[1] == 'P'}
 }
 
 // defaultPath is a command's PATH when the test node's own has none.

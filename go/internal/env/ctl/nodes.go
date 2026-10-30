@@ -99,9 +99,10 @@ func (c *Controller) containerLog(ctx context.Context, l model.Lease, lines int,
 		if err != nil {
 			return nil, logError(err)
 		}
-		// A line over 64 KiB comes in parts; a node that predates
-		// tail_lines sends the whole log: the last lines are kept.
-		t.add(strings.TrimRight(string(e.GetLine()), "\r\n"))
+		// A line over 64 KiB, or one left unfinished, comes in parts,
+		// joined; a node that predates tail_lines sends the whole log:
+		// the last lines are kept.
+		t.addPart(strings.TrimRight(string(e.GetLine()), "\r\n"), e.GetSource().String(), e.GetPartial())
 	}
 	return t.result(), nil
 }
@@ -156,6 +157,41 @@ type logTail struct {
 	lines []string
 	// head is the oldest kept line; bytes what the kept lines hold.
 	head, bytes int
+	// open are the lines whose parts came partial so far (addPart), by
+	// source, in the order they began.
+	open []*openLine
+}
+
+// openLine is a line of one source whose parts came partial: a part of
+// 64 KiB of a longer line, or one the guest left unfinished for a second
+// (ADR 0026). It holds at most a byte over the budget's line, which cut
+// then cuts.
+type openLine struct {
+	source string
+	text   strings.Builder
+}
+
+// addPart adds an entry of a log: a partial one is held until the next
+// entry of its source that is not partial ends its line, which goes in
+// joined; entries of other sources go in meanwhile.
+func (t *logTail) addPart(s, source string, partial bool) {
+	i := slices.IndexFunc(t.open, func(o *openLine) bool { return o.source == source })
+	if i < 0 {
+		if !partial {
+			t.add(s)
+			return
+		}
+		t.open = append(t.open, &openLine{source: source})
+		i = len(t.open) - 1
+	}
+	o := t.open[i]
+	if room := t.b.line + 1 - o.text.Len(); room > 0 {
+		o.text.WriteString(s[:min(len(s), room)])
+	}
+	if !partial {
+		t.open = slices.Delete(t.open, i, i+1)
+		t.add(o.text.String())
+	}
 }
 
 func (t *logTail) add(s string) {
@@ -173,8 +209,13 @@ func (t *logTail) add(s string) {
 	}
 }
 
-// result is the kept lines, oldest first; nil when none came.
+// result is the kept lines, oldest first, a line still open last as far
+// as it came; nil when none came.
 func (t *logTail) result() []string {
+	for _, o := range t.open {
+		t.add(o.text.String())
+	}
+	t.open = nil
 	if t.lines == nil {
 		return nil
 	}

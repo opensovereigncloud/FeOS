@@ -911,7 +911,7 @@ func (p *podService) resume(ctx context.Context, id string) error {
 	}
 	if info, err := p.get(id); err == nil && info.State == podv1.PodState_POD_STATE_HIBERNATED {
 		unlock()
-		_, err := p.restore(ctx, id, "", false)
+		_, err := p.restore(ctx, id, "", false, nil, nil)
 		return err
 	}
 	defer unlock()
@@ -1217,18 +1217,29 @@ func (p *podService) hibernate(ctx context.Context, req *podv1.HibernatePodReque
 
 func (p *podService) RestorePod(ctx context.Context, req *podv1.RestorePodRequest) (*podv1.RestorePodResponse, error) {
 	return mutate(p, ctx, func(ctx context.Context) (*podv1.RestorePodResponse, error) {
-		return p.restore(ctx, req.GetPodId(), req.GetHeadKey(), req.GetCold())
+		return p.restore(ctx, req.GetPodId(), req.GetHeadKey(), req.GetCold(), req.GetLogLabels(), req.GetLogRedact())
 	})
 }
 
-func (p *podService) restore(ctx context.Context, id, headKey string, cold bool) (*podv1.RestorePodResponse, error) {
+func (p *podService) restore(ctx context.Context, id, headKey string, cold bool, logLabels map[string]string,
+	logRedact []string) (*podv1.RestorePodResponse, error) {
 	if err := checkID(id); err != nil {
 		return nil, err
 	}
-	if _, err := p.get(id); err != nil {
+	_, err := p.get(id)
+	if err != nil {
 		if err := p.adopt(id, headKey); err != nil {
 			return nil, err
 		}
+	}
+	// A node without the pod's record takes its log labels and
+	// redactions; one with it replaces its own when labels come (ADR 0026).
+	if adopted := err != nil; adopted || len(logLabels) > 0 {
+		p.mu.Lock()
+		if pd := p.pods[id]; pd != nil {
+			pd.logLabels, pd.logRedact = maps.Clone(logLabels), slices.Clone(logRedact)
+		}
+		p.mu.Unlock()
 	}
 	unlock, err := p.endBringUpAndLock(ctx, id)
 	if err != nil {
