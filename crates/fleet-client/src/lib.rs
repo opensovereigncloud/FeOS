@@ -33,6 +33,7 @@ mod calls;
 mod events;
 mod identity;
 mod node;
+mod sink;
 mod telemetry;
 mod tls;
 mod token;
@@ -42,6 +43,7 @@ pub use calls::{CallsOn, NodeCalls, OnRuntime};
 pub use events::Events;
 pub use identity::NODE_DIR;
 pub use node::{server, Incoming, NodeConn};
+pub use sink::{LogStream, Logs, ShippedPod, Shipper, Target as SinkTarget};
 pub use telemetry::{inventory_hash, Diskd, Installed, Inventory};
 pub use token::{check_trust_domain, JoinToken};
 
@@ -205,9 +207,17 @@ pub struct Fleet {
     calls: NodeCalls,
     /// Retires every dialer of a node connection when feosd stops.
     retire: Arc<watch::Sender<bool>>,
+    /// The sink the control plane names (ADR 0026).
+    sink: watch::Receiver<Option<sink::Target>>,
 }
 
 impl Fleet {
+    /// The sink the control plane names, and how the node reaches it, as
+    /// it changes: none while it names none.
+    pub fn sink(&self) -> watch::Receiver<Option<sink::Target>> {
+        self.sink.clone()
+    }
+
     /// The node's events, which go to the control plane.
     pub fn events(&self) -> &Events {
         &self.events
@@ -340,6 +350,7 @@ pub fn start<I: Inventory>(
     let (nodes, incoming) = Nodes::new(link.name.clone(), retired);
     let (uplink, published) = watch::channel(None);
     runtime.spawn(events::publish(events.clone(), published));
+    let (sink, sink_target) = watch::channel(None);
     let collector = Collector::new(
         inventory,
         &start_id,
@@ -358,6 +369,8 @@ pub fn start<I: Inventory>(
         nodes,
         collector,
         uplink,
+        sink,
+        bad_sink: None,
         spread: std::hash::BuildHasher::hash_one(
             &std::collections::hash_map::RandomState::new(),
             &start_id,
@@ -371,6 +384,7 @@ pub fn start<I: Inventory>(
             runtime,
             calls,
             retire: Arc::new(retire),
+            sink: sink_target,
         },
         incoming,
     ))
@@ -384,6 +398,10 @@ struct Runner<I> {
     collector: Collector<I>,
     /// The uplink's channel, for the events' stream.
     uplink: watch::Sender<Option<Channel>>,
+    /// The sink, as the control plane names it.
+    sink: watch::Sender<Option<sink::Target>>,
+    /// A sink's endpoint of no use that was said.
+    bad_sink: Option<String>,
     /// Picks the instance the uplink starts with.
     spread: usize,
 }
@@ -430,6 +448,7 @@ impl<I: Inventory> Runner<I> {
                 Outcome::Refused(message) => {
                     self.nodes.clear();
                     self.uplink.send_replace(None);
+                    self.sink.send_replace(None);
                     error!(
                         "Fleet: The control plane refused the node ({message}); it has to \
                          join again with a new join token in {}",
@@ -621,16 +640,58 @@ impl<I: Inventory> Runner<I> {
         Ok(name)
     }
 
-    /// The uplink's and the node connections' configurations.
-    fn configs(
-        &self,
-        identity: &Identity,
-    ) -> Result<(Arc<ClientConfig>, Arc<ClientConfig>), String> {
+    /// The uplink's, the node connections' and the sink's configurations.
+    fn configs(&self, identity: &Identity) -> Result<Configs, String> {
         let config = |alpn| {
             tls::node_config(&self.provider, identity, &self.config.trust_domain, alpn)
                 .map_err(|e| format!("the node's certificate: {e}"))
         };
-        Ok((config(tls::ALPN_UPLINK)?, config(tls::ALPN_NODE)?))
+        let sink = tls::sink_config(&self.provider, identity, &self.config.trust_domain)
+            .map_err(|e| format!("the node's certificate: {e}"))?;
+        Ok((config(tls::ALPN_UPLINK)?, config(tls::ALPN_NODE)?, sink))
+    }
+
+    /// Names the sink `endpoint` to the shipper, reached with `config` as
+    /// node `node`; an empty one: no sink.
+    fn publish_sink(&mut self, endpoint: &str, config: &Arc<ClientConfig>, node: &str) {
+        let endpoint = match endpoint {
+            "" => None,
+            endpoint if is_host_port(endpoint) => Some(endpoint),
+            endpoint => {
+                if self.bad_sink.as_deref() != Some(endpoint) {
+                    warn!("Fleet: The control plane names the sink {endpoint:?}, not HOST:PORT");
+                    self.bad_sink = Some(endpoint.to_string());
+                }
+                None
+            }
+        };
+        self.sink.send_if_modified(|current| {
+            let same = match (current.as_ref(), endpoint) {
+                (None, None) => true,
+                (Some(target), Some(endpoint)) => {
+                    target.endpoint == endpoint
+                        && Arc::ptr_eq(&target.config, config)
+                        && target.node == node
+                }
+                _ => false,
+            };
+            if same {
+                return false;
+            }
+            let moved = current.as_ref().map(|target| target.endpoint.as_str()) != endpoint;
+            if moved {
+                match endpoint {
+                    Some(endpoint) => info!("Fleet: The sink is at {endpoint}: the logs go there"),
+                    None => info!("Fleet: The control plane names no sink: no logs are shipped"),
+                }
+            }
+            *current = endpoint.map(|endpoint| sink::Target {
+                endpoint: endpoint.to_string(),
+                config: config.clone(),
+                node: node.to_string(),
+            });
+            true
+        });
     }
 
     /// Where the node connections go: every instance the control plane
@@ -682,7 +743,7 @@ impl<I: Inventory> Runner<I> {
 
     /// Serves with `identity` until the control plane refuses it.
     async fn serve(&mut self, dir: &NodeDir, mut identity: Identity) -> Outcome {
-        let (uplink_config, node_config) = match self.configs(&identity) {
+        let (uplink_config, node_config, mut sink_config) = match self.configs(&identity) {
             Ok(configs) => configs,
             Err(e) => return Outcome::Broken(e),
         };
@@ -715,7 +776,7 @@ impl<I: Inventory> Runner<I> {
             if Utc::now() >= renew_at {
                 match self.renew(dir, &identity, &mut uplink).await {
                     Ok(renewed) => match self.configs(&renewed) {
-                        Ok((uplink_config, node_config)) => {
+                        Ok((uplink_config, node_config, renewed_sink)) => {
                             info!(
                                 "Fleet: Renewed the node's certificate, until {}",
                                 renewed.state.not_after
@@ -725,6 +786,11 @@ impl<I: Inventory> Runner<I> {
                             renew_wait = RENEW_BACKOFF.0;
                             uplink.set_config(uplink_config);
                             self.nodes.renew(node_config);
+                            sink_config = renewed_sink;
+                            let endpoint = self.sink.borrow().as_ref().map(|t| t.endpoint.clone());
+                            if let Some(endpoint) = endpoint {
+                                self.publish_sink(&endpoint, &sink_config, &identity.state.name);
+                            }
                         }
                         Err(e) => return Outcome::Broken(e),
                     },
@@ -802,6 +868,7 @@ impl<I: Inventory> Runner<I> {
                         self.nodes.set(&targets);
                     }
                     uplink.set_targets(self.uplink_targets(&identity.state.instances));
+                    self.publish_sink(&answer.sink_endpoint, &sink_config, &identity.state.name);
                     if let Err(outcome) =
                         self.join_mesh(&mut uplink, &mut joined, &mut taking).await
                     {
@@ -981,6 +1048,16 @@ impl<I: Inventory> Runner<I> {
                 ))
             })
     }
+}
+
+/// The configurations of the uplink, the node connections and the sink.
+type Configs = (Arc<ClientConfig>, Arc<ClientConfig>, Arc<ClientConfig>);
+
+/// Whether `endpoint` is `host:port`.
+fn is_host_port(endpoint: &str) -> bool {
+    endpoint
+        .rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
 }
 
 /// An answer of JoinMesh that feosd takes.

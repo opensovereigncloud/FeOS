@@ -116,6 +116,12 @@ pub fn node_id(trust_domain: &str, name: &str) -> String {
     format!("spiffe://{trust_domain}/node/{name}")
 }
 
+/// The prefix of the SPIFFE IDs of the sink's instances (ADR 0026),
+/// `spiffe://<trust domain>/sink/<name>`.
+pub fn sink_id_prefix(trust_domain: &str) -> String {
+    format!("spiffe://{trust_domain}/sink/")
+}
+
 /// The SPIFFE ID that the control plane's certificates on its port for
 /// nodes carry, and no other certificate of the platform CA.
 pub fn control_plane_id(trust_domain: &str) -> String {

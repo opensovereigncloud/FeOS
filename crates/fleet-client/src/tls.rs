@@ -96,6 +96,23 @@ pub fn node_config(
     Ok(finish(config, alpn))
 }
 
+/// The configuration of a connection to the sink (ADR 0026): the node's
+/// certificate, and the sink's checked against the trust bundle and for
+/// its one URI, `spiffe://<trust domain>/sink/<name>`, whatever the name it
+/// is dialed by.
+pub fn sink_config(
+    provider: &Arc<CryptoProvider>,
+    identity: &Identity,
+    trust_domain: &str,
+) -> Result<Arc<ClientConfig>, Error> {
+    let verifier = Arc::new(SinkVerifier::new(provider, &identity.bundle, trust_domain)?);
+    let config = builder(provider)?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(identity.chain.clone(), identity.private_key())?;
+    Ok(finish(config, ALPN_UPLINK))
+}
+
 /// The trust anchors of `roots`: each root's subject and key, without its
 /// name constraints. rustls-webpki checks no URI name constraint and
 /// refuses every URI name beneath one (fail closed), and the roots that
@@ -387,6 +404,122 @@ impl ServerCertVerifier for ControlPlaneVerifier {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.inner.supported_verify_schemes()
+    }
+}
+
+/// Checks a sink's own certificate beyond its chain: no IP address, and
+/// exactly one URI name, a sink's SPIFFE ID in the trust domain.
+fn check_sink_leaf(leaf: &[u8], trust_domain: &str) -> Result<(), Error> {
+    use x509_parser::extensions::GeneralName;
+    let (_, cert) = x509_parser::parse_x509_certificate(leaf)
+        .map_err(|e| refused(format!("the sink's certificate: {e}")))?;
+    let names = cert
+        .subject_alternative_name()
+        .map_err(|e| refused(format!("the sink's certificate's names: {e}")))?;
+    let names = names.map(|names| names.value.general_names.as_slice());
+    let mut uris = Vec::new();
+    for name in names.unwrap_or_default() {
+        match name {
+            GeneralName::URI(uri) => uris.push(*uri),
+            GeneralName::IPAddress(_) => {
+                return Err(refused("the sink's certificate carries an IP address"))
+            }
+            _ => {}
+        }
+    }
+    let prefix = token::sink_id_prefix(trust_domain);
+    let named = match uris.as_slice() {
+        [uri] => uri.strip_prefix(&prefix).is_some_and(token::is_dns_label),
+        _ => false,
+    };
+    if !named {
+        return Err(refused(format!(
+            "the server's certificate names {uris:?}, not a sink {prefix}<name>"
+        )));
+    }
+    Ok(())
+}
+
+/// The check of a sink: the chain to the trust bundle, for a server, and
+/// the sink's own certificate; not the name it was dialed by.
+#[derive(Debug)]
+struct SinkVerifier {
+    roots: RootCertStore,
+    trust_domain: String,
+    provider: Arc<CryptoProvider>,
+}
+
+impl SinkVerifier {
+    fn new(
+        provider: &Arc<CryptoProvider>,
+        bundle: &[CertificateDer<'_>],
+        trust_domain: &str,
+    ) -> Result<Self, Error> {
+        let roots = anchors(bundle)?;
+        if roots.is_empty() {
+            return Err(Error::General("the trust bundle is empty".into()));
+        }
+        Ok(Self {
+            roots,
+            trust_domain: trust_domain.to_string(),
+            provider: provider.clone(),
+        })
+    }
+}
+
+impl ServerCertVerifier for SinkVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_cert_signed_by_trust_anchor(
+            &cert,
+            &self.roots,
+            intermediates,
+            now,
+            self.provider.signature_verification_algorithms.all,
+        )?;
+        check_sink_leaf(end_entity, &self.trust_domain)?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -745,6 +878,58 @@ pub(crate) mod tests {
         );
         refused(
             verify(&verifier, &[&foreign, &other.cert], "ferun.feos.test"),
+            "UnknownIssuer",
+        );
+    }
+
+    #[test]
+    fn a_sink_is_checked_for_its_uri_not_its_name() {
+        let root = Ca::root("root");
+        let issuer = root.intermediate("issuer");
+        let key = key();
+        let verifier =
+            SinkVerifier::new(&provider(), &[root.cert.der().clone()], "feos.local").unwrap();
+        let sink = |dns: &[&str], uris: &[&str], usage| issuer.leaf(dns, uris, usage, &key);
+        let server = ExtendedKeyUsagePurpose::ServerAuth;
+        // Whatever name it is dialed by: an address, or a name it lacks.
+        let leaf = sink(
+            &["sink.feos.test"],
+            &["spiffe://feos.local/sink/a-1"],
+            server.clone(),
+        );
+        verify(&verifier, &[&leaf, &issuer.cert], "sink.feos.test").unwrap();
+        verify(&verifier, &[&leaf, &issuer.cert], "10.0.0.7").unwrap();
+        verify(&verifier, &[&leaf, &issuer.cert], "other.feos.test").unwrap();
+        let no_dns = sink(&[], &["spiffe://feos.local/sink/b"], server.clone());
+        verify(&verifier, &[&no_dns, &issuer.cert], "10.0.0.7").unwrap();
+        // Not a sink: the control plane, a pod, another trust domain, a
+        // sink without a name, two URIs.
+        for uris in [
+            &["spiffe://feos.local/ferun"][..],
+            &["spiffe://feos.local/tenant/t/sandbox/s"],
+            &["spiffe://other.local/sink/a"],
+            &["spiffe://feos.local/sink/"],
+            &["spiffe://feos.local/sink/a/b"],
+            &["spiffe://feos.local/sink/a", "spiffe://feos.local/sink/b"],
+            &[],
+        ] {
+            let leaf = sink(&["sink.feos.test"], uris, server.clone());
+            refused(
+                verify(&verifier, &[&leaf, &issuer.cert], "sink.feos.test"),
+                "not a sink",
+            );
+        }
+        // A client's certificate, another CA's.
+        let client = sink(
+            &[],
+            &["spiffe://feos.local/sink/a"],
+            ExtendedKeyUsagePurpose::ClientAuth,
+        );
+        assert!(verify(&verifier, &[&client, &issuer.cert], "x").is_err());
+        let other = Ca::root("other").intermediate("issuer");
+        let foreign = other.leaf(&[], &["spiffe://feos.local/sink/a"], server, &key);
+        refused(
+            verify(&verifier, &[&foreign, &other.cert], "x"),
             "UnknownIssuer",
         );
     }
