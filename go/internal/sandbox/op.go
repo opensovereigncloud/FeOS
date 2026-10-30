@@ -586,8 +586,10 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 	var res callResult
 	switch h.kind {
 	case OpCreate:
+		// The log labels go beside the spec (ADR 0026): a create delivered
+		// again finds its pod by the spec, whatever the labels.
 		resp, err := pc.CreatePod(ctx, &podv1.CreatePodRequest{PodId: id, Spec: h.spec, ImageLayers: h.layers,
-			PullToken: h.pullToken})
+			PullToken: h.pullToken, LogLabels: h.row.LogLabels})
 		res.err = err
 		if err == nil {
 			res.pod = resp.GetPod()

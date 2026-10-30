@@ -474,6 +474,10 @@ func (n *Node) Partition(on bool) {
 // Pods returns the node's pods' records, sorted by ID.
 func (n *Node) Pods() []*podv1.PodInfo { return n.pods.list() }
 
+// LogLabels are the log labels the create of a pod the node holds sent
+// (CreatePodRequest.log_labels); nil when it holds none.
+func (n *Node) LogLabels(pod podid.ID) map[string]string { return n.pods.logLabelsOf(pod.String()) }
+
 // Script returns the node's script of faults and scripted answers.
 func (n *Node) Script() *Script { return n.script }
 

@@ -498,7 +498,9 @@ TABLE jobs
   COLUMN started_at timestamp with time zone
   COLUMN finished_at timestamp with time zone
   COLUMN deadline_at timestamp with time zone NOT NULL
+  COLUMN log_retention_days integer
   CONSTRAINT CHECK (((finished_at IS NULL) = (phase = ANY (ARRAY['queued'::text, 'running'::text]))))
+  CONSTRAINT CHECK (((log_retention_days >= 1) AND (log_retention_days <= 400)))
   CONSTRAINT CHECK ((id ~ '^[a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}$'::text))
   CONSTRAINT CHECK ((phase = ANY (ARRAY['queued'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'deadline_exceeded'::text, 'cancelled'::text])))
   CONSTRAINT FOREIGN KEY (owner) REFERENCES tenants(id) ON DELETE CASCADE
@@ -745,6 +747,7 @@ TABLE sandboxes
   COLUMN idle_after_s integer
   COLUMN address text NOT NULL DEFAULT ''::text
   COLUMN tenant_job boolean NOT NULL DEFAULT false
+  COLUMN log_labels jsonb NOT NULL DEFAULT '{}'::jsonb
   CONSTRAINT CHECK (((memory_mib >= 256) AND (memory_mib <= 65536)))
   CONSTRAINT CHECK (((op = ''::text) = (op_id IS NULL)))
   CONSTRAINT CHECK (((vcpus >= 1) AND (vcpus <= 32)))
@@ -773,6 +776,22 @@ TABLE schema_migrations
   COLUMN applied_at timestamp with time zone NOT NULL DEFAULT now()
   CONSTRAINT PRIMARY KEY (version)
   CREATE UNIQUE INDEX schema_migrations_pkey ON public.schema_migrations USING btree (version)
+TABLE service_tokens
+  COLUMN hash text NOT NULL
+  COLUMN id uuid NOT NULL DEFAULT gen_random_uuid()
+  COLUMN kind text NOT NULL
+  COLUMN name text NOT NULL
+  COLUMN created_by text NOT NULL DEFAULT ''::text
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN last_used_at timestamp with time zone
+  COLUMN cert_window timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN cert_count integer NOT NULL DEFAULT 0
+  CONSTRAINT CHECK ((kind = 'sink'::text))
+  CONSTRAINT CHECK ((name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'::text))
+  CONSTRAINT PRIMARY KEY (hash)
+  CONSTRAINT UNIQUE (id)
+  CREATE UNIQUE INDEX service_tokens_id_key ON public.service_tokens USING btree (id)
+  CREATE UNIQUE INDEX service_tokens_pkey ON public.service_tokens USING btree (hash)
 TABLE ssh_bindings
   COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN name text NOT NULL

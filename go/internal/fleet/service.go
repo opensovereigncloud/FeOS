@@ -93,7 +93,10 @@ type Config struct {
 	// PodNetwork is the cluster's ULA when its pods are on a mesh (ADR
 	// 0017); the zero prefix when its network is routed.
 	PodNetwork netip.Prefix
-	Log        *slog.Logger
+	// SinkEndpoint is host:port of the sink's ingest (--sink-endpoint, ADR
+	// 0026), which every TelemetryResponse names; "": none.
+	SinkEndpoint string
+	Log          *slog.Logger
 }
 
 // Deps are the parts of the instance fleet works with.

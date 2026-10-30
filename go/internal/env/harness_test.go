@@ -273,7 +273,7 @@ func (h *harness) instance(envID uuid.UUID, kind, object string, replica, releas
 	id := podid.Mint()
 	zero := 0
 	if _, _, err := h.st.CreateSandbox(h.ctx(), store.NewSandbox{ID: id, Owner: tenantA, Image: "img", VCPUs: 1, MemoryMiB: 512,
-		EnvironmentID: envID, PodTemplate: &model.PodTemplate{SecurityGroups: []string{model.EnvGroupID(envID)}},
+		ImageRef: "registry.test/img@sha256:" + strings.Repeat("0", 64), EnvironmentID: envID, PodTemplate: &model.PodTemplate{SecurityGroups: []string{model.EnvGroupID(envID)}},
 		IdleAfterS: &zero}); err != nil {
 		h.t.Fatal(err)
 	}

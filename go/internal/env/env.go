@@ -66,7 +66,10 @@ type Deps struct {
 	// (--apps-zone, ADR 0021); "": no hosts, and no environment can be
 	// made public.
 	AppsZone string
-	Log      *slog.Logger
+	// SinkURL is the sink's API (--sink-url, ADR 0026), which the logs
+	// calls ask first; "": the nodes only.
+	SinkURL string
+	Log     *slog.Logger
 	// EnvChanged runs in the transaction that changed an environment's
 	// publicity or marked it deleting, with its row locked: the domains
 	// bound to it derive their states again (internal/domains). nil:
@@ -114,7 +117,7 @@ func New(deps Deps) (*Service, error) {
 	c, err := ctl.New(ctl.Deps{
 		InstanceID: deps.InstanceID, DB: deps.DB, Store: st, Elector: deps.Elector, Conns: deps.Conns,
 		Engine: deps.Engine, Runner: deps.Runner, Ports: deps.Ports, Sealer: deps.Sealer,
-		Blueprint: deps.Blueprint, Log: deps.Log,
+		Blueprint: deps.Blueprint, SinkURL: deps.SinkURL, Log: deps.Log,
 	})
 	if err != nil {
 		return nil, err

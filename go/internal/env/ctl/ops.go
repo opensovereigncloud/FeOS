@@ -30,8 +30,10 @@ const maxLogLines = 10000
 // and their source: the main container's log of replica replica of an
 // image service, of an addon (replica 0), or of a job's latest run (its
 // stored tail once the run's row is gone) (SourceContainer); the process
-// log of an attached service (SourceProcess). It never wakes an instance
-// (ErrPaused); ErrNoObject (its text names a replica the object does not
+// log of an attached service (SourceProcess). With --sink-url, a
+// container's log is the sink's first (sinkLog), the node's when the sink
+// fails or has no line. It never wakes an instance (ErrPaused, unless the
+// sink has its lines); ErrNoObject (its text names a replica the object does not
 // have), ErrNotRunning for a replica the target release has but that has
 // no instance yet (the release waits for its addons or a job, or for
 // capacity), ErrNoContainerLogs.
@@ -91,6 +93,12 @@ func (c *Controller) LogTail(ctx context.Context, envID uuid.UUID, kind, name st
 		return nil, "", &stateError{msg: fmt.Sprintf("%s %s has no replica %d (it has %d)", kind, name, replica, desired),
 			kind: ErrNoObject}
 	}
+	// A row without log labels (inserted before ADR 0026) is not shipped.
+	if len(row.Sandbox.LogLabels) > 0 {
+		if out, ok := c.sinkLog(ctx, "instance", row.Sandbox.ID.String(), row.Sandbox.CreatedAt, lines); ok {
+			return out, SourceContainer, nil
+		}
+	}
 	out, err := c.instanceLog(ctx, row.Sandbox, lines)
 	return out, SourceContainer, err
 }
@@ -108,8 +116,8 @@ func (c *Controller) instanceLog(ctx context.Context, sb store.Sandbox, lines in
 	return c.containerLog(ctx, lease(sb), lines, answerLog)
 }
 
-// jobLog is a job's latest run's log: its container's while its row runs,
-// else the tail its run kept.
+// jobLog is a job's latest run's log: the sink's (sinkLog), else its
+// container's while its row runs, else the tail its run kept.
 func (c *Controller) jobLog(ctx context.Context, v *view, name string, lines int) ([]string, string, error) {
 	run, err := c.st.LatestJobRun(ctx, v.env.ID, name)
 	if errors.Is(err, store.ErrNoRow) {
@@ -117,6 +125,11 @@ func (c *Controller) jobLog(ctx context.Context, v *view, name string, lines int
 	}
 	if err != nil {
 		return nil, "", err
+	}
+	if !run.SandboxID.IsZero() {
+		if out, ok := c.sinkLog(ctx, "instance", run.SandboxID.String(), run.StartedAt, lines); ok {
+			return out, SourceContainer, nil
+		}
 	}
 	if !run.SandboxID.IsZero() && run.Phase == model.RunRunning {
 		if sb, err := c.st.GetSandbox(ctx, run.SandboxID); err == nil && sb.ClientState == model.StateRunning {

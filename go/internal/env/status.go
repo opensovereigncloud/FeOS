@@ -159,7 +159,7 @@ func instanceStatus(row store.EnvInstanceRow) InstanceStatus {
 	}
 	return InstanceStatus{ID: sb.ID.String(), Replica: i.Replica, Phase: i.Phase, State: sb.ClientState, Node: sb.Node,
 		Address: sb.Address, Release: i.Release, Restarts: i.Restarts, LastExit: i.LastExit,
-		ReadySince: rfc3339(i.ReadySince), Detail: detail}
+		ReadySince: rfc3339(i.ReadySince), Detail: detail, Image: sb.ImageRef}
 }
 
 // routesOf are a spec's routes by name, their ports resolved, each with

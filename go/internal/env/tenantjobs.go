@@ -53,6 +53,9 @@ type CreateTenantJobRequest struct {
 	// process exited, its first 4 KiB the job's result; "": none.
 	ResultPath string            `json:"resultPath,omitempty"`
 	Labels     map[string]string `json:"labels,omitempty"`
+	// LogRetentionDays is how long the sink keeps the job's log (ADR 0026),
+	// 1 to 400 days; 0: the sink's default.
+	LogRetentionDays int `json:"logRetentionDays,omitempty"`
 }
 
 // TenantJobStatus is a job as the answers show it.
@@ -77,6 +80,9 @@ type TenantJobStatus struct {
 	StartedAt  string            `json:"startedAt"`
 	FinishedAt string            `json:"finishedAt"`
 	DeadlineAt string            `json:"deadlineAt"`
+	// LogRetentionDays is what the create asked; 0 (absent): the sink's
+	// default.
+	LogRetentionDays int `json:"logRetentionDays,omitempty"`
 }
 
 // TenantJobList is GET /api/v1/jobs.
@@ -93,7 +99,7 @@ func tenantJobStatus(r store.TenantJob) TenantJobStatus {
 	return TenantJobStatus{ID: r.ID.String(), Image: r.Image, ImageRef: r.ImageRef, Phase: r.Phase, Reason: r.Reason,
 		Detail: r.Detail, ExitCode: r.ExitCode, Result: r.Result, ResultPath: r.ResultPath, Vcpus: r.VCPUs,
 		MemoryMib: r.MemoryMiB, Labels: r.Labels, CreatedAt: rfc3339(r.CreatedAt), StartedAt: rfc3339(r.StartedAt),
-		FinishedAt: rfc3339(r.FinishedAt), DeadlineAt: rfc3339(r.DeadlineAt)}
+		FinishedAt: rfc3339(r.FinishedAt), DeadlineAt: rfc3339(r.DeadlineAt), LogRetentionDays: r.LogRetentionDays}
 }
 
 // CreateTenantJob is POST /api/v1/jobs: a job of the tenant, created (true) or,
@@ -188,6 +194,13 @@ func tenantJobSpec(req CreateTenantJobRequest) (ctl.TenantJobSpec, error) {
 		if k == "" {
 			return rs, errBadRequest("a label's key is empty")
 		}
+	}
+	if d := req.LogRetentionDays; d != 0 {
+		if d < model.MinLogRetentionDays || d > model.MaxLogRetentionDays {
+			return rs, errBadRequest("logRetentionDays %d is out of range: use %d..%d", d, model.MinLogRetentionDays,
+				model.MaxLogRetentionDays)
+		}
+		rs.LogRetentionDays = d
 	}
 	return rs, nil
 }

@@ -454,8 +454,13 @@ func (c *Controller) insertFrom(ctx context.Context, v *view, in insert, leaderS
 			if own.IngressGroup {
 				own.SecurityGroups = append(slices.Clone(tmpl.SecurityGroups), model.IngressGroupID(id))
 			}
+			attempt := 0
+			if in.run != nil {
+				attempt = in.run.Attempt
+			}
 			return store.NewSandbox{ID: id, Owner: v.env.Owner, Image: p.image, VCPUs: p.vcpus, MemoryMiB: p.memoryMB,
-				ImageRef: ref, EnvironmentID: v.env.ID, PodTemplate: &own, PinNode: in.pin, IdleAfterS: &idle}
+				ImageRef: ref, EnvironmentID: v.env.ID, PodTemplate: &own, PinNode: in.pin, IdleAfterS: &idle,
+				LogLabels: instanceLogLabels(v.env.Owner, id, v.env.ID, p.kind, p.name, in.replica, in.release, attempt)}
 		})
 		if err != nil {
 			return err

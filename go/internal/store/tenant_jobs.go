@@ -29,6 +29,9 @@ type TenantJob struct {
 	VCPUs, MemoryMiB int
 	ResultPath       string
 	Labels           map[string]string
+	// LogRetentionDays is how long the job asked its log be kept (ADR
+	// 0026); 0: the sink's default.
+	LogRetentionDays int
 	Phase            string
 	Reason, Detail   string
 	ExitCode         *int
@@ -45,14 +48,14 @@ func (r *TenantJob) Ended() bool { return !r.FinishedAt.IsZero() }
 
 const tenantJobCols = `id, owner, coalesce(idempotency_key, ''), request_hash, image, image_ref, vcpus, memory_mib,
 	result_path, labels, phase, reason, detail, exit_code, result, log_tail, created_at, started_at, finished_at,
-	deadline_at`
+	deadline_at, coalesce(log_retention_days, 0)`
 
 func scanTenantJob(row pgx.Row) (TenantJob, error) {
 	var r TenantJob
 	var started, finished *time.Time
 	if err := row.Scan(&r.ID, &r.Owner, &r.Key, &r.RequestHash, &r.Image, &r.ImageRef, &r.VCPUs, &r.MemoryMiB,
 		&r.ResultPath, &r.Labels, &r.Phase, &r.Reason, &r.Detail, &r.ExitCode, &r.Result, &r.LogTail, &r.CreatedAt,
-		&started, &finished, &r.DeadlineAt); err != nil {
+		&started, &finished, &r.DeadlineAt, &r.LogRetentionDays); err != nil {
 		return TenantJob{}, err
 	}
 	r.StartedAt, r.FinishedAt = timeOf(started), timeOf(finished)
@@ -76,10 +79,10 @@ func (s *Store) InsertTenantJob(ctx context.Context, r TenantJob, sealed []byte,
 		return TenantJob{}, err
 	}
 	out, err := scanTenantJob(s.q.QueryRow(ctx, `INSERT INTO jobs (id, owner, idempotency_key, request_hash, image, image_ref,
-			vcpus, memory_mib, result_path, labels, sealed, deadline_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, now() + $12::interval) RETURNING `+tenantJobCols,
+			vcpus, memory_mib, result_path, labels, sealed, deadline_at, log_retention_days)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, now() + $12::interval, $13) RETURNING `+tenantJobCols,
 		r.ID, r.Owner, nullString(r.Key), r.RequestHash, r.Image, r.ImageRef, r.VCPUs, r.MemoryMiB, r.ResultPath, labels,
-		sealed, interval(deadline)))
+		sealed, interval(deadline), nullPositive(r.LogRetentionDays)))
 	if err != nil {
 		return TenantJob{}, insertError("insert job "+r.ID.String(), err)
 	}
@@ -186,4 +189,12 @@ func (s *Store) LeftTenantJobPods(ctx context.Context) ([]Sandbox, error) {
 	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
 		LEFT JOIN jobs j ON j.id = s.id WHERE s.tenant_job AND (j.id IS NULL OR j.finished_at IS NOT NULL)
 		ORDER BY s.id`))
+}
+
+// nullPositive is n, or NULL for 0 and less.
+func nullPositive(n int) any {
+	if n <= 0 {
+		return nil
+	}
+	return n
 }

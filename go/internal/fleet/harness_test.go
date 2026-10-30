@@ -254,6 +254,9 @@ type harness struct {
 	s        *Service
 }
 
+// testSink is the sink's ingest every telemetry answer names.
+const testSink = "ferun-sink.feos.test:4317"
+
 // newHarness gives the test a database and a Service of its own: the
 // node TTL is 1 s, the drain timeout 5 minutes (the superseded grace 15
 // minutes), the rollout grace 30 s.
@@ -264,7 +267,7 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{t: t, d: d, st: store.New(d), iss: testIssuer(t), links: newFakeLinks(), hooks: newFakeHooks(), bindings: &fakeBindings{}}
 	h.s = New(Config{
 		InstanceID: "i1", TrustDomain: testTD, NodeTTL: time.Second, ConnDrainTimeout: 5 * time.Minute,
-		RolloutGrace: 30 * time.Second, Log: dbtest.Logger(t),
+		RolloutGrace: 30 * time.Second, SinkEndpoint: testSink, Log: dbtest.Logger(t),
 	}, Deps{DB: d, Issuer: h.iss, Links: h.links, Hooks: h.hooks, Bindings: h.bindings})
 	t.Cleanup(h.s.stop)
 	return h

@@ -27,6 +27,11 @@ func TestTenantJobSpec(t *testing.T) {
 		rs.VCPUs != 2 || rs.MemoryMiB != 2048 || rs.Deadline != 20*time.Minute {
 		t.Fatalf("sized %+v %v", rs, err)
 	}
+	for _, d := range []int{0, 1, 400} {
+		if rs, err := tenantJobSpec(CreateTenantJobRequest{Image: "b", LogRetentionDays: d}); err != nil || rs.LogRetentionDays != d {
+			t.Fatalf("logRetentionDays %d: %+v %v", d, rs, err)
+		}
+	}
 	for _, bad := range []CreateTenantJobRequest{
 		{},
 		{Image: "b", Env: map[string]string{"A-B": "x"}},
@@ -41,6 +46,8 @@ func TestTenantJobSpec(t *testing.T) {
 		{Image: "b", ResultPath: "/dev/termination-log"},
 		{Image: "b", ResultPath: "/run/../etc/x"},
 		{Image: "b", Labels: map[string]string{"": "x"}},
+		{Image: "b", LogRetentionDays: -1},
+		{Image: "b", LogRetentionDays: 401},
 	} {
 		_, err := tenantJobSpec(bad)
 		var ae *apierr.Error

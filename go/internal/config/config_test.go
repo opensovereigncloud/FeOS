@@ -560,3 +560,34 @@ func TestDomainFlags(t *testing.T) {
 		}
 	}
 }
+
+// The sink's flags (ADR 0026): empty by default, from their variables,
+// and what Validate refuses.
+func TestSinkFlags(t *testing.T) {
+	t.Parallel()
+	c, err := Parse([]string{"--database-url", testURL}, env(nil))
+	if err != nil || c.SinkEndpoint != "" || c.SinkURL != "" {
+		t.Fatalf("defaults %q %q %v", c.SinkEndpoint, c.SinkURL, err)
+	}
+	c, err = Parse([]string{"--database-url", testURL, "--sink-url", "http://ferun-sink:8080"},
+		env(map[string]string{"FERUN_SINK_ENDPOINT": "sink.fecode.dev:4317"}))
+	if err != nil || c.SinkEndpoint != "sink.fecode.dev:4317" || c.SinkURL != "http://ferun-sink:8080" {
+		t.Fatalf("parsed %q %q %v", c.SinkEndpoint, c.SinkURL, err)
+	}
+	for _, bad := range [][]string{
+		{"--sink-endpoint", "sink.fecode.dev"}, {"--sink-endpoint", ":4317"}, {"--sink-endpoint", "::1:4317"},
+		{"--sink-url", "ferun-sink:8080"}, {"--sink-url", "ftp://ferun-sink"}, {"--sink-url", "http://ferun-sink?x=1"},
+	} {
+		if _, err := Parse(append([]string{"--database-url", testURL}, bad...), env(nil)); err == nil ||
+			!strings.Contains(err.Error(), strings.TrimPrefix(bad[0], "-")) {
+			t.Errorf("%q: %v", bad, err)
+		}
+	}
+	var b strings.Builder
+	Usage(&b, CmdServe)
+	for _, f := range []string{"--sink-endpoint (FERUN_SINK_ENDPOINT)", "--sink-url (FERUN_SINK_URL)"} {
+		if !strings.Contains(b.String(), f) {
+			t.Errorf("serve help lacks %s", f)
+		}
+	}
+}

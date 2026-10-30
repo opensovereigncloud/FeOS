@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"maps"
 	"net/netip"
 	"os"
 	"slices"
@@ -84,6 +85,9 @@ type pod struct {
 	exited map[string]containerExit
 	// logs are the containers' log lines (Script.AppendLog).
 	logs map[string][]string
+	// logLabels are the labels its create sent (ADR 0026), as feosd keeps
+	// them in the pod's record.
+	logLabels map[string]string
 }
 
 // containerExit is how a container's process ended: its code, or none
@@ -665,7 +669,7 @@ func containerStatuses(spec *podv1.PodSpec, exited map[string]containerExit) []*
 
 func (p *podService) CreatePod(ctx context.Context, req *podv1.CreatePodRequest) (*podv1.CreatePodResponse, error) {
 	return mutate(p, ctx, func(ctx context.Context) (*podv1.CreatePodResponse, error) {
-		info, err := p.create(ctx, req.GetPodId(), req.GetSpec(), req.GetImageLayers())
+		info, err := p.create(ctx, req.GetPodId(), req.GetSpec(), req.GetImageLayers(), req.GetLogLabels())
 		if err != nil {
 			return nil, err
 		}
@@ -673,7 +677,8 @@ func (p *podService) CreatePod(ctx context.Context, req *podv1.CreatePodRequest)
 	})
 }
 
-func (p *podService) create(ctx context.Context, id string, spec *podv1.PodSpec, layers *podv1.ImageLayers) (*podv1.PodInfo, error) {
+func (p *podService) create(ctx context.Context, id string, spec *podv1.PodSpec, layers *podv1.ImageLayers,
+	logLabels map[string]string) (*podv1.PodInfo, error) {
 	if err := checkID(id); err != nil {
 		return nil, err
 	}
@@ -713,7 +718,7 @@ func (p *podService) create(ctx context.Context, id string, spec *podv1.PodSpec,
 		return nil, status.Errorf(codes.Internal, "keep pod %s: %v", id, err)
 	}
 	p.nextPID++
-	pd := &pod{uid: uid, info: info, lock: make(chan struct{}, 1), pid: p.nextPID}
+	pd := &pod{uid: uid, info: info, lock: make(chan struct{}, 1), pid: p.nextPID, logLabels: maps.Clone(logLabels)}
 	p.pods[id] = pd
 	out := clonePod(info)
 	p.mu.Unlock()
@@ -1400,6 +1405,17 @@ func (p *podService) ListPods(context.Context, *podv1.ListPodsRequest) (*podv1.L
 }
 
 // list returns the pods' records, sorted by ID.
+// logLabelsOf are the log labels of a pod's create; nil when the node
+// does not hold it.
+func (p *podService) logLabelsOf(id string) map[string]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if pd := p.pods[id]; pd != nil {
+		return maps.Clone(pd.logLabels)
+	}
+	return nil
+}
+
 func (p *podService) list() []*podv1.PodInfo {
 	p.mu.Lock()
 	defer p.mu.Unlock()

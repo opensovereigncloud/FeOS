@@ -57,6 +57,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -179,7 +180,12 @@ type Deps struct {
 	Sealer     envdeps.Sealer
 	// Blueprint looks up an addon type.
 	Blueprint func(typ string) (addons.Blueprint, bool)
-	Log       *slog.Logger
+	// SinkURL is the sink's API inside the cluster (--sink-url, ADR 0026),
+	// which the logs calls ask first; "": they read the nodes only.
+	SinkURL string
+	// SinkClient asks the sink; nil: a client with a 10 s timeout.
+	SinkClient *http.Client
+	Log        *slog.Logger
 }
 
 // timings are the controller's durations, fields so that the package's
@@ -300,6 +306,9 @@ func New(deps Deps) (*Controller, error) {
 	}
 	if deps.Blueprint == nil {
 		deps.Blueprint = addons.Get
+	}
+	if deps.SinkClient == nil {
+		deps.SinkClient = &http.Client{Timeout: 10 * time.Second}
 	}
 	st := deps.Store
 	if st == nil {

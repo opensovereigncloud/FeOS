@@ -230,7 +230,8 @@ func TestStatus(t *testing.T) {
 	api := got.Objects[0]
 	if api.Runtime != spec.RuntimeImage || api.Desired != 2 || api.Ready != 1 || len(api.Instances) != 4 ||
 		api.Instances[0].ID != api0.String() || api.Instances[0].Node != "n1" || api.Instances[0].Address != "fd6b::11" ||
-		api.Instances[0].Detail != "" || api.Instances[1].Phase != model.PhaseExited {
+		api.Instances[0].Detail != "" || api.Instances[1].Phase != model.PhaseExited ||
+		api.Instances[0].Image != "registry.test/img@sha256:"+strings.Repeat("0", 64) {
 		t.Fatalf("api %+v", api)
 	}
 	dev := got.Objects[1]

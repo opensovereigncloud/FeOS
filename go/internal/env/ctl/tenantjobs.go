@@ -66,6 +66,9 @@ type TenantJobSpec struct {
 	Deadline         time.Duration
 	ResultPath       string
 	Labels           map[string]string
+	// LogRetentionDays is how long the sink keeps the job's log (1 to
+	// 400); 0: its default.
+	LogRetentionDays int
 	// Key is the create's Idempotency-Key ("": none), Hash its body's
 	// hash, which a repeat with the key must have.
 	Key, Hash string
@@ -130,7 +133,8 @@ func (c *Controller) CreateTenantJob(ctx context.Context, owner string, rs Tenan
 		}
 		row, err := tx.CreateMintedSandbox(ctx, func(id podid.ID) store.NewSandbox {
 			return store.NewSandbox{ID: id, Owner: owner, Image: rs.Image, VCPUs: rs.VCPUs, MemoryMiB: rs.MemoryMiB,
-				ImageRef: ref, PodTemplate: &tmpl, IdleAfterS: &idle, TenantJob: true}
+				ImageRef: ref, PodTemplate: &tmpl, IdleAfterS: &idle, TenantJob: true,
+				LogLabels: tenantJobLogLabels(owner, id, rs.LogRetentionDays)}
 		})
 		if err != nil {
 			return err
@@ -147,7 +151,7 @@ func (c *Controller) CreateTenantJob(ctx context.Context, owner string, rs Tenan
 		}
 		job, err = tx.InsertTenantJob(ctx, store.TenantJob{ID: row.ID, Owner: owner, Key: rs.Key, RequestHash: rs.Hash,
 			Image: rs.Image, ImageRef: ref, VCPUs: rs.VCPUs, MemoryMiB: rs.MemoryMiB, ResultPath: rs.ResultPath,
-			Labels: rs.Labels}, sealed, rs.Deadline)
+			Labels: rs.Labels, LogRetentionDays: rs.LogRetentionDays}, sealed, rs.Deadline)
 		return err
 	})
 	if errors.Is(err, store.ErrExists) && rs.Key != "" {
@@ -431,9 +435,10 @@ func (c *Controller) DeleteTenantJob(ctx context.Context, owner string, id podid
 	return nil
 }
 
-// TenantJobLog is the last lines lines of a job's log: read from its pod while
-// it runs, redacted of its secrets; the kept tail once it has ended; none
-// while its pod does not run yet. ErrNoObject: owner has no such job.
+// TenantJobLog is the last lines lines of a job's log: while it runs, the
+// sink's (sinkLog) or else its pod's, redacted of its secrets; the kept
+// tail once it has ended, as its secrets are gone then and the sink's
+// lines are not redacted; none while its pod does not run yet. ErrNoObject: owner has no such job.
 func (c *Controller) TenantJobLog(ctx context.Context, owner string, id podid.ID, lines int) ([]string, error) {
 	r, err := c.st.GetTenantJob(ctx, owner, id)
 	if errors.Is(err, store.ErrNoRow) {
@@ -444,6 +449,13 @@ func (c *Controller) TenantJobLog(ctx context.Context, owner string, id podid.ID
 	}
 	if r.Ended() {
 		return r.LogTail[max(len(r.LogTail)-lines, 0):], nil
+	}
+	if out, ok := c.sinkLog(ctx, "job", id.String(), r.CreatedAt, lines); ok {
+		secrets := c.tenantJobSecretValues(ctx, id)
+		for i := range out {
+			out[i] = redact(out[i], secrets)
+		}
+		return out, nil
 	}
 	sb, err := c.st.GetSandbox(ctx, id)
 	if errors.Is(err, model.ErrNotFound) || (err == nil && !(steady(sb) && c.connected(sb.Node))) {

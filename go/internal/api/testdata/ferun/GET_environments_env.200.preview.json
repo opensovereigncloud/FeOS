@@ -74,7 +74,8 @@
             "restarts": 0,
             "lastExit": null,
             "readySince": "2026-10-18T10:42:30Z",
-            "detail": ""
+            "detail": "",
+            "image": "registry.fecode.dev/expensa/nats@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           }
         ]
       },
@@ -98,7 +99,8 @@
             "restarts": 0,
             "lastExit": null,
             "readySince": "2026-10-18T10:42:51Z",
-            "detail": ""
+            "detail": "",
+            "image": "registry.fecode.dev/expensa/postgres@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           }
         ]
       }

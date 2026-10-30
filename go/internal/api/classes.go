@@ -274,7 +274,7 @@ func (s *server) tenant(h apiHandler) http.Handler {
 				s.log.Warn("touch a tenant token", "err", err)
 			}
 		}
-		return h(w, r.WithContext(auth.WithTenant(r.Context(), auth.Tenant{Name: name})))
+		return h(w, r.WithContext(auth.WithTenant(r.Context(), auth.Tenant{Name: name, Token: tok})))
 	})
 }
 

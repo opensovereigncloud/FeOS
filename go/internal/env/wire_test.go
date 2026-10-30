@@ -34,10 +34,12 @@ func TestObjectStatusJSON(t *testing.T) {
 	}{{
 		ObjectStatus{Kind: spec.KindService, Name: "expense-service", Runtime: spec.RuntimeImage, Desired: 2, Ready: 1,
 			Instances: []InstanceStatus{{ID: "0193a000-0000-7000-8000-000000000101", Replica: 0, Phase: model.PhaseReady,
-				State: model.StateRunning, Node: "n1", Address: "fd6b::5", Release: 7, ReadySince: "2026-10-18T12:00:00Z"}}},
+				State: model.StateRunning, Node: "n1", Address: "fd6b::5", Release: 7, ReadySince: "2026-10-18T12:00:00Z",
+				Image: "registry.test/expense@sha256:0123"}}},
 		`{"kind":"service","name":"expense-service","runtime":"image","desired":2,"ready":1,"instances":[` +
 			`{"id":"0193a000-0000-7000-8000-000000000101","replica":0,"phase":"ready","state":"running","node":"n1",` +
-			`"address":"fd6b::5","release":7,"restarts":0,"lastExit":null,"readySince":"2026-10-18T12:00:00Z","detail":""}]}`,
+			`"address":"fd6b::5","release":7,"restarts":0,"lastExit":null,"readySince":"2026-10-18T12:00:00Z","detail":"",` +
+			`"image":"registry.test/expense@sha256:0123"}]}`,
 	}, {
 		ObjectStatus{Kind: spec.KindService, Name: "idle", Runtime: spec.RuntimeImage},
 		`{"kind":"service","name":"idle","runtime":"image","desired":0,"ready":0,"instances":[]}`,

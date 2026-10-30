@@ -245,7 +245,14 @@ type Config struct {
 	// AccessLogRetention is how long the ingress's access log is kept
 	// (ADR 0021).
 	AccessLogRetention time.Duration
-	LogLevel           slog.Level
+	// SinkEndpoint is host:port of the sink's ingest (ADR 0026), which
+	// every TelemetryResponse names to the nodes; empty: they ship no
+	// logs.
+	SinkEndpoint string
+	// SinkURL is the sink's HTTP API inside the cluster, which the logs
+	// calls read first; empty: they read the nodes only.
+	SinkURL  string
+	LogLevel slog.Level
 
 	// Version is the build's version, shown to nodes, MCP clients and the
 	// admin API. Not a flag.
@@ -426,6 +433,10 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.DurationVar(&c.ActivityRetention, "activity-retention", c.ActivityRetention, "how long activity is kept")
 	fs.DurationVar(&c.TrafficRetention, "traffic-retention", c.TrafficRetention, "how long traffic records are kept")
 	fs.DurationVar(&c.AccessLogRetention, "access-log-retention", c.AccessLogRetention, "how long the ingress's access log is kept")
+	fs.StringVar(&c.SinkEndpoint, "sink-endpoint", c.SinkEndpoint,
+		"host:port of the sink's ingest (ADR 0026), named to the nodes, which ship their pods' logs there; empty: no logs are shipped")
+	fs.StringVar(&c.SinkURL, "sink-url", c.SinkURL,
+		"the sink's HTTP API inside the cluster, e.g. http://ferun-sink:8080, which the logs calls read first; empty: the nodes only")
 	fs.StringVar(&t.logLevel, "log-level", t.logLevel, "debug, info, warn or error")
 	return t
 }
@@ -537,6 +548,17 @@ func (c *Config) Validate() error {
 	}
 	if c.DomainUnverifiedMax < 1 {
 		bad("--domain-unverified-max must be at least 1")
+	}
+	if c.SinkEndpoint != "" {
+		if host, port, err := splitHostPort(c.SinkEndpoint); err != nil || host == "" || port == "" {
+			bad("--sink-endpoint %q is not host:port", c.SinkEndpoint)
+		}
+	}
+	if c.SinkURL != "" {
+		if u, err := url.Parse(c.SinkURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" ||
+			u.User != nil || u.RawQuery != "" {
+			bad("--sink-url %q is not an http(s) URL", c.SinkURL)
+		}
 	}
 	if c.DNSResolver != "" {
 		if _, _, err := splitHostPort(c.DNSResolver); err != nil {

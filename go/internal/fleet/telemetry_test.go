@@ -41,8 +41,8 @@ func TestTelemetry(t *testing.T) {
 		ObjectStore: true, ObjectStoreId: "abc", PodPrefix: "2001:db8:1:2::/64",
 	}
 	resp := h.report("n1", serial, tel)
-	if resp.GetIntervalSeconds() != 5 {
-		t.Fatalf("interval %d", resp.GetIntervalSeconds())
+	if resp.GetIntervalSeconds() != 5 || resp.GetSinkEndpoint() != testSink {
+		t.Fatalf("interval %d, sink %q", resp.GetIntervalSeconds(), resp.GetSinkEndpoint())
 	}
 	n := h.node("n1")
 	if n.Status != model.NodeReady || n.Hostname != "hostone�" || n.CPUCores != math.MaxInt32 ||

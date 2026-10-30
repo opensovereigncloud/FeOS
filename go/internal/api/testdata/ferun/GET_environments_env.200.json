@@ -44,7 +44,8 @@
             "restarts": 0,
             "lastExit": null,
             "readySince": "2026-10-16T16:22:58Z",
-            "detail": ""
+            "detail": "",
+            "image": "registry.fecode.dev/expensa/approval-service@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           }
         ]
       },
@@ -66,7 +67,8 @@
             "restarts": 0,
             "lastExit": null,
             "readySince": "2026-10-18T14:04:02Z",
-            "detail": ""
+            "detail": "",
+            "image": "registry.fecode.dev/expensa/expense-service@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           },
           {
             "id": "0193d5e6-0000-7000-8000-000000000003",
@@ -79,7 +81,8 @@
             "restarts": 0,
             "lastExit": null,
             "readySince": "2026-10-16T16:22:58Z",
-            "detail": ""
+            "detail": "",
+            "image": "registry.fecode.dev/expensa/expense-service@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           },
           {
             "id": "0193d5e6-0000-7000-8000-000000000004",
@@ -92,7 +95,8 @@
             "restarts": 3,
             "lastExit": 1,
             "readySince": "",
-            "detail": "exited with code 1; restarting in 4s"
+            "detail": "exited with code 1; restarting in 4s",
+            "image": "registry.fecode.dev/expensa/expense-service@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           }
         ]
       },
@@ -114,7 +118,8 @@
             "restarts": 0,
             "lastExit": null,
             "readySince": "2026-10-18T14:04:02Z",
-            "detail": ""
+            "detail": "",
+            "image": "registry.fecode.dev/expensa/web@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           }
         ]
       },
@@ -138,7 +143,8 @@
             "restarts": 0,
             "lastExit": null,
             "readySince": "2026-10-16T16:21:40Z",
-            "detail": ""
+            "detail": "",
+            "image": "registry.fecode.dev/expensa/nats@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           }
         ]
       },
@@ -162,7 +168,8 @@
             "restarts": 0,
             "lastExit": null,
             "readySince": "2026-10-16T16:21:40Z",
-            "detail": ""
+            "detail": "",
+            "image": "registry.fecode.dev/expensa/postgres@sha256:4e1f0c2a9b7d3e5f6a8c0b1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f"
           }
         ]
       },

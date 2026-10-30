@@ -180,6 +180,9 @@ type InstanceStatus struct {
 	LastExit   *int   `json:"lastExit"`
 	ReadySince string `json:"readySince"`
 	Detail     string `json:"detail"`
+	// Image is the image the instance runs, registry/repository@sha256:…
+	// as its release resolved it.
+	Image string `json:"image"`
 }
 
 // JobRunStatus is a run of a job.

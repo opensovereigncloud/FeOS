@@ -115,7 +115,7 @@ func (s *Service) reportTelemetry(ctx context.Context, t *fleetv1.Telemetry) (*f
 			// could not remove waits for the node's hash to change.
 			reconcile = differs && m.For >= mismatchSettle && report.InventoryHash != m.ReconciledHash
 		}
-		resp = &fleetv1.TelemetryResponse{IntervalSeconds: telemetryInterval}
+		resp = &fleetv1.TelemetryResponse{IntervalSeconds: telemetryInterval, SinkEndpoint: s.cfg.SinkEndpoint}
 		return s.listInstances(ctx, tx, &resp.Instances)
 	})
 	if err != nil {

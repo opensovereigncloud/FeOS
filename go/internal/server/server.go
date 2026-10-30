@@ -319,7 +319,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	fl = fleet.New(fleet.Config{
 		InstanceID: i.id, TrustDomain: cfg.TrustDomain, NodeCertTTL: cfg.NodeCertTTL, PodCertTTL: cfg.PodCertTTL,
 		RolloutGrace: cfg.RolloutGrace, NodeTTL: cfg.NodeTTL, ConnDrainTimeout: cfg.ConnDrainTimeout,
-		ActivityRetention: cfg.ActivityRetention, PodNetwork: i.podNetwork, Log: i.log,
+		ActivityRetention: cfg.ActivityRetention, PodNetwork: i.podNetwork, SinkEndpoint: cfg.SinkEndpoint, Log: i.log,
 	}, fleet.Deps{DB: i.DB, Store: i.Store, Issuer: i.Issuer, Links: i.Links, Hooks: i.Engine, Bindings: i.Bindings,
 		Activity: i.Activity, Elector: i.Elector})
 	i.Fleet = fl
@@ -425,7 +425,7 @@ func (i *Instance) newEnvironments(key []byte) (*env.Service, error) {
 	s, err := env.New(env.Deps{
 		InstanceID: i.id, DB: i.DB, Store: i.Store, Elector: i.Elector, Conns: i.Links, Engine: i.Engine,
 		Runner: runner, Ports: fwd, Sealer: sealer, AppsZone: i.cfg.AppsZone, EnvChanged: i.Domains.EnvChanged,
-		Log: i.log,
+		SinkURL: i.cfg.SinkURL, Log: i.log,
 	})
 	if err != nil {
 		return nil, err

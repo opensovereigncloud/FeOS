@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -89,6 +90,10 @@ type Sandbox struct {
 	// TenantJob makes the row a tenant's job's pod (ADR 0018), its ID the
 	// job's; fixed at the insert.
 	TenantJob bool
+	// LogLabels are the labels of the pod's container logs (ADR 0026),
+	// sent with its create; fixed at the insert, empty for a sandbox a
+	// tenant made itself.
+	LogLabels map[string]string
 }
 
 // IsInstance reports whether the row is an instance of an environment or
@@ -119,7 +124,8 @@ func sandboxColumns(p string) string {
 		"checkpoint_epoch", "checkpoint_head", "checkpoint_memory", "checkpoint_at", "checkpoint_store",
 		"pending_since", "unreachable_since", "run_id", "kube_version", "ssh_version",
 		"created_at", "updated_at", "last_active_at", "paused_at", "policy_failed", "policy_failures",
-		"policy_not_before", "environment_id", "pod_template", "pin_node", "idle_after_s", "address", "tenant_job"}
+		"policy_not_before", "environment_id", "pod_template", "pin_node", "idle_after_s", "address", "tenant_job",
+		"log_labels"}
 	if p != "" {
 		for i, c := range cols {
 			cols[i] = p + "." + c
@@ -143,14 +149,15 @@ func scanSandbox(row pgx.Row) (Sandbox, error) {
 		&s.CheckpointEpoch, &s.CheckpointHead, &s.CheckpointMemory, &cpAt, &s.CheckpointStore,
 		&pendingSince, &unreachableSince, &s.RunID, &s.KubeVersion, &s.SSHVersion,
 		&s.CreatedAt, &s.UpdatedAt, &s.LastActiveAt, &pausedAt, &s.PolicyFailed, &s.PolicyFailures,
-		&policyNotBefore, &envID, &template, &s.PinNode, &s.IdleAfterS, &s.Address, &s.TenantJob)
+		&policyNotBefore, &envID, &template, &s.PinNode, &s.IdleAfterS, &s.Address, &s.TenantJob,
+		&s.LogLabels)
 	if err != nil {
 		return Sandbox{}, err
 	}
 	s.Node, s.LostFrom, s.OpID = stringOf(node), stringOf(lostFrom), uuidOf(opID)
 	s.OpDeadline, s.CheckpointAt, s.PendingSince = timeOf(opDeadline), timeOf(cpAt), timeOf(pendingSince)
 	s.UnreachableSince, s.PausedAt, s.PolicyNotBefore = timeOf(unreachableSince), timeOf(pausedAt), timeOf(policyNotBefore)
-	s.AvoidNodes = nonNil(s.AvoidNodes)
+	s.AvoidNodes, s.LogLabels = nonNil(s.AvoidNodes), stringMap(s.LogLabels)
 	s.EnvironmentID = uuidOf(envID)
 	if template != nil {
 		var t model.PodTemplate
@@ -250,6 +257,8 @@ type NewSandbox struct {
 	// TenantJob makes the row a tenant's job's pod (the caller inserts
 	// the job under its ID in the same transaction).
 	TenantJob bool
+	// LogLabels are the labels of the pod's logs (model.Log*); nil: none.
+	LogLabels map[string]string
 }
 
 // CreateSandbox inserts the sandbox unless its ID exists. It returns the
@@ -261,12 +270,16 @@ func (s *Store) CreateSandbox(ctx context.Context, n NewSandbox) (Sandbox, bool,
 	if err != nil {
 		return Sandbox{}, false, fmt.Errorf("create sandbox %s: %w", n.ID, err)
 	}
+	logLabels, err := jsonText(stringMap(n.LogLabels))
+	if err != nil {
+		return Sandbox{}, false, fmt.Errorf("create sandbox %s: log labels: %w", n.ID, err)
+	}
 	for range 3 {
 		sb, err := scanSandbox(s.q.QueryRow(ctx, `INSERT INTO sandboxes (id, owner, image, vcpus, memory_mib, image_ref,
-				environment_id, pod_template, pin_node, idle_after_s, tenant_job)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11) ON CONFLICT (id) DO NOTHING RETURNING `+sandboxCols,
+				environment_id, pod_template, pin_node, idle_after_s, tenant_job, log_labels)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12::jsonb) ON CONFLICT (id) DO NOTHING RETURNING `+sandboxCols,
 			n.ID, n.Owner, n.Image, n.VCPUs, n.MemoryMiB, n.ImageRef, nullUUID(n.EnvironmentID), template, n.PinNode,
-			n.IdleAfterS, n.TenantJob))
+			n.IdleAfterS, n.TenantJob, logLabels))
 		if err == nil {
 			return sb, true, s.Notify(ctx, chanSandbox, sb.ID.String())
 		}
@@ -518,7 +531,7 @@ func nullableColumn(name string, lifecycle bool, get func(*Sandbox) string) sand
 // sandboxWritable lists the columns UpdateSandbox writes. A lifecycle
 // write is one of client_state, node, op*, incarnation, materialised or
 // the checkpoint columns. id, owner, image, vcpus, memory_mib,
-// environment_id, pod_template, tenant_job and created_at are never written; gen and
+// environment_id, pod_template, tenant_job, log_labels and created_at are never written; gen and
 // updated_at are UpdateSandbox's.
 var sandboxWritable = []sandboxColumn{
 	plainColumn("incarnation", true, func(s *Sandbox) uuid.UUID { return s.Incarnation }),
@@ -570,6 +583,7 @@ var sandboxFixed = []sandboxColumn{
 	{name: "environment_id", equal: func(a, b *Sandbox) bool { return a.EnvironmentID == b.EnvironmentID }},
 	{name: "pod_template", equal: func(a, b *Sandbox) bool { return sameTemplate(a.PodTemplate, b.PodTemplate) }},
 	{name: "tenant_job", equal: func(a, b *Sandbox) bool { return a.TenantJob == b.TenantJob }},
+	{name: "log_labels", equal: func(a, b *Sandbox) bool { return maps.Equal(a.LogLabels, b.LogLabels) }},
 }
 
 // UpdateSandbox writes the columns in which after differs from before, the

@@ -28,6 +28,9 @@ type Sandbox struct {
 // Tenant is a request made with a tenant's token.
 type Tenant struct {
 	Name string
+	// Token is the bearer the request came with: a read on the tenant's
+	// behalf passes it on (the sink, ADR 0026), and nothing keeps it.
+	Token string
 }
 
 // Admin is a request made by an operator: with a password of
