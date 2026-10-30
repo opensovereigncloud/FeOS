@@ -24,12 +24,6 @@ import (
 	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
-// ServerID is the SPIFFE ID of the sink instance name, the one URI of its
-// certificate, which the nodes check.
-func ServerID(td, name string) string {
-	return "spiffe://" + td + "/sink/" + name
-}
-
 // pathServiceCertificates is ferund's call that issues the certificate.
 const pathServiceCertificates = "/api/v1/service-certificates"
 
@@ -157,8 +151,8 @@ func (i *Identity) obtain(ctx context.Context) (*identity, error) {
 		return nil, fmt.Errorf("the answer's bundle: %v", errOr(err, "none"))
 	}
 	leaf := chain[0]
-	if len(leaf.URIs) != 1 || leaf.URIs[0].String() != ServerID(i.td, i.name) {
-		return nil, fmt.Errorf("the certificate's URI names are %v, not %s alone", leaf.URIs, ServerID(i.td, i.name))
+	if len(leaf.URIs) != 1 || leaf.URIs[0].String() != pki.SinkID(i.td, i.name) {
+		return nil, fmt.Errorf("the certificate's URI names are %v, not %s alone", leaf.URIs, pki.SinkID(i.td, i.name))
 	}
 	if pub, ok := leaf.PublicKey.(ed25519.PublicKey); !ok || !pub.Equal(key.Public()) {
 		return nil, errors.New("the certificate is not of the key asked for")

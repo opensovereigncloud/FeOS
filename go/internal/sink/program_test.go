@@ -88,7 +88,7 @@ func (f *fakeFerund) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		// ferund's own issuance is built apart; a pod's certificate has
 		// the shape the contract asks: the one URI, ServerAuth.
-		c, leaf, err := f.iss.IssuePod(b.Bytes, ServerID(testTD, "sink-0"), nil, 24*time.Hour)
+		c, leaf, err := f.iss.IssueSink(b.Bytes, "sink-0", 24*time.Hour)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -151,7 +151,7 @@ func nodeTLS(t *testing.T, iss *pki.Issuer, name string, pod bool) *tls.Config {
 			if _, err := certs[0].Verify(x509.VerifyOptions{Roots: iss.Bundle(), Intermediates: inter}); err != nil {
 				return err
 			}
-			if len(certs[0].URIs) != 1 || certs[0].URIs[0].String() != ServerID(testTD, "sink-0") {
+			if len(certs[0].URIs) != 1 || certs[0].URIs[0].String() != pki.SinkID(testTD, "sink-0") {
 				return errors.New("not the sink")
 			}
 			return nil
