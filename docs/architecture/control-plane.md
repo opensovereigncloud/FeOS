@@ -36,13 +36,14 @@ instance serves any request. Each has two listeners:
 | the front doors, `--listen` | `:8100` | the REST API, MCP at `/mcp`, the ports at `/fwd/`, sign-in at `/auth/`, the management UI, `/healthz`, `/readyz` | an HTTPS balancer, without sticky sessions; or TLS of its own with `--tls-cert` and `--tls-key` |
 | the nodes' port, `--node-listen` | `:7443` | node connections, uplinks and joins, and the connections of `ferun-ingress`; TLS 1.3 always | a TCP passthrough, or the instances' own addresses |
 
-`ferund` has four subcommands:
+`ferund` has these subcommands (`new-issuer` too, [The CA ceremony](#the-ca-ceremony)):
 
     ferund [serve] [flags]          run an instance (the default)
     ferund init-ca --root-dir R --dir D --dns-domain X [--dns-domain Y ...]
                    [--trust-domain T] [--control-plane-domain C]
     ferund join-token --database-url URL [--ca-dir D] [--trust-domain T]
                       [--kind node|ingress] [--ttl 1h] [--node NAME]
+    ferund service-token --database-url URL --kind sink --name NAME
     ferund migrate --database-url URL
 
 Every flag has an environment variable `FERUN_<NAME>`, the flag's name in
@@ -54,7 +55,8 @@ sizes as integers with an optional `KiB`, `MiB` or `GiB` suffix.
 defaults. `serve` migrates the database at its start; `migrate` does only
 that. `join-token` issues a node's token, or with `--kind ingress` one
 for an instance of `ferun-ingress`; `--node` pins it to a name of that
-kind ([The ingress](#the-ingress)).
+kind ([The ingress](#the-ingress)). `service-token` issues the long-lived
+token of an instance of `ferun-sink` ([The sink](#the-sink)).
 
 ### serve's flags
 
@@ -114,6 +116,8 @@ kind ([The ingress](#the-ingress)).
 | `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus a pause's deadline and 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
 | `--shutdown-grace` | `11m` | how long a stopping instance waits for its requests, its tool calls and its ops |
 | `--activity-retention`, `--traffic-retention`, `--access-log-retention` | `720h`, `168h`, `168h` | how long activity, traffic records and the ingress's access log are kept |
+| `--sink-endpoint` | none | `host:port` of the sink's ingest ([The sink](#the-sink)), named in every telemetry answer to the nodes, which ship their pods' logs there; empty: nothing is shipped |
+| `--sink-url` | none | the sink's HTTP API inside the cluster, e.g. `http://ferun-sink:8080`, which the logs calls read first; empty: the nodes only |
 | `--log-level` | `info` | |
 
 Fixed timings, not flags (`internal/config`): an instance's heartbeat every
@@ -220,7 +224,8 @@ replicate synchronously ([Operations](#operations)).
   domains](#certificates-of-domains)); `0016_access_logs.sql`, the
   ingress's access log ([The ingress service](#the-ingress-service));
   `0017_tenant_jobs.sql`, the tenants' jobs and `sandboxes.tenant_job`
-  ([Tenants' jobs](#tenants-jobs))) and
+  ([Tenants' jobs](#tenants-jobs)); `0019_sink.sql`, `sandboxes.log_labels`,
+  `jobs.log_retention_days` and `service_tokens` ([The sink](#the-sink))) and
   applied under an advisory lock, recorded in `schema_migrations`. The
   same locked section creates the cluster's MCP session key, reconciles
   `--pod-network` with the database's ([The pods'
@@ -269,7 +274,8 @@ log), partitioned by day; `issued_certs`
 `domains` ([Domains](#domains)); `domain_certs`, `acme_accounts`,
 `acme_challenges` (the domains' certificates, [Certificates of
 domains](#certificates-of-domains)); `jobs` (the tenants' jobs,
-[Tenants' jobs](#tenants-jobs)).
+[Tenants' jobs](#tenants-jobs)); `service_tokens` (the sink's tokens,
+[The sink](#the-sink)).
 Tokens are stored as SHA-256 hashes only, and shown once, at their
 creation.
 `placements`, which held the placement decisions and was written and read
@@ -1229,11 +1235,12 @@ The routes, bodies, status codes and texts are the sandbox system's;
 | Class | Routes | Credential |
 |---|---|---|
 | admin | `/api/v1/admin/…` | an admin's UI session (cookie), or Basic with `--admin-users` |
-| tenant | `/api/v1/sandboxes`, `/api/v1/sandboxes/{id}` (create, list, get, delete, pause, resume, tokens, access), `/api/v1/tools`, `/api/v1/environments[/…]` but the route door, `/api/v1/domains[/…]` | a tenant's token |
+| tenant | `/api/v1/sandboxes`, `/api/v1/sandboxes/{id}` (create, list, get, delete, pause, resume, tokens, access), `/api/v1/tools`, `/api/v1/environments[/…]` but the route door, `/api/v1/domains[/…]`, `/api/v1/jobs[/…]`, `/api/v1/tenant` | a tenant's token |
 | sandbox | `/api/v1/sandboxes/{id}/…`: exec, files, dirs, search, fetch, processes, calls, watches, bindings | the sandbox's own token |
 | mcp | `/mcp` | the sandbox's token, with the door's own answers |
 | forward | `/fwd/…`, `/api/v1/sandboxes/{id}/ports/…` | the sandbox's token in `Authorization` alone ([ports](#ports)) |
 | route | `/api/v1/environments/{env}/http/…` | a route token of the environment ([the route door](#the-route-door)) |
+| service | `POST /api/v1/service-certificates` | a service token ([The sink](#the-sink)) |
 | public | `/healthz`, `/readyz`, `/auth/…`, the UI | none |
 
 A tenant's token is not accepted on a sandbox route, not even for its own
@@ -1255,7 +1262,7 @@ it relies on the sandbox. The admin API has tenants, each with `sandboxCount` (i
 sandboxes, without its environments' instances), `environmentCount` (its
 environments not being deleted) and its tokens (hashed, shown once),
 nodes (with their connections to the serving instance, certificates,
-drain, removal and capacity settings), join tokens, instances and the leader, and the
+drain, removal and capacity settings), join tokens, service tokens (list and revoke, [The sink](#the-sink)), instances and the leader, and the
 activity of a sandbox or a node, with gaps and traffic records. `GET
 /api/v1/admin/nodes` answers the nodes and `defaults`, the serving
 instance's settings that the UI explains the fleet with:
@@ -1740,6 +1747,7 @@ with its ops, bookings, tombstones and holds. `0006` adds five columns:
 | `pin_node` | a create goes to this node alone; a start or resume goes to the row's own node anyway, where its pod and volume are, and a restore anywhere, its checkpoint carrying the volume; a pinned row avoids no node |
 | `idle_after_s` | NULL: `--idle-pause`; 0: never; n: seconds |
 | `address` | the pod's IPv6 address as last observed in CreatePod, RestorePod, GetPod and ListPods, cleared when the pod is gone or hibernated; a change on an instance row, or on a row whose pod has groups of its own, sends `env-groups` in its transaction |
+| `log_labels` | (`0019`) the labels of the pod's container logs, sent beside the spec with its create ([The sink](#the-sink)); fixed |
 
 A row with a template builds its pod from it: the container `main` with
 the row's pinned image and the template's command (none: the image's
@@ -2464,7 +2472,8 @@ its `url` (`https://<host><prefix>`) for a route to an image service of
 a public environment and `route` for every other, `public`, its `hosts`
 (its default host while it is public, the platform has an apps zone and
 it is not being deleted; otherwise empty), and the number of open
-incidents. The listing shows `public` and `hosts` too. An
+incidents. An instance carries its `image`, `registry/repository@sha256:…`
+as its release resolved it. The listing shows `public` and `hosts` too. An
 incident has its object, release, condition, summary, opening and
 closing, and evidence: `exits`, `logTail` (redacted and bounded), `diff`
 (since the realised release), `placement`, and `pending`, what a release
@@ -2494,7 +2503,7 @@ name; one the tenant does not have is 404 "no such environment".
 | `GET …/{env}/secrets`, `PUT`, `DELETE …/secrets/{name}` | the names with their latest versions; `{name, version}`; 204, 409 while pinned |
 | `GET …/{env}/incidents[?open=1]`, `…/incidents/{id}` | newest first; one |
 | `GET …/{env}/access-logs[?limit=200&beforeTsNs=&traceId=]` | `{records}`: the newest page of the ingress's access log before `beforeTsNs` (a record's `tsNs`, a string), at most 1000, ascending, of the trace `traceId` (32 lower case hex digits; else 400) when given; each `{tsNs, time, durationNs, ingress, service, instance, host, method, path, proto, status, outcome, attempts, heldNs, bytesIn, bytesOut, clientIp, userAgent, traceId, spanId, parentSpanId}` ([ingress.md](ingress.md#access-log)) |
-| `GET …/{env}/objects/{kind}/{name}/logs?lines=200&replica=0` | `{lines, source}`, the source `container` or `process`; 501; 409 "paused", `not_running` (also for a replica without an instance yet, or none at all); 404 for a replica beyond the object's ([Logs](#probes-exits-and-restarts)) |
+| `GET …/{env}/objects/{kind}/{name}/logs?lines=200&replica=0` | `{lines, source}`, the source `container` or `process`; with `--sink-url` a container's log is the sink's first ([The sink](#the-sink)); 501; 409 "paused" (unless the sink has the instance's lines), `not_running` (also for a replica without an instance yet, or none at all); 404 for a replica beyond the object's ([Logs](#probes-exits-and-restarts)) |
 | `POST …/{env}/services/{name}/restart` | 202: an image service's replicas one at a time, each waited for until it is live again, up to 5 minutes, or an attached service's process |
 | `POST …/{env}/jobs/{name}/run` | 202; 409 `busy` "job X runs already (release N, attempt M)" with `Retry-After: 30` while a run of the job runs, of any release; 409 `not_ready` |
 | `POST`, `DELETE …/{env}/route-tokens` | 201 `{token}`; 204 |
@@ -2545,6 +2554,7 @@ create (ADR 0025).
 | `sealed` | the secrets and image credentials, sealed; NULL once the job has ended |
 | `phase`, `reason`, `detail`, `exit_code` | `queued`, `running`, `succeeded`, `failed` (`exit`, `image`, `node_lost`, `no_exit_status`), `deadline_exceeded`, `cancelled` |
 | `result`, `log_tail` | the result file's first 4 KiB; the log's last 1000 lines within 64 KiB, redacted of the job's secrets |
+| `log_retention_days` | the create's `logRetentionDays` (`0019`), the pod's `ferun.retention_days`; NULL: the sink's default |
 | `created_at`, `started_at`, `finished_at`, `deadline_at` | `deadline_at` is the create's `now()` plus its deadline (10 minutes when unset, at most 2 hours) |
 
 `env-probe` looks at every tenant's job that has not ended, on the
@@ -2571,10 +2581,10 @@ any row, and its deadline counts on.
 
 | Method and path | Answers |
 |---|---|
-| `POST /api/v1/jobs` `{image, command?, env?, secrets?, imageCredentials?, vcpus?, memoryMib?, deadline?, resultPath?, labels?}` | 201 the job; with an `Idempotency-Key` a create made with the same body 200 with that job, another body 422 `job_key_conflict`; 422 for an image that does not resolve; 400 for what the body gets wrong (an env or secret name that is no variable's, one in both, a size out of range, a deadline above 2h, a `resultPath` that is not absolute and clean or lies under `/dev`); 503 "secrets need --secret-key-file" for secrets or image credentials without it; 409 while the tenant is being deleted |
+| `POST /api/v1/jobs` `{image, command?, env?, secrets?, imageCredentials?, vcpus?, memoryMib?, deadline?, resultPath?, labels?, logRetentionDays?}` | 201 the job; with an `Idempotency-Key` a create made with the same body 200 with that job, another body 422 `job_key_conflict`; 422 for an image that does not resolve; 400 for what the body gets wrong (an env or secret name that is no variable's, one in both, a size out of range, a deadline above 2h, a `resultPath` that is not absolute and clean or lies under `/dev`, a `logRetentionDays` outside 1 to 400); 503 "secrets need --secret-key-file" for secrets or image credentials without it; 409 while the tenant is being deleted |
 | `GET /api/v1/jobs?label=k=v` | `{jobs}`, newest first, the labels ANDed |
-| `GET /api/v1/jobs/{id}` | `{id, image, imageRef, phase, reason, detail, exitCode, result, resultPath, vcpus, memoryMib, labels, createdAt, startedAt, finishedAt, deadlineAt}` |
-| `GET /api/v1/jobs/{id}/logs?lines=200` | `{lines}`: from the pod while it runs, redacted of the job's secrets; none while it is queued; the kept tail once it has ended |
+| `GET /api/v1/jobs/{id}` | `{id, image, imageRef, phase, reason, detail, exitCode, result, resultPath, vcpus, memoryMib, labels, createdAt, startedAt, finishedAt, deadlineAt, logRetentionDays?}` (`logRetentionDays` only when the create asked) |
+| `GET /api/v1/jobs/{id}/logs?lines=200` | `{lines}`: while it runs the sink's (with `--sink-url`) or else the pod's, redacted of the job's secrets; none while it is queued; the kept tail once it has ended |
 | `POST /api/v1/jobs/{id}/cancel` | the job, `cancelled` unless it had ended |
 | `DELETE /api/v1/jobs/{id}` | 204 |
 
@@ -2956,6 +2966,61 @@ it deleting, so that its domains' states follow at once. The loop
 domain's own, an environment's deletion or a publicity changed by
 another writer; it leaves a grace's end to the check due then, which
 first looks whether the record is right again.
+
+## The sink
+
+`ferun-sink` keeps the platform's logs ([ADR 0026](../adr/0026-the-sink.md),
+[sink.md](sink.md)): a program of its own, which `ferund` neither carries
+nor waits for. `ferund`'s part:
+
+- **Labels.** The insert of an environment's instance or job run and of a
+  tenant's job's pod writes `sandboxes.log_labels` (`model.Log*`):
+  `ferun.tenant`, `ferun.instance` (the row's ID); an environment's
+  `ferun.environment`, `ferun.kind`, `ferun.object`, `ferun.replica`,
+  `ferun.release` (the release the instance was inserted for: a kept
+  instance's later release does not change it), a job run's
+  `ferun.attempt`; a tenant's job's `ferun.job` (its ID), `ferun.attempt`
+  `1` and, when it asked, `ferun.retention_days`. The engine sends them
+  as `CreatePodRequest.log_labels`, beside the spec: a create delivered
+  again finds its pod whatever the labels, and a restore sends none
+  (`feosd` keeps the pod's record). A sandbox a tenant made itself, an
+  attached service's workspace included, has none, and its logs are not
+  shipped. A row an instance of the previous version inserted has `{}`.
+- **The nodes.** Every `TelemetryResponse` names `--sink-endpoint`
+  (`sink_endpoint`); empty, the nodes ship nothing.
+- **Reads.** With `--sink-url`, the objects' logs call (a replica's or an
+  addon's instance, a job's latest run) and a running tenant's job's logs
+  ask the sink first: `GET <sink-url>/api/v1/logs?instance=<sandbox ID>`
+  (`job=<ID>` for a tenant's job) `&container=main&direction=backward&since=<the row's creation, the run's
+  start>&limit=500`, paged by its `cursor` up to `lines` and the answer's
+  budget (8 KiB a line, 4 MiB), with the caller's own bearer, so that the
+  sink answers the tenant's streams only. A sink that fails or has no
+  line leaves the read to the node, as before; a paused instance whose
+  lines the sink has is answered, not 409 "paused". A tenant's job's lines
+  are redacted of its secrets; an ended job answers its kept tail, as its
+  secrets are gone and the sink's lines are not redacted. An attached
+  service's process log is the node's.
+- **`GET /api/v1/tenant`** (tenant class): `{"tenant": "<name>"}`, the
+  token's tenant, which the sink asks for its readers; 401 otherwise.
+- **Service tokens.** `ferund service-token --kind sink --name <name>`
+  prints `feos-sink-<secret>` once; `service_tokens` keeps its SHA-256,
+  kind, name, creator, creation and last use, and an activity row
+  (`service_token_created`) says who made it. `GET
+  /api/v1/admin/service-tokens` lists them (never the token), `DELETE
+  /api/v1/admin/service-tokens/{id}` revokes one (`{revoked}`, an
+  activity row `service_token_revoked`); the certificates issued under it
+  live on until their end.
+- **`POST /api/v1/service-certificates`** (service class: `Authorization:
+  Bearer feos-sink-…`) `{"csr": "<PEM CERTIFICATE REQUEST>"}` →
+  `{"certificate": "<PEM leaf and issuer>", "bundle": "<PEM roots>",
+  "notAfter": "<RFC 3339>"}`: a server certificate (ServerAuth) for the
+  CSR's key (Ed25519 or ECDSA P-256), valid 24 h, its one URI
+  `spiffe://<td>/sink/<name>` (`pki.SinkID`, `pki.ParseSinkID`) and no
+  DNS name or address, which no pod's certificate may name. An unknown or
+  revoked token is 401 "unknown service token", a CSR that is not one
+  400, and more than 10 requests of a token within an hour (counted on
+  the token's row, on the database's clock) 429; each certificate is an
+  activity row (`service_cert`, credential).
 
 ## The activity log
 

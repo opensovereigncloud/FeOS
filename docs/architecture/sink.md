@@ -195,16 +195,29 @@ Deletes the streams, their lines and chunks. 204.
 ## `ferund`
 
 - **Labels**: an environment's instance and job run, and a tenant's job,
-  get `log_labels` on their pod's create (the table above).
-  `POST /api/v1/jobs` takes `logRetentionDays` (1 to 400), which becomes
-  `ferun.retention_days`.
+  get `log_labels` on their pod's create (the table above), kept on their
+  sandbox row (`sandboxes.log_labels`, migration `0019`). `ferun.release`
+  is the release the instance was made for. A sandbox a tenant made
+  itself (an attached service's workspace too) has none: its logs are
+  not shipped. `POST /api/v1/jobs` takes `logRetentionDays` (1 to 400),
+  which becomes `ferun.retention_days`.
 - `--sink-endpoint` (host:port of the ingest) to the nodes;
   `--sink-url` (the API, inside the cluster) for its own reads.
 - `GET /api/v1/tenant`: the token's tenant.
-- `ferund service-token --kind sink --name <name>`, and `POST
-  /api/v1/service-certificates`.
+- `ferund service-token --kind sink --name <name>` prints
+  `feos-sink-<secret>` once; `GET /api/v1/admin/service-tokens` lists the
+  tokens, `DELETE /api/v1/admin/service-tokens/{id}` revokes one (the
+  certificates issued under it live on, 24 h at most). `POST
+  /api/v1/service-certificates` issues a server certificate
+  (ServerAuth, no DNS name) for an Ed25519 or ECDSA P-256 key; at most 10
+  requests of a token an hour (429).
 - `InstanceStatus.image`: the image the instance runs,
   `registry/repository@sha256:…` as the release resolved it.
 - The objects' logs call and a job run's log read from the sink when
-  `--sink-url` is set, with the caller's token, and from the node as
-  before when the sink has no lines or fails.
+  `--sink-url` is set, with the caller's token
+  (`instance=<sandbox ID>&container=main&direction=backward&since=<its
+  start>`, paged), and from the node as before when the sink has no lines
+  or fails; a paused instance's lines are answered from the sink. A
+  tenant's job's log reads the sink while the job runs, redacted of its
+  secrets; once it has ended, its kept tail, as its secrets are gone then
+  (its full log is the sink's own `GET /api/v1/logs?job=<id>`).
