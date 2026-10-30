@@ -21,12 +21,14 @@ import (
 // statement of its own with a fresh snapshot: the sandbox runs without an
 // op, idles at all and was last active more than its idle interval ago
 // (its idle_after_s, else idle; 0 never), no failed idle pause backs it
-// off, and the ingress's fence does not keep it awake (ingressFence). A
-// sandbox that does not exist fails it.
+// off, the ingress's fence does not keep it awake (ingressFence), and no
+// attached service keeps it running (attachedAwake). A sandbox that does
+// not exist fails it.
 func (s *Store) IdleRecheck(ctx context.Context, id podid.ID, idle time.Duration) (bool, error) {
 	var ok bool
 	err := s.q.QueryRow(ctx, `SELECT client_state = 'running' AND op = '' AND `+idleOn(2)+`
 			AND last_active_at < now() - `+idleAfter(2)+` AND `+policyDue(PolicyIdle)+` AND `+ingressFence+`
+			AND NOT `+attachedAwake+`
 		FROM sandboxes s WHERE id = $1`, id, interval(idle)).Scan(&ok)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil

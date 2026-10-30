@@ -129,6 +129,25 @@ func idleOf(s spec.Service) int {
 	return int(d / time.Second)
 }
 
+// attachedIdleOf is an attached service's idle_after_s: the seconds of
+// its idle, 0 for never, nil when it has none (no claim: its sandbox's
+// own interval applies).
+func attachedIdleOf(s spec.Service) *int {
+	if s.Idle == spec.IdleNever {
+		n := 0
+		return &n
+	}
+	if s.Idle == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(s.Idle)
+	if err != nil || d <= 0 {
+		return nil
+	}
+	n := int(d / time.Second)
+	return &n
+}
+
 // rolloutOf is an image service's rollout budget: 10m when unset.
 func rolloutOf(s spec.Service) time.Duration {
 	if s.Rollout == nil {

@@ -880,18 +880,30 @@ func idleOn(n int) string {
 // IdleSandboxes returns up to limit running sandboxes without an op on one
 // of nodes whose last_active_at is older than their idle interval (their
 // idle_after_s, or idle for a row without one; 0 never idles), that have
-// no live hold of any kind, that no failed idle pause backs off and that
+// no live hold of any kind, that no failed idle pause backs off, that
 // the ingress's fence does not keep awake (ingressFence: a service
-// instance of a public environment while an ingress may be cut off), the
-// least recently active first.
+// instance of a public environment while an ingress may be cut off) and
+// that no attached service keeps running (attachedAwake), the least
+// recently active first.
 func (s *Store) IdleSandboxes(ctx context.Context, idle time.Duration, nodes []string, limit int) ([]Sandbox, error) {
 	return collectSandboxes(s.q.Query(ctx, "SELECT "+sandboxColumns("s")+` FROM sandboxes s
 		WHERE s.client_state = 'running' AND s.op = '' AND `+idleOn(1)+` AND s.last_active_at < now() - `+idleAfter(1)+`
 			AND s.node = ANY($2) AND `+policyDue(PolicyIdle)+`
 			AND NOT EXISTS (SELECT 1 FROM sandbox_holds h WHERE h.sandbox_id = s.id AND h.lease_until > now())
-			AND `+ingressFence+`
+			AND `+ingressFence+` AND NOT `+attachedAwake+`
 		ORDER BY s.last_active_at LIMIT $3`, interval(idle), nonNil(nodes), limit))
 }
+
+// attachedAwake is the condition under which a sandbox row s stays running
+// for an attached service whose process runs in its incarnation (ADR 0018,
+// "An attached service idles as an image service does"): one that starts,
+// until its awake_until; one whose idle is 0 (never); one with an idle,
+// while s was active within it. A sandbox's idle interval is thus the
+// longest of its own and its attached services' claims.
+const attachedAwake = `EXISTS (SELECT 1 FROM env_attached a WHERE a.sandbox_id = s.id AND a.process_id <> ''
+		AND a.sandbox_incarnation = s.incarnation
+		AND (a.awake_until > now() OR a.idle_after_s = 0
+			OR s.last_active_at > now() - make_interval(secs => a.idle_after_s)))`
 
 // HibernateCandidates returns up to limit paused sandboxes without an op,
 // paused for longer than after, on one of nodes that has an object store,

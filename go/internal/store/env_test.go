@@ -1033,3 +1033,96 @@ func TestIngressNotifications(t *testing.T) {
 	}
 	expectPayload(t, ch, ingressEnv(other.ID))
 }
+
+// An attached service keeps the sandbox it runs in awake (ADR 0018, "An
+// attached service idles as an image service does"): while it starts,
+// until its awake_until; with an idle, while the sandbox was active within
+// it; with idle 0 (never), always; with neither, not at all. Only a
+// process in the sandbox's current incarnation counts, and the idle
+// loop and its recheck agree.
+func TestAttachedServicesKeepTheirSandboxAwake(t *testing.T) {
+	s, _ := newStore(t)
+	mkTenant(t, s, "acme")
+	mkNode(t, s, "n1")
+	env := mkEnv(t, s, "acme", "preview")
+	sb := mkSandbox(t, s, "acme")
+	place(t, s, sb.ID, "n1", model.StateRunning)
+	inc := get(t, s, sb.ID).Incarnation
+	exec(t, s, "UPDATE sandboxes SET last_active_at = now() - interval '5 minutes' WHERE id = $1", sb.ID)
+	idle := func() bool {
+		t.Helper()
+		rows, err := s.IdleSandboxes(bg, 10*time.Second, []string{"n1"}, 10)
+		must(t, err)
+		ok, err := s.IdleRecheck(bg, sb.ID, 10*time.Second)
+		must(t, err)
+		if (len(rows) == 1) != ok {
+			t.Fatalf("the loop (%d rows) and the recheck (%v) disagree", len(rows), ok)
+		}
+		return ok
+	}
+	if !idle() {
+		t.Fatal("a sandbox without attached services idles after its own interval")
+	}
+	a, err := s.InsertAttached(bg, store.EnvAttached{EnvID: env.ID, Service: "web", SandboxID: sb.ID, SandboxIncarnation: inc,
+		ProcessID: "p1"})
+	must(t, err)
+	if !idle() {
+		t.Fatal("an attached service without a claim kept the sandbox awake")
+	}
+	// It starts: awake until its budget is spent.
+	starting := a
+	starting.AwakeUntil = time.Now().Add(10 * time.Minute)
+	a, err = s.UpdateAttached(bg, a, starting)
+	must(t, err)
+	if idle() {
+		t.Fatal("a starting service did not keep its sandbox awake")
+	}
+	spent := a
+	spent.AwakeUntil = time.Now().Add(-time.Second)
+	a, err = s.UpdateAttached(bg, a, spent)
+	must(t, err)
+	if !idle() {
+		t.Fatal("a spent budget kept the sandbox awake")
+	}
+	// Ready with an idle of 15 minutes: awake within it, not after.
+	fifteen := 15 * 60
+	ready := a
+	ready.AwakeUntil, ready.Phase, ready.IdleAfterS = time.Time{}, model.PhaseReady, &fifteen
+	a, err = s.UpdateAttached(bg, a, ready)
+	must(t, err)
+	if a.IdleAfterS == nil || *a.IdleAfterS != fifteen || !a.AwakeUntil.IsZero() {
+		t.Fatalf("written: %+v", a)
+	}
+	if idle() {
+		t.Fatal("active 5 minutes ago, within its 15 minutes: paused")
+	}
+	exec(t, s, "UPDATE sandboxes SET last_active_at = now() - interval '20 minutes' WHERE id = $1", sb.ID)
+	if !idle() {
+		t.Fatal("past its idle, the sandbox did not idle")
+	}
+	// Never: awake while its process runs.
+	zero := 0
+	never := a
+	never.IdleAfterS = &zero
+	a, err = s.UpdateAttached(bg, a, never)
+	must(t, err)
+	if idle() {
+		t.Fatal("idle never: paused")
+	}
+	// Its process gone, or of an older incarnation: no claim.
+	gone := a
+	gone.ProcessID = ""
+	a, err = s.UpdateAttached(bg, a, gone)
+	must(t, err)
+	if !idle() {
+		t.Fatal("a service without a process kept the sandbox awake")
+	}
+	back := a
+	back.ProcessID = "p2"
+	a, err = s.UpdateAttached(bg, a, back)
+	must(t, err)
+	exec(t, s, "UPDATE sandboxes SET incarnation = gen_random_uuid() WHERE id = $1", sb.ID)
+	if !idle() {
+		t.Fatal("a process of the old incarnation kept the new one awake")
+	}
+}

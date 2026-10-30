@@ -674,7 +674,27 @@ func (c *Controller) superviseAttached(ctx context.Context, v *view, p *attached
 	if after.ProcessID != "" {
 		c.attachedReadiness(ctx, p, l, a, &after, now)
 	}
+	keepAwake(&after, a, p, now, duration("", spec.DefaultRolloutTimeout))
 	c.writeAttached(ctx, a, after, l)
+}
+
+// keepAwake sets what the service claims of its sandbox (ADR 0018, "An
+// attached service idles as an image service does"): a process started
+// by this look keeps it running until it is ready, for at most budget
+// from its start; a ready one, or one whose process is gone, no longer
+// does; once it runs, its idle (the plan's) applies.
+func keepAwake(after *store.EnvAttached, before store.EnvAttached, p *attachedPlan, now time.Time, budget time.Duration) {
+	switch {
+	case after.ProcessID == "" || after.Phase == model.PhaseReady:
+		after.AwakeUntil = time.Time{}
+	case after.ProcessID != before.ProcessID:
+		after.AwakeUntil = now.Add(budget)
+	}
+	if (p.idle == nil) != (before.IdleAfterS == nil) || (p.idle != nil && *p.idle != *before.IdleAfterS) {
+		after.IdleAfterS = p.idle
+	} else {
+		after.IdleAfterS = before.IdleAfterS // the same: no write
+	}
 }
 
 // processName is the name of an attached service's process (§13.4).
@@ -794,6 +814,7 @@ func (c *Controller) writeAttached(ctx context.Context, before, after store.EnvA
 		next.SandboxIncarnation, next.TemplateHash, next.ProcessID = after.SandboxIncarnation, after.TemplateHash, after.ProcessID
 		next.Phase, next.ReadySince, next.Restarts, next.LastExit = after.Phase, after.ReadySince, after.Restarts, after.LastExit
 		next.ProbeFailures, next.NextRestartAt, next.Detail = after.ProbeFailures, after.NextRestartAt, after.Detail
+		next.AwakeUntil, next.IdleAfterS = after.AwakeUntil, after.IdleAfterS
 		if _, err := tx.UpdateAttached(ctx, cur, next); err != nil {
 			return err
 		}

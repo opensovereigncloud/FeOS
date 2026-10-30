@@ -1,7 +1,9 @@
 # ADR 0018: Environments and releases: FeRun's CaaS API takes typed objects, and every change is a numbered release
 
 **Status:** Accepted · **Date:** 2026-10-18; tenants' jobs (§ A
-tenant's job) Proposed 2026-10-30
+tenant's job) Proposed 2026-10-30; what keeps a sandbox awake for its
+attached services (§ An attached service idles as an image service
+does) Accepted 2026-10-30
 
 ## Context
 
@@ -421,6 +423,48 @@ Proposed 2026-10-30; its first step built.
      result in the container's status (the guest's one change).
   4. Tenants' jobs in FeRun's MCP tools and the management UI, when a
      caller asks.
+
+### An attached service idles as an image service does
+
+Accepted 2026-10-30, after FeCode's previews froze while they built.
+
+A sandbox pauses when it is idle for `--idle-pause` (10 s by default)
+and nothing holds it: no exec, no forward, no process started by
+`process_start`. An attached service held its sandbox only while
+`ferund` woke a paused sandbox to start it, and for at most a minute;
+started in a sandbox that ran, it held nothing. So a preview whose
+process builds before it listens (a cold `npm ci`, a type check, a Go
+build: ten minutes) was paused ten seconds after the agent's last tool
+call, and went on only while the agent called again, until the
+release's readiness budget ran out. That the idle rule of a workspace,
+ten seconds after the agent stops, decided when the application sleeps
+was nobody's decision. Two things were mixed:
+
+- **A service that starts is work the platform asked for.** From the
+  start of its process (a release's start, a restart, a replacement)
+  until it is ready, an attached service keeps its sandbox awake, for at
+  most its rollout budget (the service's `rollout.timeout`, else
+  10 min). A service that does not get ready in that time fails its
+  release as before, and the sandbox may sleep.
+- **A service that is ready and unused may sleep: scale to zero is a
+  feature.** An attached service takes `idle` as an image service does:
+  the sandbox it runs in stays awake while the sandbox was active within
+  the longest `idle` of its ready attached services; `idle: never` (0)
+  keeps it awake while the service runs. Activity is what it is for any
+  sandbox (`last_active_at`): an exec, a forwarded request (a route's
+  requests reach an attached service through the port door, which holds
+  and touches the sandbox), a process. A request to a sleeping preview
+  wakes it, as before. Without `idle`, an attached service holds nothing
+  once ready, and the sandbox's own idle interval applies.
+
+A sandbox's idle interval is thus the longest of its own and its
+attached services' claims; the idle loop asks for it in one statement
+(`env_attached.awake_until` for a start, `env_attached.idle_after_s` for
+a ready service), so a pause never races the controller. Its process
+paused is frozen, not stopped: it goes on where it was when the sandbox
+resumes. The caller decides the values: FeCode gives a preview's
+attached services the `idle` its class gives image services (15 min).
+Hibernation after `--hibernate-after` of being paused is unchanged.
 
 ### What changed while it was built
 

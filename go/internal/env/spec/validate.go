@@ -351,8 +351,11 @@ func (v *validator) service(name string, svc Service) {
 			v.errorf(p+".resources", "remove resources, or run the service as an image",
 				"an attached service has its sandbox's resources")
 		}
-		if svc.Idle != "" {
-			v.errorf(p+".idle", "remove idle, or run the service as an image", "an attached service does not idle")
+		if svc.Idle != "" && svc.Idle != IdleNever {
+			// The sandbox's own activity wakes it, and so does a route.
+			if d, ok := v.duration(p+".idle", svc.Idle); ok && d < time.Minute {
+				v.errorf(p+".idle", `use 1m or more, "never", or remove idle`, "idle %s is shorter than 1m", svc.Idle)
+			}
 		}
 		if svc.Rollout != nil {
 			v.errorf(p+".rollout", "remove rollout, or run the service as an image", "an attached service has no rollout")
