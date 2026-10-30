@@ -218,6 +218,15 @@ Deletes the streams, their lines and chunks. 204.
   (`instance=<sandbox ID>&container=main&direction=backward&since=<its
   start>`, paged), and from the node as before when the sink has no lines
   or fails; a paused instance's lines are answered from the sink. A
-  tenant's job's log reads the sink while the job runs, redacted of its
-  secrets; once it has ended, its kept tail, as its secrets are gone then
-  (its full log is the sink's own `GET /api/v1/logs?job=<id>`).
+  tenant's job's log reads the sink too, also once the job has ended;
+  its kept tail when the sink has no line.
+- **Redaction**: a create with labels names `log_redact`, asked anew at
+  each create and stored nowhere: the values `ferund` redacts its stored
+  tails of, each also in its URL-userinfo escaping, of 4 bytes or more,
+  longest first. An environment's pod: its addons' credentials, its
+  tenant secrets (latest versions and those its releases pin) and those
+  its template names; a tenant's job's: its secrets and image
+  credentials. A failure to compute them fails the create, so that no
+  pod ships unredacted lines. `ferund` redacts a running tenant job's
+  sink lines again; an ended job's (its secrets are gone) are the node's
+  redaction alone.

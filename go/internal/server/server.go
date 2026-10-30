@@ -432,6 +432,7 @@ func (i *Instance) newEnvironments(key []byte) (*env.Service, error) {
 	}
 	i.Engine.SetSecretResolver(s.RowSecret)
 	i.Engine.SetPrepareHook(s.PrepareHook)
+	i.Engine.SetLogRedactor(s.LogRedact)
 	return s, nil
 }
 

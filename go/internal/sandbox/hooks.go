@@ -41,6 +41,12 @@ type SecretResolver func(ctx context.Context, row store.Sandbox, name string, ve
 // (the observation decides).
 type PrepareHook func(ctx context.Context, node string, sb store.Sandbox, kind OpKind) error
 
+// LogRedactor returns the values the node replaces in the lines it ships
+// of the pod of row, which has log labels (CreatePodRequest.log_redact,
+// ADR 0026): asked before every create, never stored. An error fails the
+// create before any pod call.
+type LogRedactor func(ctx context.Context, row store.Sandbox) ([]string, error)
+
 // ErrNodeUnfit is what a PrepareHook's error wraps when the node itself
 // cannot take the pod (a volume the node refuses to create, one in use by
 // another pod or failed there): a fresh unpinned create then avoids the
@@ -56,6 +62,7 @@ type engineHooks struct {
 	mu      sync.Mutex
 	secrets SecretResolver
 	prepare PrepareHook
+	redact  LogRedactor
 	access  func(ctx context.Context, pinned string, auth model.RegistryCredentials) error
 }
 
@@ -108,6 +115,21 @@ func (e *Engine) SetPrepareHook(h PrepareHook) {
 	e.hooks.mu.Lock()
 	defer e.hooks.mu.Unlock()
 	e.hooks.prepare = h
+}
+
+// SetLogRedactor sets what a create with log labels asks for the values
+// its node redacts; nil: none are named.
+func (e *Engine) SetLogRedactor(r LogRedactor) {
+	e.hooks.mu.Lock()
+	defer e.hooks.mu.Unlock()
+	e.hooks.redact = r
+}
+
+// logRedactor is the redactor SetLogRedactor set, or nil.
+func (e *Engine) logRedactor() LogRedactor {
+	e.hooks.mu.Lock()
+	defer e.hooks.mu.Unlock()
+	return e.hooks.redact
 }
 
 // secretResolver is the resolver SetSecretResolver set, or nil.
@@ -201,6 +223,13 @@ func (e *Engine) prepareSpec(ctx context.Context, h *OpHandle) error {
 		return &prepareError{node: h.target, kind: h.kind, err: err}
 	}
 	h.spec = spec
+	// The values its node redacts of the lines it ships: asked anew at
+	// every create, as the spec's secrets are.
+	if r := e.logRedactor(); r != nil && len(h.row.LogLabels) > 0 {
+		if h.logRedact, err = r(ctx, h.row); err != nil {
+			return &prepareError{node: h.target, kind: h.kind, err: fmt.Errorf("the log's redactions: %w", err)}
+		}
+	}
 	h.layers = e.imageLayers(ctx, h.row.ImageRef)
 	// The guest's pull token, for a sandbox with image credentials: asked
 	// for now, so that it lives the registry's whole life for the pull.

@@ -435,10 +435,11 @@ func (c *Controller) DeleteTenantJob(ctx context.Context, owner string, id podid
 	return nil
 }
 
-// TenantJobLog is the last lines lines of a job's log: while it runs, the
-// sink's (sinkLog) or else its pod's, redacted of its secrets; the kept
-// tail once it has ended, as its secrets are gone then and the sink's
-// lines are not redacted; none while its pod does not run yet. ErrNoObject: owner has no such job.
+// TenantJobLog is the last lines lines of a job's log: the sink's
+// (sinkLog), whose lines its node redacted of the job's secrets
+// (LogRedact), redacted here again while the job runs; else, once it has
+// ended, its kept tail; else its pod's, redacted of its secrets; none
+// while its pod does not run yet. ErrNoObject: owner has no such job.
 func (c *Controller) TenantJobLog(ctx context.Context, owner string, id podid.ID, lines int) ([]string, error) {
 	r, err := c.st.GetTenantJob(ctx, owner, id)
 	if errors.Is(err, store.ErrNoRow) {
@@ -447,15 +448,17 @@ func (c *Controller) TenantJobLog(ctx context.Context, owner string, id podid.ID
 	if err != nil {
 		return nil, err
 	}
-	if r.Ended() {
-		return r.LogTail[max(len(r.LogTail)-lines, 0):], nil
-	}
 	if out, ok := c.sinkLog(ctx, "job", id.String(), r.CreatedAt, lines); ok {
-		secrets := c.tenantJobSecretValues(ctx, id)
-		for i := range out {
-			out[i] = redact(out[i], secrets)
+		if !r.Ended() {
+			secrets := c.tenantJobSecretValues(ctx, id)
+			for i := range out {
+				out[i] = redact(out[i], secrets)
+			}
 		}
 		return out, nil
+	}
+	if r.Ended() {
+		return r.LogTail[max(len(r.LogTail)-lines, 0):], nil
 	}
 	sb, err := c.st.GetSandbox(ctx, id)
 	if errors.Is(err, model.ErrNotFound) || (err == nil && !(steady(sb) && c.connected(sb.Node))) {

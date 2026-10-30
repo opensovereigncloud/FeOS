@@ -75,6 +75,58 @@ func TestLogLabels(t *testing.T) {
 	}
 }
 
+// redactValues are each value and its userinfo escaping, at least 4
+// bytes, once, longest first; redact replaces exactly those.
+func TestRedactValues(t *testing.T) {
+	got := redactValues([]string{"p@ss:w0rd", "abc", "plain-value", "p@ss:w0rd", ""})
+	want := []string{"p%40ss%3Aw0rd", "plain-value", "p@ss:w0rd"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	line := "user:p%40ss%3Aw0rd@db and p@ss:w0rd and abc"
+	if r := redact(line, []string{"p@ss:w0rd", "abc"}); r != "user:"+redactedMark+"@db and "+redactedMark+" and abc" {
+		t.Fatalf("redact %q", r)
+	}
+}
+
+// A create with log labels names the values its node redacts
+// (log_redact), asked anew at the create and stored nowhere: an
+// environment's tenant secrets with their userinfo forms, a tenant's
+// job's secrets and image credentials.
+func TestLogRedact(t *testing.T) {
+	h := newHarness(t, options{})
+	n1 := h.addNode("n1")
+	env := h.newEnv("stage")
+	const token = "s3cr3t/t0ken"
+	h.putSecret(env.ID, "token", token)
+	r1 := h.apply(env.ID, fmt.Sprintf(`{"services":{"web":{"image":%q,"env":{"TOKEN":{"secret":"token"}}}}}`, testImage))
+	h.waitRelease(env.ID, r1, model.ReleaseRealised, 30*time.Second)
+	web := h.waitRows(env.ID, spec.KindService, "web", 1, 10*time.Second, "running", running)[0].Sandbox.ID
+	if got := n1.LogRedact(web); !slices.Equal(got, []string{"s3cr3t%2Ft0ken", token}) {
+		t.Fatalf("the instance's create: %q", got)
+	}
+	var stored int
+	if err := h.d.Pool.QueryRow(bg, `SELECT count(*) FROM sandboxes WHERE log_labels::text LIKE '%t0ken%'`).Scan(&stored); err != nil ||
+		stored != 0 {
+		t.Fatalf("a secret on a row: %d %v", stored, err)
+	}
+
+	rs := tenantJobSpecOf(time.Minute)
+	rs.Secrets = map[string]string{"GIT_TOKEN": "git-secret-value"}
+	rs.ImageCredentials = &model.RegistryCredentials{Username: "build", Password: "registry-password"}
+	job := h.createTenantJob(rs)
+	h.runningPod(job.ID)
+	if got := n1.LogRedact(job.ID); !slices.Equal(got, []string{"registry-password", "git-secret-value", "build"}) {
+		t.Fatalf("the job's create: %q", got)
+	}
+	// A job without secrets names none.
+	plain := h.createTenantJob(tenantJobSpecOf(time.Minute))
+	h.runningPod(plain.ID)
+	if got := n1.LogRedact(plain.ID); len(got) != 0 {
+		t.Fatalf("a job without secrets: %q", got)
+	}
+}
+
 // fakeSink is the sink's GET /api/v1/logs: lines (oldest first) per
 // selector, pages of at most limit, newest first; down answers 503.
 type fakeSink struct {
@@ -205,6 +257,20 @@ func TestSinkLogs(t *testing.T) {
 	got, err := h.c.TenantJobLog(ctx, testTenant, job.ID, 10)
 	if err != nil || len(got) != 2 || got[0] != "cloning with "+redactedMark || got[1] != "done" {
 		t.Fatalf("the job's log: %q %v", got, err)
+	}
+	// Once it has ended: the sink's lines as the node redacted them, else
+	// its kept tail.
+	if _, err := h.c.CancelTenantJob(bg, testTenant, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	sink.set("job="+job.ID.String(), []string{"cloning with [redacted]", "done", "cancelled"}, false)
+	got, err = h.c.TenantJobLog(ctx, testTenant, job.ID, 10)
+	if err != nil || !slices.Equal(got, []string{"cloning with [redacted]", "done", "cancelled"}) {
+		t.Fatalf("the ended job's log: %q %v", got, err)
+	}
+	sink.set("job="+job.ID.String(), nil, false)
+	if got, err = h.c.TenantJobLog(ctx, testTenant, job.ID, 10); err != nil || slices.Contains(got, "cancelled") {
+		t.Fatalf("the ended job's kept tail: %q %v", got, err)
 	}
 	sink.mu.Lock()
 	asked := slices.Clone(sink.asked)

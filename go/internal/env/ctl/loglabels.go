@@ -4,12 +4,17 @@
 package ctl
 
 import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 
 	"github.com/google/uuid"
 
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/podid"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // The labels of a pod's container logs (ADR 0026), set at the insert of
@@ -39,4 +44,41 @@ func tenantJobLogLabels(owner string, id podid.ID, days int) map[string]string {
 		l[model.LogRetentionDays] = strconv.Itoa(days)
 	}
 	return l
+}
+
+// LogRedact is the engine's log redactor (sandbox.LogRedactor): the
+// values a pod's shipped log lines are redacted of on its node
+// (CreatePodRequest.log_redact), computed at every create and stored
+// nowhere: those a stored tail of the row is redacted of, each with its
+// userinfo escaping (redactValues). An environment's row: envSecretValues
+// (its addons' credentials, its tenant secrets, those its template
+// names); a tenant's job's: its secrets and image credentials. An error
+// fails the create, so that no pod ships what it could not be told to
+// redact.
+func (c *Controller) LogRedact(ctx context.Context, row store.Sandbox) ([]string, error) {
+	var vals []string
+	switch {
+	case row.TenantJob:
+		sealed, err := c.st.TenantJobSealed(ctx, row.ID)
+		if err != nil {
+			return nil, fmt.Errorf("job %s: %w", row.ID, err)
+		}
+		if sealed != nil {
+			secrets, err := c.tenantJobSecrets(ctx, row.ID)
+			if err != nil {
+				return nil, err
+			}
+			vals = slices.Collect(maps.Values(secrets))
+		}
+	case row.EnvironmentID != uuid.Nil:
+		v, err := c.load(ctx, row.EnvironmentID)
+		if err != nil {
+			return nil, fmt.Errorf("environment %s: %w", row.EnvironmentID, err)
+		}
+		if v == nil {
+			return nil, fmt.Errorf("environment %s is being deleted or has no release", row.EnvironmentID)
+		}
+		vals = c.envSecretValues(ctx, v, row.PodTemplate)
+	}
+	return redactValues(vals), nil
 }

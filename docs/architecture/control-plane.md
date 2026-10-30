@@ -2584,7 +2584,7 @@ any row, and its deadline counts on.
 | `POST /api/v1/jobs` `{image, command?, env?, secrets?, imageCredentials?, vcpus?, memoryMib?, deadline?, resultPath?, labels?, logRetentionDays?}` | 201 the job; with an `Idempotency-Key` a create made with the same body 200 with that job, another body 422 `job_key_conflict`; 422 for an image that does not resolve; 400 for what the body gets wrong (an env or secret name that is no variable's, one in both, a size out of range, a deadline above 2h, a `resultPath` that is not absolute and clean or lies under `/dev`, a `logRetentionDays` outside 1 to 400); 503 "secrets need --secret-key-file" for secrets or image credentials without it; 409 while the tenant is being deleted |
 | `GET /api/v1/jobs?label=k=v` | `{jobs}`, newest first, the labels ANDed |
 | `GET /api/v1/jobs/{id}` | `{id, image, imageRef, phase, reason, detail, exitCode, result, resultPath, vcpus, memoryMib, labels, createdAt, startedAt, finishedAt, deadlineAt, logRetentionDays?}` (`logRetentionDays` only when the create asked) |
-| `GET /api/v1/jobs/{id}/logs?lines=200` | `{lines}`: while it runs the sink's (with `--sink-url`) or else the pod's, redacted of the job's secrets; none while it is queued; the kept tail once it has ended |
+| `GET /api/v1/jobs/{id}/logs?lines=200` | `{lines}`: the sink's (with `--sink-url`), else from the pod while it runs, redacted of the job's secrets; none while it is queued; the kept tail once it has ended and the sink has no line |
 | `POST /api/v1/jobs/{id}/cancel` | the job, `cancelled` unless it had ended |
 | `DELETE /api/v1/jobs/{id}` | 204 |
 
@@ -2986,6 +2986,13 @@ nor waits for. `ferund`'s part:
   (`feosd` keeps the pod's record). A sandbox a tenant made itself, an
   attached service's workspace included, has none, and its logs are not
   shipped. A row an instance of the previous version inserted has `{}`.
+  A create with labels also names `log_redact`, the values its node
+  replaces with `[redacted]` in the lines it ships: asked of the
+  controller at each create (`LogRedact`, the engine's `LogRedactor`)
+  and stored nowhere, the secret values a stored tail is redacted of
+  ([Logs](#probes-exits-and-restarts); a tenant's job's secrets and image
+  credentials) with their userinfo escaping. A failure there fails the
+  create before any pod call.
 - **The nodes.** Every `TelemetryResponse` names `--sink-endpoint`
   (`sink_endpoint`); empty, the nodes ship nothing.
 - **Reads.** With `--sink-url`, the objects' logs call (a replica's or an
@@ -2996,10 +3003,11 @@ nor waits for. `ferund`'s part:
   budget (8 KiB a line, 4 MiB), with the caller's own bearer, so that the
   sink answers the tenant's streams only. A sink that fails or has no
   line leaves the read to the node, as before; a paused instance whose
-  lines the sink has is answered, not 409 "paused". A tenant's job's lines
-  are redacted of its secrets; an ended job answers its kept tail, as its
-  secrets are gone and the sink's lines are not redacted. An attached
-  service's process log is the node's.
+  lines the sink has is answered, not 409 "paused". A tenant's job's log
+  is the sink's also once it has ended (its node redacted the lines),
+  its kept tail when the sink has none; a running job's sink lines are
+  redacted of its secrets again. An attached service's process log is
+  the node's.
 - **`GET /api/v1/tenant`** (tenant class): `{"tenant": "<name>"}`, the
   token's tenant, which the sink asks for its readers; 401 otherwise.
 - **Service tokens.** `ferund service-token --kind sink --name <name>`

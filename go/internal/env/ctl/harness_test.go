@@ -204,6 +204,7 @@ func newHarness(t *testing.T, o options) *harness {
 	}
 	h.eng.SetSecretResolver(h.c.RowSecret)
 	h.eng.SetPrepareHook(h.c.PrepareHook)
+	h.eng.SetLogRedactor(h.c.LogRedact)
 	h.el.Register(h.fl.Loops()...)
 	h.el.Register(h.eng.Loops()...)
 	h.el.Register(h.c.Loops()...)

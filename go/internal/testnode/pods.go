@@ -88,6 +88,8 @@ type pod struct {
 	// logLabels are the labels its create sent (ADR 0026), as feosd keeps
 	// them in the pod's record.
 	logLabels map[string]string
+	// logRedact are the values its create named to redact (ADR 0026).
+	logRedact []string
 }
 
 // containerExit is how a container's process ended: its code, or none
@@ -669,7 +671,7 @@ func containerStatuses(spec *podv1.PodSpec, exited map[string]containerExit) []*
 
 func (p *podService) CreatePod(ctx context.Context, req *podv1.CreatePodRequest) (*podv1.CreatePodResponse, error) {
 	return mutate(p, ctx, func(ctx context.Context) (*podv1.CreatePodResponse, error) {
-		info, err := p.create(ctx, req.GetPodId(), req.GetSpec(), req.GetImageLayers(), req.GetLogLabels())
+		info, err := p.create(ctx, req.GetPodId(), req.GetSpec(), req.GetImageLayers(), req.GetLogLabels(), req.GetLogRedact())
 		if err != nil {
 			return nil, err
 		}
@@ -678,7 +680,7 @@ func (p *podService) CreatePod(ctx context.Context, req *podv1.CreatePodRequest)
 }
 
 func (p *podService) create(ctx context.Context, id string, spec *podv1.PodSpec, layers *podv1.ImageLayers,
-	logLabels map[string]string) (*podv1.PodInfo, error) {
+	logLabels map[string]string, logRedact []string) (*podv1.PodInfo, error) {
 	if err := checkID(id); err != nil {
 		return nil, err
 	}
@@ -718,7 +720,8 @@ func (p *podService) create(ctx context.Context, id string, spec *podv1.PodSpec,
 		return nil, status.Errorf(codes.Internal, "keep pod %s: %v", id, err)
 	}
 	p.nextPID++
-	pd := &pod{uid: uid, info: info, lock: make(chan struct{}, 1), pid: p.nextPID, logLabels: maps.Clone(logLabels)}
+	pd := &pod{uid: uid, info: info, lock: make(chan struct{}, 1), pid: p.nextPID, logLabels: maps.Clone(logLabels),
+		logRedact: slices.Clone(logRedact)}
 	p.pods[id] = pd
 	out := clonePod(info)
 	p.mu.Unlock()
@@ -1405,15 +1408,15 @@ func (p *podService) ListPods(context.Context, *podv1.ListPodsRequest) (*podv1.L
 }
 
 // list returns the pods' records, sorted by ID.
-// logLabelsOf are the log labels of a pod's create; nil when the node
-// does not hold it.
-func (p *podService) logLabelsOf(id string) map[string]string {
+// logLabelsOf are the log labels and redactions of a pod's create; nil
+// when the node does not hold it.
+func (p *podService) logLabelsOf(id string) (map[string]string, []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if pd := p.pods[id]; pd != nil {
-		return maps.Clone(pd.logLabels)
+		return maps.Clone(pd.logLabels), slices.Clone(pd.logRedact)
 	}
-	return nil
+	return nil, nil
 }
 
 func (p *podService) list() []*podv1.PodInfo {

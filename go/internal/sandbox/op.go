@@ -146,6 +146,9 @@ type OpHandle struct {
 	// pullToken is the guest's pull token of a create with image
 	// credentials (prepare, ADR 0025); "": anonymous.
 	pullToken string
+	// logRedact are the values a create's node redacts of the lines it
+	// ships (prepare, ADR 0026).
+	logRedact []string
 
 	mu sync.Mutex
 	// dirty: a pod event arrived while the op ran; the finish syncs.
@@ -589,7 +592,7 @@ func (e *Engine) callOp(ctx context.Context, pc podv1.PodServiceClient, h *OpHan
 		// The log labels go beside the spec (ADR 0026): a create delivered
 		// again finds its pod by the spec, whatever the labels.
 		resp, err := pc.CreatePod(ctx, &podv1.CreatePodRequest{PodId: id, Spec: h.spec, ImageLayers: h.layers,
-			PullToken: h.pullToken, LogLabels: h.row.LogLabels})
+			PullToken: h.pullToken, LogLabels: h.row.LogLabels, LogRedact: h.logRedact})
 		res.err = err
 		if err == nil {
 			res.pod = resp.GetPod()

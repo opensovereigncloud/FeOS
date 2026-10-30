@@ -179,10 +179,17 @@ func (s *Service) PrepareHook(ctx context.Context, node string, sb store.Sandbox
 	return s.ctl.PrepareHook(ctx, node, sb, kind)
 }
 
+// LogRedact is the engine's log redactor (sandbox.LogRedactor): the
+// controller's.
+func (s *Service) LogRedact(ctx context.Context, row store.Sandbox) ([]string, error) {
+	return s.ctl.LogRedact(ctx, row)
+}
+
 // The hooks are the engine's.
 var (
 	_ sandbox.SecretResolver = (*Service)(nil).RowSecret
 	_ sandbox.PrepareHook    = (*Service)(nil).PrepareHook
+	_ sandbox.LogRedactor    = (*Service)(nil).LogRedact
 )
 
 // specBlueprint adapts an addon blueprint to what spec.Validate asks of

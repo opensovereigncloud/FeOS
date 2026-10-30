@@ -279,17 +279,30 @@ const redactedMark = "[redacted]"
 // escaping), longest first: step and probe output and stored log tails
 // never carry a credential into a detail, an incident or a log.
 func redact(s string, secrets []string) string {
-	vals := slices.Clone(secrets)
+	for _, v := range redactValues(secrets) {
+		s = strings.ReplaceAll(s, v, redactedMark)
+	}
+	return s
+}
+
+// redactValues are the strings redact replaces of secrets: each value and
+// its userinfo escaping, of 4 bytes or more, once, longest first. A pod's
+// create names them (CreatePodRequest.log_redact), so that its node
+// replaces them in the lines it ships to the sink as redact would.
+func redactValues(secrets []string) []string {
+	vals := make([]string, 0, 2*len(secrets))
 	for _, v := range secrets {
+		vals = append(vals, v)
 		if e := escapeUserinfo(v); e != v {
 			vals = append(vals, e)
 		}
 	}
-	slices.SortFunc(vals, func(a, b string) int { return len(b) - len(a) })
-	for _, v := range vals {
-		if len(v) >= 4 {
-			s = strings.ReplaceAll(s, v, redactedMark)
+	vals = slices.DeleteFunc(vals, func(v string) bool { return len(v) < 4 })
+	slices.SortFunc(vals, func(a, b string) int {
+		if len(a) != len(b) {
+			return len(b) - len(a)
 		}
-	}
-	return s
+		return strings.Compare(a, b)
+	})
+	return slices.Compact(vals)
 }
