@@ -9,7 +9,9 @@
 //! bundle/rootfs/       overlay: the image's rootfs below, upper/ above
 //! bundle/config.json   OCI runtime spec
 //! upper/, work/        the container's writes, on the data root
-//! logs/container.log   stdout and stderr of the container's process
+//! logs/container.log   stdout and stderr of the container's process, in the
+//!                      CRI format (crate::output); container.log.id its ID
+//! logs/stdout, stderr  FIFOs the container's process writes to
 //! ```
 //!
 //! Every container sees the FeOS toolbox read-only at /feos-tools and the

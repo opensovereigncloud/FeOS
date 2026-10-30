@@ -17,6 +17,7 @@ use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
 use log::{error, info, warn};
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use tokio::sync::{mpsc, oneshot};
 
@@ -35,19 +36,36 @@ fn load(id: &str) -> Result<Container, TaskError> {
 }
 
 /// Where a container's stdout or stderr goes: appended to `path`, or
-/// discarded when it is empty.
-fn output(path: &str) -> Result<File, TaskError> {
+/// discarded when it is empty. A FIFO at `path`, as the container service
+/// makes them (ADR 0026), is held open for reading too, the second file,
+/// while the container is there: its reader may restart, and a FIFO
+/// without one would end the container's writes with SIGPIPE.
+fn output(path: &str) -> Result<(File, Option<File>), TaskError> {
     let path = if path.is_empty() { "/dev/null" } else { path };
-    OpenOptions::new()
+    let failed = |e: std::io::Error| TaskError::Io(format!("{path}: {e}"));
+    let is_fifo = std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_fifo());
+    // Read and write: opening it never waits for a writer.
+    let keeper = match is_fifo {
+        true => Some(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(failed)?,
+        ),
+        false => None,
+    };
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| TaskError::Io(format!("{path}: {e}")))
+        .map_err(failed)?;
+    Ok((file, keeper))
 }
 
 /// Creates the container from its bundle; returns the pid of its init
-/// process, which waits for Start.
-fn create(req: &CreateRequest) -> Result<i32, TaskError> {
+/// process, which waits for Start, and its output's FIFOs to hold.
+fn create(req: &CreateRequest) -> Result<(i32, Vec<File>), TaskError> {
     let state = Path::new(RUNTIME_STATE_DIR).join(&req.container_id);
     if state.exists() {
         // Runtime state the dispatcher does not know: left from a task
@@ -66,18 +84,21 @@ fn create(req: &CreateRequest) -> Result<i32, TaskError> {
     }
 
     std::fs::create_dir_all(RUNTIME_STATE_DIR)?;
+    let (stdout, stdout_keeper) = output(&req.stdout_path)?;
+    let (stderr, stderr_keeper) = output(&req.stderr_path)?;
+    let outputs = stdout_keeper.into_iter().chain(stderr_keeper).collect();
     let container = ContainerBuilder::new(req.container_id.clone(), SyscallType::Linux)
         .with_root_path(RUNTIME_STATE_DIR)
         .map_err(|e| TaskError::Runtime(format!("runtime state directory: {e}")))?
-        .with_stdout(output(&req.stdout_path)?)
-        .with_stderr(output(&req.stderr_path)?)
+        .with_stdout(stdout)
+        .with_stderr(stderr)
         .as_init(&req.bundle_path)
         .with_systemd(false)
         .build()
         .map_err(|e| TaskError::Runtime(format!("create {}: {e}", req.container_id)))?;
     container
         .pid()
-        .map(|pid| pid.as_raw())
+        .map(|pid| (pid.as_raw(), outputs))
         .ok_or_else(|| TaskError::Internal("created container has no pid".to_string()))
 }
 
@@ -89,9 +110,11 @@ pub async fn handle_create(
     let id = req.container_id.clone();
     info!("Worker: Creating container {id} from {}", req.bundle_path);
     match blocking(move || create(&req)).await {
-        Ok(pid) => {
+        Ok((pid, outputs)) => {
             info!("Worker: Created container {id} with init pid {pid}");
-            let _ = event_tx.send(Event::ContainerCreated { id, pid }).await;
+            let _ = event_tx
+                .send(Event::ContainerCreated { id, pid, outputs })
+                .await;
             let _ = responder.send(Ok(CreateResponse { pid: pid.into() }));
         }
         Err(error) => {
@@ -214,6 +237,24 @@ pub async fn wait_for_process_exit(id: String, pid: i32, event_tx: mpsc::Sender<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fifo_is_held_open_for_its_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("stdout");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        // No reader but the one it holds: the open does not wait, and a
+        // write does not fail.
+        let (mut file, keeper) = output(fifo.to_str().unwrap()).unwrap();
+        assert!(keeper.is_some());
+        std::io::Write::write_all(&mut file, b"line\n").unwrap();
+        // A file is appended to, as before.
+        let log = dir.path().join("container.log");
+        let (_, keeper) = output(log.to_str().unwrap()).unwrap();
+        assert!(keeper.is_none() && log.is_file());
+        let (_, keeper) = output("").unwrap();
+        assert!(keeper.is_none());
+    }
 
     #[test]
     fn signal_numbers_are_checked() {

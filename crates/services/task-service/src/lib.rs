@@ -28,6 +28,9 @@ pub struct Container {
     pub bundle_path: String,
     pub exit_code: Option<i32>,
     pub wait_responder: Option<oneshot::Sender<Result<WaitResponse, TaskError>>>,
+    /// The FIFOs of its output, held open until it is deleted, so that it
+    /// never writes into one without a reader (worker::output).
+    pub outputs: Vec<std::fs::File>,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -69,10 +72,27 @@ pub enum Command {
 
 #[derive(Debug)]
 pub enum Event {
-    ContainerCreated { id: String, pid: i32 },
-    ContainerCreateFailed { id: String, error: TaskError },
-    ContainerStarted { id: String },
-    ContainerStartFailed { id: String, error: TaskError },
-    ContainerStopped { id: String, exit_code: i32 },
-    ContainerDeleted { id: String },
+    ContainerCreated {
+        id: String,
+        pid: i32,
+        outputs: Vec<std::fs::File>,
+    },
+    ContainerCreateFailed {
+        id: String,
+        error: TaskError,
+    },
+    ContainerStarted {
+        id: String,
+    },
+    ContainerStartFailed {
+        id: String,
+        error: TaskError,
+    },
+    ContainerStopped {
+        id: String,
+        exit_code: i32,
+    },
+    ContainerDeleted {
+        id: String,
+    },
 }

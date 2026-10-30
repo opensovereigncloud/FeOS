@@ -5,6 +5,7 @@ use crate::{
     dispatcher::{runtime_knows, validate_container_id},
     error::ContainerServiceError,
     logs,
+    output::{self, Outputs},
     persistence::{repository::ContainerRepository, ContainerRecord, ContainerStatus},
     runtime::{
         adapter::ContainerAdapter,
@@ -144,6 +145,7 @@ pub async fn create_container(
     token: &PullToken,
     repository: &ContainerRepository,
     adapter: &ContainerAdapter,
+    outputs: &Outputs,
 ) -> Result<CreateContainerResponse, ContainerServiceError> {
     let container_id = match req.container_id.as_deref().filter(|s| !s.is_empty()) {
         Some(id) => id.to_string(),
@@ -166,6 +168,7 @@ pub async fn create_container(
             token,
             repository,
             adapter,
+            outputs,
         )
         .await;
     }
@@ -214,12 +217,13 @@ pub async fn create_container(
             bundle::provision(&id, &image_dir, &spec, false)
         })
         .await?;
-        create_in_runtime(&mut record, repository, adapter).await
+        create_in_runtime(&mut record, repository, adapter, outputs).await
     }
     .await;
 
     if let Err(e) = &result {
         error!("ContainerWorker ({container_id}): Creation failed: {e}");
+        outputs.stop(&container_id);
         let removed = container_id.clone();
         let _ = blocking(move || bundle::remove(&removed)).await;
         if let Err(e) = repository.delete_container(&container_id).await {
@@ -241,6 +245,7 @@ async fn adopt_container(
     token: &PullToken,
     repository: &ContainerRepository,
     adapter: &ContainerAdapter,
+    outputs: &Outputs,
 ) -> Result<CreateContainerResponse, ContainerServiceError> {
     info!("ContainerWorker ({container_id}): Adopting the container of a previous boot");
     let config = config.unwrap_or_default();
@@ -309,7 +314,8 @@ async fn adopt_container(
         },
         config: merged,
     };
-    if let Err(e) = create_in_runtime(&mut record, repository, adapter).await {
+    if let Err(e) = create_in_runtime(&mut record, repository, adapter, outputs).await {
+        outputs.stop(&container_id);
         bundle::unmount(&container_id);
         return Err(e);
     }
@@ -319,15 +325,22 @@ async fn adopt_container(
     })
 }
 
-/// Creates the container in the runtime and records it as CREATED.
+/// Creates the container in the runtime, its output read into its log,
+/// and records it as CREATED.
 async fn create_in_runtime(
     record: &mut ContainerRecord,
     repository: &ContainerRepository,
     adapter: &ContainerAdapter,
+    outputs: &Outputs,
 ) -> Result<(), ContainerServiceError> {
     let id = record.container_id.clone();
+    outputs
+        .start(&id)
+        .await
+        .map_err(ContainerServiceError::Adapter)?;
+    let (stdout, stderr) = output::fifos(&id);
     let pid = adapter
-        .create_container(&id, &bundle::bundle_dir(&id), &bundle::log_file(&id))
+        .create_container(&id, &bundle::bundle_dir(&id), &stdout, &stderr)
         .await
         .map_err(|e| ContainerServiceError::Adapter(format!("create {id}: {e}")))?;
     info!("ContainerWorker ({id}): Created, init pid {pid}");
@@ -345,6 +358,7 @@ pub async fn handle_start_container(
     responder: oneshot::Sender<Result<StartContainerResponse, ContainerServiceError>>,
     repository: ContainerRepository,
     adapter: Arc<ContainerAdapter>,
+    outputs: Outputs,
 ) {
     let id = req.container_id.clone();
     let result = adapter.start_container(&id).await;
@@ -362,7 +376,7 @@ pub async fn handle_start_container(
                 }
             };
             let _ = responder.send(Ok(StartContainerResponse {}));
-            tokio::spawn(track_exit(id, pid, repository, adapter));
+            tokio::spawn(track_exit(id, pid, repository, adapter, outputs));
         }
         Err(e) => {
             let err = ContainerServiceError::Adapter(e.to_string());
@@ -373,16 +387,19 @@ pub async fn handle_start_container(
 }
 
 /// Records the container as STOPPED, with its exit code, once its process
-/// `pid` exits. The task service maps a signal to 128 + the signal.
+/// `pid` exits, and what it wrote is in its log. The task service maps a
+/// signal to 128 + the signal.
 async fn track_exit(
     id: String,
     pid: Option<i64>,
     repository: ContainerRepository,
     adapter: Arc<ContainerAdapter>,
+    outputs: Outputs,
 ) {
     match adapter.wait_container(&id).await {
         Ok(exit_code) => {
             info!("Worker: Container {id} exited with code {exit_code}");
+            outputs.finish(&id).await;
             if let Err(e) = repository.record_exit(&id, pid, exit_code).await {
                 warn!("Worker: Failed to record that container {id} stopped: {e}");
             }
@@ -429,6 +446,7 @@ pub async fn handle_delete_container(
     responder: oneshot::Sender<Result<DeleteContainerResponse, ContainerServiceError>>,
     repository: ContainerRepository,
     adapter: Arc<ContainerAdapter>,
+    outputs: Outputs,
 ) {
     let id = req.container_id.clone();
     let result = async {
@@ -436,6 +454,7 @@ pub async fn handle_delete_container(
             .delete_container(&id)
             .await
             .map_err(|e| ContainerServiceError::Adapter(e.to_string()))?;
+        outputs.stop(&id);
         let remove_id = id.clone();
         blocking(move || bundle::remove(&remove_id)).await?;
         repository.delete_container(&id).await?;
@@ -461,10 +480,18 @@ pub async fn handle_stream_logs(
     let id = req.container_id.clone();
     let path = bundle::log_file(&id);
     let open_path = path.clone();
-    let (tail_lines, tail) = (req.tail_lines, req.tail);
+    let start = logs::Start {
+        tail_lines: req.tail_lines,
+        tail: req.tail,
+        from_offset: if req.follow { req.from_offset } else { 0 },
+        log_id: if req.follow {
+            req.log_id
+        } else {
+            String::new()
+        },
+    };
     let opened = blocking(move || {
-        logs::open(&open_path, tail_lines, tail)
-            .map_err(|e| format!("{}: {e}", open_path.display()))
+        logs::open(&open_path, &start).map_err(|e| format!("{}: {e}", open_path.display()))
     })
     .await;
     match opened {

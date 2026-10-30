@@ -566,6 +566,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 name = "container-service"
 version = "0.6.0"
 dependencies = [
+ "chrono",
  "feos-proto",
  "feos-utils",
  "hyper-util",
@@ -4720,6 +4721,7 @@ dependencies = [
  "libcontainer",
  "log",
  "nix 0.30.1",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",

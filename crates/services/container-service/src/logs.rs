@@ -4,24 +4,34 @@
 //! A container's log, `logs/container.log` in its directory, as
 //! `StreamContainerLogs` serves it.
 //!
-//! The task service appends the container's stdout and stderr to the one
-//! file, so a line's source is not known. A line goes out without its
-//! newline; one over [`MAX_LINE`] bytes goes out in parts of at most that
-//! many, counted from where the line starts. `tail_lines` counts the lines
-//! of the log, each as many lines as it has parts. A tail is found reading
-//! back from the end in blocks, never the whole file: a line that reaches
+//! The guest writes the container's stdout and stderr to the one file, a
+//! line of the CRI format per entry (crate::output, crate::cri), which goes
+//! out as its text, with its time, source and whether it is a part. A line
+//! of a log written before (ADR 0026), without the format's prefix, goes
+//! out as it is, without a time or a source; one over [`MAX_LINE`] bytes
+//! goes out in parts of at most that many, counted from where the line
+//! starts, all but the last partial. Every entry carries the byte offset
+//! of its line's start in the file and the offset after it, and the log's
+//! ID (crate::cri::read_id).
+//!
+//! `tail_lines` counts the entries of the log: a line of the format as one,
+//! one of before as many as it has parts. A tail is found reading back from
+//! the end in blocks, never the whole file: a line of before that reaches
 //! further back than the parts asked for could fill is cut, so that its
 //! last parts are a full [`MAX_LINE`] each. Nor does a tail reach back
 //! further than [`MAX_TAIL_BYTES`] from the end, however few lines that
-//! is, so it never sends more bytes than that: a line that starts further
-//! back is cut the same way, to its last whole parts within those bytes,
-//! or left out when not one part fits.
+//! is, so it never sends more bytes than that: a line of before that starts
+//! further back is cut the same way, to its last whole parts within those
+//! bytes, or left out when not one part fits; a line of the format is left
+//! out.
 //!
 //! With `follow`, the stream polls the file, which is only ever appended
 //! to, and ends when the container is deleted (its log file goes, or
 //! another one takes its place) or the caller ends the call. A line that
-//! stays unfinished for [`IDLE_FLUSH`] goes out as it is.
+//! stays unfinished for [`IDLE_FLUSH`] goes out as it is. `from_offset`
+//! starts it at an offset an entry named, of the log `log_id` names.
 
+use crate::cri::{self, MAX_PREFIX};
 use crate::persistence::repository::ContainerRepository;
 use feos_proto::container_service::{log_entry::Source, LogEntry};
 use std::fs::File;
@@ -51,19 +61,53 @@ pub const IDLE_FLUSH: Duration = Duration::from_secs(1);
 /// The entries a log stream sends.
 pub type LogSender = mpsc::Sender<Result<LogEntry, Status>>;
 
-/// How many entries a line of `len` bytes goes out as.
+/// How many entries a line of before of `len` bytes goes out as.
 fn parts(len: u64, max: u64) -> u64 {
     len.div_ceil(max).max(1)
+}
+
+/// How many entries the line goes out as: one if it is of the format.
+fn units(len: u64, max: u64, record: bool) -> u64 {
+    if record {
+        1
+    } else {
+        parts(len, max)
+    }
+}
+
+/// Whether the line from `start` to `end`, without its newline, is one of
+/// the format: shorter than `room`, which [`Lines`] holds a line for at
+/// most, and with the format's prefix.
+fn is_record(file: &File, start: u64, end: u64, room: u64) -> io::Result<bool> {
+    let len = end - start;
+    if len >= room {
+        return Ok(false);
+    }
+    let mut prefix = vec![0u8; (len as usize).min(MAX_PREFIX)];
+    file.read_exact_at(&mut prefix, start)?;
+    Ok(cri::parse(&prefix).is_some())
+}
+
+/// Whether `offset` is where a line starts: the file's start, or right
+/// after a newline.
+fn at_line_start(file: &File, offset: u64) -> io::Result<bool> {
+    if offset == 0 {
+        return Ok(true);
+    }
+    let mut before = [0u8; 1];
+    file.read_exact_at(&mut before, offset - 1)?;
+    Ok(before[0] == b'\n')
 }
 
 /// Where the last `lines` lines of a log of `len` bytes start, and how many
 /// leading parts of the line there to leave out. Reads back from the end in
 /// blocks of `block` bytes, never further than `bytes` from the end; a line
-/// counts as many lines as it has parts of at most `max` bytes. A line
-/// whose start lies further back than `lines` parts reach is cut to its
-/// last `lines` × `max` bytes; one whose start lies further back than
-/// `bytes` reach is cut to its last whole parts within them, or left out
-/// when not one fits.
+/// of the format counts as one line, one of before as many as it has parts
+/// of at most `max` bytes. A line of before whose start lies further back
+/// than `lines` parts reach is cut to its last `lines` × `max` bytes; one
+/// whose start lies further back than `bytes` reach is cut to its last
+/// whole parts within them, or left out when not one fits. A line of the
+/// format that starts further back is left out.
 pub(crate) fn tail_start(
     file: &File,
     len: u64,
@@ -76,6 +120,7 @@ pub(crate) fn tail_start(
         return Ok((len, 0));
     }
     let max = max.max(1) as u64;
+    let room = max + MAX_PREFIX as u64;
     let mut buf = vec![0u8; block.max(1)];
     // The lines still wanted, and the end of the line looked at, without
     // its newline.
@@ -101,32 +146,50 @@ pub(crate) fn tail_start(
         }
         while let Some(q) = block[..k].iter().rposition(|&b| b == b'\n') {
             let line_start = lo + q as u64 + 1;
-            if let Some(found) = settle(line_start, line_end, need, max) {
+            let record = is_record(file, line_start, line_end, room)?;
+            if let Some(found) = settle(line_start, line_end, need, max, record) {
                 return Ok(found);
             }
-            need -= parts(line_end - line_start, max);
+            need -= units(line_end - line_start, max, record);
             line_end = line_start - 1;
             k = q;
         }
-        // The line reaches below this block: is it already long enough?
-        if line_end - lo > need * max {
+        // The line reaches below this block: is it already long enough,
+        // and too long to be one of the format?
+        if line_end - lo > need * max && line_end - lo >= room {
             return Ok((line_end - need * max, 0));
         }
         hi = lo;
     }
     if floor == 0 {
-        return Ok(settle(0, line_end, need, max).unwrap_or((0, 0)));
+        let record = is_record(file, 0, line_end, room)?;
+        return Ok(settle(0, line_end, need, max, record).unwrap_or((0, 0)));
     }
     // The bytes end inside the line looked at, or just before it starts.
-    let mut before = [0u8; 1];
-    file.read_exact_at(&mut before, floor - 1)?;
-    if before[0] == b'\n' {
-        return Ok(settle(floor, line_end, need, max).unwrap_or((floor, 0)));
+    if at_line_start(file, floor)? {
+        let record = is_record(file, floor, line_end, room)?;
+        return Ok(settle(floor, line_end, need, max, record).unwrap_or((floor, 0)));
     }
-    // It started further back: its last whole parts within the bytes, at
-    // most need of them (more would have been settled above); without one,
-    // the tail starts after it.
-    let whole = (line_end - floor) / max;
+    // It started further back. One of the format is left out; it starts
+    // within `room` of its end, if it is one.
+    let reach = room.saturating_sub(line_end - floor);
+    if reach > 0 {
+        let lo = floor.saturating_sub(reach);
+        let mut back = vec![0u8; (floor - lo) as usize];
+        file.read_exact_at(&mut back, lo)?;
+        let start = match back.iter().rposition(|&b| b == b'\n') {
+            Some(q) => Some(lo + q as u64 + 1),
+            None => (lo == 0).then_some(0),
+        };
+        if let Some(start) = start
+            && is_record(file, start, line_end, room)?
+        {
+            return Ok(((line_end + 1).min(len), 0));
+        }
+    }
+    // One of before: its last whole parts within the bytes, at most need
+    // of them; without one, the tail starts after it.
+    let whole = ((line_end - floor) / max).min(need);
     if whole > 0 {
         return Ok((line_end - whole * max, 0));
     }
@@ -134,8 +197,12 @@ pub(crate) fn tail_start(
 }
 
 /// Where the tail starts if the line from `start` to `end` holds the last
-/// of the `need` lines still wanted.
-fn settle(start: u64, end: u64, need: u64, max: u64) -> Option<(u64, u64)> {
+/// of the `need` lines still wanted; `record`: it is one of the format,
+/// one line.
+fn settle(start: u64, end: u64, need: u64, max: u64, record: bool) -> Option<(u64, u64)> {
+    if record {
+        return (need == 1).then_some((start, 0));
+    }
     let len = end - start;
     if len > need * max {
         return Some((end - need * max, 0));
@@ -144,58 +211,154 @@ fn settle(start: u64, end: u64, need: u64, max: u64) -> Option<(u64, u64)> {
     (parts >= need).then(|| (start, parts - need))
 }
 
+/// An entry of the log, before it goes out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Part {
+    /// Where its line, or its part of a line of before, starts in the
+    /// file, and where the next entry starts.
+    pub(crate) offset: u64,
+    pub(crate) next_offset: u64,
+    pub(crate) text: Vec<u8>,
+    /// 0 and unspecified for a line of before.
+    pub(crate) time_unix_nano: i64,
+    pub(crate) source: Source,
+    pub(crate) partial: bool,
+}
+
 /// Cuts bytes into the entries of a log: at each newline, which is left
-/// out, and after `max` bytes of a line.
+/// out; a line of the format as one entry, one of before after every `max`
+/// bytes.
 pub(crate) struct Lines {
     max: usize,
+    /// The most a line is held for: a part and the longest prefix. A line
+    /// that reaches it is not one of the format.
+    room: usize,
     /// The part of a line read so far.
     pending: Vec<u8>,
-    /// The line being read went out in part already: its newline does not
-    /// end an empty line.
+    /// The offset in the file after the bytes pushed.
+    pos: u64,
+    /// The line being read went out in part already, or started before the
+    /// bytes pushed: its newline does not end an empty line, and it is not
+    /// one of the format.
     parted: bool,
     /// Entries still to leave out, from the start of a tail.
     skip: u64,
 }
 
 impl Lines {
+    #[cfg(test)]
     pub(crate) fn new(max: usize, skip: u64) -> Self {
+        Self::at(max, skip, 0, false)
+    }
+
+    /// Cuts the bytes from offset `pos` on; `parted`: a line starts not
+    /// there but before.
+    pub(crate) fn at(max: usize, skip: u64, pos: u64, parted: bool) -> Self {
+        let max = max.max(1);
         Self {
-            max: max.max(1),
+            max,
+            room: max + MAX_PREFIX,
             pending: Vec::new(),
-            parted: false,
+            pos,
+            parted,
             skip,
         }
     }
 
-    fn emit(&mut self, out: &mut Vec<Vec<u8>>) {
-        let line = std::mem::take(&mut self.pending);
+    fn emit(&mut self, part: Part, out: &mut Vec<Part>) {
         if self.skip > 0 {
             self.skip -= 1;
         } else {
-            out.push(line);
+            out.push(part);
         }
     }
 
+    /// The pending bytes of a line, from `start` to the newline before
+    /// `next` or to `next`, as its entries.
+    fn end(&mut self, start: u64, next: u64, out: &mut Vec<Part>) {
+        let line = std::mem::take(&mut self.pending);
+        if !self.parted
+            && let Some(record) = cri::parse(&line)
+        {
+            let part = Part {
+                offset: start,
+                next_offset: next,
+                text: record.text.to_vec(),
+                time_unix_nano: record.time_unix_nano,
+                source: record.source,
+                partial: record.partial,
+            };
+            return self.emit(part, out);
+        }
+        if line.is_empty() && self.parted {
+            return;
+        }
+        let count = line.len().div_ceil(self.max).max(1);
+        for k in 0..count {
+            let text = line
+                .get(k * self.max..((k + 1) * self.max).min(line.len()))
+                .unwrap_or_default();
+            let offset = start + (k * self.max) as u64;
+            let last = k + 1 == count;
+            let part = Part {
+                offset,
+                next_offset: if last {
+                    next
+                } else {
+                    offset + text.len() as u64
+                },
+                text: text.to_vec(),
+                time_unix_nano: 0,
+                source: Source::Unspecified,
+                partial: !last,
+            };
+            self.emit(part, out);
+        }
+    }
+
+    /// Sends the whole parts of a line that filled the room: it is one of
+    /// before.
+    fn cut(&mut self, out: &mut Vec<Part>) {
+        let start = self.pos - self.pending.len() as u64;
+        let whole = self.pending.len() / self.max * self.max;
+        let rest = self.pending.split_off(whole);
+        let line = std::mem::replace(&mut self.pending, rest);
+        for (k, text) in line.chunks(self.max).enumerate() {
+            let offset = start + (k * self.max) as u64;
+            let part = Part {
+                offset,
+                next_offset: offset + text.len() as u64,
+                text: text.to_vec(),
+                time_unix_nano: 0,
+                source: Source::Unspecified,
+                partial: true,
+            };
+            self.emit(part, out);
+        }
+        self.parted = true;
+    }
+
     /// Adds bytes, putting the entries they finish into `out`.
-    pub(crate) fn push(&mut self, mut data: &[u8], out: &mut Vec<Vec<u8>>) {
+    pub(crate) fn push(&mut self, mut data: &[u8], out: &mut Vec<Part>) {
         while !data.is_empty() {
-            let room = self.max - self.pending.len();
+            let room = self.room - self.pending.len();
             let window = &data[..room.min(data.len())];
             match window.iter().position(|&b| b == b'\n') {
                 Some(i) => {
                     self.pending.extend_from_slice(&window[..i]);
-                    if !self.pending.is_empty() || !self.parted {
-                        self.emit(out);
-                    }
+                    self.pos += i as u64;
+                    let start = self.pos - self.pending.len() as u64;
+                    self.pos += 1;
+                    self.end(start, self.pos, out);
                     self.parted = false;
                     data = &data[i + 1..];
                 }
                 None => {
                     self.pending.extend_from_slice(window);
+                    self.pos += window.len() as u64;
                     data = &data[window.len()..];
-                    if self.pending.len() == self.max {
-                        self.emit(out);
-                        self.parted = true;
+                    if self.pending.len() == self.room {
+                        self.cut(out);
                     }
                 }
             }
@@ -209,9 +372,10 @@ impl Lines {
 
     /// Sends the unfinished line as it is: at the end of the log, or when
     /// it waited long enough.
-    pub(crate) fn flush(&mut self, out: &mut Vec<Vec<u8>>) {
+    pub(crate) fn flush(&mut self, out: &mut Vec<Part>) {
         if !self.pending.is_empty() {
-            self.emit(out);
+            let start = self.pos - self.pending.len() as u64;
+            self.end(start, self.pos, out);
             self.parted = true;
         }
     }
@@ -223,6 +387,8 @@ pub(crate) struct LogFile {
     /// The file's device and inode: another file at its path, or none, is
     /// a deleted container.
     identity: (u64, u64),
+    /// Its ID, which the entries carry.
+    log_id: String,
     offset: u64,
     lines: Lines,
 }
@@ -239,15 +405,16 @@ impl LogFile {
         Ok(Some(Self {
             file,
             identity: (meta.dev(), meta.ino()),
+            log_id: cri::read_id(path),
             offset: 0,
-            lines: Lines::new(MAX_LINE, 0),
+            lines: Lines::at(MAX_LINE, 0, 0, false),
         }))
     }
 
     /// Reads on from where it was, up to `end` or the end of the file, at
     /// most [`READ_CHUNK`] bytes. Returns the entries finished and the
     /// bytes read; none at the end.
-    fn read(&mut self, end: Option<u64>) -> io::Result<(Vec<Vec<u8>>, usize)> {
+    fn read(&mut self, end: Option<u64>) -> io::Result<(Vec<Part>, usize)> {
         let mut want = READ_CHUNK;
         if let Some(end) = end {
             want = want.min(end.saturating_sub(self.offset) as usize);
@@ -273,29 +440,50 @@ pub(crate) struct Opened {
     end: u64,
 }
 
-/// Opens the log at `path` and finds where the stream starts: the last
-/// `tail_lines` lines (capped at [`MAX_TAIL_LINES`] and
-/// [`MAX_TAIL_BYTES`]) when above 0, else the whole log with `tail`, else
-/// its end.
-pub(crate) fn open(path: &Path, tail_lines: u32, tail: bool) -> io::Result<Opened> {
+/// Where a stream starts.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Start {
+    pub(crate) tail_lines: u32,
+    pub(crate) tail: bool,
+    /// With follow: the offset and the log it is of; wins over the tails
+    /// when either is set.
+    pub(crate) from_offset: u64,
+    pub(crate) log_id: String,
+}
+
+/// Opens the log at `path` and finds where the stream starts: at
+/// `from_offset` if it is of the log there and within it, else at 0, when
+/// it or `log_id` is set; the last `tail_lines` lines (capped at
+/// [`MAX_TAIL_LINES`] and [`MAX_TAIL_BYTES`]) when above 0, else the whole
+/// log with `tail`, else its end.
+pub(crate) fn open(path: &Path, start: &Start) -> io::Result<Opened> {
     let Some(mut log) = LogFile::open(path)? else {
         return Ok(Opened { log: None, end: 0 });
     };
     let len = log.file.metadata()?.len();
-    let (start, skip) = match tail_lines.min(MAX_TAIL_LINES) {
-        0 if tail => (0, 0),
-        0 => (len, 0),
-        lines => tail_start(
-            &log.file,
-            len,
-            lines.into(),
-            MAX_TAIL_BYTES,
-            BLOCK,
-            MAX_LINE,
-        )?,
+    let (offset, skip) = if start.from_offset > 0 || !start.log_id.is_empty() {
+        let same = start.log_id.is_empty() || start.log_id == log.log_id;
+        match same && start.from_offset <= len {
+            true => (start.from_offset, 0),
+            false => (0, 0),
+        }
+    } else {
+        match start.tail_lines.min(MAX_TAIL_LINES) {
+            0 if start.tail => (0, 0),
+            0 => (len, 0),
+            lines => tail_start(
+                &log.file,
+                len,
+                lines.into(),
+                MAX_TAIL_BYTES,
+                BLOCK,
+                MAX_LINE,
+            )?,
+        }
     };
-    log.offset = start;
-    log.lines = Lines::new(MAX_LINE, skip);
+    log.offset = offset;
+    let parted = !at_line_start(&log.file, offset)?;
+    log.lines = Lines::at(MAX_LINE, skip, offset, parted);
     Ok(Opened {
         log: Some(log),
         end: len,
@@ -325,12 +513,16 @@ impl From<Status> for End {
     }
 }
 
-async fn send(tx: &LogSender, entries: Vec<Vec<u8>>) -> Result<(), End> {
-    for line in entries {
+async fn send(tx: &LogSender, log_id: &str, parts: Vec<Part>) -> Result<(), End> {
+    for part in parts {
         let entry = LogEntry {
-            line,
-            source: Source::Unspecified as i32,
-            ..Default::default()
+            line: part.text,
+            source: part.source as i32,
+            offset: part.offset,
+            next_offset: part.next_offset,
+            time_unix_nano: part.time_unix_nano,
+            partial: part.partial,
+            log_id: log_id.to_string(),
         };
         tx.send(Ok(entry)).await.map_err(|_| End::Gone)?;
     }
@@ -346,13 +538,13 @@ async fn read_through(
 ) -> Result<(LogFile, bool), End> {
     let mut read_any = false;
     loop {
-        let (read, entries, n) = blocking(move || {
-            let (entries, n) = log.read(end)?;
-            Ok((log, entries, n))
+        let (read, parts, n) = blocking(move || {
+            let (parts, n) = log.read(end)?;
+            Ok((log, parts, n))
         })
         .await?;
         log = read;
-        send(tx, entries).await?;
+        send(tx, &log.log_id, parts).await?;
         if n == 0 {
             return Ok((log, read_any));
         }
@@ -364,7 +556,7 @@ async fn read_through(
 async fn flush(log: &mut LogFile, tx: &LogSender) -> Result<(), End> {
     let mut out = Vec::new();
     log.lines.flush(&mut out);
-    send(tx, out).await
+    send(tx, &log.log_id, out).await
 }
 
 /// Whether the file at `path` is no longer the one of `identity`.
@@ -477,15 +669,25 @@ mod tests {
     ) -> Vec<Vec<u8>> {
         let len = content.len() as u64;
         let (start, skip) = tail_start(file, len, lines, bytes, block, max).unwrap();
-        let mut split = Lines::new(max, skip);
+        let parted = !at_line_start(file, start).unwrap();
+        let mut split = Lines::at(max, skip, start, parted);
         let mut out = Vec::new();
         split.push(&content[start as usize..], &mut out);
         split.flush(&mut out);
-        out
+        texts(out)
+    }
+
+    fn texts(parts: Vec<Part>) -> Vec<Vec<u8>> {
+        parts.into_iter().map(|part| part.text).collect()
     }
 
     /// All entries of `content`, with parts of at most `max` bytes.
     fn entries(content: &[u8], max: usize) -> Vec<Vec<u8>> {
+        texts(parts_of(content, max))
+    }
+
+    /// The same, as parts.
+    fn parts_of(content: &[u8], max: usize) -> Vec<Part> {
         let mut split = Lines::new(max, 0);
         let mut out = Vec::new();
         split.push(content, &mut out);
@@ -648,6 +850,19 @@ mod tests {
             }
             let start = end - line.len();
             end = start.saturating_sub(1);
+            // A line of the format is one entry, or none when it starts
+            // further back than the bytes reach.
+            let record = (line.len() < max + MAX_PREFIX)
+                .then(|| cri::parse(line))
+                .flatten();
+            if let Some(record) = record {
+                if start < floor {
+                    break;
+                }
+                picked.push(vec![record.text.to_vec()]);
+                need -= 1;
+                continue;
+            }
             if start < floor {
                 // It starts further back than the bytes reach: its last
                 // whole parts within them, if one fits.
@@ -804,16 +1019,29 @@ mod tests {
             .flat_map(|i| format!("{i}\n").into_bytes())
             .collect();
         let file = file_with(&content);
-        let opened = open(file.path(), u32::MAX, false).unwrap();
+        let opened = open(file.path(), &tail_of_lines(u32::MAX, false)).unwrap();
         let mut log = opened.log.unwrap();
         let (got, _) = log.read(Some(opened.end)).unwrap();
         assert_eq!(got.len(), MAX_TAIL_LINES as usize);
-        assert_eq!(got[0], b"5");
+        assert_eq!(got[0].text, b"5");
     }
 
     /// The entries a stream without follow sends for the log at `path`.
     fn read_all(path: &Path, tail_lines: u32, tail: bool) -> Vec<Vec<u8>> {
-        let opened = open(path, tail_lines, tail).unwrap();
+        texts(read_parts(path, &tail_of_lines(tail_lines, tail)))
+    }
+
+    fn tail_of_lines(tail_lines: u32, tail: bool) -> Start {
+        Start {
+            tail_lines,
+            tail,
+            ..Default::default()
+        }
+    }
+
+    /// The parts a stream without follow sends for the log at `path`.
+    fn read_parts(path: &Path, start: &Start) -> Vec<Part> {
+        let opened = open(path, start).unwrap();
         let mut log = opened.log.unwrap();
         let mut out = Vec::new();
         loop {
@@ -864,18 +1092,227 @@ mod tests {
     fn open_starts_where_the_request_says() {
         let file = file_with(b"one\ntwo\nthree\n");
         let read = |tail_lines, tail| {
-            let opened = open(file.path(), tail_lines, tail).unwrap();
+            let opened = open(file.path(), &tail_of_lines(tail_lines, tail)).unwrap();
             let mut log = opened.log.unwrap();
             let (got, _) = log.read(Some(opened.end)).unwrap();
-            strings(&got)
+            strings(&texts(got))
         };
         assert_eq!(read(0, true), ["one", "two", "three"]);
         assert!(read(0, false).is_empty());
         assert_eq!(read(1, false), ["three"]);
         assert_eq!(read(2, true), ["two", "three"]);
 
-        let missing = open(Path::new("/nonexistent/container.log"), 5, true).unwrap();
+        let missing = open(
+            Path::new("/nonexistent/container.log"),
+            &tail_of_lines(5, true),
+        )
+        .unwrap();
         assert!(missing.log.is_none());
+    }
+
+    /// A line of the format, read at `second`.
+    fn record(second: u64, source: Source, partial: bool, text: &[u8]) -> Vec<u8> {
+        let time = std::time::UNIX_EPOCH + Duration::from_secs(second);
+        let mut out = Vec::new();
+        cri::write(&mut out, time, source, partial, text);
+        out
+    }
+
+    #[test]
+    fn lines_of_the_format_go_out_as_their_text() {
+        let mut content = b"old line\n".to_vec();
+        let first = content.len() as u64;
+        content.extend(record(1, Source::Stdout, false, b"hello"));
+        let second = content.len() as u64;
+        content.extend(record(2, Source::Stderr, true, b"a part"));
+        let third = content.len() as u64;
+        content.extend(record(3, Source::Stderr, false, b""));
+        let end = content.len() as u64;
+        let parts = parts_of(&content, MAX_LINE);
+        assert_eq!(
+            parts,
+            [
+                Part {
+                    offset: 0,
+                    next_offset: first,
+                    text: b"old line".to_vec(),
+                    time_unix_nano: 0,
+                    source: Source::Unspecified,
+                    partial: false,
+                },
+                Part {
+                    offset: first,
+                    next_offset: second,
+                    text: b"hello".to_vec(),
+                    time_unix_nano: 1_000_000_000,
+                    source: Source::Stdout,
+                    partial: false,
+                },
+                Part {
+                    offset: second,
+                    next_offset: third,
+                    text: b"a part".to_vec(),
+                    time_unix_nano: 2_000_000_000,
+                    source: Source::Stderr,
+                    partial: true,
+                },
+                Part {
+                    offset: third,
+                    next_offset: end,
+                    text: Vec::new(),
+                    time_unix_nano: 3_000_000_000,
+                    source: Source::Stderr,
+                    partial: false,
+                },
+            ]
+        );
+        // A line of before over the most goes out in parts, all but the
+        // last partial, each where it starts.
+        let mut long = vec![b'x'; 2 * MAX_LINE + 5];
+        long.push(b'\n');
+        let parts = parts_of(&long, MAX_LINE);
+        let at: Vec<_> = parts
+            .iter()
+            .map(|p| (p.offset, p.next_offset, p.partial))
+            .collect();
+        let max = MAX_LINE as u64;
+        assert_eq!(
+            at,
+            [
+                (0, max, true),
+                (max, 2 * max, true),
+                (2 * max, 2 * max + 6, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_full_part_of_the_format_is_one_entry() {
+        let text = vec![b'y'; MAX_LINE];
+        let mut content = record(1, Source::Stdout, true, &text);
+        content.extend(record(2, Source::Stdout, false, b"rest"));
+        let file = file_with(&content);
+        let all = read_parts(file.path(), &tail_of_lines(0, true));
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].text, text);
+        assert!(all[0].partial);
+        assert_eq!(all[1].text, b"rest");
+        assert_eq!(all[1].next_offset, content.len() as u64);
+        // A tail counts it as one line.
+        assert_eq!(read_all(file.path(), 1, false), [b"rest".to_vec()]);
+        assert_eq!(read_all(file.path(), 2, false), [text, b"rest".to_vec()]);
+    }
+
+    #[test]
+    fn tails_over_both_formats_are_the_same_whatever_the_blocks() {
+        // Lines of before and of the format, of pseudo-random lengths.
+        let max = 16;
+        let mut content = Vec::new();
+        let mut seed: u32 = 11;
+        for i in 0..60u64 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let len = ((seed >> 16) % 40) as usize;
+            let byte = b'a' + (i % 26) as u8;
+            if (seed >> 8).is_multiple_of(3) {
+                let source = if i % 2 == 0 {
+                    Source::Stdout
+                } else {
+                    Source::Stderr
+                };
+                content.extend(record(i, source, false, &vec![byte; len % max]));
+            } else {
+                content.extend(std::iter::repeat_n(byte, len));
+                content.push(b'\n');
+            }
+        }
+        let file = file_with(&content);
+        for bytes in 0..=content.len() + 1 {
+            for lines in [1, 2, 5, 40, 1000] {
+                let want = model_in(&content, lines, bytes, max);
+                for block in [1, 3, 17, 4096] {
+                    let got = tail_of(
+                        file.as_file(),
+                        &content,
+                        lines as u64,
+                        bytes as u64,
+                        block,
+                        max,
+                    );
+                    assert_eq!(got, want, "{lines} lines, {bytes} bytes, block {block}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_follow_starts_at_an_offset_of_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("container.log");
+        let id = cri::ensure_id(&path).unwrap();
+        let mut content = record(1, Source::Stdout, false, b"one");
+        let second = content.len() as u64;
+        content.extend(record(2, Source::Stdout, false, b"two"));
+        std::fs::write(&path, &content).unwrap();
+        let from = |from_offset, log_id: &str| {
+            let start = Start {
+                tail_lines: 1,
+                from_offset,
+                log_id: log_id.to_string(),
+                ..Default::default()
+            };
+            strings(&texts(read_parts(&path, &start)))
+        };
+        // From an offset of the log, whatever the tail says.
+        assert_eq!(from(second, &id), ["two"]);
+        assert_eq!(from(second, ""), ["two"]);
+        assert_eq!(from(0, &id), ["one", "two"]);
+        // Of another log, or past its end: from its start.
+        assert_eq!(from(second, "another"), ["one", "two"]);
+        assert_eq!(from(content.len() as u64 + 1, &id), ["one", "two"]);
+        // At its end: nothing yet.
+        assert!(from(content.len() as u64, &id).is_empty());
+        // The entries carry the log's ID.
+        let (tx, mut rx) = mpsc::channel(4);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let opened = open(&path, &tail_of_lines(1, false)).unwrap();
+        let log = opened.log.unwrap();
+        rt.block_on(async {
+            let (_, read) = read_through(log, Some(opened.end), &tx).await.ok().unwrap();
+            assert!(read);
+            let entry = rx.recv().await.unwrap().unwrap();
+            assert_eq!(entry.log_id, id);
+            assert_eq!(entry.offset, second);
+            assert_eq!(entry.next_offset, content.len() as u64);
+            assert_eq!(entry.time_unix_nano, 2_000_000_000);
+            assert_eq!(entry.source, Source::Stdout as i32);
+        });
+    }
+
+    #[test]
+    fn a_follow_from_inside_a_long_line_of_before_goes_on_with_it() {
+        let mut content = vec![b'x'; 10];
+        content.extend(b"\nnext\n");
+        let file = file_with(&content);
+        // The offset after the first of the line's parts (of 4 bytes).
+        let mut split = Lines::at(4, 0, 4, true);
+        let mut out = Vec::new();
+        split.push(&content[4..], &mut out);
+        let at: Vec<_> = out
+            .iter()
+            .map(|p| (p.offset, String::from_utf8_lossy(&p.text).into_owned()))
+            .collect();
+        assert_eq!(
+            at,
+            [
+                (4, "xxxx".to_string()),
+                (8, "xx".to_string()),
+                (11, "next".to_string())
+            ]
+        );
+        assert!(!at_line_start(file.as_file(), 4).unwrap());
+        assert!(at_line_start(file.as_file(), 11).unwrap());
     }
 
     #[test]
@@ -885,14 +1322,33 @@ mod tests {
         for chunk in [&b"ab"[..], b"c\nde", b"fghij", b"\n", b"\nk"] {
             split.push(chunk, &mut out);
         }
-        assert_eq!(strings(&out), ["abc", "defg", "hij", ""]);
+        assert_eq!(strings(&texts(out.clone())), ["abc", "defg", "hij", ""]);
         assert!(split.has_pending());
         split.flush(&mut out);
-        assert_eq!(strings(&out), ["abc", "defg", "hij", "", "k"]);
+        assert_eq!(
+            strings(&texts(out.clone())),
+            ["abc", "defg", "hij", "", "k"]
+        );
         // The rest of a line that went out unfinished does not make an
         // empty line of its own.
         split.push(b"\nl\n", &mut out);
-        assert_eq!(strings(&out[5..]), ["l"]);
+        assert_eq!(strings(&texts(out[5..].to_vec())), ["l"]);
+        // Every entry says where it starts and where the next one does.
+        let at: Vec<_> = out
+            .iter()
+            .map(|p| (p.offset, p.next_offset, p.partial))
+            .collect();
+        assert_eq!(
+            at,
+            [
+                (0, 4, false),
+                (4, 8, true),
+                (8, 12, false),
+                (12, 13, false),
+                (13, 14, false),
+                (15, 17, false)
+            ]
+        );
     }
 
     async fn collect(mut rx: mpsc::Receiver<Result<LogEntry, Status>>) -> Vec<String> {
@@ -912,7 +1368,7 @@ mod tests {
         let path = dir.path().join("container.log");
         std::fs::write(&path, "a\nb\nunfinished").unwrap();
         let (tx, rx) = mpsc::channel(4);
-        let opened = open(&path, 2, false).unwrap();
+        let opened = open(&path, &tail_of_lines(2, false)).unwrap();
         tokio::spawn(stream(
             opened,
             false,
@@ -931,7 +1387,7 @@ mod tests {
         let path = dir.path().join("container.log");
         std::fs::write(&path, "old\n").unwrap();
         let (tx, mut rx) = mpsc::channel(4);
-        let opened = open(&path, 0, true).unwrap();
+        let opened = open(&path, &tail_of_lines(0, true)).unwrap();
         tokio::spawn(stream(
             opened,
             true,
@@ -980,7 +1436,7 @@ mod tests {
         let path = dir.path().join("main").join("container.log");
         let follow = || {
             let (tx, rx) = mpsc::channel(4);
-            let opened = open(&path, 0, true).unwrap();
+            let opened = open(&path, &tail_of_lines(0, true)).unwrap();
             tokio::spawn(stream(
                 opened,
                 true,
@@ -1011,7 +1467,7 @@ mod tests {
         let path = dir.path().join("container.log");
         std::fs::write(&path, "").unwrap();
         let (tx, rx) = mpsc::channel(4);
-        let opened = open(&path, 0, false).unwrap();
+        let opened = open(&path, &tail_of_lines(0, false)).unwrap();
         let task = tokio::spawn(stream(
             opened,
             true,

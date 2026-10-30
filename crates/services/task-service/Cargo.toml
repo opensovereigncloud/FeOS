@@ -17,3 +17,6 @@ nix = { workspace = true, features = ["signal", "process", "sched"] }
 libc = { workspace = true }
 libcontainer = { workspace = true }
 tokio-stream = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -351,10 +351,22 @@ async fn print_logs(
     use std::io::Write;
     let mut entries = client.stream_container_logs(request).await?.into_inner();
     let mut stdout = std::io::stdout();
+    // A part goes on in the next entry of its stream (ADR 0026): the source
+    // of one printed without its newline.
+    let mut open: Option<i32> = None;
     while let Some(entry) = entries.message().await? {
+        if open.is_some_and(|source| source != entry.source) {
+            stdout.write_all(b"\n")?;
+        }
         stdout.write_all(&entry.line)?;
-        stdout.write_all(b"\n")?;
+        open = entry.partial.then_some(entry.source);
+        if !entry.partial {
+            stdout.write_all(b"\n")?;
+        }
         stdout.flush()?;
+    }
+    if open.is_some() {
+        stdout.write_all(b"\n")?;
     }
     Ok(())
 }
