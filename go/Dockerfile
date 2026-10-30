@@ -4,11 +4,13 @@
 # The image of ferund, FeRun (ADR 0015): the management UI (web/) built
 # and embedded, ferund built static, on a distroless base, as a non-root
 # user. It carries ferun-ingress as well (ADR 0021), built static into
-# /ferun-ingress, and ferun-sink (ADR 0026) into /ferun-sink: their pods
-# run the same image with those entrypoints. The build context is the
-# repository's root, which holds both:
+# /ferun-ingress, whose pods run the same image with that entrypoint.
+# ferun-sink (ADR 0026), a service of its own, is an image of its own, the
+# stage ferun-sink. The build context is the repository's root, which
+# holds both:
 #
 #   docker build -f go/Dockerfile -t ferund .
+#   docker build -f go/Dockerfile --target ferun-sink -t ferun-sink .
 #
 # Termination grace: on SIGTERM an instance keeps serving its requests and
 # finishing its ops for up to --shutdown-grace (10 minutes by default),
@@ -49,10 +51,17 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${VERSION}" -o /o
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${VERSION}" -o /out/ferun-ingress ./cmd/ferun-ingress
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=${VERSION}" -o /out/ferun-sink ./cmd/ferun-sink
 
+# ferun-sink's image: the program alone, its API and its ingest.
+FROM gcr.io/distroless/static-debian12:nonroot AS ferun-sink
+COPY --from=build /out/ferun-sink /ferun-sink
+EXPOSE 8080 4317
+ENTRYPOINT ["/ferun-sink"]
+CMD ["serve"]
+
+# ferund's image, the default target.
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/ferund /ferund
 COPY --from=build /out/ferun-ingress /ferun-ingress
-COPY --from=build /out/ferun-sink /ferun-sink
 # The front doors (REST, MCP, the UI, the ports) and the nodes' port.
 EXPOSE 8100 7443
 ENTRYPOINT ["/ferund"]

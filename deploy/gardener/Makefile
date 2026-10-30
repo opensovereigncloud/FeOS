@@ -32,9 +32,12 @@ GATEWAY_NAME ?= platform
 # since a set given replaces the built-in one.
 comma := ,
 FERUN_DENY_PREFIX = $(if $(strip $(DENY_PREFIXES)),default$(comma)$(subst $(eval) ,$(comma),$(strip $(DENY_PREFIXES))))
-export DOMAIN REGISTRY OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_SINK_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE
-DOCKER ?= docker
 TAG ?= dev
+# ferun-sink's image: a platform image, on GHCR with FeOS's others, not in
+# the projects' registry (README.md, The sink).
+SINK_IMAGE ?= ghcr.io/gardenlinux/feos/ferun-sink:$(TAG)
+export DOMAIN REGISTRY SINK_IMAGE OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_SINK_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE
+DOCKER ?= docker
 PACKAGES_DIR ?= $(REPO_ROOT)/target/packages
 CONTEXT := $(REPO_ROOT)/target/gardener/feos-node
 MANIFESTS := $(REPO_ROOT)/target/gardener/manifests
@@ -56,7 +59,7 @@ endef
 cat-yaml = awk 'FNR==1{print "---"}1' $(1)
 
 .PHONY: feos-node push-feos-node deploy-feos feos-k8s push-feos-k8s deploy-feos-k8s
-.PHONY: ferund push-ferund deploy-ferund deploy-ferun-ingress deploy-ferun-sink
+.PHONY: ferund push-ferund deploy-ferund deploy-ferun-ingress ferun-sink push-ferun-sink deploy-ferun-sink
 .PHONY: manifests apply-feos apply-ferun apply-ferun-db-import apply-ferun-ingress apply-ferun-sink apply-fechat apply-registry FORCE
 
 # feosd, diskd, feosctl, Firecracker and the guest from the packages, for
@@ -97,9 +100,14 @@ deploy-ferun-ingress: push-ferund ## Push ferund's image and roll ferun-ingress,
 	kubectl -n ferun-ingress rollout restart statefulset/ferun-ingress
 	kubectl -n ferun-ingress rollout status statefulset/ferun-ingress --timeout=10m
 
-# ferun-sink ships in ferund's image too (README.md, The sink).
-deploy-ferun-sink: push-ferund ## Push ferund's image and roll ferun-sink.
-	kubectl -n ferun rollout restart deployment/ferun-sink
+ferun-sink: ## Build ferun-sink's image (SINK_IMAGE).
+	$(DOCKER) build -f $(REPO_ROOT)/go/Dockerfile --target ferun-sink -t $(SINK_IMAGE) $(REPO_ROOT)
+
+push-ferun-sink: ferun-sink ## Build and push ferun-sink's image.
+	$(DOCKER) push $(SINK_IMAGE)
+
+deploy-ferun-sink: push-ferun-sink ## Push ferun-sink's image and roll it.
+	kubectl -n ferun set image deployment/ferun-sink ferun-sink=$(SINK_IMAGE)
 	kubectl -n ferun rollout status deployment/ferun-sink --timeout=5m
 
 manifests: $(MANIFESTS)/feos.yaml $(MANIFESTS)/feos-k8s.yaml $(MANIFESTS)/ferun.yaml $(MANIFESTS)/fechat.yaml $(MANIFESTS)/registry.yaml $(MANIFESTS)/ferun-ingress.yaml $(MANIFESTS)/ferun-sink.yaml ## Write every part's manifests, with the parameters, to target/gardener/manifests.
@@ -132,7 +140,7 @@ $(MANIFESTS)/ferun-ingress.yaml: FORCE
 	$(call render,DOMAIN REGISTRY FERUN_NODES_IP APPS_ZONE NODE_CIDR,cat ferun-ingress/ferun-ingress.yaml)
 
 $(MANIFESTS)/ferun-sink.yaml: FORCE
-	$(call render,DOMAIN REGISTRY FERUN_SINK_IP GATEWAY_NAMESPACE GATEWAY_NAME,cat ferun-sink/ferun-sink.yaml)
+	$(call render,DOMAIN SINK_IMAGE FERUN_SINK_IP GATEWAY_NAMESPACE GATEWAY_NAME,cat ferun-sink/ferun-sink.yaml)
 
 # A network of the shoot that DENY_PREFIXES leaves out is open to the
 # microVMs, which leave through the feos-node pod on the host's network:

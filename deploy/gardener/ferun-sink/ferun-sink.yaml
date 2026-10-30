@@ -4,9 +4,10 @@
 # ferun-sink on the Gardener shoot (ADR 0026, docs/architecture/sink.md,
 # deploy/gardener/README.md, The sink): two instances in the namespace
 # ferun, beside ferund, over the database sink of ferun-db, with the cold
-# stage in the platform's bucket. Its program ships in ferund's image
-# (/ferun-sink). The ${...} are the deployment's parameters
-# (config.env.example), which make fills in:
+# stage in the platform's bucket. Its image is a platform image on GHCR
+# (SINK_IMAGE, go/Dockerfile's stage ferun-sink), pulled with the Secret
+# ghcr-pull while FeOS's packages there are not public. The ${...} are
+# the deployment's parameters (config.env.example), which make fills in:
 #
 #   make -C deploy/gardener apply-ferun-sink
 #
@@ -65,7 +66,7 @@ spec:
         app: ferun-sink
     spec:
       imagePullSecrets:
-        - name: oci-pull
+        - name: ghcr-pull
       securityContext:
         runAsNonRoot: true
       # On different workers where they can be.
@@ -82,10 +83,7 @@ spec:
       terminationGracePeriodSeconds: 40
       containers:
         - name: ferun-sink
-          image: ${REGISTRY}/ferund:dev
-          imagePullPolicy: Always
-          command: ["/ferun-sink"]
-          args: ["serve"]
+          image: ${SINK_IMAGE}
           env:
             - name: FERUN_SINK_NAME
               value: ferun-sink

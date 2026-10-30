@@ -352,12 +352,20 @@ namespace `ferun`, over the database `sink` of `ferun-db` and the
 platform's bucket. The nodes ship to its ingest at
 `FERUN_SINK_IP:4317`, over mTLS with their node certificates; tenants
 read at `https://run.<DOMAIN>/api/v1/logs` and `/api/v1/log-streams`
-with their FeRun tokens, through the HTTPRoute `ferun-sink`. Its program
-ships in ferund's image (`/ferun-sink`).
+with their FeRun tokens, through the HTTPRoute `ferun-sink`. Its image
+is a platform image of its own on GHCR,
+`ghcr.io/gardenlinux/feos/ferun-sink` (`SINK_IMAGE`, the stage
+`ferun-sink` of `go/Dockerfile`), not one of the projects' registry.
 
 Setting it up, with ferund on a version that issues service
 certificates (`POST /api/v1/service-certificates`) and answers `GET
 /api/v1/tenant`:
+
+0. The pull secret `ghcr-pull` in `ferun`, while FeOS's packages on GHCR
+   are not public: a token that reads them (`read:packages`):
+
+       kubectl -n ferun create secret docker-registry ghcr-pull \
+         --docker-server=ghcr.io --docker-username=<user> --docker-password=<token>
 
 1. The role `sink` of `ferun-db`: its password in a Secret, from which
    CloudNativePG makes the role (`managed.roles` in
@@ -392,7 +400,7 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
    <FERUN_SINK_IP>:4317`) and reads from the sink (`--sink-url
    http://ferun-sink.ferun.svc:8080`).
 
-A new image is ferund's: `make -C deploy/gardener deploy-ferun-sink`
+A new image: `make -C deploy/gardener deploy-ferun-sink TAG=<tag>`
 pushes it and rolls the instances. Lines are kept 30 days
 (`FERUN_SINK_LOG_RETENTION`), a tenant's job asks for up to 400
 (`FERUN_SINK_LOG_RETENTION_MAX`); the chunks lie at
