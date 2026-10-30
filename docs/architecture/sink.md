@@ -82,31 +82,48 @@ One `ResourceLogs` per stream. Its resource attributes are the pod's
 One `LogRecord` per entry: `time_unix_nano` the line's time (0 for an
 old line: the sink uses `observed_time_unix_nano`, when the node read
 it), `body` the text as a string (invalid UTF-8 replaced), attributes
-`log.offset` (int), `log.iostream` (`stdout`, `stderr`, or none), and
-`log.partial` (bool, only when true).
+`log.offset` (int), `log.next_offset` (int, the entry's `next_offset`:
+the offset just past the line), `log.iostream` (`stdout`, `stderr`, or
+none), and `log.partial` (bool, only when true). `Positions` answers the
+greatest `log.next_offset` stored; from a node that sends none, the
+offset of the last line stored, which the node then sends again and the
+sink stores once.
 
 ## The sink
 
 A program of `go/` (`go/cmd/ferun-sink`, `go/internal/sink`), its own
 database (`sink`, migrations of its own), two ports:
 
-- **ingest** (gRPC over TLS, `--ingest-listen`, default `:4317`):
-  `LogsService/Export` and `SinkService`, nodes only. A batch is stored in
-  one transaction and then answered; a line is stored once per (stream,
-  offset). A tenant over its quota (`--log-quota`, bytes a day, 0: none)
-  is refused with `RESOURCE_EXHAUSTED`; a database failure with
-  `UNAVAILABLE`.
+- **ingest** (gRPC over TLS 1.3, `--ingest-listen`, default `:4317`):
+  `LogsService/Export` and `SinkService`, nodes only, from the first
+  certificate on. A batch is stored in one transaction and then
+  answered; a line is stored once per (stream, offset), and one at or
+  below the stream's last chunked offset counts as stored. A tenant over
+  its quota (`--log-quota`, bytes of text a day, UTC, 0: none; reached by
+  what is stored, so the batch that crosses it is stored) is refused with
+  `RESOURCE_EXHAUSTED`, which names it; the other tenants' streams of the
+  same batch are stored. A database failure is `UNAVAILABLE`; a request
+  over 8 MiB, of more than 10,000 records, or with a resource without
+  `ferun.pod`, `ferun.container`, `ferun.log_id` and `ferun.tenant` or a
+  record without `log.offset` is refused. A stream's `node` is the name
+  in the node's certificate, not `ferun.node`; the sink does not check
+  that the node runs the pod.
 - **API** (HTTP, `--listen`, default `:8080`): the routes below, behind
   the cluster's Gateway at `run.<domain>/api/v1/logs` and
-  `/api/v1/log-streams`; `/healthz`.
+  `/api/v1/log-streams`; `/healthz`, 200 once the ingest serves and while
+  the database answers.
 
 **Identity.** The sink holds a service token of kind `sink` (`ferund
 service-token --kind sink --name <name>`, kept in a Secret). With it, it
 asks `ferund` for a certificate (`POST /api/v1/service-certificates`,
 Bearer the token, `{"csr": "<PEM>"}` → `{"certificate": "<PEM chain>",
-"bundle": "<PEM roots>", "notAfter": "<RFC 3339>"}`), valid 24 h, the URI
-`spiffe://<td>/sink/<name>`, and asks again at half its life. The bundle
-verifies the nodes' certificates.
+"bundle": "<PEM roots>", "notAfter": "<RFC 3339>"}`, the CSR of an
+Ed25519 key), valid 24 h, the URI `spiffe://<td>/sink/<name>` and
+ServerAuth, and asks again at half its life. `<name>` is the token's,
+and the sink's `--name` must be it: the instances of a deployment share
+one token and name (`ferun-sink`). The sink checks the certificate's one
+URI and key and that it verifies to the bundle. The bundle verifies the
+nodes' certificates (ClientAuth, one URI `spiffe://<td>/node/<name>`).
 
 **Tenants.** A read brings the tenant's FeRun token (`Authorization:
 Bearer …`); the sink asks `ferund` `GET /api/v1/tenant` with it (`200
@@ -114,31 +131,38 @@ Bearer …`); the sink asks `ferund` `GET /api/v1/tenant` with it (`200
 by the token's SHA-256.
 
 **Stages.** `log_streams` (one row per stream key: labels, first and last
-time, next offset, ended), `log_lines` (hot: stream, offset, time,
-source, level, partial, text; partitioned by day), `log_chunks` (stream,
+time, next offset, ended; its ID `s_` and 16 random hex digits),
+`log_lines` (hot: stream, offset, time, source, level, partial, text;
+partitioned by the day it arrived), `log_chunks` (stream,
 first and last offset and time, lines, bytes, levels as a bit set, the
 object's key), `log_traces` (trace ID, stream, time). A stream's lines
 become a chunk at 1 MiB, when the oldest is 10 min old, or when the
 stream ends: gzip NDJSON (`{"o":offset,"t":ns,"s":"stdout","l":"error","p":true,"x":"text"}`
-a line) at `logs/<tenant>/<stream id>/<first offset>.ndjson.gz`, claimed
-with `FOR UPDATE SKIP LOCKED`, the row written and the lines deleted in
-one transaction after the upload. The object store is S3 with SigV4
-(`--bucket-endpoint`, `--bucket`, `--bucket-region`, keys from
-`SINK_BUCKET_ACCESS_KEY`, `SINK_BUCKET_SECRET_KEY`), signed with the
-standard library.
+a line; `s`, `l` and `p` left out when empty or false) at
+`<prefix>logs/<tenant>/<stream id>/<first offset>.ndjson.gz`, at most 16
+MiB of text a chunk, claimed with `FOR UPDATE SKIP LOCKED` and a lease of
+two minutes (the database's clock), the row written and the lines
+deleted in one transaction after the upload. The object store is S3 with
+SigV4 at path-style URLs (`--bucket-endpoint`, `--bucket`,
+`--bucket-region`, `auto` for Cloudflare R2, `--bucket-prefix`, keys
+from `SINK_BUCKET_ACCESS_KEY`, `SINK_BUCKET_SECRET_KEY`), signed with
+the standard library.
 
-**Level** (§6): a JSON line's `level`, `lvl` or `severity`; else a
-leading `ERROR`, `WARN`, `WARNING`, `INFO`, `DEBUG`, `TRACE`, `FATAL`,
-`PANIC` (bare, `[…]`, or `level=…`), case insensitive; mapped to
-`error` (also fatal, panic, critical), `warn`, `info`, `debug` (also
-trace), or `` (unknown). **Trace ID**: a JSON line's `trace_id`,
+**Level** (§6): a JSON line's `level`, `lvl` or `severity` (a word, or a
+number on pino's scale: 50 and above error, 40 warn, 30 info, 10 and 20
+debug); else a leading `ERROR`, `WARN`, `WARNING`, `INFO`, `DEBUG`,
+`TRACE`, `FATAL`, `PANIC` (bare, `[…]`, or `level=…`, also after a
+leading `time=` or `ts=` field, as Go's slog writes it), case
+insensitive; mapped to `error` (also fatal, panic, critical), `warn`,
+`info`, `debug` (also trace), or `` (unknown). **Trace ID**: a JSON line's `trace_id`,
 `traceId` or `traceparent` (its second field): 32 lowercase hex, not all
 zero.
 
 **Retention**: `--log-retention` (720 h) or a stream's
 `ferun.retention_days`, at most `--log-retention-max` (9600 h); a sweep
-every 10 min deletes expired chunks (object, then row) and drops empty
-day partitions of `log_lines`.
+every 10 min deletes expired chunks (object, then row), hot lines and
+trace rows by the lines' times, the streams with nothing left, and drops
+empty day partitions of `log_lines`.
 
 ## Reading
 
@@ -149,7 +173,7 @@ All routes need a tenant's token and answer only its streams.
 | parameter | |
 |---|---|
 | `environment`, `kind`, `object`, `replica`, `instance`, `container`, `job`, `attempt`, `stream` | the selector; one of `environment`, `job`, `instance`, `stream` is required |
-| `since`, `until` | RFC 3339 or Unix nanoseconds; `until` defaults to now, `since` to `until` − 1 h (backward) or to the stream's start (forward) |
+| `since`, `until` | RFC 3339 or Unix nanoseconds, both included; `until` defaults to now, `since` to `until` − 1 h (backward) or to the stream's start (forward), and, with `trace`, to the start of what is kept |
 | `q` | words that all appear, case insensitive; `-word` must not |
 | `re` | an RE2 expression |
 | `level` | a comma list of `error`, `warn`, `info`, `debug`, `unknown` |
@@ -162,7 +186,7 @@ All routes need a tenant's token and answer only its streams.
 ```json
 {
   "lines": [
-    {"ts": "1761825600123456789", "time": "2026-10-30T12:00:00.123456789Z", "stream": "s_…",
+    {"ts": "1793361600123456789", "time": "2026-10-30T12:00:00.123456789Z", "stream": "s_…",
      "offset": "4096", "source": "stdout", "level": "error", "partial": false, "text": "…"}
   ],
   "streams": {"s_…": {"id": "s_…", "tenant": "…", "instance": "…", "container": "main",
@@ -180,7 +204,11 @@ empty at the end. `partial` says the page stopped at the scan limit (256
 MiB of lines read) before `limit`: there may be more behind `cursor`.
 With `follow=1` the answer is `application/x-ndjson`, one object a line:
 `{"line": {…}, "stream": {…}}` (the stream once, with its first line), and
-`{}` every 15 s.
+`{}` after 15 s without a line. It gives the page a backward read gives
+(`since`, `until`, `limit` and the filters as there), oldest first, then
+every line of the selector's open streams stored after it, by each
+stream's offsets, polling every 500 ms; it takes no `cursor`. A
+`level` of `unknown` selects the lines whose `level` is `""`.
 
 ### `GET /api/v1/log-streams`
 

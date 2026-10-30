@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,7 +43,17 @@ type migration struct {
 }
 
 func migrations() ([]migration, error) {
-	entries, err := fs.ReadDir(migrationFS, "migrations")
+	sub, err := fs.Sub(migrationFS, "migrations")
+	if err != nil {
+		return nil, err
+	}
+	return readMigrations(sub)
+}
+
+// readMigrations reads the files NNNN_name.sql at the root of fsys, in
+// the order of their numbers.
+func readMigrations(fsys fs.FS) ([]migration, error) {
+	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +67,7 @@ func migrations() ([]migration, error) {
 		if err != nil {
 			return nil, fmt.Errorf("migration %s: %w", e.Name(), err)
 		}
-		b, err := fs.ReadFile(migrationFS, path.Join("migrations", e.Name()))
+		b, err := fs.ReadFile(fsys, e.Name())
 		if err != nil {
 			return nil, err
 		}
@@ -84,15 +93,51 @@ func CheckServerVersion(num int) error {
 // starting together serialise on the lock: one applies, the others find the
 // schema applied.
 func (d *DB) Migrate(ctx context.Context, bootstrap func(ctx context.Context, tx pgx.Tx) error) error {
+	ms, err := migrations()
+	if err != nil {
+		return err
+	}
+	return d.migrate(ctx, ms, func(ctx context.Context, tx pgx.Tx) error {
+		if err := ensureClusterSecret(ctx, tx, SecretMCPSession); err != nil {
+			return err
+		}
+		var today time.Time
+		if err := tx.QueryRow(ctx, "SELECT (now() AT TIME ZONE 'utc')::date").Scan(&today); err != nil {
+			return err
+		}
+		if err := ensurePartitions(ctx, tx, today, today.AddDate(0, 0, 1)); err != nil {
+			return err
+		}
+		if bootstrap != nil {
+			if err := bootstrap(ctx, tx); err != nil {
+				return fmt.Errorf("bootstrap: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+// MigrateFS is Migrate for a database of another program (ferun-sink):
+// the migrations are the files NNNN_name.sql at the root of fsys, and
+// then (nil: none) runs in the same transaction after them. Nothing of
+// ferund's own is created.
+func (d *DB) MigrateFS(ctx context.Context, fsys fs.FS, then func(ctx context.Context, tx pgx.Tx) error) error {
+	ms, err := readMigrations(fsys)
+	if err != nil {
+		return err
+	}
+	return d.migrate(ctx, ms, then)
+}
+
+// migrate refuses PostgreSQL below 17, then applies ms under the advisory
+// lock in one transaction, records them in schema_migrations and runs
+// then (nil: none).
+func (d *DB) migrate(ctx context.Context, ms []migration, then func(ctx context.Context, tx pgx.Tx) error) error {
 	var num int
 	if err := d.Pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&num); err != nil {
 		return fmt.Errorf("read the server version: %w", err)
 	}
 	if err := CheckServerVersion(num); err != nil {
-		return err
-	}
-	ms, err := migrations()
-	if err != nil {
 		return err
 	}
 	return d.Tx(ctx, func(tx pgx.Tx) error {
@@ -137,20 +182,8 @@ func (d *DB) Migrate(ctx context.Context, bootstrap func(ctx context.Context, tx
 			}
 			d.log.Info("applied migration", "migration", m.name)
 		}
-		if err := ensureClusterSecret(ctx, tx, SecretMCPSession); err != nil {
-			return err
-		}
-		var today time.Time
-		if err := tx.QueryRow(ctx, "SELECT (now() AT TIME ZONE 'utc')::date").Scan(&today); err != nil {
-			return err
-		}
-		if err := ensurePartitions(ctx, tx, today, today.AddDate(0, 0, 1)); err != nil {
-			return err
-		}
-		if bootstrap != nil {
-			if err := bootstrap(ctx, tx); err != nil {
-				return fmt.Errorf("bootstrap: %w", err)
-			}
+		if then != nil {
+			return then(ctx, tx)
 		}
 		return nil
 	})

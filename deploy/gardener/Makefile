@@ -32,7 +32,7 @@ GATEWAY_NAME ?= platform
 # since a set given replaces the built-in one.
 comma := ,
 FERUN_DENY_PREFIX = $(if $(strip $(DENY_PREFIXES)),default$(comma)$(subst $(eval) ,$(comma),$(strip $(DENY_PREFIXES))))
-export DOMAIN REGISTRY OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE
+export DOMAIN REGISTRY OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_SINK_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE
 DOCKER ?= docker
 TAG ?= dev
 PACKAGES_DIR ?= $(REPO_ROOT)/target/packages
@@ -56,8 +56,8 @@ endef
 cat-yaml = awk 'FNR==1{print "---"}1' $(1)
 
 .PHONY: feos-node push-feos-node deploy-feos feos-k8s push-feos-k8s deploy-feos-k8s
-.PHONY: ferund push-ferund deploy-ferund deploy-ferun-ingress
-.PHONY: manifests apply-feos apply-ferun apply-ferun-db-import apply-ferun-ingress apply-fechat apply-registry FORCE
+.PHONY: ferund push-ferund deploy-ferund deploy-ferun-ingress deploy-ferun-sink
+.PHONY: manifests apply-feos apply-ferun apply-ferun-db-import apply-ferun-ingress apply-ferun-sink apply-fechat apply-registry FORCE
 
 # feosd, diskd, feosctl, Firecracker and the guest from the packages, for
 # the feos-node pod (ADR 0020).
@@ -97,7 +97,12 @@ deploy-ferun-ingress: push-ferund ## Push ferund's image and roll ferun-ingress,
 	kubectl -n ferun-ingress rollout restart statefulset/ferun-ingress
 	kubectl -n ferun-ingress rollout status statefulset/ferun-ingress --timeout=10m
 
-manifests: $(MANIFESTS)/feos.yaml $(MANIFESTS)/feos-k8s.yaml $(MANIFESTS)/ferun.yaml $(MANIFESTS)/fechat.yaml $(MANIFESTS)/registry.yaml $(MANIFESTS)/ferun-ingress.yaml ## Write every part's manifests, with the parameters, to target/gardener/manifests.
+# ferun-sink ships in ferund's image too (README.md, The sink).
+deploy-ferun-sink: push-ferund ## Push ferund's image and roll ferun-sink.
+	kubectl -n ferun rollout restart deployment/ferun-sink
+	kubectl -n ferun rollout status deployment/ferun-sink --timeout=5m
+
+manifests: $(MANIFESTS)/feos.yaml $(MANIFESTS)/feos-k8s.yaml $(MANIFESTS)/ferun.yaml $(MANIFESTS)/fechat.yaml $(MANIFESTS)/registry.yaml $(MANIFESTS)/ferun-ingress.yaml $(MANIFESTS)/ferun-sink.yaml ## Write every part's manifests, with the parameters, to target/gardener/manifests.
 
 $(MANIFESTS)/feos.yaml: FORCE
 	$(call render,DOMAIN REGISTRY WORKER_POOL FERUN_NODES_IP DENY_PREFIXES,cat feos/feos.yaml)
@@ -125,6 +130,9 @@ $(MANIFESTS)/registry.yaml: FORCE
 # Only with an apps zone: without one there is nothing to serve.
 $(MANIFESTS)/ferun-ingress.yaml: FORCE
 	$(call render,DOMAIN REGISTRY FERUN_NODES_IP APPS_ZONE NODE_CIDR,cat ferun-ingress/ferun-ingress.yaml)
+
+$(MANIFESTS)/ferun-sink.yaml: FORCE
+	$(call render,DOMAIN REGISTRY FERUN_SINK_IP GATEWAY_NAMESPACE GATEWAY_NAME,cat ferun-sink/ferun-sink.yaml)
 
 # A network of the shoot that DENY_PREFIXES leaves out is open to the
 # microVMs, which leave through the feos-node pod on the host's network:
@@ -161,6 +169,11 @@ apply-ferun-db-import: $(MANIFESTS)/ferun-db-import.yaml ## Once: create ferun-d
 	kubectl apply -f $<
 
 apply-ferun-ingress: $(MANIFESTS)/ferun-ingress.yaml ## Apply ferun-ingress, its balancer and the apps zone's certificate.
+	kubectl apply -f $<
+
+apply-ferun-sink: $(MANIFESTS)/ferun-sink.yaml ## Apply ferun-sink, its database, Services and route (its secrets first: README.md).
+	@for s in ferun-sink-token ferun-sink-bucket ferun-sink-db; do \
+	  kubectl -n ferun get secret $$s >/dev/null 2>&1 || { echo "the secret ferun/$$s is missing (README.md, The sink)" >&2; exit 1; }; done
 	kubectl apply -f $<
 
 apply-fechat: $(MANIFESTS)/fechat.yaml ## Apply FeChat, the k3s manifests.
