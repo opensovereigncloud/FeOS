@@ -1,0 +1,661 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package sink
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/sink/s3"
+)
+
+// memBucket is a bucket in memory.
+type memBucket struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+	puts    int
+	failPut error
+}
+
+func newMemBucket() *memBucket { return &memBucket{objects: map[string][]byte{}} }
+
+func (b *memBucket) Put(_ context.Context, key string, body []byte, _ string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.failPut != nil {
+		return b.failPut
+	}
+	b.puts++
+	b.objects[key] = append([]byte(nil), body...)
+	return nil
+}
+
+func (b *memBucket) Get(_ context.Context, key string, _ int64) ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	o, ok := b.objects[key]
+	if !ok {
+		return nil, fmt.Errorf("GET %s: %w", key, s3.ErrNotFound)
+	}
+	return o, nil
+}
+
+func (b *memBucket) Delete(_ context.Context, key string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.objects, key)
+	return nil
+}
+
+func (b *memBucket) keys() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var ks []string
+	for k := range b.objects {
+		ks = append(ks, k)
+	}
+	return ks
+}
+
+func testConfig() Config {
+	c := Default()
+	c.Name = "sink-0"
+	c.BucketPrefix = "pre"
+	return c
+}
+
+// newTestDB is a migrated, empty database of the sink's own.
+func newTestDB(t *testing.T) *db.DB {
+	t.Helper()
+	d := dbtest.Open(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := Migrate(ctx, d); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	return d
+}
+
+func newTestStore(t *testing.T, cfg Config) (*Store, *memBucket) {
+	t.Helper()
+	d := newTestDB(t)
+	b := newMemBucket()
+	return NewStore(d, b, cfg, dbtest.Logger(t)), b
+}
+
+// base is the tests' time of the first line.
+var base = time.Now().Add(-5 * time.Minute).UnixNano()
+
+func envLabels(tenant, env string, replica int) Labels {
+	return Labels{Tenant: tenant, Node: "node-1", Instance: "inst" + fmt.Sprint(replica), Environment: env, Kind: "service",
+		Object: "api", Replica: replica, Release: 3, Attrs: map[string]string{attrTenant: tenant}}
+}
+
+// lines makes n lines from offset off on, 10 bytes apart, a millisecond
+// apart from ts on.
+func lines(off int64, ts int64, n int, text func(i int) string) []Line {
+	out := make([]Line, n)
+	for i := range out {
+		t := text(i)
+		lvl, tr := Extract(t)
+		out[i] = Line{Off: off + int64(i)*10, TS: ts + int64(i)*int64(time.Millisecond), Source: "stdout", Level: lvl, Trace: tr, Text: t}
+	}
+	return out
+}
+
+func batch(key StreamKey, l Labels, ls []Line) []StreamBatch {
+	return []StreamBatch{{Key: key, Labels: l, Lines: ls, Next: -1}}
+}
+
+func mustRead(t *testing.T, s *Store, tenant string, v url.Values) scanResult {
+	t.Helper()
+	q, err := parseQuery(v, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.Read(context.Background(), tenant, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func texts(r scanResult, forward bool) []string {
+	p := r.page(forward)
+	out := make([]string, len(p.Lines))
+	for i, l := range p.Lines {
+		out[i] = l.Text
+	}
+	return out
+}
+
+func TestIngestIdempotent(t *testing.T) {
+	s, _ := newTestStore(t, testConfig())
+	ctx := context.Background()
+	key := StreamKey{"pod1", "main", "L1"}
+	l := envLabels("acme", "env1", 0)
+	ls := lines(0, base, 5, func(i int) string { return fmt.Sprintf("line %d", i) })
+	for range 3 {
+		if err := s.Ingest(ctx, batch(key, l, ls)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Overlapping and new, and labels that lose to the first write's.
+	l2 := envLabels("acme", "other", 1)
+	more := lines(30, base+int64(3*time.Millisecond), 4, func(i int) string { return fmt.Sprintf("line %d", i+3) })
+	if err := s.Ingest(ctx, batch(key, l2, more)); err != nil {
+		t.Fatal(err)
+	}
+	var n, lineCount, bytes, next, lastOff int64
+	var env string
+	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_lines), lines, bytes, next_offset, last_off, environment
+		FROM log_streams`).Scan(&n, &lineCount, &bytes, &next, &lastOff, &env); err != nil {
+		t.Fatal(err)
+	}
+	if n != 7 || lineCount != 7 || bytes != 7*6 || next != 60 || lastOff != 60 || env != "env1" {
+		t.Errorf("lines %d, counted %d, bytes %d, next %d, last %d, env %q", n, lineCount, bytes, next, lastOff, env)
+	}
+	pos, err := s.Positions(ctx, []StreamKey{{"nope", "x", "y"}, key})
+	if err != nil || pos[0] != 0 || pos[1] != 60 {
+		t.Errorf("positions %v, %v", pos, err)
+	}
+	// A node that sends log.next_offset gets it back.
+	b := batch(key, l, lines(70, base+int64(10*time.Millisecond), 1, func(int) string { return "x" }))
+	b[0].Next = 82
+	if err := s.Ingest(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if pos, _ := s.Positions(ctx, []StreamKey{key}); pos[0] != 82 {
+		t.Errorf("positions after next_offset %v", pos)
+	}
+	if err := s.EndStreams(ctx, []StreamKey{key, {"nope", "x", "y"}}, 0); err != nil {
+		t.Fatal(err)
+	}
+	r := mustRead(t, s, "acme", url.Values{"environment": {"env1"}})
+	if got := strings.Join(texts(r, false), "|"); got != "line 0|line 1|line 2|line 3|line 4|line 5|line 6|x" {
+		t.Errorf("read %s", got)
+	}
+	for _, st := range r.streams {
+		if st.EndedAt == nil {
+			t.Error("stream not ended")
+		}
+	}
+	if r := mustRead(t, s, "other-tenant", url.Values{"environment": {"env1"}}); len(r.lines) != 0 {
+		t.Error("another tenant reads the stream")
+	}
+}
+
+func TestQuota(t *testing.T) {
+	cfg := testConfig()
+	cfg.Quota = 100
+	s, _ := newTestStore(t, cfg)
+	ctx := context.Background()
+	text := func(int) string { return strings.Repeat("a", 60) }
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("small", "e", 0), lines(0, base, 2, text))); err != nil {
+		t.Fatal(err)
+	}
+	// Over now: small's next batch is refused, big's in the same batch stored.
+	b := append(batch(StreamKey{"p", "c", "1"}, envLabels("small", "e", 0), lines(100, base, 1, text)),
+		batch(StreamKey{"q", "c", "1"}, envLabels("big", "e", 0), lines(0, base, 1, text))...)
+	err := s.Ingest(ctx, b)
+	if !errors.Is(err, ErrQuota) || !strings.Contains(err.Error(), "small") {
+		t.Fatalf("over quota: %v", err)
+	}
+	var small, big int64
+	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_lines l JOIN log_streams s ON s.id = l.stream_id WHERE s.tenant = 'small'),
+		(SELECT count(*) FROM log_lines l JOIN log_streams s ON s.id = l.stream_id WHERE s.tenant = 'big')`).Scan(&small, &big); err != nil {
+		t.Fatal(err)
+	}
+	if small != 2 || big != 1 {
+		t.Errorf("small %d, big %d", small, big)
+	}
+}
+
+// chunkAll makes chunks until none is due.
+func chunkAll(t *testing.T, s *Store) int {
+	t.Helper()
+	total := 0
+	for {
+		n, err := s.chunkRound(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 0 {
+			return total
+		}
+		total += n
+	}
+}
+
+func TestChunksAndQueries(t *testing.T) {
+	cfg := testConfig()
+	cfg.ChunkBytes = 100
+	s, bucket := newTestStore(t, cfg)
+	ctx := context.Background()
+	key1, key2 := StreamKey{"pod1", "main", "L1"}, StreamKey{"pod2", "main", "L1"}
+	// Stream 1: 30 lines, chunked in pieces; stream 2: interleaved in
+	// time, kept hot.
+	ln := func(prefix string) func(int) string {
+		return func(i int) string {
+			lvl := "INFO"
+			if i%10 == 7 {
+				lvl = "ERROR"
+			}
+			return fmt.Sprintf("%s %s line %02d", lvl, prefix, i)
+		}
+	}
+	for i := 0; i < 30; i += 10 {
+		if err := s.Ingest(ctx, batch(key1, envLabels("acme", "env1", 0),
+			lines(int64(i)*10, base+int64(2*i)*int64(time.Millisecond), 10, func(j int) string { return ln("a")(i + j) }))); err != nil {
+			t.Fatal(err)
+		}
+		if n := chunkAll(t, s); n != 1 {
+			t.Fatalf("%d chunks made", n)
+		}
+	}
+	s.cfg.ChunkBytes = 1 << 20
+	if err := s.Ingest(ctx, batch(key2, envLabels("acme", "env1", 1),
+		lines(0, base+int64(time.Millisecond), 30, func(j int) string { return ln("b")(j) }))); err != nil {
+		t.Fatal(err)
+	}
+	// Stream 2 is below the size, too young and open: stays hot.
+	chunkAll(t, s)
+	var chunks, hot int
+	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_chunks), (SELECT count(*) FROM log_lines)`).Scan(&chunks, &hot); err != nil {
+		t.Fatal(err)
+	}
+	if chunks != 3 || hot != 30 || len(bucket.keys()) != 3 {
+		t.Fatalf("chunks %d, hot %d, objects %v", chunks, hot, bucket.keys())
+	}
+	for _, k := range bucket.keys() {
+		if !strings.HasPrefix(k, "pre/logs/acme/s_") || !strings.HasSuffix(k, ".ndjson.gz") {
+			t.Errorf("key %s", k)
+		}
+	}
+	// A line sent again after its chunk is not stored again.
+	if err := s.Ingest(ctx, batch(key1, envLabels("acme", "env1", 0), lines(0, base, 1, ln("a")))); err != nil {
+		t.Fatal(err)
+	}
+
+	all := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "limit": {"100"}})
+	if len(all.lines) != 60 || all.cursor != nil || all.partial {
+		t.Fatalf("%d lines, cursor %v, partial %v", len(all.lines), all.cursor, all.partial)
+	}
+	page := all.page(false)
+	for i := 1; i < len(page.Lines); i++ {
+		if page.Lines[i].TS < page.Lines[i-1].TS {
+			t.Fatalf("lines not oldest first at %d", i)
+		}
+	}
+	if len(page.Streams) != 2 {
+		t.Errorf("%d streams", len(page.Streams))
+	}
+
+	// Pages backward and forward meet every line once.
+	for _, dir := range []string{"backward", "forward"} {
+		seen := map[string]bool{}
+		v := url.Values{"environment": {"env1"}, "limit": {"7"}, "direction": {dir}}
+		if dir == "forward" {
+			v.Set("since", fmt.Sprint(base-int64(time.Hour)))
+		}
+		for pages := 0; ; pages++ {
+			if pages > 20 {
+				t.Fatal("too many pages")
+			}
+			r := mustRead(t, s, "acme", v)
+			for _, x := range texts(r, dir == "forward") {
+				if seen[x] {
+					t.Fatalf("%s: %q twice", dir, x)
+				}
+				seen[x] = true
+			}
+			if r.cursor == nil {
+				break
+			}
+			v.Set("cursor", encodeCursor(dir == "forward", *r.cursor))
+		}
+		if len(seen) != 60 {
+			t.Errorf("%s: %d lines", dir, len(seen))
+		}
+	}
+
+	// Filters, across both stages.
+	errs := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "level": {"error"}})
+	if got := strings.Join(texts(errs, false), "|"); got != "ERROR a line 07|ERROR b line 07|ERROR b line 17|ERROR a line 17|ERROR b line 27|ERROR a line 27" {
+		t.Errorf("errors: %s", got)
+	}
+	words := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "q": {"A -error"}, "replica": {"0"}})
+	if len(words.lines) != 27 {
+		t.Errorf("words: %d lines", len(words.lines))
+	}
+	re := mustRead(t, s, "acme", url.Values{"instance": {"inst0"}, "re": {`line 2[0-4]$`}})
+	if len(re.lines) != 5 {
+		t.Errorf("re: %d lines", len(re.lines))
+	}
+
+	// The scan limit makes a partial page with a cursor that goes on.
+	small := *s
+	small.cfg.ScanLimit = 100
+	q, _ := parseQuery(url.Values{"environment": {"env1"}, "q": {"zzz"}}, time.Now())
+	r, err := small.Read(ctx, "acme", q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.partial || r.cursor == nil || len(r.lines) != 0 {
+		t.Errorf("scan limit: partial %v cursor %v lines %d", r.partial, r.cursor, len(r.lines))
+	}
+
+	// Streams list.
+	sts, err := s.Streams(ctx, "acme", Selector{Environment: "env1"}, 0)
+	if err != nil || len(sts) != 2 || sts[0].Lines != 30 {
+		t.Fatalf("streams %v, %v", sts, err)
+	}
+}
+
+func TestTraceIndex(t *testing.T) {
+	cfg := testConfig()
+	cfg.ChunkBytes = 1
+	s, _ := newTestStore(t, cfg)
+	ctx := context.Background()
+	other := "0af7651916cd43dd8448eb211c80319c"
+	text := func(i int) string {
+		tr := other
+		if i == 3 {
+			tr = traceA
+		}
+		return fmt.Sprintf(`{"level":"info","i":%d,"trace_id":"%s"}`, i, tr)
+	}
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base-int64(48*time.Hour), 5, text))); err != nil {
+		t.Fatal(err)
+	}
+	chunkAll(t, s)
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(100, base, 5, text))); err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	_ = s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_traces WHERE trace_id = $1`, traceA).Scan(&rows)
+	if rows != 2 {
+		t.Fatalf("%d trace rows", rows)
+	}
+	// Two days back, without since: the trace's index finds both.
+	r := mustRead(t, s, "acme", url.Values{"environment": {"e"}, "trace": {traceA}})
+	if len(r.lines) != 2 {
+		t.Errorf("trace: %d lines: %v", len(r.lines), texts(r, false))
+	}
+}
+
+func TestRetentionAndDelete(t *testing.T) {
+	cfg := testConfig()
+	cfg.ChunkBytes = 1
+	cfg.Retention = 24 * time.Hour
+	cfg.RetentionMax = 72 * time.Hour
+	s, bucket := newTestStore(t, cfg)
+	ctx := context.Background()
+	old := base - int64(30*time.Hour)
+	text := func(i int) string { return fmt.Sprintf("line %d", i) }
+	// Default retention: expires. retention_days 2: kept. 400: clamped to
+	// 3 days, expires.
+	short, long := envLabels("acme", "e", 0), envLabels("acme", "e", 1)
+	long.RetentionDays = 2
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "short"}, short, lines(0, old, 3, text))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "long"}, long, lines(0, old, 3, text))); err != nil {
+		t.Fatal(err)
+	}
+	ancient := envLabels("acme", "e", 2)
+	ancient.RetentionDays = 400
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "ancient"}, ancient, lines(0, base-int64(100*time.Hour), 1, text))); err != nil {
+		t.Fatal(err)
+	}
+	chunkAll(t, s)
+	if n := len(bucket.keys()); n != 3 {
+		t.Fatalf("%d objects", n)
+	}
+	// A hot line past retention goes too.
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "short"}, short, lines(100, old, 1, text))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var streams []string
+	rows, _ := s.db.Pool.Query(ctx, `SELECT log_id FROM log_streams ORDER BY log_id`)
+	for rows.Next() {
+		var x string
+		_ = rows.Scan(&x)
+		streams = append(streams, x)
+	}
+	rows.Close()
+	if fmt.Sprint(streams) != "[long]" || len(bucket.keys()) != 1 {
+		t.Errorf("after the sweep: streams %v, objects %v", streams, bucket.keys())
+	}
+
+	// DELETE of an environment's streams: objects, rows, lines.
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "new"}, short, lines(0, base, 2, text))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "job"}, Labels{Tenant: "acme", Job: "j1", Attrs: map[string]string{}},
+		lines(0, base, 2, text))); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.DeleteStreams(ctx, "other", "e", ""); err != nil || n != 0 {
+		t.Fatalf("another tenant deleted %d: %v", n, err)
+	}
+	n, err := s.DeleteStreams(ctx, "acme", "e", "")
+	if err != nil || n != 2 {
+		t.Fatalf("deleted %d: %v", n, err)
+	}
+	var left, hot int
+	_ = s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_streams), (SELECT count(*) FROM log_lines)`).Scan(&left, &hot)
+	if left != 1 || hot != 2 || len(bucket.keys()) != 0 {
+		t.Errorf("after delete: %d streams, %d hot lines, objects %v", left, hot, bucket.keys())
+	}
+}
+
+func TestPartitions(t *testing.T) {
+	s, _ := newTestStore(t, testConfig())
+	ctx := context.Background()
+	// An empty partition of last week and one with a line.
+	for _, d := range []string{"2026-01-01", "2026-01-02"} {
+		dd, _ := time.Parse(time.DateOnly, d)
+		if _, err := s.db.Pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s PARTITION OF log_lines FOR VALUES FROM ('%s') TO ('%s')`,
+			partitionName(dd), d, dd.AddDate(0, 0, 1).Format(time.DateOnly))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base, 1, func(int) string { return "x" }))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Pool.Exec(ctx, `INSERT INTO log_lines (day, stream_id, off, ts, source, level, partial, text)
+		SELECT '2026-01-02', id, 99, 1, '', 16, false, 'old' FROM log_streams`); err != nil {
+		t.Fatal(err)
+	}
+	dropped, err := maintainPartitions(ctx, s.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(dropped) != "[log_lines_20260101]" {
+		t.Errorf("dropped %v", dropped)
+	}
+}
+
+func TestChunkClaimsAcrossInstances(t *testing.T) {
+	cfg := testConfig()
+	cfg.ChunkBytes = 1
+	d := newTestDB(t)
+	bucket := newMemBucket()
+	ctx := context.Background()
+	stores := make([]*Store, 4)
+	for i := range stores {
+		c := cfg
+		c.Name = fmt.Sprintf("sink-%d", i)
+		stores[i] = NewStore(d, bucket, c, dbtest.Logger(t))
+	}
+	const streams, rounds = 20, 5
+	for r := 0; r < rounds; r++ {
+		for i := 0; i < streams; i++ {
+			if err := stores[0].Ingest(ctx, batch(StreamKey{fmt.Sprintf("pod%d", i), "c", "1"}, envLabels("acme", "e", i),
+				lines(int64(r)*100, base+int64(r)*int64(time.Second), 5, func(j int) string { return fmt.Sprintf("r%d l%d", r, j) }))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var wg sync.WaitGroup
+		errc := make(chan error, len(stores))
+		for _, s := range stores {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					n, err := s.chunkRound(ctx)
+					if err != nil {
+						errc <- err
+						return
+					}
+					if n == 0 {
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		close(errc)
+		for err := range errc {
+			t.Fatal(err)
+		}
+	}
+	var chunks, hot, lineSum int
+	if err := d.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_chunks), (SELECT count(*) FROM log_lines),
+		(SELECT coalesce(sum(lines), 0) FROM log_chunks)`).Scan(&chunks, &hot, &lineSum); err != nil {
+		t.Fatal(err)
+	}
+	if chunks != streams*rounds || hot != 0 || lineSum != streams*rounds*5 || bucket.puts != streams*rounds {
+		t.Errorf("chunks %d, hot %d, lines %d, puts %d", chunks, hot, lineSum, bucket.puts)
+	}
+	r := mustRead(t, stores[1], "acme", url.Values{"environment": {"e"}, "limit": {"5000"}, "since": {fmt.Sprint(base - 1)}})
+	if len(r.lines) != streams*rounds*5 {
+		t.Errorf("read %d lines", len(r.lines))
+	}
+}
+
+func TestChunkUploadFailure(t *testing.T) {
+	cfg := testConfig()
+	cfg.ChunkBytes = 1
+	s, bucket := newTestStore(t, cfg)
+	ctx := context.Background()
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base, 3, func(int) string { return "x" }))); err != nil {
+		t.Fatal(err)
+	}
+	bucket.failPut = errors.New("bucket down")
+	if _, err := s.chunkRound(ctx); err == nil {
+		t.Fatal("no error")
+	}
+	// The claim holds: no round takes the stream until it runs out.
+	bucket.failPut = nil
+	if n, err := s.chunkRound(ctx); err != nil || n != 0 {
+		t.Fatalf("claimed again at once: %d, %v", n, err)
+	}
+	if _, err := s.db.Pool.Exec(ctx, `UPDATE log_streams SET chunk_lease = now() - interval '1s'`); err != nil {
+		t.Fatal(err)
+	}
+	if n := chunkAll(t, s); n != 1 {
+		t.Fatalf("%d chunks after the lease ran out", n)
+	}
+	// Lines stay readable throughout.
+	if r := mustRead(t, s, "acme", url.Values{"environment": {"e"}}); len(r.lines) != 3 {
+		t.Errorf("%d lines", len(r.lines))
+	}
+}
+
+// followRecorder collects a follow's output.
+type followRecorder struct {
+	mu      sync.Mutex
+	lines   []string
+	streams int
+	beats   int
+}
+
+func (f *followRecorder) Line(l Line, st *streamRow) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lines = append(f.lines, l.Text)
+	return nil
+}
+
+func (f *followRecorder) Heartbeat() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.beats++
+	return nil
+}
+
+func (f *followRecorder) snapshot() ([]string, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.lines...), f.beats
+}
+
+func TestFollow(t *testing.T) {
+	cfg := testConfig()
+	cfg.ChunkBytes = 1
+	cfg.FollowPoll = 20 * time.Millisecond
+	cfg.Heartbeat = 50 * time.Millisecond
+	s, _ := newTestStore(t, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	key := StreamKey{"p", "c", "1"}
+	text := func(prefix string) func(int) string {
+		return func(i int) string { return fmt.Sprintf("%s%d", prefix, i) }
+	}
+	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(0, base, 3, text("old")))); err != nil {
+		t.Fatal(err)
+	}
+	q, _ := parseQuery(url.Values{"environment": {"e"}, "follow": {"1"}, "q": {"-skip"}}, time.Now())
+	rec := &followRecorder{}
+	done := make(chan error, 1)
+	go func() { done <- s.Follow(ctx, "acme", q, rec) }()
+	waitFor(t, func() bool { l, _ := rec.snapshot(); return len(l) == 3 })
+	// New lines, some chunked away before the follow sees them, a new
+	// stream, and a line the filter drops.
+	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(100, base+int64(time.Second), 3, text("new")))); err != nil {
+		t.Fatal(err)
+	}
+	chunkAll(t, s)
+	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(200, base+int64(2*time.Second), 2, text("hot")))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ingest(ctx, batch(StreamKey{"p2", "c", "1"}, envLabels("acme", "e", 1), append(
+		lines(0, base+int64(3*time.Second), 1, text("second")), lines(10, base+int64(4*time.Second), 1, text("skip"))...))); err != nil {
+		t.Fatal(err)
+	}
+	want := "old0|old1|old2|new0|new1|new2|hot0|hot1|second0"
+	waitFor(t, func() bool { l, _ := rec.snapshot(); return strings.Join(l, "|") == want })
+	waitFor(t, func() bool { _, b := rec.snapshot(); return b > 0 })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if l, _ := rec.snapshot(); strings.Join(l, "|") != want {
+		t.Errorf("follow gave %v", l)
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

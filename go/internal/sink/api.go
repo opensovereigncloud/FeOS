@@ -1,0 +1,209 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package sink
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gardenlinux/feos/go/internal/apierr"
+)
+
+// api is the HTTP API (sink.md, Reading).
+type api struct {
+	store   *Store
+	tenants *Tenants
+	ingest  <-chan struct{}
+	log     *slog.Logger
+}
+
+// newAPI returns the HTTP API's handler: /api/v1/logs,
+// /api/v1/log-streams and /healthz; ingest is closed once the ingest
+// serves.
+func newAPI(store *Store, tenants *Tenants, ingest <-chan struct{}, log *slog.Logger) http.Handler {
+	a := &api{store: store, tenants: tenants, ingest: ingest, log: log}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", a.healthz)
+	mux.HandleFunc("GET /api/v1/logs", a.tenant(a.logs))
+	mux.HandleFunc("GET /api/v1/log-streams", a.tenant(a.streams))
+	mux.HandleFunc("DELETE /api/v1/log-streams", a.tenant(a.deleteStreams))
+	return mux
+}
+
+// healthz answers 200 once the ingest serves and while the database
+// answers: the instance's readiness for both Services.
+func (a *api) healthz(w http.ResponseWriter, r *http.Request) {
+	select {
+	case <-a.ingest:
+	default:
+		http.Error(w, "the ingest waits for its certificate", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := a.store.db.Pool.Ping(ctx); err != nil {
+		http.Error(w, "database: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	_, _ = w.Write([]byte("ok\n"))
+}
+
+// tenant resolves the request's token to its tenant through ferund; a
+// refusal of ferund is passed on as it came.
+func (a *api) tenant(h func(w http.ResponseWriter, r *http.Request, tenant string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") || len(auth) <= len("Bearer ") {
+			apierr.Write(w, apierr.New(http.StatusUnauthorized, "a tenant's token is required (Authorization: Bearer …)"))
+			return
+		}
+		t, err := a.tenants.Resolve(r.Context(), auth)
+		var ref *refusal
+		if errors.As(err, &ref) {
+			if ref.contentType != "" {
+				w.Header().Set("Content-Type", ref.contentType)
+			}
+			w.WriteHeader(ref.status)
+			_, _ = w.Write(ref.body)
+			return
+		}
+		if err != nil {
+			a.log.Warn("resolve a tenant", "err", err)
+			apierr.Write(w, apierr.New(http.StatusBadGateway, "cannot ask ferund for the token's tenant"))
+			return
+		}
+		h(w, r, t)
+	}
+}
+
+func (a *api) logs(w http.ResponseWriter, r *http.Request, tenant string) {
+	q, err := parseQuery(r.URL.Query(), time.Now())
+	if err != nil {
+		apierr.Write(w, apierr.New(http.StatusBadRequest, "%s", err.Error()))
+		return
+	}
+	if q.Follow {
+		a.follow(w, r, tenant, q)
+		return
+	}
+	res, err := a.store.Read(r.Context(), tenant, q)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res.page(q.Forward))
+}
+
+func (a *api) streams(w http.ResponseWriter, r *http.Request, tenant string) {
+	v := r.URL.Query()
+	sel, err := parseSelector(v)
+	if err != nil {
+		apierr.Write(w, apierr.New(http.StatusBadRequest, "%s", err.Error()))
+		return
+	}
+	since := time.Now().Add(-7 * 24 * time.Hour).UnixNano()
+	if t := v.Get("since"); t != "" {
+		if since, err = parseTime("since", t); err != nil {
+			apierr.Write(w, apierr.New(http.StatusBadRequest, "%s", err.Error()))
+			return
+		}
+	}
+	rows, err := a.store.Streams(r.Context(), tenant, sel, since)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	out := struct {
+		Streams []StreamJSON `json:"streams"`
+	}{Streams: make([]StreamJSON, 0, len(rows))}
+	for _, st := range rows {
+		out.Streams = append(out.Streams, st.json())
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *api) deleteStreams(w http.ResponseWriter, r *http.Request, tenant string) {
+	v := r.URL.Query()
+	env, job := v.Get("environment"), v.Get("job")
+	if (env == "") == (job == "") || len(v) != 1 {
+		apierr.Write(w, apierr.New(http.StatusBadRequest, "give environment or job, and nothing else"))
+		return
+	}
+	n, err := a.store.DeleteStreams(r.Context(), tenant, env, job)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	a.log.Info("deleted streams", "tenant", tenant, "environment", env, "job", job, "streams", n)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *api) fail(w http.ResponseWriter, r *http.Request, err error) {
+	if r.Context().Err() != nil {
+		return
+	}
+	a.log.Error("read", "path", r.URL.Path, "err", err)
+	apierr.Write(w, apierr.New(http.StatusServiceUnavailable, "the sink cannot answer now"))
+}
+
+// follow answers follow=1 as NDJSON.
+func (a *api) follow(w http.ResponseWriter, r *http.Request, tenant string, q Query) {
+	rc := http.NewResponseController(w)
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	_ = rc.Flush()
+	out := &ndjsonFollow{w: w, rc: rc, enc: json.NewEncoder(w), sent: map[int64]bool{}}
+	if err := a.store.Follow(r.Context(), tenant, q, out); err != nil && r.Context().Err() == nil {
+		a.log.Warn("follow", "err", err)
+	}
+}
+
+// ndjsonFollow writes a follow's objects: {"line": …, "stream": …} with
+// the stream the first time only, and {}.
+type ndjsonFollow struct {
+	w    http.ResponseWriter
+	rc   *http.ResponseController
+	enc  *json.Encoder
+	sent map[int64]bool
+}
+
+type followLine struct {
+	Line   LineJSON    `json:"line"`
+	Stream *StreamJSON `json:"stream,omitempty"`
+}
+
+func (f *ndjsonFollow) Line(l Line, st *streamRow) error {
+	out := followLine{Line: lineJSON(l, st.SID)}
+	if !f.sent[st.ID] {
+		f.sent[st.ID] = true
+		sj := st.json()
+		out.Stream = &sj
+	}
+	if err := f.enc.Encode(out); err != nil {
+		return err
+	}
+	return f.rc.Flush()
+}
+
+func (f *ndjsonFollow) Heartbeat() error {
+	if _, err := f.w.Write([]byte("{}\n")); err != nil {
+		return err
+	}
+	return f.rc.Flush()
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
+}
