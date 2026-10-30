@@ -1103,7 +1103,14 @@ type CreatePodRequest struct {
 	// ferun.object, ferun.replica, ferun.release, ferun.job, ferun.attempt,
 	// ferun.retention_days; docs/architecture/sink.md). Taken by a new pod only. Empty: the pod's logs
 	// are not shipped.
-	LogLabels     map[string]string `protobuf:"bytes,5,rep,name=log_labels,json=logLabels,proto3" json:"log_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	LogLabels map[string]string `protobuf:"bytes,5,rep,name=log_labels,json=logLabels,proto3" json:"log_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Values the node replaces with "[redacted]" in the lines it ships (ADR
+	// 0026): the pod's secrets as the control plane resolved them into its
+	// containers' environment, and the forms they appear in (a URL's
+	// userinfo). Beside the spec like log_labels, kept in the pod's record,
+	// never sent to the sink. A value cut across two parts of a long line
+	// is not found.
+	LogRedact     []string `protobuf:"bytes,6,rep,name=log_redact,json=logRedact,proto3" json:"log_redact,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1169,6 +1176,13 @@ func (x *CreatePodRequest) GetPullToken() string {
 func (x *CreatePodRequest) GetLogLabels() map[string]string {
 	if x != nil {
 		return x.LogLabels
+	}
+	return nil
+}
+
+func (x *CreatePodRequest) GetLogRedact() []string {
+	if x != nil {
+		return x.LogRedact
 	}
 	return nil
 }
@@ -2456,7 +2470,7 @@ const file_feos_pod_v1_pod_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\x0e2\x1b.feos.pod.v1.ContainerStateR\x05state\x12 \n" +
 	"\texit_code\x18\x03 \x01(\x05H\x00R\bexitCode\x88\x01\x01B\f\n" +
 	"\n" +
-	"_exit_code\"\xba\x02\n" +
+	"_exit_code\"\xd9\x02\n" +
 	"\x10CreatePodRequest\x12\x15\n" +
 	"\x06pod_id\x18\x01 \x01(\tR\x05podId\x12(\n" +
 	"\x04spec\x18\x02 \x01(\v2\x14.feos.pod.v1.PodSpecR\x04spec\x12;\n" +
@@ -2464,7 +2478,9 @@ const file_feos_pod_v1_pod_proto_rawDesc = "" +
 	"\n" +
 	"pull_token\x18\x04 \x01(\tR\tpullToken\x12K\n" +
 	"\n" +
-	"log_labels\x18\x05 \x03(\v2,.feos.pod.v1.CreatePodRequest.LogLabelsEntryR\tlogLabels\x1a<\n" +
+	"log_labels\x18\x05 \x03(\v2,.feos.pod.v1.CreatePodRequest.LogLabelsEntryR\tlogLabels\x12\x1d\n" +
+	"\n" +
+	"log_redact\x18\x06 \x03(\tR\tlogRedact\x1a<\n" +
 	"\x0eLogLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"o\n" +
