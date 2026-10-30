@@ -26,6 +26,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/db/dbtest"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/nodelink"
+	"github.com/gardenlinux/feos/go/internal/pki"
 	"github.com/gardenlinux/feos/go/internal/podid"
 	"github.com/gardenlinux/feos/go/internal/sandbox"
 	"github.com/gardenlinux/feos/go/internal/store"
@@ -59,6 +60,8 @@ type envOptions struct {
 	ready   func(context.Context) error
 	// sealer seals the sandboxes' image credentials; nil: none.
 	sealer Sealer
+	// issuer issues the service certificates; nil: none.
+	issuer *pki.Issuer
 	// db shares another env's database (a second instance).
 	db *db.DB
 	// environments builds the environments service on the test's
@@ -127,7 +130,7 @@ func newEnv(t *testing.T, o envOptions) *env {
 	deps := Deps{
 		DB: d, Store: st, Engine: eng, Conns: e.conns, Fleet: o.fleet, Tools: tools.NewREST(runner),
 		Specs: tools.Specs, MCP: o.mcp, Ports: o.ports, Watches: o.watches, Bindings: o.bindings, Ready: o.ready,
-		Ingress: o.ingress, Sealer: o.sealer,
+		Ingress: o.ingress, Sealer: o.sealer, Issuer: o.issuer,
 	}
 	if o.environments != nil {
 		deps.Environments = o.environments(d, st)

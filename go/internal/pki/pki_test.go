@@ -1016,6 +1016,8 @@ func TestIssuePod(t *testing.T) {
 		{"ingress ID", IngressID(testTD, "x"), nil},
 		{"under an ingress ID", IngressID(testTD, "x") + "/y", nil},
 		{"ingress namespace", "spiffe://" + testTD + "/ingress", nil},
+		{"sink ID", SinkID(testTD, "x"), nil},
+		{"sink namespace", "spiffe://" + testTD + "/sink", nil},
 		{"other trust domain", "spiffe://other.test/tenant/a/sandbox/b", nil},
 		{"no path", "spiffe://" + testTD, nil},
 		{"dot segment", "spiffe://" + testTD + "/a/../ferun", nil},

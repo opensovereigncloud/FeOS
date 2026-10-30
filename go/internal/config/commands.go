@@ -18,11 +18,12 @@ import (
 
 // The subcommands of ferund.
 const (
-	CmdServe     = "serve"
-	CmdInitCA    = "init-ca"
-	CmdNewIssuer = "new-issuer"
-	CmdJoinToken = "join-token"
-	CmdMigrate   = "migrate"
+	CmdServe        = "serve"
+	CmdInitCA       = "init-ca"
+	CmdNewIssuer    = "new-issuer"
+	CmdJoinToken    = "join-token"
+	CmdServiceToken = "service-token"
+	CmdMigrate      = "migrate"
 )
 
 // InitCA is the configuration of `ferund init-ca`: the platform CA's root
@@ -140,6 +141,50 @@ func registerJoinToken(fs *flag.FlagSet, c *JoinToken) *string {
 	return &level
 }
 
+// ServiceToken is the configuration of `ferund service-token` (ADR 0026).
+type ServiceToken struct {
+	DatabaseURL string
+	// Kind is the service: model.ServiceSink, an instance of ferun-sink.
+	Kind string
+	// Name is the holder's name, its certificate's
+	// spiffe://<td>/<kind>/<name>.
+	Name     string
+	LogLevel slog.Level
+}
+
+// ParseServiceToken reads the flags of service-token.
+func ParseServiceToken(args []string, getenv func(string) string) (ServiceToken, error) {
+	c := ServiceToken{Kind: model.ServiceSink, LogLevel: slog.LevelWarn}
+	fs := newFlagSet(CmdServiceToken)
+	level := registerServiceToken(fs, &c)
+	if err := parseFlags(fs, args, getenv); err != nil {
+		return ServiceToken{}, err
+	}
+	var errs []error
+	if err := c.LogLevel.UnmarshalText([]byte(*level)); err != nil {
+		errs = append(errs, fmt.Errorf("--log-level: %w", err))
+	}
+	if c.DatabaseURL == "" {
+		errs = append(errs, errors.New("--database-url is required"))
+	}
+	if c.Kind != model.ServiceSink {
+		errs = append(errs, fmt.Errorf("--kind %q: %s", c.Kind, model.ServiceSink))
+	}
+	if !pki.IsNodeName(c.Name) {
+		errs = append(errs, fmt.Errorf("--name %q is not a name (a DNS label; required)", c.Name))
+	}
+	return c, errors.Join(errs...)
+}
+
+func registerServiceToken(fs *flag.FlagSet, c *ServiceToken) *string {
+	level := strings.ToLower(c.LogLevel.String())
+	fs.StringVar(&c.DatabaseURL, "database-url", c.DatabaseURL, "PostgreSQL DSN (required)")
+	fs.StringVar(&c.Kind, "kind", c.Kind, "the service: sink (an instance of ferun-sink)")
+	fs.StringVar(&c.Name, "name", c.Name, "the holder's name, a DNS label: its certificate names spiffe://<trust domain>/<kind>/<name> (required)")
+	fs.StringVar(&level, "log-level", level, "debug, info, warn or error")
+	return &level
+}
+
 // Migrate is the configuration of `ferund migrate`.
 type Migrate struct {
 	DatabaseURL string
@@ -193,6 +238,10 @@ func Usage(w io.Writer, cmd string) {
 		registerJoinToken(fs, &JoinToken{CADir: Default().CADir, TrustDomain: Default().TrustDomain, TTL: JoinTokenTTL,
 			Kind: model.JoinKindNode, LogLevel: slog.LevelWarn})
 		fmt.Fprintln(w, "Usage: ferund join-token --database-url URL [--kind node|ingress] [flags]\n\nIssues a one-time join token for a node or an instance of ferun-ingress and prints it:\nfeos-join-<secret>.<pin>, or feos-ingress-join-<secret>.<pin> for an instance of ferun-ingress.")
+	case CmdServiceToken:
+		fs = newFlagSet(cmd)
+		registerServiceToken(fs, &ServiceToken{Kind: model.ServiceSink, LogLevel: slog.LevelWarn})
+		fmt.Fprintln(w, "Usage: ferund service-token --database-url URL --kind sink --name NAME\n\nIssues a long-lived service token (ADR 0026) and prints it once: feos-sink-<secret>,\nwhich an instance of ferun-sink trades for its certificates. Revoke it with\nDELETE /api/v1/admin/service-tokens/{id}.")
 	case CmdMigrate:
 		fs = newFlagSet(cmd)
 		registerMigrate(fs, &Migrate{LogLevel: slog.LevelInfo})
@@ -203,11 +252,12 @@ func Usage(w io.Writer, cmd string) {
 FeRun, the control plane of FeOS (ADR 0015).
 
 Commands:
-  serve        run an instance (the default when no command is given)
-  init-ca      make the platform CA's root and issuer
-  new-issuer   make a new issuer under the platform CA's root
-  join-token   issue a join token for a node or an ingress instance
-  migrate      apply the database migrations and exit
+  serve          run an instance (the default when no command is given)
+  init-ca        make the platform CA's root and issuer
+  new-issuer     make a new issuer under the platform CA's root
+  join-token     issue a join token for a node or an ingress instance
+  service-token  issue a service token for an instance of ferun-sink
+  migrate        apply the database migrations and exit
 
 Every flag has an environment variable FERUN_<NAME>, the flag's name in upper
 snake case (--database-url: FERUN_DATABASE_URL); a flag wins over its variable.

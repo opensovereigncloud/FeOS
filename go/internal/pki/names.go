@@ -18,13 +18,15 @@ import (
 
 // The SPIFFE layout (provisional; ADR 0014 leaves it open): a node is
 // spiffe://<td>/node/<name>, an instance of ferun-ingress is
-// spiffe://<td>/ingress/<name>, the control plane's instances share
+// spiffe://<td>/ingress/<name>, an instance of ferun-sink is
+// spiffe://<td>/sink/<name>, the control plane's instances share
 // spiffe://<td>/ferun, a sandbox's pod is
 // spiffe://<td>/tenant/<tenant>/sandbox/<id>.
 const (
 	spiffeScheme    = "spiffe://"
 	nodePath        = "/node/"
 	ingressPath     = "/ingress/"
+	sinkPath        = "/sink/"
 	controlPlanePth = "/ferun"
 	maxCNBytes      = 64
 )
@@ -37,6 +39,11 @@ func NodeID(td, name string) string {
 // IngressID is the SPIFFE ID of the ferun-ingress instance name.
 func IngressID(td, name string) string {
 	return spiffeScheme + td + ingressPath + name
+}
+
+// SinkID is the SPIFFE ID of the ferun-sink instance name (ADR 0026).
+func SinkID(td, name string) string {
+	return spiffeScheme + td + sinkPath + name
 }
 
 // SandboxID is the SPIFFE ID of a sandbox's pod.
@@ -71,7 +78,14 @@ func ParseIngressID(td string, cert *x509.Certificate) (string, error) {
 	return parseNamedID(td, cert, ingressPath, "an ingress", IngressID)
 }
 
-// parseNamedID is ParseNodeID and ParseIngressID: the one URI name of cert
+// ParseSinkID returns the instance name of a ferun-sink certificate: the
+// certificate must carry exactly one URI name, spiffe://<td>/sink/<name>,
+// with name a DNS label. Neither a node's nor an ingress's passes.
+func ParseSinkID(td string, cert *x509.Certificate) (string, error) {
+	return parseNamedID(td, cert, sinkPath, "a sink", SinkID)
+}
+
+// parseNamedID is ParseNodeID, ParseIngressID and ParseSinkID: the one URI name of cert
 // must be spiffe://<td><path><name> in canonical form, with name a DNS
 // label; holder names the holder in errors ("a node") and id rebuilds the
 // URI.
@@ -166,8 +180,8 @@ func within(name, domain string) bool {
 // validatePodID checks a pod's SPIFFE ID: spiffe://<td>/<path> in canonical
 // form, path segments of letters, digits, ".", "-" and "_" (the SPIFFE ID
 // rules), and outside the namespaces of the control plane (/ferun), of
-// nodes (/node/...) and of ferun-ingress (/ingress/...), so that a pod's
-// certificate can never pose as any of them.
+// nodes (/node/...), of ferun-ingress (/ingress/...) and of ferun-sink
+// (/sink/...), so that a pod's certificate can never pose as any of them.
 func validatePodID(td, id string) error {
 	if strings.ContainsAny(id, "%?#@") {
 		return fmt.Errorf("SPIFFE ID %q is not canonical", id)
@@ -205,6 +219,9 @@ func validatePodID(td, id string) error {
 	}
 	if path == strings.TrimSuffix(ingressPath, "/") || strings.HasPrefix(path, ingressPath) {
 		return fmt.Errorf("SPIFFE ID %q names an ingress; a pod never gets it", id)
+	}
+	if path == strings.TrimSuffix(sinkPath, "/") || strings.HasPrefix(path, sinkPath) {
+		return fmt.Errorf("SPIFFE ID %q names a sink; a pod never gets it", id)
 	}
 	return nil
 }

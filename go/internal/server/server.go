@@ -358,7 +358,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 		DB: i.DB, Store: i.Store, Engine: i.Engine, Elector: i.Elector, Conns: i.Links, Fleet: fl,
 		Tools: tools.NewREST(i.Runner), Specs: tools.Specs, MCP: i.mcp, Ports: i.streams.Ports,
 		Watches: i.streams.Watches, Bindings: i.Bindings, Environments: i.Env, Ingress: ing, Domains: i.Domains, TenantJobs: i.Env,
-		Ready: i.ready, Sealer: sealerOf(sealer),
+		Ready: i.ready, Sealer: sealerOf(sealer), Issuer: i.Issuer,
 	}
 	if ui.Built() {
 		deps.UI = ui.FS()

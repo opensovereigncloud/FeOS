@@ -36,6 +36,10 @@ var routeClasses = map[string]class{
 	"GET /api/v1/admin/ingresses":                         classAdmin,
 	"DELETE /api/v1/admin/ingresses/{name}":               classAdmin,
 	"GET /api/v1/admin/instances":                         classAdmin,
+	"GET /api/v1/admin/service-tokens":                    classAdmin,
+	"DELETE /api/v1/admin/service-tokens/{id}":            classAdmin,
+	"GET /api/v1/tenant":                                  classTenant,
+	"POST /api/v1/service-certificates":                   classService,
 
 	"GET /api/v1/tools":                           classTenant,
 	"POST /api/v1/sandboxes":                      classTenant,
@@ -187,6 +191,8 @@ func classAnswer(t *testing.T, e *env, pattern string, c class) {
 		if got := w.Header().Get("WWW-Authenticate"); got != "" {
 			t.Fatalf("%s: WWW-Authenticate %q", pattern, got)
 		}
+	case classService:
+		expect(t, w, http.StatusUnauthorized, errBody("service token required"))
 	case classMCP:
 		if w.Header().Get("X-Door") != "mcp" {
 			t.Fatalf("%s: not the MCP door: %d %s", pattern, w.Code, w.Body.String())

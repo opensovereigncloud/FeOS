@@ -12,10 +12,14 @@
 //	          /api/v1/environments[/…]   environments (ADR 0018) but their door;
 //	          /api/v1/domains[/…]        the domains (ADR 0021)
 //	          /api/v1/jobs[/…]           the tenants' jobs (ADR 0018)
+//	          /api/v1/tenant             the token's tenant (the sink asks, ADR 0026)
 //	sandbox   /api/v1/sandboxes/{id}/…   the sandbox's own token: everything that
 //	                                     acts inside the sandbox
 //	mcp       /mcp                       the MCP door's own class (internal/mcpsrv)
 //	forward   /fwd/…, …/ports/…          the port door's own class (internal/ports)
+//	service   /api/v1/service-certificates
+//	                                     a service token (ADR 0026): the sink's
+//	                                     certificates
 //	route     /api/v1/environments/{env}/http/…
 //	                                     the route door's own class: a route token
 //	                                     of the environment (internal/env)
@@ -53,6 +57,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/leader"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/nodelink"
+	"github.com/gardenlinux/feos/go/internal/pki"
 	"github.com/gardenlinux/feos/go/internal/podid"
 	"github.com/gardenlinux/feos/go/internal/store"
 	"github.com/gardenlinux/feos/go/internal/tools"
@@ -222,6 +227,9 @@ type Deps struct {
 	// Sealer seals a sandbox's image credentials (ADR 0025); nil: a
 	// create or a PUT with credentials answers 503.
 	Sealer Sealer
+	// Issuer issues the service certificates (ADR 0026); nil: they
+	// answer 503.
+	Issuer *pki.Issuer
 }
 
 // Sealer seals what the engine opens (internal/seal).
@@ -335,6 +343,9 @@ const (
 	// {path...}): a route token of the environment, plain-text answers, a
 	// tenant's token refused; the environments service checks it.
 	classRoute class = "route"
+	// classService is a platform service's (ADR 0026): a service token
+	// (service_tokens), POST /api/v1/service-certificates.
+	classService class = "service"
 )
 
 // route is one line of the route table.
@@ -358,6 +369,7 @@ func (s *server) routes() []route {
 		add(classSandbox, pattern, s.sandbox(serve(h)))
 	}
 	public := func(pattern string, h http.Handler) { add(classPublic, pattern, h) }
+	service := func(pattern string, h apiHandler) { add(classService, pattern, s.service(h)) }
 
 	// Operators: tenants, the node fleet, join tokens, the ingress's
 	// instances, the instances and the activity log. Nobody's tenant: the
@@ -452,6 +464,10 @@ func (s *server) routes() []route {
 
 	// The tenants' jobs (ADR 0018): a container run to its end, once.
 	s.tenantJobRoutes(tenant)
+
+	// The sink (ADR 0026): a token's tenant, its instances' certificates
+	// and their service tokens.
+	s.sinkRoutes(admin, tenant, service)
 
 	// The doors with classes of their own: their answers are plain text
 	// (forward) or the MCP door's, not this API's JSON.

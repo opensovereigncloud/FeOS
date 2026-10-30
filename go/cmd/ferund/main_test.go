@@ -188,6 +188,29 @@ func TestMigrateAndJoinToken(t *testing.T) {
 		!strings.Contains(errOut, "--kind") {
 		t.Fatalf("--kind pod: exit %d %s", code, errOut)
 	}
+
+	// service-token issues a sink's token, printed once, stored by its
+	// hash with an activity row.
+	code, out, errOut = runCmd([]string{"service-token", "--database-url", url, "--kind", "sink", "--name", "sink-0"}, noEnv)
+	if code != 0 || !strings.HasPrefix(errOut, "sink service token ") || !strings.Contains(errOut, "for sink-0") {
+		t.Fatalf("service-token: exit %d %s", code, errOut)
+	}
+	tok := strings.TrimSpace(out)
+	sts, err := store.New(d).ListServiceTokens(ctx)
+	if !strings.HasPrefix(tok, "feos-sink-") || err != nil || len(sts) != 1 || sts[0].Hash != store.HashToken(tok) ||
+		sts[0].Name != "sink-0" || sts[0].Kind != "sink" || sts[0].CreatedBy != "ferund service-token" {
+		t.Fatalf("token %q, rows %+v %v", tok, sts, err)
+	}
+	var acts int
+	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM activity WHERE kind = 'service_token_created'").Scan(&acts); err != nil ||
+		acts != 1 {
+		t.Fatalf("activity rows %d %v", acts, err)
+	}
+	for _, args := range [][]string{{"--kind", "node", "--name", "a"}, {"--name", "Bad_Name"}, {}} {
+		if code, _, _ := runCmd(append([]string{"service-token", "--database-url", url}, args...), noEnv); code != 2 {
+			t.Errorf("service-token %v: exit %d", args, code)
+		}
+	}
 }
 
 func TestCommandLine(t *testing.T) {
@@ -199,6 +222,7 @@ func TestCommandLine(t *testing.T) {
 	}{
 		{[]string{"--help"}, 0, "Commands:"},
 		{[]string{"help", "join-token"}, 0, "--node (FERUN_NODE)"},
+		{[]string{"help", "service-token"}, 0, `--kind (FERUN_KIND, default "sink")`},
 		{[]string{"serve", "--help"}, 0, "--database-url (FERUN_DATABASE_URL)"},
 		{[]string{"migrate", "-h"}, 0, "Applies the database migrations"},
 		{[]string{"version"}, 0, ""},

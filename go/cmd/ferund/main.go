@@ -9,6 +9,7 @@
 //	ferund init-ca --root-dir R --dir D --dns-domain X ...
 //	ferund new-issuer --root-dir R --dir D --dns-domain X ...
 //	ferund join-token --database-url URL [--kind node|ingress] [--ttl 1h] [--node NAME]
+//	ferund service-token --database-url URL --kind sink --name NAME
 //	ferund migrate --database-url URL
 //
 // Every flag has an environment variable FERUN_<NAME> (internal/config).
@@ -18,6 +19,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,6 +30,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gardenlinux/feos/go/internal/config"
 	"github.com/gardenlinux/feos/go/internal/db"
@@ -36,6 +39,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/pki"
 	"github.com/gardenlinux/feos/go/internal/server"
+	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // version is the build's version, set with -ldflags "-X main.version=…";
@@ -66,6 +70,8 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		err = newIssuer(args, getenv, stdout)
 	case config.CmdJoinToken:
 		err = joinToken(args, getenv, stdout, stderr)
+	case config.CmdServiceToken:
+		err = serviceToken(args, getenv, stdout, stderr)
 	case config.CmdMigrate:
 		err = migrate(args, getenv, stderr)
 	case "help":
@@ -211,6 +217,46 @@ func joinToken(args []string, getenv func(string) string, stdout, stderr io.Writ
 	}
 	fmt.Fprintf(stderr, "%s join token %s for %s, valid until %s\n", c.Kind, id, pinned,
 		expires.UTC().Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintln(stdout, token)
+	return nil
+}
+
+// serviceToken issues a service token (ADR 0026) in the database and
+// prints it once; the database keeps its hash, and an activity row says
+// who made it.
+func serviceToken(args []string, getenv func(string) string, stdout, stderr io.Writer) error {
+	c, err := config.ParseServiceToken(args, getenv)
+	if err != nil {
+		return flagErr(err)
+	}
+	log := newLogger(stderr, c.LogLevel)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	d, err := db.Open(ctx, c.DatabaseURL, log)
+	if err != nil {
+		return fmt.Errorf("open the database: %w", err)
+	}
+	defer d.Close()
+	token, hash, err := pki.NewServiceToken(c.Kind)
+	if err != nil {
+		return fmt.Errorf("make a service token: %w", err)
+	}
+	const by = "ferund service-token"
+	var t store.ServiceToken
+	err = store.New(d).InTx(ctx, func(tx *store.Store) error {
+		var err error
+		if t, err = tx.CreateServiceToken(ctx, hash, c.Kind, c.Name, by); err != nil {
+			return err
+		}
+		detail, _ := json.Marshal(map[string]any{"kind": c.Kind, "name": c.Name, "id": t.ID.String(), "by": by})
+		return tx.InsertActivity(ctx, store.ActivityRow{TsNs: time.Now().UnixNano(), Source: store.SourceFerund,
+			Kind: "service_token_created", Category: "credential",
+			Name: fmt.Sprintf("%s token %s created by %s", c.Kind, c.Name, by), Detail: detail})
+	})
+	if err != nil {
+		return fmt.Errorf("store the service token: %w", err)
+	}
+	fmt.Fprintf(stderr, "%s service token %s for %s\n", c.Kind, t.ID, c.Name)
 	fmt.Fprintln(stdout, token)
 	return nil
 }
