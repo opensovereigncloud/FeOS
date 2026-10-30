@@ -126,6 +126,8 @@ pub struct Beside {
     pub pull_token: String,
     /// The labels of its containers' logs (ADR 0026).
     pub log_labels: HashMap<String, String>,
+    /// The values its shipped log lines are redacted of: secrets.
+    pub log_redact: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -205,9 +207,10 @@ impl Pod {
         })
     }
 
-    /// Its record, with its hibernation in flight, which is never kept.
+    /// Its record, with its hibernation in flight, which is never kept,
+    /// and without the values its logs are redacted of.
     fn shown(&self) -> PodInfo {
-        let mut info = self.info.clone();
+        let mut info = shown(self.info.clone());
         info.hibernation = self.hibernation.as_ref().map(Hibernation::shown);
         info
     }
@@ -437,6 +440,7 @@ impl Pods {
             image_layers,
             pull_token,
             log_labels,
+            log_redact,
         } = beside;
         spec::check_id(&pod_id)?;
         let spec = spec::normalize(spec)?;
@@ -455,6 +459,7 @@ impl Pods {
             state: PodState::Pending as i32,
             image_layers,
             log_labels,
+            log_redact,
             ..Default::default()
         };
         let recorded = match self.add(info, spec::has_network(&spec)).await {
@@ -488,7 +493,7 @@ impl Pods {
         }
         self.announce(&info, false);
         self.spawn_bring_up(&pod_id);
-        Ok(info)
+        Ok(shown(info))
     }
 
     /// Adds the pod `info`, unless one with its ID is there, which comes
@@ -1886,6 +1891,20 @@ impl Pods {
         Ok(guest.stream_container_logs(request).await?.into_inner())
     }
 
+    /// The running pods whose logs are shipped, those with log labels, as
+    /// they are kept: with the values their lines are redacted of (ADR
+    /// 0026). For feosd's log shipper alone.
+    pub fn shipping_logs(&self) -> Vec<PodInfo> {
+        let mut pods: Vec<PodInfo> = self
+            .pods()
+            .values()
+            .filter(|pod| pod.info.state() == PodState::Running && !pod.info.log_labels.is_empty())
+            .map(|pod| pod.info.clone())
+            .collect();
+        pods.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
+        pods
+    }
+
     pub fn list(&self) -> Vec<PodInfo> {
         let mut pods: Vec<PodInfo> = self.pods().values().map(Pod::shown).collect();
         pods.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
@@ -3087,9 +3106,16 @@ fn stale(vm: &VmInfo, wanted: &VmConfig) -> bool {
 }
 
 /// A create of a pod that exists finds it if the spec is the same.
+/// A pod's record as the API answers it: without the values its logs are
+/// redacted of, which are secrets.
+fn shown(mut info: PodInfo) -> PodInfo {
+    info.log_redact.clear();
+    info
+}
+
 fn same_spec(existing: PodInfo, spec: &PodSpec) -> Result<PodInfo, Status> {
     if existing.spec.as_ref() == Some(spec) {
-        Ok(existing)
+        Ok(shown(existing))
     } else {
         Err(Status::already_exists(format!(
             "pod {} exists with another spec",
@@ -3853,6 +3879,7 @@ mod tests {
         };
         let beside = |tenant: &str| Beside {
             log_labels: labels(tenant),
+            log_redact: vec![format!("{tenant}-secret")],
             ..Default::default()
         };
         let created = pods
@@ -3860,17 +3887,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.log_labels, labels("acme"));
+        // The secrets are kept, and in no answer.
+        assert!(created.log_redact.is_empty());
         let again = pods
             .create(POD.to_string(), spec, beside("other"))
             .await
             .unwrap();
         assert_eq!(again.log_labels, labels("acme"));
+        assert!(again.log_redact.is_empty());
+        assert!(pods.list()[0].log_redact.is_empty());
+        assert!(pods.get(POD).await.unwrap().log_redact.is_empty());
+        assert_eq!(pods.info(POD).unwrap().log_redact, ["acme-secret"]);
         let kept = Store::open(dir.path().join("pods"))
             .unwrap()
             .load()
             .unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].log_labels, labels("acme"));
+        assert_eq!(kept[0].log_redact, ["acme-secret"]);
     }
 
     /// A delete takes the pod out and removes its record in one go: a save

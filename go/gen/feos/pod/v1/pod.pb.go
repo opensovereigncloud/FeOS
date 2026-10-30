@@ -691,7 +691,11 @@ type PodInfo struct {
 	Baked *BakedLayer `protobuf:"bytes,13,opt,name=baked,proto3" json:"baked,omitempty"`
 	// The labels of its containers' logs that its create named (ADR 0026):
 	// with them, feosd ships the logs to the sink.
-	LogLabels     map[string]string `protobuf:"bytes,14,rep,name=log_labels,json=logLabels,proto3" json:"log_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	LogLabels map[string]string `protobuf:"bytes,14,rep,name=log_labels,json=logLabels,proto3" json:"log_labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// The values its shipped log lines are redacted of, as its create named
+	// them (CreatePodRequest.log_redact): kept in the record, and empty in
+	// every answer of the API.
+	LogRedact     []string `protobuf:"bytes,15,rep,name=log_redact,json=logRedact,proto3" json:"log_redact,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -820,6 +824,13 @@ func (x *PodInfo) GetBaked() *BakedLayer {
 func (x *PodInfo) GetLogLabels() map[string]string {
 	if x != nil {
 		return x.LogLabels
+	}
+	return nil
+}
+
+func (x *PodInfo) GetLogRedact() []string {
+	if x != nil {
+		return x.LogRedact
 	}
 	return nil
 }
@@ -2440,7 +2451,7 @@ const file_feos_pod_v1_pod_proto_rawDesc = "" +
 	"\x0fsecurity_groups\x18\a \x03(\tR\x0esecurityGroups\x12#\n" +
 	"\rdns_upstreams\x18\b \x03(\tR\fdnsUpstreams\x12\x1f\n" +
 	"\vname_tables\x18\t \x03(\tR\n" +
-	"nameTablesJ\x04\b\x01\x10\x06R\btap_nameR\vmac_addressR\tipv4_cidrR\agatewayR\x03dns\"\xd3\x05\n" +
+	"nameTablesJ\x04\b\x01\x10\x06R\btap_nameR\vmac_addressR\tipv4_cidrR\agatewayR\x03dns\"\xf2\x05\n" +
 	"\aPodInfo\x12\x15\n" +
 	"\x06pod_id\x18\x01 \x01(\tR\x05podId\x12(\n" +
 	"\x04spec\x18\x02 \x01(\v2\x14.feos.pod.v1.PodSpecR\x04spec\x12+\n" +
@@ -2461,7 +2472,9 @@ const file_feos_pod_v1_pod_proto_rawDesc = "" +
 	"\x04disk\x18\f \x01(\v2\x17.feos.pod.v1.BakedLayerR\x04disk\x12-\n" +
 	"\x05baked\x18\r \x01(\v2\x17.feos.pod.v1.BakedLayerR\x05baked\x12B\n" +
 	"\n" +
-	"log_labels\x18\x0e \x03(\v2#.feos.pod.v1.PodInfo.LogLabelsEntryR\tlogLabels\x1a<\n" +
+	"log_labels\x18\x0e \x03(\v2#.feos.pod.v1.PodInfo.LogLabelsEntryR\tlogLabels\x12\x1d\n" +
+	"\n" +
+	"log_redact\x18\x0f \x03(\tR\tlogRedact\x1a<\n" +
 	"\x0eLogLabelsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x9b\x01\n" +

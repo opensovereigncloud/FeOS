@@ -66,6 +66,24 @@ fn unix_nanos(time: SystemTime) -> u64 {
         })
 }
 
+/// What a line is redacted of: `values` without the empty ones and
+/// repeats, the longest first, so that one inside another goes whole.
+pub(crate) fn redactions(mut values: Vec<String>) -> Vec<String> {
+    values.retain(|value| !value.is_empty());
+    values.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    values.dedup();
+    values
+}
+
+/// Replaces every one of `values` in `text` with `[redacted]`.
+pub(crate) fn redact(text: &mut String, values: &[String]) {
+    for value in values {
+        if text.contains(value.as_str()) {
+            *text = text.replace(value.as_str(), "[redacted]");
+        }
+    }
+}
+
 /// A record to send: an entry of the log, or the node's own of lines it
 /// dropped.
 #[derive(Clone, Debug, PartialEq)]
@@ -413,6 +431,25 @@ mod tests {
             attributes(&record.attributes),
             pairs(&[("log.offset", "0"), ("log.next_offset", "4")])
         );
+    }
+
+    #[test]
+    fn secrets_are_redacted() {
+        let values = redactions(vec![
+            "hunter2".into(),
+            String::new(),
+            "user:hunter2".into(),
+            "hunter2".into(),
+        ]);
+        assert_eq!(values, ["user:hunter2", "hunter2"]);
+        let mut text = "postgres://user:hunter2@db and hunter2 again".to_string();
+        redact(&mut text, &values);
+        assert_eq!(text, "postgres://[redacted]@db and [redacted] again");
+        let mut clean = "nothing here".to_string();
+        redact(&mut clean, &values);
+        assert_eq!(clean, "nothing here");
+        redact(&mut clean, &[]);
+        assert_eq!(clean, "nothing here");
     }
 
     #[test]

@@ -227,6 +227,10 @@ message PodInfo {
   // The labels of its containers' logs that its create named (ADR 0026):
   // with them, feosd ships the logs to the sink.
   map<string, string> log_labels = 14;
+  // The values its shipped log lines are redacted of, as its create named
+  // them (CreatePodRequest.log_redact): kept in the record, and empty in
+  // every answer of the API.
+  repeated string log_redact = 15;
 }
 
 // A hibernation in flight.

@@ -91,6 +91,7 @@ impl PodService for Pods {
                     image_layers: request.image_layers,
                     pull_token: request.pull_token,
                     log_labels: request.log_labels,
+                    log_redact: request.log_redact,
                 },
             )
             .await?;

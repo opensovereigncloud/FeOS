@@ -6,7 +6,7 @@
 //! logs, which go to the sink the control plane names (ADR 0026).
 
 use feos_proto::container_service::StreamContainerLogsRequest;
-use feos_proto::pod_service::{PodInfo, PodState};
+use feos_proto::pod_service::PodInfo;
 use fleet_client::{
     Diskd, Fleet, Incoming, Installed, Inventory, LogStream, Logs, ShippedPod, Shipper,
 };
@@ -72,9 +72,8 @@ struct PodLogs(Pods);
 impl Logs for PodLogs {
     fn pods(&self) -> Vec<ShippedPod> {
         self.0
-            .list()
+            .shipping_logs()
             .into_iter()
-            .filter(|pod| pod.state() == PodState::Running && !pod.log_labels.is_empty())
             .map(|pod| ShippedPod {
                 containers: pod
                     .spec
@@ -82,6 +81,7 @@ impl Logs for PodLogs {
                     .unwrap_or_default(),
                 id: pod.pod_id,
                 labels: pod.log_labels,
+                redact: pod.log_redact,
             })
             .collect()
     }

@@ -85,8 +85,18 @@ pub struct Target {
 pub struct ShippedPod {
     pub id: String,
     pub labels: HashMap<String, String>,
+    /// The values its lines are redacted of before they are sent: secrets,
+    /// never sent nor logged.
+    pub redact: Vec<String>,
     /// Its containers' names, as its guest knows them.
     pub containers: Vec<String>,
+}
+
+/// What a pod's streams send with their lines, and leave out of them.
+struct Labels {
+    labels: HashMap<String, String>,
+    /// The longest first.
+    redact: Vec<String>,
 }
 
 /// A container's log, as its guest streams it.
@@ -293,11 +303,14 @@ async fn supervise<L: Logs>(inner: Arc<Inner>, logs: Arc<L>) {
             }
             false => Vec::new(),
         };
-        let wanted: HashMap<(String, String), Arc<HashMap<String, String>>> = pods
+        let wanted: HashMap<(String, String), Arc<Labels>> = pods
             .into_iter()
             .filter(|pod| !pod.labels.is_empty())
             .flat_map(|pod| {
-                let labels = Arc::new(pod.labels);
+                let labels = Arc::new(Labels {
+                    labels: pod.labels,
+                    redact: batch::redactions(pod.redact),
+                });
                 pod.containers
                     .into_iter()
                     .map(move |container| ((pod.id.clone(), container), labels.clone()))
@@ -369,7 +382,7 @@ async fn follow<L: Logs>(
     inner: Arc<Inner>,
     logs: Arc<L>,
     (pod, container): (String, String),
-    labels: Arc<HashMap<String, String>>,
+    labels: Arc<Labels>,
     state: Arc<State>,
     mut drains: mpsc::Receiver<oneshot::Sender<()>>,
 ) {
@@ -430,7 +443,7 @@ struct Shipping {
     inner: Arc<Inner>,
     pod: String,
     container: String,
-    labels: Arc<HashMap<String, String>>,
+    labels: Arc<Labels>,
     state: Arc<State>,
     /// A failed export was said, until one succeeds.
     warned: bool,
@@ -522,7 +535,7 @@ impl Shipping {
         let mut entries = logs.logs(&self.pod, request).await?;
         *lock(&self.state.log_id) = log_id.clone();
         self.state.following.store(true, Ordering::Relaxed);
-        let mut resource = batch::resource(&self.key(&log_id), &target.node, &self.labels);
+        let mut resource = batch::resource(&self.key(&log_id), &target.node, &self.labels.labels);
         let mut limit = Limit::new(batch::RATE, batch::BURST, Instant::now());
         let mut batch = Batch::new();
         let mut waiting: Vec<oneshot::Sender<()>> = Vec::new();
@@ -555,13 +568,15 @@ impl Shipping {
                         self.send(&mut batch, &resource, &mut limit).await?;
                         log_id = entry.log_id.clone();
                         *lock(&self.state.log_id) = log_id.clone();
-                        resource = batch::resource(&self.key(&log_id), &target.node, &self.labels);
+                        resource = batch::resource(&self.key(&log_id), &target.node, &self.labels.labels);
                         if self.position(&log_id).await? > entry.offset {
                             return Ok(Done::Again);
                         }
                     }
                     let now = Instant::now();
-                    for line in limit.admit(Line::of(entry), now) {
+                    let mut line = Line::of(entry);
+                    batch::redact(&mut line.text, &self.labels.redact);
+                    for line in limit.admit(line, now) {
                         if batch.would_overflow(&line) {
                             self.send(&mut batch, &resource, &mut limit).await?;
                         }

@@ -1260,6 +1260,7 @@ impl Logs for Pods {
         vec![ShippedPod {
             id: POD.into(),
             labels: [("ferun.tenant".to_string(), "acme".to_string())].into(),
+            redact: vec!["hunter2".into()],
             containers: vec!["main".into()],
         }]
     }
@@ -1344,7 +1345,7 @@ async fn a_node_ships_its_pods_logs_to_the_sink_it_is_told_of() {
     std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
     let fleet = node(&address, dir.path());
     let log = GuestLog::default();
-    for text in ["first", "second", "third"] {
+    for text in ["first", "second", "third hunter2"] {
         log.append(text);
     }
     let shipper = Shipper::start(Pods(log.clone()), fleet.sink());
@@ -1404,6 +1405,14 @@ async fn a_node_ships_its_pods_logs_to_the_sink_it_is_told_of() {
             record.body,
             Some(AnyValue {
                 value: Some(any_value::Value::StringValue("second".into())),
+            })
+        );
+        // A secret goes redacted.
+        let record = &request.resource_logs[0].scope_logs[0].log_records[1];
+        assert_eq!(
+            record.body,
+            Some(AnyValue {
+                value: Some(any_value::Value::StringValue("third [redacted]".into())),
             })
         );
     }
