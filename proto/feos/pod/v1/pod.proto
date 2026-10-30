@@ -224,6 +224,9 @@ message PodInfo {
   BakedLayer disk = 12;
   // The layer the pod baked of its image, once the object store has it.
   BakedLayer baked = 13;
+  // The labels of its containers' logs that its create named (ADR 0026):
+  // with them, feosd ships the logs to the sink.
+  map<string, string> log_labels = 14;
 }
 
 // A hibernation in flight.

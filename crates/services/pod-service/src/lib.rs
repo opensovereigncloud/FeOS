@@ -34,7 +34,7 @@ use feos_proto::volume_service::{
     CreateVolumeRequest, DeleteVolumeRequest, DeleteVolumeResponse, GetVolumeRequest,
     ListVolumesRequest, ListVolumesResponse, Volume,
 };
-pub use pods::{read_record, Pods, StopRecord, Stopped, STOP_RECORD};
+pub use pods::{read_record, Beside, LogDrain, Pods, StopRecord, Stopped, LOG_DRAIN, STOP_RECORD};
 use std::pin::Pin;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
@@ -87,8 +87,11 @@ impl PodService for Pods {
             .create(
                 request.pod_id,
                 request.spec.unwrap_or_default(),
-                request.image_layers,
-                request.pull_token,
+                pods::Beside {
+                    image_layers: request.image_layers,
+                    pull_token: request.pull_token,
+                    log_labels: request.log_labels,
+                },
             )
             .await?;
         Ok(Response::new(CreatePodResponse { pod: Some(pod) }))
