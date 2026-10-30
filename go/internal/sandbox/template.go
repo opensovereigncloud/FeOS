@@ -155,7 +155,7 @@ func (r *envResolver) secret(name string, version int, escape string) (string, e
 			return "", fmt.Errorf("secret %s version %d: %w", name, version, errNoResolver)
 		}
 		if !r.row.IsInstance() {
-			return "", fmt.Errorf("secret %s version %d: the sandbox is no environment's or run's", name, version)
+			return "", fmt.Errorf("secret %s version %d: the sandbox is no environment's or tenant job's", name, version)
 		}
 		var err error
 		if s, err = r.resolve(r.ctx, r.row, name, version); err != nil {
@@ -174,8 +174,8 @@ func (r *envResolver) secret(name string, version int, escape string) (string, e
 
 // secretOwner names what a row's secrets belong to in an error.
 func secretOwner(row store.Sandbox) string {
-	if row.TenantRun {
-		return "run " + row.ID.String()
+	if row.TenantJob {
+		return "job " + row.ID.String()
 	}
 	return "environment " + row.EnvironmentID.String()
 }

@@ -80,7 +80,7 @@ type TenantInfo struct {
 // (those being deleted are none) and its tokens (oldest first).
 func (s *Store) ListTenants(ctx context.Context) ([]TenantInfo, error) {
 	rows, err := s.q.Query(ctx, `SELECT t.id, t.created_at, t.deleting_at,
-			(SELECT count(*) FROM sandboxes s WHERE s.owner = t.id AND s.environment_id IS NULL AND NOT s.tenant_run),
+			(SELECT count(*) FROM sandboxes s WHERE s.owner = t.id AND s.environment_id IS NULL AND NOT s.tenant_job),
 			(SELECT count(*) FROM environments e WHERE e.owner = t.id AND NOT e.deleting)
 		FROM tenants t ORDER BY t.id`)
 	if err != nil {

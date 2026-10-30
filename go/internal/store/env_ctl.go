@@ -23,7 +23,7 @@ import (
 // created again under the same ID (FeCode replaces a lost workspace
 // sandbox so) is a new incarnation the service starts in anew; one of
 // another tenant under that ID is never used.
-const attachedUsable = `s.owner = e.owner AND s.environment_id IS NULL AND NOT s.tenant_run`
+const attachedUsable = `s.owner = e.owner AND s.environment_id IS NULL AND NOT s.tenant_job`
 
 // EnvCtlMembers returns the members of an environment's security group:
 // the addresses of its instance rows (any state, until the row is gone)

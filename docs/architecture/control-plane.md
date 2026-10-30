@@ -219,8 +219,8 @@ replicate synchronously ([Operations](#operations)).
   the domains' certificates and ACME's tables ([Certificates of
   domains](#certificates-of-domains)); `0016_access_logs.sql`, the
   ingress's access log ([The ingress service](#the-ingress-service));
-  `0017_runs.sql`, the tenants' runs and `sandboxes.tenant_run`
-  ([Tenants' runs](#tenants-runs))) and
+  `0017_tenant_jobs.sql`, the tenants' jobs and `sandboxes.tenant_job`
+  ([Tenants' jobs](#tenants-jobs))) and
   applied under an advisory lock, recorded in `schema_migrations`. The
   same locked section creates the cluster's MCP session key, reconciles
   `--pod-network` with the database's ([The pods'
@@ -268,8 +268,8 @@ log), partitioned by day; `issued_certs`
 `env_incidents`, `env_route_tokens` ([Environments](#environments));
 `domains` ([Domains](#domains)); `domain_certs`, `acme_accounts`,
 `acme_challenges` (the domains' certificates, [Certificates of
-domains](#certificates-of-domains)); `runs` (the tenants' runs,
-[Tenants' runs](#tenants-runs)).
+domains](#certificates-of-domains)); `jobs` (the tenants' jobs,
+[Tenants' jobs](#tenants-jobs)).
 Tokens are stored as SHA-256 hashes only, and shown once, at their
 creation.
 `placements`, which held the placement decisions and was written and read
@@ -1904,11 +1904,11 @@ inside a transaction:
 | Loop | Interval | Does |
 |---|---|---|
 | `env-reconcile` | 2 s, hint `env-reconcile` | a step ([below](#a-reconcile-step)) for each environment that has a release and is not deleted, four at once |
-| `env-probe` | 1 s | exits, restarts and readiness of the instances whose rows run without an op on a node this instance is connected to; attached services; the tenants' runs that have not ended, and the pods their ends left ([Tenants' runs](#tenants-runs)); at most 16 checks at once |
+| `env-probe` | 1 s | exits, restarts and readiness of the instances whose rows run without an op on a node this instance is connected to; attached services; the tenants' jobs that have not ended, and the pods their ends left ([Tenants' jobs](#tenants-jobs)); at most 16 checks at once |
 | `env-groups` | 10 s, hint `env-groups` | per connected node, the groups its rows' templates name and the groups their rules name (`ferun-ingress` among them), put again where the node's differ, and what the node holds of the ingress's groups recorded ([Security groups](#security-groups)); the groups of environments and sandboxes that are gone deleted, once no pod names them, and an `ing-` group of a sandbox that runs elsewhere too |
 | `env-names` | 2 s, hint `env-names` | per connected node, the name tables its rows' templates name and the tables they include, updated by a delta or put again where the node's differ; the tables of environments and sandboxes that are gone deleted, once no pod names them ([Names](#names)) |
 | `env-volumes` | 30 s | volumes marked deleting, 64 a pass, deleted on their node once no pod holds them (`FAILED_PRECONDITION`: later, at the end of the queue; `NOT_FOUND`: done), then their rows; a removed node's lose their rows only; records of environments' volumes on a connected node that no pod holds and no row places there are deleted |
-| `env-delete` | 5 s | the environments of deleting tenants marked deleting; per deleting environment, 16 a pass, the oldest-touched first: its instances deleted, its attached services cleaned up ([below](#attached-services)) before their rows go, its volumes marked deleting, its env group and env table deleted from every connected node; its row goes once no instance, volume, group, table or attached service still to clean is left, and its releases, secrets, runs, incidents and route tokens with it; an environment whose pass did not finish (a volume on a node that is down, a sandbox not woken yet) is touched, so that it goes to the end of the queue and stuck environments never hold the others back; the tenants' runs that ended 7 days ago |
+| `env-delete` | 5 s | the environments of deleting tenants marked deleting; per deleting environment, 16 a pass, the oldest-touched first: its instances deleted, its attached services cleaned up ([below](#attached-services)) before their rows go, its volumes marked deleting, its env group and env table deleted from every connected node; its row goes once no instance, volume, group, table or attached service still to clean is left, and its releases, secrets, runs, incidents and route tokens with it; an environment whose pass did not finish (a volume on a node that is down, a sandbox not woken yet) is touched, so that it goes to the end of the queue and stuck environments never hold the others back; the tenants' jobs that ended 7 days ago |
 
 **The Ensure pool.** The controller runs `Engine.Ensure` for the rows
 that should run, and its other slow work (an addon's provisioning, an
@@ -2516,65 +2516,69 @@ of at most 253 bytes. Not built: MCP tools and grants for environments,
 an admin listing, volumes for services, a copy of data on a clone, addon
 backups and minor upgrades, a CLI.
 
-### Tenants' runs
+### Tenants' jobs
 
-A tenant's run (ADR 0018, "A tenant's run") is a job's run without an
-environment: one pod to its end, its input in the create. Its pod is a
-row of `sandboxes` under the run's ID with `tenant_run` set (`0017`;
-`run_id` is the activity's run span), a template (the run's command,
-its `env` as literals, its secrets as secrets of version 0, its image
-credentials as the secrets `imageCredentials.username` and
-`imageCredentials.password`), `idle_after_s` 0, no groups (`feosd`'s
-default group: out to the internet, nothing in) and no name tables. It
-is an instance row to every query that tells a tenant's sandbox from
-one: absent from the tenant's sandboxes, no tokens, 404 on the sandbox
-routes. The engine's secret resolver (`RowSecret`) unseals a run's
-secrets and image credentials from `runs.sealed` (AAD `runs|<id>`), an
-environment's from `env_secrets`; the image is pinned to its digest at
-the create, asked with the credentials, and the registry is asked again
-before the pod's create (ADR 0025).
+A tenant's job (ADR 0018, "A tenant's job") is a job without an
+environment: one pod run to its end exactly once, its input in the
+create, and never retried. It has one run, so the job carries its
+status, exit code, result and log under its one ID, where an
+environment's job has runs (`env_job_runs`). Its pod is a row of
+`sandboxes` under the job's ID with `tenant_job` set (`0017`), a
+template (the job's command, its `env` as literals, its secrets as
+secrets of version 0, its image credentials as the secrets
+`imageCredentials.username` and `imageCredentials.password`),
+`idle_after_s` 0, no groups (`feosd`'s default group: out to the
+internet, nothing in) and no name tables. It is an instance row to every
+query that tells a tenant's sandbox from one: absent from the tenant's
+sandboxes, no tokens, 404 on the sandbox routes. The engine's secret
+resolver (`RowSecret`) unseals a tenant job's secrets and image
+credentials from `jobs.sealed` (AAD `jobs|<id>`), an environment's from
+`env_secrets`; the image is pinned to its digest at the create, asked
+with the credentials, and the registry is asked again before the pod's
+create (ADR 0025).
 
-| Column of `runs` | What it is |
+| Column of `jobs` | What it is |
 |---|---|
 | `id` | its pod's sandbox ID, a short one |
 | `owner`, `idempotency_key`, `request_hash` | the tenant; the create's `Idempotency-Key`, unique per tenant; the body's SHA-256 without the values of its secrets and image credentials, which a caller mints anew for a repeat |
 | `image`, `image_ref`, `vcpus`, `memory_mib`, `result_path`, `labels` | as created, the image pinned |
-| `sealed` | the secrets and image credentials, sealed; NULL once the run has ended |
+| `sealed` | the secrets and image credentials, sealed; NULL once the job has ended |
 | `phase`, `reason`, `detail`, `exit_code` | `queued`, `running`, `succeeded`, `failed` (`exit`, `image`, `node_lost`, `no_exit_status`), `deadline_exceeded`, `cancelled` |
-| `result`, `log_tail` | the result file's first 4 KiB; the log's last 1000 lines within 64 KiB, redacted of the run's secrets |
+| `result`, `log_tail` | the result file's first 4 KiB; the log's last 1000 lines within 64 KiB, redacted of the job's secrets |
 | `created_at`, `started_at`, `finished_at`, `deadline_at` | `deadline_at` is the create's `now()` plus its deadline (10 minutes when unset, at most 2 hours) |
 
-`env-probe` looks at every run that has not ended, on the database's
-clock: past its deadline it ends `deadline_exceeded`; a lost row
-`failed`/`node_lost`, never run again; a row that is gone
-`failed`/`no_exit_status`; a row stopped or failed after the run
-started, the same, since a run never runs twice; a running pod is read
-by `GetPod`, and a main container that runs marks the run `running`, one
-that exited ends it (0 `succeeded`, another code `failed`/`exit`, none
-`failed`/`no_exit_status`) after its result file was read through the
-guest's `Read` tool (the exited container's root filesystem stays while
-the pod does). Any other row is brought up by the Ensure pool, and an
-Ensure that the registry refuses ends the run `failed`/`image`. An end
-reads the log's tail from a pod that runs (before it drops the run's
-secrets, which redact it), writes the run once (`finished_at IS NULL`)
-and deletes the pod; `env-probe` deletes the pods whose run ended or
-went (`LeftRunPods`) as well, and `env-delete` sweeps the runs that
-ended 7 days ago. A create, a cancel and a delete run on the instance
-that takes the request: a cancel ends the run `cancelled` with its
-tail and deletes its pod, a delete cancels a run that has not ended and
-removes its record. A run is never paused, suspended or hibernated for
-want of calls; a drain moves it as any row, and its deadline counts on.
+`env-probe` looks at every tenant's job that has not ended, on the
+database's clock: past its deadline it ends `deadline_exceeded`; a lost
+row `failed`/`node_lost`, never run again; a row that is gone
+`failed`/`no_exit_status`; a row stopped or failed after the job
+started, the same, since a tenant's job never runs twice; a running pod
+is read by `GetPod`, and a main container that runs marks the job
+`running`, one that exited ends it (0 `succeeded`, another code
+`failed`/`exit`, none `failed`/`no_exit_status`) after its result file
+was read through the guest's `Read` tool (the exited container's root
+filesystem stays while the pod does). Any other row is brought up by the
+Ensure pool, and an Ensure that the registry refuses ends the job
+`failed`/`image`. An end reads the log's tail from a pod that runs
+(before it drops the job's secrets, which redact it), writes the job
+once (`finished_at IS NULL`) and deletes the pod; `env-probe` deletes
+the pods whose job ended or went (`LeftTenantJobPods`) as well, and
+`env-delete` sweeps the jobs that ended 7 days ago. A create, a cancel
+and a delete run on the instance that takes the request: a cancel ends
+the job `cancelled` with its tail and deletes its pod, a delete cancels
+a job that has not ended and removes its record. A tenant's job is never
+paused, suspended or hibernated for want of calls; a drain moves it as
+any row, and its deadline counts on.
 
 | Method and path | Answers |
 |---|---|
-| `POST /api/v1/runs` `{image, command?, env?, secrets?, imageCredentials?, vcpus?, memoryMib?, deadline?, resultPath?, labels?}` | 201 the run; with an `Idempotency-Key` a create made with the same body 200 with that run, another body 422 `run_key_conflict`; 422 for an image that does not resolve; 400 for what the body gets wrong (an env or secret name that is no variable's, one in both, a size out of range, a deadline above 2h, a `resultPath` that is not absolute and clean or lies under `/dev`); 503 "secrets need --secret-key-file" for secrets or image credentials without it; 409 while the tenant is being deleted |
-| `GET /api/v1/runs?label=k=v` | `{runs}`, newest first, the labels ANDed |
-| `GET /api/v1/runs/{id}` | `{id, image, imageRef, phase, reason, detail, exitCode, result, resultPath, vcpus, memoryMib, labels, createdAt, startedAt, finishedAt, deadlineAt}` |
-| `GET /api/v1/runs/{id}/logs?lines=200` | `{lines}`: from the pod while it runs, redacted of the run's secrets; none while it is queued; the kept tail once it has ended |
-| `POST /api/v1/runs/{id}/cancel` | the run, `cancelled` unless it had ended |
-| `DELETE /api/v1/runs/{id}` | 204 |
+| `POST /api/v1/jobs` `{image, command?, env?, secrets?, imageCredentials?, vcpus?, memoryMib?, deadline?, resultPath?, labels?}` | 201 the job; with an `Idempotency-Key` a create made with the same body 200 with that job, another body 422 `job_key_conflict`; 422 for an image that does not resolve; 400 for what the body gets wrong (an env or secret name that is no variable's, one in both, a size out of range, a deadline above 2h, a `resultPath` that is not absolute and clean or lies under `/dev`); 503 "secrets need --secret-key-file" for secrets or image credentials without it; 409 while the tenant is being deleted |
+| `GET /api/v1/jobs?label=k=v` | `{jobs}`, newest first, the labels ANDed |
+| `GET /api/v1/jobs/{id}` | `{id, image, imageRef, phase, reason, detail, exitCode, result, resultPath, vcpus, memoryMib, labels, createdAt, startedAt, finishedAt, deadlineAt}` |
+| `GET /api/v1/jobs/{id}/logs?lines=200` | `{lines}`: from the pod while it runs, redacted of the job's secrets; none while it is queued; the kept tail once it has ended |
+| `POST /api/v1/jobs/{id}/cancel` | the job, `cancelled` unless it had ended |
+| `DELETE /api/v1/jobs/{id}` | 204 |
 
-A run the tenant does not have is 404 "no such run". Not built (ADR
+A job the tenant does not have is 404 "no such job". Not built (ADR
 0018's later steps): `follow` on the log, exits as events, a cancel by
 `SIGTERM`, MCP tools and the UI.
 

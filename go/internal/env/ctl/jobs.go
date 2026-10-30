@@ -296,9 +296,10 @@ func (c *Controller) finishJob(ctx context.Context, v *view, r store.EnvInstance
 // noExitStatus is the detail of an exit without a code.
 const noExitStatus = "the node did not report an exit status"
 
-// outcome is a run's end (a job's or a tenant's) from its exit code and
-// the detail of an end that is no exit ("" for an exit): succeeded for a
-// 0 without a detail; an exit without a code gets noExitStatus.
+// outcome is the end of an environment job's run or of a tenant's job,
+// from its exit code and the detail of an end that is no exit ("" for an
+// exit): succeeded for a 0 without a detail; an exit without a code gets
+// noExitStatus.
 func outcome(code *int, detail string) (succeeded bool, why string) {
 	if code == nil && detail == "" {
 		return false, noExitStatus

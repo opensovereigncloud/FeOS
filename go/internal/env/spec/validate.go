@@ -161,7 +161,7 @@ var (
 )
 
 // ValidEnvName reports whether name is an environment variable's name, as
-// a spec's env takes them (a tenant's run's env and secrets too).
+// a spec's env takes them (a tenant's job's env and secrets too).
 func ValidEnvName(name string) bool { return envVarName.MatchString(name) }
 
 // SystemSecretPrefix begins the names of the addons' credentials, which

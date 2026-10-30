@@ -24,12 +24,12 @@ import (
 	"github.com/gardenlinux/feos/go/internal/store"
 )
 
-// CodeRunKeyConflict is a create whose Idempotency-Key names a run made
+// CodeJobKeyConflict is a create whose Idempotency-Key names a job made
 // with another request (422).
-const CodeRunKeyConflict = "run_key_conflict"
+const CodeJobKeyConflict = "job_key_conflict"
 
-// CreateRunRequest is POST /api/v1/runs (ADR 0018, "A tenant's run").
-type CreateRunRequest struct {
+// CreateTenantJobRequest is POST /api/v1/jobs (ADR 0018, "A tenant's job").
+type CreateTenantJobRequest struct {
 	// Image is pinned to its digest at the create, asked with
 	// ImageCredentials.
 	Image string `json:"image"`
@@ -50,13 +50,13 @@ type CreateRunRequest struct {
 	// most 2h.
 	Deadline string `json:"deadline,omitempty"`
 	// ResultPath is a file of the container that is read once its
-	// process exited, its first 4 KiB the run's result; "": none.
+	// process exited, its first 4 KiB the job's result; "": none.
 	ResultPath string            `json:"resultPath,omitempty"`
 	Labels     map[string]string `json:"labels,omitempty"`
 }
 
-// RunStatus is a run as the answers show it.
-type RunStatus struct {
+// TenantJobStatus is a job as the answers show it.
+type TenantJobStatus struct {
 	ID string `json:"id"`
 	// Image is as asked, ImageRef pinned.
 	Image    string `json:"image"`
@@ -79,51 +79,51 @@ type RunStatus struct {
 	DeadlineAt string            `json:"deadlineAt"`
 }
 
-// RunList is GET /api/v1/runs.
-type RunList struct {
-	Runs []RunStatus `json:"runs"`
+// TenantJobList is GET /api/v1/jobs.
+type TenantJobList struct {
+	TenantJobs []TenantJobStatus `json:"jobs"`
 }
 
-// RunLogs is GET /api/v1/runs/{id}/logs.
-type RunLogs struct {
+// TenantJobLogsAnswer is GET /api/v1/jobs/{id}/logs.
+type TenantJobLogsAnswer struct {
 	Lines []string `json:"lines"`
 }
 
-func runStatus(r store.Run) RunStatus {
-	return RunStatus{ID: r.ID.String(), Image: r.Image, ImageRef: r.ImageRef, Phase: r.Phase, Reason: r.Reason,
+func tenantJobStatus(r store.TenantJob) TenantJobStatus {
+	return TenantJobStatus{ID: r.ID.String(), Image: r.Image, ImageRef: r.ImageRef, Phase: r.Phase, Reason: r.Reason,
 		Detail: r.Detail, ExitCode: r.ExitCode, Result: r.Result, ResultPath: r.ResultPath, Vcpus: r.VCPUs,
 		MemoryMib: r.MemoryMiB, Labels: r.Labels, CreatedAt: rfc3339(r.CreatedAt), StartedAt: rfc3339(r.StartedAt),
 		FinishedAt: rfc3339(r.FinishedAt), DeadlineAt: rfc3339(r.DeadlineAt)}
 }
 
-// CreateRun is POST /api/v1/runs: a run of the tenant, created (true) or,
-// for a key a create with the same request made, the run that create
-// made (false). A key that names a run of another request is 422
-// run_key_conflict; the secrets and image credentials need
+// CreateTenantJob is POST /api/v1/jobs: a job of the tenant, created (true) or,
+// for a key a create with the same request made, the job that create
+// made (false). A key that names a job of another request is 422
+// job_key_conflict; the secrets and image credentials need
 // --secret-key-file (503).
-func (s *Service) CreateRun(ctx context.Context, tenant, key string, req CreateRunRequest) (RunStatus, bool, error) {
-	rs, err := runSpec(req)
+func (s *Service) CreateTenantJob(ctx context.Context, tenant, key string, req CreateTenantJobRequest) (TenantJobStatus, bool, error) {
+	rs, err := tenantJobSpec(req)
 	if err != nil {
-		return RunStatus{}, false, err
+		return TenantJobStatus{}, false, err
 	}
 	rs.Key, rs.Hash = key, requestHash(req)
-	r, created, err := s.ctl.CreateRun(ctx, tenant, rs)
+	r, created, err := s.ctl.CreateTenantJob(ctx, tenant, rs)
 	if err != nil {
-		return RunStatus{}, false, runError(err)
+		return TenantJobStatus{}, false, tenantJobError(err)
 	}
-	return runStatus(r), created, nil
+	return tenantJobStatus(r), created, nil
 }
 
 // requestHash is a create's hash for its key: the request without the
 // values of its secrets and image credentials, which a caller mints anew
 // when it sends a create again.
-func requestHash(req CreateRunRequest) string {
+func requestHash(req CreateTenantJobRequest) string {
 	names := slices.Sorted(maps.Keys(req.Secrets))
 	req.Secrets = nil
 	hasCreds := req.ImageCredentials != nil
 	req.ImageCredentials = nil
 	b, _ := json.Marshal(struct {
-		CreateRunRequest
+		CreateTenantJobRequest
 		SecretNames []string `json:"secretNames"`
 		Credentials bool     `json:"credentials"`
 	}{req, names, hasCreds})
@@ -131,10 +131,10 @@ func requestHash(req CreateRunRequest) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// runSpec validates a create (400 for what it gets wrong) and fills in
+// tenantJobSpec validates a create (400 for what it gets wrong) and fills in
 // the defaults.
-func runSpec(req CreateRunRequest) (ctl.RunSpec, error) {
-	rs := ctl.RunSpec{Image: strings.TrimSpace(req.Image), Command: req.Command, Env: req.Env, Secrets: req.Secrets,
+func tenantJobSpec(req CreateTenantJobRequest) (ctl.TenantJobSpec, error) {
+	rs := ctl.TenantJobSpec{Image: strings.TrimSpace(req.Image), Command: req.Command, Env: req.Env, Secrets: req.Secrets,
 		ImageCredentials: req.ImageCredentials, ResultPath: req.ResultPath, Labels: req.Labels}
 	if rs.Image == "" {
 		return rs, errBadRequest("image is required")
@@ -192,16 +192,16 @@ func runSpec(req CreateRunRequest) (ctl.RunSpec, error) {
 	return rs, nil
 }
 
-// runError maps the controller's errors of the runs.
-func runError(err error) error {
+// tenantJobError maps the controller's errors of the jobs.
+func tenantJobError(err error) error {
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, ctl.ErrNoObject), errors.Is(err, store.ErrNoRow):
-		return errNoRun()
-	case errors.Is(err, ctl.ErrRunKeyConflict):
-		return apierr.WithCode(http.StatusUnprocessableEntity, CodeRunKeyConflict, "%s", err.Error())
-	case errors.Is(err, ctl.ErrRunImage):
+		return errNoTenantJob()
+	case errors.Is(err, ctl.ErrJobKeyConflict):
+		return apierr.WithCode(http.StatusUnprocessableEntity, CodeJobKeyConflict, "%s", err.Error())
+	case errors.Is(err, ctl.ErrJobImage):
 		return apierr.New(http.StatusUnprocessableEntity, "%s", err.Error())
 	case errors.Is(err, ctl.ErrNoContainerLogs):
 		return apierr.New(http.StatusNotImplemented, "%s", err.Error())
@@ -213,85 +213,85 @@ func runError(err error) error {
 	return err
 }
 
-func errNoRun() error { return apierr.New(http.StatusNotFound, "no such run") }
+func errNoTenantJob() error { return apierr.New(http.StatusNotFound, "no such job") }
 
-// runID parses a run's ID; one that is none is no run (404).
-func runID(s string) (podid.ID, error) {
+// tenantJobID parses a job's ID; one that is none is no job (404).
+func tenantJobID(s string) (podid.ID, error) {
 	id, err := podid.Parse(s)
 	if err != nil || len(id) != podid.Len {
-		return "", errNoRun()
+		return "", errNoTenantJob()
 	}
 	return id, nil
 }
 
-// GetRun is GET /api/v1/runs/{id}.
-func (s *Service) GetRun(ctx context.Context, tenant, id string) (RunStatus, error) {
-	rid, err := runID(id)
+// GetTenantJob is GET /api/v1/jobs/{id}.
+func (s *Service) GetTenantJob(ctx context.Context, tenant, id string) (TenantJobStatus, error) {
+	rid, err := tenantJobID(id)
 	if err != nil {
-		return RunStatus{}, err
+		return TenantJobStatus{}, err
 	}
-	r, err := s.st.GetRun(ctx, tenant, rid)
+	r, err := s.st.GetTenantJob(ctx, tenant, rid)
 	if err != nil {
-		return RunStatus{}, runError(err)
+		return TenantJobStatus{}, tenantJobError(err)
 	}
-	return runStatus(r), nil
+	return tenantJobStatus(r), nil
 }
 
-// ListRuns is GET /api/v1/runs?label=k=v…: the tenant's kept runs that
+// ListTenantJobs is GET /api/v1/jobs?label=k=v…: the tenant's kept jobs that
 // carry every label, newest first.
-func (s *Service) ListRuns(ctx context.Context, tenant string, labels map[string]string) (RunList, error) {
-	rows, err := s.st.ListRuns(ctx, tenant, labels)
+func (s *Service) ListTenantJobs(ctx context.Context, tenant string, labels map[string]string) (TenantJobList, error) {
+	rows, err := s.st.ListTenantJobs(ctx, tenant, labels)
 	if err != nil {
-		return RunList{}, err
+		return TenantJobList{}, err
 	}
-	out := RunList{Runs: make([]RunStatus, 0, len(rows))}
+	out := TenantJobList{TenantJobs: make([]TenantJobStatus, 0, len(rows))}
 	for _, r := range rows {
-		out.Runs = append(out.Runs, runStatus(r))
+		out.TenantJobs = append(out.TenantJobs, tenantJobStatus(r))
 	}
 	return out, nil
 }
 
-// RunLogs is GET /api/v1/runs/{id}/logs?lines=N (100 when not above 0, at
-// most 10000): from the run's pod while it runs, its kept tail once it
+// TenantJobLogs is GET /api/v1/jobs/{id}/logs?lines=N (200 when not above 0, at
+// most 10000): from the job's pod while it runs, its kept tail once it
 // has ended.
-func (s *Service) RunLogs(ctx context.Context, tenant, id string, lines int) (RunLogs, error) {
-	rid, err := runID(id)
+func (s *Service) TenantJobLogs(ctx context.Context, tenant, id string, lines int) (TenantJobLogsAnswer, error) {
+	rid, err := tenantJobID(id)
 	if err != nil {
-		return RunLogs{}, err
+		return TenantJobLogsAnswer{}, err
 	}
 	if lines <= 0 {
 		lines = defaultLogLines
 	}
-	out, err := s.ctl.RunLog(ctx, tenant, rid, min(lines, maxLogLines))
+	out, err := s.ctl.TenantJobLog(ctx, tenant, rid, min(lines, maxLogLines))
 	if err != nil {
-		return RunLogs{}, runError(err)
+		return TenantJobLogsAnswer{}, tenantJobError(err)
 	}
 	if out == nil {
 		out = []string{}
 	}
-	return RunLogs{Lines: out}, nil
+	return TenantJobLogsAnswer{Lines: out}, nil
 }
 
-// CancelRun is POST /api/v1/runs/{id}/cancel: the run as it is after the
-// cancel, which changes nothing of a run that has ended.
-func (s *Service) CancelRun(ctx context.Context, tenant, id string) (RunStatus, error) {
-	rid, err := runID(id)
+// CancelTenantJob is POST /api/v1/jobs/{id}/cancel: the job as it is after the
+// cancel, which changes nothing of a job that has ended.
+func (s *Service) CancelTenantJob(ctx context.Context, tenant, id string) (TenantJobStatus, error) {
+	rid, err := tenantJobID(id)
 	if err != nil {
-		return RunStatus{}, err
+		return TenantJobStatus{}, err
 	}
-	r, err := s.ctl.CancelRun(ctx, tenant, rid)
+	r, err := s.ctl.CancelTenantJob(ctx, tenant, rid)
 	if err != nil {
-		return RunStatus{}, runError(err)
+		return TenantJobStatus{}, tenantJobError(err)
 	}
-	return runStatus(r), nil
+	return tenantJobStatus(r), nil
 }
 
-// DeleteRun is DELETE /api/v1/runs/{id}: a run that has not ended is
+// DeleteTenantJob is DELETE /api/v1/jobs/{id}: a job that has not ended is
 // cancelled first; its record goes.
-func (s *Service) DeleteRun(ctx context.Context, tenant, id string) error {
-	rid, err := runID(id)
+func (s *Service) DeleteTenantJob(ctx context.Context, tenant, id string) error {
+	rid, err := tenantJobID(id)
 	if err != nil {
 		return err
 	}
-	return runError(s.ctl.DeleteRun(ctx, tenant, rid))
+	return tenantJobError(s.ctl.DeleteTenantJob(ctx, tenant, rid))
 }

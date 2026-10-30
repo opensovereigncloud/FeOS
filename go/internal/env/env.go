@@ -164,8 +164,8 @@ func (s *Service) ResolveSecret(ctx context.Context, envID uuid.UUID, name strin
 }
 
 // RowSecret is the engine's secret resolver (sandbox.SecretResolver): an
-// environment's secret for its instance rows (ResolveSecret), a run's for
-// a tenant's run's pod.
+// environment's secret for its instance rows (ResolveSecret), a job's for
+// a tenant's job's pod.
 func (s *Service) RowSecret(ctx context.Context, row store.Sandbox, name string, version int) (string, error) {
 	return s.ctl.RowSecret(ctx, row, name, version)
 }

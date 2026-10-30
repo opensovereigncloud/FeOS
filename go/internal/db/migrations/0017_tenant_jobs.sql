@@ -1,23 +1,22 @@
 -- SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 -- SPDX-License-Identifier: Apache-2.0
 
--- A tenant's runs (ADR 0018, "A tenant's run"): one execution of an image
--- to its end, its input in the call. A run's pod is a row of sandboxes
--- under the run's ID with tenant_run set, which every query that tells a
--- tenant's sandbox from an instance counts as an instance; the row goes
--- when the run ends, the run's row stays until the sweep (7 days after
--- its end) or a DELETE. sealed holds the run's secrets and its image
--- credentials under --secret-key-file's key with the AAD "runs|<id>",
--- NULL once the run has ended or when it has none. The database holds no
+-- A tenant's jobs (ADR 0018, "A tenant's job"): a container run to its
+-- end, its input in the call, run exactly once; the job carries its one
+-- run's status, exit code, result and log. A job's pod is a row of
+-- sandboxes under the job's ID with tenant_job set, which every query that
+-- tells a tenant's sandbox from an instance counts as an instance; the row
+-- goes when the job ends, the job's row stays until the sweep (7 days
+-- after its end) or a DELETE. sealed holds the job's secrets and its image
+-- credentials under --secret-key-file's key with the AAD "jobs|<id>", NULL
+-- once the job has ended or when it has none. The database holds no
 -- secret value: the pod's template names them, and the engine unseals
 -- them when it builds the pod's spec.
 --
--- (sandboxes.run_id is the activity's run span, 0001: hence tenant_run.)
---
 -- Additive: an instance of the previous version never reads the table,
--- and inserts sandboxes with tenant_run false.
+-- and inserts sandboxes with tenant_job false.
 
-CREATE TABLE runs (
+CREATE TABLE jobs (
   id text COLLATE "C" PRIMARY KEY CHECK (id ~ '^[a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}$'),   -- its pod's sandbox ID
   owner text NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   idempotency_key text,                        -- the create's Idempotency-Key; NULL: none
@@ -39,9 +38,9 @@ CREATE TABLE runs (
   deadline_at timestamptz NOT NULL,
   CHECK ((finished_at IS NULL) = (phase IN ('queued','running'))),
   UNIQUE (owner, idempotency_key));
-CREATE INDEX runs_owner ON runs(owner, created_at);
-CREATE INDEX runs_open ON runs(created_at) WHERE finished_at IS NULL;
-CREATE INDEX runs_finished ON runs(finished_at) WHERE finished_at IS NOT NULL;
+CREATE INDEX jobs_owner ON jobs(owner, created_at);
+CREATE INDEX jobs_open ON jobs(created_at) WHERE finished_at IS NULL;
+CREATE INDEX jobs_finished ON jobs(finished_at) WHERE finished_at IS NOT NULL;
 
-ALTER TABLE sandboxes ADD COLUMN tenant_run boolean NOT NULL DEFAULT false;   -- a run's pod; fixed
-CREATE INDEX sandboxes_tenant_run ON sandboxes(id) WHERE tenant_run;
+ALTER TABLE sandboxes ADD COLUMN tenant_job boolean NOT NULL DEFAULT false;   -- a tenant's job's pod; fixed
+CREATE INDEX sandboxes_tenant_job ON sandboxes(id) WHERE tenant_job;

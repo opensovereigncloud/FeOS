@@ -476,6 +476,39 @@ TABLE issued_certs
   CONSTRAINT PRIMARY KEY (serial)
   CREATE INDEX issued_certs_pod ON public.issued_certs USING btree (pod_id, issued_at)
   CREATE UNIQUE INDEX issued_certs_pkey ON public.issued_certs USING btree (serial)
+TABLE jobs
+  COLUMN id text COLLATE "C" NOT NULL
+  COLUMN owner text NOT NULL
+  COLUMN idempotency_key text
+  COLUMN request_hash text NOT NULL
+  COLUMN image text NOT NULL
+  COLUMN image_ref text NOT NULL
+  COLUMN vcpus integer NOT NULL
+  COLUMN memory_mib integer NOT NULL
+  COLUMN result_path text NOT NULL DEFAULT ''::text
+  COLUMN labels jsonb NOT NULL DEFAULT '{}'::jsonb
+  COLUMN sealed bytea
+  COLUMN phase text NOT NULL DEFAULT 'queued'::text
+  COLUMN reason text NOT NULL DEFAULT ''::text
+  COLUMN detail text NOT NULL DEFAULT ''::text
+  COLUMN exit_code integer
+  COLUMN result text NOT NULL DEFAULT ''::text
+  COLUMN log_tail jsonb NOT NULL DEFAULT '[]'::jsonb
+  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
+  COLUMN started_at timestamp with time zone
+  COLUMN finished_at timestamp with time zone
+  COLUMN deadline_at timestamp with time zone NOT NULL
+  CONSTRAINT CHECK (((finished_at IS NULL) = (phase = ANY (ARRAY['queued'::text, 'running'::text]))))
+  CONSTRAINT CHECK ((id ~ '^[a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}$'::text))
+  CONSTRAINT CHECK ((phase = ANY (ARRAY['queued'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'deadline_exceeded'::text, 'cancelled'::text])))
+  CONSTRAINT FOREIGN KEY (owner) REFERENCES tenants(id) ON DELETE CASCADE
+  CONSTRAINT PRIMARY KEY (id)
+  CONSTRAINT UNIQUE (owner, idempotency_key)
+  CREATE INDEX jobs_finished ON public.jobs USING btree (finished_at) WHERE (finished_at IS NOT NULL)
+  CREATE INDEX jobs_open ON public.jobs USING btree (created_at) WHERE (finished_at IS NULL)
+  CREATE INDEX jobs_owner ON public.jobs USING btree (owner, created_at)
+  CREATE UNIQUE INDEX jobs_owner_idempotency_key_key ON public.jobs USING btree (owner, idempotency_key)
+  CREATE UNIQUE INDEX jobs_pkey ON public.jobs USING btree (id)
 TABLE join_tokens
   COLUMN hash text NOT NULL
   COLUMN id uuid NOT NULL DEFAULT gen_random_uuid()
@@ -640,39 +673,6 @@ TABLE pod_tombstones
   CONSTRAINT PRIMARY KEY (pod_id, node, incarnation)
   CREATE INDEX pod_tombstones_node ON public.pod_tombstones USING btree (node, not_before)
   CREATE UNIQUE INDEX pod_tombstones_pkey ON public.pod_tombstones USING btree (pod_id, node, incarnation)
-TABLE runs
-  COLUMN id text COLLATE "C" NOT NULL
-  COLUMN owner text NOT NULL
-  COLUMN idempotency_key text
-  COLUMN request_hash text NOT NULL
-  COLUMN image text NOT NULL
-  COLUMN image_ref text NOT NULL
-  COLUMN vcpus integer NOT NULL
-  COLUMN memory_mib integer NOT NULL
-  COLUMN result_path text NOT NULL DEFAULT ''::text
-  COLUMN labels jsonb NOT NULL DEFAULT '{}'::jsonb
-  COLUMN sealed bytea
-  COLUMN phase text NOT NULL DEFAULT 'queued'::text
-  COLUMN reason text NOT NULL DEFAULT ''::text
-  COLUMN detail text NOT NULL DEFAULT ''::text
-  COLUMN exit_code integer
-  COLUMN result text NOT NULL DEFAULT ''::text
-  COLUMN log_tail jsonb NOT NULL DEFAULT '[]'::jsonb
-  COLUMN created_at timestamp with time zone NOT NULL DEFAULT now()
-  COLUMN started_at timestamp with time zone
-  COLUMN finished_at timestamp with time zone
-  COLUMN deadline_at timestamp with time zone NOT NULL
-  CONSTRAINT CHECK (((finished_at IS NULL) = (phase = ANY (ARRAY['queued'::text, 'running'::text]))))
-  CONSTRAINT CHECK ((id ~ '^[a-hjkmnp-tv-z][0-9a-hjkmnp-tv-z]{10}$'::text))
-  CONSTRAINT CHECK ((phase = ANY (ARRAY['queued'::text, 'running'::text, 'succeeded'::text, 'failed'::text, 'deadline_exceeded'::text, 'cancelled'::text])))
-  CONSTRAINT FOREIGN KEY (owner) REFERENCES tenants(id) ON DELETE CASCADE
-  CONSTRAINT PRIMARY KEY (id)
-  CONSTRAINT UNIQUE (owner, idempotency_key)
-  CREATE INDEX runs_finished ON public.runs USING btree (finished_at) WHERE (finished_at IS NOT NULL)
-  CREATE INDEX runs_open ON public.runs USING btree (created_at) WHERE (finished_at IS NULL)
-  CREATE INDEX runs_owner ON public.runs USING btree (owner, created_at)
-  CREATE UNIQUE INDEX runs_owner_idempotency_key_key ON public.runs USING btree (owner, idempotency_key)
-  CREATE UNIQUE INDEX runs_pkey ON public.runs USING btree (id)
 TABLE sandbox_holds
   COLUMN sandbox_id text COLLATE "C" NOT NULL
   COLUMN holder text NOT NULL
@@ -744,7 +744,7 @@ TABLE sandboxes
   COLUMN pin_node text NOT NULL DEFAULT ''::text
   COLUMN idle_after_s integer
   COLUMN address text NOT NULL DEFAULT ''::text
-  COLUMN tenant_run boolean NOT NULL DEFAULT false
+  COLUMN tenant_job boolean NOT NULL DEFAULT false
   CONSTRAINT CHECK (((memory_mib >= 256) AND (memory_mib <= 65536)))
   CONSTRAINT CHECK (((op = ''::text) = (op_id IS NULL)))
   CONSTRAINT CHECK (((vcpus >= 1) AND (vcpus <= 32)))
@@ -766,7 +766,7 @@ TABLE sandboxes
   CREATE INDEX sandboxes_owner ON public.sandboxes USING btree (owner, created_at)
   CREATE INDEX sandboxes_paused ON public.sandboxes USING btree (paused_at) WHERE ((client_state = 'paused'::text) AND (op = ''::text))
   CREATE INDEX sandboxes_tap ON public.sandboxes USING btree (node, "left"(id, 8)) WHERE ((node IS NOT NULL) AND (length(id) = 36))
-  CREATE INDEX sandboxes_tenant_run ON public.sandboxes USING btree (id) WHERE tenant_run
+  CREATE INDEX sandboxes_tenant_job ON public.sandboxes USING btree (id) WHERE tenant_job
   CREATE UNIQUE INDEX sandboxes_pkey ON public.sandboxes USING btree (id)
 TABLE schema_migrations
   COLUMN version integer NOT NULL

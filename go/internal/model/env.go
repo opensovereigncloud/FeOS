@@ -44,28 +44,34 @@ const (
 	PhaseRetiring  = "retiring"
 )
 
-// The phases of a run: a job's (env_job_runs.phase) running, succeeded or
-// failed; a tenant's (runs.phase) any of them.
+// The phases of a run of an environment's job (env_job_runs.phase).
 const (
-	RunQueued           = "queued"
-	RunRunning          = "running"
-	RunSucceeded        = "succeeded"
-	RunFailed           = "failed"
-	RunDeadlineExceeded = "deadline_exceeded"
-	RunCancelled        = "cancelled"
+	RunRunning   = "running"
+	RunSucceeded = "succeeded"
+	RunFailed    = "failed"
 )
 
-// The reasons of a tenant's failed run (runs.reason).
+// The phases of a tenant's job (jobs.phase), which are its one run's.
 const (
-	// RunReasonExit: its process exited with a code other than 0.
-	RunReasonExit = "exit"
-	// RunReasonImage: the image's registry refused a create of its pod.
-	RunReasonImage = "image"
-	// RunReasonNodeLost: its pod was lost with its node.
-	RunReasonNodeLost = "node_lost"
-	// RunReasonNoExitStatus: it ended without an exit code (its pod
+	JobQueued           = "queued"
+	JobRunning          = RunRunning
+	JobSucceeded        = RunSucceeded
+	JobFailed           = RunFailed
+	JobDeadlineExceeded = "deadline_exceeded"
+	JobCancelled        = "cancelled"
+)
+
+// The reasons of a tenant's failed job (jobs.reason).
+const (
+	// JobReasonExit: its process exited with a code other than 0.
+	JobReasonExit = "exit"
+	// JobReasonImage: the image's registry refused a create of its pod.
+	JobReasonImage = "image"
+	// JobReasonNodeLost: its pod was lost with its node.
+	JobReasonNodeLost = "node_lost"
+	// JobReasonNoExitStatus: it ended without an exit code (its pod
 	// stopped, failed or went).
-	RunReasonNoExitStatus = "no_exit_status"
+	JobReasonNoExitStatus = "no_exit_status"
 )
 
 // The conditions of an incident (env_incidents.condition).
