@@ -154,14 +154,20 @@ func (s *Service) Controller() *ctl.Controller { return s.ctl }
 // (--secret-key-file): without, the secrets routes answer 503.
 func (s *Service) SecretsEnabled() bool { return s.d.Sealer != nil }
 
-// ResolveSecret is the engine's secret resolver (sandbox.SecretResolver):
-// the value of version version of the secret name of environment envID, a
-// tenant's or a system secret, unsealed with its AAD (envdeps.SecretAAD).
-// A deleted version still resolves (a release pins it until a later one
-// is realised). The controller resolves it, which also generates the
-// addons' credentials.
+// ResolveSecret is the value of version version of the secret name of
+// environment envID, a tenant's or a system secret, unsealed with its AAD
+// (envdeps.SecretAAD). A deleted version still resolves (a release pins
+// it until a later one is realised). The controller resolves it, which
+// also generates the addons' credentials.
 func (s *Service) ResolveSecret(ctx context.Context, envID uuid.UUID, name string, version int) (string, error) {
 	return s.ctl.ResolveSecret(ctx, envID, name, version)
+}
+
+// RowSecret is the engine's secret resolver (sandbox.SecretResolver): an
+// environment's secret for its instance rows (ResolveSecret), a run's for
+// a tenant's run's pod.
+func (s *Service) RowSecret(ctx context.Context, row store.Sandbox, name string, version int) (string, error) {
+	return s.ctl.RowSecret(ctx, row, name, version)
 }
 
 // PrepareHook is the engine's prepare hook (sandbox.PrepareHook): the
@@ -172,7 +178,7 @@ func (s *Service) PrepareHook(ctx context.Context, node string, sb store.Sandbox
 
 // The hooks are the engine's.
 var (
-	_ sandbox.SecretResolver = (*Service)(nil).ResolveSecret
+	_ sandbox.SecretResolver = (*Service)(nil).RowSecret
 	_ sandbox.PrepareHook    = (*Service)(nil).PrepareHook
 )
 

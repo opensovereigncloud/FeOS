@@ -202,7 +202,7 @@ func newHarness(t *testing.T, o options) *harness {
 	if o.timings != nil {
 		o.timings(&h.c.t)
 	}
-	h.eng.SetSecretResolver(h.c.ResolveSecret)
+	h.eng.SetSecretResolver(h.c.RowSecret)
 	h.eng.SetPrepareHook(h.c.PrepareHook)
 	h.el.Register(h.fl.Loops()...)
 	h.el.Register(h.eng.Loops()...)

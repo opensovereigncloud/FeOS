@@ -304,6 +304,29 @@ func (r *Runner) ProcessLogsDetached(ctx context.Context, lease model.Lease, id 
 	return strings.Split(strings.TrimSuffix(stdout, "\n"), "\n"), nil
 }
 
+// ReadDetached reads a file of the main container of the lease's pod as
+// the read tool does (its first 2000 lines), also of a container whose
+// process has exited: its root filesystem stays while the pod does. A
+// file the guest cannot read as text (missing, too large, a picture) is
+// an error with the guest's text.
+func (r *Runner) ReadDetached(ctx context.Context, lease model.Lease, path string) (string, error) {
+	var resp *toolv1.ReadResponse
+	err := r.unaryDetached(ctx, lease, func(ctx context.Context, c toolv1.ToolServiceClient) error {
+		var err error
+		resp, err = c.Read(ctx, &toolv1.ReadRequest{Container: mainContainer, Path: path})
+		return err
+	})
+	switch {
+	case err != nil:
+		return "", err
+	case resp.GetError() != "":
+		return "", errors.New(resp.GetError())
+	case len(resp.GetImage()) > 0:
+		return "", fmt.Errorf("%s is a picture (%s)", path, resp.GetMediaType())
+	}
+	return resp.GetText(), nil
+}
+
 // StopProcessDetached stops a process (TERM to its group, KILL after 2 s);
 // nil when it was not running any more, an error wrapping ErrNoProcess for
 // an id the container does not know.

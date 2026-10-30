@@ -14,14 +14,16 @@
 //	               volume, instance, provisioning), release jobs, image services
 //	               (rolling, surge 1), attached services, removed objects, realised
 //	env-probe      1 s: containers' exits and restarts with backoff, readiness
-//	               (http, tcp, exec), attached services' processes
+//	               (http, tcp, exec), attached services' processes; tenants'
+//	               runs (runs.go): their ends, starts and pods
 //	env-groups     10 s, hint "env-groups": the security groups each connected
 //	               node should have, re-put where they differ; what a node holds
 //	               of the ingress's groups recorded; stale groups deleted
 //	env-names      2 s, hint "env-names": the name tables each connected node
 //	               should have, updated or re-put where they differ
 //	env-volumes    30 s: the volumes marked deleting, deleted on their nodes
-//	env-delete     5 s: environments deleting (and those of deleting tenants)
+//	env-delete     5 s: environments deleting (and those of deleting tenants);
+//	               runs that ended RunRetention ago
 //
 // The controller inserts and deletes instance rows (sandboxes with
 // environment_id) and runs Engine.Ensure for the rows that should run in

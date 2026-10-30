@@ -357,7 +357,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	deps := api.Deps{
 		DB: i.DB, Store: i.Store, Engine: i.Engine, Elector: i.Elector, Conns: i.Links, Fleet: fl,
 		Tools: tools.NewREST(i.Runner), Specs: tools.Specs, MCP: i.mcp, Ports: i.streams.Ports,
-		Watches: i.streams.Watches, Bindings: i.Bindings, Environments: i.Env, Ingress: ing, Domains: i.Domains,
+		Watches: i.streams.Watches, Bindings: i.Bindings, Environments: i.Env, Ingress: ing, Domains: i.Domains, Runs: i.Env,
 		Ready: i.ready, Sealer: sealerOf(sealer),
 	}
 	if ui.Built() {
@@ -430,7 +430,7 @@ func (i *Instance) newEnvironments(key []byte) (*env.Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	i.Engine.SetSecretResolver(s.ResolveSecret)
+	i.Engine.SetSecretResolver(s.RowSecret)
 	i.Engine.SetPrepareHook(s.PrepareHook)
 	return s, nil
 }

@@ -104,9 +104,18 @@ func ensureKey(id podid.ID) string { return "ensure/" + id.String() }
 // (create, start, resume, restore). Its failure is logged; the next pass
 // sees the row as it is.
 func (c *Controller) ensure(ctx context.Context, id podid.ID) {
+	c.ensureThen(ctx, id, nil)
+}
+
+// ensureThen is ensure, with failed called with the error of an Ensure
+// that failed (nil: none is).
+func (c *Controller) ensureThen(ctx context.Context, id podid.ID, failed func(ctx context.Context, err error)) {
 	c.pool.run(ctx, ensureKey(id), func(ctx context.Context) {
 		if _, err := c.d.Engine.Ensure(ctx, id); err != nil && ctx.Err() == nil {
 			c.log.Debug("an instance did not come up", "sandbox", id, "err", err)
+			if failed != nil {
+				failed(ctx, err)
+			}
 		}
 	})
 }

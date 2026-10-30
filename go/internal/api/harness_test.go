@@ -80,6 +80,8 @@ type env struct {
 	conns *fakeConns
 	// envs is the fake environments service, when no other is given.
 	envs *fakeEnvs
+	// runs is the fake runs service.
+	runs *fakeRuns
 	// tenantToken is a token of testTenant.
 	tenantToken string
 }
@@ -138,6 +140,8 @@ func newEnv(t *testing.T, o envOptions) *env {
 	} else {
 		deps.Domains = fakeDomains{}
 	}
+	e.runs = &fakeRuns{}
+	deps.Runs = e.runs
 	e.srv = newServer(cfg, deps)
 	e.h = e.srv.mux
 	if _, _, err := st.CreateTenant(context.Background(), testTenant); err != nil {

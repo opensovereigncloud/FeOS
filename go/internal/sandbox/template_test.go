@@ -45,7 +45,8 @@ func (s *secrets) set(env uuid.UUID, name string, version int, value string) {
 	s.values[secretKeyOf(env, name, version)] = value
 }
 
-func (s *secrets) resolve(_ context.Context, env uuid.UUID, name string, version int) (string, error) {
+func (s *secrets) resolve(_ context.Context, row store.Sandbox, name string, version int) (string, error) {
+	env := row.EnvironmentID
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++

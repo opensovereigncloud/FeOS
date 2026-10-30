@@ -10,8 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
-
 	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/podid"
@@ -25,9 +23,11 @@ import (
 // pod needs before the pod call (its security groups, its volume).
 
 // SecretResolver returns the value of version version of the secret name
-// of the environment envID, for a pod template's env (model.TemplateValue
-// and its parts). An error fails the op before any pod call.
-type SecretResolver func(ctx context.Context, envID uuid.UUID, name string, version int) (string, error)
+// of the row's environment, or of its run when the row is a tenant's
+// run's pod (ADR 0018), for a pod template's env (model.TemplateValue and
+// its parts) and image credentials. An error fails the op before any pod
+// call.
+type SecretResolver func(ctx context.Context, row store.Sandbox, name string, version int) (string, error)
 
 // PrepareHook prepares node for the op of kind on the row sb, which has a
 // pod template: called in execute once the op has its connection to node

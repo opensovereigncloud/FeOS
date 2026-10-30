@@ -611,8 +611,13 @@ func lostNode(sb store.Sandbox) string {
 // lost grace finds out without waking it, so that the next pass acts on
 // what it is). It reports whether the row is lost (the caller replaces
 // it, or keeps an addon's).
-func (c *Controller) heal(ctx context.Context, r store.EnvInstanceRow, idles bool) (lost bool) {
-	sb := r.Sandbox
+func (c *Controller) heal(ctx context.Context, sb store.Sandbox, idles bool) (lost bool) {
+	return c.healThen(ctx, sb, idles, nil)
+}
+
+// healThen is heal, with failed called with the error of an Ensure it
+// queued that failed (ensureThen).
+func (c *Controller) healThen(ctx context.Context, sb store.Sandbox, idles bool, failed func(context.Context, error)) bool {
 	if sb.Op != "" {
 		return false
 	}
@@ -620,10 +625,10 @@ func (c *Controller) heal(ctx context.Context, r store.EnvInstanceRow, idles boo
 	case model.StateLost:
 		return true
 	case model.StateStopped, model.StateFailed, model.StatePending:
-		c.ensure(ctx, sb.ID)
+		c.ensureThen(ctx, sb.ID, failed)
 	case model.StateUnknown, model.StatePaused, model.StateHibernated:
 		if !idles {
-			c.ensure(ctx, sb.ID)
+			c.ensureThen(ctx, sb.ID, failed)
 		}
 	}
 	return false

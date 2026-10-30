@@ -311,7 +311,7 @@ not of an environment.
 
 ### A tenant's run: a job's run without an environment
 
-Proposed 2026-10-30; not built.
+Proposed 2026-10-30; its first step built.
 
 - A **run** is one execution of an image to its end: one pod, ADR
   0004's job with the restart policy `Never`, and a record that keeps
@@ -341,8 +341,8 @@ Proposed 2026-10-30; not built.
     as environment variables as well: sealed in the run's row under the
     key of `--secret-key-file`, never returned, redacted from the stored
     tail, and dropped from the row when the run ends;
-  - `imageCredentials` (ADR 0025), sealed beside the pod's row as a
-    sandbox's are, gone with it;
+  - `imageCredentials` (ADR 0025), sealed with the secrets in the
+    run's row and dropped with them;
   - `vcpus` and `memoryMib`, as a sandbox's;
   - `deadline`, counted from the create on the database's clock, the
     queue included, 10 minutes when unset, at most 2 hours, as a job's
@@ -354,7 +354,9 @@ Proposed 2026-10-30; not built.
   - an `Idempotency-Key` header, unique per tenant, as a tool call's
     (ADR 0023): a repeat with the same body answers with the run it
     made, another body is refused (422), so that a caller that lost the
-    answer never starts a second build that pushes.
+    answer never starts a second build that pushes. The values of the
+    secrets and image credentials are not part of the body's hash: a
+    caller mints its tokens anew when it sends a create again.
 - **The status**, `GET /api/v1/runs/{id}` and `GET /api/v1/runs`: the
   phase, `queued` (the pod is not running yet: capacity, ADR 0025's
   question without an answer, the pull), `running`, `succeeded` (exit
@@ -399,13 +401,14 @@ Proposed 2026-10-30; not built.
   1. The table `runs` (migration 0017): the ID, which is its pod's
      (ADR 0019), owner, idempotency key and body hash, the spec without
      secrets, the sealed secrets, labels, phase, reason, exit code,
-     result, log tail and the times; `sandboxes.run_id` marking a run's
-     row, which every query that tells a tenant's sandbox from an
-     instance counts as an instance. The engine resolves a run's secrets
-     from its row and asks with its sealed image credentials. The
-     controller's job-run step ends runs without an environment as it
-     ends job runs. The routes above without `follow`, and the sweep. No
-     change to `feosd` or the guest.
+     result, log tail and the times; `sandboxes.tenant_run` marking a
+     run's row (`run_id` is the activity's run span), which every query
+     that tells a tenant's sandbox from an instance counts as an
+     instance. The engine's secret resolver takes the row and resolves
+     a run's secrets and image credentials from the run's row. The
+     controller's `env-probe` ends runs without an environment with the
+     job runs' code, `env-delete` sweeps them. The routes above without
+     `follow`. No change to `feosd` or the guest. Built.
   2. `follow` on the log, through the guest's `StreamContainerLogs`.
   3. With ADR 0022's pod: exits as events instead of the poll, a cancel
      as `SIGTERM` and the grace period, the pod ending on its own, the
@@ -597,7 +600,7 @@ The decision was taken as proposed above; building it changed these:
   through the API, validated per operation, and exports the file.
   FeCode's side, a definition per project, environments per class,
   promotion, what its agent may apply, is FeCode's ADR 0008.
-- **Runs** add a table, a column of `sandboxes`, five routes and a step
+- **Runs** add a table, a column of `sandboxes`, six routes and a step
   of the controller; `feosd` and the guest are unchanged until ADR
   0022's pod. A run's secrets reach `feosd`'s record of its pod as an
   environment's do (the known exposure), for as long as the pod lives.

@@ -61,6 +61,19 @@ func mainContainer(info *podv1.PodInfo) *podv1.ContainerStatus {
 	return nil
 }
 
+// exitOf reports whether the main container's process has exited, and
+// its exit code when the node reported one (nil: none).
+func exitOf(mc *podv1.ContainerStatus) (exited bool, code *int) {
+	if mc == nil || mc.GetState() != podv1.ContainerState_CONTAINER_STATE_EXITED {
+		return false, nil
+	}
+	if mc.ExitCode != nil {
+		n := int(mc.GetExitCode())
+		code = &n
+	}
+	return true, code
+}
+
 // containerLog reads the last lines lines of the main container's log of
 // the lease's pod (tail_lines, no follow), within the budget b: each line
 // cut to b.line, the oldest dropped beyond b.total. A node that does not
@@ -187,13 +200,21 @@ const logTailLines = 50
 // redacted before the cut, so that no part of a value the cut splits is
 // kept; nil when the log cannot be read or is empty.
 func (c *Controller) storedTail(ctx context.Context, v *view, sb store.Sandbox) []string {
-	tail, err := c.containerLog(ctx, lease(sb), logTailLines, answerLog)
+	return c.keptTail(ctx, sb, logTailLines, func() []string { return c.envSecretValues(ctx, v, sb.PodTemplate) })
+}
+
+// keptTail is the last lines lines of the row's main container's log,
+// read with the answer's line budget, redacted of the values secrets
+// returns (asked only when there are lines) and then cut to storedLog;
+// nil when the log cannot be read or is empty.
+func (c *Controller) keptTail(ctx context.Context, sb store.Sandbox, lines int, secrets func() []string) []string {
+	tail, err := c.containerLog(ctx, lease(sb), lines, answerLog)
 	if err != nil || len(tail) == 0 {
 		return tail
 	}
-	secrets := c.envSecretValues(ctx, v, sb.PodTemplate)
+	values := secrets()
 	for i := range tail {
-		tail[i] = redact(tail[i], secrets)
+		tail[i] = redact(tail[i], values)
 	}
 	return storedLog.keep(tail)
 }

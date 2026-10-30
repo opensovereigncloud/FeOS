@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/google/uuid"
-
 	podv1 "github.com/gardenlinux/feos/go/gen/feos/pod/v1"
 	"github.com/gardenlinux/feos/go/internal/model"
 	"github.com/gardenlinux/feos/go/internal/store"
@@ -57,7 +55,7 @@ func buildPodSpec(ctx context.Context, sb store.Sandbox, resolve SecretResolver)
 		main.Command = append([]string(nil), t.Command...)
 	}
 	if len(t.Env) > 0 {
-		env, err := resolveEnv(ctx, sb.EnvironmentID, t.Env, resolve)
+		env, err := resolveEnv(ctx, sb, t.Env, resolve)
 		if err != nil {
 			return nil, err
 		}
@@ -94,8 +92,8 @@ type secretKey struct {
 
 // resolveEnv renders a template's environment, each secret version
 // unsealed once.
-func resolveEnv(ctx context.Context, envID uuid.UUID, env map[string]model.TemplateValue, resolve SecretResolver) (map[string]string, error) {
-	r := &envResolver{ctx: ctx, envID: envID, resolve: resolve, seen: map[secretKey]string{}}
+func resolveEnv(ctx context.Context, row store.Sandbox, env map[string]model.TemplateValue, resolve SecretResolver) (map[string]string, error) {
+	r := &envResolver{ctx: ctx, row: row, resolve: resolve, seen: map[secretKey]string{}}
 	out := make(map[string]string, len(env))
 	for name, v := range env {
 		s, err := r.value(v)
@@ -110,7 +108,7 @@ func resolveEnv(ctx context.Context, envID uuid.UUID, env map[string]model.Templ
 // envResolver renders the values of one template.
 type envResolver struct {
 	ctx     context.Context
-	envID   uuid.UUID
+	row     store.Sandbox
 	resolve SecretResolver
 	seen    map[secretKey]string
 }
@@ -156,12 +154,12 @@ func (r *envResolver) secret(name string, version int, escape string) (string, e
 		if r.resolve == nil {
 			return "", fmt.Errorf("secret %s version %d: %w", name, version, errNoResolver)
 		}
-		if r.envID == uuid.Nil {
-			return "", fmt.Errorf("secret %s version %d: the sandbox is no environment's", name, version)
+		if !r.row.IsInstance() {
+			return "", fmt.Errorf("secret %s version %d: the sandbox is no environment's or run's", name, version)
 		}
 		var err error
-		if s, err = r.resolve(r.ctx, r.envID, name, version); err != nil {
-			return "", fmt.Errorf("secret %s version %d of environment %s: %w", name, version, r.envID, err)
+		if s, err = r.resolve(r.ctx, r.row, name, version); err != nil {
+			return "", fmt.Errorf("secret %s version %d of %s: %w", name, version, secretOwner(r.row), err)
 		}
 		r.seen[k] = s
 	}
@@ -172,6 +170,14 @@ func (r *envResolver) secret(name string, version int, escape string) (string, e
 		return escapeUserinfo(s), nil
 	}
 	return "", fmt.Errorf("secret %s: unknown escape %q", name, escape)
+}
+
+// secretOwner names what a row's secrets belong to in an error.
+func secretOwner(row store.Sandbox) string {
+	if row.TenantRun {
+		return "run " + row.ID.String()
+	}
+	return "environment " + row.EnvironmentID.String()
 }
 
 // escapeUserinfo escapes s for the user or the password of a URL's

@@ -104,12 +104,12 @@ type toolResult struct {
 	Image     *toolImage `json:"image,omitempty"`
 }
 
-// idempotencyKey is the request's call id: its Idempotency-Key header,
+// IdempotencyKey is the request's call id (and a tenant's run's create key): its Idempotency-Key header,
 // trimmed, with one pair of surrounding quotes taken off (an RFC 8941
 // sf-string, which holds no escape in this alphabet), or "" without the
 // header. More than one value, or one that is not ValidCallKey, is a 400
 // bad_idempotency_key.
-func idempotencyKey(r *http.Request) (string, error) {
+func IdempotencyKey(r *http.Request) (string, error) {
 	vs := r.Header.Values(idempotencyHeader)
 	switch len(vs) {
 	case 0:
@@ -131,7 +131,7 @@ func idempotencyKey(r *http.Request) (string, error) {
 // run makes the call of tool with params (one of the parameter structs),
 // with the request's call id, and answers it.
 func (h *REST) run(w http.ResponseWriter, r *http.Request, tool string, params any) {
-	key, err := idempotencyKey(r)
+	key, err := IdempotencyKey(r)
 	if err != nil {
 		apierr.Write(w, err)
 		return
@@ -261,7 +261,7 @@ func (h *REST) WriteFile(w http.ResponseWriter, r *http.Request) {
 		apierr.Write(w, apierr.New(http.StatusBadRequest, "path is required"))
 		return
 	}
-	key, err := idempotencyKey(r)
+	key, err := IdempotencyKey(r)
 	if err != nil {
 		apierr.Write(w, err)
 		return

@@ -44,11 +44,28 @@ const (
 	PhaseRetiring  = "retiring"
 )
 
-// The phases of a job's run (env_job_runs.phase).
+// The phases of a run: a job's (env_job_runs.phase) running, succeeded or
+// failed; a tenant's (runs.phase) any of them.
 const (
-	RunRunning   = "running"
-	RunSucceeded = "succeeded"
-	RunFailed    = "failed"
+	RunQueued           = "queued"
+	RunRunning          = "running"
+	RunSucceeded        = "succeeded"
+	RunFailed           = "failed"
+	RunDeadlineExceeded = "deadline_exceeded"
+	RunCancelled        = "cancelled"
+)
+
+// The reasons of a tenant's failed run (runs.reason).
+const (
+	// RunReasonExit: its process exited with a code other than 0.
+	RunReasonExit = "exit"
+	// RunReasonImage: the image's registry refused a create of its pod.
+	RunReasonImage = "image"
+	// RunReasonNodeLost: its pod was lost with its node.
+	RunReasonNodeLost = "node_lost"
+	// RunReasonNoExitStatus: it ended without an exit code (its pod
+	// stopped, failed or went).
+	RunReasonNoExitStatus = "no_exit_status"
 )
 
 // The conditions of an incident (env_incidents.condition).

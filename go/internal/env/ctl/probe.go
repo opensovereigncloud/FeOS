@@ -250,6 +250,7 @@ func (c *Controller) probe(ctx context.Context) error {
 			}
 		}
 	}
+	c.probeRuns(ctx, run)
 	return nil
 }
 
@@ -288,12 +289,7 @@ func (c *Controller) probeInstance(ctx context.Context, v *view, r store.EnvInst
 		return
 	}
 	mc := mainContainer(info)
-	if mc != nil && mc.GetState() == podv1.ContainerState_CONTAINER_STATE_EXITED {
-		var code *int
-		if mc.ExitCode != nil {
-			n := int(mc.GetExitCode())
-			code = &n
-		}
+	if exited, code := exitOf(mc); exited {
 		if inst.Kind == spec.KindJob {
 			c.finishJob(ctx, v, r, code, "")
 			return

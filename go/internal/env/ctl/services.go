@@ -66,7 +66,7 @@ func (c *Controller) stepService(ctx context.Context, s *stepState, name string,
 	idles := idleOf(svc) > 0
 	// The old keep serving while the new come.
 	for _, r := range old {
-		c.heal(ctx, r, idles)
+		c.heal(ctx, r.Sandbox, idles)
 	}
 	if !p.ok() {
 		s.wait(objectName(spec.KindService, name), "service %s: %s", name, p.why())
@@ -74,7 +74,7 @@ func (c *Controller) stepService(ctx context.Context, s *stepState, name string,
 	}
 	if rolling(v) && (!s.addonsReady || !s.jobsDone) {
 		for _, r := range cur {
-			c.heal(ctx, r, idles)
+			c.heal(ctx, r.Sandbox, idles)
 		}
 		s.wait(objectName(spec.KindService, name), "service %s waits for the addons and the release jobs", name)
 		return
@@ -82,7 +82,7 @@ func (c *Controller) stepService(ctx context.Context, s *stepState, name string,
 	var lost []store.EnvInstanceRow
 	for _, r := range cur {
 		c.keep(ctx, v, r, p.idle)
-		if c.heal(ctx, r, idles) {
+		if c.heal(ctx, r.Sandbox, idles) {
 			lost = append(lost, r)
 		}
 	}

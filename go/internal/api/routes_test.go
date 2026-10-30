@@ -112,6 +112,12 @@ var routeClasses = map[string]class{
 	"PUT /api/v1/domains/{id}/environment":    classTenant,
 	"DELETE /api/v1/domains/{id}/environment": classTenant,
 	"POST /api/v1/domains/{id}/check":         classTenant,
+	"POST /api/v1/runs":                       classTenant,
+	"GET /api/v1/runs":                        classTenant,
+	"GET /api/v1/runs/{id}":                   classTenant,
+	"DELETE /api/v1/runs/{id}":                classTenant,
+	"GET /api/v1/runs/{id}/logs":              classTenant,
+	"POST /api/v1/runs/{id}/cancel":           classTenant,
 
 	"/api/":             classPublic,
 	"GET /healthz":      classPublic,

@@ -191,7 +191,7 @@ func (c *Controller) stepRuns(ctx context.Context, s *stepState) {
 		switch {
 		case v.now.After(run.StartedAt.Add(timeout)):
 			c.finishJob(ctx, v, r, nil, "timed out after "+timeout.String())
-		case c.heal(ctx, r, false):
+		case c.heal(ctx, r.Sandbox, false):
 			c.finishJob(ctx, v, r, nil, "its instance was lost with node "+lostNode(r.Sandbox))
 		}
 	}
@@ -238,10 +238,7 @@ func (c *Controller) finishJob(ctx context.Context, v *view, r store.EnvInstance
 	if steady(r.Sandbox) && c.connected(r.Sandbox.Node) {
 		tail = c.storedTail(ctx, v, r.Sandbox)
 	}
-	succeeded := code != nil && *code == 0 && detail == ""
-	if code == nil && detail == "" {
-		detail = "the node did not report an exit status"
-	}
+	succeeded, detail := outcome(code, detail)
 	err := c.fenced(ctx, func(tx *store.Store) error {
 		now, err := tx.Now(ctx)
 		if err != nil {
@@ -294,6 +291,19 @@ func (c *Controller) finishJob(ctx context.Context, v *view, r store.EnvInstance
 	if err := c.deleteInstance(ctx, r.Sandbox); err != nil && ctx.Err() == nil {
 		c.rl.warn("job", "cannot delete a finished job's instance", "sandbox", r.Sandbox.ID, "err", err)
 	}
+}
+
+// noExitStatus is the detail of an exit without a code.
+const noExitStatus = "the node did not report an exit status"
+
+// outcome is a run's end (a job's or a tenant's) from its exit code and
+// the detail of an end that is no exit ("" for an exit): succeeded for a
+// 0 without a detail; an exit without a code gets noExitStatus.
+func outcome(code *int, detail string) (succeeded bool, why string) {
+	if code == nil && detail == "" {
+		return false, noExitStatus
+	}
+	return code != nil && *code == 0 && detail == "", detail
 }
 
 // maxExits is how many exits an instance keeps (env_instances.exits).

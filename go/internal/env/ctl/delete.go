@@ -194,6 +194,9 @@ const deleteBatch = 16
 // is touched, so that it goes to the end of the queue: the oldest-touched
 // come first, and those that wait long never hold the others back.
 func (c *Controller) deleteLoop(ctx context.Context) error {
+	if err := c.sweepRuns(ctx); err != nil {
+		return fmt.Errorf("sweep the runs: %w", err)
+	}
 	tenants, err := c.st.DeletingTenants(ctx)
 	if err != nil {
 		return err

@@ -78,6 +78,9 @@ type Runner interface {
 	// StopProcessDetached stops a process (TERM, then KILL after 2 s);
 	// nil when it was not running any more.
 	StopProcessDetached(ctx context.Context, lease model.Lease, id string) error
+	// ReadDetached reads a text file of the main container, also once its
+	// process has exited (a tenant's run's result file).
+	ReadDetached(ctx context.Context, lease model.Lease, path string) (string, error)
 }
 
 // Ports is what the environments need of the port door (*ports.Handler).

@@ -38,7 +38,7 @@ func (e *Engine) registryAuth(ctx context.Context, row store.Sandbox) (model.Reg
 			return model.RegistryCredentials{}, errNoResolver
 		}
 		auth, err := t.ImageCredentials.Resolve(func(name string) (string, error) {
-			return resolve(ctx, row.EnvironmentID, name, 0)
+			return resolve(ctx, row, name, 0)
 		})
 		if err != nil {
 			return model.RegistryCredentials{}, fmt.Errorf("the image credentials: %w", err)
