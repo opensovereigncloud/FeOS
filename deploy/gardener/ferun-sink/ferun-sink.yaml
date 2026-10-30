@@ -1,0 +1,231 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# ferun-sink on the Gardener shoot (ADR 0026, docs/architecture/sink.md,
+# deploy/gardener/README.md, The sink): two instances in the namespace
+# ferun, beside ferund, over the database sink of ferun-db, with the cold
+# stage in the platform's bucket. Its program ships in ferund's image
+# (/ferun-sink). The ${...} are the deployment's parameters
+# (config.env.example), which make fills in:
+#
+#   make -C deploy/gardener apply-ferun-sink
+#
+# Secrets the operator makes in the namespace ferun, before the pods
+# start:
+#   ferun-sink-token   key token: the sink's service token at ferund
+#                      (ferund service-token --kind sink --name ferun-sink);
+#                      both instances share it and the name ferun-sink.
+#   ferun-sink-bucket  keys endpoint (e.g.
+#                      https://<account>.eu.r2.cloudflarestorage.com),
+#                      region (auto for R2), bucket, prefix (e.g. sink/;
+#                      may be empty), access-key, secret-key.
+#   ferun-sink-db      type kubernetes.io/basic-auth, keys username (sink)
+#                      and password: the role sink of ferun-db, which
+#                      CloudNativePG creates from it (../ferun/postgres.yaml,
+#                      managed.roles).
+# The database sink is the Database below; the role must exist first.
+#
+# The nodes reach the ingest at ${FERUN_SINK_IP}:4317, a fixed ClusterIP
+# like ferund-nodes', since feosd runs on the hosts: ferund's
+# --sink-endpoint names it. Tenants read at https://run.${DOMAIN}/api/v1/logs
+# and /api/v1/log-streams (the HTTPRoute below); ferund reads at
+# http://ferun-sink.ferun.svc:8080 (its --sink-url).
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: ferun-db-sink
+  namespace: ferun
+spec:
+  cluster:
+    name: ferun-db
+  name: sink
+  owner: sink
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ferun-sink
+  namespace: ferun
+spec:
+  # Instances share nothing but the database and the bucket; any of them
+  # serves any node and any read.
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: ferun-sink
+  template:
+    metadata:
+      labels:
+        app: ferun-sink
+    spec:
+      imagePullSecrets:
+        - name: oci-pull
+      securityContext:
+        runAsNonRoot: true
+      # On different workers where they can be.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: ferun-sink
+      # A stop lets reads and batches end within 10 s each.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: ferun-sink
+          image: ${REGISTRY}/ferund:dev
+          imagePullPolicy: Always
+          command: ["/ferun-sink"]
+          args: ["serve"]
+          env:
+            - name: FERUN_SINK_NAME
+              value: ferun-sink
+            - name: FERUN_SINK_LISTEN
+              value: ":8080"
+            - name: FERUN_SINK_INGEST_LISTEN
+              value: ":4317"
+            - name: FERUN_SINK_TRUST_DOMAIN
+              value: run.${DOMAIN}
+            - name: FERUN_SINK_FERUN_URL
+              value: http://ferund.ferun.svc:8100
+            # ferun-db's primary, as ferund's (../ferun/kustomization.yaml);
+            # 16 connections an instance (ferun-db's max_connections).
+            - name: FERUN_SINK_DATABASE_URL
+              value: 'postgres://sink@ferun-db-rw.ferun.svc:5432/sink?sslmode=require&target_session_attrs=read-write&connect_timeout=5&pool_max_conns=16'
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ferun-sink-db
+                  key: password
+            - name: SINK_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ferun-sink-token
+                  key: token
+            - name: FERUN_SINK_BUCKET_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: ferun-sink-bucket
+                  key: endpoint
+            - name: FERUN_SINK_BUCKET_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: ferun-sink-bucket
+                  key: region
+            - name: FERUN_SINK_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: ferun-sink-bucket
+                  key: bucket
+            - name: FERUN_SINK_BUCKET_PREFIX
+              valueFrom:
+                secretKeyRef:
+                  name: ferun-sink-bucket
+                  key: prefix
+                  optional: true
+            - name: SINK_BUCKET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ferun-sink-bucket
+                  key: access-key
+            - name: SINK_BUCKET_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ferun-sink-bucket
+                  key: secret-key
+            # Lines are kept 30 days; a tenant's job may ask for up to 400
+            # (logRetentionDays). No quota yet.
+            - name: FERUN_SINK_LOG_RETENTION
+              value: 720h
+            - name: FERUN_SINK_LOG_RETENTION_MAX
+              value: 9600h
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: ingest
+              containerPort: 4317
+          # Ready once the ingest has its certificate and while the
+          # database answers: the condition of both Services.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 1Gi }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ferun-sink
+  namespace: ferun
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app: ferun-sink
+---
+# The read API: the HTTPRoute below, and ferund's own reads.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferun-sink
+  namespace: ferun
+spec:
+  selector:
+    app: ferun-sink
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+# The ingest. feosd runs on the hosts, which do not resolve the cluster's
+# names, so the service has a fixed address, which ferund hands the nodes
+# (--sink-endpoint ${FERUN_SINK_IP}:4317).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ferun-sink-ingest
+  namespace: ferun
+spec:
+  clusterIP: ${FERUN_SINK_IP}
+  selector:
+    app: ferun-sink
+  ports:
+    - name: ingest
+      port: 4317
+      targetPort: ingest
+---
+# The tenants' reads at https://run.<DOMAIN>, beside ferund's route
+# (../ferun/route.yaml): the longer path prefixes win over its catch-all.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ferun-sink
+  namespace: ferun
+spec:
+  parentRefs:
+    - name: ${GATEWAY_NAME}
+      namespace: ${GATEWAY_NAMESPACE}
+  hostnames:
+    - run.${DOMAIN}
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: /api/v1/logs }
+        - path: { type: PathPrefix, value: /api/v1/log-streams }
+      backendRefs: [{name: ferun-sink, port: 8080}]
+      # A follow streams for as long as its reader stays.
+      timeouts:
+        request: 0s

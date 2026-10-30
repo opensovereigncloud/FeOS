@@ -35,7 +35,10 @@
 # (README.md, A lost worker), and on fewer workers than instances one
 # stays pending.
 # CloudNativePG keeps the owner ferun's password in the secret
-# ferun-db-app; kustomization.yaml hands it to ferund as PGPASSWORD.
+# ferun-db-app; kustomization.yaml hands it to ferund as PGPASSWORD. The
+# role sink, ferun-sink's (ADR 0026), takes its password from the secret
+# ferun-sink-db, which the operator makes (../ferun-sink); its database
+# is the Database there.
 # A shoot whose ferund ran on the StatefulSet postgres creates this
 # cluster from a copy of that database first (import/, README.md).
 apiVersion: postgresql.cnpg.io/v1
@@ -75,7 +78,8 @@ spec:
       # Per instance of ferund 32 pooled connections and the listener. A
       # stopping one keeps them for up to its termination grace, 12 minutes
       # (deploy/k3s/ferun/ferund.yaml), so two deploys within it keep
-      # three revisions alive: 3 x 3 x 33 = 297. The operator, psql and
+      # three revisions alive: 3 x 3 x 33 = 297. ferun-sink's two
+      # instances take 16 each, 48 during a rollout. The operator, psql and
       # ferund join-token connect too; the standbys' streaming does not
       # count (max_wal_senders).
       max_connections: '400'
@@ -88,6 +92,13 @@ spec:
       number: 1
       dataDurability: required
       failoverQuorum: true
+  managed:
+    roles:
+      - name: sink
+        ensure: present
+        login: true
+        passwordSecret:
+          name: ferun-sink-db
   bootstrap:
     initdb:
       database: ferun
