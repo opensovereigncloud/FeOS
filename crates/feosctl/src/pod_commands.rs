@@ -353,6 +353,7 @@ fn create_pod_request(opts: CreatePodOptions) -> CreatePodRequest {
         image_layers: None,
         pull_token: String::new(),
         log_labels: Default::default(),
+        log_redact: Vec::new(),
     }
 }
 

@@ -324,6 +324,13 @@ message CreatePodRequest {
   // ferun.retention_days; docs/architecture/sink.md). Taken by a new pod only. Empty: the pod's logs
   // are not shipped.
   map<string, string> log_labels = 5;
+  // Values the node replaces with "[redacted]" in the lines it ships (ADR
+  // 0026): the pod's secrets as the control plane resolved them into its
+  // containers' environment, and the forms they appear in (a URL's
+  // userinfo). Beside the spec like log_labels, kept in the pod's record,
+  // never sent to the sink. A value cut across two parts of a long line
+  // is not found.
+  repeated string log_redact = 6;
 }
 
 // The baked layers of a pod's image that its create names (ADR 0025): a
