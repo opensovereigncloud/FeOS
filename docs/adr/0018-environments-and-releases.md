@@ -1,6 +1,7 @@
 # ADR 0018: Environments and releases: FeRun's CaaS API takes typed objects, and every change is a numbered release
 
-**Status:** Accepted · **Date:** 2026-10-18
+**Status:** Accepted · **Date:** 2026-10-18; runs (§ A tenant's run)
+Proposed 2026-10-30
 
 ## Context
 
@@ -308,6 +309,110 @@ not of an environment.
   their grants, the CLI and an admin's listing of every tenant's
   environments come later.
 
+### A tenant's run: a job's run without an environment
+
+Proposed 2026-10-30; not built.
+
+- A **run** is one execution of an image to its end: one pod, ADR
+  0004's job with the restart policy `Never`, and a record that keeps
+  its outcome, its exit code, a small result and the tail of its log
+  after the pod is gone. A job's run in an environment is a run; a
+  **tenant's run** is one without an environment, made by one call that
+  carries all of its input. It is for work that has no place in a
+  release and needs one pod for minutes: an image build first (ADR 0022),
+  then a tenant's one-off maintenance.
+- It is not a new runner. Its pod is an instance row of the sandboxes'
+  registry, as a job's run is, placed, admitted (ADR 0025), started,
+  moved by a drain and deleted by the engine; the environments'
+  controller, which ends job runs, ends tenant runs with the same code,
+  in a step of its own beside the environments' in the same loop:
+  the exit read from the pod, the deadline, a lost node, the log's tail
+  redacted and stored, the instance deleted. What differs is where the
+  pod's template comes from, the call and not a release, and where the
+  record lives, a row of `runs` and not of `env_job_runs`.
+- **The create**, `POST /api/v1/runs`:
+  - `image`, resolved with the run's credentials and pinned to its
+    digest at the create; a refusal or an unknown image is the create's
+    error (422 with the registry's answer), and no run is made;
+  - `command`, the whole argv, replacing the image's entrypoint and
+    command; empty, they run. `args` beside it comes with ADR 0004's
+    `args` in the container spec;
+  - `env`, literal values, and `secrets`, values the run's container gets
+    as environment variables as well: sealed in the run's row under the
+    key of `--secret-key-file`, never returned, redacted from the stored
+    tail, and dropped from the row when the run ends;
+  - `imageCredentials` (ADR 0025), sealed beside the pod's row as a
+    sandbox's are, gone with it;
+  - `vcpus` and `memoryMib`, as a sandbox's;
+  - `deadline`, counted from the create on the database's clock, the
+    queue included, 10 minutes when unset, at most 2 hours, as a job's
+    timeout;
+  - `resultPath`, a file of the container's that `ferund` reads when the
+    process has exited, at most 4 KiB, returned as the run's `result`;
+    not under `/dev`, which is the container's own tmpfs;
+  - `labels`, a string map for `?label=k=v`;
+  - an `Idempotency-Key` header, unique per tenant, as a tool call's
+    (ADR 0023): a repeat with the same body answers with the run it
+    made, another body is refused (422), so that a caller that lost the
+    answer never starts a second build that pushes.
+- **The status**, `GET /api/v1/runs/{id}` and `GET /api/v1/runs`: the
+  phase, `queued` (the pod is not running yet: capacity, ADR 0025's
+  question without an answer, the pull), `running`, `succeeded` (exit
+  0), `failed`, `deadline_exceeded` or `cancelled`; a `reason` for
+  `failed`: `exit` with the `exitCode`, `image` (the registry refused at
+  a pod's create), `node_lost`, `no_exit_status`; the image's digest,
+  the result, and when it was created, started, ended and is due.
+- **The log**, `GET /api/v1/runs/{id}/logs?lines=N`: read from the pod
+  while it runs, with `follow` streaming what is appended until it
+  ends; after the end, the tail kept in the record, the last 64 KiB and
+  at most 1000 lines, redacted of the run's secrets. A job's run keeps
+  50 lines; a build's failure needs its end, which is longer.
+- **Cancel**, `POST /api/v1/runs/{id}/cancel`, ends a queued or running
+  run as `cancelled`, its pod stopped and deleted, its tail kept; on a
+  run that has ended it changes nothing. **Delete**, `DELETE
+  /api/v1/runs/{id}`, cancels a run that has not ended and removes its
+  record.
+- **Retention.** The pod goes as soon as its run has ended and its
+  exit, result and tail are read: no ended pod holds memory (ADR 0004).
+  The record stays 7 days after the end, then a sweep removes it; a
+  caller that keeps a build's log copies it.
+- **A run never idles.** Its row's idle interval is 0, as a job run's:
+  it is not paused, suspended or hibernated for want of calls. A drain
+  moves it as it moves any pod, by hibernation and a restore elsewhere,
+  and its deadline counts on.
+- **A lost node fails the run**, `node_lost`, and it is never run again:
+  a run may have had effects, a pushed image, and only its caller knows
+  whether a second one is safe. The caller creates a new run.
+- **The exit comes from the guest.** The guest has a container's exit
+  code and log already (ADR 0004, built). Until it reports exits as
+  events (ADR 0022, step 3), `ferund` reads them as it reads a job's,
+  by `GetPod` every second; the pod stays up after its container exits,
+  so the result file and the log's tail are read from it before it is
+  deleted. When the pod ends on its own as ADR 0004 decides, its record
+  carries the tail (ADR 0022, step 7) and the guest puts the result
+  file into the container's status before the microVM goes down.
+- **A run is not a sandbox.** It has no tokens, exec, tools, files, port
+  forwards or previews, and is absent from the tenant's sandboxes. Its
+  pod has `feosd`'s default group, out to the internet and nothing in,
+  and no name table: it reaches no environment, and no pod reaches it.
+- **Built in steps**, the first one enough for FeCode's builds:
+  1. The table `runs` (migration 0017): the ID, which is its pod's
+     (ADR 0019), owner, idempotency key and body hash, the spec without
+     secrets, the sealed secrets, labels, phase, reason, exit code,
+     result, log tail and the times; `sandboxes.run_id` marking a run's
+     row, which every query that tells a tenant's sandbox from an
+     instance counts as an instance. The engine resolves a run's secrets
+     from its row and asks with its sealed image credentials. The
+     controller's job-run step ends runs without an environment as it
+     ends job runs. The routes above without `follow`, and the sweep. No
+     change to `feosd` or the guest.
+  2. `follow` on the log, through the guest's `StreamContainerLogs`.
+  3. With ADR 0022's pod: exits as events instead of the poll, a cancel
+     as `SIGTERM` and the grace period, the pod ending on its own, the
+     result in the container's status (the guest's one change).
+  4. A run in FeRun's MCP tools and the management UI, when a caller
+     asks.
+
 ### What changed while it was built
 
 The decision was taken as proposed above; building it changed these:
@@ -419,6 +524,41 @@ The decision was taken as proposed above; building it changed these:
   at once; but a group says what a pod reaches and a table what it calls
   by name, and every group would become a table on every node that has
   it.
+- **A tenant's work to its end as a run of an environment's job, with
+  arguments per run.** It reuses the most, and fits the least: the job's
+  image and command are a release's, pinned, while a build's commit,
+  tags and tokens are the run's; secrets per run would be a secret's new
+  version and a release per build, a history of tokens; a job runs once
+  at a time, a project builds three services at once; the job's pod is
+  in `env-<id>`, so a build of a stage environment would run a
+  Dockerfile's `RUN` steps next to its Postgres; and the tenant would
+  keep an environment for nothing but its builds. The run's machinery
+  is the job's; its input is the call's.
+- **A hidden environment per tenant for its runs**, so that every query
+  that knows instances knows runs: one security group for every run of
+  the tenant, every FeCode project's builds reaching each other, and an
+  environment without releases that the controller would reconcile.
+- **A sandbox driven by exec**, as FeCode builds today: a detached
+  process because the exec's process group is killed with the call, a
+  poll of `/proc` because `sleep infinity` reaps nothing, keep-awake
+  calls against the idle pause, the exit code, digest and log in files,
+  the deadline and the delete in the caller. Each step is a missing
+  primitive, and a sandbox's tokens and tools are open to a build that
+  needs none.
+- **"Task" or "job" as the noun.** A job is this ADR's object that
+  makes runs, and a task is the task service of ADR 0003 and ADR 0007.
+  A run is what this ADR and ADR 0022 call an execution already.
+- **A builds API** (ADR 0022's draft, deferred by FeCode's ADR 0009):
+  a run with a source fetched by `ferund`, which has no git client; the
+  builder clones with a token its caller passes as a secret of the run.
+- **A run retried by `ferund`** after a lost node or a failure, as a
+  job's attempts are: a run may have pushed, and its caller decides.
+- **The ended pod kept** to read files or exec into: memory held until
+  a delete (ADR 0004's alternative); the result file and the tail are
+  what callers read.
+- **A deadline from the start**, not the create: a run queued for want
+  of capacity would wait without bound, and the caller would keep a
+  second clock.
 
 ## Consequences
 
@@ -457,6 +597,18 @@ The decision was taken as proposed above; building it changed these:
   through the API, validated per operation, and exports the file.
   FeCode's side, a definition per project, environments per class,
   promotion, what its agent may apply, is FeCode's ADR 0008.
+- **Runs** add a table, a column of `sandboxes`, five routes and a step
+  of the controller; `feosd` and the guest are unchanged until ADR
+  0022's pod. A run's secrets reach `feosd`'s record of its pod as an
+  environment's do (the known exposure), for as long as the pod lives.
+- FeCode builds with runs: per build, one `POST /api/v1/runs` of the
+  builder image with the commit and the repository as `env`, its two
+  short-lived tokens as `secrets`, the builder image's credentials,
+  2 GiB, a deadline of 20 minutes, `resultPath` the digest's file and
+  the build's ID as the idempotency key; its poller reads the run, and
+  the result and tail once it has ended, and cancels on a superseded
+  commit. The build sandbox, its detached start, the `/proc` polls,
+  keep-awake, its own deadline and the delete go (FeCode's ADR 0009 §3).
 
 ## Open questions
 
@@ -492,3 +644,15 @@ The decision was taken as proposed above; building it changed these:
 - Tenancy: a FeRun tenant per FeCode project, for quotas and billing;
   today FeCode keeps its projects' environments under one tenant,
   labelled by project.
+- Runs: how many a tenant may run at once and how much they may take
+  (ADR 0022's build limits); FeCode limits itself to three builds per
+  project meanwhile.
+- Runs: whether the record's 7 days are a flag, and whether a tenant
+  lists runs of every age or only the kept ones.
+- Runs: whether a job's run in an environment becomes a row of `runs`,
+  so that `POST …/jobs/{name}/run` answers with a run's ID that `GET
+  /api/v1/runs/{id}` and its log serve, and a manual job takes `env`
+  per run; today it answers 202 without one, and the environment's
+  status shows a job's last run only.
+- Runs: exec into a running run for debugging, which a build's log
+  makes rare.

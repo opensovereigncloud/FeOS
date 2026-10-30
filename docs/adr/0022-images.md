@@ -119,29 +119,29 @@ that is there when the pod is not.
 
 ### Builds run on the platform
 
-- `ferund` builds images: `POST /api/v1/builds` with a source, a build
-  context and a Dockerfile within it, build arguments, and the image to
-  push, `<registry>/<repository>:<tag>`, in any registry. A build is
-  a run of the platform's **builder** image, BuildKit, in a pod of the
-  tenant's like a job's run (ADR 0018): placed, logged, bounded in time,
-  retried never. Its result is a digest, kept with the build's record;
-  its failure a record with the log's tail.
-- The source is a snapshot `ferund` fetches for the build and puts into
-  the pod as files: a git repository at a commit, fetched over HTTPS
-  with the credential the caller passes for that one fetch (FeCode's
-  git gateway with a token of a landing's; any forge with a token), or
-  an archive the caller uploads. The credential is used by `ferund` and
-  discarded; the pod gets the tree and the commit's ID as a build
-  argument. No credential of the caller's enters the build pod but a
-  push token it passes for that one build, scoped to the image's
-  repository and short-lived (FeCode mints one per build for its
-  registry, FeCode's ADR 0012).
+- A build is a **tenant's run** (ADR 0018) of the platform's
+  **builder** image, BuildKit: placed, admitted, logged and bounded in
+  time like any run, never retried. `ferund` keeps no build record and
+  fetches no source: the run's record has the exit, the result (the
+  pushed manifest's digest, from the builder's result file) and the
+  log's tail; the builder clones the commit itself.
+- The caller passes what the build needs as the run's input: the
+  repository, commit, context, Dockerfile, build arguments and the image
+  to push, `<registry>/<repository>:<tag>` in any registry, as `env`;
+  a read token for the source and a push token scoped to the image's
+  repository, both short-lived and minted for that one build, as the
+  run's `secrets` (FeCode mints both, FeCode's ADR 0009 §3 and ADR
+  0012). No other credential of the caller's enters the build's pod.
 - The microVM is the boundary between tenants (ADR 0001), so the
   builder's container may hold what a build needs, mount and user
   namespaces among them, which no container of a service holds. A
   build's cache is BuildKit's registry cache in the image's own
   repository, so the second build of a project is the first's work
   reused.
+- `POST /api/v1/builds`, `ferund` fetching a snapshot and running the
+  builder (this section's first draft), was deferred on 2026-10-29
+  (FeCode's ADR 0009): until a tenant besides FeCode builds, the run is
+  the platform's whole part of a build.
 
 ### A service's pod is supervised by its guest
 
@@ -203,6 +203,13 @@ services (ADR 0016) are not part of this ADR.
 - **Lazy image formats** (eStargz, Nydus) and a converter beside the
   registry: a second image format to keep; a baked layer in the object
   store is fetched lazily by chunk already (ADR 0011).
+- **A builds API in `ferund`**, with the source fetched by `ferund` and
+  only the push token in the pod (this ADR's first draft): `ferund`
+  would grow a git client and build records for what a run with two
+  short-lived tokens does; deferred by FeCode's ADR 0009.
+- **A build sandbox driven by exec**, as FeCode built first: every step
+  of it, a detached start, polls of `/proc`, keep-awake calls, files for
+  the outcome, works around the run that ADR 0018 now gives.
 - **Builds in the agent's sandbox**: the sandbox has no privileges and
   the build would depend on a workspace being there; a build at landing
   needs no sandbox and gives stage the image of main itself.
@@ -231,8 +238,7 @@ services (ADR 0016) are not part of this ADR.
   pulls. A pod of a service starts without a pull, in the time its
   layer takes to attach.
 - `ferund` gains the create's registry credentials (ADR 0025),
-  resolution with them, builds with the builder image and their
-  records, and loses its probes, its `GetPod` poll and its restarts by
+  resolution with them, builds as tenants' runs (ADR 0018), and loses its probes, its `GetPod` poll and its restarts by
   reboot as the guest takes them over. Releases pin digests as before.
 - `feos-guest` gains what ADR 0004 lists and the ring log; its
   `ContainerSpec` and status grow additively (ADR 0007). Every image
@@ -249,8 +255,8 @@ services (ADR 0016) are not part of this ADR.
 - Built in two tracks. Images in ADR 0025's order, since FeCode needs
   private images first: the question before every new pod, credentials
   with the create and the registry's token for the guest's pull, the
-  bake in an image's first pod; then builds, whose push tokens their
-  caller brings; the bake pod and the host's pull last. Until then the
+  bake in an image's first pod; then builds, as runs (ADR 0018, their
+  first step); the bake pod and the host's pull last. Until then the
   registry's token is what the guest gets, scoped to one repository's
   pull and expiring in minutes, the one credential that enters a pod
   ([security.md](../security.md)), and a registry that takes only Basic
@@ -267,7 +273,8 @@ services (ADR 0016) are not part of this ADR.
 - **Per-container resources** and limits in the guest, and the memory a
   pod's sidecars may take.
 - **Build limits**: how many builds a tenant runs at once, how long one
-  may run, and the builder pod's size.
+  may run, and the builder pod's size; they are the limits of runs
+  (ADR 0018).
 - **Scanning** images for known vulnerabilities before a release runs
   them.
 - **Signing**: whether a build's result is signed and a release checks
