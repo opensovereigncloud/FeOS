@@ -164,18 +164,51 @@ reaps.
   record from when its process exits until it starts again or is
   adopted. `GetContainer` and `ListContainers` report it, and so feosd's
   `GetPod`; a container that did not survive a reboot has none.
-- A container's stdout and stderr go to one file, `logs/container.log` in
-  its directory, which an adoption keeps. `StreamContainerLogs` serves
-  it: the last `tail_lines` lines (at most 10 000, and from no further
-  back than 4 MiB before the end, found reading back from the end), or
-  all of it with `tail`, then with `follow` what the container appends,
-  until the container is deleted or the caller ends the call. A line
-  goes out without its newline, one over 64 KiB in parts; the source of
-  a line is not known. A tail counts each part as a line, and cuts a
-  line that reaches further back than the parts asked for, or than the
+- A container's stdout and stderr are FIFOs, `logs/stdout` and
+  `logs/stderr` in its directory (ADR 0026). PID 1 reads them and writes
+  each line to `logs/container.log` in the CRI log format (`<RFC 3339
+  nano, UTC> <stdout|stderr> <F|P> <text>`), the time it read the line:
+  a line over 64 KiB goes in parts (`P`), and one left unfinished for a
+  second goes as a part too, which the next entry of its stream goes on
+  with. The log's ID (`log_id`, 32 hex digits) is written beside it,
+  `container.log.id`, before the log is made, and stays with the log;
+  a container created anew under its name gets a new log and ID. An
+  adoption keeps both; a log a crash left unfinished gets its newline
+  first. stdout and stderr are read side by side: lines of the two
+  streams written within the same moment may land in either order.
+- The FIFOs are open for reading and writing in PID 1, and the task
+  service holds them open too while the container is there: a container
+  never writes into one without a reader, and gets no SIGPIPE whatever
+  restarts. A task service that restarts lets go of its hold; PID 1
+  still reads. A guest that upgrades itself execs, and reads the FIFOs
+  of every container the runtime knows again when its container service
+  starts: meanwhile the pipe holds what the container writes, and the
+  container waits once it is full. Only the unfinished line PID 1 had
+  read is lost then. A suspended or hibernated pod's readers are in its
+  snapshot as they were; lines read right after a restore carry the
+  guest's clock, which may lag until the node pushes the time. When a
+  container's process exits, what its FIFOs still hold and its
+  unfinished lines are written before its exit is recorded. A write to
+  the log that fails is logged and the line dropped: the log never holds
+  the container up.
+- `StreamContainerLogs` serves the log: the last `tail_lines` lines (at
+  most 10 000, and from no further back than 4 MiB before the end, found
+  reading back from the end), or all of it with `tail`, then with
+  `follow` what is appended, until the container is deleted or the
+  caller ends the call; with `follow` and `from_offset` (and `log_id`)
+  from an offset an entry named, or from 0 of the log there is when the
+  offset is past its end or of another log. An entry is the line's text
+  without the prefix, with its source, time, whether it is a part, its
+  offset, the next offset and the log's ID. A line written before ADR
+  0026, without the prefix, goes out as it is, without a time or a
+  source, one over 64 KiB in parts. A tail counts a line of the format
+  as one, and each part of a line of before as one; it cuts a line of
+  before that reaches further back than the parts asked for, or than the
   4 MiB, so that its last parts are 64 KiB each (a line of which not one
-  such part fits in the 4 MiB is left out); a follow sends a last line
-  that stays unfinished for a second as it is.
+  such part fits in the 4 MiB is left out), and leaves a line of the
+  format out that starts beyond the 4 MiB. A follow sends a last line of
+  before that stays unfinished for a second as it is. `feosctl container
+  logs` prints a part and the rest of its line as one line.
 
 ## Power
 
