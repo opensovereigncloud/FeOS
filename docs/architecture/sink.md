@@ -45,6 +45,12 @@ output.
 
 `ferund` sends a pod's labels with its create
 (`CreatePodRequest.log_labels`); `feosd` keeps them in the pod's record.
+A restore brings them again (`RestorePodRequest.log_labels`,
+`log_redact`): a node that takes the pod from its checkpoint records
+them, one that has the pod replaces its own when the labels are not
+empty. The guest's log and its ID travel on the pod's disk, so the
+restored pod's streams are the same ones, and the node goes on from
+where the sink has them (`Positions`), wherever they were shipped from.
 `ferund` names the sink's ingest in every `TelemetryResponse`
 (`sink_endpoint`, `--sink-endpoint`); empty: nothing is shipped.
 

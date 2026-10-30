@@ -214,8 +214,16 @@ impl PodService for Pods {
         self.check_serving()?;
         let request = request.into_inner();
         Ok(Response::new(
-            self.restore(&request.pod_id, &request.head_key, request.cold)
-                .await?,
+            self.restore(
+                &request.pod_id,
+                &request.head_key,
+                request.cold,
+                pods::LogSettings {
+                    labels: request.log_labels,
+                    redact: request.log_redact,
+                },
+            )
+            .await?,
         ))
     }
 }

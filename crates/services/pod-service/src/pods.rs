@@ -116,9 +116,19 @@ pub const LOG_DRAIN: Duration = Duration::from_secs(5);
 /// joined it, and a pod of its abandoned hibernations: the last ones.
 const REQUEST_IDS: usize = 16;
 
+/// A pod's log labels and the values its shipped lines are redacted of
+/// (ADR 0026), as a restore brings them. No Debug: it holds secrets.
+#[derive(Clone, Default)]
+pub struct LogSettings {
+    pub labels: HashMap<String, String>,
+    /// Secrets: kept in the pod's record, never in an answer.
+    pub redact: Vec<String>,
+}
+
 /// What a create brings beside the pod's spec, which is not compared with
-/// it: a create delivered twice with others is the same create.
-#[derive(Clone, Debug, Default)]
+/// it: a create delivered twice with others is the same create. No Debug:
+/// it holds secrets.
+#[derive(Clone, Default)]
 pub struct Beside {
     /// The baked layers of its image that the caller knows (ADR 0025).
     pub image_layers: Option<ImageLayers>,
@@ -783,7 +793,8 @@ impl Pods {
         let lock = self.lock_for_resume(pod_id).await?;
         if self.info(pod_id)?.state() == PodState::Hibernated {
             drop(lock);
-            self.restore_detached(pod_id, "", false).await?;
+            self.restore_detached(pod_id, "", false, LogSettings::default())
+                .await?;
             return Ok(());
         }
         self.expect_state(pod_id, PodState::Suspended)?;
@@ -1109,18 +1120,25 @@ impl Pods {
     /// the node can load the snapshot, unless `cold`; otherwise, and if the
     /// restore of the memory fails before the guest ran, the pod boots
     /// anew on the checkpoint's disk. It runs in a task of its own
-    /// (`detached`).
+    /// (`detached`). `logs` are its log labels and redactions (ADR 0026):
+    /// a pod the node takes from its checkpoint gets them, and one it has
+    /// gets them in place of its own unless their labels are empty.
     pub async fn restore(
         &self,
         pod_id: &str,
         head_key: &str,
         cold: bool,
+        logs: LogSettings,
     ) -> Result<RestorePodResponse, Status> {
         let (pod_id, head_key) = (pod_id.to_string(), head_key.to_string());
-        self.detached(
-            move |pods| async move { pods.restore_detached(&pod_id, &head_key, cold).await },
-        )
+        self.detached(move |pods| async move {
+            pods.restore_detached(&pod_id, &head_key, cold, logs).await
+        })
         .await
+        .map(|mut response| {
+            response.pod = response.pod.map(shown);
+            response
+        })
     }
 
     async fn restore_detached(
@@ -1128,12 +1146,23 @@ impl Pods {
         pod_id: &str,
         head_key: &str,
         cold: bool,
+        logs: LogSettings,
     ) -> Result<RestorePodResponse, Status> {
         spec::check_id(pod_id)?;
         if self.info(pod_id).is_err() {
-            self.adopt_checkpoint(pod_id, head_key).await?;
+            self.adopt_checkpoint(pod_id, head_key, &logs).await?;
         }
         let lock = self.end_bring_up_and_lock(pod_id).await?;
+        if !logs.labels.is_empty() {
+            let current = self.info(pod_id)?;
+            if current.log_labels != logs.labels || current.log_redact != logs.redact {
+                self.update(pod_id, |info| {
+                    info.log_labels = logs.labels;
+                    info.log_redact = logs.redact;
+                })
+                .await;
+            }
+        }
         let info = self.info(pod_id)?;
         let own = info.checkpoint.as_ref().map(|c| c.head_key.clone());
         let key = match head_key {
@@ -1241,7 +1270,12 @@ impl Pods {
 
     /// Records a pod the node does not have, hibernated, from its
     /// checkpoint: its spec is beside the head.
-    async fn adopt_checkpoint(&self, pod_id: &str, head_key: &str) -> Result<(), Status> {
+    async fn adopt_checkpoint(
+        &self,
+        pod_id: &str,
+        head_key: &str,
+        logs: &LogSettings,
+    ) -> Result<(), Status> {
         if head_key.is_empty() {
             return Err(Status::not_found(format!(
                 "no pod {pod_id}: name its checkpoint's head to restore it here"
@@ -1279,6 +1313,8 @@ impl Pods {
                     epoch: head.epoch,
                     memory: head.memory.is_some(),
                 }),
+                log_labels: logs.labels.clone(),
+                log_redact: logs.redact.clone(),
                 ..Default::default()
             };
             match self.add(info, false).await? {
@@ -3905,6 +3941,61 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].log_labels, labels("acme"));
         assert_eq!(kept[0].log_redact, ["acme-secret"]);
+    }
+
+    /// A restore brings the log labels and redactions of a pod the node has
+    /// in place of its own, unless it brings no labels; its answers never
+    /// show the redactions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restore_replaces_a_pods_log_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let pods = bare_pods(dir.path());
+        let labels = |tenant: &str| -> HashMap<String, String> {
+            [("ferun.tenant".to_string(), tenant.to_string())].into()
+        };
+        let info = PodInfo {
+            pod_id: POD.to_string(),
+            state: PodState::Hibernated as i32,
+            spec: Some(PodSpec::default()),
+            checkpoint: Some(Checkpoint {
+                head_key: "snapshots/p/1/head.json".to_string(),
+                epoch: 1,
+                memory: false,
+            }),
+            log_labels: labels("old"),
+            log_redact: vec!["old-secret".to_string()],
+            ..Default::default()
+        };
+        pods.inner.store.save(&info).await.unwrap();
+        pods.pods().insert(POD.to_string(), Pod::new(info));
+        // Without diskd the restore fails after it took them.
+        let restore = |logs: LogSettings| {
+            let pods = pods.clone();
+            async move { pods.restore(POD, "", false, logs).await }
+        };
+        assert!(restore(LogSettings {
+            labels: labels("new"),
+            redact: vec!["new-secret".to_string()],
+        })
+        .await
+        .is_err());
+        let kept = Store::open(dir.path().join("pods"))
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(kept[0].log_labels, labels("new"));
+        assert_eq!(kept[0].log_redact, ["new-secret"]);
+        // No labels: the pod keeps its own.
+        assert!(restore(LogSettings {
+            labels: HashMap::new(),
+            redact: vec!["ignored".to_string()],
+        })
+        .await
+        .is_err());
+        let info = pods.info(POD).unwrap();
+        assert_eq!(info.log_labels, labels("new"));
+        assert_eq!(info.log_redact, ["new-secret"]);
+        assert!(pods.list()[0].log_redact.is_empty());
     }
 
     /// A delete takes the pod out and removes its record in one go: a save
