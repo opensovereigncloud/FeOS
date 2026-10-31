@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Redpanda's only lock (values.yaml): its brokers among themselves, its
-# configuration Job, ferun-sink and Quickwit's indexers.
+# configuration Job, ferun-sink and Quickwit.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -38,9 +38,10 @@ spec:
       ports:
         - { port: 9644, protocol: TCP }
     # The Kafka API's clients: ferun-sink (it produces and reads the tail)
-    # and Quickwit's indexers (their Kafka sources).
+    # and Quickwit (its indexers run the Kafka sources; the node that
+    # answers a source's create checks the topic first).
     - from:
         - podSelector: { matchLabels: { app: ferun-sink } }
-        - podSelector: { matchLabels: { app.kubernetes.io/component: indexer, app.kubernetes.io/name: quickwit } }
+        - podSelector: { matchLabels: { app.kubernetes.io/name: quickwit } }
       ports:
         - { port: 9093, protocol: TCP }

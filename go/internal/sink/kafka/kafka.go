@@ -129,25 +129,53 @@ func (c *Client) Produce(ctx context.Context, topic string, recs []Record) error
 }
 
 // Ends are the offsets after the last record of each of topic's
-// partitions.
+// partitions. A partition whose leader moved (stale metadata) is asked
+// again after the metadata are refreshed, three times at most.
 func (c *Client) Ends(ctx context.Context, topic string) (map[int32]int64, error) {
-	lo, err := c.adm.ListEndOffsets(ctx, topic)
-	if err != nil {
-		return nil, fmt.Errorf("kafka: end offsets of %s: %w", topic, err)
-	}
-	out := map[int32]int64{}
 	var errs []error
-	lo.Each(func(o kadm.ListedOffset) {
-		if o.Err != nil {
-			errs = append(errs, o.Err)
-			return
+	for try := 0; try < 3; try++ {
+		if try > 0 {
+			c.cl.ForceMetadataRefresh()
+			t := time.NewTimer(time.Duration(try) * 200 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil, ctx.Err()
+			case <-t.C:
+			}
 		}
-		out[o.Partition] = o.Offset
-	})
-	if len(errs) > 0 {
-		return nil, fmt.Errorf("kafka: end offsets of %s: %w", topic, errors.Join(errs...))
+		lo, err := c.adm.ListEndOffsets(ctx, topic)
+		if err != nil {
+			errs = []error{err}
+			continue
+		}
+		out := map[int32]int64{}
+		errs = errs[:0]
+		lo.Each(func(o kadm.ListedOffset) {
+			if o.Err != nil {
+				errs = append(errs, o.Err)
+				return
+			}
+			out[o.Partition] = o.Offset
+		})
+		if len(errs) == 0 {
+			return out, nil
+		}
+		if !retriable(errs) {
+			break
+		}
 	}
-	return out, nil
+	return nil, fmt.Errorf("kafka: end offsets of %s: %w", topic, errors.Join(errs...))
+}
+
+// retriable reports whether every error is one the next try may not have.
+func retriable(errs []error) bool {
+	for _, err := range errs {
+		if !kerr.IsRetriable(err) {
+			return false
+		}
+	}
+	return true
 }
 
 // Read reads topic's records of each partition of from, from its offset
