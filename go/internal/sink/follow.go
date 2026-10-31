@@ -6,6 +6,7 @@ package sink
 import (
 	"context"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 
@@ -202,24 +203,7 @@ func (s *Store) followPoll(ctx context.Context, tenant string, live streamFilter
 	}
 	var hot []Line
 	if len(ids) > 0 {
-		rows, err := tx.Query(ctx, `SELECT l.stream_id, l.off, l.ts, l.source, l.level, l.partial, l.cont, l.text, l.trace
-			FROM log_lines l JOIN unnest($1::bigint[], $2::bigint[]) AS k(id, after) ON l.stream_id = k.id AND l.off > k.after
-			ORDER BY l.stream_id, l.off LIMIT $3`, ids, from, followBatch)
-		if err != nil {
-			return nil, nil, false, fmt.Errorf("hot lines: %w", err)
-		}
-		for rows.Next() {
-			var l Line
-			var lvl int16
-			if err := rows.Scan(&l.Stream, &l.Off, &l.TS, &l.Source, &lvl, &l.Partial, &l.Cont, &l.Text, &l.Trace); err != nil {
-				rows.Close()
-				return nil, nil, false, err
-			}
-			l.Level = int(lvl)
-			hot = append(hot, l)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+		if hot, err = hotAfter(ctx, tx, ids, from, math.MaxInt64, nil, followBatch); err != nil {
 			return nil, nil, false, fmt.Errorf("hot lines: %w", err)
 		}
 	}

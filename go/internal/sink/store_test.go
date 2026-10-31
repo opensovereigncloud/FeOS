@@ -111,14 +111,36 @@ func TestIngestIdempotent(t *testing.T) {
 	if err := s.Ingest(ctx, batch(key, l2, more)); err != nil {
 		t.Fatal(err)
 	}
-	var n, lineCount, bytes, next, lastOff int64
+	var n, rowCount, lineCount, bytes, hotLines, hotBytes, next, lastOff int64
 	var env string
-	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_lines), lines, bytes, next_offset, last_off, environment
-		FROM log_streams`).Scan(&n, &lineCount, &bytes, &next, &lastOff, &env); err != nil {
+	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT coalesce(sum(lines), 0) FROM log_batches), (SELECT count(*) FROM log_batches),
+		lines, bytes, hot_lines, hot_bytes, next_offset, last_off, environment
+		FROM log_streams`).Scan(&n, &rowCount, &lineCount, &bytes, &hotLines, &hotBytes, &next, &lastOff, &env); err != nil {
 		t.Fatal(err)
 	}
-	if n != 7 || lineCount != 7 || bytes != 7*6 || next != 60 || lastOff != 60 || env != "env1" {
-		t.Errorf("lines %d, counted %d, bytes %d, next %d, last %d, env %q", n, lineCount, bytes, next, lastOff, env)
+	if n != 7 || lineCount != 7 || bytes != 7*6 || hotLines != 7 || hotBytes != 7*6 || next != 60 || lastOff != 60 || env != "env1" {
+		t.Errorf("lines %d, counted %d, bytes %d, hot %d/%d, next %d, last %d, env %q", n, lineCount, bytes, hotLines, hotBytes,
+			next, lastOff, env)
+	}
+	// A row per batch: the first, sent three times, once, and the new
+	// lines of the one that overlaps it.
+	type row struct{ first, last, minTS, maxTS, lines, bytes, levels int64 }
+	rs, err := s.db.Pool.Query(ctx, `SELECT first_off, last_off, min_ts, max_ts, lines, bytes, levels FROM log_batches ORDER BY first_off`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []row
+	for rs.Next() {
+		var r row
+		if err := rs.Scan(&r.first, &r.last, &r.minTS, &r.maxTS, &r.lines, &r.bytes, &r.levels); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, r)
+	}
+	rs.Close()
+	ms := int64(time.Millisecond)
+	if want := []row{{0, 40, base, base + 4*ms, 5, 30, LevelUnknown}, {50, 60, base + 5*ms, base + 6*ms, 2, 12, LevelUnknown}}; rowCount != 2 || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("batches %v, want %v", got, want)
 	}
 	pos, err := s.Positions(ctx, []StreamKey{{"nope", "x", "y"}, key})
 	if err != nil || pos[0] != 0 || pos[1] != 60 {
@@ -167,8 +189,8 @@ func TestQuota(t *testing.T) {
 		t.Fatalf("over quota: %v", err)
 	}
 	var small, big int64
-	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_lines l JOIN log_streams s ON s.id = l.stream_id WHERE s.tenant = 'small'),
-		(SELECT count(*) FROM log_lines l JOIN log_streams s ON s.id = l.stream_id WHERE s.tenant = 'big')`).Scan(&small, &big); err != nil {
+	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT sum(b.lines) FROM log_batches b JOIN log_streams s ON s.id = b.stream_id WHERE s.tenant = 'small'),
+		(SELECT sum(b.lines) FROM log_batches b JOIN log_streams s ON s.id = b.stream_id WHERE s.tenant = 'big')`).Scan(&small, &big); err != nil {
 		t.Fatal(err)
 	}
 	if small != 2 || big != 1 {
@@ -198,7 +220,7 @@ func TestIndexAndQueries(t *testing.T) {
 	ctx := context.Background()
 	key1, key2 := StreamKey{"pod1", "main", "L1"}, StreamKey{"pod2", "main", "L1"}
 	// Stream 1: 30 lines, indexed in pieces; stream 2: interleaved in
-	// time, kept hot.
+	// time, its first batch indexed, two kept hot.
 	ln := func(prefix string) func(int) string {
 		return func(i int) string {
 			lvl := "INFO"
@@ -225,16 +247,18 @@ func TestIndexAndQueries(t *testing.T) {
 	}
 	indexAll(t, s)
 	// The rest of stream 2 stays hot.
-	if err := s.Ingest(ctx, batch(key2, envLabels("acme", "env1", 1),
-		lines(100, base+int64(11*time.Millisecond), 20, func(j int) string { return ln("b")(j + 10) }))); err != nil {
+	for k := range 2 {
+		if err := s.Ingest(ctx, batch(key2, envLabels("acme", "env1", 1),
+			lines(100+int64(k)*100, base+int64(11+10*k)*int64(time.Millisecond), 10, func(j int) string { return ln("b")(j + 10 + 10*k) }))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var hot, rows int
+	if err := s.db.Pool.QueryRow(ctx, `SELECT sum(lines), count(*) FROM log_batches`).Scan(&hot, &rows); err != nil {
 		t.Fatal(err)
 	}
-	var hot int
-	if err := s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_lines`).Scan(&hot); err != nil {
-		t.Fatal(err)
-	}
-	if n := idx.count("acme"); n != 50 || hot != 20 {
-		t.Fatalf("indexed %d, hot %d", n, hot)
+	if n := idx.count("acme"); n != 50 || hot != 20 || rows != 2 {
+		t.Fatalf("indexed %d, hot %d in %d batches", n, hot, rows)
 	}
 	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-v2-30d]" {
 		t.Errorf("indexes %v", ids)
@@ -430,7 +454,7 @@ func TestRetentionAndDelete(t *testing.T) {
 		t.Fatalf("deleted %d: %v", n, err)
 	}
 	var left, hot int
-	_ = s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_streams), (SELECT count(*) FROM log_lines)`).Scan(&left, &hot)
+	_ = s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_streams), (SELECT sum(lines) FROM log_batches)`).Scan(&left, &hot)
 	envDocs, _ := idx.Search(ctx, "ferun-logs-*", quickwitQuery("acme", "e"))
 	if left != 1 || hot != 2 || len(envDocs) != 0 {
 		t.Errorf("after delete: %d streams, %d hot lines, %d documents", left, hot, len(envDocs))
@@ -440,12 +464,15 @@ func TestRetentionAndDelete(t *testing.T) {
 func TestPartitions(t *testing.T) {
 	s, _ := newTestStore(t, testConfig())
 	ctx := context.Background()
-	// An empty partition of last week and one with a line.
-	for _, d := range []string{"2026-01-01", "2026-01-02"} {
-		dd, _ := time.Parse(time.DateOnly, d)
-		if _, err := s.db.Pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s PARTITION OF log_lines FOR VALUES FROM ('%s') TO ('%s')`,
-			partitionName(dd), d, dd.AddDate(0, 0, 1).Format(time.DateOnly))); err != nil {
-			t.Fatal(err)
+	// Of each hot table, an empty partition of last week and one with a
+	// row.
+	for _, table := range hotTables {
+		for _, d := range []string{"2026-01-01", "2026-01-02"} {
+			dd, _ := time.Parse(time.DateOnly, d)
+			if _, err := s.db.Pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')`,
+				partitionName(table, dd), table, d, dd.AddDate(0, 0, 1).Format(time.DateOnly))); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base, 1, func(int) string { return "x" }))); err != nil {
@@ -455,12 +482,27 @@ func TestPartitions(t *testing.T) {
 		SELECT '2026-01-02', id, 99, 1, '', 16, false, 'old' FROM log_streams`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.db.Pool.Exec(ctx, `INSERT INTO log_batches (day, stream_id, first_off, last_off, min_ts, max_ts, lines, bytes, levels, data)
+		SELECT '2026-01-02', id, 98, 98, 1, 1, 1, 3, 16, $1 FROM log_streams`,
+		encodeBatch([]Line{{Off: 98, TS: 1, Level: LevelUnknown, Text: "old"}})); err != nil {
+		t.Fatal(err)
+	}
 	dropped, err := maintainPartitions(ctx, s.db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(dropped) != "[log_lines_20260101]" {
+	if fmt.Sprint(dropped) != "[log_batches_20260101 log_lines_20260101]" {
 		t.Errorf("dropped %v", dropped)
+	}
+	// Every partition of log_batches compresses its data with lz4.
+	var parts, lz4 int
+	if err := s.db.Pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE a.attcompression = 'l')
+		FROM pg_inherits i JOIN pg_attribute a ON a.attrelid = i.inhrelid AND a.attname = 'data'
+		WHERE i.inhparent = 'log_batches'::regclass`).Scan(&parts, &lz4); err != nil {
+		t.Fatal(err)
+	}
+	if parts != daysAhead+2 || lz4 != parts {
+		t.Errorf("%d partitions, %d with lz4", parts, lz4)
 	}
 }
 
@@ -508,7 +550,7 @@ func TestIndexClaimsAcrossInstances(t *testing.T) {
 		}
 	}
 	var hot int
-	if err := d.Pool.QueryRow(ctx, `SELECT count(*) FROM log_lines`).Scan(&hot); err != nil {
+	if err := d.Pool.QueryRow(ctx, `SELECT count(*) FROM log_batches`).Scan(&hot); err != nil {
 		t.Fatal(err)
 	}
 	if n := idx.count("acme"); hot != 0 || n != streams*rounds*5 {

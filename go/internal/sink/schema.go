@@ -19,9 +19,16 @@ import (
 //go:embed migrations/*.sql
 var migrationFS embed.FS
 
-// tableLines is the hot stage, partitioned by the day a line arrived:
-// one partition a day, log_lines_YYYYMMDD.
-const tableLines = "log_lines"
+// The hot stage's tables, partitioned by the day a row arrived: one
+// partition a day, <table>_YYYYMMDD. log_batches holds it; log_lines did
+// before (a row a line) and goes once the instances of before are gone.
+const (
+	tableBatches = "log_batches"
+	tableLines   = "log_lines"
+)
+
+// hotTables are the tables whose partitions are made and dropped.
+var hotTables = []string{tableBatches, tableLines}
 
 // partitionLockKey serialises the creation and dropping of the hot stage's
 // partitions across instances ("sink" and a 2).
@@ -32,7 +39,7 @@ const daysAhead = 2
 
 // Migrate applies the sink's migrations (its own schema_migrations in its
 // own database) and creates the hot stage's partitions of today and the
-// next two days (DB clock, UTC).
+// next two days (DB clock, UTC), of each of hotTables.
 func Migrate(ctx context.Context, d *db.DB) error {
 	sub, err := fs.Sub(migrationFS, "migrations")
 	if err != nil {
@@ -48,8 +55,8 @@ func day(t time.Time) time.Time {
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }
 
-func partitionName(t time.Time) string {
-	return tableLines + "_" + day(t).Format("20060102")
+func partitionName(table string, t time.Time) string {
+	return table + "_" + day(t).Format("20060102")
 }
 
 // ensurePartitions creates the partitions of today and the next daysAhead
@@ -62,22 +69,24 @@ func ensurePartitions(ctx context.Context, tx pgx.Tx) error {
 	if err := tx.QueryRow(ctx, "SELECT (now() AT TIME ZONE 'utc')::date").Scan(&today); err != nil {
 		return err
 	}
-	for i := 0; i <= daysAhead; i++ {
-		dd := today.AddDate(0, 0, i)
-		// The names are made here from a constant and a date, never from
-		// input.
-		stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')",
-			pgx.Identifier{partitionName(dd)}.Sanitize(), tableLines,
-			dd.Format(time.DateOnly), dd.AddDate(0, 0, 1).Format(time.DateOnly))
-		if _, err := tx.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("create partition %s: %w", partitionName(dd), err)
+	for _, table := range hotTables {
+		for i := 0; i <= daysAhead; i++ {
+			dd := today.AddDate(0, 0, i)
+			// The names are made here from a constant and a date, never
+			// from input.
+			stmt := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')",
+				pgx.Identifier{partitionName(table, dd)}.Sanitize(), table,
+				dd.Format(time.DateOnly), dd.AddDate(0, 0, 1).Format(time.DateOnly))
+			if _, err := tx.Exec(ctx, stmt); err != nil {
+				return fmt.Errorf("create partition %s: %w", partitionName(table, dd), err)
+			}
 		}
 	}
 	return nil
 }
 
 // maintainPartitions creates the partitions ahead and drops those of the
-// days before yesterday that are empty: a line arrives into today's, so a
+// days before yesterday that are empty: a row arrives into today's, so a
 // past day's only empties. It returns the names dropped.
 func maintainPartitions(ctx context.Context, d *db.DB) ([]string, error) {
 	if err := d.Tx(ctx, func(tx pgx.Tx) error {
@@ -92,18 +101,26 @@ func maintainPartitions(ctx context.Context, d *db.DB) ([]string, error) {
 	if err := d.Pool.QueryRow(ctx, "SELECT (now() AT TIME ZONE 'utc')::date").Scan(&today); err != nil {
 		return nil, err
 	}
-	rows, err := d.Pool.Query(ctx, `SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-		WHERE i.inhparent = $1::regclass ORDER BY c.relname`, tableLines)
-	if err != nil {
-		return nil, err
-	}
-	names, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return nil, err
+	type partition struct{ table, name string }
+	var parts []partition
+	for _, table := range hotTables {
+		rows, err := d.Pool.Query(ctx, `SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+			WHERE i.inhparent = $1::regclass ORDER BY c.relname`, table)
+		if err != nil {
+			return nil, err
+		}
+		names, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range names {
+			parts = append(parts, partition{table, n})
+		}
 	}
 	var dropped []string
-	for _, n := range names {
-		suffix, ok := strings.CutPrefix(n, tableLines+"_")
+	for _, p := range parts {
+		n := p.name
+		suffix, ok := strings.CutPrefix(n, p.table+"_")
 		if !ok {
 			continue
 		}

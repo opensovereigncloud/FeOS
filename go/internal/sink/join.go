@@ -132,15 +132,6 @@ func partsOf(ctx context.Context, tx pgx.Tx, h *Line, upTo int64) (int64, []Line
 	if err := tx.QueryRow(ctx, `SELECT chunked_last FROM log_streams WHERE id = $1`, h.Stream).Scan(&mark); err != nil {
 		return 0, nil, err
 	}
-	rows, err := tx.Query(ctx, `SELECT off, partial, cont, text FROM log_lines
-		WHERE stream_id = $1 AND source = $2 AND off > $3 AND off <= $4 ORDER BY off LIMIT 2000`,
-		h.Stream, h.Source, h.Off, upTo)
-	if err != nil {
-		return 0, nil, err
-	}
-	hot, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Line, error) {
-		l := Line{Stream: h.Stream, Source: h.Source}
-		return l, r.Scan(&l.Off, &l.Partial, &l.Cont, &l.Text)
-	})
+	hot, err := hotAfter(ctx, tx, []int64{h.Stream}, []int64{h.Off}, upTo, &h.Source, 2000)
 	return mark, hot, err
 }

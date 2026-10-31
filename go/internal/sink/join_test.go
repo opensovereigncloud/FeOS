@@ -25,7 +25,8 @@ func TestPartialLinesJoined(t *testing.T) {
 	key, l := StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0)
 	big := strings.Repeat("x", 600<<10)
 	// The first batch goes to the cold stage, its rest stays hot; stderr
-	// runs between the parts; a re-sent batch changes nothing.
+	// runs between the parts; a re-sent batch changes nothing; the last
+	// line's rest comes in the next batch.
 	first := []Line{
 		part(0, 0, "stdout", "INFO a", false),
 		part(10, 1, "stdout", "ERROR b1 ", true),
@@ -47,6 +48,14 @@ func TestPartialLinesJoined(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The rest of the last line in a batch of its own, hot as well.
+	if err := s.Ingest(ctx, batch(key, l, []Line{part(100, 10, "stdout", " d2", false)})); err != nil {
+		t.Fatal(err)
+	}
+	var batches int
+	if err := s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_batches`).Scan(&batches); err != nil || batches != 2 {
+		t.Fatalf("%d hot batches: %v", batches, err)
+	}
 	type want struct {
 		text    string
 		off     string
@@ -54,7 +63,7 @@ func TestPartialLinesJoined(t *testing.T) {
 		level   string
 	}
 	all := []want{{"INFO a", "0", false, "info"}, {"ERROR b1 b2 b3 needle", "10", false, "error"}, {"e", "20", false, ""},
-		{"c", "50", false, ""}, {"<1 MiB>", "60", true, ""}, {"d1 open", "90", true, ""}}
+		{"c", "50", false, ""}, {"<1 MiB>", "60", true, ""}, {"d1 open d2", "90", false, ""}}
 	check := func(name string, got []LineJSON, w []want) {
 		t.Helper()
 		if len(got) != len(w) {

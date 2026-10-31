@@ -110,6 +110,17 @@ counted against its quota in the sink (§7).
 stage stays as below, but holds a line only until Quickwit has published
 it, seconds rather than minutes; there are no chunks of the sink's own.*
 
+*Changed on 2026-10-31: the hot stage is a row per batch, not per line
+(`log_batches`). A stream's part of an ingested batch is one row: its
+lines encoded in one column, which PostgreSQL compresses, beside their
+first and last offset, first and last time, count, bytes and level bits,
+which the reads and the indexer select by. A row a line cost an insert,
+two index entries, their WAL and its replication, then a delete, a dead
+tuple and vacuum, for every line; at a company's volume that made the
+database the bottleneck. The indexer takes whole batches and deletes
+them; a read filters a batch's lines itself. `log_lines` stays until the
+instances that wrote it are gone; the indexer drains what they left.*
+
 **Hot.** A batch lands in `log_lines` in the sink's PostgreSQL, one row
 per line (stream, offset, time, source, level, text), partitioned by day
 like `ferund`'s `traffic_records`. Recent reads and following a log come from here.

@@ -172,44 +172,8 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 		}
 	}
 
-	// The hot lines, in the scan's order, the filters applied here.
-	dir, cmp := "DESC", "<"
-	if q.Forward {
-		dir, cmp = "ASC", ">"
-	}
-	sql := `SELECT stream_id, off, ts, source, level, partial, text, trace FROM log_lines
-		WHERE stream_id = ANY($1) AND ts >= $2 AND ts <= $3 AND (level & $4) <> 0 AND NOT cont`
-	args := []any{ids, q.Since, q.Until, q.Levels}
-	if q.Cursor != nil {
-		sql += " AND (ts, stream_id, off) " + cmp + " ($5, $6, $7)"
-		args = append(args, q.Cursor.TS, q.Cursor.Stream, q.Cursor.Off)
-	}
-	sql += " ORDER BY ts " + dir + ", stream_id " + dir + ", off " + dir
-	rows, err := tx.Query(ctx, sql, args...)
+	hot, through, scanned, res.partial, err = s.readHot(ctx, tx, &q, ids)
 	if err != nil {
-		return scanResult{}, fmt.Errorf("hot lines: %w", err)
-	}
-	for rows.Next() {
-		var l Line
-		var lvl int16
-		if err := rows.Scan(&l.Stream, &l.Off, &l.TS, &l.Source, &lvl, &l.Partial, &l.Text, &l.Trace); err != nil {
-			rows.Close()
-			return scanResult{}, err
-		}
-		l.Level = int(lvl)
-		scanned += int64(len(l.Text))
-		if l.Partial || q.match(&l) {
-			hot = append(hot, l)
-		}
-		if len(hot) >= q.Limit || scanned >= s.cfg.ScanLimit {
-			p := l.pos()
-			through = &p
-			res.partial = len(hot) < q.Limit
-			break
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return scanResult{}, fmt.Errorf("hot lines: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -266,6 +230,126 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 		}
 	}
 	return res, nil
+}
+
+// readHot reads the hot lines of a read in the scan's order, those of
+// the streams ids in its range, after its cursor and of its levels, never
+// one that goes on with another (Cont): it reads the batches that may hold
+// some, those the farthest back in the scan's order first, and gives a
+// line once no batch left can hold one before it. It stops with enough
+// lines for the page (a partial one counts, to be joined) or at ScanLimit
+// bytes of their text, returning then the last line it read (through) and
+// whether the page is short.
+func (s *Store) readHot(ctx context.Context, tx pgx.Tx, q *Query, ids []int64) (hot []Line, through *pos, scanned int64,
+	partial bool, err error) {
+	takes := func(l *Line) bool { return l.Level&q.Levels != 0 && !l.Cont && q.inRange(l) }
+	order := func(a, b Line) int {
+		c := cmpPos(a.pos(), b.pos())
+		if !q.Forward {
+			c = -c
+		}
+		return c
+	}
+	pending, err := s.readLegacy(ctx, tx, q, ids)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	slices.SortFunc(pending, order)
+	// give gives the pending lines before edge (the next batch's earliest
+	// time in the scan's order), or all, and reports a stop.
+	give := func(all bool, edge int64) bool {
+		n := 0
+		defer func() { pending = pending[n:] }()
+		for ; n < len(pending); n++ {
+			l := pending[n]
+			if !all && ((q.Forward && l.TS >= edge) || (!q.Forward && l.TS <= edge)) {
+				return false
+			}
+			scanned += int64(len(l.Text))
+			if l.Partial || q.match(&l) {
+				hot = append(hot, l)
+			}
+			if len(hot) >= q.Limit || scanned >= s.cfg.ScanLimit {
+				p := l.pos()
+				through, partial = &p, len(hot) < q.Limit
+				n++
+				return true
+			}
+		}
+		return false
+	}
+	sql := `SELECT stream_id, min_ts, max_ts, data FROM log_batches
+		WHERE stream_id = ANY($1) AND max_ts >= $2 AND min_ts <= $3 AND (levels & $4) <> 0`
+	args := []any{ids, q.Since, q.Until, q.Levels}
+	switch {
+	case q.Cursor != nil && q.Forward:
+		sql += " AND max_ts >= $5"
+		args = append(args, q.Cursor.TS)
+	case q.Cursor != nil:
+		sql += " AND min_ts <= $5"
+		args = append(args, q.Cursor.TS)
+	}
+	if q.Forward {
+		sql += " ORDER BY min_ts, stream_id, first_off"
+	} else {
+		sql += " ORDER BY max_ts DESC, stream_id DESC, first_off DESC"
+	}
+	rows, err := tx.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, nil, 0, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var stream, minTS, maxTS int64
+		var data []byte
+		if err := rows.Scan(&stream, &minTS, &maxTS, &data); err != nil {
+			return nil, nil, 0, false, err
+		}
+		edge := maxTS
+		if q.Forward {
+			edge = minTS
+		}
+		if give(false, edge) {
+			return hot, through, scanned, partial, nil
+		}
+		ls, err := decodeBatch(data, stream)
+		if err != nil {
+			return nil, nil, 0, false, err
+		}
+		for i := range ls {
+			if takes(&ls[i]) {
+				pending = append(pending, ls[i])
+			}
+		}
+		slices.SortFunc(pending, order)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, 0, false, err
+	}
+	give(true, 0)
+	return hot, through, scanned, partial, nil
+}
+
+// readLegacy reads a read's hot lines of log_lines (transitional: the
+// instances of before write them until they are gone), as readHot takes
+// them.
+func (s *Store) readLegacy(ctx context.Context, tx pgx.Tx, q *Query, ids []int64) ([]Line, error) {
+	sql := `SELECT stream_id, off, ts, source, level, partial, cont, text, trace FROM log_lines
+		WHERE stream_id = ANY($1) AND ts >= $2 AND ts <= $3 AND (level & $4) <> 0 AND NOT cont`
+	args := []any{ids, q.Since, q.Until, q.Levels}
+	if q.Cursor != nil {
+		cmp := "<"
+		if q.Forward {
+			cmp = ">"
+		}
+		sql += " AND (ts, stream_id, off) " + cmp + " ($5, $6, $7)"
+		args = append(args, q.Cursor.TS, q.Cursor.Stream, q.Cursor.Off)
+	}
+	rows, err := tx.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, scanLegacyLine)
 }
 
 // earlier is whichever of a (nil: none) and b comes first in the scan's

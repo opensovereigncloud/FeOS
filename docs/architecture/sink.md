@@ -234,19 +234,32 @@ Bearer …`); the sink asks `ferund` `GET /api/v1/tenant` with it (`200
 {"tenant": "<name>"}`, `401` passed on) and keeps the answer a minute,
 by the token's SHA-256.
 
-**Stages.** `log_streams` (one row per stream key: labels, first and last
-time, next offset, ended, `chunked_last`, the mark of what the index
-holds; its ID `s_` and 16 random hex digits) and `log_lines` (hot:
-stream, offset, time, source, level, partial, text, trace ID, and
-`cont`: the line goes on with the last of its source, which was partial;
-partitioned by the day it arrived) in the database; the cold stage is
-Quickwit (§10). Every second, four loops of each instance claim streams
-with hot lines (at most 32 a round, `FOR UPDATE SKIP LOCKED`, a lease of
-three minutes of the database's clock), send their lines, oldest offset
-first and at most 6 MiB of text a round, to the stream's index with
-`commit=wait_for`, and once Quickwit answers, the split holding them
-published, delete them and move the mark past them, in one transaction a
-stream. A failure of the index holds the round's claims for 30 s. A
+**Stages.** `log_streams` (one row per stream key: labels, first and
+last time, next offset, ended, `chunked_last`, the mark of what the
+index holds; its ID `s_` and 16 random hex digits) and `log_batches`
+(hot: a row per stream and ingested batch, migration `0006`) in the
+database; the cold stage is Quickwit (§10). A batch row has the stream,
+the first and last offset, the lines' earliest and latest time, the
+number of lines, their bytes of text, the bits of their levels, and
+`data`: the lines in offset order, each its offset, time and level
+(varints), a flags byte (partial, and `cont`: the line goes on with the
+last of its source, which was partial), and its source, text and trace
+ID (each a length and its bytes), which PostgreSQL compresses with lz4;
+partitioned by the day it arrived. A stream's part of an Export is one
+row, several when its text is over 2 MiB. The reads select the batches
+whose times and levels may hold lines they want and filter the lines
+themselves. Every second, four loops of each instance claim streams with
+hot lines (at most 32 a round, `FOR UPDATE SKIP LOCKED`, a lease of
+three minutes of the database's clock), send the lines of their batches,
+oldest first, whole, at most 6 MiB of text a round (at least one batch),
+to the stream's index with `commit=wait_for`, and once Quickwit answers,
+the split holding them published, delete those batches and move the mark
+to the last one's last offset, in one transaction a stream. A failure of
+the index holds the round's claims for 30 s. Until 2026-10-31 the hot
+stage was `log_lines`, a row a line; while instances of before still
+write it (a rolling update), the reads take its lines as hot lines too
+and the indexer drains them with the batches, in the order of their
+offsets. That goes, with `log_lines`, in a later release. A
 stream's index is `<--index-prefix>-v<version>-<days>d`
 (`ferun-logs-v2-30d`): the days of `--log-retention`, or of
 `--log-retention-max` for a stream whose `ferun.retention_days` is
@@ -307,9 +320,10 @@ zero.
 
 **Retention**: `--log-retention` (720 h) or a stream's
 `ferun.retention_days`, at most `--log-retention-max` (9600 h); a sweep
-every 10 min deletes expired hot lines by their times, the streams whose
-last line is past their retention and that have nothing left in the
-database, and drops empty day partitions of `log_lines`. Quickwit drops a
+every 10 min deletes the hot batches whose latest line is past
+retention, the streams whose last line is past their retention and that
+have nothing left in the database, and drops empty day partitions of
+`log_batches` (and `log_lines`). Quickwit drops a
 split of an index once its newest line is past the index's retention,
 which is at least the stream's; a read never answers a line of a stream
 that is gone.

@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -144,6 +146,9 @@ type claimed struct {
 	st        *streamRow
 	retention *int
 	lines     []Line
+	// batches are the first offsets of the batches the lines are of,
+	// legacy the offsets of those of log_lines (transitional).
+	batches, legacy []int64
 }
 
 // indexRound claims the streams with hot lines (FOR UPDATE SKIP LOCKED,
@@ -188,7 +193,7 @@ func (s *Store) indexRound(ctx context.Context) (int, error) {
 		if size >= indexBatchBytes {
 			break
 		}
-		lines, n, err := s.hotLines(ctx, c.st.ID, indexBatchBytes-size)
+		lines, n, err := s.hotLines(ctx, c, indexBatchBytes-size)
 		if err != nil {
 			return 0, err
 		}
@@ -227,42 +232,99 @@ func (s *Store) indexRound(ctx context.Context) (int, error) {
 	return moved, errors.Join(errs...)
 }
 
-// hotLines reads a stream's hot lines, oldest offset first, until limit
-// bytes of text (at least one line); it returns them and their bytes.
-func (s *Store) hotLines(ctx context.Context, stream int64, limit int64) ([]Line, int64, error) {
-	rows, err := s.db.Pool.Query(ctx, `SELECT off, ts, source, level, partial, cont, text, trace FROM log_lines
-		WHERE stream_id = $1 ORDER BY off LIMIT 100000`, stream)
+// maxIndexLines bounds the lines one stream gives a round.
+const maxIndexLines = 100000
+
+// hotLines reads a claimed stream's hot batches, oldest offset first,
+// whole, until limit bytes of text or maxIndexLines (at least one batch);
+// it returns their lines and bytes and notes the batches in c. The lines
+// an instance of before left in log_lines go with them, in the order of
+// their offsets (transitional: the drain of log_lines).
+func (s *Store) hotLines(ctx context.Context, c *claimed, limit int64) ([]Line, int64, error) {
+	stream := c.st.ID
+	c.batches, c.legacy = nil, nil
+	rows, err := s.db.Pool.Query(ctx, `SELECT first_off, last_off, lines, bytes FROM log_batches
+		WHERE stream_id = $1 ORDER BY first_off LIMIT 10000`, stream)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer rows.Close()
+	type unit struct {
+		first, last, lines, bytes int64
+		legacy                    *Line
+	}
+	units, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (unit, error) {
+		var u unit
+		err := r.Scan(&u.first, &u.last, &u.lines, &u.bytes)
+		return u, err
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	// Each list is the first of its table; past the last of a full one,
+	// the other's are not taken, so what is taken is the stream's first.
+	bound := int64(math.MaxInt64)
+	if len(units) == 10000 {
+		bound = units[len(units)-1].last
+	}
+	legacy, err := legacyLines(ctx, s.db.Pool, stream, maxIndexLines)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(legacy) == maxIndexLines {
+		bound = min(bound, legacy[len(legacy)-1].Off)
+	}
+	for i := range legacy {
+		l := &legacy[i]
+		units = append(units, unit{first: l.Off, last: l.Off, lines: 1, bytes: int64(len(l.Text)), legacy: l})
+	}
+	slices.SortFunc(units, func(a, b unit) int { return cmpInt(a.first, b.first) })
 	var lines []Line
-	var size int64
-	for rows.Next() {
-		l := Line{Stream: stream}
-		var lvl int16
-		if err := rows.Scan(&l.Off, &l.TS, &l.Source, &lvl, &l.Partial, &l.Cont, &l.Text, &l.Trace); err != nil {
-			return nil, 0, err
-		}
-		l.Level = int(lvl)
-		if len(lines) > 0 && size+int64(len(l.Text)) > limit {
+	var size, count int64
+	for _, u := range units {
+		if u.first > bound || (len(c.batches)+len(c.legacy) > 0 && (size+u.bytes > limit || count+u.lines > maxIndexLines)) {
 			break
 		}
-		lines = append(lines, l)
-		size += int64(len(l.Text))
+		size, count = size+u.bytes, count+u.lines
+		if u.legacy != nil {
+			c.legacy = append(c.legacy, u.first)
+			lines = append(lines, *u.legacy)
+		} else {
+			c.batches = append(c.batches, u.first)
+		}
 	}
-	return lines, size, rows.Err()
+	if len(c.batches) > 0 {
+		rows, err := s.db.Pool.Query(ctx, `SELECT data FROM log_batches WHERE stream_id = $1 AND first_off = ANY($2)`,
+			stream, c.batches)
+		if err != nil {
+			return nil, 0, err
+		}
+		for rows.Next() {
+			var data []byte
+			if err := rows.Scan(&data); err != nil {
+				rows.Close()
+				return nil, 0, err
+			}
+			ls, err := decodeBatch(data, stream)
+			if err != nil {
+				rows.Close()
+				return nil, 0, err
+			}
+			lines = append(lines, ls...)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, 0, err
+		}
+	}
+	slices.SortFunc(lines, func(a, b Line) int { return cmpInt(a.Off, b.Off) })
+	return lines, size, nil
 }
 
 // markIndexed moves a claimed stream's mark past the lines it indexed and
-// deletes them, unless its claim went to another instance meanwhile (that
-// one indexes them too: the reads drop the second copy).
+// deletes their batches, unless its claim went to another instance
+// meanwhile (that one indexes them too: the reads drop the second copy).
 func (s *Store) markIndexed(ctx context.Context, c *claimed) error {
-	offs := make([]int64, len(c.lines))
-	for i, l := range c.lines {
-		offs[i] = l.Off
-	}
-	last := offs[len(offs)-1]
+	last := c.lines[len(c.lines)-1].Off
 	return s.db.Tx(ctx, func(tx pgx.Tx) error {
 		var owner *string
 		err := tx.QueryRow(ctx, `SELECT chunk_owner FROM log_streams WHERE id = $1 FOR UPDATE`, c.st.ID).Scan(&owner)
@@ -277,10 +339,19 @@ func (s *Store) markIndexed(ctx context.Context, c *claimed) error {
 			return nil
 		}
 		var n, b int64
-		if err := tx.QueryRow(ctx, `WITH d AS (DELETE FROM log_lines WHERE stream_id = $1 AND off = ANY($2)
-				RETURNING octet_length(text) AS b)
-			SELECT count(*), coalesce(sum(b), 0) FROM d`, c.st.ID, offs).Scan(&n, &b); err != nil {
-			return fmt.Errorf("delete the lines: %w", err)
+		if err := tx.QueryRow(ctx, `WITH d AS (DELETE FROM log_batches WHERE stream_id = $1 AND first_off = ANY($2)
+				RETURNING lines, bytes)
+			SELECT coalesce(sum(lines), 0), coalesce(sum(bytes), 0) FROM d`, c.st.ID, c.batches).Scan(&n, &b); err != nil {
+			return fmt.Errorf("delete the batches: %w", err)
+		}
+		if len(c.legacy) > 0 {
+			var ln, lb int64
+			if err := tx.QueryRow(ctx, `WITH d AS (DELETE FROM log_lines WHERE stream_id = $1 AND off = ANY($2)
+					RETURNING octet_length(text) AS b)
+				SELECT count(*), coalesce(sum(b), 0) FROM d`, c.st.ID, c.legacy).Scan(&ln, &lb); err != nil {
+				return fmt.Errorf("delete the lines: %w", err)
+			}
+			n, b = n+ln, b+lb
 		}
 		_, err = tx.Exec(ctx, `UPDATE log_streams SET hot_lines = greatest(hot_lines - $2, 0), hot_bytes = greatest(hot_bytes - $3, 0),
 				hot_since = CASE WHEN hot_lines - $2 > 0 THEN chunk_claimed_at END,

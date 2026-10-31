@@ -110,8 +110,8 @@ func newSID() (string, error) {
 }
 
 // Ingest stores a batch in one transaction: each stream's row (its
-// labels the first write's), its lines once per offset (a line at or
-// below the stream's mark, or already hot, is taken as stored), the
+// labels the first write's), its new lines as a row of log_batches (a
+// line at or below the stream's mark or its last offset is stored), the
 // stream's counters and times, and the tenants' usage of
 // the day. A stream of a tenant over its quota is left out and Ingest
 // returns ErrQuota (wrapped) after the commit.
@@ -208,10 +208,9 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 	slices.SortStableFunc(b.Lines, func(x, y Line) int { return cmpInt(x.Off, y.Off) })
 	next, last := b.Next, int64(-1)
 	from := max(chunkedLast, lastOff)
-	var offs, tss []int64
-	var sources, texts, traces []string
-	var levels []int16
-	var partials, conts []bool
+	var fresh []Line
+	var n, bytes int64
+	var minTS, maxTS *int64
 	for _, ln := range b.Lines {
 		next = max(next, ln.Off)
 		last = max(last, ln.Off)
@@ -220,52 +219,26 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 		}
 		from = ln.Off
 		bit := sourceBit(ln.Source)
-		conts = append(conts, open&bit != 0)
+		ln.Cont = open&bit != 0
 		if ln.Partial {
 			open |= bit
 		} else {
 			open &^= bit
 		}
-		offs = append(offs, ln.Off)
-		tss = append(tss, ln.TS)
-		sources = append(sources, ln.Source)
-		levels = append(levels, int16(ln.Level))
-		partials = append(partials, ln.Partial)
-		texts = append(texts, ln.Text)
-		traces = append(traces, ln.Trace)
+		fresh = append(fresh, ln)
+		n++
+		bytes += int64(len(ln.Text))
+		if minTS == nil || ln.TS < *minTS {
+			minTS = &ln.TS
+		}
+		if maxTS == nil || ln.TS > *maxTS {
+			maxTS = &ln.TS
+		}
 	}
-	var n, bytes int64
-	var minTS, maxTS *int64
-	if len(offs) > 0 {
-		rows, err := tx.Query(ctx, `INSERT INTO log_lines (stream_id, off, ts, source, level, partial, cont, text, trace)
-			SELECT $1, x.off, x.ts, x.source, x.level, x.partial, x.cont, x.text, x.trace
-			FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::smallint[], $6::boolean[], $7::boolean[], $8::text[],
-				$9::text[]) AS x(off, ts, source, level, partial, cont, text, trace)
-			WHERE NOT EXISTS (SELECT 1 FROM log_lines l WHERE l.stream_id = $1 AND l.off = x.off)
-			ON CONFLICT DO NOTHING
-			RETURNING ts, octet_length(text)`, id, offs, tss, sources, levels, partials, conts, texts, traces)
-		if err != nil {
-			return 0, fmt.Errorf("lines: %w", err)
-		}
-		for rows.Next() {
-			var ts, size int64
-			if err := rows.Scan(&ts, &size); err != nil {
-				rows.Close()
-				return 0, err
-			}
-			n++
-			bytes += size
-			if minTS == nil || ts < *minTS {
-				minTS = &ts
-			}
-			if maxTS == nil || ts > *maxTS {
-				maxTS = &ts
-			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return 0, fmt.Errorf("lines: %w", err)
-		}
+	// The stream's lock and its last offset make each of them new: a
+	// batch sent again stores nothing, one that overlaps its new lines.
+	if err := insertBatches(ctx, tx, id, fresh); err != nil {
+		return 0, fmt.Errorf("lines: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE log_streams SET
 			lines = lines + $2, bytes = bytes + $3, hot_lines = hot_lines + $2, hot_bytes = hot_bytes + $3,
