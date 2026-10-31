@@ -5,13 +5,17 @@
 # (README.md). Run from the repository's root: make -C deploy/gardener
 # <target>, with KUBECONFIG at the shoot. The parameters come from
 # config.env (config.env.example). Pushing needs `docker login` at
-# REGISTRY. ferund's image and FeChat's manifests are deploy/k3s's, built
+# PLATFORM_REGISTRY (ferund, ferun-ingress, ferun-sink, feos-node) and
+# REGISTRY (feos-k8s, FeChat). ferund's image and FeChat's manifests are deploy/k3s's, built
 # and filled in with this directory's parameters; their routes are this
 # directory's HTTPRoutes in place of k3s's Ingresses.
 
 REPO_ROOT := $(abspath ../..)
 -include config.env
 REGISTRY ?= $(if $(DOMAIN),oci.$(DOMAIN))
+# Where the platform's own images live: GHCR, not the projects' registry
+# (config.env.example); pulled with the Secret ghcr-pull.
+PLATFORM_REGISTRY ?= ghcr.io/gardenlinux/feos
 # How long calls wait for a node that announced it stops: ferund's
 # --rollout-grace (config.env.example).
 FERUN_ROLLOUT_GRACE ?= 8m
@@ -35,8 +39,8 @@ FERUN_DENY_PREFIX = $(if $(strip $(DENY_PREFIXES)),default$(comma)$(subst $(eval
 TAG ?= dev
 # ferun-sink's image: a platform image, on GHCR with FeOS's others, not in
 # the projects' registry (README.md, The sink).
-SINK_IMAGE ?= ghcr.io/gardenlinux/feos/ferun-sink:$(TAG)
-export DOMAIN REGISTRY SINK_IMAGE OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE
+SINK_IMAGE ?= $(PLATFORM_REGISTRY)/ferun-sink:$(TAG)
+export DOMAIN REGISTRY PLATFORM_REGISTRY SINK_IMAGE OIDC_ISSUER WORKER_POOL NODE_NAME_PREFIX FERUN_NODES_IP FERUN_ROLLOUT_GRACE FECHAT_MODEL APPS_ZONE NODE_CIDR DENY_PREFIXES FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE
 DOCKER ?= docker
 PACKAGES_DIR ?= $(REPO_ROOT)/target/packages
 CONTEXT := $(REPO_ROOT)/target/gardener/feos-node
@@ -65,15 +69,15 @@ cat-yaml = awk 'FNR==1{print "---"}1' $(1)
 # feosd, diskd, feosctl, Firecracker and the guest from the packages, for
 # the feos-node pod (ADR 0020).
 feos-node: ## Build the feos-node image from target/packages.
-	$(call need,REGISTRY)
+	$(call need,PLATFORM_REGISTRY)
 	@ls $(PACKAGES_DIR)/feosd_*.deb >/dev/null 2>&1 || { echo "no packages; run make packages"; exit 1; }
 	rm -rf $(CONTEXT) && mkdir -p $(CONTEXT)
 	cp $(PACKAGES_DIR)/*.deb feos/Dockerfile feos/run $(CONTEXT)/
 	dpkg-deb -f $$(ls $(PACKAGES_DIR)/feosd_*.deb | head -1) Version > $(CONTEXT)/version
-	$(DOCKER) build -t $(REGISTRY)/feos-node:$(TAG) $(CONTEXT)
+	$(DOCKER) build -t $(PLATFORM_REGISTRY)/feos-node:$(TAG) $(CONTEXT)
 
 push-feos-node: feos-node ## Build and push the feos-node image.
-	$(DOCKER) push $(REGISTRY)/feos-node:$(TAG)
+	$(DOCKER) push $(PLATFORM_REGISTRY)/feos-node:$(TAG)
 
 deploy-feos: push-feos-node ## Push and roll the feos-node DaemonSet, a node at a time.
 	kubectl -n feos rollout restart daemonset/feos-node
@@ -92,7 +96,7 @@ deploy-feos-k8s: $(MANIFESTS)/feos-k8s.yaml push-feos-k8s ## Push, apply and rol
 	kubectl -n feos rollout status deployment/feos-k8s --timeout=5m
 
 ferund push-ferund deploy-ferund: ## ferund's image and rollout, as deploy/k3s's.
-	$(MAKE) -C ../k3s $@ REGISTRY='$(REGISTRY)' TAG='$(TAG)' DOCKER='$(DOCKER)'
+	$(MAKE) -C ../k3s $@ REGISTRY='$(PLATFORM_REGISTRY)' TAG='$(TAG)' DOCKER='$(DOCKER)'
 
 # ferun-ingress ships in ferund's image: roll ferund first (README.md, The
 # ingress).
@@ -112,6 +116,7 @@ deploy-ferun-sink: push-ferun-sink ## Push ferun-sink's image and roll it.
 
 manifests: $(MANIFESTS)/feos.yaml $(MANIFESTS)/feos-k8s.yaml $(MANIFESTS)/ferun.yaml $(MANIFESTS)/fechat.yaml $(MANIFESTS)/registry.yaml $(MANIFESTS)/ferun-ingress.yaml $(MANIFESTS)/ferun-sink.yaml ## Write every part's manifests, with the parameters, to target/gardener/manifests.
 
+$(MANIFESTS)/feos.yaml: REGISTRY = $(PLATFORM_REGISTRY)
 $(MANIFESTS)/feos.yaml: FORCE
 	$(call render,DOMAIN REGISTRY WORKER_POOL FERUN_NODES_IP DENY_PREFIXES,cat feos/feos.yaml)
 
@@ -120,6 +125,7 @@ $(MANIFESTS)/feos-k8s.yaml: FORCE
 
 # The k3s manifests live outside this directory. An empty APPS_ZONE
 # switches ferund's hosts off.
+$(MANIFESTS)/ferun.yaml: REGISTRY = $(PLATFORM_REGISTRY)
 $(MANIFESTS)/ferun.yaml: FORCE
 	$(call render,DOMAIN REGISTRY OIDC_ISSUER FERUN_NODES_IP FERUN_ROLLOUT_GRACE FERUN_DENY_PREFIX GATEWAY_NAMESPACE GATEWAY_NAME,kubectl kustomize --load-restrictor LoadRestrictionsNone ferun,APPS_ZONE EDGE_NAME EDGE_ADDRESSES DOMAIN_CHALLENGE_LABEL ACME_DIRECTORY ACME_EMAIL ACME_PROFILE)
 
@@ -136,6 +142,7 @@ $(MANIFESTS)/registry.yaml: FORCE
 	$(call render,DOMAIN GATEWAY_NAMESPACE GATEWAY_NAME,cat registry/registry.yaml)
 
 # Only with an apps zone: without one there is nothing to serve.
+$(MANIFESTS)/ferun-ingress.yaml: REGISTRY = $(PLATFORM_REGISTRY)
 $(MANIFESTS)/ferun-ingress.yaml: FORCE
 	$(call render,DOMAIN REGISTRY FERUN_NODES_IP APPS_ZONE NODE_CIDR,cat ferun-ingress/ferun-ingress.yaml)
 

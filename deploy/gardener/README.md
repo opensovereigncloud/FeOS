@@ -152,13 +152,22 @@ The issuer, and the registry, whose secrets
     kubectl -n registry create secret generic registry-auth --from-file=htpasswd=<htpasswd>
     docker login <REGISTRY>
 
-Every namespace that pulls from it, `feos`, `ferun` and `fechat`, needs
-the secret `oci-pull` with the registry's credentials, as
-[`../k3s/README.md`](../k3s/README.md) makes it.
+Every namespace that pulls from it, `feos` (feos-k8s) and `fechat`,
+needs the secret `oci-pull` with the registry's credentials, as
+[`../k3s/README.md`](../k3s/README.md) makes it. The platform's own
+images, ferund (with ferun-ingress), ferun-sink and feos-node, are on
+GHCR (`PLATFORM_REGISTRY`, `ghcr.io/gardenlinux/feos`), not in the
+projects' registry: while the packages there are not public, the
+namespaces `ferun`, `ferun-ingress` and `feos` need the secret
+`ghcr-pull`, a token that reads them (`read:packages`), and pushing
+needs a login with `write:packages`:
+
+    kubectl -n <namespace> create secret docker-registry ghcr-pull \
+      --docker-server=ghcr.io --docker-username=<user> --docker-password=<token>
 
 ferund, with CloudNativePG running ([What it needs](#what-it-needs)):
 the CA and the secrets of [`../k3s/README.md`](../k3s/README.md),
-`ferun-ca`, `oci-pull`, `ferund`, `ferund-secret-key` and
+`ferun-ca`, `ghcr-pull`, `ferund`, `ferund-secret-key` and
 `oidc-client-ferun`. The secret `ferund` holds only `FERUN_ADMIN_USERS`
 and `FERUN_BOOTSTRAP_TOKEN`: the database's URL is built in
 [`ferun/kustomization.yaml`](ferun/kustomization.yaml), and its password
@@ -188,6 +197,7 @@ from `kube-system/shoot-info` and stops if `DENY_PREFIXES` leaves one out:
     make packages FEOS_VERSION=...
     make -C deploy/gardener push-feos-node apply-feos
     kubectl -n feos create secret docker-registry oci-pull ...
+    kubectl -n feos create secret docker-registry ghcr-pull ...
     kubectl -n feos create secret generic diskd-s3 --from-env-file=<s3.env> \
       --from-literal=DISKD_S3_PREFIX=<prefix>/
     kubectl -n feos create secret generic feos-k8s-ferun --from-literal=credentials="feos-k8s:$pw"
@@ -361,12 +371,6 @@ is a platform image of its own on GHCR,
 Setting it up, with ferund on a version that issues service
 certificates (`POST /api/v1/service-certificates`) and answers `GET
 /api/v1/tenant`:
-
-0. The pull secret `ghcr-pull` in `ferun`, while FeOS's packages on GHCR
-   are not public: a token that reads them (`read:packages`):
-
-       kubectl -n ferun create secret docker-registry ghcr-pull \
-         --docker-server=ghcr.io --docker-username=<user> --docker-password=<token>
 
 1. The role `sink` of `ferun-db`: its password in a Secret, from which
    CloudNativePG makes the role (`managed.roles` in

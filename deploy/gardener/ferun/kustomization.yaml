@@ -39,6 +39,11 @@ patches:
         replicas: 3
         template:
           spec:
+            # ferund's image is on GHCR (PLATFORM_REGISTRY): the Secret
+            # ghcr-pull pulls it.
+            imagePullSecrets:
+              - $patch: replace
+              - name: ghcr-pull
             # A lost worker's instance starts again on another after a
             # minute instead of five: until then the other two carry every
             # stream.
@@ -66,6 +71,14 @@ patches:
                   # networks, which may lie outside it (config.env.example).
                   - name: FERUN_DENY_PREFIX
                     value: '${FERUN_DENY_PREFIX}'
+                  # The sink (ADR 0026, ../ferun-sink): the nodes ship to
+                  # its ingest, a headless Service's name that ferund
+                  # resolves for them, since a host reaches no ClusterIP;
+                  # ferund reads it at its API.
+                  - name: FERUN_SINK_ENDPOINT
+                    value: ferun-sink-ingest.ferun.svc.cluster.local:4317
+                  - name: FERUN_SINK_URL
+                    value: http://ferun-sink.ferun.svc:8080
                   # ferun-db's primary, whichever instance that is: the -rw
                   # service follows it, and read-write refuses a connection
                   # that lands on a standby during a switchover. This wins

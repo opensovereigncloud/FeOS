@@ -73,7 +73,7 @@ spec:
       # --stop-grace says the same, 300 s by default.
       terminationGracePeriodSeconds: 300
       imagePullSecrets:
-        - name: oci-pull
+        - name: ghcr-pull
       initContainers:
         - name: prepare
           image: ${REGISTRY}/feos-node:dev
