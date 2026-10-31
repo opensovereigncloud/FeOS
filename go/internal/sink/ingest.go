@@ -34,6 +34,16 @@ const (
 	maxKeys          = 1000
 )
 
+// A stream's sources: an ingress's access log (ferun.source), and a
+// container's output (any other).
+const (
+	SourceIngress   = "ingress"
+	SourceContainer = "container"
+	// ingressPod starts the ferun.pod of an ingress's streams, the
+	// instance's name follows.
+	ingressPod = "ingress/"
+)
+
 // The resource and record attributes the sink reads (sink.md, The OTLP
 // shape).
 const (
@@ -50,6 +60,7 @@ const (
 	attrJob           = "ferun.job"
 	attrAttempt       = "ferun.attempt"
 	attrRetentionDays = "ferun.retention_days"
+	attrSource        = "ferun.source"
 	attrOffset        = "log.offset"
 	attrNextOffset    = "log.next_offset"
 	attrIOStream      = "log.iostream"
@@ -66,7 +77,7 @@ type ingest struct {
 }
 
 // newIngestServer is the ingest's gRPC server: TLS of the identity, nodes
-// only, LogsService and SinkService.
+// and ingresses only, LogsService and SinkService.
 func newIngestServer(store *Store, ident *Identity, log *slog.Logger) *grpc.Server {
 	in := &ingest{store: store, ident: ident, log: log}
 	srv := grpc.NewServer(
@@ -82,10 +93,10 @@ func newIngestServer(store *Store, ident *Identity, log *slog.Logger) *grpc.Serv
 	return srv
 }
 
-type nodeKey struct{}
+type peerKey struct{}
 
-// authorize puts the node's name, from its verified certificate, into the
-// context; a call without one is refused.
+// authorize puts the peer, from its verified certificate, into the
+// context; a call without one is refused, and SinkService is the nodes'.
 func (in *ingest) authorize(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
 	p, ok := peer.FromContext(ctx)
 	if !ok {
@@ -95,21 +106,35 @@ func (in *ingest) authorize(ctx context.Context, req any, info *grpc.UnaryServer
 	if !ok {
 		return nil, status.Error(codes.Unauthenticated, "not TLS")
 	}
-	node, err := in.ident.verifyNode(ti.State.PeerCertificates)
+	pr, err := in.ident.verifyPeer(ti.State.PeerCertificates)
 	if err != nil {
-		return nil, status.Errorf(codes.PermissionDenied, "not a node: %v", err)
+		return nil, status.Errorf(codes.PermissionDenied, "not a node or an ingress: %v", err)
 	}
-	return h(context.WithValue(ctx, nodeKey{}, node), req)
+	if pr.node == "" && strings.HasPrefix(info.FullMethod, "/"+sinkv1.SinkService_ServiceDesc.ServiceName+"/") {
+		return nil, status.Error(codes.PermissionDenied, "the sink service is the nodes'")
+	}
+	return h(context.WithValue(ctx, peerKey{}, pr), req)
 }
 
+func peerOf(ctx context.Context) ingestPeer {
+	p, _ := ctx.Value(peerKey{}).(ingestPeer)
+	return p
+}
+
+// nodeOf is the peer's name, for the log.
 func nodeOf(ctx context.Context) string {
-	n, _ := ctx.Value(nodeKey{}).(string)
-	return n
+	if p := peerOf(ctx); p.node != "" {
+		return p.node
+	}
+	return ingressPod + peerOf(ctx).ingress
 }
 
 // Export stores a batch and answers once it is committed.
 func (in *ingest) Export(ctx context.Context, req *otlplogsv1.ExportLogsServiceRequest) (*otlplogsv1.ExportLogsServiceResponse, error) {
-	batch, err := parseExport(req, nodeOf(ctx), time.Now())
+	batch, err := parseExport(req, peerOf(ctx), time.Now())
+	if errors.Is(err, errNotYours) {
+		return nil, status.Error(codes.PermissionDenied, err.Error())
+	}
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -170,14 +195,20 @@ func streamKeys(ks []*sinkv1.StreamKey) ([]StreamKey, error) {
 	return out, nil
 }
 
+// errNotYours refuses a stream the peer may not write.
+var errNotYours = errors.New("not the peer's stream")
+
 // parseExport reads an Export into the streams' batches: a ResourceLogs a
 // stream (two of the same key are joined), its labels from the resource's
-// attributes and node, the node of the certificate. A record without
+// attributes and the peer, the node of the certificate. A record without
 // log.offset, a resource without its key or tenant, and more than
-// maxExportRecords records are refused. A record's time is its own, else
+// maxExportRecords records are refused. A stream with ferun.source
+// ingress is an ingress's whose name its ferun.pod has (ingress/<name>),
+// every other a node's, never of an ingress/ pod: one of another peer
+// refuses the request with errNotYours. A record's time is its own, else
 // when the node read it, else now; its text is made valid UTF-8 without
 // NULs, which PostgreSQL's text cannot hold.
-func parseExport(req *otlplogsv1.ExportLogsServiceRequest, node string, now time.Time) ([]StreamBatch, error) {
+func parseExport(req *otlplogsv1.ExportLogsServiceRequest, p ingestPeer, now time.Time) ([]StreamBatch, error) {
 	count := 0
 	for _, rl := range req.GetResourceLogs() {
 		for _, sl := range rl.GetScopeLogs() {
@@ -201,11 +232,22 @@ func parseExport(req *otlplogsv1.ExportLogsServiceRequest, node string, now time
 		if attrs[attrTenant] == "" {
 			return nil, fmt.Errorf("resource %d: %s is required", i, attrTenant)
 		}
+		source := SourceContainer
+		if attrs[attrSource] == SourceIngress {
+			source = SourceIngress
+			if p.ingress == "" || key.Pod != ingressPod+p.ingress {
+				return nil, fmt.Errorf("resource %d: %w: a stream of %s %s is the ingress's of its %s alone", i, errNotYours,
+					attrSource, SourceIngress, attrPod)
+			}
+		} else if p.node == "" || strings.HasPrefix(key.Pod, ingressPod) {
+			return nil, fmt.Errorf("resource %d: %w: a stream without %s %s is a node's, of a pod not %s…", i, errNotYours,
+				attrSource, SourceIngress, ingressPod)
+		}
 		j, ok := byKey[key]
 		if !ok {
 			j = len(out)
 			byKey[key] = j
-			out = append(out, StreamBatch{Key: key, Labels: labelsOf(attrs, node), Next: -1})
+			out = append(out, StreamBatch{Key: key, Labels: labelsOf(attrs, p.node, source), Next: -1})
 		}
 		b := &out[j]
 		for _, sl := range rl.GetScopeLogs() {
@@ -222,7 +264,7 @@ func parseExport(req *otlplogsv1.ExportLogsServiceRequest, node string, now time
 	return out, nil
 }
 
-func labelsOf(attrs map[string]string, node string) Labels {
+func labelsOf(attrs map[string]string, node, source string) Labels {
 	num := func(k string) int {
 		n, _ := strconv.Atoi(attrs[k])
 		return max(n, 0)
@@ -231,7 +273,7 @@ func labelsOf(attrs map[string]string, node string) Labels {
 		Tenant: attrs[attrTenant], Node: node, Instance: attrs[attrInstance],
 		Environment: attrs[attrEnvironment], Kind: attrs[attrKind], Object: attrs[attrObject], Job: attrs[attrJob],
 		Replica: num(attrReplica), Release: num(attrRelease), Attempt: num(attrAttempt),
-		RetentionDays: num(attrRetentionDays), Attrs: attrs,
+		RetentionDays: num(attrRetentionDays), Source: source, Attrs: attrs,
 	}
 }
 

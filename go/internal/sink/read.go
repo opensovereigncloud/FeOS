@@ -29,7 +29,7 @@ type streamRow struct {
 	Replica, Release                                            int
 	Job                                                         string
 	Attempt                                                     int
-	Node                                                        string
+	Node, Source                                                string
 	FirstNs, LastNs                                             *int64
 	EndedAt                                                     *time.Time
 	Lines, Bytes                                                int64
@@ -37,12 +37,12 @@ type streamRow struct {
 }
 
 const streamCols = `id, sid, tenant, instance, container, environment, kind, object, replica, release, job, attempt, node,
-	first_ns, last_ns, ended_at, lines, bytes, chunked_last, last_off`
+	source, first_ns, last_ns, ended_at, lines, bytes, chunked_last, last_off`
 
 func scanStream(r pgx.CollectableRow) (*streamRow, error) {
 	var s streamRow
 	err := r.Scan(&s.ID, &s.SID, &s.Tenant, &s.Instance, &s.Container, &s.Environment, &s.Kind, &s.Object,
-		&s.Replica, &s.Release, &s.Job, &s.Attempt, &s.Node, &s.FirstNs, &s.LastNs, &s.EndedAt,
+		&s.Replica, &s.Release, &s.Job, &s.Attempt, &s.Node, &s.Source, &s.FirstNs, &s.LastNs, &s.EndedAt,
 		&s.Lines, &s.Bytes, &s.ChunkedLast, &s.LastOff)
 	return &s, err
 }
@@ -72,6 +72,7 @@ func selectStreams(ctx context.Context, q db.Querier, tenant string, f streamFil
 	for _, c := range []struct{ col, v string }{
 		{"environment", f.sel.Environment}, {"kind", f.sel.Kind}, {"object", f.sel.Object},
 		{"instance", f.sel.Instance}, {"container", f.sel.Container}, {"job", f.sel.Job}, {"sid", f.sel.Stream},
+		{"source", f.sel.Source},
 	} {
 		if c.v != "" {
 			add(c.col+" = ?", c.v)
@@ -398,6 +399,7 @@ type StreamJSON struct {
 	Job         string     `json:"job"`
 	Attempt     int        `json:"attempt"`
 	Node        string     `json:"node"`
+	Source      string     `json:"source"`
 	FirstTime   *time.Time `json:"firstTime"`
 	LastTime    *time.Time `json:"lastTime"`
 	EndedAt     *time.Time `json:"endedAt"`
@@ -422,7 +424,7 @@ func (st *streamRow) json() StreamJSON {
 	return StreamJSON{
 		ID: st.SID, Tenant: st.Tenant, Instance: st.Instance, Container: st.Container, Environment: st.Environment,
 		Kind: st.Kind, Object: st.Object, Replica: st.Replica, Release: st.Release, Job: st.Job, Attempt: st.Attempt,
-		Node: st.Node, FirstTime: nsTime(st.FirstNs), LastTime: nsTime(st.LastNs), EndedAt: ended,
+		Node: st.Node, Source: st.Source, FirstTime: nsTime(st.FirstNs), LastTime: nsTime(st.LastNs), EndedAt: ended,
 		Lines: st.Lines, Bytes: st.Bytes,
 	}
 }

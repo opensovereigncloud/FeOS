@@ -25,10 +25,11 @@ const (
 )
 
 // Selector selects streams by their labels; one of Environment, Job,
-// Instance and Stream is set.
+// Instance and Stream is set. Source is SourceIngress, SourceContainer
+// or "" for both.
 type Selector struct {
-	Environment, Kind, Object, Instance, Container, Job, Stream string
-	Replica, Attempt                                            *int
+	Environment, Kind, Object, Instance, Container, Job, Stream, Source string
+	Replica, Attempt                                                    *int
 }
 
 // Query is a read of /api/v1/logs: the selector, the time range in Unix
@@ -123,6 +124,10 @@ func parseSelector(v url.Values) (Selector, error) {
 	s := Selector{
 		Environment: v.Get("environment"), Kind: v.Get("kind"), Object: v.Get("object"),
 		Instance: v.Get("instance"), Container: v.Get("container"), Job: v.Get("job"), Stream: v.Get("stream"),
+		Source: v.Get("source"),
+	}
+	if s.Source != "" && s.Source != SourceIngress && s.Source != SourceContainer {
+		return Selector{}, fmt.Errorf("source must be ingress or container")
 	}
 	for _, n := range []struct {
 		name string

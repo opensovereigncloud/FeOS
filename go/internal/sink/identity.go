@@ -214,8 +214,8 @@ func parseCerts(text string) ([]*x509.Certificate, error) {
 
 // TLSConfig is the ingest's server configuration: the current
 // certificate, TLS 1.3, and a client certificate that verifies to the
-// current bundle for client authentication and names a node of the trust
-// domain (pki.ParseNodeID).
+// current bundle for client authentication and names a node or an
+// ingress of the trust domain (pki.ParseNodeID, pki.ParseIngressID).
 func (i *Identity) TLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion:             tls.VersionTLS13,
@@ -229,20 +229,25 @@ func (i *Identity) TLSConfig() *tls.Config {
 			return id.cert, nil
 		},
 		VerifyConnection: func(cs tls.ConnectionState) error {
-			_, err := i.verifyNode(cs.PeerCertificates)
+			_, err := i.verifyPeer(cs.PeerCertificates)
 			return err
 		},
 	}
 }
 
-// verifyNode checks a client's chain and returns its node's name.
-func (i *Identity) verifyNode(chain []*x509.Certificate) (string, error) {
+// ingestPeer is a client of the ingest: a node or an ingress, by its name.
+type ingestPeer struct {
+	node, ingress string
+}
+
+// verifyPeer checks a client's chain and returns whose it is.
+func (i *Identity) verifyPeer(chain []*x509.Certificate) (ingestPeer, error) {
 	id := i.cur.Load()
 	if id == nil {
-		return "", errors.New("no bundle yet")
+		return ingestPeer{}, errors.New("no bundle yet")
 	}
 	if len(chain) == 0 {
-		return "", errors.New("no client certificate")
+		return ingestPeer{}, errors.New("no client certificate")
 	}
 	inter := x509.NewCertPool()
 	for _, c := range chain[1:] {
@@ -250,7 +255,14 @@ func (i *Identity) verifyNode(chain []*x509.Certificate) (string, error) {
 	}
 	if _, err := chain[0].Verify(x509.VerifyOptions{Roots: id.bundle, Intermediates: inter,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
-		return "", fmt.Errorf("client certificate: %w", err)
+		return ingestPeer{}, fmt.Errorf("client certificate: %w", err)
 	}
-	return pki.ParseNodeID(i.td, chain[0])
+	node, err := pki.ParseNodeID(i.td, chain[0])
+	if err == nil {
+		return ingestPeer{node: node}, nil
+	}
+	if ingress, ierr := pki.ParseIngressID(i.td, chain[0]); ierr == nil {
+		return ingestPeer{ingress: ingress}, nil
+	}
+	return ingestPeer{}, fmt.Errorf("neither a node's nor an ingress's certificate: %w", err)
 }

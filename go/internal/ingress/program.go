@@ -132,6 +132,7 @@ func New(cfg Config, deps Deps) (*Program, error) {
 		MeshEndpoint:     cfg.MeshEndpoint,
 		MeshMTU:          cfg.MeshMTU,
 		Version:          cfg.Version,
+		SinkEndpoint:     cfg.SinkEndpoint,
 	}, agent.Deps{
 		Mesh:             deps.Mesh,
 		OnState:          p.onState,

@@ -1,7 +1,8 @@
 # The sink
 
 `ferun-sink` keeps the platform's logs (ADR 0026): every container's
-output of the pods FeRun makes, shipped by the nodes, kept in its
+output of the pods FeRun makes, shipped by the nodes, and the requests
+`ferun-ingress` answered, written by its instances, kept in its
 PostgreSQL first and in the object store after, and read by tenants over
 HTTP. This page is the contract between its parts; the ADR says why.
 
@@ -138,10 +139,11 @@ it, it sends to `ferund` as before (`PublishAccessLogs`).
   environment, service). Key: `ferun.pod` = `ingress/<instance name>`,
   `ferun.container` = `<environment id>/<service>`, `ferun.log_id` = the
   agent's start (a UUID). Labels: `ferun.tenant` (the environment's
-  owner), `ferun.environment`, `ferun.kind` = `service`, `ferun.object` =
-  the service, `ferun.source` = `ingress`. A record's `log.offset` is its
-  number in the stream from 0, `log.next_offset` the number after;
-  `log.iostream` none.
+  owner, as the proxy's routing table has it), `ferun.environment`,
+  `ferun.kind` = `service`, `ferun.object` = the service, `ferun.source`
+  = `ingress`. A record's `log.offset` is its number in the stream from
+  0, `log.next_offset` the number after; `log.iostream` none. The
+  stream's `node` is empty.
 - **Line**: the record as JSON, the fields and names of `ferund`'s
   `AccessLogRecord` (`tsNs` as a string, `time`, `durationNs`,
   `ingress`, `service`, `instance`, `host`, `method`, `path`, `proto`,
@@ -152,18 +154,28 @@ it, it sends to `ferund` as before (`PublishAccessLogs`).
 - **TLS**: the ingress presents its certificate
   (`spiffe://<td>/ingress/<name>`) and checks the sink's as a node does.
   The sink takes streams with `ferun.source` = `ingress` from an
-  ingress's certificate only, whose name is the key's, and every other
-  stream from a node's certificate only.
+  ingress's certificate only, whose name is the key's (`ferun.pod` =
+  `ingress/<name>`), and every other stream from a node's certificate
+  only, never one whose `ferun.pod` begins with `ingress/`; a request
+  with a stream of another is refused whole with `PERMISSION_DENIED`.
+  `SinkService` is the nodes' alone: an ingress needs no positions (each
+  start is a new stream) and ends no stream.
 - **Batches**: the agent's buffer (10,000 records) as now, a batch at
-  most 1,000 records or 1 MiB, every second; a failed batch is kept and
-  sent again with backoff (1 to 30 s) while new records wait in the
-  buffer, which drops and counts what overflows it.
+  most 1,000 records or 1 MiB of lines, every second or once 1,000 wait;
+  a failed batch is kept, with its offsets, and sent again with backoff
+  (1 to 30 s) while new records wait in the buffer, which drops and
+  counts what overflows it. A batch refused with `INVALID_ARGUMENT` or
+  `RESOURCE_EXHAUSTED` is dropped and counted, as is a record without a
+  tenant.
 - **Reading**: the selector `source` (`ingress` or `container`; none:
-  both) picks them; a stream's JSON has `source`. `ferund`'s `GET
-  /api/v1/environments/{env}/access-logs` reads them from the sink
-  (`environment`, `source=ingress`, `trace`, backward from `before`) and
-  answers its `AccessLogList` as before, the table `access_logs` only
-  for what the sink does not have.
+  both) picks them; a stream's JSON has `source` (`log_streams.source`,
+  migration `0003`, `container` for every stream before it). `ferund`'s
+  `GET /api/v1/environments/{env}/access-logs` reads them from the sink
+  (`environment`, `source=ingress`, `trace`, backward from `before`,
+  `since=0`) and answers its `AccessLogList` as before; when the sink
+  has fewer records than the page, the table `access_logs` gives the
+  rest, older than the sink's oldest, and the whole page when the sink
+  fails ([`ferund`](#ferund)).
 
 ## The sink
 
@@ -171,8 +183,10 @@ A program of `go/` (`go/cmd/ferun-sink`, `go/internal/sink`), its own
 database (`sink`, migrations of its own), two ports:
 
 - **ingest** (gRPC over TLS 1.3, `--ingest-listen`, default `:4317`):
-  `LogsService/Export` and `SinkService`, nodes only, from the first
-  certificate on. A batch is stored in one transaction and then
+  `LogsService/Export` and `SinkService`, nodes only, and
+  `LogsService/Export` for the ingresses' access logs ([The ingress's
+  access log](#the-ingresss-access-log)), from the first certificate
+  on. A batch is stored in one transaction and then
   answered; a line is stored once per (stream, offset), and one at or
   below the last offset stored counts as stored: a node sends a stream's
   lines in the order of their offsets. A tenant over
@@ -184,7 +198,8 @@ database (`sink`, migrations of its own), two ports:
   `ferun.pod`, `ferun.container`, `ferun.log_id` and `ferun.tenant` or a
   record without `log.offset` is refused. A stream's `node` is the name
   in the node's certificate, not `ferun.node`; the sink does not check
-  that the node runs the pod.
+  that the node runs the pod. A stream's `source` is `ingress` for
+  `ferun.source` `ingress`, else `container`.
 - **API** (HTTP, `--listen`, default `:8080`): the routes below, behind
   the cluster's Gateway at `run.<domain>/api/v1/logs` and
   `/api/v1/log-streams`; `/healthz`, 200 once the ingest serves and while
@@ -200,7 +215,8 @@ ServerAuth, and asks again at half its life. `<name>` is the token's,
 and the sink's `--name` must be it: the instances of a deployment share
 one token and name (`ferun-sink`). The sink checks the certificate's one
 URI and key and that it verifies to the bundle. The bundle verifies the
-nodes' certificates (ClientAuth, one URI `spiffe://<td>/node/<name>`).
+nodes' certificates (ClientAuth, one URI `spiffe://<td>/node/<name>`)
+and the ingresses' (`spiffe://<td>/ingress/<name>`).
 
 **Tenants.** A read brings the tenant's FeRun token (`Authorization:
 Bearer …`); the sink asks `ferund` `GET /api/v1/tenant` with it (`200
@@ -251,7 +267,7 @@ All routes need a tenant's token and answer only its streams.
 
 | parameter | |
 |---|---|
-| `environment`, `kind`, `object`, `replica`, `instance`, `container`, `job`, `attempt`, `stream` | the selector; one of `environment`, `job`, `instance`, `stream` is required |
+| `environment`, `kind`, `object`, `replica`, `instance`, `container`, `job`, `attempt`, `stream`, `source` | the selector; one of `environment`, `job`, `instance`, `stream` is required; `source` is `ingress` or `container` (none: both) |
 | `since`, `until` | RFC 3339 or Unix nanoseconds, both included; `until` defaults to now, `since` to `until` − 1 h (backward) or to the stream's start (forward), and, with `trace`, to the start of what is kept |
 | `q` | words that all appear, case insensitive; `-word` must not |
 | `re` | an RE2 expression |
@@ -270,7 +286,7 @@ All routes need a tenant's token and answer only its streams.
   ],
   "streams": {"s_…": {"id": "s_…", "tenant": "…", "instance": "…", "container": "main",
      "environment": "…", "kind": "service", "object": "api", "replica": 0, "release": 12,
-     "job": "", "attempt": 0, "node": "…", "firstTime": "…", "lastTime": "…", "endedAt": null,
+     "job": "", "attempt": 0, "node": "…", "source": "container", "firstTime": "…", "lastTime": "…", "endedAt": null,
      "lines": 1234, "bytes": 56789}},
   "cursor": "…",
   "partial": false
@@ -333,6 +349,12 @@ Deletes the streams, their lines and chunks. 204.
   requests of a token an hour (429).
 - `InstanceStatus.image`: the image the instance runs,
   `registry/repository@sha256:…` as the release resolved it.
+- `GET /api/v1/environments/{env}/access-logs` reads the ingress's
+  lines from the sink when `--sink-url` is set, with the caller's token
+  (`environment=<ID>&source=ingress&direction=backward&since=0&until=<beforeTsNs − 1>&trace=<traceId>&limit=<the rest>`,
+  paged up to 8 times), each line's JSON an `AccessLogRecord`; the table
+  `access_logs` gives what the page lacks, older than the sink's oldest,
+  and the whole page when the sink fails.
 - The objects' logs call and a job run's log read from the sink when
   `--sink-url` is set, with the caller's token
   (`instance=<sandbox ID>&container=main&direction=backward&since=<its

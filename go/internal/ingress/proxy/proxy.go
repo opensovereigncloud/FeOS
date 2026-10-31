@@ -586,12 +586,13 @@ type request struct {
 	wait waiter
 	// inflight is its place among the forwarded requests.
 	inflight slot
-	// trace is its server span (W3C Trace Context); env and service are
-	// where it was routed, "" before; instance is the last attempt's,
+	// trace is its server span (W3C Trace Context); env, its tenant and
+	// service are where it was routed, "" before; instance is the last attempt's,
 	// attempts counts them, held is how long it waited for an instance.
 	// They make its access log record.
 	trace    trace
 	env      string
+	tenant   string
 	service  string
 	instance string
 	attempts int
@@ -628,7 +629,7 @@ func (p *Proxy) serve(w *recorder, r *http.Request) {
 		rep.write(w)
 		return
 	}
-	q.env, q.service, q.trace = tg.env.id, tg.svc.name, newTrace(r.Header)
+	q.env, q.tenant, q.service, q.trace = tg.env.id, tg.env.tenant, tg.svc.name, newTrace(r.Header)
 	defer q.record()
 	if r.ContentLength != 0 && r.Body != nil && r.Body != http.NoBody {
 		if p.cfg.MaxBody > 0 && r.ContentLength > p.cfg.MaxBody {

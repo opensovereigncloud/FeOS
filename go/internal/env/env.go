@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -67,9 +68,12 @@ type Deps struct {
 	// made public.
 	AppsZone string
 	// SinkURL is the sink's API (--sink-url, ADR 0026), which the logs
-	// calls ask first; "": the nodes only.
+	// calls and the access log ask first; "": the nodes and the table
+	// only.
 	SinkURL string
-	Log     *slog.Logger
+	// SinkClient asks the sink; nil: a client with a 10 s timeout.
+	SinkClient *http.Client
+	Log        *slog.Logger
 	// EnvChanged runs in the transaction that changed an environment's
 	// publicity or marked it deleting, with its row locked: the domains
 	// bound to it derive their states again (internal/domains). nil:
@@ -107,6 +111,9 @@ func New(deps Deps) (*Service, error) {
 	if deps.Blueprint == nil {
 		deps.Blueprint = addons.Get
 	}
+	if deps.SinkClient == nil {
+		deps.SinkClient = &http.Client{Timeout: 10 * time.Second}
+	}
 	st := deps.Store
 	if st == nil {
 		st = store.New(deps.DB)
@@ -117,7 +124,7 @@ func New(deps Deps) (*Service, error) {
 	c, err := ctl.New(ctl.Deps{
 		InstanceID: deps.InstanceID, DB: deps.DB, Store: st, Elector: deps.Elector, Conns: deps.Conns,
 		Engine: deps.Engine, Runner: deps.Runner, Ports: deps.Ports, Sealer: deps.Sealer,
-		Blueprint: deps.Blueprint, SinkURL: deps.SinkURL, Log: deps.Log,
+		Blueprint: deps.Blueprint, SinkURL: deps.SinkURL, SinkClient: deps.SinkClient, Log: deps.Log,
 	})
 	if err != nil {
 		return nil, err

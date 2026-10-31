@@ -84,6 +84,7 @@ Go's syntax, byte sizes as integers with an optional `KiB`, `MiB` or
 | `--control-plane` | required | the nodes' port of `ferund`, `host:port`, comma-separated, tried in random order |
 | `--control-plane-name` | required | the DNS name the control plane's certificates are verified for: `ferun.<domain>` |
 | `--trust-domain` | required | the SPIFFE trust domain |
+| `--sink-endpoint` | none | the sink's ingest, `host:port`, where the access log goes ([Access log](#access-log)); a name is resolved by the instance, any of its addresses serves; empty: to `ferund` |
 | `--listen-http`, `--listen-https`, `--health-listen` | required | an IP address and a port each: the pod's IP, never a wildcard, which would bind the mesh device's address too |
 | `--tls-cert`, `--tls-key` | required | the apps zone's wildcard certificate and its key, PEM, read again every 30 s |
 | `--mesh-device` | `ferun-mesh` | the WireGuard device |
@@ -756,12 +757,12 @@ tracing SDK:
   `traceparent: 00-<trace>-<span>-<flags>`, so the application's spans
   are its children. A retry to another instance keeps the span.
 - The span's data is the request's access log record
-  ([Access log](#access-log)); nothing is exported over OTLP.
+  ([Access log](#access-log)); no span is exported over OTLP.
 
 ### Access log
 
 - After its response, each request routed to an environment becomes a
-  record: its start and duration, the environment, the service, the
+  record: its start and duration, the environment and its tenant, the service, the
   instance of the last attempt, host, method, the escaped path without
   the query, protocol, status (101 for an upgrade, 0 when none was
   written), outcome (the status class, `upgraded`, `aborted`), bytes in
@@ -788,6 +789,26 @@ tracing SDK:
   and dropped after `--access-log-retention`
   ([control-plane.md](control-plane.md)); the owner reads them with
   `GET /api/v1/environments/{env}/access-logs`.
+- **Into the sink** (ADR 0026 §8, the contract in
+  [sink.md](sink.md#the-ingresss-access-log)). With `--sink-endpoint`
+  the agent sends the records to the sink instead
+  (`LogsService/Export`, OTLP over gRPC, TLS 1.3 with its ingress
+  certificate; the sink's certificate must verify to the trust bundle,
+  carry no IP address and name `spiffe://<td>/sink/<name>`, whatever
+  address was dialled). The name is resolved by gRPC's DNS resolver and
+  dialled again after a lost connection. Each (environment, service)
+  is a stream of the run, keyed `ingress/<name>`, `<env>/<service>`, the
+  run's ID, each record a JSON line of it numbered from 0, with the
+  environment's tenant as the proxy routed it. A batch holds at most
+  1,000 records or 1 MiB of lines and is numbered once: one the sink
+  failed to take is sent again as it was after a backoff (1 s, doubling
+  to 30 s), while new records wait in the buffer (10,000 with the
+  batch, as before); one it refuses (`INVALID_ARGUMENT`,
+  `RESOURCE_EXHAUSTED`) is dropped and counted. A record without a
+  tenant is dropped and counted. The agent sends while it holds a
+  certificate, with or without its connection to `ferund`, and the
+  shutdown sends the rest the same way. `ferund` reads the lines back
+  for `…/access-logs`.
 
 ### Retries
 
@@ -1091,7 +1112,7 @@ expiry.
 | `ferun_ingress_upstream_connections_cut_total` | open connections to instances closed because the table no longer routes to them |
 | `ferun_ingress_upstream_connections`, `ferun_ingress_endpoints`, `ferun_ingress_endpoint_nodes{admitted}`, `ferun_ingress_hosts` | the data path now |
 | `ferun_ingress_domain_certificates`, `ferun_ingress_acme_challenges`, `ferun_ingress_acme_answers_total{result}` | hosts with a certificate of their own; the challenges in the table; requests under `/.well-known/acme-challenge/`, `answered` or `unknown` |
-| `ferun_ingress_access_log_sent_total`, `…_dropped_total`, `ferun_ingress_access_log_pending` | access log records `ferund` took, those dropped, those waiting |
+| `ferun_ingress_access_log_sent_total`, `…_dropped_total`, `ferun_ingress_access_log_pending` | access log records `ferund` or the sink took, those dropped, those waiting (a batch on its way to the sink included) |
 | `ferun_ingress_table_age_seconds`, `ferun_ingress_mesh_nodes{handshake}`, `ferun_ingress_mesh_handshake_age_seconds{node}`, `ferun_ingress_mesh_peers`, `ferun_ingress_mesh_configured` | the table's age and the mesh's health |
 | `ferun_ingress_info{name,version}`, `ferun_ingress_ready`, `ferun_ingress_draining`, `ferun_ingress_control_connected`, `ferun_ingress_control_refusals_total`, `ferun_ingress_identity_removed`, `ferun_ingress_identity_not_after_seconds`, `ferun_ingress_tls_not_after_seconds` | the instance |
 
