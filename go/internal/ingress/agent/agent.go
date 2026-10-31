@@ -6,6 +6,8 @@ package agent
 import (
 	"context"
 	"crypto"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +21,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 
+	"github.com/gardenlinux/feos/go/internal/ingress/sinklog"
 	"github.com/gardenlinux/feos/go/internal/ingress/wg"
 	"github.com/gardenlinux/feos/go/internal/ingress/wire"
 	"github.com/gardenlinux/feos/go/internal/pki"
@@ -64,6 +67,10 @@ type Config struct {
 	MeshMTU int
 	// Version is the program's version, sent in Hello.
 	Version string
+	// SinkEndpoint is host:port of the sink's ingest (ADR 0026 §8): the
+	// access log goes there, with the instance's certificate, in place of
+	// the control plane. "": to the control plane.
+	SinkEndpoint string
 }
 
 // Deps are the agent's collaborators.
@@ -178,6 +185,9 @@ type Agent struct {
 	wakes       map[wakeKey]*wakeEntry
 	// alog is the access log's buffer; it has its own lock.
 	alog *accessLog
+	// sink is the client of the sink's ingest; nil without
+	// Config.SinkEndpoint. Run closes it.
+	sink *sinklog.Client
 }
 
 // New checks cfg and makes an agent; Run starts it.
@@ -221,12 +231,17 @@ func New(cfg Config, deps Deps) (*Agent, error) {
 	if deps.Mesh == nil {
 		return nil, errors.New("ingress agent: no mesh device")
 	}
+	if cfg.SinkEndpoint != "" {
+		if host, port, err := net.SplitHostPort(cfg.SinkEndpoint); err != nil || host == "" || port == "" {
+			return nil, fmt.Errorf("ingress agent: sink endpoint %q is not host:port", cfg.SinkEndpoint)
+		}
+	}
 	log := deps.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	cfg.ControlPlane = slices.Clone(cfg.ControlPlane)
-	return &Agent{
+	a := &Agent{
 		cfg:       cfg,
 		deps:      deps,
 		log:       log,
@@ -236,10 +251,28 @@ func New(cfg Config, deps Deps) (*Agent, error) {
 		order:     shuffled,
 		tried:     map[string]bool{},
 		wakes:     map[wakeKey]*wakeEntry{},
-		alog:      newAccessLog(),
+		alog:      newAccessLog(cfg.Name, cfg.SinkEndpoint != ""),
 		cacheKick: make(chan struct{}, 1),
 		meshKick:  make(chan struct{}, 1),
-	}, nil
+	}
+	if cfg.SinkEndpoint != "" {
+		c, err := sinklog.NewClient(cfg.SinkEndpoint, cfg.TrustDomain, a.sinkIdentity)
+		if err != nil {
+			return nil, fmt.Errorf("ingress agent: %w", err)
+		}
+		a.sink = c
+	}
+	return a, nil
+}
+
+// sinkIdentity is the certificate and bundle the access log goes to the
+// sink with.
+func (a *Agent) sinkIdentity() (*tls.Certificate, *x509.CertPool, error) {
+	id := a.identity()
+	if id == nil {
+		return nil, nil, errors.New("no certificate yet")
+	}
+	return &id.cert, id.bundle, nil
 }
 
 // Run runs the agent until ctx ends: it loads the state, configures the
@@ -290,6 +323,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.runCtx = nil
 	a.mu.Unlock()
 	a.goroutines.Wait()
+	if a.sink != nil {
+		_ = a.sink.Close()
+	}
 	return nil
 }
 

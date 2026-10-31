@@ -6,6 +6,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	otlplogsv1 "github.com/gardenlinux/feos/go/gen/otlp/collector/logs/v1"
+	"github.com/gardenlinux/feos/go/internal/ingress/sinklog"
 	"github.com/gardenlinux/feos/go/internal/ingress/wire"
 )
 
@@ -30,44 +33,68 @@ const (
 	// plane that does not take access logs (UNIMPLEMENTED) before it
 	// sends again, dropping what it holds.
 	accessLogUnsupported = time.Minute
+	// sinkRetryMin and sinkRetryMax bound the backoff of a batch the
+	// sink failed to take.
+	sinkRetryMin = time.Second
+	sinkRetryMax = 30 * time.Second
 )
 
 // accessLog is the agent's buffer of the access log: the records not
 // sent yet, numbered from seq in the run start, and the count of those
-// dropped since the last batch the control plane took.
+// dropped since the last batch the control plane took. With a sink
+// (Config.SinkEndpoint), held is the batch on its way there, its records
+// out of pending and numbered in their streams; it is sent until the sink
+// takes or refuses it.
 type accessLog struct {
 	start string
 	kick  chan struct{}
-	// send serializes the sends of the loop and of FlushAccessLog.
-	send sync.Mutex
+	// batch is the most records of a batch: the control plane's or the
+	// sink's bound.
+	batch int
+	// send serializes the sends of the loop and of FlushAccessLog; the
+	// sink's streams, held and retry are the sender's.
+	send    sync.Mutex
+	streams *sinklog.Streams
+	held    *otlplogsv1.ExportLogsServiceRequest
+	retry   *backoff
 
 	mu      sync.Mutex
 	pending []wire.AccessLogEntry
-	seq     int64
-	missed  int64
+	// heldN counts the records of held.
+	heldN  int
+	seq    int64
+	missed int64
 	// sent and dropped count records for the metrics: those the control
-	// plane took, and those dropped.
+	// plane or the sink took, and those dropped.
 	sent, dropped uint64
 }
 
-func newAccessLog() *accessLog {
-	return &accessLog{start: uuid.NewString(), kick: make(chan struct{}, 1)}
+// newAccessLog returns the buffer of the instance name; sink: it sends
+// to the sink.
+func newAccessLog(name string, sink bool) *accessLog {
+	l := &accessLog{start: uuid.NewString(), kick: make(chan struct{}, 1), batch: wire.MaxAccessLogRecords}
+	if sink {
+		l.batch = sinklog.MaxRecords
+		l.streams = sinklog.NewStreams(name, l.start)
+		l.retry = newBackoff(sinkRetryMin, sinkRetryMax)
+	}
+	return l
 }
 
-// Record keeps a record of the proxy's for the control plane (the
-// proxy's AccessLog). It never blocks: when accessLogBuffer records wait
-// already, the record is dropped and counted.
+// Record keeps a record of the proxy's for the control plane or the
+// sink (the proxy's AccessLog). It never blocks: when accessLogBuffer
+// records wait already, the record is dropped and counted.
 func (a *Agent) Record(e wire.AccessLogEntry) {
 	l := a.alog
 	l.mu.Lock()
-	if len(l.pending) >= accessLogBuffer {
+	if len(l.pending)+l.heldN >= accessLogBuffer {
 		l.missed++
 		l.dropped++
 		l.mu.Unlock()
 		return
 	}
 	l.pending = append(l.pending, e)
-	full := len(l.pending) >= wire.MaxAccessLogRecords
+	full := len(l.pending) >= l.batch
 	l.mu.Unlock()
 	if full {
 		select {
@@ -77,13 +104,13 @@ func (a *Agent) Record(e wire.AccessLogEntry) {
 	}
 }
 
-// AccessLogCounts returns the records the control plane took, those
-// dropped, and those waiting.
+// AccessLogCounts returns the records the control plane or the sink
+// took, those dropped, and those waiting.
 func (a *Agent) AccessLogCounts() (sent, dropped uint64, pending int) {
 	l := a.alog
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.sent, l.dropped, len(l.pending)
+	return l.sent, l.dropped, len(l.pending) + l.heldN
 }
 
 // accessLogLoop sends the pending records every accessLogEvery, and at
@@ -120,7 +147,7 @@ func (a *Agent) FlushAccessLog(ctx context.Context) error {
 		if pending == 0 {
 			return nil
 		}
-		if a.current() == nil {
+		if a.sink == nil && a.current() == nil || a.sink != nil && a.identity() == nil {
 			return ErrNotConnected
 		}
 		if wait := a.sendAccessLog(ctx); wait > 0 {
@@ -137,6 +164,9 @@ func (a *Agent) FlushAccessLog(ctx context.Context) error {
 // failed to store waits for the next send; a control plane without the
 // method has every pending record dropped.
 func (a *Agent) sendAccessLog(ctx context.Context) time.Duration {
+	if a.sink != nil {
+		return a.sendToSink(ctx)
+	}
 	l := a.alog
 	l.send.Lock()
 	defer l.send.Unlock()
@@ -150,7 +180,7 @@ func (a *Agent) sendAccessLog(ctx context.Context) time.Duration {
 			l.mu.Unlock()
 			return 0
 		}
-		n := min(len(l.pending), wire.MaxAccessLogRecords)
+		n := min(len(l.pending), l.batch)
 		batch := &wire.AccessLogBatch{Start: l.start, Seq: l.seq, Missed: l.missed,
 			Records: append([]wire.AccessLogEntry(nil), l.pending[:n]...)}
 		l.mu.Unlock()
@@ -176,7 +206,7 @@ func (a *Agent) sendAccessLog(ctx context.Context) time.Duration {
 			l.missed += int64(m)
 			l.dropped += uint64(m)
 		}
-		more := len(l.pending) >= wire.MaxAccessLogRecords
+		more := len(l.pending) >= l.batch
 		l.mu.Unlock()
 		switch {
 		case err == nil:
@@ -200,4 +230,68 @@ func (a *Agent) sendAccessLog(ctx context.Context) time.Duration {
 func (l *accessLog) take(n int) {
 	l.pending = append(l.pending[:0], l.pending[n:]...)
 	l.seq += int64(n)
+}
+
+// sendToSink sends batches to the sink until fewer than a batch wait, and
+// returns how long to wait before the next send: 0 when it may go on as
+// usual. Without a certificate the records wait. A batch the sink failed
+// to take is sent again after a backoff, the same records under the same
+// offsets, while new records wait in the buffer; one it refuses as
+// invalid or over the tenant's quota is dropped and counted.
+func (a *Agent) sendToSink(ctx context.Context) time.Duration {
+	l := a.alog
+	l.send.Lock()
+	defer l.send.Unlock()
+	for {
+		if a.identity() == nil {
+			return 0
+		}
+		if l.held == nil {
+			l.mu.Lock()
+			if len(l.pending) == 0 {
+				l.mu.Unlock()
+				return 0
+			}
+			recs := slices.Clone(l.pending[:min(len(l.pending), l.batch)])
+			l.mu.Unlock()
+			req, taken, skipped := l.streams.Batch(recs)
+			l.mu.Lock()
+			l.take(taken)
+			l.dropped += uint64(skipped)
+			l.held, l.heldN = req, taken-skipped
+			l.mu.Unlock()
+			if req == nil {
+				continue
+			}
+		}
+
+		cctx, cancel := context.WithTimeout(ctx, a.tune.callTimeout)
+		err := a.sink.Export(cctx, l.held)
+		cancel()
+		code := status.Code(err)
+		drop := code == codes.InvalidArgument || code == codes.ResourceExhausted
+		if err != nil && !drop {
+			if ctx.Err() == nil {
+				a.rl.warn("access-log", "ingress agent: sending the access log to the sink failed; trying again", "err", err)
+			}
+			return l.retry.delay()
+		}
+		l.retry.reset()
+		l.mu.Lock()
+		if err == nil {
+			l.sent += uint64(l.heldN)
+		} else {
+			l.dropped += uint64(l.heldN)
+		}
+		n := l.heldN
+		l.held, l.heldN = nil, 0
+		more := len(l.pending) >= l.batch
+		l.mu.Unlock()
+		if drop {
+			a.rl.warn("access-log", "ingress agent: the sink refused a batch of the access log; dropped", "records", n, "err", err)
+		}
+		if !more {
+			return 0
+		}
+	}
 }

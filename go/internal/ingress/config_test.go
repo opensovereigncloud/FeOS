@@ -42,8 +42,14 @@ func TestParseDefaultsAndEnv(t *testing.T) {
 	if c.Name != "ferun-ingress-0" || !slices.Equal(c.ControlPlane, []string{"10.250.0.10:7443"}) ||
 		c.ControlPlaneName != "ferun.run.fecode.dev" || c.TrustDomain != "run.fecode.dev" ||
 		c.ListenHTTP != "100.64.1.2:8080" || c.ListenHTTPS != "100.64.1.2:8443" || c.HealthListen != "100.64.1.2:9090" ||
-		c.TLSCert != "/tls/tls.crt" || c.TLSKey != "/tls/tls.key" || c.MeshEndpoint != "100.64.1.2:51820" {
+		c.TLSCert != "/tls/tls.crt" || c.TLSKey != "/tls/tls.key" || c.MeshEndpoint != "100.64.1.2:51820" ||
+		c.SinkEndpoint != "" {
 		t.Fatalf("required settings %+v", c)
+	}
+	sinkEnv := requiredEnv()
+	sinkEnv["FERUN_INGRESS_SINK_ENDPOINT"] = "ferun-sink-ingest.ferun.svc.cluster.local:4317"
+	if c, err := Parse(nil, getenvOf(sinkEnv)); err != nil || c.SinkEndpoint != sinkEnv["FERUN_INGRESS_SINK_ENDPOINT"] {
+		t.Fatalf("sink endpoint %q, %v", c.SinkEndpoint, err)
 	}
 	want := Default()
 	if c.StateDir != "/var/lib/ferun-ingress" || c.JoinTokenFile != "" || c.MeshDevice != "ferun-mesh" ||
@@ -197,7 +203,7 @@ func TestParseSizesAndDurations(t *testing.T) {
 		{"--mesh-mtu", "1000"}, {"--mesh-device", "a-device-name-too-long"}, {"--mesh-device", "a/b"},
 		{"--mesh-endpoint", "0.0.0.0:51820"}, {"--mesh-endpoint", "10.0.0.1"}, {"--name", "Ferun_Ingress"},
 		{"--trust-domain", "https://x"}, {"--control-plane-name", "10.0.0.1"}, {"--log-format", "xml"},
-		{"--log-level", "loud"},
+		{"--log-level", "loud"}, {"--sink-endpoint", "ferun-sink-ingest"}, {"--sink-endpoint", ":4317"},
 	} {
 		if _, err := Parse(args, getenvOf(requiredEnv())); err == nil {
 			t.Errorf("%q accepted", args)

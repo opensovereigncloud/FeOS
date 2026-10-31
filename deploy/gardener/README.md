@@ -331,7 +331,8 @@ Afterwards:
 - **What an instance may do.** It faces the internet as root with
   `NET_ADMIN` alone, for its WireGuard device, under the runtime's
   default seccomp profile (`RuntimeDefault`), and dials only DNS,
-  ferund's 7443 and the workers' UDP 51820 (`ferun-ingress-egress`).
+  ferund's 7443, the sink's ingest 4317 (its access log, ADR 0026 §8)
+  and the workers' UDP 51820 (`ferun-ingress-egress`).
   A proxy without the capability, in a container of its own, is the
   follow-up (ADR 0021, open questions).
 - **Cookies.** ferun-ingress makes every cookie that an app's answer sets

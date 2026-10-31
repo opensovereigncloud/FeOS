@@ -75,6 +75,7 @@ func (q *request) record() {
 		Time:         q.wait.start.UTC(),
 		DurationNs:   int64(end.Sub(q.wait.start)),
 		Env:          q.env,
+		Tenant:       q.tenant,
 		Service:      q.service,
 		Instance:     q.instance,
 		Host:         cutField(q.host, wire.MaxAccessLogText),

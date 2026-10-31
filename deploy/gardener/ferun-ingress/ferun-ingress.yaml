@@ -151,8 +151,8 @@ spec:
         - { protocol: TCP, port: 9090 }
         - { protocol: UDP, port: 51820 }
 ---
-# What the instances dial, and nothing else: DNS, ferund's nodes' port
-# and the workers' feos-mesh. Requests to the apps' pods go inside the
+# What the instances dial, and nothing else: DNS, ferund's nodes' port,
+# the sink's ingest and the workers' feos-mesh. Requests to the apps' pods go inside the
 # mesh device, so the network sees only its UDP to the workers. An
 # instance taken over through the proxy cannot reach the cluster's other
 # services. Calico checks a connection to a Service at the pod and port
@@ -197,6 +197,18 @@ spec:
             cidr: ${FERUN_NODES_IP}/32
       ports:
         - { protocol: TCP, port: 7443 }
+    # The sink's ingest, for the access log: its instances' addresses,
+    # which the headless Service ferun-sink-ingest resolves to
+    # (FERUN_INGRESS_SINK_ENDPOINT). The sink has no policy of its own.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ferun
+          podSelector:
+            matchLabels:
+              app: ferun-sink
+      ports:
+        - { protocol: TCP, port: 4317 }
     # The workers' feos-mesh.
     - to:
         - ipBlock:
@@ -338,6 +350,12 @@ spec:
               value: "ferun.run.${DOMAIN}"
             - name: FERUN_INGRESS_TRUST_DOMAIN
               value: "run.${DOMAIN}"
+            # The access log goes into the sink (ADR 0026 §8), with the
+            # instance's certificate, as streams of the services it
+            # served; the instance resolves the headless Service itself.
+            # Without it, it goes to ferund (PublishAccessLogs).
+            - name: FERUN_INGRESS_SINK_ENDPOINT
+              value: "ferun-sink-ingest.ferun.svc.cluster.local:4317"
             # Its own join token alone, copied by the init container; the
             # Secret of every instance's token is not mounted here.
             - name: FERUN_INGRESS_JOIN_TOKEN_FILE

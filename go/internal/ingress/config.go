@@ -69,6 +69,9 @@ type Config struct {
 	// are verified for: ferun.<domain>.
 	ControlPlaneName string
 	TrustDomain      string
+	// SinkEndpoint is host:port of the sink's ingest (ADR 0026 §8), where
+	// the access log goes; "": to the control plane.
+	SinkEndpoint string
 	// ListenHTTP, ListenHTTPS and HealthListen are the listeners: an IP
 	// address and a port each, never an unspecified address (D20). Port 0
 	// picks a free port (tests).
@@ -190,6 +193,8 @@ func registerServe(fs *flag.FlagSet, c *Config) *string {
 	fs.StringVar(&c.ControlPlaneName, "control-plane-name", c.ControlPlaneName,
 		"the DNS name the control plane's certificates are verified for: ferun.<domain> (required)")
 	fs.StringVar(&c.TrustDomain, "trust-domain", c.TrustDomain, "the SPIFFE trust domain (required)")
+	fs.StringVar(&c.SinkEndpoint, "sink-endpoint", c.SinkEndpoint,
+		"host:port of the sink's ingest, where the access log goes (a name is resolved, any of its addresses serves); empty: to the control plane")
 	fs.StringVar(&c.ListenHTTP, "listen-http", c.ListenHTTP,
 		"the HTTP listener (redirects to https), an IP address and a port: the pod's IP, never a wildcard (required)")
 	fs.StringVar(&c.ListenHTTPS, "listen-https", c.ListenHTTPS,
@@ -263,6 +268,11 @@ func (c *Config) Validate() error {
 		bad("--trust-domain is required")
 	} else if err := pki.ValidateTrustDomain(c.TrustDomain); err != nil {
 		bad("--trust-domain: %w", err)
+	}
+	if c.SinkEndpoint != "" {
+		if err := checkHostPort(c.SinkEndpoint); err != nil {
+			bad("--sink-endpoint: %w", err)
+		}
 	}
 	for _, l := range []struct{ name, v string }{
 		{"listen-http", c.ListenHTTP}, {"listen-https", c.ListenHTTPS}, {"health-listen", c.HealthListen},
