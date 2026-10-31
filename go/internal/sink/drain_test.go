@@ -153,7 +153,7 @@ func TestDrainHot(t *testing.T) {
 	}
 	// The drained lines lie in their streams' partitions.
 	for _, r := range lg.records(logTopic) {
-		if string(r.Key) != "acme/e/" || r.Partition != kafka.Partition("acme/e/", int32(testConfig().KafkaPartitions)) {
+		if string(r.Key) != "acme/e" || r.Partition != kafka.Partition("acme/e", int32(testConfig().KafkaPartitions)) {
 			t.Errorf("record %q in %d", r.Key, r.Partition)
 		}
 	}

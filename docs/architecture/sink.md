@@ -2,16 +2,16 @@
 
 `ferun-sink` keeps the platform's logs (ADR 0026): every container's
 output of the pods FeRun makes, shipped by the nodes, and the requests
-`ferun-ingress` answered, written by its instances, kept in its
-PostgreSQL first and in Quickwit's indexes after (ADR 0026 §10), and
-read by tenants over HTTP. This page is the contract between its parts;
+`ferun-ingress` answered, written by its instances, appended to
+Redpanda's topics and indexed from there by Quickwit (ADR 0026 §10,
+§11), and read by tenants over HTTP. This page is the contract between its parts;
 the ADR says why.
 
 ```
 guest ──CRI lines──▶ logs/container.log
                          │ StreamContainerLogs(follow, from_offset)
-feosd (node) ──OTLP LogsService/Export, SinkService (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `sink`
-     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Quickwit ferun-logs-v2-<days>d (splits in the object store)
+feosd (node) ──OTLP LogsService/Export, SinkService (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `sink` (streams, positions, quota)
+     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Redpanda topic ferun-logs-v3-<days>d ──Kafka source──▶ Quickwit index of that name
 ferund ──CreatePodRequest.log_labels──▶ feosd                                │
      ◀── GET /api/v1/tenant (a tenant's token) ──────────────────────────────┤
 tenants (FeCode) ── GET /api/v1/logs, /api/v1/log-streams (Bearer) ──────────┘
@@ -197,14 +197,17 @@ database (`sink`, migrations of its own), two ports:
   `LogsService/Export` and `SinkService`, nodes only, and
   `LogsService/Export` for the ingresses' access logs ([The ingress's
   access log](#the-ingresss-access-log)), from the first certificate
-  on. A batch is stored in one transaction and then
-  answered; a line is stored once per (stream, offset), and one at or
-  below the last offset stored counts as stored: a node sends a stream's
-  lines in the order of their offsets. A tenant over
+  on. A batch is stored in one transaction and then answered: each
+  stream's row locked, its new lines produced to its topic (Redpanda
+  answers once every in-sync replica has them), the row and the usage
+  updated, the commit. A line is stored once per (stream, offset), and
+  one at or below the last offset stored counts as stored: a node sends
+  a stream's lines in the order of their offsets. A tenant over
   its quota (`--log-quota`, bytes of text a day, UTC, 0: none; reached by
   what is stored, so the batch that crosses it is stored) is refused with
   `RESOURCE_EXHAUSTED`, which names it; the other tenants' streams of the
-  same batch are stored. A database failure is `UNAVAILABLE`; a request
+  same batch are stored. A failure of the database or of Redpanda is
+  `UNAVAILABLE`, and nothing of the batch is stored; a request
   over 8 MiB, of more than 10,000 records, or with a resource without
   `ferun.pod`, `ferun.container`, `ferun.log_id` and `ferun.tenant` or a
   record without `log.offset` is refused. A stream's `node` is the name
@@ -235,46 +238,38 @@ Bearer …`); the sink asks `ferund` `GET /api/v1/tenant` with it (`200
 by the token's SHA-256.
 
 **Stages.** `log_streams` (one row per stream key: labels, first and
-last time, next offset, ended, `chunked_last`, the mark of what the
-index holds; its ID `s_` and 16 random hex digits) and `log_batches`
-(hot: a row per stream and ingested batch, migration `0006`) in the
-database; the cold stage is Quickwit (§10). A batch row has the stream,
-the first and last offset, the lines' earliest and latest time, the
-number of lines, their bytes of text, the bits of their levels, and
-`data`: the lines in offset order, each its offset, time and level
-(varints), a flags byte (partial, and `cont`: the line goes on with the
-last of its source, which was partial), and its source, text and trace
-ID (each a length and its bytes), which PostgreSQL compresses with lz4;
-partitioned by the day it arrived. A stream's part of an Export is one
-row, several when its text is over 2 MiB. The reads select the batches
-whose times and levels may hold lines they want and filter the lines
-themselves. Every second, four loops of each instance claim streams with
-hot lines (at most 32 a round, `FOR UPDATE SKIP LOCKED`, a lease of
-three minutes of the database's clock), send the lines of their batches,
-oldest first, whole, at most 6 MiB of text a round (at least one batch),
-to the stream's index with `commit=wait_for`, and once Quickwit answers,
-the split holding them published, delete those batches and move the mark
-to the last one's last offset, in one transaction a stream. A failure of
-the index holds the round's claims for 30 s. Until 2026-10-31 the hot
-stage was `log_lines`, a row a line; while instances of before still
-write it (a rolling update), the reads take its lines as hot lines too
-and the indexer drains them with the batches, in the order of their
-offsets. That goes, with `log_lines`, in a later release. A
-stream's index is `<--index-prefix>-v<version>-<days>d`
-(`ferun-logs-v2-30d`): the days of `--log-retention`, or of
+last time, next offset, the last offset stored, ended; its ID `s_` and 16
+random hex digits) and `log_usage` (a tenant's bytes of a day) in the
+database; the lines in Redpanda, then in Quickwit (§11). A topic per
+index, of its name: `<--index-prefix>-v<version>-<days>d`
+(`ferun-logs-v3-30d`), the days of `--log-retention`, or of
 `--log-retention-max` for a stream whose `ferun.retention_days` is
-longer than the default; the sink makes an index it does not find
-(Quickwit's index API), with its retention, `--index-commit-timeout`
+longer than the default. The sink makes a topic it does not find
+(`--kafka-partitions` 12, `--kafka-replication` 3, `retention.ms`
+`--kafka-retention` 24 h, `segment.ms` an hour, `write.caching` off), its
+index (Quickwit's index API) with its retention, `--index-commit-timeout`
 (10 s) as its commit interval and `--index-partitions` (16, at most 200)
-partitions. A document is a line with its stream's labels: `ts` (ns, the
-time field), `tenant`, `stream` (the ID), `environment`, `kind`,
-`object`, `replica`, `release`, `instance`, `container`, `job`,
-`attempt`, `source`, `iostream`, `level` (the bit), `trace_id`, `off`,
-`partial`, `cont`, and `text` (Quickwit's `default` tokenizer, with
-positions). Quickwit has no key of its own: a batch sent again is
-indexed again, and the reads take one (stream, offset) once.
-`--index-ingest-url` names Quickwit's indexers, `--index-search-url` its
-searchers (every other call).
+partitions, and the index's one Kafka source `kafka` on the topic
+(`auto.offset.reset` earliest; a session of 10 s). A record is a line as
+the index's document, JSON: `ts` (ns, the time field), `tenant`,
+`stream` (the ID), `environment`, `kind`, `object`, `replica`,
+`release`, `instance`, `container`, `job`, `attempt`, `source`,
+`iostream`, `level` (the bit), `trace_id`, `off`, `partial`, `cont`, and
+`text` (Quickwit's `default` tokenizer, with positions). Its key is
+`<tenant>/<environment>` of its stream, or `<tenant>//<job>` for a stream
+of no environment (a tenant's job), its partition the key's FNV-1a hash
+modulo the topic's partitions, chosen by the sink: a stream's lines are
+in order in one partition, and an environment's streams (its jobs' runs
+among them) share theirs, as a tenant's job's do. The source indexes each record once, the topic's
+offsets kept in Quickwit's metastore with each split it publishes; a
+batch the sink produced twice (an answer to the node that did not
+arrive, then the node's next send) is indexed twice, and the reads take
+one (stream, offset) once. `--kafka-brokers` names Redpanda's brokers
+(also the sources'), `--index-search-url` Quickwit's REST API. Until
+2026-10-31 the hot stage was `log_batches` (and before it `log_lines`)
+in the database; what an instance of before left there is produced to
+the topics once and deleted, a stream an instance of before still claims
+left to it; the tables go in the next release.
 
 **Partitions.** One tenant may hold many projects' environments (FeCode's
 does), so an index's lines are hashed into partitions by their tenant,
@@ -320,10 +315,11 @@ zero.
 
 **Retention**: `--log-retention` (720 h) or a stream's
 `ferun.retention_days`, at most `--log-retention-max` (9600 h); a sweep
-every 10 min deletes the hot batches whose latest line is past
-retention, the streams whose last line is past their retention and that
-have nothing left in the database, and drops empty day partitions of
-`log_batches` (and `log_lines`). Quickwit drops a
+every 10 min deletes the streams whose last line is past their
+retention (and, while they are there, drops empty day partitions of the
+hot tables of before). A topic keeps its records `--kafka-retention`, a
+replay buffer: an index that falls further behind loses what the topic
+dropped. Quickwit drops a
 split of an index once its newest line is past the index's retention,
 which is at least the stream's; a read never answers a line of a stream
 that is gone.
@@ -331,6 +327,13 @@ that is gone.
 ## Reading
 
 All routes need a tenant's token and answer only its streams.
+
+A read takes its streams from the database, then reads, of each log
+topic, the partitions of their keys from the index source's checkpoint
+(`GET /api/v1/indexes/<id>`: per partition the last offset published) to
+their end, the lines Quickwit has not published, then searches the
+indexes (`<prefix>-*`, the versions of before too). A line in both is
+taken once (stream, offset).
 
 ### `GET /api/v1/logs`
 
@@ -382,8 +385,12 @@ With `follow=1` the answer is `application/x-ndjson`, one object a line:
 `{"line": {…}, "stream": {…}}` (the stream once, with its first line), and
 `{}` after 15 s without a line. It gives the page a backward read gives
 (`since`, `until`, `limit` and the filters as there), oldest first, then
-every line of the selector's open streams stored after it, by each
-stream's offsets, polling every 500 ms; it takes no `cursor`. A
+every line of the selector's streams stored after it: the topics'
+partitions of the selector (an environment's one; a job's or an
+instance's those of its streams, every one before it has a stream), read
+from their ends of before the page as records come (a fetch waits up to 500 ms); a line the
+page gave is not given again, and a stream of the selector that starts
+meanwhile is followed too. It takes no `cursor`. A
 `level` of `unknown` selects the lines whose `level` is `""`.
 
 ### `GET /api/v1/log-streams`
@@ -394,7 +401,7 @@ most 500.
 
 ### `DELETE /api/v1/log-streams?environment=<id>` or `?job=<id>`
 
-Deletes the streams and their hot lines, and leaves a delete task of the environment's or job's lines in every log index (Quickwit removes them when its janitor rewrites their splits; no read finds them meanwhile). 204.
+Deletes the streams' rows, and leaves a delete task of the environment's or job's lines in every log index (Quickwit removes them when its janitor rewrites their splits; no read finds them meanwhile). 204.
 
 ## `ferund`
 

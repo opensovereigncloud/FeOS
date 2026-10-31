@@ -361,8 +361,9 @@ Afterwards:
 ferun-sink (ADR 0026, [`docs/architecture/sink.md`](../../docs/architecture/sink.md))
 keeps the pods' logs: the Deployment `ferun-sink` of
 [`ferun-sink/`](ferun-sink/ferun-sink.yaml), two instances in the
-namespace `ferun`, over the database `sink` of `ferun-db` and
-Quickwit. The nodes ship to its ingest, port 4317, over mTLS
+namespace `ferun`, over the database `sink` of `ferun-db` (its
+streams, positions and quota), Redpanda and Quickwit. The nodes ship to
+its ingest, port 4317, over mTLS
 with their node certificates, each at the address of an instance that
 ferund gives it: the hosts reach no ClusterIP, so the Service
 `ferun-sink-ingest` is headless and ferund resolves it; tenants
@@ -419,7 +420,15 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
 
    The sink makes its indexes (`ferun-logs-v2-<days>d`) itself.
 
-6. ferund tells the nodes where to ship (`--sink-endpoint
+6. Redpanda, the log of record (ADR 0026 §11): the sink produces every
+   line and span to its topics, Quickwit's indexers read them with their
+   Kafka sources; three brokers of [`redpanda/values.yaml`](redpanda/values.yaml)
+   (the chart 26.2.4), one a worker, and their NetworkPolicy. The sink
+   makes the topics (and the indexes and their sources) itself:
+
+       make -C deploy/gardener apply-redpanda
+
+7. ferund tells the nodes where to ship (`--sink-endpoint
    ferun-sink-ingest.ferun.svc.cluster.local:4317`, which it resolves
    every 10 s and hands each node one ready instance) and reads from the
    sink (`--sink-url http://ferun-sink.ferun.svc:8080`).

@@ -176,17 +176,19 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 	}
 }
 
-// followPartitions are the partitions of n a follow of tenant's sel reads:
-// every partition a stream of sel may lie in, also one that starts during
-// the follow. Only a selector of an environment and a job names its
-// streams' key; a selector of a stream names streams that exist (live);
-// any other may match a stream of any key, so it reads every partition.
+// followPartitions are the partitions of n a follow of sel reads: an
+// environment's one; a job's: a tenant's job's one and those of its open
+// streams (a run of an environment's job); a stream's or an instance's,
+// those of its streams; every one for a job or an instance that has no
+// stream yet, since its key is not known before.
 func followPartitions(tenant string, sel Selector, live []*streamRow, n int32) []int32 {
 	switch {
-	case sel.Stream != "":
+	case sel.Environment != "":
+		return []int32{kafka.Partition(streamKey(tenant, sel.Environment, ""), n)}
+	case sel.Job != "" && len(live) > 0:
+		return append(partitionsOf(live, n), kafka.Partition(streamKey(tenant, "", sel.Job), n))
+	case len(live) > 0:
 		return partitionsOf(live, n)
-	case sel.Environment != "" && sel.Job != "":
-		return []int32{kafka.Partition(streamKey(tenant, sel.Environment, sel.Job), n)}
 	}
 	all := make([]int32, n)
 	for i := range all {

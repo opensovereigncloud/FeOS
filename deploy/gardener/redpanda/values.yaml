@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Redpanda, the sink's log of record (ADR 0026 §11), as the Helm chart
+# redpanda/redpanda 26.2.4 of https://charts.redpanda.com runs it, in the
+# namespace ferun with the release name redpanda (README.md, The sink):
+# three brokers, one on each worker, a volume each, reached inside the
+# cluster only, and only by ferun-sink and Quickwit's indexers
+# (networkpolicy.yaml); no TLS or SASL. Redpanda's Community Edition is
+# under the Business Source License: the topics are the platform's own,
+# never a tenant's, and no enterprise feature is on.
+image:
+  tag: v26.2.4                 # chart 26.2.4 defaults to v26.2.3 (appVersion); pin explicitly
+statefulset:
+  replicas: 3
+  # chart default: hard pod anti-affinity on kubernetes.io/hostname => needs 3 schedulable nodes
+resources:
+  cpu:
+    cores: 1                   # == --smp 1, requests.cpu = limits.cpu = 1; < 1 core forces --overprovisioned
+    overprovisioned: true      # shared vCPUs (no static CPU manager) -> don't busy-poll
+  memory:
+    container:
+      max: 2.5Gi               # requests = limits = 2.5Gi; chart gives redpanda --memory = 80% (2048M), --reserve-memory = 0.2%+200M
+storage:
+  persistentVolume:
+    enabled: true
+    size: 20Gi
+    storageClass: general-purpose
+tls:
+  enabled: false
+auth:
+  sasl:
+    enabled: false
+external:
+  enabled: false
+console:
+  enabled: false
+monitoring:
+  enabled: false               # ServiceMonitor off (metrics stay on admin :9644 /public_metrics)
+logging:
+  usageStats:
+    enabled: false
+tuning:
+  tune_aio_events: false       # removes the privileged "tuning" init container
+listeners:
+  # external.enabled=false alone still binds the per-listener "default" external ports
+  # (9094/9645/8083/8084) inside the pod; switch each off explicitly.
+  admin:
+    external: { default: { enabled: false } }
+  kafka:
+    external: { default: { enabled: false } }
+  http:
+    enabled: false             # drops 8082 from the Service; the broker STILL listens on 8082 (chart always renders pandaproxy_api)
+    external: { default: { enabled: false } }
+  schemaRegistry:
+    enabled: false             # drops 8081 from the Service; the broker STILL listens on 8081 (always rendered)
+    external: { default: { enabled: false } }
+config:
+  cluster:
+    default_topic_replications: 3
+    auto_create_topics_enabled: false
+    write_caching_default: false             # fsync before ack with acks=all (image's dev redpanda.yaml sets true)
+    # Enterprise features that are ON by default during the 30-day built-in trial; turn them off so the
+    # cluster never ends up "using enterprise features without a license" (that blocks feature upgrades).
+    partition_autobalancing_mode: node_add
+    core_balancing_continuous: false
+tests:
+  enabled: false

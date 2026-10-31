@@ -1,18 +1,18 @@
 # Traces
 
 `ferun-sink` keeps the spans of the pods FeRun makes and of the requests
-`ferun-ingress` answers (ADR 0026 §10, step 10), in its PostgreSQL first
-and in Quickwit's trace index after, and answers them to a tenant in the
-shape of Jaeger's query API. This page is the contract between the
-parts; the ADR says why. Logs are docs/architecture/sink.md; what that
-page says of identities, the hot stage and Quickwit holds here unless
-this one says otherwise.
+`ferun-ingress` answers (ADR 0026 §10, step 10), appended to a Redpanda
+topic and indexed from there by Quickwit's trace index (§11), and
+answers them to a tenant in the shape of Jaeger's query API. This page is
+the contract between the parts; the ADR says why. Logs are
+docs/architecture/sink.md; what that page says of identities, the topics
+and Quickwit holds here unless this one says otherwise.
 
 ```
 pod (OTel SDK) ──OTLP/gRPC :4317, OTLP/HTTP protobuf :4318──▶ feosd at 169.254.169.1
                                    │ the pod by its source address, its ferun.* labels stamped
-feosd (node) ──OTLP TraceService/Export (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `trace_spans`
-ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Quickwit ferun-traces-v1-<days>d
+feosd (node) ──OTLP TraceService/Export (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `trace_usage` (quota)
+ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Redpanda ferun-traces-v2-<days>d ──Kafka source──▶ Quickwit index of that name
 tenants (FeCode) ── GET /api/v1/jaeger/api/… (Bearer) ─────────┘
 ```
 
@@ -156,8 +156,11 @@ answers `PERMISSION_DENIED`. At most 10,000 spans a request
 A span without a valid `trace_id` (16 bytes, not all zero) or `span_id`
 (8 bytes, not all zero) is dropped and counted in the answer's
 `partial_success.rejected_spans`, with an `error_message`. The others
-become documents (below) and are inserted into `trace_spans` in one
-transaction with the tenant's usage; the answer comes after the commit.
+become documents (below) and are produced to the trace topic in one
+transaction with the tenant's usage, each keyed by its trace ID (a
+trace's spans in one partition); the answer comes after Redpanda has
+them on every in-sync replica and the commit, well within the 8 s the
+node gives a pod's export.
 A span without a start gets the time it came as its `ts`; a resource
 without `service.name` the service `unknown_service`.
 
@@ -168,26 +171,21 @@ crosses it is stored; of a request of several tenants, the others'
 spans are stored). A loop of the sink deletes the usage of the days
 before yesterday.
 
-### The hot stage and the indexer
+### The topic
 
-`trace_spans` (migration `0005`) holds a span from its ingest until its
-index has published it: tenant, trace ID, span ID, start, the document
-(`jsonb`), when it came, and the indexer's claim (owner, lease). An
-index on (tenant, trace ID) serves reads of a trace not yet indexed.
-
-The indexer runs beside the logs' (`RunIndex`): it claims up to 5,000
-spans or 6 MiB of documents whose claim is free or expired (lease three
-minutes, `FOR UPDATE SKIP LOCKED`), ingests them into the index with
-`commit=wait_for`, and then deletes them, the claim its own. A round
-that failed leaves the rows to the next claim after the lease. Spans sent
-twice (a node's retry after an answer that did not arrive) are two
-documents; a read keeps one per span ID.
+`trace_spans` and its indexer held a span until its index had published
+it until 2026-10-31 (§10); now the trace index's Kafka source takes the
+spans from their topic, of the index's name, made as the log topics are
+(sink.md, Stages). Spans sent twice (a node's retry after an answer that
+did not arrive) are two records and two documents; a read keeps one per
+span ID. What an instance of before left in `trace_spans` is produced to
+the topic once and deleted; the table goes in the next release.
 
 ### The index
 
-`<--trace-index-prefix>-v<N>-<days>d`, default `ferun-traces-v1-30d`
-(`--trace-retention`, 30 days), created at first use as the logs'
-indexes are (`EnsureIndex`), with the logs' commit interval. `N` is the
+`<--trace-index-prefix>-v<N>-<days>d`, default `ferun-traces-v2-30d`
+(`--trace-retention`, 30 days), created at first use with its topic and source as the logs'
+indexes are, with a commit interval of 5 s. `N` is the
 mapping's version (`quickwit.TraceMappingVersion`): a changed mapping is
 a new index, and reads search `<prefix>-*`, every version, until the old
 one ages out. Spans are partitioned as the log indexes' lines are, by
@@ -236,11 +234,14 @@ data source among them, reads them with the base URL
 - `GET /api/v1/jaeger/api/traces/{traceID}` → `{"data": [trace]}`; none
   of the tenant's spans: 404 `{"data": null, "errors": [{"code": 404,
   "msg": "trace not found"}]}`. The spans come from the index and from
-  `trace_spans`, one per span ID, at most 10,000. FeRun's selectors
+  the topic's tail: the trace's partition from the source's checkpoint
+  to its end, the spans not yet published, so a fresh request's trace is
+  found at once; one per span ID, at most 10,000. FeRun's selectors
   (below) narrow it to the spans that have them.
 - `GET /api/v1/jaeger/api/traces?service=&operation=&tags=&start=&end=&minDuration=&maxDuration=&limit=`
   → `{"data": [traces]}`: the traces of the newest spans that match,
-  each whole. `start`, `end` in µs since the epoch (default the last
+  each whole. A search reads the index alone: a span is found by it at
+  most a commit (5 s) after it came; `/services` and `/operations` too. `start`, `end` in µs since the epoch (default the last
   hour); `minDuration`, `maxDuration` as Go durations (`100ms`, `1.5s`);
   `tags` a JSON object of attribute and value (a string, a number or a
   bool; a key without a backslash), each matched in the span's or the

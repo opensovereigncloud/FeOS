@@ -74,10 +74,16 @@ func (s *Store) ensure(ctx context.Context, id string, days int) (int32, error) 
 	})
 }
 
-// streamKey is a stream's key in the topics: its tenant, environment and
-// job, the labels a read selects by, so that the streams a read wants lie
-// in few partitions (one an environment or a job).
-func streamKey(tenant, environment, job string) string { return tenant + "/" + environment + "/" + job }
+// streamKey is a stream's key in the topics: its tenant and environment,
+// or, for a stream of no environment (a tenant's job), its tenant and job.
+// A read selects by these labels, so the streams it wants lie in few
+// partitions: an environment's, its jobs' runs among them, in one.
+func streamKey(tenant, environment, job string) string {
+	if environment != "" {
+		return tenant + "/" + environment
+	}
+	return tenant + "//" + job
+}
 
 // docOf is a line as its stream's index holds it.
 func docOf(l Line, st *streamRow) quickwit.Doc {

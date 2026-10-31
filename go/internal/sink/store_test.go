@@ -202,14 +202,14 @@ func TestIngestIdempotent(t *testing.T) {
 	// labels.
 	sid := streamSID(t, s, key)
 	recs := lg.records(logTopic)
-	part := kafka.Partition("acme/env1/", int32(testConfig().KafkaPartitions))
+	part := kafka.Partition("acme/env1", int32(testConfig().KafkaPartitions))
 	var offs []int64
 	for _, r := range recs {
 		var d quickwit.Doc
 		if err := json.Unmarshal(r.Value, &d); err != nil {
 			t.Fatal(err)
 		}
-		if string(r.Key) != "acme/env1/" || r.Partition != part || d.Stream != sid || d.Tenant != "acme" ||
+		if string(r.Key) != "acme/env1" || r.Partition != part || d.Stream != sid || d.Tenant != "acme" ||
 			d.Environment != "env1" || d.Replica != 0 || d.Release != 3 || d.Source != SourceContainer || d.IOStream != "stdout" {
 			t.Errorf("record %q in %d: %+v", r.Key, r.Partition, d)
 		}
@@ -218,23 +218,31 @@ func TestIngestIdempotent(t *testing.T) {
 	if fmt.Sprint(offs) != "[0 10 20 30 40 50 60]" {
 		t.Errorf("offsets in the topic %v", offs)
 	}
-	// A job's stream lies in its job's partition.
+	// A run of an environment's job lies in its environment's partition, a
+	// tenant's job (no environment) in its job's.
 	job := Labels{Tenant: "acme", Environment: "env1", Job: "build-1", Attrs: map[string]string{}}
 	if err := s.Ingest(ctx, batch(StreamKey{"pod2", "main", "L1"}, job, lines(0, base, 1, func(int) string { return "j" }))); err != nil {
 		t.Fatal(err)
 	}
+	tjob := Labels{Tenant: "acme", Job: "build-2", Attrs: map[string]string{}}
+	if err := s.Ingest(ctx, batch(StreamKey{"pod3", "main", "L1"}, tjob, lines(0, base, 1, func(int) string { return "t" }))); err != nil {
+		t.Fatal(err)
+	}
 	recs = lg.records(logTopic)
-	jobs := 0
+	inEnv, jobs := 0, 0
 	for _, r := range recs {
-		if string(r.Key) == "acme/env1/build-1" {
+		switch string(r.Key) {
+		case "acme/env1":
+			inEnv++
+		case "acme//build-2":
 			jobs++
-			if r.Partition != kafka.Partition("acme/env1/build-1", int32(testConfig().KafkaPartitions)) {
-				t.Errorf("the job's record in %d", r.Partition)
+			if r.Partition != kafka.Partition("acme//build-2", int32(testConfig().KafkaPartitions)) {
+				t.Errorf("the tenant's job's record in %d", r.Partition)
 			}
 		}
 	}
-	if len(recs) != 8 || jobs != 1 {
-		t.Errorf("%d records, %d of the job", len(recs), jobs)
+	if len(recs) != 9 || inEnv != 8 || jobs != 1 {
+		t.Errorf("%d records, %d of the environment, %d of the tenant's job", len(recs), inEnv, jobs)
 	}
 
 	pos, err := s.Positions(ctx, []StreamKey{{"nope", "x", "y"}, key})
@@ -257,7 +265,7 @@ func TestIngestIdempotent(t *testing.T) {
 	for _, when := range []string{"tail", "index"} {
 		if when == "index" {
 			idx.sync(lg)
-			if n := idx.count("acme"); n != 9 {
+			if n := idx.count("acme"); n != 10 {
 				t.Fatalf("%d documents", n)
 			}
 		}
@@ -971,12 +979,18 @@ func TestFollowPartitions(t *testing.T) {
 		want []int32
 	}{
 		{Selector{Stream: "s_1"}, partitionsOf(live, 12)},
-		{Selector{Environment: "e", Job: "j"}, []int32{kafka.Partition("acme/e/j", 12)}},
-		{Selector{Environment: "e"}, []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
-		{Selector{Job: "j"}, []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
-		{Selector{Instance: "i"}, []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+		{Selector{Environment: "e", Job: "j"}, []int32{kafka.Partition("acme/e", 12)}},
+		{Selector{Environment: "e"}, []int32{kafka.Partition("acme/e", 12)}},
+		{Selector{Job: "j"}, append(partitionsOf(live, 12), kafka.Partition("acme//j", 12))},
+		{Selector{Job: "j"}, nil},
+		{Selector{Instance: "i"}, partitionsOf(live, 12)},
+		{Selector{Instance: "i"}, nil}, // no stream yet: every partition (below)
 	} {
-		if got := followPartitions("acme", c.sel, live, 12); !slices.Equal(got, c.want) {
+		l := live
+		if c.want == nil {
+			l, c.want = nil, []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+		}
+		if got := followPartitions("acme", c.sel, l, 12); !slices.Equal(got, c.want) {
 			t.Errorf("%+v: %v, want %v", c.sel, got, c.want)
 		}
 	}

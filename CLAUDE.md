@@ -35,7 +35,8 @@ FeRun, the control plane (ADR 0015), is Go in `go/` (`ferund`,
 `docs/architecture/control-plane.md` before larger changes there. Its rules:
 
 - **Fixed dependencies.** The standard library, pgx/v5, grpc, protobuf, the
-  MCP go-sdk, google/uuid, x/crypto and x/sync; for the UI React, Vite and
+  MCP go-sdk, google/uuid, x/crypto, x/sync and franz-go (the sink's Kafka
+  client, ADR 0026 §11); for the UI React, Vite and
   Vitest. Never `go get`, `go mod tidy`, or edit `go.mod`, `go.sum` or
   `go/internal/deps`, and add no npm package, without asking.
 - **Static.** `ferund` builds with `CGO_ENABLED=0`; check it with `file`.

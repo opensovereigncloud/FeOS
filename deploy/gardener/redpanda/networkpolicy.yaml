@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Redpanda's only lock (values.yaml): its brokers among themselves, its
+# configuration Job, ferun-sink and Quickwit's indexers.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redpanda
+  namespace: ferun
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redpanda
+      app.kubernetes.io/instance: redpanda
+      app.kubernetes.io/component: redpanda-statefulset
+  policyTypes: [Ingress]
+  ingress:
+    # broker <-> broker: Raft/RPC, Kafka (internal pandaproxy/schema-registry clients and rpk), admin (sidecar probes, rpk)
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redpanda
+              app.kubernetes.io/instance: redpanda
+              app.kubernetes.io/component: redpanda-statefulset
+      ports:
+        - { port: 33145, protocol: TCP }   # RPC
+        - { port: 9093,  protocol: TCP }   # Kafka API
+        - { port: 9644,  protocol: TCP }   # Admin API
+        # add 8082 (HTTP proxy) / 8081 (schema registry) only if something uses them; they listen regardless
+    # post-install/post-upgrade Job "redpanda-configuration" syncs cluster config via the admin API
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: redpanda-configuration
+              app.kubernetes.io/instance: redpanda
+              app.kubernetes.io/component: redpanda-post-install
+      ports:
+        - { port: 9644, protocol: TCP }
+    # The Kafka API's clients: ferun-sink (it produces and reads the tail)
+    # and Quickwit's indexers (their Kafka sources).
+    - from:
+        - podSelector: { matchLabels: { app: ferun-sink } }
+        - podSelector: { matchLabels: { app.kubernetes.io/component: indexer, app.kubernetes.io/name: quickwit } }
+      ports:
+        - { port: 9093, protocol: TCP }

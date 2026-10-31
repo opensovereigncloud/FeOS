@@ -1,6 +1,6 @@
 # ADR 0026: The sink — a program of its own that keeps what the platform and its pods say: logs first, traces and audit records after, in the database first and in the object store after
 
-**Status:** Accepted (Malte, 2026-10-30), steps 1 to 7 built and live on shoot `fecode` since 2026-10-31; §10, Quickwit as the index and the cold store, accepted 2026-10-31 (Malte) · **Date:** 2026-10-30
+**Status:** Accepted (Malte, 2026-10-30), steps 1 to 7 built and live on shoot `fecode` since 2026-10-31; §10, Quickwit as the index and the cold store, accepted 2026-10-31 (Malte); §11, Redpanda as the log of record in place of the database's hot stage, accepted 2026-10-31 (Malte) · **Date:** 2026-10-30
 
 ## Context
 
@@ -370,6 +370,84 @@ Jaeger-compatible API for traces.
   splits in the sink's bucket under `quickwit/`. Its chart (0.8.17) runs
   the 0.9.3 image; R2 takes it without request checksums.
 
+### 11. Redpanda is the log of record; the database keeps no line (2026-10-31)
+
+Decided by Malte on 2026-10-31, after a look at the path as built: a
+PostgreSQL in the middle of the ingest is a queue, a lock service and a
+live tail at once, it shares its cluster with `ferund`'s (§1 says logs
+must not burden the control plane), every line is written twice (its
+write-ahead log and the index), and the sink's indexer rebuilds by hand
+what Quickwit does for a Kafka topic by itself: it keeps a topic's
+offsets in its metastore in the same transaction that publishes a split,
+so each record is indexed exactly once. Traces had the same shape again
+(`trace_spans` and an indexer of their own).
+
+```
+guest container.log ─▶ feosd ──OTLP (node cert)──▶ ferun-sink ──acks=all──▶ Redpanda topic ─▶ Quickwit Kafka source ─▶ splits (bucket)
+ferun-ingress ───────────────OTLP (ingress cert)──▶    │  gate: peers, labels,                │ ▲ read back: the tail
+pods ─OTLP─▶ feosd (169.254.169.1) ───────────────▶    │  quota, positions                    │ │ Quickwit has not
+                                                       ▼                                       │ │ committed, and follow
+                                              PostgreSQL: streams, positions, quota ◀─────────┘ │
+tenants ── GET /api/v1/logs, /api/v1/jaeger ─▶ ferun-sink: Quickwit + the topic's tail ─────────┘
+```
+
+- **One log for every signal.** A topic per index: `<prefix>-v<version>-<days>d`, the
+  index's own name (`ferun-logs-v3-30d`, `ferun-logs-v3-400d`,
+  `ferun-traces-v2-30d`), each indexed by one Kafka source of its index.
+  The topics are a replay buffer, kept a day (`--kafka-retention`); the
+  index is the store. Redpanda (Kafka API, three brokers, replication
+  three) answers a produce once every in-sync replica has it, synced to
+  disk.
+- **The sink stays the gate, and keeps no line.** It checks the peers
+  (§3, §8), takes the labels, counts the quota, and for a log stream
+  keeps its row: labels, first and last time, `next_offset` for the
+  node, and the rule that a line at or below the last offset stored is
+  stored. It locks the stream, takes the new lines, produces them, and
+  answers the node only after the produce and the commit of the stream's
+  row. A batch the node sends again stores nothing; one sent again after
+  an answer that did not arrive may lie in the topic twice, which the
+  reads drop (one (stream, offset), one span ID). `log_batches`,
+  `log_lines` and `trace_spans` and both indexers go.
+- **The partition is the reader's address.** A log record's key is its
+  stream's tenant and environment (a tenant's job: tenant and job), the
+  partition the key's hash: a stream's lines stay in order, and a read
+  or a follow of an environment, its jobs' runs among them, reads one
+  partition per topic. A span's key is its trace ID: a trace
+  is read from one partition.
+- **Reading is the index and the tail.** A read asks Quickwit for the
+  source's checkpoint first (per partition, what it has published), then
+  searches the index as before, then reads the topic's partitions of
+  its selector from the checkpoint to their end: the lines Quickwit has
+  not committed, seconds of them. Every line is in one of the two, some
+  in both; the read takes each (stream, offset) once. The trace by ID
+  reads its trace's partition the same way, so a fresh request's trace
+  is found at once; the searches of traces read the index alone, so a
+  span is found by a search after a commit (5 s).
+- **Following is the topic.** A follow reads its partitions from their
+  end as records come (a fetch waits up to half a second), after the
+  backward page it gives first; a line it gave on that page is not given
+  again. No database is polled.
+- **On the nodes, nothing changes, on purpose.** The guest's
+  `container.log` is the node's buffer and stays its source (§3): feosd
+  follows it from the position the sink keeps and sends one batch a
+  stream at a time. A node producing to Redpanda itself was weighed and
+  not chosen: Kafka's ACLs know a client, not a tenant or a stream, so
+  neither the rule that a node writes only container streams and an
+  ingress only its own, nor a tenant's quota, could be kept there; the
+  position a moved or restored pod's stream goes on from must be kept
+  beside the node anyway; and feosd would carry a Kafka client of its
+  own. The gate stays one program with one certificate check.
+- **Deployment.** Redpanda by its Helm chart in the namespace `ferun`,
+  three brokers on the three workers with a volume each, reached only by
+  the sink and Quickwit (a NetworkPolicy, no TLS or SASL inside the
+  cluster). Its Community Edition is under the Business Source License:
+  only its features without an enterprise licence are used.
+- **The move.** The new indexes' sources fill them from the topics; the
+  indexes of before stay readable by the prefix until their retention
+  empties them. What lay hot in the database when the new sink started
+  is produced to the topics once and deleted; the tables go in the next
+  release.
+
 ### Steps
 
 1. **The guest's format.** CRI lines with time and stream,
@@ -398,6 +476,9 @@ Jaeger-compatible API for traces.
    once, `log_traces` dropped, OTLP's own trace IDs and severities.
 10. **Traces** (§10): the node's OTLP listener for pods, spans through the
     sink into Quickwit, the Jaeger API per tenant, the ingress's spans.
+11. **Redpanda** (§11): the topics, the produce in place of the hot
+    stage, the Kafka sources, reads and follows from the index and the
+    tail, the move of the hot rows; then the tables' drop.
 
 ## Alternatives considered
 
@@ -434,6 +515,14 @@ Jaeger-compatible API for traces.
 - **The sink's own chunks for good** (steps 4 and 5, until 2026-10-31):
   fine for a selector and a time, a scan for a word, and no place for
   traces without building a trace store as well. Replaced by §10.
+- **The database as the hot stage** (§4, §10, until 2026-10-31): one
+  transaction for positions, quota and lines, but a queue in the control
+  plane's database cluster, every line written twice, and an indexer of
+  our own beside Quickwit's Kafka source. Replaced by §11. **Apache
+  Kafka** in place of Redpanda: the same API and Apache-2.0, but a JVM
+  cluster to run; Redpanda was chosen for its single binary, its licence
+  checked for the features used. **feosd producing to the topics
+  itself**: see §11, on the nodes.
 - **Grafana Tempo** for traces (and Loki for logs): AGPL-3.0, and a
   cluster each with a ring, ingesters and compactors. **ClickHouse**
   (with an OpenTelemetry schema): strong where traces are aggregated
