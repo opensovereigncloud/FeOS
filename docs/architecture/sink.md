@@ -281,7 +281,8 @@ Deletes the streams, their lines and chunks. 204.
   itself (an attached service's workspace too) has none: its logs are
   not shipped. `POST /api/v1/jobs` takes `logRetentionDays` (1 to 400),
   which becomes `ferun.retention_days`.
-- `--sink-endpoint` (host:port of the ingest) to the nodes;
+- `--sink-endpoint` (host:port of the ingest) to the nodes, a name
+  resolved every 10 s into one ready instance's address per node;
   `--sink-url` (the API, inside the cluster) for its own reads.
 - `GET /api/v1/tenant`: the token's tenant.
 - `ferund service-token --kind sink --name <name>` prints

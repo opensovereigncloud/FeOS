@@ -434,7 +434,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 	fs.DurationVar(&c.TrafficRetention, "traffic-retention", c.TrafficRetention, "how long traffic records are kept")
 	fs.DurationVar(&c.AccessLogRetention, "access-log-retention", c.AccessLogRetention, "how long the ingress's access log is kept")
 	fs.StringVar(&c.SinkEndpoint, "sink-endpoint", c.SinkEndpoint,
-		"host:port of the sink's ingest (ADR 0026), named to the nodes, which ship their pods' logs there; empty: no logs are shipped")
+		"host:port of the sink's ingest (ADR 0026), named to the nodes, which ship their pods' logs there; a name is resolved and each node given one of its addresses; empty: no logs are shipped")
 	fs.StringVar(&c.SinkURL, "sink-url", c.SinkURL,
 		"the sink's HTTP API inside the cluster, e.g. http://ferun-sink:8080, which the logs calls read first; empty: the nodes only")
 	fs.StringVar(&t.logLevel, "log-level", t.logLevel, "debug, info, warn or error")

@@ -116,7 +116,7 @@ token of an instance of `ferun-sink` ([The sink](#the-sink)).
 | `--hibernate-timeout` | `1h` | how long ferund waits for a hibernation, plus a pause's deadline and 16 s per GiB of memory; on a feosd that reports its hibernations, the node's goes on after it |
 | `--shutdown-grace` | `11m` | how long a stopping instance waits for its requests, its tool calls and its ops |
 | `--activity-retention`, `--traffic-retention`, `--access-log-retention` | `720h`, `168h`, `168h` | how long activity, traffic records and the ingress's access log are kept |
-| `--sink-endpoint` | none | `host:port` of the sink's ingest ([The sink](#the-sink)), named in every telemetry answer to the nodes, which ship their pods' logs there; empty: nothing is shipped |
+| `--sink-endpoint` | none | `host:port` of the sink's ingest ([The sink](#the-sink)), named in every telemetry answer to the nodes, which ship their pods' logs there; a name (a headless Service's) is resolved every 10 s and each node is given one of its addresses, the same while it is there, since a node neither resolves the cluster's names nor reaches its ClusterIPs; empty: nothing is shipped |
 | `--sink-url` | none | the sink's HTTP API inside the cluster, e.g. `http://ferun-sink:8080`, which the logs calls read first; empty: the nodes only |
 | `--log-level` | `info` | |
 
@@ -3003,7 +3003,8 @@ nor waits for. `ferund`'s part:
   unfinished for a second) with the next entries of its source up to one
   that is not partial, cut to the line budget.
 - **The nodes.** Every `TelemetryResponse` names `--sink-endpoint`
-  (`sink_endpoint`); empty, the nodes ship nothing.
+  (`sink_endpoint`), a name as one of its addresses per node, looked up
+  every 10 s (`fleet/sink.go`); empty, the nodes ship nothing.
 - **Reads.** With `--sink-url`, the objects' logs call (a replica's or an
   addon's instance, a job's latest run) and a running tenant's job's logs
   ask the sink first: `GET <sink-url>/api/v1/logs?instance=<sandbox ID>`

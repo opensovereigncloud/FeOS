@@ -13,7 +13,7 @@ what FeOS needs (ublk, tun, vhost-vsock, WireGuard, nftables).
 |---|---|---|
 | [`feos/`](feos/) | namespace `feos`, the DaemonSet `feos-node` on every worker of the pool `WORKER_POOL`, and `feos-k8s` | diskd and feosd in a pod per worker, whose microVMs live in it (ADR 0020); feos-k8s joins new workers and drains cordoned ones in FeRun |
 | [`ferun/`](ferun/) | namespace `ferun` | ferund, three instances, one on each worker, and its PostgreSQL `ferun-db`, a CloudNativePG cluster of three instances, one on each worker ([`ferun/postgres.yaml`](ferun/postgres.yaml)); the k3s manifests of ferund ([`../k3s/ferun`](../k3s/ferun)) with the nodes' port at a shoot address; `https://run.<DOMAIN>` by the HTTPRoute [`ferun/route.yaml`](ferun/route.yaml) in place of k3s's Ingress |
-| [`ferun-sink/`](ferun-sink/) | namespace `ferun` | ferun-sink, two instances over the database `sink` of `ferun-db` and the bucket: the nodes ship logs to its ingest at `FERUN_SINK_IP:4317`, tenants read at `https://run.<DOMAIN>/api/v1/logs` ([The sink](#the-sink)) |
+| [`ferun-sink/`](ferun-sink/) | namespace `ferun` | ferun-sink, two instances over the database `sink` of `ferun-db` and the bucket: the nodes ship logs to its ingest's instances, tenants read at `https://run.<DOMAIN>/api/v1/logs` ([The sink](#the-sink)) |
 | [`ferun-ingress/`](ferun-ingress/) | namespace `ferun-ingress` | ferun-ingress, an instance on every worker, behind a LoadBalancer of their own with `externalTrafficPolicy: Local`: `https://<label>.<APPS_ZONE>`, public environments' hosts, straight to their pods over the mesh ([The ingress](#the-ingress)) |
 | [`../k3s/fechat`](../k3s/fechat), [`fechat/`](fechat/) | namespace `fechat` | FeChat, unchanged but for its route: `https://chat.<DOMAIN>` by the HTTPRoute [`fechat/route.yaml`](fechat/route.yaml) in place of k3s's Ingress |
 | [`registry/`](registry/) | namespace `registry` | an image registry, `https://oci.<DOMAIN>`: distribution with its blobs in an object store |
@@ -85,7 +85,6 @@ on make's command line wins over the file.
 | `WORKER_POOL` | the worker pool that runs FeOS, its label `worker.gardener.cloud/pool` |
 | `NODE_NAME_PREFIX` | the beginning of the pool's node names, on IronCore `shoot--<project>--<shoot>-<pool>-`; feos-k8s removes from FeRun only nodes with it, by force, so no other shoot's nodes may match ([`config.env.example`](config.env.example)) |
 | `FERUN_NODES_IP` | the ClusterIP of the service `ferund-nodes`, which feosd and ferun-ingress dial: a free address of the shoot's service network (`spec.networking.services`) |
-| `FERUN_SINK_IP` | the ClusterIP of the service `ferun-sink-ingest`, where feosd ships the pods' logs (ferund's `--sink-endpoint <ip>:4317`): another free address of the service network ([The sink](#the-sink)) |
 | `FERUN_ROLLOUT_GRACE` | how long a call waits for a node that announced it stops, ferund's `--rollout-grace`: default `8m`, for the feos-node pods, which suspend their microVMs and resume them; `30s` where feosd runs on the host without `--suspend-on-stop` ([`config.env.example`](config.env.example)) |
 | `EDGE_NAME`, `EDGE_ADDRESSES`, `DOMAIN_CHALLENGE_LABEL` | tenants' domains (ADR 0021): the name a domain's CNAME points at (default `edge.<DOMAIN>`; empty: domains off), the balancer's addresses for apex A records, and the TXT label that proves a claim (default `_ferun-challenge`); names under `DOMAIN` are reserved ([`config.env.example`](config.env.example)) |
 | `ACME_DIRECTORY`, `ACME_PROFILE`, `ACME_EMAIL` | the domains' certificates (ADR 0021), which ferund orders over HTTP-01 through ferun-ingress's port 80: the CA's directory (empty: none is ordered, domains stay `issuing`), the profile (default `shortlived`, six days, renewed after three), the account's contact (optional) ([`config.env.example`](config.env.example)) |
@@ -349,8 +348,10 @@ ferun-sink (ADR 0026, [`docs/architecture/sink.md`](../../docs/architecture/sink
 keeps the pods' logs: the Deployment `ferun-sink` of
 [`ferun-sink/`](ferun-sink/ferun-sink.yaml), two instances in the
 namespace `ferun`, over the database `sink` of `ferun-db` and the
-platform's bucket. The nodes ship to its ingest at
-`FERUN_SINK_IP:4317`, over mTLS with their node certificates; tenants
+platform's bucket. The nodes ship to its ingest, port 4317, over mTLS
+with their node certificates, each at the address of an instance that
+ferund gives it: the hosts reach no ClusterIP, so the Service
+`ferun-sink-ingest` is headless and ferund resolves it; tenants
 read at `https://run.<DOMAIN>/api/v1/logs` and `/api/v1/log-streams`
 with their FeRun tokens, through the HTTPRoute `ferun-sink`. Its image
 is a platform image of its own on GHCR,
@@ -389,7 +390,7 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
          --from-literal=region=auto --from-literal=bucket=<bucket> --from-literal=prefix=sink/ \
          --from-literal=access-key=<key id> --from-literal=secret-key=<secret>
 
-4. `FERUN_SINK_IP` in `config.env`, then the manifests: the Database
+4. The manifests: the Database
    `sink` (owned by `sink`), the Deployment, its Services and the route.
    An instance is ready once it holds its certificate:
 
@@ -397,8 +398,9 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
        kubectl -n ferun rollout status deployment/ferun-sink --timeout=5m
 
 5. ferund tells the nodes where to ship (`--sink-endpoint
-   <FERUN_SINK_IP>:4317`) and reads from the sink (`--sink-url
-   http://ferun-sink.ferun.svc:8080`).
+   ferun-sink-ingest.ferun.svc.cluster.local:4317`, which it resolves
+   every 10 s and hands each node one ready instance) and reads from the
+   sink (`--sink-url http://ferun-sink.ferun.svc:8080`).
 
 A new image: `make -C deploy/gardener deploy-ferun-sink TAG=<tag>`
 pushes it and rolls the instances. Lines are kept 30 days

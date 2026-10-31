@@ -94,7 +94,8 @@ type Config struct {
 	// 0017); the zero prefix when its network is routed.
 	PodNetwork netip.Prefix
 	// SinkEndpoint is host:port of the sink's ingest (--sink-endpoint, ADR
-	// 0026), which every TelemetryResponse names; "": none.
+	// 0026), which every TelemetryResponse names, a name resolved to one of
+	// its addresses per node (sinkAddresses); "": none.
 	SinkEndpoint string
 	Log          *slog.Logger
 }
@@ -174,6 +175,8 @@ type Service struct {
 	joinSlotWait time.Duration
 	// presents are the slots of OnPresented's locked passes (4).
 	presents chan struct{}
+	// sink is the address each node ships its logs to (ADR 0026).
+	sink *sinkAddresses
 
 	// The inputs of node expiry's health gate; tests replace them.
 	leadingSince func() time.Time
@@ -244,6 +247,7 @@ func New(cfg Config, deps Deps) *Service {
 		now:          time.Now,
 		expiryBatch:  fencedBatch,
 		notified:     map[string]time.Time{},
+		sink:         newSinkAddresses(cfg.SinkEndpoint),
 	}
 	if s.el != nil {
 		s.leadingSince = s.el.LeadingSince

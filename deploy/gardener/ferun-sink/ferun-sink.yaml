@@ -26,9 +26,11 @@
 #                      managed.roles).
 # The database sink is the Database below; the role must exist first.
 #
-# The nodes reach the ingest at ${FERUN_SINK_IP}:4317, a fixed ClusterIP
-# like ferund-nodes', since feosd runs on the hosts: ferund's
-# --sink-endpoint names it. Tenants read at https://run.${DOMAIN}/api/v1/logs
+# The nodes reach the ingest at an instance's address, which ferund looks
+# up from the headless service ferun-sink-ingest (its --sink-endpoint
+# ferun-sink-ingest.ferun.svc.cluster.local:4317) and hands each node:
+# feosd runs on the hosts, which neither resolve the cluster's names nor
+# reach its ClusterIPs. Tenants read at https://run.${DOMAIN}/api/v1/logs
 # and /api/v1/log-streams (the HTTPRoute below); ferund reads at
 # http://ferun-sink.ferun.svc:8080 (its --sink-url).
 apiVersion: postgresql.cnpg.io/v1
@@ -189,16 +191,15 @@ spec:
       port: 8080
       targetPort: http
 ---
-# The ingest. feosd runs on the hosts, which do not resolve the cluster's
-# names, so the service has a fixed address, which ferund hands the nodes
-# (--sink-endpoint ${FERUN_SINK_IP}:4317).
+# The ingest, headless: its name resolves to the ready instances'
+# addresses, one of which ferund hands each node (--sink-endpoint).
 apiVersion: v1
 kind: Service
 metadata:
   name: ferun-sink-ingest
   namespace: ferun
 spec:
-  clusterIP: ${FERUN_SINK_IP}
+  clusterIP: None
   selector:
     app: ferun-sink
   ports:

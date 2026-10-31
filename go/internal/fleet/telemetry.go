@@ -29,6 +29,8 @@ func (s *Service) reportTelemetry(ctx context.Context, t *fleetv1.Telemetry) (*f
 	if err != nil {
 		return nil, err
 	}
+	// Looked up before the transaction, which waits for nothing else.
+	sinkAddr := s.sink.forNode(ctx, p.Node)
 	startID, err := uuid.Parse(t.GetStartId())
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "start_id %q is not a UUID", activity.Clean(t.GetStartId()))
@@ -115,7 +117,7 @@ func (s *Service) reportTelemetry(ctx context.Context, t *fleetv1.Telemetry) (*f
 			// could not remove waits for the node's hash to change.
 			reconcile = differs && m.For >= mismatchSettle && report.InventoryHash != m.ReconciledHash
 		}
-		resp = &fleetv1.TelemetryResponse{IntervalSeconds: telemetryInterval, SinkEndpoint: s.cfg.SinkEndpoint}
+		resp = &fleetv1.TelemetryResponse{IntervalSeconds: telemetryInterval, SinkEndpoint: sinkAddr}
 		return s.listInstances(ctx, tx, &resp.Instances)
 	})
 	if err != nil {
