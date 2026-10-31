@@ -421,7 +421,7 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
          --from-literal=username=quickwit --from-literal=password="$(openssl rand -hex 24)"
        make -C deploy/gardener apply-ferun apply-quickwit
 
-   The sink makes its indexes (`ferun-logs-<days>d`) itself.
+   The sink makes its indexes (`ferun-logs-v2-<days>d`) itself.
 
 6. ferund tells the nodes where to ship (`--sink-endpoint
    ferun-sink-ingest.ferun.svc.cluster.local:4317`, which it resolves
@@ -430,8 +430,11 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
 
 A new image: `make -C deploy/gardener deploy-ferun-sink TAG=<tag>`
 pushes it and rolls the instances. Lines are kept 30 days
-(`FERUN_SINK_LOG_RETENTION`, the index `ferun-logs-30d`), a tenant's job
-asks for up to 400 (`FERUN_SINK_LOG_RETENTION_MAX`, `ferun-logs-400d`).
+(`FERUN_SINK_LOG_RETENTION`, the index `ferun-logs-v2-30d`), a tenant's job
+asks for up to 400 (`FERUN_SINK_LOG_RETENTION_MAX`, `ferun-logs-v2-400d`).
+The indexes of before, `ferun-logs-30d` and `ferun-logs-400d`, are
+read too until their retention has emptied them; then they can be
+deleted (`DELETE /api/v1/indexes/<id>` at Quickwit).
 The chunks the sink wrote before Quickwit all moved into the index on
 2026-10-31.
 

@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -20,7 +19,7 @@ import (
 // test's. Ingest answers once the documents are published; Search reads
 // the indexes a pattern names.
 type Index interface {
-	EnsureIndex(ctx context.Context, id string, retentionDays, commitSecs int) error
+	EnsureIndex(ctx context.Context, id string, settings quickwit.IndexSettings) error
 	Indexes(ctx context.Context, prefix string) ([]string, error)
 	Ingest(ctx context.Context, id string, docs []quickwit.Doc) error
 	Search(ctx context.Context, pattern string, q quickwit.Query) ([]quickwit.Doc, error)
@@ -43,12 +42,12 @@ const (
 	indexBackoff = 30 * time.Second
 )
 
-// indexID is the index of a retention in days: <prefix>-<days>d.
-func (s *Store) indexID(days int) string {
-	return s.cfg.IndexPrefix + "-" + strconv.Itoa(days) + "d"
-}
+// indexID is the index of a retention in days, of the current mapping:
+// <prefix>-v<version>-<days>d.
+func (s *Store) indexID(days int) string { return quickwit.IndexID(s.cfg.IndexPrefix, days) }
 
-// indexPattern names every log index of the sink.
+// indexPattern names every log index of the sink, of every mapping
+// version (<prefix>-<days>d is version 1).
 func (s *Store) indexPattern() string { return s.cfg.IndexPrefix + "-*" }
 
 func durationDays(d time.Duration) int { return int((d + 24*time.Hour - 1) / (24 * time.Hour)) }
@@ -77,7 +76,9 @@ func (s *Store) ensure(ctx context.Context, id string, days int) error {
 	if ok {
 		return nil
 	}
-	if err := s.index.EnsureIndex(ctx, id, days, int(s.cfg.CommitTimeout/time.Second)); err != nil {
+	settings := quickwit.IndexSettings{RetentionDays: days, CommitSecs: int(s.cfg.CommitTimeout / time.Second),
+		Partitions: s.cfg.IndexPartitions}
+	if err := s.index.EnsureIndex(ctx, id, settings); err != nil {
 		return fmt.Errorf("index %s: %w", id, err)
 	}
 	s.ensured.mu.Lock()

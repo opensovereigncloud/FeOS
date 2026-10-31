@@ -27,7 +27,7 @@ type memIndex struct {
 
 func newMemIndex() *memIndex { return &memIndex{docs: map[string][]quickwit.Doc{}} }
 
-func (m *memIndex) EnsureIndex(_ context.Context, id string, _, _ int) error {
+func (m *memIndex) EnsureIndex(_ context.Context, id string, _ quickwit.IndexSettings) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.docs[id]; !ok {

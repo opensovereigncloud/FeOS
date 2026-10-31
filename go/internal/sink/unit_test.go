@@ -264,8 +264,16 @@ func TestConfig(t *testing.T) {
 	if c.Name != "sink-0" || c.Retention != 24*time.Hour || c.Quota != 1<<30 || c.ServiceToken != "tok" {
 		t.Errorf("config %+v", c)
 	}
-	if c.IndexPrefix != "ferun-logs" || c.CommitTimeout != 10*time.Second {
-		t.Errorf("index %q, commit %v", c.IndexPrefix, c.CommitTimeout)
+	if c.IndexPrefix != "ferun-logs" || c.CommitTimeout != 10*time.Second || c.IndexPartitions != 16 {
+		t.Errorf("index %q, commit %v, %d partitions", c.IndexPrefix, c.CommitTimeout, c.IndexPartitions)
+	}
+	for _, p := range []string{"0", "201"} {
+		if _, err := Parse([]string{"--index-partitions", p}, func(k string) string { return env[k] }); err == nil {
+			t.Errorf("--index-partitions %s passed", p)
+		}
+	}
+	if c, err := Parse([]string{"--index-partitions", "200"}, func(k string) string { return env[k] }); err != nil || c.IndexPartitions != 200 {
+		t.Errorf("--index-partitions 200: %d, %v", c.IndexPartitions, err)
 	}
 	delete(env, "FERUN_SINK_INDEX_SEARCH_URL")
 	if _, err := Parse(nil, func(k string) string { return env[k] }); err == nil {

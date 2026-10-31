@@ -236,9 +236,16 @@ func TestIndexAndQueries(t *testing.T) {
 	if n := idx.count("acme"); n != 50 || hot != 20 {
 		t.Fatalf("indexed %d, hot %d", n, hot)
 	}
-	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-30d]" {
+	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-v2-30d]" {
 		t.Errorf("indexes %v", ids)
 	}
+	// A read finds the lines of an index of before (version 1,
+	// <prefix>-<days>d) with the current version's: stream 1's first
+	// batch moves there.
+	idx.mu.Lock()
+	v2 := idx.docs["ferun-logs-v2-30d"]
+	idx.docs["ferun-logs-30d"], idx.docs["ferun-logs-v2-30d"] = v2[:10], v2[10:]
+	idx.mu.Unlock()
 	// A line sent again after it was indexed is not stored again.
 	if err := s.Ingest(ctx, batch(key1, envLabels("acme", "env1", 0), lines(0, base, 1, ln("a")))); err != nil {
 		t.Fatal(err)
@@ -372,7 +379,7 @@ func TestRetentionAndDelete(t *testing.T) {
 	indexAll(t, s)
 	// An index per retention: the default's, and the longest's for the
 	// streams that ask for more.
-	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-1d ferun-logs-3d]" || idx.count("acme") != 7 {
+	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-v2-1d ferun-logs-v2-3d]" || idx.count("acme") != 7 {
 		t.Fatalf("indexes %v, %d documents", ids, idx.count("acme"))
 	}
 	// A hot line past retention goes too.
@@ -406,6 +413,13 @@ func TestRetentionAndDelete(t *testing.T) {
 	}
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "job"}, Labels{Tenant: "acme", Job: "j1", Attrs: map[string]string{}},
 		lines(0, base, 2, text))); err != nil {
+		t.Fatal(err)
+	}
+	// An index of before (version 1) gets its delete task too.
+	if err := idx.EnsureIndex(ctx, "ferun-logs-1d", quickwit.IndexSettings{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Ingest(ctx, "ferun-logs-1d", []quickwit.Doc{{Tenant: "acme", Environment: "e", Stream: "s_v1", Text: "v1"}}); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := s.DeleteStreams(ctx, "other", "e", ""); err != nil || n != 0 {

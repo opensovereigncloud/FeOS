@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/gardenlinux/feos/go/internal/pki"
+	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
 // EnvPrefix starts every environment variable of a flag.
@@ -59,8 +60,12 @@ type Config struct {
 	ServiceToken string
 	// The index (ADR 0026 §10): Quickwit's indexers for ingest, its
 	// searchers for everything else, and the prefix of the log indexes'
-	// names (<prefix>-<days>d).
+	// names (<prefix>-v<version>-<days>d).
 	IndexIngestURL, IndexSearchURL, IndexPrefix string
+	// IndexPartitions is how many partitions a new index hashes its lines
+	// into by tenant, environment and job (its partition_key); an index
+	// keeps the number it was made with.
+	IndexPartitions int
 	// Retention is how long lines are kept, unless a stream asks for
 	// longer (ferun.retention_days); RetentionMax bounds what it asks.
 	Retention, RetentionMax time.Duration
@@ -100,6 +105,8 @@ func Default() Config {
 		FollowPoll:    500 * time.Millisecond,
 		Heartbeat:     15 * time.Second,
 		ScanLimit:     256 << 20,
+
+		IndexPartitions: 16,
 	}
 }
 
@@ -139,7 +146,8 @@ func register(fs *flag.FlagSet, c *Config) *string {
 	fs.StringVar(&c.FerunURL, "ferun-url", c.FerunURL, "ferund's API inside the cluster, e.g. http://ferund.ferun.svc:8100 (required)")
 	fs.StringVar(&c.IndexIngestURL, "index-ingest-url", c.IndexIngestURL, "Quickwit's indexers, e.g. http://quickwit-indexer:7280 (required)")
 	fs.StringVar(&c.IndexSearchURL, "index-search-url", c.IndexSearchURL, "Quickwit's searchers, e.g. http://quickwit-searcher:7280 (required)")
-	fs.StringVar(&c.IndexPrefix, "index-prefix", c.IndexPrefix, "the prefix of the log indexes' names, <prefix>-<days>d")
+	fs.StringVar(&c.IndexPrefix, "index-prefix", c.IndexPrefix, "the prefix of the log indexes' names, <prefix>-v<version>-<days>d")
+	fs.IntVar(&c.IndexPartitions, "index-partitions", c.IndexPartitions, "how many partitions a new index hashes lines into by tenant, environment and job, 1 to 200 (an index keeps its own)")
 	fs.DurationVar(&c.CommitTimeout, "index-commit-timeout", c.CommitTimeout, "how soon a line is searchable in the index, whole seconds (a new index's commit_timeout_secs)")
 	fs.DurationVar(&c.Retention, "log-retention", c.Retention, "how long lines are kept, unless a stream asks for longer")
 	fs.DurationVar(&c.RetentionMax, "log-retention-max", c.RetentionMax, "the longest a stream may ask for (ferun.retention_days)")
@@ -183,6 +191,9 @@ func (c *Config) Validate() error {
 	}
 	if c.IndexPrefix == "" || strings.ContainsAny(c.IndexPrefix, "*/ ") {
 		bad("--index-prefix must be a name")
+	}
+	if c.IndexPartitions < 1 || c.IndexPartitions > quickwit.MaxPartitions {
+		bad("--index-partitions must be 1 to %d", quickwit.MaxPartitions)
 	}
 	if c.CommitTimeout < time.Second || c.CommitTimeout%time.Second != 0 {
 		bad("--index-commit-timeout must be whole seconds, at least one")

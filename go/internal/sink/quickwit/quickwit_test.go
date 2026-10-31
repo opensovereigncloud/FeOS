@@ -5,8 +5,10 @@ package quickwit
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +36,58 @@ func TestQueryString(t *testing.T) {
 	}
 }
 
+func TestIndexID(t *testing.T) {
+	for _, c := range []struct {
+		prefix string
+		days   int
+		want   string
+	}{
+		{"ferun-logs", 30, "ferun-logs-v2-30d"},
+		{"ferun-logs", 400, "ferun-logs-v2-400d"},
+		{"x", 1, "x-v2-1d"},
+	} {
+		if got := IndexID(c.prefix, c.days); got != c.want {
+			t.Errorf("IndexID(%q, %d) = %q, want %q", c.prefix, c.days, got, c.want)
+		}
+	}
+	// A read's pattern, <prefix>-*, names the indexes of every version,
+	// <prefix>-<days>d being version 1's.
+	for _, id := range []string{"ferun-logs-30d", IndexID("ferun-logs", 30)} {
+		if !strings.HasPrefix(id, "ferun-logs-") {
+			t.Errorf("%s is not of the pattern", id)
+		}
+	}
+}
+
+func TestIndexConfig(t *testing.T) {
+	var cfg struct {
+		IndexID    string `json:"index_id"`
+		DocMapping struct {
+			TagFields     []string `json:"tag_fields"`
+			PartitionKey  string   `json:"partition_key"`
+			Timestamp     string   `json:"timestamp_field"`
+			FieldMappings []struct {
+				Name, Type string
+			} `json:"field_mappings"`
+		} `json:"doc_mapping"`
+		Indexing struct {
+			CommitSecs int `json:"commit_timeout_secs"`
+		} `json:"indexing_settings"`
+		Retention struct {
+			Period string `json:"period"`
+		} `json:"retention"`
+	}
+	if err := json.Unmarshal(IndexConfig("ferun-logs-v2-30d", IndexSettings{RetentionDays: 30, CommitSecs: 10, Partitions: 16}), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	m := cfg.DocMapping
+	if cfg.IndexID != "ferun-logs-v2-30d" || cfg.Indexing.CommitSecs != 10 || cfg.Retention.Period != "30 days" ||
+		m.PartitionKey != "hash_mod((tenant,environment,job), 16)" || fmt.Sprint(m.TagFields) != "[tenant environment job]" ||
+		m.Timestamp != "ts" || len(m.FieldMappings) == 0 || m.FieldMappings[0].Name != "ts" || m.FieldMappings[0].Type != "datetime" {
+		t.Errorf("config %+v", cfg)
+	}
+}
+
 // TestQuickwit runs against the Quickwit at FERUN_TEST_QUICKWIT_URL (one
 // node of every service, e.g. `quickwit run` in its container).
 func TestQuickwit(t *testing.T) {
@@ -47,12 +101,17 @@ func TestQuickwit(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	id := fmt.Sprintf("test-logs-%d-1d", time.Now().UnixNano())
-	if err := c.EnsureIndex(ctx, id, 1, 1); err != nil {
+	prefix := fmt.Sprintf("test-logs-%d", time.Now().UnixNano())
+	id := IndexID(prefix, 1)
+	settings := IndexSettings{RetentionDays: 1, CommitSecs: 1, Partitions: 16}
+	if err := c.EnsureIndex(ctx, id, settings); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.EnsureIndex(ctx, id, 1, 1); err != nil {
+	if err := c.EnsureIndex(ctx, id, settings); err != nil {
 		t.Fatalf("again: %v", err)
+	}
+	if err := c.EnsureIndex(ctx, id, IndexSettings{RetentionDays: 1, CommitSecs: 1}); err == nil {
+		t.Error("an index of no partitions passed")
 	}
 	defer func() { _ = c.do(context.Background(), "DELETE", c.search+"/api/v1/indexes/"+id, "", nil, nil) }()
 	now := time.Now().UnixNano()
@@ -65,10 +124,17 @@ func TestQuickwit(t *testing.T) {
 			Text: "other stream"},
 		{TS: now, Tenant: "other", Stream: "s_3", Environment: "e", Source: "container", Level: 1, Off: 0, Text: "ERROR not acme's"},
 	}
+	// A tenant of many environments and a job: their lines go to splits
+	// of their partitions.
+	for i, env := range []string{"prod", "stage", "dev", "preview-1", "preview-2", "preview-3"} {
+		docs = append(docs, Doc{TS: now + int64(i), Tenant: "part", Stream: "s_" + env, Environment: env, Source: "container",
+			Level: 1, Text: "a line of " + env})
+	}
+	docs = append(docs, Doc{TS: now, Tenant: "part", Stream: "s_job", Job: "build-1", Source: "container", Level: 1, Text: "a job's line"})
 	if err := c.Ingest(ctx, id, docs); err != nil {
 		t.Fatal(err)
 	}
-	pattern := strings.TrimSuffix(id, "1d") + "*"
+	pattern := prefix + "-*"
 	search := func(q Query) string {
 		t.Helper()
 		if q.Max == 0 {
@@ -109,8 +175,77 @@ func TestQuickwit(t *testing.T) {
 	if err != nil || len(hits) != 1 || hits[0].TS != now+1 || !hits[0].Partial || hits[0].Text != "second line" {
 		t.Errorf("a hit's fields: %+v, %v", hits, err)
 	}
-	ids, err := c.Indexes(ctx, "test-logs-")
-	if err != nil || !strings.Contains(strings.Join(ids, " "), id) {
+
+	// Partitions: a split holds few environments and records them as
+	// tags, so a search for one environment reads fewer splits.
+	var splits struct {
+		Splits []struct {
+			SplitID string   `json:"split_id"`
+			Tags    []string `json:"tags"`
+		} `json:"splits"`
+	}
+	if err := c.do(ctx, "GET", c.search+"/api/v1/indexes/"+id+"/splits", "", nil, &splits); err != nil {
+		t.Fatal(err)
+	}
+	withProd := 0
+	for _, sp := range splits.Splits {
+		tags := strings.Join(sp.Tags, " ")
+		if !strings.Contains(tags, "tenant!") || !strings.Contains(tags, "environment!") || !strings.Contains(tags, "job!") {
+			t.Errorf("split %s without its tag fields: %v", sp.SplitID, sp.Tags)
+		}
+		if strings.Contains(tags, "environment:prod") {
+			withProd++
+		}
+	}
+	if len(splits.Splits) < 2 || withProd != 1 {
+		t.Errorf("%d splits, %d with prod: %+v", len(splits.Splits), withProd, splits.Splits)
+	}
+	plan := func(q Query) int {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{"query": q.String(), "max_hits": 10})
+		var out struct {
+			Searched []string `json:"searched_splits"`
+		}
+		if err := c.do(ctx, "POST", c.search+"/api/v1/"+id+"/search-plan", "application/json", body, &out); err != nil {
+			t.Fatal(err)
+		}
+		return len(out.Searched)
+	}
+	if all, prod, job := plan(Query{Tenant: "part"}), plan(Query{Tenant: "part", Environment: "prod"}),
+		plan(Query{Tenant: "part", Job: "build-1"}); prod != 1 || job != 1 || all < 2 {
+		t.Errorf("splits searched: %d for the tenant, %d for an environment, %d for a job", all, prod, job)
+	}
+
+	// An index of version 1 (<prefix>-<days>d: tenant its only tag, no
+	// partitions) is searched with the current one's, in one order.
+	old := prefix + "-1d"
+	var v1 map[string]any
+	if err := json.Unmarshal(IndexConfig(old, settings), &v1); err != nil {
+		t.Fatal(err)
+	}
+	dm, ok := v1["doc_mapping"].(map[string]any)
+	if !ok {
+		t.Fatalf("config %v", v1)
+	}
+	delete(dm, "partition_key")
+	dm["tag_fields"] = []string{"tenant"}
+	body, _ := json.Marshal(v1)
+	if err := c.do(ctx, "POST", c.search+"/api/v1/indexes", "application/json", body, nil); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.do(context.Background(), "DELETE", c.search+"/api/v1/indexes/"+old, "", nil, nil) }()
+	if err := c.Ingest(ctx, old, []Doc{{TS: now + 10, Tenant: "part", Stream: "s_prod", Environment: "prod",
+		Source: "container", Level: 1, Off: 5, Text: "a line of before"}}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err = c.Search(ctx, pattern, Query{Tenant: "part", Environment: "prod", Max: 10})
+	if err != nil || len(hits) != 2 || hits[0].TS != now+10 || hits[0].Text != "a line of before" || hits[1].Text != "a line of prod" {
+		t.Errorf("across versions: %+v, %v", hits, err)
+	}
+
+	ids, err := c.Indexes(ctx, prefix+"-")
+	slices.Sort(ids)
+	if err != nil || fmt.Sprint(ids) != fmt.Sprint([]string{old, id}) {
 		t.Errorf("indexes %v, %v", ids, err)
 	}
 	if err := c.Delete(ctx, id, Query{Tenant: "acme", Environment: "e"}); err != nil {

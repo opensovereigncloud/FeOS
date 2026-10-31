@@ -303,6 +303,19 @@ Jaeger-compatible API for traces.
   `--log-retention`, `ferun-logs-400d` for a stream that asks for more,
   up to `--log-retention-max`. A stream that asks for 90 days is kept for
   400; never shorter than asked. A read searches `ferun-logs-*`.
+- **Partitions, and a version in the name.** *Changed on 2026-10-31:*
+  one tenant holds many projects' environments (FeCode's), so splits
+  that mix them all let a search for one environment prune none. An
+  index hashes its lines into partitions by tenant, environment and job
+  (`hash_mod((tenant,environment,job), 16)`, `--index-partitions`), a
+  split holds one partition's, and the three are tags, so such a search
+  reads only the splits that have its environment or job. Quickwit
+  changes neither an index's partition key nor, for its splits, its
+  mapping, so an index's name carries the version of its configuration:
+  `ferun-logs-v2-30d` and `ferun-logs-v2-400d` take the new lines, and
+  the indexes of before (`ferun-logs-30d`, `ferun-logs-400d`, version 1)
+  are still read through `ferun-logs-*` and get every delete task, until
+  their own retention has emptied them.
 - **What a search is.** A read selects its streams in the database as
   before (their labels, their marks, the hot lines in one snapshot) and
   asks Quickwit for the cold part: the selector's labels, the time range,

@@ -240,9 +240,44 @@ func (c *Client) do(ctx context.Context, method, url, ctype string, body []byte,
 	return d.Decode(out)
 }
 
-// IndexConfig is the configuration of a log index id whose lines are
-// kept retentionDays, committed every commitSecs.
-func IndexConfig(id string, retentionDays, commitSecs int) []byte {
+// MappingVersion is the version of IndexConfig, in every log index's
+// name (IndexID). Quickwit never changes an index's partition key or time
+// field, and a changed mapping only applies to new splits, so a change of
+// IndexConfig is a new version: new lines go to the new version's
+// indexes, a read searches <prefix>-* and so the old ones too, which
+// their retention empties. Version 1 is the indexes named <prefix>-<days>d
+// (tenant the only tag, no partitions), version 2 partitions by tenant,
+// environment and job.
+const MappingVersion = 2
+
+// MaxPartitions is the most partitions an index may have: Quickwit's
+// max_num_partitions (200 by default), past which it puts every line into
+// one partition more.
+const MaxPartitions = 200
+
+// IndexID is the log index of a retention in days, in prefix, of
+// MappingVersion: <prefix>-v<version>-<days>d.
+func IndexID(prefix string, days int) string {
+	return prefix + "-v" + strconv.Itoa(MappingVersion) + "-" + strconv.Itoa(days) + "d"
+}
+
+// IndexSettings are what an index is made with, and never change for it:
+// its lines are kept RetentionDays, committed every CommitSecs, and
+// hashed by their tenant, environment and job into Partitions partitions
+// (1 to MaxPartitions), a split holding one partition's lines.
+type IndexSettings struct {
+	RetentionDays, CommitSecs, Partitions int
+}
+
+// partitionKey is the partition key of an index of n partitions. A
+// search for an environment or a job prunes the splits whose tags lack it
+// (tag_fields), so a split should hold few of them.
+func partitionKey(n int) string {
+	return "hash_mod((tenant,environment,job), " + strconv.Itoa(n) + ")"
+}
+
+// IndexConfig is the configuration of the log index id.
+func IndexConfig(id string, s IndexSettings) []byte {
 	raw := func(name string) map[string]any {
 		return map[string]any{"name": name, "type": "text", "tokenizer": "raw"}
 	}
@@ -266,24 +301,30 @@ func IndexConfig(id string, retentionDays, commitSecs int) []byte {
 				{"name": "text", "type": "text", "tokenizer": "default", "record": "position"},
 			},
 			"timestamp_field": "ts",
-			"tag_fields":      []string{"tenant"},
+			// Quickwit records a split's values of a tag field while
+			// they are fewer than 1,000.
+			"tag_fields":    []string{"tenant", "environment", "job"},
+			"partition_key": partitionKey(s.Partitions),
 		},
-		"indexing_settings": map[string]any{"commit_timeout_secs": commitSecs},
+		"indexing_settings": map[string]any{"commit_timeout_secs": s.CommitSecs},
 		"search_settings":   map[string]any{"default_search_fields": []string{"text"}},
-		"retention":         map[string]any{"period": fmt.Sprintf("%d days", retentionDays), "schedule": "hourly"},
+		"retention":         map[string]any{"period": fmt.Sprintf("%d days", s.RetentionDays), "schedule": "hourly"},
 	}
 	b, _ := json.Marshal(cfg)
 	return b
 }
 
-// EnsureIndex creates the log index id unless it exists.
-func (c *Client) EnsureIndex(ctx context.Context, id string, retentionDays, commitSecs int) error {
+// EnsureIndex creates the log index id with s unless it exists; one that
+// exists keeps its own settings.
+func (c *Client) EnsureIndex(ctx context.Context, id string, s IndexSettings) error {
+	if s.Partitions < 1 || s.Partitions > MaxPartitions {
+		return fmt.Errorf("quickwit: %d partitions, not 1 to %d", s.Partitions, MaxPartitions)
+	}
 	err := c.do(ctx, http.MethodGet, c.search+"/api/v1/indexes/"+url.PathEscape(id), "", nil, nil)
 	if err == nil || !IsNotFound(err) {
 		return err
 	}
-	err = c.do(ctx, http.MethodPost, c.search+"/api/v1/indexes", "application/json",
-		IndexConfig(id, retentionDays, commitSecs), nil)
+	err = c.do(ctx, http.MethodPost, c.search+"/api/v1/indexes", "application/json", IndexConfig(id, s), nil)
 	var e *Error
 	if errors.As(err, &e) && e.Status == http.StatusBadRequest && strings.Contains(e.Message, "already exist") {
 		return nil

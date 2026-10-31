@@ -11,7 +11,7 @@ the ADR says why.
 guest ──CRI lines──▶ logs/container.log
                          │ StreamContainerLogs(follow, from_offset)
 feosd (node) ──OTLP LogsService/Export, SinkService (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `sink`
-     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Quickwit ferun-logs-<days>d (splits in the object store)
+     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Quickwit ferun-logs-v2-<days>d (splits in the object store)
 ferund ──CreatePodRequest.log_labels──▶ feosd                                │
      ◀── GET /api/v1/tenant (a tenant's token) ──────────────────────────────┤
 tenants (FeCode) ── GET /api/v1/logs, /api/v1/log-streams (Bearer) ──────────┘
@@ -247,19 +247,46 @@ first and at most 6 MiB of text a round, to the stream's index with
 `commit=wait_for`, and once Quickwit answers, the split holding them
 published, delete them and move the mark past them, in one transaction a
 stream. A failure of the index holds the round's claims for 30 s. A
-stream's index is `<--index-prefix>-<days>d` (`ferun-logs`): the days of
-`--log-retention`, or of `--log-retention-max` for a stream whose
-`ferun.retention_days` is longer than the default; the sink makes an
-index it does not find (Quickwit's index API), with its retention and
-`--index-commit-timeout` (10 s) as its commit interval. A document is a
-line with its stream's labels: `ts` (ns, the time field), `tenant` (a
-tag), `stream` (the ID), `environment`, `kind`, `object`, `replica`,
-`release`, `instance`, `container`, `job`, `attempt`, `source`,
-`iostream`, `level` (the bit), `trace_id`, `off`, `partial`, `cont`, and
-`text` (Quickwit's `default` tokenizer, with positions). Quickwit has no
-key of its own: a batch sent again is indexed again, and the reads take
-one (stream, offset) once. `--index-ingest-url` names Quickwit's
-indexers, `--index-search-url` its searchers (every other call).
+stream's index is `<--index-prefix>-v<version>-<days>d`
+(`ferun-logs-v2-30d`): the days of `--log-retention`, or of
+`--log-retention-max` for a stream whose `ferun.retention_days` is
+longer than the default; the sink makes an index it does not find
+(Quickwit's index API), with its retention, `--index-commit-timeout`
+(10 s) as its commit interval and `--index-partitions` (16, at most 200)
+partitions. A document is a line with its stream's labels: `ts` (ns, the
+time field), `tenant`, `stream` (the ID), `environment`, `kind`,
+`object`, `replica`, `release`, `instance`, `container`, `job`,
+`attempt`, `source`, `iostream`, `level` (the bit), `trace_id`, `off`,
+`partial`, `cont`, and `text` (Quickwit's `default` tokenizer, with
+positions). Quickwit has no key of its own: a batch sent again is
+indexed again, and the reads take one (stream, offset) once.
+`--index-ingest-url` names Quickwit's indexers, `--index-search-url` its
+searchers (every other call).
+
+**Partitions.** One tenant may hold many projects' environments (FeCode's
+does), so an index's lines are hashed into partitions by their tenant,
+environment and job (`partition_key: hash_mod((tenant,environment,job),
+<--index-partitions>)`), and a split holds one partition's lines: a
+commit writes a split per partition that got lines, and merges keep
+them apart. `tenant`, `environment` and `job` are tags (`tag_fields`):
+Quickwit records a split's values of each while they are fewer than
+1,000, and a search for an environment or a job reads only the splits
+that have it. More partitions mean fewer environments a split and more,
+smaller splits; Quickwit's own bound is 200 (`max_num_partitions`).
+
+**Versions.** Quickwit never changes an index's partition key or time
+field, and a changed mapping only applies to new splits, so the index
+configuration has a version in the index's name
+(`quickwit.MappingVersion`): version 1, `<prefix>-<days>d`, had
+`tenant` as its only tag and no partitions; version 2 is the above. A
+new version's indexes take every new line; a read searches
+`<prefix>-*`, the old and the new together (the fields it reads are the
+same in both, `ts` a datetime in each, so they sort as one), and a
+delete leaves its task in every index of the prefix. The old indexes
+are emptied by their own retention and can then be deleted by hand.
+`--index-partitions` (and `--index-commit-timeout`) apply only to
+indexes made after a change: an index keeps what it was made with, so a
+change takes a new version or a new retention.
 
 **Chunks of before.** Until 2026-10-31 the cold stage wrote gzip NDJSON
 chunks to the object store (`log_chunks`); they all moved into the index
