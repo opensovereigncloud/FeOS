@@ -31,7 +31,8 @@
 # ferun-sink-ingest.ferun.svc.cluster.local:4317) and hands each node:
 # feosd runs on the hosts, which neither resolve the cluster's names nor
 # reach its ClusterIPs. Tenants read at https://run.${DOMAIN}/api/v1/logs
-# and /api/v1/log-streams (the HTTPRoute below); ferund reads at
+# and /api/v1/log-streams, and their traces at /api/v1/jaeger (the
+# HTTPRoute below, traces.md); ferund reads at
 # http://ferun-sink.ferun.svc:8080 (its --sink-url).
 apiVersion: postgresql.cnpg.io/v1
 kind: Database
@@ -196,6 +197,7 @@ spec:
     - matches:
         - path: { type: PathPrefix, value: /api/v1/logs }
         - path: { type: PathPrefix, value: /api/v1/log-streams }
+        - path: { type: PathPrefix, value: /api/v1/jaeger }
       backendRefs: [{name: ferun-sink, port: 8080}]
       # A follow streams for as long as its reader stays.
       timeouts:
