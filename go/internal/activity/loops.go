@@ -15,10 +15,9 @@ import (
 )
 
 // RetentionConfig is how long the partitioned logs are kept
-// (--activity-retention, --traffic-retention, --access-log-retention); 0
-// keeps them forever.
+// (--activity-retention, --traffic-retention); 0 keeps them forever.
 type RetentionConfig struct {
-	Activity, Traffic, AccessLogs time.Duration
+	Activity, Traffic time.Duration
 }
 
 // LoopPartitions names the partition and retention loop.
@@ -28,7 +27,7 @@ const LoopPartitions = "activity-partitions"
 const daysAhead = 2
 
 // Loops returns the leader's hourly loop that keeps the partitions of
-// activity, traffic_records and access_logs for today and the next two
+// activity and traffic_records for today and the next two
 // days (DB clock, UTC) and drops the partitions past their retention. It
 // returns model.Loop, which leader.Loop aliases.
 func Loops(d *db.DB, rc RetentionConfig, log *slog.Logger) []model.Loop {
@@ -58,7 +57,7 @@ func maintainPartitions(ctx context.Context, d *db.DB, rc RetentionConfig, log *
 	for _, t := range []struct {
 		table     string
 		retention time.Duration
-	}{{db.TableActivity, rc.Activity}, {db.TableTraffic, rc.Traffic}, {db.TableAccessLogs, rc.AccessLogs}} {
+	}{{db.TableActivity, rc.Activity}, {db.TableTraffic, rc.Traffic}} {
 		if t.retention <= 0 {
 			continue
 		}

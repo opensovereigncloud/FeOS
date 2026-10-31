@@ -5,31 +5,15 @@ package wire
 
 import "time"
 
-// The bounds of PublishAccessLogs. The control plane refuses a batch
-// beyond them with INVALID_ARGUMENT; the ingress cuts fields to them
-// before it records a request.
+// The bounds of an access log record's fields, which the ingress cuts
+// them to before it records a request: MaxAccessLogPath bounds Path,
+// MaxAccessLogUserAgent UserAgent and MaxAccessLogText every other text
+// field, in bytes.
 const (
-	// MaxAccessLogRecords is the most records of one batch.
-	MaxAccessLogRecords = 500
-	// MaxAccessLogPath bounds Path, MaxAccessLogUserAgent UserAgent and
-	// MaxAccessLogText every other text field, in bytes.
 	MaxAccessLogPath      = 1024
 	MaxAccessLogUserAgent = 256
 	MaxAccessLogText      = 256
 )
-
-// AccessLogBatch is a part of an ingress's access log (ADR 0021): the
-// records numbered Seq, Seq+1, … of the run Start (an ID the ingress
-// draws when it starts), oldest first. Missed counts the records the
-// ingress dropped since the last batch it sent, because its buffer was
-// full or the control plane refused them. A batch sent again is the same
-// batch: the control plane stores each (ingress, Start, Seq) once.
-type AccessLogBatch struct {
-	Start   string           `json:"start"`
-	Seq     int64            `json:"seq"`
-	Missed  int64            `json:"missed"`
-	Records []AccessLogEntry `json:"records"`
-}
 
 // AccessLogEntry is one request the ingress answered for an environment,
 // which is also the request's server span (W3C Trace Context): TraceID
@@ -39,8 +23,9 @@ type AccessLogBatch struct {
 // "upgraded", or "aborted". Instance is the instance the last attempt
 // went to, "" when none; Attempts counts the attempts, HeldNs how long
 // the request waited for an instance. Tenant is the environment's owner,
-// which labels its stream in the sink (ADR 0026 §8); the control plane
-// takes the owner from its own table.
+// which labels its stream in the sink (ADR 0026 §8), where the agent
+// writes it as a line (internal/ingress/sinklog); it never goes to the
+// control plane.
 type AccessLogEntry struct {
 	Time         time.Time `json:"time"`
 	DurationNs   int64     `json:"durationNs"`
@@ -64,6 +49,3 @@ type AccessLogEntry struct {
 	SpanID       string    `json:"spanId"`
 	ParentSpanID string    `json:"parentSpanId"`
 }
-
-// AccessLogAck says the batch is stored.
-type AccessLogAck struct{}

@@ -612,7 +612,12 @@ changed these points:
   batch sent again is stored once, drops and counts what overflows, and
   sends the rest before it stops. A request that reaches no environment
   is counted, not recorded. The path is kept without its query, which
-  often carries tokens.
+  often carries tokens. *Superseded by ADR 0026 §8 (2026-10-31):* the
+  ingress writes the records into the sink as lines of the service's
+  streams; `PublishAccessLogs`, `access_logs` and
+  `--access-log-retention` were removed on 2026-10-31, the table dropped
+  without its history (migration `0020`), and `…/access-logs` reads the
+  sink alone.
 - **Each record is the request's span.** The ingress continues a
   client's W3C `traceparent` or starts a sampled trace, and the instance
   gets the ingress's span as its parent; the span's IDs are columns of

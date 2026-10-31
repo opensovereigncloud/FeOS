@@ -68,8 +68,8 @@ type Deps struct {
 	// made public.
 	AppsZone string
 	// SinkURL is the sink's API (--sink-url, ADR 0026), which the logs
-	// calls and the access log ask first; "": the nodes and the table
-	// only.
+	// calls ask first and the access log alone; "": the logs calls read
+	// the nodes only, and the access log answers 503.
 	SinkURL string
 	// SinkClient asks the sink; nil: a client with a 10 s timeout.
 	SinkClient *http.Client

@@ -242,9 +242,6 @@ type Config struct {
 	ShutdownGrace     time.Duration
 	ActivityRetention time.Duration
 	TrafficRetention  time.Duration
-	// AccessLogRetention is how long the ingress's access log is kept
-	// (ADR 0021).
-	AccessLogRetention time.Duration
 	// SinkEndpoint is host:port of the sink's ingest (ADR 0026), which
 	// every TelemetryResponse names to the nodes; empty: they ship no
 	// logs.
@@ -305,7 +302,6 @@ func Default() Config {
 		ShutdownGrace:          11 * time.Minute,
 		ActivityRetention:      720 * time.Hour,
 		TrafficRetention:       168 * time.Hour,
-		AccessLogRetention:     168 * time.Hour,
 		DomainChallengeLabel:   "_ferun-challenge",
 		ACMEProfile:            DefaultACMEProfile,
 		DomainGrace:            72 * time.Hour,
@@ -432,11 +428,10 @@ func registerServe(fs *flag.FlagSet, c *Config) *serveTexts {
 		"how long a stopping instance waits for its requests, its tool calls and its ops; set a container's termination grace to at least this plus 60s")
 	fs.DurationVar(&c.ActivityRetention, "activity-retention", c.ActivityRetention, "how long activity is kept")
 	fs.DurationVar(&c.TrafficRetention, "traffic-retention", c.TrafficRetention, "how long traffic records are kept")
-	fs.DurationVar(&c.AccessLogRetention, "access-log-retention", c.AccessLogRetention, "how long the ingress's access log is kept")
 	fs.StringVar(&c.SinkEndpoint, "sink-endpoint", c.SinkEndpoint,
 		"host:port of the sink's ingest (ADR 0026), named to the nodes, which ship their pods' logs there; a name is resolved and each node given one of its addresses; empty: no logs are shipped")
 	fs.StringVar(&c.SinkURL, "sink-url", c.SinkURL,
-		"the sink's HTTP API inside the cluster, e.g. http://ferun-sink:8080, which the logs calls read first; empty: the nodes only")
+		"the sink's HTTP API inside the cluster, e.g. http://ferun-sink:8080, which the logs calls read first and the access log alone; empty: the nodes only, and no access log")
 	fs.StringVar(&t.logLevel, "log-level", t.logLevel, "debug, info, warn or error")
 	return t
 }
@@ -618,7 +613,6 @@ func (c *Config) Validate() error {
 		{"node-cert-ttl", c.NodeCertTTL}, {"pod-cert-ttl", c.PodCertTTL}, {"conn-drain-timeout", c.ConnDrainTimeout},
 		{"hibernate-timeout", c.HibernateTimeout},
 		{"activity-retention", c.ActivityRetention}, {"traffic-retention", c.TrafficRetention},
-		{"access-log-retention", c.AccessLogRetention},
 		{"domain-grace", c.DomainGrace},
 	}
 	for _, d := range positive {

@@ -108,7 +108,7 @@ counted against its quota in the sink (§7).
 
 **Hot.** A batch lands in `log_lines` in the sink's PostgreSQL, one row
 per line (stream, offset, time, source, level, text), partitioned by day
-like `access_logs`. Recent reads and following a log come from here.
+like `ferund`'s `traffic_records`. Recent reads and following a log come from here.
 
 **Cold.** A stream's lines become a **chunk** once they reach 1 MiB, once
 the oldest is ten minutes old, or once the stream ends. An instance
@@ -214,9 +214,15 @@ application's logs.
   and resolves the headless Service's name itself.
 - **`ferund` keeps the API, not the table.** `…/access-logs` reads the
   service's ingress lines from the sink and answers them as it does now,
-  and the trace filter becomes the sink's `trace`. Without a sink, the
-  ingress sends to `ferund` as before. `access_logs` is read for its
-  retention after the switch, then dropped (N−1).
+  and the trace filter becomes the sink's `trace`. *Changed on
+  2026-10-31, by Malte's decision that no history is needed:* the sink
+  is the only place. `access_logs` was dropped the same day with its
+  partitions (migration `0020`), its records not moved and not read for
+  their retention; `PublishAccessLogs` and `--access-log-retention` are
+  gone. Without `--sink-url`, or with the sink down, `…/access-logs`
+  answers 503 (`no_log_store`, `log_store_unavailable`); an ingress
+  without `--sink-endpoint` keeps no access log and counts its records
+  as dropped.
 - **FeCode** shows a service's requests in its Logs tab as a source of
   their own beside its replicas, a request's trace ID as a link to the
   lines of its trace (FeCode ADR 0009 §12).

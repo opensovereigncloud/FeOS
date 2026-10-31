@@ -27,8 +27,6 @@ const (
 	MethodSync  = "/" + ServiceName + "/Sync"
 	MethodWake  = "/" + ServiceName + "/Wake"
 	MethodHold  = "/" + ServiceName + "/Hold"
-	// MethodPublishAccessLogs is the ingress's access log (ADR 0021).
-	MethodPublishAccessLogs = "/" + ServiceName + "/PublishAccessLogs"
 )
 
 // IngressServer is the server side of IngressService. An implementation
@@ -44,7 +42,6 @@ type IngressServer interface {
 	Sync(*SyncRequest, SyncServer) error
 	Wake(context.Context, *WakeRequest) (*WakeResponse, error)
 	Hold(context.Context, *HoldRequest) (*HoldResponse, error)
-	PublishAccessLogs(context.Context, *AccessLogBatch) (*AccessLogAck, error)
 	mustEmbedUnimplementedIngressServer()
 }
 
@@ -81,10 +78,6 @@ func (UnimplementedIngressServer) Hold(context.Context, *HoldRequest) (*HoldResp
 	return nil, status.Error(codes.Unimplemented, "method Hold not implemented")
 }
 
-func (UnimplementedIngressServer) PublishAccessLogs(context.Context, *AccessLogBatch) (*AccessLogAck, error) {
-	return nil, status.Error(codes.Unimplemented, "method PublishAccessLogs not implemented")
-}
-
 func (UnimplementedIngressServer) mustEmbedUnimplementedIngressServer() {}
 
 // RegisterIngressServer registers srv with s. The server must force
@@ -104,7 +97,6 @@ var ServiceDesc = grpc.ServiceDesc{
 		{MethodName: "Hello", Handler: unaryHandler(MethodHello, IngressServer.Hello)},
 		{MethodName: "Wake", Handler: unaryHandler(MethodWake, IngressServer.Wake)},
 		{MethodName: "Hold", Handler: unaryHandler(MethodHold, IngressServer.Hold)},
-		{MethodName: "PublishAccessLogs", Handler: unaryHandler(MethodPublishAccessLogs, IngressServer.PublishAccessLogs)},
 	},
 	Streams: []grpc.StreamDesc{
 		{StreamName: "Sync", Handler: syncHandler, ServerStreams: true},

@@ -6,6 +6,7 @@ package env
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -14,12 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/gardenlinux/feos/go/internal/apierr"
 	"github.com/gardenlinux/feos/go/internal/auth"
 	"github.com/gardenlinux/feos/go/internal/ingress/sinklog"
 	"github.com/gardenlinux/feos/go/internal/ingress/wire"
-	"github.com/gardenlinux/feos/go/internal/store"
 )
 
 // fakeAccessSink is the sink's GET /api/v1/logs over an environment's
@@ -89,28 +88,15 @@ func (f *fakeAccessSink) setDown(down bool) {
 	f.mu.Unlock()
 }
 
-// With --sink-url the access log is read from the sink with the caller's
-// token, the table giving what is older than the sink's oldest; without
-// a token or with the sink down, from the table alone.
+// The access log is read from the sink with the caller's token, page by
+// page; without --sink-url or a token, or with the sink down, it answers
+// 503 with a code of its own.
 func TestAccessLogsFromSink(t *testing.T) {
 	h := newHarness(t, harnessOptions{})
 	h.create("stage", nil)
 	e := h.env("stage")
 	const trace = "4bf92f3577b34da6a3ce929d0e0e4736"
 	t0 := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
-	start := uuid.New()
-	var rows []store.AccessLogRow
-	for i := range 3 {
-		r := store.AccessLogRow{TsNs: t0.Add(time.Duration(i) * time.Second).UnixNano(), Ingress: "in-0", StartID: start,
-			Seq: int64(i), EnvID: e.ID, Service: "web", Path: "/old" + strconv.Itoa(i), Status: 200, Outcome: "2xx"}
-		if i == 1 {
-			r.TraceID = trace
-		}
-		rows = append(rows, r)
-	}
-	if _, err := h.st.InsertAccessLogs(h.ctx(), rows...); err != nil {
-		t.Fatal(err)
-	}
 	sink := &fakeAccessSink{t: t, env: e.ID.String()}
 	for i := range 5 {
 		rec := wire.AccessLogEntry{Time: t0.Add(time.Duration(10+i) * time.Second), DurationNs: 1500, Env: e.ID.String(),
@@ -124,8 +110,20 @@ func TestAccessLogsFromSink(t *testing.T) {
 	}
 	srv := httptest.NewServer(sink)
 	t.Cleanup(srv.Close)
-	h.svc.d.SinkURL = srv.URL + "/"
 	ctx := auth.WithTenant(h.ctx(), auth.Tenant{Name: tenantA, Token: "tok"})
+
+	// refused checks that the read answers 503 with code.
+	refused := func(name string, ctx context.Context, code string) {
+		t.Helper()
+		_, err := h.svc.AccessLogs(ctx, tenantA, "stage", AccessLogQuery{})
+		var ae *apierr.Error
+		if !errors.As(err, &ae) || ae.Status != http.StatusServiceUnavailable || ae.Code != code {
+			t.Errorf("%s: %v, want 503 %s", name, err, code)
+		}
+	}
+	refused("no --sink-url", ctx, CodeNoLogStore)
+	h.svc.d.SinkURL = srv.URL + "/"
+	refused("no token", h.ctx(), CodeNoLogStore)
 
 	paths := func(ctx context.Context, q AccessLogQuery) []string {
 		t.Helper()
@@ -133,7 +131,7 @@ func TestAccessLogsFromSink(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var out []string
+		out := []string{}
 		for _, r := range l.Records {
 			out = append(out, r.Path)
 		}
@@ -141,19 +139,17 @@ func TestAccessLogsFromSink(t *testing.T) {
 	}
 	for _, c := range []struct {
 		name string
-		ctx  context.Context
 		q    AccessLogQuery
 		want []string
 	}{
-		{"no token", h.ctx(), AccessLogQuery{}, []string{"/old0", "/old1", "/old2"}},
-		{"the sink's newest", ctx, AccessLogQuery{Limit: 3}, []string{"/new2", "/new3", "/new4"}},
-		{"the sink's, then the table's", ctx, AccessLogQuery{},
-			[]string{"/old0", "/old1", "/old2", "/new0", "/new1", "/new2", "/new3", "/new4"}},
-		{"before", ctx, AccessLogQuery{Limit: 3, BeforeTsNs: t0.Add(11 * time.Second).UnixNano()},
-			[]string{"/old1", "/old2", "/new0"}},
-		{"a trace", ctx, AccessLogQuery{TraceID: trace}, []string{"/old1", "/new2"}},
+		{"the newest", AccessLogQuery{Limit: 3}, []string{"/new2", "/new3", "/new4"}},
+		{"all, over pages", AccessLogQuery{}, []string{"/new0", "/new1", "/new2", "/new3", "/new4"}},
+		{"before", AccessLogQuery{Limit: 3, BeforeTsNs: t0.Add(13 * time.Second).UnixNano()},
+			[]string{"/new0", "/new1", "/new2"}},
+		{"before the oldest", AccessLogQuery{BeforeTsNs: t0.Add(10 * time.Second).UnixNano()}, []string{}},
+		{"a trace", AccessLogQuery{TraceID: trace}, []string{"/new2"}},
 	} {
-		if got := paths(c.ctx, c.q); !slices.Equal(got, c.want) {
+		if got := paths(ctx, c.q); !slices.Equal(got, c.want) {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
@@ -173,7 +169,5 @@ func TestAccessLogsFromSink(t *testing.T) {
 	}
 
 	sink.setDown(true)
-	if got := paths(ctx, AccessLogQuery{}); !slices.Equal(got, []string{"/old0", "/old1", "/old2"}) {
-		t.Errorf("the sink down: %v", got)
-	}
+	refused("the sink down", ctx, CodeLogStoreUnavailable)
 }

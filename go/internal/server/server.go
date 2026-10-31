@@ -366,7 +366,7 @@ func New(ctx context.Context, cfg config.Config, log *slog.Logger) (_ *Instance,
 	i.Elector.Register(fl.Loops()...)
 	i.Elector.Register(i.Engine.Loops()...)
 	i.Elector.Register(activity.Loops(i.DB, activity.RetentionConfig{Activity: cfg.ActivityRetention,
-		Traffic: cfg.TrafficRetention, AccessLogs: cfg.AccessLogRetention}, i.log)...)
+		Traffic: cfg.TrafficRetention}, i.log)...)
 	i.Elector.Register(api.Loops(deps)...)
 	i.Elector.Register(i.streams.Loops...)
 	i.Elector.Register(i.Env.Loops()...)

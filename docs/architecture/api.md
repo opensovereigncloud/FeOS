@@ -160,7 +160,6 @@ content type `application/grpc+json`. Method names are
 | `Sync` | the ingress server, streaming | `{}` → a stream of `Table` |
 | `Wake` | the ingress server | `{env, service}` → `{waking, retryAfterSeconds}` |
 | `Hold` | the ingress server | `{hold, release, leaving}` → `{held, refused: [{instance, reason}], leaseSeconds}` |
-| `PublishAccessLogs` | the ingress server | `{start, seq, missed, records: [AccessLogEntry]}` → `{}` |
 
 - **Encoding.** JSON names are camelCase, and nothing is HTML-escaped;
   `[]byte` is base64, a time RFC 3339 with nanoseconds. A certificate is
@@ -193,17 +192,11 @@ content type `application/grpc+json`. Method names are
   receiver keeps the state (`wire.State`, `Apply`): a delta or a part
   whose `seq` is not the next ends the stream, and the ingress connects
   again.
-- **The access log.** A batch holds at most 500 records of the run
-  `start` (a UUID the ingress draws when it starts), numbered `seq`,
-  `seq+1`, … oldest first; `missed` counts the records dropped since the
-  last batch taken. An `AccessLogEntry` is `{time, durationNs, env,
-  service, instance, host, method, path, proto, status, outcome,
-  bytesIn, bytesOut, clientIp, userAgent, attempts, heldNs, traceId,
-  spanId, parentSpanId}`: `path` escaped and without the query, at most
-  1 KiB, `userAgent` at most 256 bytes, other text at most 256 bytes;
-  `outcome` the status class, `upgraded` or `aborted`; the IDs lower case
-  hex, `parentSpanId` empty without the client's span
-  ([ingress.md](ingress.md#access-log)).
+- **The access log** is not on this service: the ingress writes it into
+  the sink ([sink.md](sink.md#the-ingresss-access-log)). The method
+  `PublishAccessLogs`, which carried it to `ferund` before, was removed
+  on 2026-10-31; an ingress of before that calls it gets
+  `UNIMPLEMENTED`.
 - **Errors.** A refused connection answers every call
   `PERMISSION_DENIED` with the refusal's text, by which the ingress tells
   a removal from other refusals ([ingress.md](ingress.md#refusals)).
@@ -214,8 +207,7 @@ content type `application/grpc+json`. Method names are
   ready or cannot read the database, and on database errors;
   `NOT_FOUND` for a Wake of an environment that is not public or a
   service that is not routed; `INVALID_ARGUMENT` for a Hold list of more
-  than 10 000 IDs, and for an access log batch of more than 500 records,
-  a `start` that is not a UUID or a negative `seq`. A Hold refuses an ID by itself, with the reason
+  than 10 000 IDs. A Hold refuses an ID by itself, with the reason
   `gone`, `not public`, `not running`, `busy` or `invalid`.
 - **Compatibility** follows protobuf's rules, kept by hand: a field is
   added, never renamed, retyped or reused, and its JSON name never

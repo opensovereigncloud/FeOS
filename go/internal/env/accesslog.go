@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gardenlinux/feos/go/internal/apierr"
 	"github.com/gardenlinux/feos/go/internal/auth"
 	"github.com/gardenlinux/feos/go/internal/store"
 )
@@ -73,12 +74,20 @@ type AccessLogRecord struct {
 	ParentSpanID string    `json:"parentSpanId"`
 }
 
-// AccessLogs is GET /api/v1/environments/{env}/access-logs. With
-// --sink-url and the caller's token it reads the ingress's lines of the
-// environment from the sink (ADR 0026 §8); when the sink has fewer than
-// the page's records before BeforeTsNs, the table access_logs gives the
-// rest, older than the sink's oldest, and all of the page when the sink
-// fails.
+// The codes of the access log's answers when the sink cannot be read
+// (503), which clients (FeCode) match.
+const (
+	// CodeNoLogStore: ferund has no --sink-url (or the request no token
+	// to read the sink with), and the access log is kept nowhere else.
+	CodeNoLogStore = "no_log_store"
+	// CodeLogStoreUnavailable: the sink failed; Retry-After.
+	CodeLogStoreUnavailable = "log_store_unavailable"
+)
+
+// AccessLogs is GET /api/v1/environments/{env}/access-logs: the
+// ingress's lines of the environment in the sink (ADR 0026 §8), read with
+// the caller's token. Without --sink-url or a token it answers 503
+// no_log_store, and when the sink fails 503 log_store_unavailable.
 func (s *Service) AccessLogs(ctx context.Context, tenant, env string, q AccessLogQuery) (AccessLogList, error) {
 	e, err := resolveEnv(ctx, s.st, tenant, env, store.NoLock)
 	if err != nil {
@@ -88,30 +97,22 @@ func (s *Service) AccessLogs(ctx context.Context, tenant, env string, q AccessLo
 		q.Limit = accessLogDefaultLimit
 	}
 	q.Limit = min(q.Limit, accessLogMaxLimit)
-	sink, ok := s.sinkAccessLogs(ctx, e.ID.String(), q)
-	if ok && len(sink) >= q.Limit {
-		return AccessLogList{Records: sink}, nil
+	t, _ := auth.TenantFrom(ctx)
+	switch {
+	case s.d.SinkURL == "":
+		return AccessLogList{}, apierr.WithCode(http.StatusServiceUnavailable, CodeNoLogStore,
+			"the access log is kept in the sink, and this ferund has no --sink-url")
+	case t.Token == "":
+		return AccessLogList{}, apierr.WithCode(http.StatusServiceUnavailable, CodeNoLogStore,
+			"the access log is read from the sink with the caller's token, and the request has none")
 	}
-	if len(sink) > 0 {
-		q.BeforeTsNs = sink[0].TsNs
-	}
-	rows, err := s.st.ListEnvAccessLogs(ctx, e.ID, store.AccessLogQuery{Limit: q.Limit - len(sink), BeforeTsNs: q.BeforeTsNs,
-		TraceID: q.TraceID})
+	recs, err := s.sinkAccessLogs(ctx, t.Token, e.ID.String(), q)
 	if err != nil {
-		return AccessLogList{}, fmt.Errorf("access log: %w", err)
+		s.log.Warn("cannot read the access log from the sink", "env", e.ID, "err", err)
+		return AccessLogList{}, apierr.WithCode(http.StatusServiceUnavailable, CodeLogStoreUnavailable,
+			"the log store cannot be read; try again shortly").RetryAfter(5)
 	}
-	out := AccessLogList{Records: make([]AccessLogRecord, 0, len(rows)+len(sink))}
-	for _, r := range rows {
-		out.Records = append(out.Records, AccessLogRecord{
-			TsNs: r.TsNs, Time: time.Unix(0, r.TsNs).UTC(), DurationNs: r.DurationNs, Ingress: r.Ingress,
-			Service: r.Service, Instance: r.Instance, Host: r.Host, Method: r.Method, Path: r.Path, Proto: r.Proto,
-			Status: r.Status, Outcome: r.Outcome, Attempts: r.Attempts, HeldNs: r.HeldNs,
-			BytesIn: r.BytesIn, BytesOut: r.BytesOut, ClientIP: r.ClientIP, UserAgent: r.UserAgent,
-			TraceID: r.TraceID, SpanID: r.SpanID, ParentSpanID: r.ParentSpanID,
-		})
-	}
-	out.Records = append(out.Records, sink...)
-	return out, nil
+	return AccessLogList{Records: recs}, nil
 }
 
 // sinkAccessPages bounds the pages one read asks the sink for: a page
@@ -119,14 +120,9 @@ func (s *Service) AccessLogs(ctx context.Context, tenant, env string, q AccessLo
 const sinkAccessPages = 8
 
 // sinkAccessLogs reads the newest q.Limit records of the environment
-// envID before q.BeforeTsNs (of q.TraceID) from the sink: its streams of
-// source ingress, as many as it has, oldest first. ok is false without
-// --sink-url or the caller's token, and when the sink fails.
-func (s *Service) sinkAccessLogs(ctx context.Context, envID string, q AccessLogQuery) ([]AccessLogRecord, bool) {
-	t, _ := auth.TenantFrom(ctx)
-	if s.d.SinkURL == "" || t.Token == "" {
-		return nil, false
-	}
+// envID before q.BeforeTsNs (of q.TraceID) from the sink with token: its
+// streams of source ingress, as many as it has, oldest first.
+func (s *Service) sinkAccessLogs(ctx context.Context, token, envID string, q AccessLogQuery) ([]AccessLogRecord, error) {
 	v := url.Values{"environment": {envID}, "source": {"ingress"}, "direction": {"backward"}, "since": {"0"}}
 	if q.BeforeTsNs > 0 {
 		v.Set("until", strconv.FormatInt(q.BeforeTsNs-1, 10))
@@ -138,10 +134,9 @@ func (s *Service) sinkAccessLogs(ctx context.Context, envID string, q AccessLogQ
 	n := 0
 	for range sinkAccessPages {
 		v.Set("limit", strconv.Itoa(q.Limit-n))
-		page, cursor, err := s.sinkAccessPage(ctx, t.Token, v)
+		page, cursor, err := s.sinkAccessPage(ctx, token, v)
 		if err != nil {
-			s.log.Warn("cannot read the access log from the sink; reading the table", "env", envID, "err", err)
-			return nil, false
+			return nil, err
 		}
 		pages = append(pages, page)
 		n += len(page)
@@ -154,7 +149,7 @@ func (s *Service) sinkAccessLogs(ctx context.Context, envID string, q AccessLogQ
 	for i := len(pages) - 1; i >= 0; i-- {
 		out = append(out, pages[i]...)
 	}
-	return out[max(len(out)-q.Limit, 0):], true
+	return out[max(len(out)-q.Limit, 0):], nil
 }
 
 // sinkAccessPage asks the sink for one page: its records, oldest first,

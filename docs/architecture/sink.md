@@ -141,8 +141,9 @@ once.
 `ferun-ingress` writes every request it answered for an environment
 into the sink itself (ADR 0026 §8), when `--sink-endpoint` names the
 ingest (its manifest: `ferun-sink-ingest.ferun.svc.cluster.local:4317`;
-it runs in the cluster's network and resolves the name itself); without
-it, it sends to `ferund` as before (`PublishAccessLogs`).
+it runs in the cluster's network and resolves the name itself). The
+sink is its only destination: without `--sink-endpoint` the access log
+is not kept, and the agent counts its records as dropped.
 
 - **Stream**: one per (ingress instance, start of its agent,
   environment, service). Key: `ferun.pod` = `ingress/<instance name>`,
@@ -181,10 +182,10 @@ it, it sends to `ferund` as before (`PublishAccessLogs`).
   migration `0003`, `container` for every stream before it). `ferund`'s
   `GET /api/v1/environments/{env}/access-logs` reads them from the sink
   (`environment`, `source=ingress`, `trace`, backward from `before`,
-  `since=0`) and answers its `AccessLogList` as before; when the sink
-  has fewer records than the page, the table `access_logs` gives the
-  rest, older than the sink's oldest, and the whole page when the sink
-  fails ([`ferund`](#ferund)).
+  `since=0`) and answers its `AccessLogList`; the sink is the only
+  place it reads ([`ferund`](#ferund)). `ferund`'s own table of before,
+  `access_logs`, was dropped on 2026-10-31 (migration `0020`) without
+  moving its records.
 
 ## The sink
 
@@ -359,11 +360,11 @@ Deletes the streams, their lines and chunks. 204.
 - `InstanceStatus.image`: the image the instance runs,
   `registry/repository@sha256:…` as the release resolved it.
 - `GET /api/v1/environments/{env}/access-logs` reads the ingress's
-  lines from the sink when `--sink-url` is set, with the caller's token
+  lines from the sink alone, with the caller's token
   (`environment=<ID>&source=ingress&direction=backward&since=0&until=<beforeTsNs − 1>&trace=<traceId>&limit=<the rest>`,
-  paged up to 8 times), each line's JSON an `AccessLogRecord`; the table
-  `access_logs` gives what the page lacks, older than the sink's oldest,
-  and the whole page when the sink fails.
+  paged up to 8 times), each line's JSON an `AccessLogRecord`. Without
+  `--sink-url` it answers 503 `no_log_store`, and 503
+  `log_store_unavailable` (`Retry-After: 5`) when the sink fails.
 - The objects' logs call and a job run's log read from the sink when
   `--sink-url` is set, with the caller's token
   (`instance=<sandbox ID>&container=main&direction=backward&since=<its

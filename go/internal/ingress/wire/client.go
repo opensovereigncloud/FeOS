@@ -67,11 +67,6 @@ func (c *Client) Hold(ctx context.Context, in *HoldRequest, opts ...grpc.CallOpt
 	return invoke[HoldRequest, HoldResponse](ctx, c.cc, MethodHold, in, opts)
 }
 
-// PublishAccessLogs sends a batch of the ingress's access log.
-func (c *Client) PublishAccessLogs(ctx context.Context, in *AccessLogBatch, opts ...grpc.CallOption) (*AccessLogAck, error) {
-	return invoke[AccessLogBatch, AccessLogAck](ctx, c.cc, MethodPublishAccessLogs, in, opts)
-}
-
 // Sync opens the Sync stream: it sends the SyncRequest and closes the
 // sending side. The stream ends with ctx.
 func (c *Client) Sync(ctx context.Context, opts ...grpc.CallOption) (SyncClient, error) {
