@@ -6,10 +6,9 @@ package sink
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
@@ -67,12 +66,12 @@ func (j *joiner) finish(partial bool) bool {
 }
 
 // joinParts completes each partial head of a read with the lines that go
-// on with it, those at or below bound[stream] (the read's snapshot): from
-// the index up to the stream's mark, then its hot lines, the mark and the
-// hot lines read in one snapshot. A head whose rest is not there stays
-// partial.
+// on with it, those at or below bound[stream] (the streams' last offsets
+// the read saw): from the index and the topic's tail of its stream, each
+// offset once. A head whose rest is not there stays partial.
 func (s *Store) joinParts(ctx context.Context, tenant string, heads []Line, streams map[int64]*streamRow,
 	bound map[int64]int64) error {
+	tails := map[int64][]quickwit.Doc{}
 	for i := range heads {
 		h := &heads[i]
 		if !h.Partial || h.Cont {
@@ -83,38 +82,35 @@ func (s *Store) joinParts(ctx context.Context, tenant string, heads []Line, stre
 		if !ok || st == nil || upTo <= h.Off {
 			continue
 		}
-		tx, err := s.db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		from := h.Off
+		rest, err := s.index.Search(ctx, s.indexPattern(), quickwit.Query{Tenant: tenant, Environment: st.Environment,
+			Job: st.Job, Stream: st.SID, IOStream: h.Source, OffAfter: &from, OffTo: &upTo, Order: quickwit.ByOffset,
+			Max: 2000})
 		if err != nil {
-			return err
+			return fmt.Errorf("the rest of a partial line: index: %w", err)
 		}
-		mark, hot, err := partsOf(ctx, tx, h, upTo)
-		_ = tx.Rollback(context.WithoutCancel(ctx))
-		if err != nil {
-			return fmt.Errorf("the rest of a partial line: %w", err)
+		tail, ok := tails[st.ID]
+		if !ok {
+			if tail, err = s.tailDocs(ctx, []*streamRow{st}); err != nil {
+				return fmt.Errorf("the rest of a partial line: %w", err)
+			}
+			tails[st.ID] = tail
 		}
-		var cold []quickwit.Doc
-		if to := min(mark, upTo); to > h.Off {
-			from := h.Off
-			cold, err = s.index.Search(ctx, s.indexPattern(), quickwit.Query{Tenant: tenant, Environment: st.Environment, Job: st.Job, Stream: st.SID,
-				IOStream: h.Source, OffAfter: &from, OffTo: &to, Order: quickwit.ByOffset, Max: 2000})
-			if err != nil {
-				return fmt.Errorf("the rest of a partial line: index: %w", err)
+		for _, d := range tail {
+			if d.Stream == st.SID && d.IOStream == h.Source && d.Off > h.Off && d.Off <= upTo {
+				rest = append(rest, d)
 			}
 		}
+		slices.SortFunc(rest, func(a, b quickwit.Doc) int { return cmpInt(a.Off, b.Off) })
 		j := newJoiner(h)
 		last := h.Off
-		for k := range cold {
-			if cold[k].Off <= last {
-				continue // the index's second copy
+		for k := range rest {
+			if rest[k].Off <= last {
+				continue // in both, or twice in the topic
 			}
-			last = cold[k].Off
-			l := lineOf(cold[k], h.Stream)
+			last = rest[k].Off
+			l := lineOf(rest[k], h.Stream)
 			if j.add(&l) {
-				break
-			}
-		}
-		for k := range hot {
-			if j.done || j.add(&hot[k]) {
 				break
 			}
 		}
@@ -123,15 +119,4 @@ func (s *Store) joinParts(ctx context.Context, tenant string, heads []Line, stre
 		}
 	}
 	return nil
-}
-
-// partsOf reads the mark of h's stream and the hot lines of its source
-// after h, at most up to upTo.
-func partsOf(ctx context.Context, tx pgx.Tx, h *Line, upTo int64) (int64, []Line, error) {
-	var mark int64
-	if err := tx.QueryRow(ctx, `SELECT chunked_last FROM log_streams WHERE id = $1`, h.Stream).Scan(&mark); err != nil {
-		return 0, nil, err
-	}
-	hot, err := hotAfter(ctx, tx, []int64{h.Stream}, []int64{h.Off}, upTo, &h.Source, 2000)
-	return mark, hot, err
 }

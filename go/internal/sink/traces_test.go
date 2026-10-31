@@ -359,7 +359,7 @@ func TestTraceConfig(t *testing.T) {
 // testEnv is a getenv of the required settings, and more.
 func testEnv(more map[string]string) func(string) string {
 	env := map[string]string{EnvName("name"): "sink-0", EnvName("database-url"): "postgres://x/y", EnvName("trust-domain"): testTD,
-		EnvName("ferun-url"): "http://ferund:8100", EnvName("index-ingest-url"): "http://qw:7280",
+		EnvName("ferun-url"): "http://ferund:8100", EnvName("kafka-brokers"): "rp:9092",
 		EnvName("index-search-url"): "http://qw:7280", EnvServiceToken: "t"}
 	for k, v := range more {
 		env[k] = v

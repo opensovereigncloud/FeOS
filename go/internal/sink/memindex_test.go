@@ -6,10 +6,12 @@ package sink
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"slices"
 	"strings"
 	"sync"
 
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
@@ -17,23 +19,34 @@ import (
 // queries the sink makes, a word matched as a substring (a superset of
 // Quickwit's whole words, which the sink's own filters narrow anyway).
 type memIndex struct {
-	mu         sync.Mutex
-	docs       map[string][]quickwit.Doc
-	ingests    int
-	failIngest error
-	// dupNext indexes the next ingest twice, as a batch sent again would.
-	dupNext bool
+	memSources
+	mu   sync.Mutex
+	docs map[string][]quickwit.Doc
 }
 
 func newMemIndex() *memIndex { return &memIndex{docs: map[string][]quickwit.Doc{}} }
 
-func (m *memIndex) EnsureIndex(_ context.Context, id string, _ quickwit.IndexSettings) error {
+func (m *memIndex) Ensure(_ context.Context, id string, _ []byte, src quickwit.Source) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if _, ok := m.docs[id]; !ok {
 		m.docs[id] = nil
 	}
+	m.mu.Unlock()
+	m.ensure(id, src)
 	return nil
+}
+
+// sync is a commit of every source: what the topics hold that the index
+// has not taken is indexed now.
+func (m *memIndex) sync(lg *memLog) {
+	m.pull(lg, func(id string, r kafka.Record) {
+		var d quickwit.Doc
+		if json.Unmarshal(r.Value, &d) == nil {
+			m.mu.Lock()
+			m.docs[id] = append(m.docs[id], d)
+			m.mu.Unlock()
+		}
+	})
 }
 
 func (m *memIndex) Indexes(_ context.Context, prefix string) ([]string, error) {
@@ -47,24 +60,6 @@ func (m *memIndex) Indexes(_ context.Context, prefix string) ([]string, error) {
 	}
 	slices.Sort(ids)
 	return ids, nil
-}
-
-func (m *memIndex) Ingest(_ context.Context, id string, docs []quickwit.Doc) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failIngest != nil {
-		return m.failIngest
-	}
-	if _, ok := m.docs[id]; !ok {
-		return &quickwit.Error{Status: 404, Message: "index " + id + " not found"}
-	}
-	m.ingests++
-	m.docs[id] = append(m.docs[id], docs...)
-	if m.dupNext {
-		m.docs[id] = append(m.docs[id], docs...)
-		m.dupNext = false
-	}
-	return nil
 }
 
 func matches(d *quickwit.Doc, q *quickwit.Query) bool {
@@ -138,6 +133,14 @@ func (m *memIndex) Delete(_ context.Context, id string, q quickwit.Query) error 
 	}
 	m.docs[id] = keep
 	return nil
+}
+
+// add puts docs into the index id as its source would have, making the
+// index unless it is there: an index of before, filled by its indexer.
+func (m *memIndex) add(id string, docs ...quickwit.Doc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.docs[id] = append(m.docs[id], docs...)
 }
 
 // count is how many documents of tenant the indexes hold.

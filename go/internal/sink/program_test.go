@@ -170,11 +170,10 @@ func TestEndToEnd(t *testing.T) {
 	cfg := Default()
 	cfg.Name, cfg.Listen, cfg.IngestListen = "sink-0", "127.0.0.1:0", "127.0.0.1:0"
 	cfg.DatabaseURL, cfg.TrustDomain, cfg.FerunURL, cfg.ServiceToken = dbURL, testTD, fsrv.URL, "svc-token"
-	cfg.ChunkInterval, cfg.FollowPoll = 50*time.Millisecond, 20*time.Millisecond
-	idx := newMemIndex()
+	idx, lg := newMemIndex(), newMemLog()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	prog, err := New(ctx, cfg, Deps{Index: idx, TraceIndex: newMemTraceIndex()}, dbtest.Logger(t))
+	prog, err := New(ctx, cfg, Deps{Index: idx, TraceIndex: newMemTraceIndex(), Log: lg}, dbtest.Logger(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,18 +250,29 @@ func TestEndToEnd(t *testing.T) {
 	if resp, _ := get("/healthz", ""); resp.StatusCode != 200 {
 		t.Errorf("healthz %d", resp.StatusCode)
 	}
-	// The lines move to the cold stage; the read finds them there.
-	waitFor(t, func() bool { return idx.count("acme") > 0 })
-	resp, b := get("/api/v1/logs?environment=env1", "tenant-token")
-	if resp.StatusCode != 200 {
-		t.Fatalf("logs: %d %s", resp.StatusCode, b)
-	}
+	// The lines are in the topic's tail, then in the index: a read finds
+	// them in either.
 	var page PageJSON
-	if err := json.Unmarshal(b, &page); err != nil {
-		t.Fatal(err)
-	}
-	if len(page.Lines) != 3 || page.Lines[1].Level != "error" || page.Lines[1].Source != "stderr" || page.Lines[2].Text != "plain" {
-		t.Fatalf("page %s", b)
+	var b []byte
+	for _, when := range []string{"tail", "index"} {
+		if when == "index" {
+			idx.sync(lg)
+			if idx.count("acme") != 3 {
+				t.Fatalf("%d documents", idx.count("acme"))
+			}
+		}
+		var resp *http.Response
+		resp, b = get("/api/v1/logs?environment=env1", "tenant-token")
+		if resp.StatusCode != 200 {
+			t.Fatalf("%s: logs: %d %s", when, resp.StatusCode, b)
+		}
+		page = PageJSON{}
+		if err := json.Unmarshal(b, &page); err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Lines) != 3 || page.Lines[1].Level != "error" || page.Lines[1].Source != "stderr" || page.Lines[2].Text != "plain" {
+			t.Fatalf("%s: page %s", when, b)
+		}
 	}
 	st := page.Streams[page.Lines[0].Stream]
 	if st.Node != "node-1" || st.Environment != "env1" || st.Release != 4 || st.Lines != 3 || st.Tenant != "acme" {
@@ -271,7 +281,7 @@ func TestEndToEnd(t *testing.T) {
 	if !strings.Contains(string(b), `"ts":"`) || !strings.Contains(string(b), `"offset":"20"`) {
 		t.Errorf("ts and offset are not strings: %s", b)
 	}
-	resp, b = get("/api/v1/logs?environment=env1&trace="+traceA, "tenant-token")
+	resp, b := get("/api/v1/logs?environment=env1&trace="+traceA, "tenant-token")
 	if resp.StatusCode != 200 || strings.Count(string(b), `"offset"`) != 1 {
 		t.Errorf("trace: %d %s", resp.StatusCode, b)
 	}
@@ -366,7 +376,7 @@ func TestIngressEndToEnd(t *testing.T) {
 	cfg.DatabaseURL, cfg.TrustDomain, cfg.FerunURL, cfg.ServiceToken = dbURL, testTD, fsrv.URL, "svc-token"
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	prog, err := New(ctx, cfg, Deps{Index: newMemIndex(), TraceIndex: newMemTraceIndex()}, dbtest.Logger(t))
+	prog, err := New(ctx, cfg, Deps{Index: newMemIndex(), TraceIndex: newMemTraceIndex(), Log: newMemLog()}, dbtest.Logger(t))
 	if err != nil {
 		t.Fatal(err)
 	}

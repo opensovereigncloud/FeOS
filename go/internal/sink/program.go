@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
@@ -39,12 +40,13 @@ type Program struct {
 }
 
 // Deps are what tests replace: the index (nil: Quickwit at the
-// configuration's URLs), the trace index (nil: the index, which must
-// serve traces) and the HTTP client of the calls to ferund (nil: the
-// default).
+// configuration's URL), the trace index (nil: the index, which must
+// serve traces), the log of record (nil: the configuration's brokers)
+// and the HTTP client of the calls to ferund (nil: the default).
 type Deps struct {
 	Index      Index
 	TraceIndex TraceIndex
+	Log        Log
 	HTTP       *http.Client
 }
 
@@ -64,7 +66,7 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 	}
 	index := deps.Index
 	if index == nil {
-		c, err := quickwit.New(cfg.IndexIngestURL, cfg.IndexSearchURL, nil)
+		c, err := quickwit.New(cfg.IndexSearchURL, nil)
 		if err != nil {
 			d.Close()
 			return nil, err
@@ -80,6 +82,15 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 		}
 		traceIndex = ti
 	}
+	rlog := deps.Log
+	if rlog == nil {
+		kc, err := kafka.New(cfg.KafkaBrokers)
+		if err != nil {
+			d.Close()
+			return nil, err
+		}
+		rlog = kafkaLog{kc}
+	}
 	lis, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		d.Close()
@@ -89,8 +100,8 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 		cfg:      cfg,
 		log:      log,
 		db:       d,
-		store:    NewStore(d, index, cfg, log),
-		traces:   NewTraces(d, traceIndex, cfg, log),
+		store:    NewStore(d, index, rlog, cfg, log),
+		traces:   NewTraces(d, traceIndex, rlog, cfg, log),
 		ident:    NewIdentity(cfg.FerunURL, cfg.ServiceToken, cfg.TrustDomain, cfg.Name, deps.HTTP, log),
 		tenants:  NewTenants(cfg.FerunURL, deps.HTTP, tenantTTL),
 		apiLis:   lis,
@@ -147,7 +158,7 @@ func (p *Program) Run(ctx context.Context) error {
 		}()
 	}
 	run("identity", p.ident.Run)
-	run("cold stage", p.store.RunIndex)
+	run("hot rows of before", p.drainHot)
 	run("traces", p.traces.Run)
 	run("sweep", p.store.RunSweep)
 	run("ingest", p.serveIngest)

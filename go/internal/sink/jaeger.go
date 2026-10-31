@@ -23,14 +23,12 @@ import (
 
 // The bounds of the reads of traces (traces.md, Reading): the spans of a
 // trace, the traces of a search, the names of services and operations,
-// the spans read from trace_spans, how far back the names go, and the
-// traces loaded at once.
+// how far back the names go, and the traces loaded at once.
 const (
 	maxTraceSpans      = 10000
 	defaultTraceLimit  = 20
 	maxTraceLimit      = 100
 	maxSpanNames       = 10000
-	maxHotSpans        = 10000
 	maxTags            = 32
 	spanNamesLookback  = 7 * 24 * time.Hour
 	defaultTraceWindow = time.Hour
@@ -56,7 +54,7 @@ func (t *Traces) names(ctx context.Context, q quickwit.SpanQuery, sinceNs int64,
 	if err != nil {
 		return nil, fmt.Errorf("index: %w", err)
 	}
-	hot, err := t.hotSpans(ctx, q, maxHotSpans)
+	hot, err := t.tailSpans(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +66,7 @@ func (t *Traces) names(ctx context.Context, q quickwit.SpanQuery, sinceNs int64,
 }
 
 // Trace answers a trace's spans of sel (its Tenant and TraceID set), from
-// the index and trace_spans, one per span ID, the earliest first, at most
+// the index and its topic's tail (ADR 0026 §11), one per span ID, the earliest first, at most
 // maxTraceSpans; none: nil.
 func (t *Traces) Trace(ctx context.Context, sel quickwit.SpanQuery) ([]quickwit.SpanDoc, error) {
 	q := quickwit.SpanQuery{Tenant: sel.Tenant, TraceID: sel.TraceID, Environment: sel.Environment, Object: sel.Object,
@@ -77,7 +75,7 @@ func (t *Traces) Trace(ctx context.Context, sel quickwit.SpanQuery) ([]quickwit.
 	if err != nil {
 		return nil, fmt.Errorf("index: %w", err)
 	}
-	hot, err := t.hotSpans(ctx, q, maxTraceSpans)
+	hot, err := t.tailSpans(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +117,7 @@ func (t *Traces) Find(ctx context.Context, q quickwit.SpanQuery, limit int) ([][
 	for _, h := range hits {
 		newest[h.TraceID] = h.NewestNs
 	}
-	hot, err := t.hotSpans(ctx, q, maxHotSpans)
+	hot, err := t.tailSpans(ctx, q)
 	if err != nil {
 		return nil, err
 	}

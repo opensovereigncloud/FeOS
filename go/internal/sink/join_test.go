@@ -20,13 +20,14 @@ func part(off int64, ms int, source, text string, partial bool) Line {
 
 func TestPartialLinesJoined(t *testing.T) {
 	cfg := testConfig()
-	s, _ := newTestStore(t, cfg)
+	s, idx, lg := newTestStore(t, cfg)
 	ctx := context.Background()
 	key, l := StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0)
 	big := strings.Repeat("x", 600<<10)
-	// The first batch goes to the cold stage, its rest stays hot; stderr
-	// runs between the parts; a re-sent batch changes nothing; the last
-	// line's rest comes in the next batch.
+	// The first batch goes into the index, the rest stays in the topic's
+	// tail, so that a line's parts lie in both; stderr runs between the
+	// parts; a re-sent batch changes nothing; the last line's rest comes
+	// in the next batch.
 	first := []Line{
 		part(0, 0, "stdout", "INFO a", false),
 		part(10, 1, "stdout", "ERROR b1 ", true),
@@ -36,7 +37,7 @@ func TestPartialLinesJoined(t *testing.T) {
 	if err := s.Ingest(ctx, batch(key, l, first)); err != nil {
 		t.Fatal(err)
 	}
-	indexAll(t, s)
+	idx.sync(lg)
 	second := []Line{
 		part(40, 4, "stdout", "b3 needle", false),
 		part(50, 5, "stdout", "c", false),
@@ -48,13 +49,13 @@ func TestPartialLinesJoined(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The rest of the last line in a batch of its own, hot as well.
+	// The rest of the last line in a batch of its own, in the tail as
+	// well.
 	if err := s.Ingest(ctx, batch(key, l, []Line{part(100, 10, "stdout", " d2", false)})); err != nil {
 		t.Fatal(err)
 	}
-	var batches int
-	if err := s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_batches`).Scan(&batches); err != nil || batches != 2 {
-		t.Fatalf("%d hot batches: %v", batches, err)
+	if n, recs := idx.count("acme"), lg.count(logTopic); n != 4 || recs != 11 {
+		t.Fatalf("%d of %d records indexed", n, recs)
 	}
 	type want struct {
 		text    string
@@ -79,29 +80,38 @@ func TestPartialLinesJoined(t *testing.T) {
 			}
 		}
 	}
-	check("backward", mustRead(t, s, "acme", url.Values{"stream": {sidOf(t, s)}}).page(false).Lines, all)
-	// Page by page, either way: each joined line once, never a part.
-	for _, dir := range []string{"backward", "forward"} {
-		var got []LineJSON
-		v := url.Values{"stream": {sidOf(t, s)}, "limit": {"1"}, "direction": {dir}, "since": {fmt.Sprint(base - 1)}}
-		for range 20 {
-			r := mustRead(t, s, "acme", v)
-			p := r.page(dir == "forward")
-			if dir == "forward" {
-				got = append(got, p.Lines...)
-			} else {
-				got = append(p.Lines, got...)
+	reads := func(when string) {
+		t.Helper()
+		check(when+", backward", mustRead(t, s, "acme", url.Values{"stream": {sidOf(t, s)}}).page(false).Lines, all)
+		// Page by page, either way: each joined line once, never a part.
+		for _, dir := range []string{"backward", "forward"} {
+			var got []LineJSON
+			v := url.Values{"stream": {sidOf(t, s)}, "limit": {"1"}, "direction": {dir}, "since": {fmt.Sprint(base - 1)}}
+			for range 20 {
+				r := mustRead(t, s, "acme", v)
+				p := r.page(dir == "forward")
+				if dir == "forward" {
+					got = append(got, p.Lines...)
+				} else {
+					got = append(p.Lines, got...)
+				}
+				if p.Cursor == "" {
+					break
+				}
+				v.Set("cursor", p.Cursor)
 			}
-			if p.Cursor == "" {
-				break
-			}
-			v.Set("cursor", p.Cursor)
+			check(when+", "+dir, got, all)
 		}
-		check(dir, got, all)
+		// Filters see the joined line.
+		check(when+", q", mustRead(t, s, "acme", url.Values{"stream": {sidOf(t, s)}, "q": {"needle"}}).page(false).Lines, all[1:2])
+		check(when+", level", mustRead(t, s, "acme", url.Values{"stream": {sidOf(t, s)}, "level": {"error"}}).page(false).Lines, all[1:2])
 	}
-	// Filters see the joined line.
-	check("q", mustRead(t, s, "acme", url.Values{"stream": {sidOf(t, s)}, "q": {"needle"}}).page(false).Lines, all[1:2])
-	check("level", mustRead(t, s, "acme", url.Values{"stream": {sidOf(t, s)}, "level": {"error"}}).page(false).Lines, all[1:2])
+	reads("index and tail")
+	// The parts in the topic twice, and then all in the index.
+	produceAgain(t, lg, logTopic, sidOf(t, s))
+	reads("twice")
+	idx.sync(lg)
+	reads("index")
 }
 
 func sidOf(t *testing.T, s *Store) string {

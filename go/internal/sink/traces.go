@@ -5,14 +5,12 @@ package sink
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"math"
 	"strconv"
-	"sync/atomic"
 
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
@@ -21,10 +19,10 @@ import (
 )
 
 // TraceIndex is the trace index (docs/architecture/traces.md): Quickwit
-// (quickwit.Client) or a test's.
+// (quickwit.Client) or a test's; its Kafka source fills it from its
+// topic (ADR 0026 §11).
 type TraceIndex interface {
-	EnsureTraceIndex(ctx context.Context, id string, s quickwit.IndexSettings) error
-	IngestSpans(ctx context.Context, id string, docs []json.RawMessage) error
+	SourceIndex
 	SearchSpans(ctx context.Context, pattern string, q quickwit.SpanQuery) ([]quickwit.SpanDoc, error)
 	SpanTerms(ctx context.Context, pattern string, q quickwit.SpanQuery, field string, size int) ([]string, error)
 	NewestTraces(ctx context.Context, pattern string, q quickwit.SpanQuery, n int) ([]quickwit.TraceHit, error)
@@ -32,23 +30,19 @@ type TraceIndex interface {
 
 var _ TraceIndex = (*quickwit.Client)(nil)
 
-// Traces is the sink's spans: the ingest into trace_spans, the indexer
-// that moves them into the trace index, and the reads of both.
+// Traces is the sink's spans: the gate of their ingest into the trace
+// topic, and the reads of the index and the topic's tail.
 type Traces struct {
 	db    *db.DB
 	index TraceIndex
+	pipes *pipes
 	cfg   Config
 	log   *slog.Logger
-	// owner names this process in a span's claim.
-	owner   string
-	ensured atomic.Bool
 }
 
-// NewTraces returns the spans over d and index.
-func NewTraces(d *db.DB, index TraceIndex, cfg Config, log *slog.Logger) *Traces {
-	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	return &Traces{db: d, index: index, cfg: cfg, log: log, owner: cfg.Name + "/" + hex.EncodeToString(b)}
+// NewTraces returns the spans over d, the trace index and the topics.
+func NewTraces(d *db.DB, index TraceIndex, log Log, cfg Config, logger *slog.Logger) *Traces {
+	return &Traces{db: d, index: index, pipes: newPipes(log, index, cfg), cfg: cfg, log: logger}
 }
 
 // indexID is the trace index: <prefix>-v<mapping version>-<days>d.

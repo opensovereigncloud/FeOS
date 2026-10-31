@@ -5,9 +5,11 @@ package sink
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
@@ -29,6 +32,10 @@ func testConfig() Config {
 	return c
 }
 
+// logTopic is the topic (and index) of the default retention of
+// testConfig.
+var logTopic = quickwit.IndexID("ferun-logs", 30)
+
 // newTestDB is a migrated, empty database of the sink's own.
 func newTestDB(t *testing.T) *db.DB {
 	t.Helper()
@@ -41,11 +48,13 @@ func newTestDB(t *testing.T) *db.DB {
 	return d
 }
 
-func newTestStore(t *testing.T, cfg Config) (*Store, *memIndex) {
+// newTestStore is a store over a new database, the index in memory and
+// the topics in memory; idx.sync(lg) is a commit of the index's sources.
+func newTestStore(t *testing.T, cfg Config) (*Store, *memIndex, *memLog) {
 	t.Helper()
 	d := newTestDB(t)
-	idx := newMemIndex()
-	return NewStore(d, idx, cfg, dbtest.Logger(t)), idx
+	idx, lg := newMemIndex(), newMemLog()
+	return NewStore(d, idx, lg, cfg, dbtest.Logger(t)), idx, lg
 }
 
 // base is the tests' time of the first line.
@@ -94,8 +103,72 @@ func texts(r scanResult, forward bool) []string {
 	return out
 }
 
+// pageAll reads every page of v in its direction, oldest first.
+func pageAll(t *testing.T, s *Store, v url.Values) []string {
+	t.Helper()
+	forward := v.Get("direction") == "forward"
+	var got []string
+	for pages := 0; ; pages++ {
+		if pages > 200 {
+			t.Fatal("too many pages")
+		}
+		r := mustRead(t, s, "acme", v)
+		if forward {
+			got = append(got, texts(r, true)...)
+		} else {
+			got = append(texts(r, false), got...)
+		}
+		if r.cursor == nil {
+			return got
+		}
+		v.Set("cursor", encodeCursor(forward, *r.cursor))
+	}
+}
+
+// docsIn are the documents of topic's records, in the topic's order.
+func docsIn(t *testing.T, lg *memLog, topic string) []quickwit.Doc {
+	t.Helper()
+	var out []quickwit.Doc
+	for _, r := range lg.records(topic) {
+		var d quickwit.Doc
+		if err := json.Unmarshal(r.Value, &d); err != nil {
+			t.Fatalf("record %d/%d: %v", r.Partition, r.Offset, err)
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+// produceAgain appends the records of topic's stream sid to the topic once
+// more, as after an answer to the node that did not arrive.
+func produceAgain(t *testing.T, lg *memLog, topic, sid string) int {
+	t.Helper()
+	var again []kafka.Record
+	for _, r := range lg.records(topic) {
+		var d quickwit.Doc
+		if json.Unmarshal(r.Value, &d) == nil && d.Stream == sid {
+			again = append(again, kafka.Record{Partition: r.Partition, Key: r.Key, Value: r.Value})
+		}
+	}
+	if err := lg.Produce(context.Background(), topic, again); err != nil {
+		t.Fatal(err)
+	}
+	return len(again)
+}
+
+// streamSID is the stream ID of the stream of key.
+func streamSID(t *testing.T, s *Store, key StreamKey) string {
+	t.Helper()
+	var sid string
+	if err := s.db.Pool.QueryRow(context.Background(), `SELECT sid FROM log_streams WHERE pod = $1 AND container = $2 AND log_id = $3`,
+		key.Pod, key.Container, key.LogID).Scan(&sid); err != nil {
+		t.Fatal(err)
+	}
+	return sid
+}
+
 func TestIngestIdempotent(t *testing.T) {
-	s, _ := newTestStore(t, testConfig())
+	s, idx, lg := newTestStore(t, testConfig())
 	ctx := context.Background()
 	key := StreamKey{"pod1", "main", "L1"}
 	l := envLabels("acme", "env1", 0)
@@ -105,43 +178,65 @@ func TestIngestIdempotent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A batch sent again produces nothing.
+	if lg.produces != 1 {
+		t.Errorf("%d produces of a batch sent three times", lg.produces)
+	}
 	// Overlapping and new, and labels that lose to the first write's.
 	l2 := envLabels("acme", "other", 1)
 	more := lines(30, base+int64(3*time.Millisecond), 4, func(i int) string { return fmt.Sprintf("line %d", i+3) })
 	if err := s.Ingest(ctx, batch(key, l2, more)); err != nil {
 		t.Fatal(err)
 	}
-	var n, rowCount, lineCount, bytes, hotLines, hotBytes, next, lastOff int64
+	var lineCount, bytes, next, lastOff int64
 	var env string
-	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT coalesce(sum(lines), 0) FROM log_batches), (SELECT count(*) FROM log_batches),
-		lines, bytes, hot_lines, hot_bytes, next_offset, last_off, environment
-		FROM log_streams`).Scan(&n, &rowCount, &lineCount, &bytes, &hotLines, &hotBytes, &next, &lastOff, &env); err != nil {
+	if err := s.db.Pool.QueryRow(ctx, `SELECT lines, bytes, next_offset, last_off, environment FROM log_streams`).
+		Scan(&lineCount, &bytes, &next, &lastOff, &env); err != nil {
 		t.Fatal(err)
 	}
-	if n != 7 || lineCount != 7 || bytes != 7*6 || hotLines != 7 || hotBytes != 7*6 || next != 60 || lastOff != 60 || env != "env1" {
-		t.Errorf("lines %d, counted %d, bytes %d, hot %d/%d, next %d, last %d, env %q", n, lineCount, bytes, hotLines, hotBytes,
-			next, lastOff, env)
+	if lineCount != 7 || bytes != 7*6 || next != 60 || lastOff != 60 || env != "env1" {
+		t.Errorf("lines %d, bytes %d, next %d, last %d, env %q", lineCount, bytes, next, lastOff, env)
 	}
-	// A row per batch: the first, sent three times, once, and the new
-	// lines of the one that overlaps it.
-	type row struct{ first, last, minTS, maxTS, lines, bytes, levels int64 }
-	rs, err := s.db.Pool.Query(ctx, `SELECT first_off, last_off, min_ts, max_ts, lines, bytes, levels FROM log_batches ORDER BY first_off`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got []row
-	for rs.Next() {
-		var r row
-		if err := rs.Scan(&r.first, &r.last, &r.minTS, &r.maxTS, &r.lines, &r.bytes, &r.levels); err != nil {
+	// A record per (stream, offset), in the stream's partition, keyed by
+	// its tenant, environment and job, its document of the first write's
+	// labels.
+	sid := streamSID(t, s, key)
+	recs := lg.records(logTopic)
+	part := kafka.Partition("acme/env1/", int32(testConfig().KafkaPartitions))
+	var offs []int64
+	for _, r := range recs {
+		var d quickwit.Doc
+		if err := json.Unmarshal(r.Value, &d); err != nil {
 			t.Fatal(err)
 		}
-		got = append(got, r)
+		if string(r.Key) != "acme/env1/" || r.Partition != part || d.Stream != sid || d.Tenant != "acme" ||
+			d.Environment != "env1" || d.Replica != 0 || d.Release != 3 || d.Source != SourceContainer || d.IOStream != "stdout" {
+			t.Errorf("record %q in %d: %+v", r.Key, r.Partition, d)
+		}
+		offs = append(offs, d.Off)
 	}
-	rs.Close()
-	ms := int64(time.Millisecond)
-	if want := []row{{0, 40, base, base + 4*ms, 5, 30, LevelUnknown}, {50, 60, base + 5*ms, base + 6*ms, 2, 12, LevelUnknown}}; rowCount != 2 || fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("batches %v, want %v", got, want)
+	if fmt.Sprint(offs) != "[0 10 20 30 40 50 60]" {
+		t.Errorf("offsets in the topic %v", offs)
 	}
+	// A job's stream lies in its job's partition.
+	job := Labels{Tenant: "acme", Environment: "env1", Job: "build-1", Attrs: map[string]string{}}
+	if err := s.Ingest(ctx, batch(StreamKey{"pod2", "main", "L1"}, job, lines(0, base, 1, func(int) string { return "j" }))); err != nil {
+		t.Fatal(err)
+	}
+	recs = lg.records(logTopic)
+	jobs := 0
+	for _, r := range recs {
+		if string(r.Key) == "acme/env1/build-1" {
+			jobs++
+			if r.Partition != kafka.Partition("acme/env1/build-1", int32(testConfig().KafkaPartitions)) {
+				t.Errorf("the job's record in %d", r.Partition)
+			}
+		}
+	}
+	if len(recs) != 8 || jobs != 1 {
+		t.Errorf("%d records, %d of the job", len(recs), jobs)
+	}
+
 	pos, err := s.Positions(ctx, []StreamKey{{"nope", "x", "y"}, key})
 	if err != nil || pos[0] != 0 || pos[1] != 60 {
 		t.Errorf("positions %v, %v", pos, err)
@@ -158,24 +253,33 @@ func TestIngestIdempotent(t *testing.T) {
 	if err := s.EndStreams(ctx, []StreamKey{key, {"nope", "x", "y"}}, 0); err != nil {
 		t.Fatal(err)
 	}
-	r := mustRead(t, s, "acme", url.Values{"environment": {"env1"}})
-	if got := strings.Join(texts(r, false), "|"); got != "line 0|line 1|line 2|line 3|line 4|line 5|line 6|x" {
-		t.Errorf("read %s", got)
-	}
-	for _, st := range r.streams {
-		if st.EndedAt == nil {
-			t.Error("stream not ended")
+	// Read from the topic's tail, then from the index once it has them.
+	for _, when := range []string{"tail", "index"} {
+		if when == "index" {
+			idx.sync(lg)
+			if n := idx.count("acme"); n != 9 {
+				t.Fatalf("%d documents", n)
+			}
 		}
-	}
-	if r := mustRead(t, s, "other-tenant", url.Values{"environment": {"env1"}}); len(r.lines) != 0 {
-		t.Error("another tenant reads the stream")
+		r := mustRead(t, s, "acme", url.Values{"environment": {"env1"}})
+		if got := strings.Join(texts(r, false), "|"); got != "line 0|j|line 1|line 2|line 3|line 4|line 5|line 6|x" {
+			t.Errorf("%s: read %s", when, got)
+		}
+		for _, st := range r.streams {
+			if st.SID == sid && st.EndedAt == nil {
+				t.Errorf("%s: stream not ended", when)
+			}
+		}
+		if r := mustRead(t, s, "other-tenant", url.Values{"environment": {"env1"}}); len(r.lines) != 0 {
+			t.Errorf("%s: another tenant reads the stream", when)
+		}
 	}
 }
 
 func TestQuota(t *testing.T) {
 	cfg := testConfig()
 	cfg.Quota = 100
-	s, _ := newTestStore(t, cfg)
+	s, _, lg := newTestStore(t, cfg)
 	ctx := context.Background()
 	text := func(int) string { return strings.Repeat("a", 60) }
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("small", "e", 0), lines(0, base, 2, text))); err != nil {
@@ -188,39 +292,131 @@ func TestQuota(t *testing.T) {
 	if !errors.Is(err, ErrQuota) || !strings.Contains(err.Error(), "small") {
 		t.Fatalf("over quota: %v", err)
 	}
-	var small, big int64
-	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT sum(b.lines) FROM log_batches b JOIN log_streams s ON s.id = b.stream_id WHERE s.tenant = 'small'),
-		(SELECT sum(b.lines) FROM log_batches b JOIN log_streams s ON s.id = b.stream_id WHERE s.tenant = 'big')`).Scan(&small, &big); err != nil {
+	per := map[string]int{}
+	for _, d := range docsIn(t, lg, logTopic) {
+		per[d.Tenant]++
+	}
+	var smallLast, smallUsed, bigUsed int64
+	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT last_off FROM log_streams WHERE tenant = 'small'),
+		(SELECT bytes FROM log_usage WHERE tenant = 'small'), (SELECT bytes FROM log_usage WHERE tenant = 'big')`).
+		Scan(&smallLast, &smallUsed, &bigUsed); err != nil {
 		t.Fatal(err)
 	}
-	if small != 2 || big != 1 {
-		t.Errorf("small %d, big %d", small, big)
+	if per["small"] != 2 || per["big"] != 1 || smallLast != 10 || smallUsed != 120 || bigUsed != 60 {
+		t.Errorf("records %v, small's last offset %d, usage %d and %d", per, smallLast, smallUsed, bigUsed)
 	}
 }
 
-// indexAll hands every hot line to the index.
-func indexAll(t *testing.T, s *Store) int {
-	t.Helper()
-	total := 0
-	for {
-		n, err := s.indexRound(context.Background())
-		if err != nil {
+// A produce that fails stores nothing, neither a stream's row nor its
+// counters nor the usage; the node sends again, and everything is stored.
+func TestProduceFailure(t *testing.T) {
+	s, _, lg := newTestStore(t, testConfig())
+	ctx := context.Background()
+	known, fresh := StreamKey{"p", "c", "1"}, StreamKey{"q", "c", "1"}
+	text := func(i int) string { return fmt.Sprintf("line %d", i) }
+	if err := s.Ingest(ctx, batch(known, envLabels("acme", "e", 0), lines(0, base, 2, text))); err != nil {
+		t.Fatal(err)
+	}
+	b := append(batch(known, envLabels("acme", "e", 0), lines(0, base, 5, text)),
+		batch(fresh, envLabels("acme", "e", 1), lines(0, base, 3, text))...)
+	lg.failProduce = errors.New("redpanda down")
+	if err := s.Ingest(ctx, b); err == nil {
+		t.Fatal("no error")
+	}
+	state := func() string {
+		t.Helper()
+		var streams, lines, last, used int64
+		if err := s.db.Pool.QueryRow(ctx, `SELECT count(*), sum(lines), max(last_off),
+			(SELECT sum(bytes) FROM log_usage) FROM log_streams`).Scan(&streams, &lines, &last, &used); err != nil {
 			t.Fatal(err)
 		}
-		if n == 0 {
-			return total
-		}
-		total += n
+		return fmt.Sprintf("%d streams, %d lines, last %d, %d bytes used, %d records", streams, lines, last, used,
+			lg.count(logTopic))
+	}
+	if got := state(); got != "1 streams, 2 lines, last 10, 12 bytes used, 2 records" {
+		t.Errorf("after the failed produce: %s", got)
+	}
+	if pos, _ := s.Positions(ctx, []StreamKey{known, fresh}); fmt.Sprint(pos) != "[10 0]" {
+		t.Errorf("positions %v", pos)
+	}
+	lg.failProduce = nil
+	if err := s.Ingest(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	if got := state(); got != "2 streams, 8 lines, last 40, 48 bytes used, 8 records" {
+		t.Errorf("sent again: %s", got)
+	}
+	r := mustRead(t, s, "acme", url.Values{"environment": {"e"}})
+	if len(r.lines) != 8 {
+		t.Errorf("read %v", texts(r, false))
 	}
 }
 
-func TestIndexAndQueries(t *testing.T) {
+// Instances of the sink take a stream's lines once between them: the
+// stream's row is the lock.
+func TestIngestAcrossInstances(t *testing.T) {
+	d := newTestDB(t)
+	idx, lg := newMemIndex(), newMemLog()
+	ctx := context.Background()
+	stores := make([]*Store, 4)
+	for i := range stores {
+		c := testConfig()
+		c.Name = fmt.Sprintf("sink-%d", i)
+		stores[i] = NewStore(d, idx, lg, c, dbtest.Logger(t))
+	}
+	const streams, rounds = 10, 5
+	var wg sync.WaitGroup
+	errc := make(chan error, len(stores))
+	for _, s := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Every instance sends every batch, as nodes do that retry
+			// at another instance.
+			for r := range rounds {
+				var b []StreamBatch
+				for i := range streams {
+					b = append(b, batch(StreamKey{fmt.Sprintf("pod%d", i), "c", "1"}, envLabels("acme", "e", i),
+						lines(int64(r)*100, base+int64(r)*int64(time.Second), 5, func(j int) string { return fmt.Sprintf("r%d l%d", r, j) }))...)
+				}
+				if err := s.Ingest(ctx, b); err != nil {
+					errc <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errc)
+	for err := range errc {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, d := range docsIn(t, lg, logTopic) {
+		k := fmt.Sprintf("%s/%d", d.Stream, d.Off)
+		if seen[k] {
+			t.Errorf("%s twice in the topic", k)
+		}
+		seen[k] = true
+	}
+	if len(seen) != streams*rounds*5 {
+		t.Errorf("%d records", len(seen))
+	}
+	idx.sync(lg)
+	r := mustRead(t, stores[1], "acme", url.Values{"environment": {"e"}, "limit": {"5000"}, "since": {fmt.Sprint(base - 1)}})
+	if len(r.lines) != streams*rounds*5 {
+		t.Errorf("read %d lines", len(r.lines))
+	}
+}
+
+func TestReadTailAndIndex(t *testing.T) {
 	cfg := testConfig()
-	s, idx := newTestStore(t, cfg)
+	s, idx, lg := newTestStore(t, cfg)
 	ctx := context.Background()
 	key1, key2 := StreamKey{"pod1", "main", "L1"}, StreamKey{"pod2", "main", "L1"}
-	// Stream 1: 30 lines, indexed in pieces; stream 2: interleaved in
-	// time, its first batch indexed, two kept hot.
+	// Stream 1: 30 lines, in the index; stream 2: interleaved in time, its
+	// first batch in the index and in the topic's tail again, as after an
+	// answer lost, its last two only in the tail.
 	ln := func(prefix string) func(int) string {
 		return func(i int) string {
 			lvl := "INFO"
@@ -235,124 +431,223 @@ func TestIndexAndQueries(t *testing.T) {
 			lines(int64(i)*10, base+int64(2*i)*int64(time.Millisecond), 10, func(j int) string { return ln("a")(i + j) }))); err != nil {
 			t.Fatal(err)
 		}
-		if n := indexAll(t, s); n != 1 {
-			t.Fatalf("%d streams indexed", n)
-		}
+		idx.sync(lg)
 	}
-	// The index holds one of the batches twice, as after an answer lost.
-	idx.dupNext = true
 	if err := s.Ingest(ctx, batch(key2, envLabels("acme", "env1", 1),
 		lines(0, base+int64(time.Millisecond), 10, func(j int) string { return ln("b")(j) }))); err != nil {
 		t.Fatal(err)
 	}
-	indexAll(t, s)
-	// The rest of stream 2 stays hot.
+	idx.sync(lg)
+	if n := produceAgain(t, lg, logTopic, streamSID(t, s, key2)); n != 10 {
+		t.Fatalf("%d records again", n)
+	}
 	for k := range 2 {
 		if err := s.Ingest(ctx, batch(key2, envLabels("acme", "env1", 1),
 			lines(100+int64(k)*100, base+int64(11+10*k)*int64(time.Millisecond), 10, func(j int) string { return ln("b")(j + 10 + 10*k) }))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	var hot, rows int
-	if err := s.db.Pool.QueryRow(ctx, `SELECT sum(lines), count(*) FROM log_batches`).Scan(&hot, &rows); err != nil {
-		t.Fatal(err)
+	if n, recs := idx.count("acme"), lg.count(logTopic); n != 40 || recs != 70 {
+		t.Fatalf("indexed %d, %d records", n, recs)
 	}
-	if n := idx.count("acme"); n != 50 || hot != 20 || rows != 2 {
-		t.Fatalf("indexed %d, hot %d in %d batches", n, hot, rows)
-	}
-	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-v2-30d]" {
+	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-v3-30d]" {
 		t.Errorf("indexes %v", ids)
 	}
 	// A read finds the lines of an index of before (version 1,
 	// <prefix>-<days>d) with the current version's: stream 1's first
 	// batch moves there.
 	idx.mu.Lock()
-	v2 := idx.docs["ferun-logs-v2-30d"]
-	idx.docs["ferun-logs-30d"], idx.docs["ferun-logs-v2-30d"] = v2[:10], v2[10:]
+	v3 := idx.docs[logTopic]
+	idx.docs["ferun-logs-30d"], idx.docs[logTopic] = v3[:10], v3[10:]
 	idx.mu.Unlock()
 	// A line sent again after it was indexed is not stored again.
+	produces := lg.produces
 	if err := s.Ingest(ctx, batch(key1, envLabels("acme", "env1", 0), lines(0, base, 1, ln("a")))); err != nil {
 		t.Fatal(err)
 	}
-
-	all := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "limit": {"100"}})
-	if len(all.lines) != 60 || all.cursor != nil || all.partial {
-		t.Fatalf("%d lines, cursor %v, partial %v", len(all.lines), all.cursor, all.partial)
-	}
-	page := all.page(false)
-	for i := 1; i < len(page.Lines); i++ {
-		if page.Lines[i].TS < page.Lines[i-1].TS {
-			t.Fatalf("lines not oldest first at %d", i)
-		}
-	}
-	if len(page.Streams) != 2 {
-		t.Errorf("%d streams", len(page.Streams))
+	if lg.produces != produces {
+		t.Error("a line indexed already was produced again")
 	}
 
-	// Pages backward and forward meet every line once.
-	for _, dir := range []string{"backward", "forward"} {
-		seen := map[string]bool{}
-		v := url.Values{"environment": {"env1"}, "limit": {"7"}, "direction": {dir}}
-		if dir == "forward" {
-			v.Set("since", fmt.Sprint(base-int64(time.Hour)))
+	reads := func(when string) {
+		t.Helper()
+		all := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "limit": {"100"}})
+		if len(all.lines) != 60 || all.cursor != nil || all.partial {
+			t.Fatalf("%s: %d lines, cursor %v, partial %v", when, len(all.lines), all.cursor, all.partial)
 		}
-		for pages := 0; ; pages++ {
-			if pages > 20 {
-				t.Fatal("too many pages")
+		page := all.page(false)
+		for i := 1; i < len(page.Lines); i++ {
+			if page.Lines[i].TS < page.Lines[i-1].TS {
+				t.Fatalf("%s: lines not oldest first at %d", when, i)
 			}
-			r := mustRead(t, s, "acme", v)
-			for _, x := range texts(r, dir == "forward") {
+		}
+		if len(page.Streams) != 2 {
+			t.Errorf("%s: %d streams", when, len(page.Streams))
+		}
+
+		// Pages backward and forward meet every line once.
+		for _, dir := range []string{"backward", "forward"} {
+			v := url.Values{"environment": {"env1"}, "limit": {"7"}, "direction": {dir}}
+			if dir == "forward" {
+				v.Set("since", fmt.Sprint(base-int64(time.Hour)))
+			}
+			got := pageAll(t, s, v)
+			seen := map[string]bool{}
+			for _, x := range got {
 				if seen[x] {
-					t.Fatalf("%s: %q twice", dir, x)
+					t.Errorf("%s, %s: %q twice", when, dir, x)
 				}
 				seen[x] = true
 			}
-			if r.cursor == nil {
-				break
+			if len(seen) != 60 || !slices.Equal(got, texts(all, false)) {
+				t.Errorf("%s, %s: %d lines", when, dir, len(seen))
 			}
-			v.Set("cursor", encodeCursor(dir == "forward", *r.cursor))
 		}
-		if len(seen) != 60 {
-			t.Errorf("%s: %d lines", dir, len(seen))
+
+		// Filters, across both.
+		errs := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "level": {"error"}})
+		if got := strings.Join(texts(errs, false), "|"); got != "ERROR a line 07|ERROR b line 07|ERROR b line 17|ERROR a line 17|ERROR b line 27|ERROR a line 27" {
+			t.Errorf("%s: errors: %s", when, got)
+		}
+		words := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "q": {"B -error"}, "replica": {"1"}})
+		if len(words.lines) != 27 {
+			t.Errorf("%s: words: %d lines", when, len(words.lines))
+		}
+		re := mustRead(t, s, "acme", url.Values{"instance": {"inst1"}, "re": {`line 2[0-4]$`}})
+		if len(re.lines) != 5 {
+			t.Errorf("%s: re: %d lines", when, len(re.lines))
+		}
+
+		// Streams list.
+		sts, err := s.Streams(ctx, "acme", Selector{Environment: "env1"}, 0)
+		if err != nil || len(sts) != 2 || sts[0].Lines != 30 {
+			t.Fatalf("%s: streams %v, %v", when, sts, err)
 		}
 	}
+	reads("tail")
+	// Quickwit commits: the index holds stream 2's first batch twice now.
+	idx.sync(lg)
+	if n := idx.count("acme"); n != 70 {
+		t.Fatalf("indexed %d", n)
+	}
+	reads("index")
+}
 
-	// Filters, across both stages.
-	errs := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "level": {"error"}})
-	if got := strings.Join(texts(errs, false), "|"); got != "ERROR a line 07|ERROR b line 07|ERROR b line 17|ERROR a line 17|ERROR b line 27|ERROR a line 27" {
-		t.Errorf("errors: %s", got)
+func TestTailAndIndexInterleaved(t *testing.T) {
+	s, idx, lg := newTestStore(t, testConfig())
+	ctx := context.Background()
+	ms := int64(time.Millisecond)
+	type want struct {
+		ts     int64
+		pod    string
+		off    int64
+		text   string
+		errors bool
 	}
-	words := mustRead(t, s, "acme", url.Values{"environment": {"env1"}, "q": {"A -error"}, "replica": {"0"}})
-	if len(words.lines) != 27 {
-		t.Errorf("words: %d lines", len(words.lines))
+	var all []want
+	// Two streams, six batches each that overlap in time, B's third at
+	// the very times of A's; the first two of each in the index, the rest
+	// in the tail.
+	for k := range 6 {
+		for _, pod := range []string{"a", "b"} {
+			var ls []Line
+			for i := range 4 {
+				ts := base + int64(8*k+2*i)*ms
+				if pod == "b" && k != 2 {
+					ts += ms
+				}
+				text := fmt.Sprintf("%s k%d i%d", pod, k, i)
+				if i == 3 {
+					text = "ERROR " + text
+				}
+				lvl, _ := Extract(text)
+				off := int64(k*40 + i*10)
+				ls = append(ls, Line{Off: off, TS: ts, Source: "stdout", Level: lvl, Text: text})
+				all = append(all, want{ts, pod, off, text, i == 3})
+			}
+			if err := s.Ingest(ctx, batch(StreamKey{pod, "main", "L"}, envLabels("acme", "e", 0), ls)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if k == 1 {
+			idx.sync(lg)
+		}
 	}
-	re := mustRead(t, s, "acme", url.Values{"instance": {"inst0"}, "re": {`line 2[0-4]$`}})
-	if len(re.lines) != 5 {
-		t.Errorf("re: %d lines", len(re.lines))
+	if n, recs := idx.count("acme"), lg.count(logTopic); n != 16 || recs != 48 {
+		t.Fatalf("indexed %d of %d", n, recs)
 	}
+	// The scan's order: time, stream (a's row first), offset.
+	slices.SortFunc(all, func(x, y want) int {
+		if c := cmpInt(x.ts, y.ts); c != 0 {
+			return c
+		}
+		if c := strings.Compare(x.pod, y.pod); c != 0 {
+			return c
+		}
+		return cmpInt(x.off, y.off)
+	})
+	var every, errs []string
+	for _, w := range all {
+		every = append(every, w.text)
+		if w.errors {
+			errs = append(errs, w.text)
+		}
+	}
+	since := fmt.Sprint(base - 1)
+	for _, dir := range []string{"backward", "forward"} {
+		for _, c := range []struct {
+			name  string
+			limit string
+			level string
+			want  []string
+		}{
+			{"all", "1000", "", every}, {"pages", "5", "", every}, {"errors", "2", "error", errs},
+		} {
+			v := url.Values{"environment": {"e"}, "direction": {dir}, "since": {since}, "limit": {c.limit}}
+			if c.level != "" {
+				v.Set("level", c.level)
+			}
+			if got := pageAll(t, s, v); !slices.Equal(got, c.want) {
+				t.Errorf("%s %s:\n got %v\nwant %v", dir, c.name, got, c.want)
+			}
+		}
+	}
+}
 
-	// The scan limit makes a partial page with a cursor that goes on.
-	small := *s
-	small.cfg.ScanLimit = 100
-	q, _ := parseQuery(url.Values{"environment": {"env1"}, "q": {"zzz"}}, time.Now())
-	r, err := small.Read(ctx, "acme", q)
-	if err != nil {
+// The scan limit bounds what a read takes from the index: past it the page
+// is partial, with a cursor that goes on from where it stopped.
+func TestScanLimit(t *testing.T) {
+	cfg := testConfig()
+	cfg.ScanLimit = 100
+	s, idx, lg := newTestStore(t, cfg)
+	ctx := context.Background()
+	key, l := StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0)
+	if err := s.Ingest(ctx, batch(key, l, lines(0, base, 600, func(i int) string { return fmt.Sprintf("old %03d", i) }))); err != nil {
 		t.Fatal(err)
 	}
-	if !r.partial || r.cursor == nil || len(r.lines) != 0 {
-		t.Errorf("scan limit: partial %v cursor %v lines %d", r.partial, r.cursor, len(r.lines))
+	idx.sync(lg)
+	if err := s.Ingest(ctx, batch(key, l, lines(6000, base+int64(time.Second), 5, func(i int) string { return fmt.Sprintf("new %d", i) }))); err != nil {
+		t.Fatal(err)
 	}
-
-	// Streams list.
-	sts, err := s.Streams(ctx, "acme", Selector{Environment: "env1"}, 0)
-	if err != nil || len(sts) != 2 || sts[0].Lines != 30 {
-		t.Fatalf("streams %v, %v", sts, err)
+	for _, dir := range []string{"backward", "forward"} {
+		// The index answers every line, the sink's filter none of the
+		// old: the first page stops at the limit.
+		v := url.Values{"environment": {"e"}, "direction": {dir}, "since": {fmt.Sprint(base - 1)}, "limit": {"10"},
+			"re": {"^new|old 59[89]"}}
+		first := mustRead(t, s, "acme", v)
+		if !first.partial || first.cursor == nil {
+			t.Errorf("%s: first page: partial %v, cursor %v", dir, first.partial, first.cursor)
+		}
+		want := "old 598|old 599|new 0|new 1|new 2|new 3|new 4"
+		if got := strings.Join(pageAll(t, s, v), "|"); got != want {
+			t.Errorf("%s: %s", dir, got)
+		}
 	}
 }
 
 func TestTraces(t *testing.T) {
 	cfg := testConfig()
-	s, _ := newTestStore(t, cfg)
+	s, idx, lg := newTestStore(t, cfg)
 	ctx := context.Background()
 	other := "0af7651916cd43dd8448eb211c80319c"
 	text := func(i int) string {
@@ -365,12 +660,12 @@ func TestTraces(t *testing.T) {
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base-int64(48*time.Hour), 5, text))); err != nil {
 		t.Fatal(err)
 	}
-	indexAll(t, s)
+	idx.sync(lg)
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(100, base, 5, text))); err != nil {
 		t.Fatal(err)
 	}
-	// Two days back, without since: the index finds the old one, the hot
-	// stage the new.
+	// Two days back, without since: the index finds the old one, the tail
+	// the new.
 	r := mustRead(t, s, "acme", url.Values{"environment": {"e"}, "trace": {traceA}})
 	if len(r.lines) != 2 {
 		t.Errorf("trace: %d lines: %v", len(r.lines), texts(r, false))
@@ -381,7 +676,7 @@ func TestRetentionAndDelete(t *testing.T) {
 	cfg := testConfig()
 	cfg.Retention = 24 * time.Hour
 	cfg.RetentionMax = 72 * time.Hour
-	s, idx := newTestStore(t, cfg)
+	s, idx, lg := newTestStore(t, cfg)
 	ctx := context.Background()
 	old := base - int64(30*time.Hour)
 	text := func(i int) string { return fmt.Sprintf("line %d", i) }
@@ -400,13 +695,14 @@ func TestRetentionAndDelete(t *testing.T) {
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "ancient"}, ancient, lines(0, base-int64(100*time.Hour), 1, text))); err != nil {
 		t.Fatal(err)
 	}
-	indexAll(t, s)
-	// An index per retention: the default's, and the longest's for the
-	// streams that ask for more.
-	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-v2-1d ferun-logs-v2-3d]" || idx.count("acme") != 7 {
+	idx.sync(lg)
+	// An index (and topic) per retention: the default's, and the longest's
+	// for the streams that ask for more.
+	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-v3-1d ferun-logs-v3-3d]" || idx.count("acme") != 7 ||
+		lg.count("ferun-logs-v3-1d") != 3 || lg.count("ferun-logs-v3-3d") != 4 {
 		t.Fatalf("indexes %v, %d documents", ids, idx.count("acme"))
 	}
-	// A hot line past retention goes too.
+	// A line in the tail of a stream past retention is not read either.
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "short"}, short, lines(100, old, 1, text))); err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +727,8 @@ func TestRetentionAndDelete(t *testing.T) {
 		t.Errorf("after the sweep: %d lines read: %v", len(r.lines), texts(r, false))
 	}
 
-	// DELETE of an environment's streams: rows, lines, a delete task.
+	// DELETE of an environment's streams: the rows and a delete task of
+	// every index; a line in the tail is read no more, its stream gone.
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "new"}, short, lines(0, base, 2, text))); err != nil {
 		t.Fatal(err)
 	}
@@ -440,12 +737,7 @@ func TestRetentionAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	// An index of before (version 1) gets its delete task too.
-	if err := idx.EnsureIndex(ctx, "ferun-logs-1d", quickwit.IndexSettings{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := idx.Ingest(ctx, "ferun-logs-1d", []quickwit.Doc{{Tenant: "acme", Environment: "e", Stream: "s_v1", Text: "v1"}}); err != nil {
-		t.Fatal(err)
-	}
+	idx.add("ferun-logs-1d", quickwit.Doc{Tenant: "acme", Environment: "e", Stream: "s_v1", Text: "v1"})
 	if n, err := s.DeleteStreams(ctx, "other", "e", ""); err != nil || n != 0 {
 		t.Fatalf("another tenant deleted %d: %v", n, err)
 	}
@@ -453,16 +745,27 @@ func TestRetentionAndDelete(t *testing.T) {
 	if err != nil || n != 2 {
 		t.Fatalf("deleted %d: %v", n, err)
 	}
-	var left, hot int
-	_ = s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_streams), (SELECT sum(lines) FROM log_batches)`).Scan(&left, &hot)
+	var left int
+	_ = s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_streams`).Scan(&left)
 	envDocs, _ := idx.Search(ctx, "ferun-logs-*", quickwitQuery("acme", "e"))
-	if left != 1 || hot != 2 || len(envDocs) != 0 {
-		t.Errorf("after delete: %d streams, %d hot lines, %d documents", left, hot, len(envDocs))
+	if left != 1 || len(envDocs) != 0 {
+		t.Errorf("after delete: %d streams, %d documents", left, len(envDocs))
+	}
+	all := url.Values{"environment": {"e"}, "since": {fmt.Sprint(base - int64(200*time.Hour))}}
+	if r := mustRead(t, s, "acme", all); len(r.lines) != 0 {
+		t.Errorf("after delete: %v", texts(r, false))
+	}
+	idx.sync(lg)
+	if r := mustRead(t, s, "acme", all); len(r.lines) != 0 {
+		t.Errorf("after delete and a commit: %v", texts(r, false))
+	}
+	if r := mustRead(t, s, "acme", url.Values{"job": {"j1"}}); len(r.lines) != 2 {
+		t.Errorf("the job's: %v", texts(r, false))
 	}
 }
 
 func TestPartitions(t *testing.T) {
-	s, _ := newTestStore(t, testConfig())
+	s, _, _ := newTestStore(t, testConfig())
 	ctx := context.Background()
 	// Of each hot table, an empty partition of last week and one with a
 	// row.
@@ -506,90 +809,6 @@ func TestPartitions(t *testing.T) {
 	}
 }
 
-func TestIndexClaimsAcrossInstances(t *testing.T) {
-	cfg := testConfig()
-	d := newTestDB(t)
-	idx := newMemIndex()
-	ctx := context.Background()
-	stores := make([]*Store, 4)
-	for i := range stores {
-		c := cfg
-		c.Name = fmt.Sprintf("sink-%d", i)
-		stores[i] = NewStore(d, idx, c, dbtest.Logger(t))
-	}
-	const streams, rounds = 20, 5
-	for r := 0; r < rounds; r++ {
-		for i := 0; i < streams; i++ {
-			if err := stores[0].Ingest(ctx, batch(StreamKey{fmt.Sprintf("pod%d", i), "c", "1"}, envLabels("acme", "e", i),
-				lines(int64(r)*100, base+int64(r)*int64(time.Second), 5, func(j int) string { return fmt.Sprintf("r%d l%d", r, j) }))); err != nil {
-				t.Fatal(err)
-			}
-		}
-		var wg sync.WaitGroup
-		errc := make(chan error, len(stores))
-		for _, s := range stores {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					n, err := s.indexRound(ctx)
-					if err != nil {
-						errc <- err
-						return
-					}
-					if n == 0 {
-						return
-					}
-				}
-			}()
-		}
-		wg.Wait()
-		close(errc)
-		for err := range errc {
-			t.Fatal(err)
-		}
-	}
-	var hot int
-	if err := d.Pool.QueryRow(ctx, `SELECT count(*) FROM log_batches`).Scan(&hot); err != nil {
-		t.Fatal(err)
-	}
-	if n := idx.count("acme"); hot != 0 || n != streams*rounds*5 {
-		t.Errorf("hot %d, indexed %d", hot, n)
-	}
-	r := mustRead(t, stores[1], "acme", url.Values{"environment": {"e"}, "limit": {"5000"}, "since": {fmt.Sprint(base - 1)}})
-	if len(r.lines) != streams*rounds*5 {
-		t.Errorf("read %d lines", len(r.lines))
-	}
-}
-
-func TestIndexFailure(t *testing.T) {
-	cfg := testConfig()
-	s, idx := newTestStore(t, cfg)
-	ctx := context.Background()
-	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base, 3, func(int) string { return "x" }))); err != nil {
-		t.Fatal(err)
-	}
-	idx.failIngest = errors.New("index down")
-	if _, err := s.indexRound(ctx); err == nil {
-		t.Fatal("no error")
-	}
-	// The claim holds for the backoff: no round takes the stream at once.
-	idx.failIngest = nil
-	if n, err := s.indexRound(ctx); err != nil || n != 0 {
-		t.Fatalf("claimed again at once: %d, %v", n, err)
-	}
-	if _, err := s.db.Pool.Exec(ctx, `UPDATE log_streams SET chunk_lease = now() - interval '1s'`); err != nil {
-		t.Fatal(err)
-	}
-	if n := indexAll(t, s); n != 1 {
-		t.Fatalf("%d streams indexed after the lease ran out", n)
-	}
-	// Lines stay readable throughout.
-	if r := mustRead(t, s, "acme", url.Values{"environment": {"e"}}); len(r.lines) != 3 {
-		t.Errorf("%d lines", len(r.lines))
-	}
-}
-
 // followRecorder collects a follow's output.
 type followRecorder struct {
 	mu      sync.Mutex
@@ -618,13 +837,30 @@ func (f *followRecorder) snapshot() ([]string, int) {
 	return append([]string(nil), f.lines...), f.beats
 }
 
+// follow runs a follow of v in the background; stop ends it and returns
+// its error.
+func follow(t *testing.T, s *Store, v url.Values) (rec *followRecorder, stop func() error) {
+	t.Helper()
+	q, err := parseQuery(v, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	rec = &followRecorder{}
+	done := make(chan error, 1)
+	go func() { done <- s.Follow(ctx, "acme", q, rec) }()
+	t.Cleanup(cancel)
+	return rec, func() error {
+		cancel()
+		return <-done
+	}
+}
+
 func TestFollow(t *testing.T) {
 	cfg := testConfig()
-	cfg.FollowPoll = 20 * time.Millisecond
 	cfg.Heartbeat = 50 * time.Millisecond
-	s, _ := newTestStore(t, cfg)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	s, idx, lg := newTestStore(t, cfg)
+	ctx := context.Background()
 	key := StreamKey{"p", "c", "1"}
 	text := func(prefix string) func(int) string {
 		return func(i int) string { return fmt.Sprintf("%s%d", prefix, i) }
@@ -632,22 +868,31 @@ func TestFollow(t *testing.T) {
 	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(0, base, 3, text("old")))); err != nil {
 		t.Fatal(err)
 	}
-	q, _ := parseQuery(url.Values{"environment": {"e"}, "follow": {"1"}, "q": {"-skip"}}, time.Now())
-	rec := &followRecorder{}
-	done := make(chan error, 1)
-	go func() { done <- s.Follow(ctx, "acme", q, rec) }()
+	idx.sync(lg)
+	rec, stop := follow(t, s, url.Values{"environment": {"e"}, "follow": {"1"}, "q": {"-skip"}})
 	waitFor(t, func() bool { l, _ := rec.snapshot(); return len(l) == 3 })
-	// New lines, some indexed before the follow sees them, a new
-	// stream, and a line the filter drops.
+	// New lines, a commit of the index meanwhile, the new lines in the
+	// topic again (an answer lost), a stream that starts now, a job's
+	// stream of the environment, a line the filter drops and another
+	// environment's line.
 	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(100, base+int64(time.Second), 3, text("new")))); err != nil {
 		t.Fatal(err)
 	}
-	indexAll(t, s)
+	idx.sync(lg)
+	produceAgain(t, lg, logTopic, streamSID(t, s, key))
 	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(200, base+int64(2*time.Second), 2, text("hot")))); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Ingest(ctx, batch(StreamKey{"p2", "c", "1"}, envLabels("acme", "e", 1), append(
 		lines(0, base+int64(3*time.Second), 1, text("second")), lines(10, base+int64(4*time.Second), 1, text("skip"))...))); err != nil {
+		t.Fatal(err)
+	}
+	jl := envLabels("acme", "e", 0)
+	jl.Job = "build-1"
+	if err := s.Ingest(ctx, batch(StreamKey{"j", "c", "1"}, jl, lines(0, base+int64(4500*time.Millisecond), 1, text("job")))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ingest(ctx, batch(StreamKey{"x", "c", "1"}, envLabels("acme", "x", 0), lines(0, base+int64(4*time.Second), 1, text("x")))); err != nil {
 		t.Fatal(err)
 	}
 	// A line in two parts, in two batches: given once, joined.
@@ -656,21 +901,84 @@ func TestFollow(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(3 * cfg.FollowPoll)
+	time.Sleep(100 * time.Millisecond)
 	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), []Line{
 		{Off: 310, TS: base + int64(6*time.Second), Source: "stdout", Level: LevelUnknown, Text: "part2"}}),
 	); err != nil {
 		t.Fatal(err)
 	}
-	want := "old0|old1|old2|new0|new1|new2|hot0|hot1|second0|part1 part2"
+	want := "old0|old1|old2|new0|new1|new2|hot0|hot1|second0|job0|part1 part2"
 	waitFor(t, func() bool { l, _ := rec.snapshot(); return strings.Join(l, "|") == want })
 	waitFor(t, func() bool { _, b := rec.snapshot(); return b > 0 })
-	cancel()
-	if err := <-done; err != nil {
+	if err := stop(); err != nil {
 		t.Fatal(err)
 	}
 	if l, _ := rec.snapshot(); strings.Join(l, "|") != want {
 		t.Errorf("follow gave %v", l)
+	}
+}
+
+// A follow of a job before its stream starts gives the stream's lines;
+// one of a stream gives only that stream's.
+func TestFollowBeforeTheStream(t *testing.T) {
+	cfg := testConfig()
+	cfg.Heartbeat = 20 * time.Millisecond
+	s, _, _ := newTestStore(t, cfg)
+	ctx := context.Background()
+	jl := envLabels("acme", "e", 0)
+	jl.Job = "build-1"
+	other := jl
+	other.Job = "build-2"
+	byJob, stopJob := follow(t, s, url.Values{"job": {"build-1"}, "follow": {"1"}})
+	byEnvJob, stopEnvJob := follow(t, s, url.Values{"environment": {"e"}, "job": {"build-1"}, "follow": {"1"}})
+	// A follow beats once it reads its partitions: wait for that.
+	for _, rec := range []*followRecorder{byJob, byEnvJob} {
+		waitFor(t, func() bool { _, b := rec.snapshot(); return b > 0 })
+	}
+	for i, l := range []Labels{other, jl} {
+		if err := s.Ingest(ctx, batch(StreamKey{l.Job, "c", "1"}, l, lines(0, base+int64(i), 1, func(int) string { return l.Job }))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sid := streamSID(t, s, StreamKey{"build-1", "c", "1"})
+	byStream, stopStream := follow(t, s, url.Values{"stream": {sid}, "follow": {"1"}})
+	waitFor(t, func() bool { l, _ := byStream.snapshot(); return len(l) == 1 })
+	if err := s.Ingest(ctx, batch(StreamKey{"build-2", "c", "1"}, other, lines(10, base+10, 1, func(int) string { return "2 again" }))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ingest(ctx, batch(StreamKey{"build-1", "c", "1"}, jl, lines(10, base+10, 1, func(int) string { return "1 again" }))); err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range []*followRecorder{byJob, byEnvJob, byStream} {
+		waitFor(t, func() bool { l, _ := rec.snapshot(); return strings.Join(l, "|") == "build-1|1 again" || len(l) > 2 })
+	}
+	for name, rec := range map[string]*followRecorder{"job": byJob, "environment and job": byEnvJob, "stream": byStream} {
+		if l, _ := rec.snapshot(); strings.Join(l, "|") != "build-1|1 again" {
+			t.Errorf("a follow of the %s gave %v", name, l)
+		}
+	}
+	for _, stop := range []func() error{stopJob, stopEnvJob, stopStream} {
+		if err := stop(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestFollowPartitions(t *testing.T) {
+	live := []*streamRow{{Tenant: "acme", Environment: "e"}, {Tenant: "acme", Environment: "e", Job: "j"}}
+	for _, c := range []struct {
+		sel  Selector
+		want []int32
+	}{
+		{Selector{Stream: "s_1"}, partitionsOf(live, 12)},
+		{Selector{Environment: "e", Job: "j"}, []int32{kafka.Partition("acme/e/j", 12)}},
+		{Selector{Environment: "e"}, []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+		{Selector{Job: "j"}, []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+		{Selector{Instance: "i"}, []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}},
+	} {
+		if got := followPartitions("acme", c.sel, live, 12); !slices.Equal(got, c.want) {
+			t.Errorf("%+v: %v, want %v", c.sel, got, c.want)
+		}
 	}
 }
 

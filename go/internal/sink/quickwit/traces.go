@@ -7,10 +7,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -210,8 +208,9 @@ func valueIs(raw json.RawMessage, v string) bool {
 // TraceMappingVersion is the version of TraceIndexConfig, in the trace
 // index's name (TraceIndexID), as MappingVersion is the log indexes': a
 // changed mapping is a new index, and reads search every version until
-// the old one ages out.
-const TraceMappingVersion = 1
+// the old one ages out. Version 2 is filled by a Kafka source (ADR 0026
+// §11).
+const TraceMappingVersion = 2
 
 // TraceIndexID is the trace index of a retention in days, in prefix, of
 // TraceMappingVersion: <prefix>-v<version>-<days>d.
@@ -263,56 +262,6 @@ func TraceIndexConfig(id string, s IndexSettings) []byte {
 	}
 	b, _ := json.Marshal(cfg)
 	return b
-}
-
-// EnsureTraceIndex creates the trace index id unless it exists.
-func (c *Client) EnsureTraceIndex(ctx context.Context, id string, s IndexSettings) error {
-	if s.Partitions < 1 || s.Partitions > MaxPartitions {
-		return fmt.Errorf("quickwit: %d partitions, not 1 to %d", s.Partitions, MaxPartitions)
-	}
-	err := c.do(ctx, http.MethodGet, c.search+"/api/v1/indexes/"+url.PathEscape(id), "", nil, nil)
-	if err == nil || !IsNotFound(err) {
-		return err
-	}
-	err = c.do(ctx, http.MethodPost, c.search+"/api/v1/indexes", "application/json",
-		TraceIndexConfig(id, s), nil)
-	var e *Error
-	if errors.As(err, &e) && e.Status == http.StatusBadRequest && strings.Contains(e.Message, "already exist") {
-		return nil
-	}
-	return err
-}
-
-// IngestSpans indexes documents, each one JSON object on one line, into
-// the index id and answers once the split that holds them is published
-// (commit=wait_for). A rejected document fails the call.
-func (c *Client) IngestSpans(ctx context.Context, id string, docs []json.RawMessage) error {
-	var body bytes.Buffer
-	for _, d := range docs {
-		if bytes.ContainsAny(d, "\r\n") {
-			return errors.New("quickwit: a document spans lines")
-		}
-		body.Write(d)
-		body.WriteByte('\n')
-	}
-	var out struct {
-		NumRejected   int `json:"num_rejected_docs"`
-		ParseFailures []struct {
-			Message string `json:"message"`
-		} `json:"parse_failures"`
-	}
-	u := c.ingest + "/api/v1/" + url.PathEscape(id) + "/ingest?commit=wait_for&detailed_response=true"
-	if err := c.do(ctx, http.MethodPost, u, "application/x-ndjson", body.Bytes(), &out); err != nil {
-		return err
-	}
-	if out.NumRejected > 0 {
-		msg := ""
-		if len(out.ParseFailures) > 0 {
-			msg = out.ParseFailures[0].Message
-		}
-		return fmt.Errorf("quickwit: %d of %d spans rejected: %s", out.NumRejected, len(docs), msg)
-	}
-	return nil
 }
 
 // spanSearch is the body of a search of q's spans.

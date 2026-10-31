@@ -253,7 +253,7 @@ func TestConfig(t *testing.T) {
 	env := map[string]string{
 		"FERUN_SINK_NAME": "sink-0", "FERUN_SINK_DATABASE_URL": "postgres://x/sink", "FERUN_SINK_TRUST_DOMAIN": "run.example.com",
 		"FERUN_SINK_FERUN_URL": "http://ferund:8100",
-		"FERUN_SINK_LOG_QUOTA": "1GiB", "FERUN_SINK_INDEX_INGEST_URL": "http://quickwit-indexer:7280",
+		"FERUN_SINK_LOG_QUOTA": "1GiB", "FERUN_SINK_KAFKA_BROKERS": "redpanda-0:9092, redpanda-1:9092,",
 		"FERUN_SINK_INDEX_SEARCH_URL": "http://quickwit-searcher:7280",
 		EnvServiceToken:               "tok",
 	}
@@ -266,6 +266,22 @@ func TestConfig(t *testing.T) {
 	}
 	if c.IndexPrefix != "ferun-logs" || c.CommitTimeout != 10*time.Second || c.IndexPartitions != 16 {
 		t.Errorf("index %q, commit %v, %d partitions", c.IndexPrefix, c.CommitTimeout, c.IndexPartitions)
+	}
+	if fmt.Sprint(c.KafkaBrokers) != "[redpanda-0:9092 redpanda-1:9092]" || c.KafkaPartitions != 12 || c.KafkaReplication != 3 ||
+		c.KafkaRetention != 24*time.Hour {
+		t.Errorf("kafka %v, %d partitions, %d replicas, retention %v", c.KafkaBrokers, c.KafkaPartitions, c.KafkaReplication,
+			c.KafkaRetention)
+	}
+	if c, err := Parse([]string{"--kafka-brokers", "a:1", "--kafka-partitions", "3", "--kafka-replication", "1", "--kafka-retention", "2h"},
+		func(k string) string { return env[k] }); err != nil || fmt.Sprint(c.KafkaBrokers) != "[a:1]" || c.KafkaPartitions != 3 ||
+		c.KafkaReplication != 1 || c.KafkaRetention != 2*time.Hour {
+		t.Errorf("kafka flags: %+v, %v", c, err)
+	}
+	for _, args := range [][]string{{"--kafka-brokers", " , "}, {"--kafka-partitions", "0"}, {"--kafka-replication", "0"},
+		{"--kafka-retention", "30s"}} {
+		if _, err := Parse(args, func(k string) string { return env[k] }); err == nil {
+			t.Errorf("%v passed", args)
+		}
 	}
 	for _, p := range []string{"0", "201"} {
 		if _, err := Parse([]string{"--index-partitions", p}, func(k string) string { return env[k] }); err == nil {

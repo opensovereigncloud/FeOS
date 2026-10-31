@@ -26,8 +26,9 @@ import (
 )
 
 // A node and an ingress export spans over the ingest with their
-// certificates; a tenant reads them in the shape of Jaeger's API, from
-// trace_spans and, once the indexer moved them, from the index.
+// certificates; a tenant reads them in the shape of Jaeger's API: a trace
+// by its ID from the topic's tail at once, and every read from the index
+// once it committed.
 func TestTracesEndToEnd(t *testing.T) {
 	dbURL := dbtest.NewDatabase(t)
 	iss := newCA(t)
@@ -36,11 +37,10 @@ func TestTracesEndToEnd(t *testing.T) {
 	cfg := Default()
 	cfg.Name, cfg.Listen, cfg.IngestListen = "sink-0", "127.0.0.1:0", "127.0.0.1:0"
 	cfg.DatabaseURL, cfg.TrustDomain, cfg.FerunURL, cfg.ServiceToken = dbURL, testTD, fsrv.URL, "svc-token"
-	cfg.ChunkInterval = 50 * time.Millisecond
-	tidx := newMemTraceIndex()
+	tidx, lg := newMemTraceIndex(), newMemLog()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	prog, err := New(ctx, cfg, Deps{Index: newMemIndex(), TraceIndex: tidx}, dbtest.Logger(t))
+	prog, err := New(ctx, cfg, Deps{Index: newMemIndex(), TraceIndex: tidx, Log: lg}, dbtest.Logger(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestTracesEndToEnd(t *testing.T) {
 		}
 		return url.Values{"x": a.Data}.Encode()
 	}
-	check := func(when string) {
+	byID := func(when string) {
 		t.Helper()
 		a := read("/traces/"+traceA, http.StatusOK)
 		if len(a.Data) != 1 || a.Data[0].TraceID != traceA || len(a.Data[0].Spans) != 2 || len(a.Data[0].Processes) != 2 ||
@@ -166,6 +166,10 @@ func TestTracesEndToEnd(t *testing.T) {
 			a.Errors[0].Code != 404 || a.Errors[0].Msg != "trace not found" {
 			t.Errorf("%s: another environment's: %+v", when, a)
 		}
+	}
+	check := func(when string) {
+		t.Helper()
+		byID(when)
 		if a := read("/traces?service=web&environment=env1", http.StatusOK); len(a.Data) != 1 || len(a.Data[0].Spans) != 2 {
 			t.Errorf("%s: search: %+v", when, a)
 		}
@@ -182,14 +186,15 @@ func TestTracesEndToEnd(t *testing.T) {
 			t.Errorf("%s: operations %s", when, got)
 		}
 	}
-	check("hot")
-	waitFor(t, func() bool { return tidx.count() == 2 })
-	waitFor(t, func() bool {
-		var n int
-		_ = prog.db.Pool.QueryRow(actx, `SELECT count(*) FROM trace_spans`).Scan(&n)
-		return n == 0
-	})
-	check("indexed")
+	byID("tail")
+	if a := read("/traces?service=web&environment=env1", http.StatusOK); len(a.Data) != 0 {
+		t.Errorf("tail: a search found %+v", a)
+	}
+	tidx.sync(lg)
+	if tidx.count() != 2 {
+		t.Fatalf("%d spans indexed", tidx.count())
+	}
+	check("index")
 
 	if a := read("/traces/zz", http.StatusBadRequest); len(a.Errors) != 1 || a.Errors[0].Code != 400 {
 		t.Errorf("a bad ID: %+v", a)

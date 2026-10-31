@@ -6,17 +6,12 @@ package sink
 import (
 	"context"
 	"fmt"
-	"math"
 	"slices"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
-
-// followBatch bounds the hot lines one poll of a follow reads.
-const followBatch = 5000
 
 // followSink is where a follow writes: a line, with its stream the first
 // time, and the heartbeat.
@@ -26,63 +21,143 @@ type followSink interface {
 }
 
 // Follow answers /api/v1/logs?follow=1: the page a backward read of q
-// gives, then every line stored after it, polling every FollowPoll, until
-// ctx ends or a write fails. Each stream is followed by its offsets: a
-// poll reads, in one snapshot, the lines after the last one it gave and
-// the stream's mark, and those of them at or below the mark from the
-// index, so that no line is given twice or missed while the cold stage
-// moves it.
+// gives, then every line stored after it, as the topics bring it, until
+// ctx ends or a write fails (ADR 0026 §11). The topics' partitions the
+// selector's streams may lie in (followPartitions) are read from where
+// they ended before the page was read; a line the page gave is not given
+// again, and a stream of the selector that starts meanwhile is followed
+// too.
 func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSink) error {
 	q.Forward, q.Cursor = false, nil
 	if !q.SinceSet {
 		q.Since = q.Until - int64(time.Hour)
 	}
-	live := streamFilter{sel: q.Sel, live: true, limit: maxStreamsRead}
-	// Where each stream is: the open ones' before the page, then the
-	// page's own, whose snapshot holds its lines; a line stored after it
-	// has a later offset.
-	streams, err := selectStreams(ctx, s.db.Pool, tenant, live)
+	live, err := selectStreams(ctx, s.db.Pool, tenant, streamFilter{sel: q.Sel, live: true, limit: maxStreamsRead})
 	if err != nil {
 		return err
 	}
-	after := map[int64]int64{}
-	for _, st := range streams {
-		after[st.ID] = st.LastOff
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	recs := make(chan []kafka.Record)
+	errc := make(chan error, len(s.classes()))
+	for _, days := range s.classes() {
+		id := s.indexID(days)
+		n, err := s.ensure(ctx, id, days)
+		if err != nil {
+			return err
+		}
+		from, err := s.pipes.ends(ctx, id, followPartitions(tenant, q.Sel, live, n))
+		if err != nil {
+			return err
+		}
+		if len(from) == 0 {
+			continue
+		}
+		f, err := s.pipes.log.Follow(id, from)
+		if err != nil {
+			return err
+		}
+		go func() {
+			defer f.Close()
+			for {
+				rs, err := f.Next(ctx)
+				if err != nil {
+					errc <- err
+					return
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				if len(rs) > 0 {
+					select {
+					case recs <- rs:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}()
 	}
 	res, err := s.Read(ctx, tenant, q)
 	if err != nil {
 		return err
 	}
+	type key struct {
+		sid string
+		off int64
+	}
+	given := map[key]bool{}
+	known := map[string]*streamRow{} // by stream ID; nil: gone
+	byID := map[int64]*streamRow{}
 	for id, st := range res.streams {
-		after[id] = st.LastOff
+		known[st.SID], byID[id] = st, st
 	}
 	slices.Reverse(res.lines)
 	for _, l := range res.lines {
-		if err := out.Line(l, res.streams[l.Stream]); err != nil {
+		st := res.streams[l.Stream]
+		given[key{st.SID, l.Off}] = true
+		if err := out.Line(l, st); err != nil {
 			return err
 		}
 	}
 	joins := followJoins{open: map[joinKey]*followJoin{}, cut: map[joinKey]bool{}}
+	beat := time.NewTicker(s.cfg.Heartbeat)
+	defer beat.Stop()
 	lastWrite := time.Now()
-	t := time.NewTimer(s.cfg.FollowPoll)
-	defer t.Stop()
+	// A record can come before its stream's row: an ingest produces, then
+	// commits. Its line waits for the row, looked for again every
+	// streamRetry, at most streamWait.
+	var waiting []waitingDoc
 	for {
+		var retry <-chan time.Time
+		if len(waiting) > 0 {
+			retry = time.After(streamRetry)
+		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-t.C:
-		}
-		lines, known, more, err := s.followPoll(ctx, tenant, live, after)
-		if err != nil {
+		case err := <-errc:
 			return err
+		case <-beat.C:
+		case <-retry:
+		case rs := <-recs:
+			now := time.Now()
+			for _, d := range docsOf(rs) {
+				if !selects(tenant, q.Sel, &d) || given[key{d.Stream, d.Off}] {
+					continue
+				}
+				given[key{d.Stream, d.Off}] = true
+				waiting = append(waiting, waitingDoc{d: d, since: now})
+			}
 		}
-		lines = joins.take(lines, time.Now())
-		for i := range lines {
-			l := lines[i]
+		var lines []Line
+		now := time.Now()
+		unknown := map[string]bool{} // not found in this round
+		keep := waiting[:0]
+		for _, w := range waiting {
+			var st *streamRow
+			if !unknown[w.d.Stream] {
+				var err error
+				if st, err = s.followed(ctx, tenant, w.d.Stream, known, now.Sub(w.since) >= streamWait); err != nil {
+					return err
+				}
+			}
+			switch _, gone := known[w.d.Stream]; {
+			case st != nil:
+				byID[st.ID] = st
+				lines = append(lines, lineOf(w.d, st.ID))
+			case !gone:
+				unknown[w.d.Stream] = true
+				keep = append(keep, w)
+			}
+		}
+		clear(waiting[len(keep):])
+		waiting = keep
+		for _, l := range joins.take(lines, time.Now()) {
 			if !q.match(&l) {
 				continue
 			}
-			if err := out.Line(l, known[l.Stream]); err != nil {
+			if err := out.Line(l, byID[l.Stream]); err != nil {
 				return err
 			}
 			lastWrite = time.Now()
@@ -93,12 +168,74 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 			}
 			lastWrite = time.Now()
 		}
-		if more {
-			t.Reset(0)
-		} else {
-			t.Reset(s.cfg.FollowPoll)
+		// A follow's set of given lines is bounded by what it wrote; a
+		// long follow forgets those older than the topics could send again.
+		if len(given) > 200000 {
+			clear(given)
 		}
 	}
+}
+
+// followPartitions are the partitions of n a follow of tenant's sel reads:
+// every partition a stream of sel may lie in, also one that starts during
+// the follow. Only a selector of an environment and a job names its
+// streams' key; a selector of a stream names streams that exist (live);
+// any other may match a stream of any key, so it reads every partition.
+func followPartitions(tenant string, sel Selector, live []*streamRow, n int32) []int32 {
+	switch {
+	case sel.Stream != "":
+		return partitionsOf(live, n)
+	case sel.Environment != "" && sel.Job != "":
+		return []int32{kafka.Partition(streamKey(tenant, sel.Environment, sel.Job), n)}
+	}
+	all := make([]int32, n)
+	for i := range all {
+		all[i] = int32(i)
+	}
+	return all
+}
+
+// waitingDoc is a record a follow took whose stream it has not found yet.
+type waitingDoc struct {
+	d     quickwit.Doc
+	since time.Time
+}
+
+// streamRetry is how often a follow looks for the stream of a line that
+// waits for it, streamWait how long at most.
+const (
+	streamRetry = 100 * time.Millisecond
+	streamWait  = 5 * time.Second
+)
+
+// followed is the stream of sid that a follow gives a line of: known, or
+// read from the database (a stream that started during the follow); nil
+// for one not found, which is gone once final (known[sid] nil).
+func (s *Store) followed(ctx context.Context, tenant, sid string, known map[string]*streamRow, final bool) (*streamRow, error) {
+	if st, ok := known[sid]; ok {
+		return st, nil
+	}
+	sts, err := selectStreams(ctx, s.db.Pool, tenant, streamFilter{sel: Selector{Stream: sid}, limit: 1})
+	if err != nil {
+		return nil, fmt.Errorf("stream %s: %w", sid, err)
+	}
+	if len(sts) == 0 {
+		if final {
+			known[sid] = nil
+		}
+		return nil, nil
+	}
+	known[sid] = sts[0]
+	return sts[0], nil
+}
+
+// selects reports whether a document is of tenant's streams of sel.
+func selects(tenant string, sel Selector, d *quickwit.Doc) bool {
+	eq := func(want, got string) bool { return want == "" || want == got }
+	return d.Tenant == tenant && eq(sel.Environment, d.Environment) && eq(sel.Kind, d.Kind) && eq(sel.Object, d.Object) &&
+		eq(sel.Instance, d.Instance) && eq(sel.Container, d.Container) && eq(sel.Job, d.Job) && eq(sel.Stream, d.Stream) &&
+		eq(sel.Source, d.Source) && (sel.Replica == nil || *sel.Replica == d.Replica) &&
+		(sel.Attempt == nil || *sel.Attempt == d.Attempt)
 }
 
 // joinKey is a stream's source, whose lines a partial one joins.
@@ -169,90 +306,4 @@ func (f *followJoins) take(lines []Line, now time.Time) []Line {
 	}
 	slices.SortStableFunc(done, func(a, b Line) int { return cmpPos(a.pos(), b.pos()) })
 	return done
-}
-
-// followPoll reads the lines after each stream's place in after, in one
-// snapshot with the streams' marks (the lines below a mark from the
-// index), advances after, and returns them in
-// each stream's offset order; more says a poll should follow at once.
-func (s *Store) followPoll(ctx context.Context, tenant string, live streamFilter, after map[int64]int64) (
-	[]Line, map[int64]*streamRow, bool, error) {
-	tx, err := s.db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return nil, nil, false, err
-	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-	streams, err := selectStreams(ctx, tx, tenant, live)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	known := map[int64]*streamRow{}
-	var ids, from []int64
-	var moved []*streamRow
-	for _, st := range streams {
-		known[st.ID] = st
-		a, ok := after[st.ID]
-		if !ok {
-			a = -1
-			after[st.ID] = a
-		}
-		ids, from = append(ids, st.ID), append(from, a)
-		if st.ChunkedLast > a {
-			moved = append(moved, st)
-		}
-	}
-	var hot []Line
-	if len(ids) > 0 {
-		if hot, err = hotAfter(ctx, tx, ids, from, math.MaxInt64, nil, followBatch); err != nil {
-			return nil, nil, false, fmt.Errorf("hot lines: %w", err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, nil, false, err
-	}
-	var all []Line
-	for _, st := range moved {
-		lines, err := s.indexedLines(ctx, tenant, st, after[st.ID], st.ChunkedLast, "")
-		if err != nil {
-			return nil, nil, false, err
-		}
-		all = append(all, lines...)
-	}
-	all = append(all, hot...)
-	for _, l := range all {
-		after[l.Stream] = max(after[l.Stream], l.Off)
-	}
-	slices.SortStableFunc(all, func(a, b Line) int {
-		if c := cmpInt(a.Stream, b.Stream); c != 0 {
-			return c
-		}
-		return cmpInt(a.Off, b.Off)
-	})
-	return all, known, len(hot) >= followBatch, nil
-}
-
-// indexedLines reads a stream's lines with offsets after from, up to and
-// including to, from the index, in offset order, each once; source, when
-// set, picks the lines of one source (stdout or stderr).
-func (s *Store) indexedLines(ctx context.Context, tenant string, st *streamRow, from, to int64, source string) ([]Line, error) {
-	var out []Line
-	for from < to {
-		iq := quickwit.Query{Tenant: tenant, Environment: st.Environment, Job: st.Job, Stream: st.SID, IOStream: source, OffAfter: &from, OffTo: &to,
-			Order: quickwit.ByOffset, Max: followBatch}
-		hits, err := s.index.Search(ctx, s.indexPattern(), iq)
-		if err != nil {
-			return nil, fmt.Errorf("index: %w", err)
-		}
-		for _, h := range hits {
-			if h.Off <= from {
-				continue // the index's second copy
-			}
-			out = append(out, lineOf(h, st.ID))
-			from = h.Off
-		}
-		if len(hits) < followBatch {
-			break
-		}
-	}
-	return out, nil
 }

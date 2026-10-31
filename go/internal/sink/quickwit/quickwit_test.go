@@ -4,14 +4,22 @@
 package quickwit
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 )
 
 func TestQueryString(t *testing.T) {
@@ -42,9 +50,9 @@ func TestIndexID(t *testing.T) {
 		days   int
 		want   string
 	}{
-		{"ferun-logs", 30, "ferun-logs-v2-30d"},
-		{"ferun-logs", 400, "ferun-logs-v2-400d"},
-		{"x", 1, "x-v2-1d"},
+		{"ferun-logs", 30, "ferun-logs-v3-30d"},
+		{"ferun-logs", 400, "ferun-logs-v3-400d"},
+		{"x", 1, "x-v3-1d"},
 	} {
 		if got := IndexID(c.prefix, c.days); got != c.want {
 			t.Errorf("IndexID(%q, %d) = %q, want %q", c.prefix, c.days, got, c.want)
@@ -88,14 +96,161 @@ func TestIndexConfig(t *testing.T) {
 	}
 }
 
-// TestQuickwit runs against the Quickwit at FERUN_TEST_QUICKWIT_URL (one
-// node of every service, e.g. `quickwit run` in its container).
-func TestQuickwit(t *testing.T) {
-	u := os.Getenv("FERUN_TEST_QUICKWIT_URL")
-	if u == "" {
-		t.Skip("FERUN_TEST_QUICKWIT_URL is not set; skipping a test that needs Quickwit")
+// fakeQuickwit answers the index API as Quickwit does for Ensure and
+// Checkpoint: an index's metadata, the creation of an index and of its
+// source.
+type fakeQuickwit struct {
+	mu      sync.Mutex
+	indexes map[string]string // id: metadata
+	sources map[string][]byte // id: the source's body
+	calls   []string
+	down    bool
+}
+
+func (f *fakeQuickwit) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	body, _ := io.ReadAll(r.Body)
+	f.calls = append(f.calls, r.Method+" "+r.URL.Path)
+	if f.down {
+		http.Error(w, `{"message":"metastore down"}`, http.StatusInternalServerError)
+		return
 	}
-	c, err := New(u, u, nil)
+	rest, _ := strings.CutPrefix(r.URL.Path, "/api/v1/indexes")
+	id, sub, _ := strings.Cut(strings.TrimPrefix(rest, "/"), "/")
+	id, _ = url.PathUnescape(id)
+	switch {
+	case r.Method == http.MethodGet && id != "" && sub == "":
+		md, ok := f.indexes[id]
+		if !ok {
+			http.Error(w, `{"message":"index not found"}`, http.StatusNotFound)
+			return
+		}
+		_, _ = io.WriteString(w, md)
+	case r.Method == http.MethodPost && id == "":
+		var cfg struct {
+			IndexID string `json:"index_id"`
+		}
+		_ = json.Unmarshal(body, &cfg)
+		if _, ok := f.indexes[cfg.IndexID]; ok {
+			http.Error(w, `{"message":"index `+cfg.IndexID+` already exists"}`, http.StatusBadRequest)
+			return
+		}
+		f.indexes[cfg.IndexID] = `{"checkpoint":{}}`
+	case r.Method == http.MethodPost && sub == "sources":
+		if _, ok := f.sources[id]; ok {
+			http.Error(w, `{"message":"source kafka already exists"}`, http.StatusBadRequest)
+			return
+		}
+		f.sources[id] = body
+	default:
+		http.Error(w, `{"message":"no"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestEnsure(t *testing.T) {
+	f := &fakeQuickwit{indexes: map[string]string{}, sources: map[string][]byte{}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	c, err := New(srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	src := Source{Topic: "ferun-logs-v3-30d", Brokers: []string{"rp-0:9092", "rp-1:9092"}}
+	cfg := IndexConfig("ferun-logs-v3-30d", IndexSettings{RetentionDays: 30, CommitSecs: 10, Partitions: 16})
+	for range 2 {
+		if err := c.Ensure(ctx, "ferun-logs-v3-30d", cfg, src); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := strings.Join(f.calls, ", "); got != "GET /api/v1/indexes/ferun-logs-v3-30d, POST /api/v1/indexes, "+
+		"POST /api/v1/indexes/ferun-logs-v3-30d/sources, GET /api/v1/indexes/ferun-logs-v3-30d, "+
+		"POST /api/v1/indexes/ferun-logs-v3-30d/sources" {
+		t.Errorf("calls %s", got)
+	}
+	var body struct {
+		SourceID   string `json:"source_id"`
+		SourceType string `json:"source_type"`
+		Format     string `json:"input_format"`
+		Params     struct {
+			Topic  string            `json:"topic"`
+			Client map[string]string `json:"client_params"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(f.sources["ferun-logs-v3-30d"], &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.SourceID != "kafka" || body.SourceType != "kafka" || body.Format != "json" || body.Params.Topic != src.Topic ||
+		body.Params.Client["bootstrap.servers"] != "rp-0:9092,rp-1:9092" || body.Params.Client["auto.offset.reset"] != "earliest" ||
+		body.Params.Client["session.timeout.ms"] != "10000" || body.Params.Client["heartbeat.interval.ms"] != "3000" {
+		t.Errorf("source %s", f.sources["ferun-logs-v3-30d"])
+	}
+	// Another error than "already exists" is one.
+	f.mu.Lock()
+	f.down = true
+	f.mu.Unlock()
+	if err := c.Ensure(ctx, "ferun-logs-v3-30d", cfg, src); err == nil {
+		t.Error("no error")
+	}
+}
+
+func TestCheckpoint(t *testing.T) {
+	f := &fakeQuickwit{indexes: map[string]string{
+		// Positions are those of the last record published, 20 digits; ""
+		// none yet; another source's are not the Kafka source's.
+		"i": `{"index_config":{},"checkpoint":{"kafka":{"00000000000000000000":"00000000000000000000",
+			"00000000000000000003":"00000000000000000041","00000000000000000007":""},
+			"_ingest-api-source":{"ingest_partition":"00000000000000000099"}}}`,
+		"new": `{"checkpoint":{}}`,
+		"bad": `{"checkpoint":{"kafka":{"0":"x"}}}`,
+	}, sources: map[string][]byte{}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	c, err := New(srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if cp, err := c.Checkpoint(ctx, "i"); err != nil || fmt.Sprint(cp) != "map[0:1 3:42]" {
+		t.Errorf("checkpoint %v, %v", cp, err)
+	}
+	if cp, err := c.Checkpoint(ctx, "new"); err != nil || len(cp) != 0 {
+		t.Errorf("a new index's %v, %v", cp, err)
+	}
+	if _, err := c.Checkpoint(ctx, "bad"); err == nil {
+		t.Error("a bad position passed")
+	}
+	if _, err := c.Checkpoint(ctx, "none"); !IsNotFound(err) {
+		t.Errorf("no index: %v", err)
+	}
+}
+
+// ingestForTest indexes docs through Quickwit's ingest API and returns
+// once their split is published: an index filled without its topic.
+func ingestForTest(ctx context.Context, c *Client, id string, docs []Doc) error {
+	var body bytes.Buffer
+	enc := json.NewEncoder(&body)
+	for i := range docs {
+		if err := enc.Encode(&docs[i]); err != nil {
+			return err
+		}
+	}
+	return c.do(ctx, http.MethodPost, c.search+"/api/v1/"+url.PathEscape(id)+"/ingest?commit=wait_for", "application/x-ndjson",
+		body.Bytes(), nil)
+}
+
+// TestQuickwit runs against the Quickwit at FERUN_TEST_QUICKWIT_URL (one
+// node of every service, e.g. `quickwit run` in its container) and the
+// Kafka API at FERUN_TEST_KAFKA_BROKERS (reached at the same addresses by
+// the test and by Quickwit): an index made with its source, filled through
+// Quickwit's ingest API, answers the sink's searches.
+func TestQuickwit(t *testing.T) {
+	u, brokers := os.Getenv("FERUN_TEST_QUICKWIT_URL"), os.Getenv("FERUN_TEST_KAFKA_BROKERS")
+	if u == "" || brokers == "" {
+		t.Skip("FERUN_TEST_QUICKWIT_URL or FERUN_TEST_KAFKA_BROKERS is not set; skipping a test that needs Quickwit and Kafka")
+	}
+	c, err := New(u, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,16 +259,24 @@ func TestQuickwit(t *testing.T) {
 	prefix := fmt.Sprintf("test-logs-%d", time.Now().UnixNano())
 	id := IndexID(prefix, 1)
 	settings := IndexSettings{RetentionDays: 1, CommitSecs: 1, Partitions: 16}
-	if err := c.EnsureIndex(ctx, id, settings); err != nil {
+	kc, err := kafka.New(strings.Split(brokers, ","))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.EnsureIndex(ctx, id, settings); err != nil {
-		t.Fatalf("again: %v", err)
+	defer kc.Close()
+	if err := kc.EnsureTopic(ctx, id, kafka.TopicConfig{Partitions: 2, Retention: time.Hour, Replication: 1}); err != nil {
+		t.Fatal(err)
 	}
-	if err := c.EnsureIndex(ctx, id, IndexSettings{RetentionDays: 1, CommitSecs: 1}); err == nil {
-		t.Error("an index of no partitions passed")
+	src := Source{Topic: id, Brokers: strings.Split(brokers, ",")}
+	for range 2 {
+		if err := c.Ensure(ctx, id, IndexConfig(id, settings), src); err != nil {
+			t.Fatal(err)
+		}
 	}
 	defer func() { _ = c.do(context.Background(), "DELETE", c.search+"/api/v1/indexes/"+id, "", nil, nil) }()
+	if cp, err := c.Checkpoint(ctx, id); err != nil || len(cp) != 0 {
+		t.Errorf("a new index's checkpoint %v, %v", cp, err)
+	}
 	now := time.Now().UnixNano()
 	docs := []Doc{
 		{TS: now, Tenant: "acme", Stream: "s_1", Environment: "e", Source: "container", IOStream: "stdout", Level: 1, Off: 10,
@@ -131,7 +294,7 @@ func TestQuickwit(t *testing.T) {
 			Level: 1, Text: "a line of " + env})
 	}
 	docs = append(docs, Doc{TS: now, Tenant: "part", Stream: "s_job", Job: "build-1", Source: "container", Level: 1, Text: "a job's line"})
-	if err := c.Ingest(ctx, id, docs); err != nil {
+	if err := ingestForTest(ctx, c, id, docs); err != nil {
 		t.Fatal(err)
 	}
 	pattern := prefix + "-*"
@@ -234,7 +397,7 @@ func TestQuickwit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = c.do(context.Background(), "DELETE", c.search+"/api/v1/indexes/"+old, "", nil, nil) }()
-	if err := c.Ingest(ctx, old, []Doc{{TS: now + 10, Tenant: "part", Stream: "s_prod", Environment: "prod",
+	if err := ingestForTest(ctx, c, old, []Doc{{TS: now + 10, Tenant: "part", Stream: "s_prod", Environment: "prod",
 		Source: "container", Level: 1, Off: 5, Text: "a line of before"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -250,9 +413,6 @@ func TestQuickwit(t *testing.T) {
 	}
 	if err := c.Delete(ctx, id, Query{Tenant: "acme", Environment: "e"}); err != nil {
 		t.Errorf("delete task: %v", err)
-	}
-	if err := c.Ingest(ctx, "no-such-index", docs[:1]); !IsNotFound(err) {
-		t.Errorf("ingest into no index: %v", err)
 	}
 }
 

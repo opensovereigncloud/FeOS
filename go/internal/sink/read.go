@@ -43,7 +43,7 @@ func scanStream(r pgx.CollectableRow) (*streamRow, error) { return scanStreamWit
 
 // scanStreamWith scans streamCols and then the columns after them into
 // more.
-func scanStreamWith(r pgx.CollectableRow, more ...any) (*streamRow, error) {
+func scanStreamWith(r interface{ Scan(...any) error }, more ...any) (*streamRow, error) {
 	var s streamRow
 	err := r.Scan(append([]any{&s.ID, &s.SID, &s.Tenant, &s.Instance, &s.Container, &s.Environment, &s.Kind, &s.Object,
 		&s.Replica, &s.Release, &s.Job, &s.Attempt, &s.Node, &s.Source, &s.FirstNs, &s.LastNs, &s.EndedAt,
@@ -128,11 +128,10 @@ type scanResult struct {
 }
 
 // Read answers a page of /api/v1/logs for tenant (not follow). It reads
-// the streams and the hot lines in one snapshot, then the index (ADR 0026
-// §10) for the lines at or below each stream's mark, which are not hot:
-// a line is in exactly one of them, and one the index holds twice is
-// taken once. It stops at the limit, at ScanLimit bytes of lines read, or
-// at the end.
+// the streams from the database, the newest lines from their topics'
+// tail (what Quickwit has not published, ADR 0026 §11), then the index;
+// a line in both is taken once. It stops at the limit, at ScanLimit bytes
+// of lines read, or at the end.
 func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, error) {
 	select {
 	case s.scans <- struct{}{}:
@@ -142,59 +141,33 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 	defer func() { <-s.scans }()
 
 	res := scanResult{streams: map[int64]*streamRow{}}
-	var hot []Line
-	var through *pos // everything up to it, in the scan's order, is seen; nil: all
-	var scanned int64
-
-	tx, err := s.db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
-		return scanResult{}, err
-	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-
 	f := streamFilter{sel: q.Sel, until: &q.Until, limit: maxStreamsRead}
 	if q.SinceSet || !q.Forward {
 		f.since = &q.Since
 	}
-	streams, err := selectStreams(ctx, tx, tenant, f)
+	streams, err := selectStreams(ctx, s.db.Pool, tenant, f)
 	if err != nil {
 		return scanResult{}, err
 	}
 	if len(streams) == 0 {
 		return res, nil
 	}
-	ids := make([]int64, len(streams))
 	for i, st := range streams {
-		ids[i] = st.ID
 		res.streams[st.ID] = st
 		if !q.SinceSet && q.Forward && st.FirstNs != nil && (i == 0 || *st.FirstNs < q.Since) {
 			q.Since = *st.FirstNs
 		}
 	}
-
-	hot, through, scanned, res.partial, err = s.readHot(ctx, tx, &q, ids)
+	tail, scanned, err := s.readTail(ctx, &q, streams)
 	if err != nil {
-		return scanResult{}, fmt.Errorf("hot lines: %w", err)
+		return scanResult{}, fmt.Errorf("tail: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return scanResult{}, err
-	}
-
-	cold, stop, err := s.readIndex(ctx, tenant, &q, res.streams, through, scanned)
+	cold, through, err := s.readIndex(ctx, tenant, &q, res.streams, nil, scanned)
 	if err != nil {
 		return scanResult{}, err
 	}
-	if stop != nil {
-		through, res.partial = earlier(&q, through, *stop), true
-	}
-	found := append(hot, cold...)
-	slices.SortFunc(found, func(a, b Line) int {
-		c := cmpPos(a.pos(), b.pos())
-		if !q.Forward {
-			c = -c
-		}
-		return c
-	})
+	res.partial = through != nil
+	found := mergeScan(&q, tail, cold)
 	if through != nil {
 		n := 0
 		for n < len(found) && !q.before(*through, found[n].pos()) {
@@ -213,9 +186,9 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 		res.cursor = through
 	}
 	// A partial line is answered joined with its rest, as far as the
-	// snapshot has it, and filtered as a whole: a page may then hold fewer
-	// lines than its limit, and its cursor goes on after the last line it
-	// considered.
+	// streams' last offsets read go, and filtered as a whole: a page may
+	// then hold fewer lines than its limit, and its cursor goes on after
+	// the last line it considered.
 	upTo := map[int64]int64{}
 	for id, st := range res.streams {
 		upTo[id] = st.LastOff
@@ -232,124 +205,48 @@ func (s *Store) Read(ctx context.Context, tenant string, q Query) (scanResult, e
 	return res, nil
 }
 
-// readHot reads the hot lines of a read in the scan's order, those of
-// the streams ids in its range, after its cursor and of its levels, never
-// one that goes on with another (Cont): it reads the batches that may hold
-// some, those the farthest back in the scan's order first, and gives a
-// line once no batch left can hold one before it. It stops with enough
-// lines for the page (a partial one counts, to be joined) or at ScanLimit
-// bytes of their text, returning then the last line it read (through) and
-// whether the page is short.
-func (s *Store) readHot(ctx context.Context, tx pgx.Tx, q *Query, ids []int64) (hot []Line, through *pos, scanned int64,
-	partial bool, err error) {
-	takes := func(l *Line) bool { return l.Level&q.Levels != 0 && !l.Cont && q.inRange(l) }
-	order := func(a, b Line) int {
-		c := cmpPos(a.pos(), b.pos())
+// readTail reads a read's lines that the index has not published, from
+// the topics' tail: those of its streams, in its range and after its
+// cursor, that pass its filters (a partial one passes, to be joined; a
+// line going on with one is never a head). It returns them and their
+// bytes of text.
+func (s *Store) readTail(ctx context.Context, q *Query, streams []*streamRow) ([]Line, int64, error) {
+	docs, err := s.tailDocs(ctx, streams)
+	if err != nil {
+		return nil, 0, err
+	}
+	bySID := make(map[string]*streamRow, len(streams))
+	for _, st := range streams {
+		bySID[st.SID] = st
+	}
+	var out []Line
+	var scanned int64
+	for _, d := range docs {
+		st := bySID[d.Stream]
+		if st == nil || d.Cont {
+			continue
+		}
+		scanned += int64(len(d.Text))
+		l := lineOf(d, st.ID)
+		if q.inRange(&l) && (l.Partial || q.match(&l)) {
+			out = append(out, l)
+		}
+	}
+	return out, scanned, nil
+}
+
+// mergeScan merges lines of the tail and the index in the scan's order,
+// each (stream, offset) once.
+func mergeScan(q *Query, a, b []Line) []Line {
+	found := append(a, b...)
+	slices.SortFunc(found, func(x, y Line) int {
+		c := cmpPos(x.pos(), y.pos())
 		if !q.Forward {
 			c = -c
 		}
 		return c
-	}
-	pending, err := s.readLegacy(ctx, tx, q, ids)
-	if err != nil {
-		return nil, nil, 0, false, err
-	}
-	slices.SortFunc(pending, order)
-	// give gives the pending lines before edge (the next batch's earliest
-	// time in the scan's order), or all, and reports a stop.
-	give := func(all bool, edge int64) bool {
-		n := 0
-		defer func() { pending = pending[n:] }()
-		for ; n < len(pending); n++ {
-			l := pending[n]
-			if !all && ((q.Forward && l.TS >= edge) || (!q.Forward && l.TS <= edge)) {
-				return false
-			}
-			scanned += int64(len(l.Text))
-			if l.Partial || q.match(&l) {
-				hot = append(hot, l)
-			}
-			if len(hot) >= q.Limit || scanned >= s.cfg.ScanLimit {
-				p := l.pos()
-				through, partial = &p, len(hot) < q.Limit
-				n++
-				return true
-			}
-		}
-		return false
-	}
-	sql := `SELECT stream_id, min_ts, max_ts, data FROM log_batches
-		WHERE stream_id = ANY($1) AND max_ts >= $2 AND min_ts <= $3 AND (levels & $4) <> 0`
-	args := []any{ids, q.Since, q.Until, q.Levels}
-	switch {
-	case q.Cursor != nil && q.Forward:
-		sql += " AND max_ts >= $5"
-		args = append(args, q.Cursor.TS)
-	case q.Cursor != nil:
-		sql += " AND min_ts <= $5"
-		args = append(args, q.Cursor.TS)
-	}
-	if q.Forward {
-		sql += " ORDER BY min_ts, stream_id, first_off"
-	} else {
-		sql += " ORDER BY max_ts DESC, stream_id DESC, first_off DESC"
-	}
-	rows, err := tx.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, nil, 0, false, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var stream, minTS, maxTS int64
-		var data []byte
-		if err := rows.Scan(&stream, &minTS, &maxTS, &data); err != nil {
-			return nil, nil, 0, false, err
-		}
-		edge := maxTS
-		if q.Forward {
-			edge = minTS
-		}
-		if give(false, edge) {
-			return hot, through, scanned, partial, nil
-		}
-		ls, err := decodeBatch(data, stream)
-		if err != nil {
-			return nil, nil, 0, false, err
-		}
-		for i := range ls {
-			if takes(&ls[i]) {
-				pending = append(pending, ls[i])
-			}
-		}
-		slices.SortFunc(pending, order)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, 0, false, err
-	}
-	give(true, 0)
-	return hot, through, scanned, partial, nil
-}
-
-// readLegacy reads a read's hot lines of log_lines (transitional: the
-// instances of before write them until they are gone), as readHot takes
-// them.
-func (s *Store) readLegacy(ctx context.Context, tx pgx.Tx, q *Query, ids []int64) ([]Line, error) {
-	sql := `SELECT stream_id, off, ts, source, level, partial, cont, text, trace FROM log_lines
-		WHERE stream_id = ANY($1) AND ts >= $2 AND ts <= $3 AND (level & $4) <> 0 AND NOT cont`
-	args := []any{ids, q.Since, q.Until, q.Levels}
-	if q.Cursor != nil {
-		cmp := "<"
-		if q.Forward {
-			cmp = ">"
-		}
-		sql += " AND (ts, stream_id, off) " + cmp + " ($5, $6, $7)"
-		args = append(args, q.Cursor.TS, q.Cursor.Stream, q.Cursor.Off)
-	}
-	rows, err := tx.Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, scanLegacyLine)
+	})
+	return slices.CompactFunc(found, func(x, y Line) bool { return x.Stream == y.Stream && x.Off == y.Off })
 }
 
 // earlier is whichever of a (nil: none) and b comes first in the scan's
@@ -424,7 +321,7 @@ func (s *Store) readIndex(ctx context.Context, tenant string, q *Query, streams 
 		fresh := 0
 		for _, h := range hits {
 			st := bySID[h.Stream]
-			if st == nil || h.Off > st.ChunkedLast || h.Cont {
+			if st == nil || h.Cont {
 				continue
 			}
 			k := key{st.ID, h.Off}

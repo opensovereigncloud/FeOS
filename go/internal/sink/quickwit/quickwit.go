@@ -169,26 +169,23 @@ func rfc3339(ns int64) string {
 	return time.Unix(0, ns).UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
-// Client calls Quickwit: ingest at an indexer, everything else at a
-// searcher (any node answers the index API).
+// Client calls Quickwit's REST API (any node answers it; the searchers'
+// Service in the reference deployment).
 type Client struct {
-	ingest, search string
-	http           *http.Client
+	search string
+	http   *http.Client
 }
 
-// New returns a client of the indexers at ingestURL and the searchers at
-// searchURL (http://host:7280).
-func New(ingestURL, searchURL string, hc *http.Client) (*Client, error) {
-	for _, u := range []string{ingestURL, searchURL} {
-		p, err := url.Parse(u)
-		if err != nil || (p.Scheme != "http" && p.Scheme != "https") || p.Host == "" {
-			return nil, fmt.Errorf("quickwit: %q is not an http(s) URL", u)
-		}
+// New returns a client of Quickwit at searchURL (http://host:7280).
+func New(searchURL string, hc *http.Client) (*Client, error) {
+	p, err := url.Parse(searchURL)
+	if err != nil || (p.Scheme != "http" && p.Scheme != "https") || p.Host == "" {
+		return nil, fmt.Errorf("quickwit: %q is not an http(s) URL", searchURL)
 	}
 	if hc == nil {
 		hc = &http.Client{}
 	}
-	return &Client{ingest: strings.TrimRight(ingestURL, "/"), search: strings.TrimRight(searchURL, "/"), http: hc}, nil
+	return &Client{search: strings.TrimRight(searchURL, "/"), http: hc}, nil
 }
 
 // Error is an answer of Quickwit that is not a success.
@@ -247,8 +244,9 @@ func (c *Client) do(ctx context.Context, method, url, ctype string, body []byte,
 // indexes, a read searches <prefix>-* and so the old ones too, which
 // their retention empties. Version 1 is the indexes named <prefix>-<days>d
 // (tenant the only tag, no partitions), version 2 partitions by tenant,
-// environment and job.
-const MappingVersion = 2
+// environment and job, version 3 is the same mapping filled by a Kafka
+// source (ADR 0026 §11): an index has its source from its start.
+const MappingVersion = 3
 
 // MaxPartitions is the most partitions an index may have: Quickwit's
 // max_num_partitions (200 by default), past which it puts every line into
@@ -314,22 +312,81 @@ func IndexConfig(id string, s IndexSettings) []byte {
 	return b
 }
 
-// EnsureIndex creates the log index id with s unless it exists; one that
-// exists keeps its own settings.
-func (c *Client) EnsureIndex(ctx context.Context, id string, s IndexSettings) error {
-	if s.Partitions < 1 || s.Partitions > MaxPartitions {
-		return fmt.Errorf("quickwit: %d partitions, not 1 to %d", s.Partitions, MaxPartitions)
-	}
+// Source is the Kafka topic an index's source reads, at the brokers.
+type Source struct {
+	Topic   string
+	Brokers []string
+}
+
+// sourceID is the one source of a sink's index.
+const sourceID = "kafka"
+
+// Ensure makes the index id of config unless it exists, and its Kafka
+// source on src's topic unless it has one (ADR 0026 §11): Quickwit keeps
+// the topic's offsets in its metastore with each split it publishes, so a
+// record is indexed once.
+func (c *Client) Ensure(ctx context.Context, id string, config []byte, src Source) error {
 	err := c.do(ctx, http.MethodGet, c.search+"/api/v1/indexes/"+url.PathEscape(id), "", nil, nil)
-	if err == nil || !IsNotFound(err) {
+	if IsNotFound(err) {
+		err = c.do(ctx, http.MethodPost, c.search+"/api/v1/indexes", "application/json", config, nil)
+		if alreadyExists(err) {
+			err = nil
+		}
+	}
+	if err != nil {
 		return err
 	}
-	err = c.do(ctx, http.MethodPost, c.search+"/api/v1/indexes", "application/json", IndexConfig(id, s), nil)
-	var e *Error
-	if errors.As(err, &e) && e.Status == http.StatusBadRequest && strings.Contains(e.Message, "already exist") {
+	body, _ := json.Marshal(map[string]any{
+		"version": "0.9", "source_id": sourceID, "source_type": "kafka", "num_pipelines": 1, "input_format": "json",
+		"params": map[string]any{
+			"topic": src.Topic, "client_log_level": "warn", "enable_backfill_mode": false,
+			// earliest: a partition without a checkpoint is read from its
+			// start, not its end; a short session, so that a restarted
+			// indexer takes its partitions again within seconds.
+			"client_params": map[string]string{"bootstrap.servers": strings.Join(src.Brokers, ","),
+				"auto.offset.reset": "earliest", "session.timeout.ms": "10000", "heartbeat.interval.ms": "3000"},
+		},
+	})
+	err = c.do(ctx, http.MethodPost, c.search+"/api/v1/indexes/"+url.PathEscape(id)+"/sources", "application/json", body, nil)
+	if alreadyExists(err) {
 		return nil
 	}
 	return err
+}
+
+func alreadyExists(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && (e.Status == http.StatusBadRequest || e.Status == http.StatusConflict) &&
+		strings.Contains(e.Message, "already exist")
+}
+
+// Checkpoint is, for each partition of the index's Kafka source, the
+// offset of the first record it has not published: Quickwit keeps the
+// offset of the last one it published, partitions and positions as
+// 20 digits; a partition it has published nothing of is not there.
+func (c *Client) Checkpoint(ctx context.Context, id string) (map[int32]int64, error) {
+	var md struct {
+		Checkpoint map[string]map[string]string `json:"checkpoint"`
+	}
+	if err := c.do(ctx, http.MethodGet, c.search+"/api/v1/indexes/"+url.PathEscape(id), "", nil, &md); err != nil {
+		return nil, err
+	}
+	out := map[int32]int64{}
+	for part, position := range md.Checkpoint[sourceID] {
+		p, err := strconv.ParseInt(part, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("quickwit: checkpoint of %s: partition %q", id, part)
+		}
+		if position == "" {
+			continue // nothing published yet: from the start
+		}
+		last, err := strconv.ParseInt(position, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("quickwit: checkpoint of %s: position %q", id, position)
+		}
+		out[int32(p)] = last + 1
+	}
+	return out, nil
 }
 
 // Indexes lists the ids of the indexes that start with prefix.
@@ -349,39 +406,6 @@ func (c *Client) Indexes(ctx context.Context, prefix string) ([]string, error) {
 		}
 	}
 	return ids, nil
-}
-
-// Ingest indexes docs into the index id and answers once the split that
-// holds them is published (commit=wait_for): only then are they in the
-// object store. A rejected document fails the call.
-func (c *Client) Ingest(ctx context.Context, id string, docs []Doc) error {
-	var body bytes.Buffer
-	enc := json.NewEncoder(&body)
-	enc.SetEscapeHTML(false)
-	for i := range docs {
-		if err := enc.Encode(&docs[i]); err != nil {
-			return err
-		}
-	}
-	var out struct {
-		NumIngested   int `json:"num_ingested_docs"`
-		NumRejected   int `json:"num_rejected_docs"`
-		ParseFailures []struct {
-			Message string `json:"message"`
-		} `json:"parse_failures"`
-	}
-	u := c.ingest + "/api/v1/" + url.PathEscape(id) + "/ingest?commit=wait_for&detailed_response=true"
-	if err := c.do(ctx, http.MethodPost, u, "application/x-ndjson", body.Bytes(), &out); err != nil {
-		return err
-	}
-	if out.NumRejected > 0 {
-		msg := ""
-		if len(out.ParseFailures) > 0 {
-			msg = out.ParseFailures[0].Message
-		}
-		return fmt.Errorf("quickwit: %d of %d documents rejected: %s", out.NumRejected, len(docs), msg)
-	}
-	return nil
 }
 
 // Search answers the hits of q in the indexes pattern names

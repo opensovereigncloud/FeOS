@@ -14,6 +14,8 @@ import (
 	_ "github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/modelcontextprotocol/go-sdk/mcp"
+	_ "github.com/twmb/franz-go/pkg/kadm"
+	_ "github.com/twmb/franz-go/pkg/kgo"
 	_ "golang.org/x/crypto/acme"
 	_ "golang.org/x/crypto/ssh"
 	_ "golang.org/x/sync/errgroup"

@@ -17,18 +17,18 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 )
 
-// Store is the sink's database and index: the write path, the cold
-// stage, the reads and retention.
+// Store is the sink's log streams: the gate of their ingest into the
+// topics, the reads from the index and the topics' tail, and retention
+// (ADR 0026 §11). The database keeps the streams, not their lines.
 type Store struct {
-	db      *db.DB
-	index   Index
-	ensured *ensured
-	cfg     Config
-	log     *slog.Logger
-	// owner names this process in a stream's chunk claim.
-	owner string
+	db    *db.DB
+	index Index
+	pipes *pipes
+	cfg   Config
+	log   *slog.Logger
 	// scans bounds the reads that scan at once.
 	scans chan struct{}
 }
@@ -36,12 +36,10 @@ type Store struct {
 // maxScans is how many reads scan at once; more wait.
 const maxScans = 8
 
-// NewStore returns the store over d and index.
-func NewStore(d *db.DB, index Index, cfg Config, log *slog.Logger) *Store {
-	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	return &Store{db: d, index: index, ensured: &ensured{ids: map[string]bool{}}, cfg: cfg, log: log,
-		owner: cfg.Name + "/" + hex.EncodeToString(b), scans: make(chan struct{}, maxScans)}
+// NewStore returns the store over d, the log indexes and the topics.
+func NewStore(d *db.DB, index Index, log Log, cfg Config, logger *slog.Logger) *Store {
+	return &Store{db: d, index: index, pipes: newPipes(log, index, cfg), cfg: cfg, log: logger,
+		scans: make(chan struct{}, maxScans)}
 }
 
 // StreamKey is a stream's key as the node names it.
@@ -109,12 +107,13 @@ func newSID() (string, error) {
 	return "s_" + hex.EncodeToString(b), nil
 }
 
-// Ingest stores a batch in one transaction: each stream's row (its
-// labels the first write's), its new lines as a row of log_batches (a
-// line at or below the stream's mark or its last offset is stored), the
-// stream's counters and times, and the tenants' usage of
-// the day. A stream of a tenant over its quota is left out and Ingest
-// returns ErrQuota (wrapped) after the commit.
+// Ingest stores a batch: in one transaction, each stream's row (its
+// labels the first write's) locked, its new lines (above its last
+// offset) produced to its index's topic, then the stream's counters and
+// times and the tenants' usage of the day, and the commit. A stream of a
+// tenant over its quota is left out and Ingest returns ErrQuota (wrapped)
+// after the commit. A failed produce stores nothing: the node sends
+// again.
 func (s *Store) Ingest(ctx context.Context, batch []StreamBatch) error {
 	sort.Slice(batch, func(i, j int) bool { return batch[i].Key.less(batch[j].Key) })
 	var over []string
@@ -140,16 +139,33 @@ func (s *Store) Ingest(ctx context.Context, batch []StreamBatch) error {
 			}
 		}
 		usage := map[string]int64{}
+		recs := map[string][]kafka.Record{}
+		var counts []streamCount
 		for i := range batch {
 			b := &batch[i]
 			if refused[b.Labels.Tenant] {
 				continue
 			}
-			n, err := s.ingestStream(ctx, tx, b)
+			c, rs, err := s.ingestStream(ctx, tx, b)
 			if err != nil {
 				return err
 			}
-			usage[b.Labels.Tenant] += n
+			counts = append(counts, c)
+			recs[c.topic] = append(recs[c.topic], rs...)
+			usage[b.Labels.Tenant] += c.bytes
+		}
+		for topic, rs := range recs {
+			if err := s.pipes.produce(ctx, topic, rs); err != nil {
+				return err
+			}
+		}
+		for _, c := range counts {
+			if _, err := tx.Exec(ctx, `UPDATE log_streams SET lines = lines + $2, bytes = bytes + $3,
+					first_ns = least(first_ns, $4), last_ns = greatest(last_ns, $5),
+					next_offset = greatest(next_offset, $6), last_off = greatest(last_off, $7), open_sources = $8
+				WHERE id = $1`, c.id, c.lines, c.bytes, c.minTS, c.maxTS, c.next, c.last, c.open); err != nil {
+				return fmt.Errorf("stream counters: %w", err)
+			}
 		}
 		for t, n := range usage {
 			if n == 0 {
@@ -171,12 +187,23 @@ func (s *Store) Ingest(ctx context.Context, batch []StreamBatch) error {
 	return nil
 }
 
-// ingestStream stores one stream's part and returns the bytes of text it
-// stored anew.
-func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (int64, error) {
+// streamCount is what a batch adds to a stream's row.
+type streamCount struct {
+	id           int64
+	topic        string
+	lines, bytes int64
+	minTS, maxTS *int64
+	next, last   int64
+	open         int16
+}
+
+// ingestStream locks one stream's row (made with its labels if new) and
+// returns its new lines as records of its topic, and what they add to the
+// row.
+func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (streamCount, []kafka.Record, error) {
 	sid, err := newSID()
 	if err != nil {
-		return 0, err
+		return streamCount{}, nil, err
 	}
 	l := b.Labels
 	var retention *int
@@ -193,27 +220,31 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 		ON CONFLICT (pod, container, log_id) DO NOTHING`,
 		sid, b.Key.Pod, b.Key.Container, b.Key.LogID, l.Tenant, l.Node, l.Instance, l.Environment,
 		l.Kind, l.Object, l.Replica, l.Release, l.Job, l.Attempt, retention, l.Attrs, source); err != nil {
-		return 0, fmt.Errorf("stream: %w", err)
+		return streamCount{}, nil, fmt.Errorf("stream: %w", err)
 	}
-	var id, chunkedLast, lastOff int64
 	var open int16
-	if err := tx.QueryRow(ctx, `SELECT id, chunked_last, last_off, open_sources FROM log_streams
-		WHERE pod = $1 AND container = $2 AND log_id = $3 FOR UPDATE`,
-		b.Key.Pod, b.Key.Container, b.Key.LogID).Scan(&id, &chunkedLast, &lastOff, &open); err != nil {
-		return 0, fmt.Errorf("lock stream: %w", err)
+	var keptDays *int
+	row := tx.QueryRow(ctx, `SELECT `+streamCols+`, open_sources, retention_days FROM log_streams
+		WHERE pod = $1 AND container = $2 AND log_id = $3 FOR UPDATE`, b.Key.Pod, b.Key.Container, b.Key.LogID)
+	st, err := scanStreamWith(row, &open, &keptDays)
+	if err != nil {
+		return streamCount{}, nil, fmt.Errorf("lock stream: %w", err)
+	}
+	topic, days := s.indexOf(keptDays)
+	n, err := s.ensure(ctx, topic, days)
+	if err != nil {
+		return streamCount{}, nil, err
 	}
 	// A node sends a stream's lines in the order of their offsets, so a
 	// line at or below the last stored is stored; a line goes on with the
 	// last of its source when that is partial.
 	slices.SortStableFunc(b.Lines, func(x, y Line) int { return cmpInt(x.Off, y.Off) })
-	next, last := b.Next, int64(-1)
-	from := max(chunkedLast, lastOff)
-	var fresh []Line
-	var n, bytes int64
-	var minTS, maxTS *int64
+	c := streamCount{id: st.ID, topic: topic, next: b.Next, last: -1}
+	from := max(st.ChunkedLast, st.LastOff)
+	var recs []kafka.Record
 	for _, ln := range b.Lines {
-		next = max(next, ln.Off)
-		last = max(last, ln.Off)
+		c.next = max(c.next, ln.Off)
+		c.last = max(c.last, ln.Off)
 		if ln.Off <= from {
 			continue
 		}
@@ -225,30 +256,22 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 		} else {
 			open &^= bit
 		}
-		fresh = append(fresh, ln)
-		n++
-		bytes += int64(len(ln.Text))
-		if minTS == nil || ln.TS < *minTS {
-			minTS = &ln.TS
+		r, err := recordOf(ln, st, n)
+		if err != nil {
+			return streamCount{}, nil, err
 		}
-		if maxTS == nil || ln.TS > *maxTS {
-			maxTS = &ln.TS
+		recs = append(recs, r)
+		c.lines++
+		c.bytes += int64(len(ln.Text))
+		if c.minTS == nil || ln.TS < *c.minTS {
+			c.minTS = &ln.TS
+		}
+		if c.maxTS == nil || ln.TS > *c.maxTS {
+			c.maxTS = &ln.TS
 		}
 	}
-	// The stream's lock and its last offset make each of them new: a
-	// batch sent again stores nothing, one that overlaps its new lines.
-	if err := insertBatches(ctx, tx, id, fresh); err != nil {
-		return 0, fmt.Errorf("lines: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `UPDATE log_streams SET
-			lines = lines + $2, bytes = bytes + $3, hot_lines = hot_lines + $2, hot_bytes = hot_bytes + $3,
-			hot_since = CASE WHEN $2 > 0 THEN coalesce(hot_since, now()) ELSE hot_since END,
-			first_ns = least(first_ns, $4), last_ns = greatest(last_ns, $5),
-			next_offset = greatest(next_offset, $6), last_off = greatest(last_off, $7), open_sources = $8
-		WHERE id = $1`, id, n, bytes, minTS, maxTS, next, last, open); err != nil {
-		return 0, fmt.Errorf("stream counters: %w", err)
-	}
-	return bytes, nil
+	c.open = open
+	return c, recs, nil
 }
 
 // sourceBit is a source's bit in log_streams.open_sources.

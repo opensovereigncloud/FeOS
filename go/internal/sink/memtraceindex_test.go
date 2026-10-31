@@ -11,47 +11,40 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
 // memTraceIndex is the trace index in memory: what Quickwit answers for
 // the queries the sink makes (SpanQuery.Match).
 type memTraceIndex struct {
-	mu         sync.Mutex
-	docs       map[string][]quickwit.SpanDoc
-	ingests    int
-	failIngest error
+	memSources
+	mu   sync.Mutex
+	docs map[string][]quickwit.SpanDoc
 }
 
 func newMemTraceIndex() *memTraceIndex { return &memTraceIndex{docs: map[string][]quickwit.SpanDoc{}} }
 
-func (m *memTraceIndex) EnsureTraceIndex(_ context.Context, id string, _ quickwit.IndexSettings) error {
+func (m *memTraceIndex) Ensure(_ context.Context, id string, _ []byte, src quickwit.Source) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if _, ok := m.docs[id]; !ok {
 		m.docs[id] = nil
 	}
+	m.mu.Unlock()
+	m.ensure(id, src)
 	return nil
 }
 
-func (m *memTraceIndex) IngestSpans(_ context.Context, id string, docs []json.RawMessage) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.failIngest != nil {
-		return m.failIngest
-	}
-	if _, ok := m.docs[id]; !ok {
-		return &quickwit.Error{Status: 404, Message: "index " + id + " not found"}
-	}
-	for _, raw := range docs {
+// sync is a commit of the trace topic's source.
+func (m *memTraceIndex) sync(lg *memLog) {
+	m.pull(lg, func(id string, r kafka.Record) {
 		var d quickwit.SpanDoc
-		if err := json.Unmarshal(raw, &d); err != nil {
-			return err
+		if json.Unmarshal(r.Value, &d) == nil {
+			m.mu.Lock()
+			m.docs[id] = append(m.docs[id], d)
+			m.mu.Unlock()
 		}
-		m.docs[id] = append(m.docs[id], d)
-	}
-	m.ingests++
-	return nil
+	})
 }
 
 func (m *memTraceIndex) match(pattern string, q *quickwit.SpanQuery) []quickwit.SpanDoc {

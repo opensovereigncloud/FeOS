@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	otlptracev1 "github.com/gardenlinux/feos/go/gen/otlp/collector/trace/v1"
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
@@ -177,13 +178,18 @@ func parseTraceExport(req *otlptracev1.ExportTraceServiceRequest, p ingestPeer, 
 // the other tenants' spans are stored.
 var ErrTraceQuota = errors.New("over the tenant's trace quota")
 
-// Ingest stores spans in trace_spans in one transaction with the
-// tenants' usage of the day (bytes of documents). The spans of a tenant
-// whose usage reached --trace-quota are left out and Ingest returns
-// ErrTraceQuota (wrapped) after the commit.
+// Ingest stores spans: in one transaction, each tenant's quota checked,
+// the spans produced to the trace topic (keyed by their trace IDs), the
+// usage counted, and the commit. A tenant over its quota is left out and
+// Ingest returns ErrTraceQuota (wrapped) after the commit; a failed
+// produce stores nothing, and the sender sends again.
 func (t *Traces) Ingest(ctx context.Context, spans []traceSpan) error {
 	if len(spans) == 0 {
 		return nil
+	}
+	id, n, err := t.ensure(ctx)
+	if err != nil {
+		return err
 	}
 	byTenant := map[string][]*traceSpan{}
 	for i := range spans {
@@ -196,8 +202,10 @@ func (t *Traces) Ingest(ctx context.Context, spans []traceSpan) error {
 	}
 	slices.Sort(tenants)
 	var over []string
-	err := t.db.Tx(ctx, func(tx pgx.Tx) error {
+	err = t.db.Tx(ctx, func(tx pgx.Tx) error {
 		over = over[:0]
+		var recs []kafka.Record
+		usage := map[string]int64{}
 		for _, tn := range tenants {
 			if t.cfg.TraceQuota > 0 {
 				var used int64
@@ -211,23 +219,20 @@ func (t *Traces) Ingest(ctx context.Context, spans []traceSpan) error {
 					continue
 				}
 			}
-			ss := byTenant[tn]
-			traceIDs, spanIDs, docs := make([]string, len(ss)), make([]string, len(ss)), make([]string, len(ss))
-			starts, sizes := make([]int64, len(ss)), make([]int64, len(ss))
-			var n int64
-			for i, s := range ss {
-				traceIDs[i], spanIDs[i], docs[i] = s.doc.TraceID, s.doc.SpanID, string(s.raw)
-				starts[i], sizes[i] = s.doc.TS, int64(len(s.raw))
-				n += sizes[i]
+			for _, s := range byTenant[tn] {
+				recs = append(recs, spanRecord(s.doc.TraceID, s.raw, n))
+				usage[tn] += int64(len(s.raw))
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO trace_spans (tenant, trace_id, span_id, start_ns, doc, bytes)
-				SELECT $1, x.trace_id, x.span_id, x.start_ns, x.doc::jsonb, x.bytes
-				FROM unnest($2::text[], $3::text[], $4::bigint[], $5::text[], $6::int[]) AS x(trace_id, span_id, start_ns, doc, bytes)`,
-				tn, traceIDs, spanIDs, starts, docs, sizes); err != nil {
-				return fmt.Errorf("spans: %w", err)
+		}
+		if err := t.pipes.produce(ctx, id, recs); err != nil {
+			return err
+		}
+		for _, tn := range tenants {
+			if usage[tn] == 0 {
+				continue
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO trace_usage (tenant, day, bytes) VALUES ($1, (now() AT TIME ZONE 'utc')::date, $2)
-				ON CONFLICT (tenant, day) DO UPDATE SET bytes = trace_usage.bytes + EXCLUDED.bytes`, tn, n); err != nil {
+				ON CONFLICT (tenant, day) DO UPDATE SET bytes = trace_usage.bytes + EXCLUDED.bytes`, tn, usage[tn]); err != nil {
 				return fmt.Errorf("usage: %w", err)
 			}
 		}

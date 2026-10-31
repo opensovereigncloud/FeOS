@@ -5,9 +5,9 @@ package sink
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -15,13 +15,17 @@ import (
 	commonv1 "github.com/gardenlinux/feos/go/gen/otlp/common/v1"
 	tracev1 "github.com/gardenlinux/feos/go/gen/otlp/trace/v1"
 	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/sink/kafka"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
-func newTestTraces(t *testing.T, cfg Config) (*Traces, *memTraceIndex) {
+// newTestTraces is the spans over a new database, the trace index in
+// memory and the topics in memory; idx.sync(lg) is a commit of the
+// index's source.
+func newTestTraces(t *testing.T, cfg Config) (*Traces, *memTraceIndex, *memLog) {
 	t.Helper()
-	idx := newMemTraceIndex()
-	return NewTraces(newTestDB(t), idx, cfg, dbtest.Logger(t)), idx
+	idx, lg := newMemTraceIndex(), newMemLog()
+	return NewTraces(newTestDB(t), idx, lg, cfg, dbtest.Logger(t)), idx, lg
 }
 
 // ingestSpans parses a request of a node's and stores it.
@@ -34,13 +38,24 @@ func ingestSpans(t *testing.T, tr *Traces, req *otlptracev1.ExportTraceServiceRe
 	return tr.Ingest(context.Background(), spans)
 }
 
-func hotCount(t *testing.T, tr *Traces) int {
+// topicSpans are the spans of the trace topic's records, keyed by trace
+// ID in its partition, by tenant.
+func topicSpans(t *testing.T, tr *Traces, lg *memLog) map[string]int {
 	t.Helper()
-	var n int
-	if err := tr.db.Pool.QueryRow(context.Background(), `SELECT count(*) FROM trace_spans`).Scan(&n); err != nil {
-		t.Fatal(err)
+	id, _ := tr.indexID()
+	parts := int32(tr.cfg.KafkaPartitions)
+	out := map[string]int{}
+	for _, r := range lg.records(id) {
+		var d quickwit.SpanDoc
+		if err := json.Unmarshal(r.Value, &d); err != nil {
+			t.Fatal(err)
+		}
+		if string(r.Key) != d.TraceID || r.Partition != kafka.Partition(d.TraceID, parts) {
+			t.Errorf("span %s: key %q, partition %d", d.SpanID, r.Key, r.Partition)
+		}
+		out[d.Tenant]++
 	}
-	return n
+	return out
 }
 
 func spanIDs(spans []quickwit.SpanDoc) string {
@@ -52,7 +67,7 @@ func spanIDs(spans []quickwit.SpanDoc) string {
 }
 
 func TestTraceStore(t *testing.T) {
-	tr, idx := newTestTraces(t, testConfig())
+	tr, idx, lg := newTestTraces(t, testConfig())
 	ctx := context.Background()
 	start := time.Now().Add(-10 * time.Minute).UnixNano()
 	root := testSpan(traceA, "000000000000000a", "", "GET /", start, 20*time.Millisecond)
@@ -69,8 +84,8 @@ func TestTraceStore(t *testing.T) {
 	if err := ingestSpans(t, tr, traceRequest(podAttrs("other", "env1", "api"), notAcme)); err != nil {
 		t.Fatal(err)
 	}
-	if n := hotCount(t, tr); n != 4 {
-		t.Fatalf("%d hot spans", n)
+	if id, _ := tr.indexID(); id != "ferun-traces-v2-30d" || fmt.Sprint(topicSpans(t, tr, lg)) != "map[acme:3 other:1]" {
+		t.Fatalf("topic %s: %v", id, topicSpans(t, tr, lg))
 	}
 	var used int64
 	if err := tr.db.Pool.QueryRow(ctx, `SELECT bytes FROM trace_usage WHERE tenant = 'acme'`).Scan(&used); err != nil || used < 300 {
@@ -138,25 +153,34 @@ func TestTraceStore(t *testing.T) {
 			t.Errorf("%s: operations %v %v", when, ops, err)
 		}
 	}
-	reads("hot")
-	n, err := tr.indexRound(ctx)
-	if err != nil || n != 4 {
-		t.Fatalf("index round: %d, %v", n, err)
+	// Before the index's commit, a trace is read by its ID from the
+	// topic's tail; a search reads the index alone and finds none.
+	if spans, err := tr.Trace(ctx, quickwit.SpanQuery{Tenant: "acme", TraceID: traceA}); err != nil || spanIDs(spans) != "000a 000b " {
+		t.Errorf("tail: trace A: %s %v", spanIDs(spans), err)
 	}
-	if hotCount(t, tr) != 0 || idx.count() != 4 {
-		t.Fatalf("after the round: %d hot, %d indexed", hotCount(t, tr), idx.count())
+	if spans, err := tr.Trace(ctx, quickwit.SpanQuery{Tenant: "acme", TraceID: traceA, Environment: "env2"}); err != nil || spans != nil {
+		t.Errorf("tail: trace A of env2: %s %v", spanIDs(spans), err)
 	}
-	if n, err := tr.indexRound(ctx); err != nil || n != 0 {
-		t.Errorf("an empty round: %d, %v", n, err)
+	if found, err := tr.Find(ctx, quickwit.SpanQuery{Tenant: "acme", SinceNs: start - int64(time.Hour), UntilNs: time.Now().UnixNano()}, 20); err != nil ||
+		len(found) != 0 {
+		t.Errorf("tail: find %d, %v", len(found), err)
 	}
-	reads("indexed")
-	// A span sent again is in the index and in trace_spans: read once.
+	if svcs, err := tr.Services(ctx, quickwit.SpanQuery{Tenant: "acme"}, start-int64(time.Hour)); err != nil || len(svcs) != 0 {
+		t.Errorf("tail: services %v %v", svcs, err)
+	}
+	idx.sync(lg)
+	if idx.count() != 4 {
+		t.Fatalf("%d indexed", idx.count())
+	}
+	reads("index")
+	// A span sent again is in the index and in the tail: read once.
 	if err := ingestSpans(t, tr, traceRequest(podAttrs("acme", "env1", "api"), child)); err != nil {
 		t.Fatal(err)
 	}
 	reads("twice")
-	if _, err := tr.indexRound(ctx); err != nil {
-		t.Fatal(err)
+	idx.sync(lg)
+	if idx.count() != 5 {
+		t.Fatalf("%d indexed", idx.count())
 	}
 	reads("indexed twice")
 
@@ -164,7 +188,7 @@ func TestTraceStore(t *testing.T) {
 	if _, err := tr.db.Pool.Exec(ctx, `INSERT INTO trace_usage VALUES ('acme', (now() AT TIME ZONE 'utc')::date - 2, 5)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tr.sweepUsage(ctx); err != nil {
+	if err := tr.sweepUsage(ctx); err != nil {
 		t.Fatal(err)
 	}
 	var days int
@@ -176,7 +200,7 @@ func TestTraceStore(t *testing.T) {
 func TestTraceQuota(t *testing.T) {
 	cfg := testConfig()
 	cfg.TraceQuota = 100
-	tr, _ := newTestTraces(t, cfg)
+	tr, _, lg := newTestTraces(t, cfg)
 	start := time.Now().UnixNano()
 	sp := func(id string) *tracev1.Span { return testSpan(traceA, id, "", "x", start, time.Millisecond) }
 	// The request that crosses the quota is stored; the next is refused.
@@ -189,57 +213,33 @@ func TestTraceQuota(t *testing.T) {
 	if err := ingestSpans(t, tr, traceRequest(podAttrs("other", "e", "api"), sp("0000000000000003"))); err != nil {
 		t.Errorf("another tenant: %v", err)
 	}
-	if n := hotCount(t, tr); n != 2 {
-		t.Errorf("%d spans stored", n)
+	if got := fmt.Sprint(topicSpans(t, tr, lg)); got != "map[acme:1 other:1]" {
+		t.Errorf("spans stored %s", got)
 	}
 }
 
-func TestTraceIndexClaims(t *testing.T) {
-	d := newTestDB(t)
-	idx := newMemTraceIndex()
-	cfg := testConfig()
-	a := NewTraces(d, idx, cfg, dbtest.Logger(t))
-	b := NewTraces(d, idx, cfg, dbtest.Logger(t))
+// A produce that fails stores nothing, not even the usage; the sender
+// sends again.
+func TestTraceProduceFailure(t *testing.T) {
+	tr, _, lg := newTestTraces(t, testConfig())
 	ctx := context.Background()
-	start := time.Now().UnixNano()
-	spans := make([]*tracev1.Span, traceClaimSpans+10)
-	for i := range spans {
-		spans[i] = testSpan(traceA, fmt.Sprintf("%016x", i+1), "", "x", start+int64(i), time.Millisecond)
+	req := traceRequest(podAttrs("acme", "e", "api"), testSpan(traceA, "0000000000000001", "", "x", time.Now().UnixNano(), time.Millisecond))
+	lg.failProduce = errors.New("down")
+	if err := ingestSpans(t, tr, req); err == nil {
+		t.Fatal("no error")
 	}
-	if err := ingestSpans(t, a, traceRequest(podAttrs("acme", "e", "api"), spans...)); err != nil {
+	var days int
+	if err := tr.db.Pool.QueryRow(ctx, `SELECT count(*) FROM trace_usage`).Scan(&days); err != nil || days != 0 {
+		t.Errorf("usage of %d days: %v", days, err)
+	}
+	lg.failProduce = nil
+	if err := ingestSpans(t, tr, req); err != nil {
 		t.Fatal(err)
 	}
-	// A failed round keeps its claims for the lease: the other instance
-	// finds nothing to claim.
-	idx.failIngest = errors.New("down")
-	if n, err := a.indexRound(ctx); err == nil || n != 0 {
-		t.Fatalf("failed round: %d, %v", n, err)
+	if got := fmt.Sprint(topicSpans(t, tr, lg)); got != "map[acme:1]" {
+		t.Errorf("spans stored %s", got)
 	}
-	idx.failIngest = nil
-	n, err := b.indexRound(ctx)
-	if err != nil || n != 10 {
-		t.Fatalf("beside the claims: %d, %v", n, err)
-	}
-	if _, err := d.Pool.Exec(ctx, `UPDATE trace_spans SET claim_lease = now() - interval '1 second'`); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := b.indexRound(ctx); err != nil || n != traceClaimSpans {
-		t.Fatalf("after the lease: %d, %v", n, err)
-	}
-	if hotCount(t, a) != 0 || idx.count() != len(spans) {
-		t.Errorf("%d hot, %d indexed", hotCount(t, a), idx.count())
-	}
-	// A round bounds the bytes of its documents.
-	big := testSpan(traceA, "00000000000fffff", "", "big", start, time.Millisecond)
-	big.Attributes = []*commonv1.KeyValue{kv("blob", str(strings.Repeat("x", 4<<20)))}
-	big2 := testSpan(traceA, "00000000000ffffe", "", "big", start, time.Millisecond)
-	big2.Attributes = big.Attributes
-	if err := ingestSpans(t, a, traceRequest(podAttrs("acme", "e", "api"), big, big2)); err != nil {
-		t.Fatal(err)
-	}
-	for range 2 {
-		if n, err := a.indexRound(ctx); err != nil || n != 1 {
-			t.Errorf("a round of big spans: %d, %v", n, err)
-		}
+	if spans, err := tr.Trace(ctx, quickwit.SpanQuery{Tenant: "acme", TraceID: traceA}); err != nil || len(spans) != 1 {
+		t.Errorf("trace: %d spans, %v", len(spans), err)
 	}
 }

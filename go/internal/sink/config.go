@@ -62,7 +62,12 @@ type Config struct {
 	// The index (ADR 0026 §10): Quickwit's indexers for ingest, its
 	// searchers for everything else, and the prefix of the log indexes'
 	// names (<prefix>-v<version>-<days>d).
-	IndexIngestURL, IndexSearchURL, IndexPrefix string
+	IndexSearchURL, IndexPrefix string
+	// The log of record (ADR 0026 §11): Redpanda's brokers, and a new
+	// topic's partitions, replicas and retention.
+	KafkaBrokers                      []string
+	KafkaPartitions, KafkaReplication int
+	KafkaRetention                    time.Duration
 	// IndexPartitions is how many partitions a new index hashes its lines
 	// into by tenant, environment and job (its partition_key); an index
 	// keeps the number it was made with.
@@ -86,13 +91,10 @@ type Config struct {
 	// at most this long after it is stored (Quickwit's
 	// commit_timeout_secs, set when an index is made).
 	CommitTimeout time.Duration
-	// Tunables, not flags: the cold stage looks for streams with hot lines
-	// every ChunkInterval, the sweep runs every SweepInterval; a follow
-	// polls every FollowPoll and sends {} after Heartbeat without a line; a
-	// read scans at most ScanLimit bytes of lines.
-	ChunkInterval time.Duration
+	// Tunables, not flags:
+	// the sweep runs every SweepInterval; a follow sends {} after Heartbeat
+	// without a line; a read scans at most ScanLimit bytes of lines.
 	SweepInterval time.Duration
-	FollowPoll    time.Duration
 	Heartbeat     time.Duration
 	ScanLimit     int64
 }
@@ -108,13 +110,14 @@ func Default() Config {
 		LogFormat:     LogFormatJSON,
 		IndexPrefix:   "ferun-logs",
 		CommitTimeout: 10 * time.Second,
-		ChunkInterval: time.Second,
 		SweepInterval: 10 * time.Minute,
-		FollowPoll:    500 * time.Millisecond,
 		Heartbeat:     15 * time.Second,
 		ScanLimit:     256 << 20,
 
 		IndexPartitions:  16,
+		KafkaPartitions:  12,
+		KafkaReplication: 3,
+		KafkaRetention:   24 * time.Hour,
 		TraceQuota:       1 << 30,
 		TraceRetention:   720 * time.Hour,
 		TraceIndexPrefix: "ferun-traces",
@@ -155,8 +158,11 @@ func register(fs *flag.FlagSet, c *Config) *string {
 	fs.StringVar(&c.DatabaseURL, "database-url", c.DatabaseURL, "the sink's PostgreSQL database (required); PGPASSWORD may hold the password")
 	fs.StringVar(&c.TrustDomain, "trust-domain", c.TrustDomain, "the SPIFFE trust domain (required)")
 	fs.StringVar(&c.FerunURL, "ferun-url", c.FerunURL, "ferund's API inside the cluster, e.g. http://ferund.ferun.svc:8100 (required)")
-	fs.StringVar(&c.IndexIngestURL, "index-ingest-url", c.IndexIngestURL, "Quickwit's indexers, e.g. http://quickwit-indexer:7280 (required)")
-	fs.StringVar(&c.IndexSearchURL, "index-search-url", c.IndexSearchURL, "Quickwit's searchers, e.g. http://quickwit-searcher:7280 (required)")
+	fs.StringVar(&c.IndexSearchURL, "index-search-url", c.IndexSearchURL, "Quickwit's REST API at its searchers, e.g. http://quickwit-searcher:7280 (required)")
+	fs.Var((*stringList)(&c.KafkaBrokers), "kafka-brokers", "the Kafka API's brokers (Redpanda), comma-separated host:port, also Quickwit's sources' (required)")
+	fs.IntVar(&c.KafkaPartitions, "kafka-partitions", c.KafkaPartitions, "the partitions of a new topic")
+	fs.IntVar(&c.KafkaReplication, "kafka-replication", c.KafkaReplication, "the replicas of a new topic's partitions")
+	fs.DurationVar(&c.KafkaRetention, "kafka-retention", c.KafkaRetention, "how long a new topic keeps its records: the replay buffer, not the store")
 	fs.StringVar(&c.IndexPrefix, "index-prefix", c.IndexPrefix, "the prefix of the log indexes' names, <prefix>-v<version>-<days>d")
 	fs.IntVar(&c.IndexPartitions, "index-partitions", c.IndexPartitions, "how many partitions a new index hashes lines into by tenant, environment and job, 1 to 200 (an index keeps its own)")
 	fs.DurationVar(&c.CommitTimeout, "index-commit-timeout", c.CommitTimeout, "how soon a line is searchable in the index, whole seconds (a new index's commit_timeout_secs)")
@@ -198,7 +204,13 @@ func (c *Config) Validate() error {
 	if c.ServiceToken == "" {
 		bad("%s is required", EnvServiceToken)
 	}
-	for _, u := range []struct{ flag, v string }{{"--index-ingest-url", c.IndexIngestURL}, {"--index-search-url", c.IndexSearchURL}} {
+	if len(c.KafkaBrokers) == 0 {
+		bad("--kafka-brokers is required")
+	}
+	if c.KafkaPartitions < 1 || c.KafkaReplication < 1 || c.KafkaRetention < time.Minute {
+		bad("--kafka-partitions and --kafka-replication must be positive, --kafka-retention at least a minute")
+	}
+	for _, u := range []struct{ flag, v string }{{"--index-search-url", c.IndexSearchURL}} {
 		if p, err := url.Parse(u.v); u.v == "" || err != nil || (p.Scheme != "http" && p.Scheme != "https") || p.Host == "" {
 			bad("%s must be an http(s) URL", u.flag)
 		}
@@ -306,5 +318,20 @@ func (b *byteSize) Set(v string) error {
 		return fmt.Errorf("%q is not a byte size (an integer with an optional KiB, MiB or GiB suffix)", v)
 	}
 	*b = byteSize(n << shift)
+	return nil
+}
+
+// stringList is a flag of a comma-separated list.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	*l = nil
+	for _, x := range strings.Split(v, ",") {
+		if x = strings.TrimSpace(x); x != "" {
+			*l = append(*l, x)
+		}
+	}
 	return nil
 }
