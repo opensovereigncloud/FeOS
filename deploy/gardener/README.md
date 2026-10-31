@@ -261,12 +261,12 @@ of the repository.
    token is `feos-ingress-join-<secret>.<pin>`; an answer without
    `"kind":"ingress"`, or with a `feos-join-` token, came from an older
    instance: discard it.
-2. The namespace, the pull secret `oci-pull` as for `ferun`, and the
+2. The namespace, the pull secret `ghcr-pull` as for `ferun`, and the
    tokens under the instances' names (only each pod's init container
    mounts this Secret, and copies the pod's own token for it):
 
        kubectl create namespace ferun-ingress
-       kubectl -n ferun-ingress create secret docker-registry oci-pull ...
+       kubectl -n ferun-ingress create secret docker-registry ghcr-pull ...
        kubectl -n ferun-ingress create secret generic ferun-ingress-join \
          --from-literal=ferun-ingress-0=<token> --from-literal=ferun-ingress-1=<token> \
          --from-literal=ferun-ingress-2=<token>
