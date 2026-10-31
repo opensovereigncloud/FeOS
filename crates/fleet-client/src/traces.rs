@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! The pods' spans (ADR 0026 §10, docs/architecture/traces.md, "The

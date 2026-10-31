@@ -212,9 +212,13 @@ pub async fn route_unreachable(handle: &Handle, prefix: Ipv6Addr, len: u8) -> io
         )))
 }
 
-/// Makes `name` a dummy device that holds `address`, as a host address,
+/// Makes `name` a dummy device that holds `addresses`, as host addresses,
 /// and no other global address.
-pub async fn dummy_with_address(handle: &Handle, name: &str, address: IpAddr) -> io::Result<()> {
+pub async fn dummy_with_addresses(
+    handle: &Handle,
+    name: &str,
+    addresses: &[IpAddr],
+) -> io::Result<()> {
     if link(handle, name).await?.is_none() {
         handle
             .link()
@@ -227,17 +231,23 @@ pub async fn dummy_with_address(handle: &Handle, name: &str, address: IpAddr) ->
     let index = index(handle, name).await?;
     own_ipv6(name)?;
     up(handle, index, name).await?;
-    let len = if address.is_ipv4() { 32 } else { 128 };
-    let stale = addresses(handle, index)
-        .await?
-        .into_iter()
+    let host = |address: &IpAddr| (*address, if address.is_ipv4() { 32 } else { 128 });
+    let wanted: Vec<(IpAddr, u8)> = addresses.iter().map(host).collect();
+    let held = self::addresses(handle, index).await?;
+    let stale = held
+        .iter()
         .filter(|message| {
             message.header.scope == AddressScope::Universe
-                && (address_of(message) != Some(address) || message.header.prefix_len != len)
+                && !address_of(message)
+                    .is_some_and(|address| wanted.contains(&(address, message.header.prefix_len)))
         })
+        .cloned()
         .collect();
     remove_addresses(handle, name, stale).await?;
-    add_address(handle, index, address, len).await
+    for (address, len) in wanted {
+        add_address(handle, index, address, len).await?;
+    }
+    Ok(())
 }
 
 /// A pod's link, as [`tap`] makes it.
@@ -254,13 +264,17 @@ pub struct PodLink {
     /// metadata service of its own; the microVM's MMDS takes the guest's
     /// answers to that address for its own, and the node never hears them.
     pub node4: Ipv4Addr,
+    /// The node's address for the pod's spans, OTLP's, on the link too, so
+    /// that ARP for it is answered (`arp_ignore` 1).
+    pub otlp4: Ipv4Addr,
     pub ipv6: Ipv6Addr,
     pub ipv4: Ipv4Addr,
 }
 
 /// Makes the pod's TAP device a link of its own between the node and the
 /// pod (ADR 0010): without router advertisements or addresses of the
-/// kernel's, and with one IPv4 address, `node4` as a /32; the node is
+/// kernel's, and with two IPv4 addresses, `node4` first and `otlp4`, as
+/// /32s; the node is
 /// `gateway` on it and answers ARP for `gateway4` by proxy, at once; the
 /// pod's addresses are routed to it.
 pub async fn tap(handle: &Handle, name: &str, pod: &PodLink) -> io::Result<()> {
@@ -274,15 +288,21 @@ pub async fn tap(handle: &Handle, name: &str, pod: &PodLink) -> io::Result<()> {
     pod_ipv4(name)?;
     up(handle, index, name).await?;
     let node4 = IpAddr::V4(pod.node4);
+    let otlp4 = IpAddr::V4(pod.otlp4);
     let ipv4 = addresses(handle, index)
         .await?
         .into_iter()
         .filter(|message| message.header.family == AddressFamily::Inet)
-        .filter(|message| (address_of(message), message.header.prefix_len) != (Some(node4), 32))
+        .filter(|message| {
+            message.header.prefix_len != 32
+                || !address_of(message).is_some_and(|address| [node4, otlp4].contains(&address))
+        })
         .collect();
     remove_addresses(handle, name, ipv4).await?;
     add_address(handle, index, pod.gateway.into(), 64).await?;
+    // The first, from which the node's ARP asks (`arp_announce` 2).
     add_address(handle, index, node4, 32).await?;
+    add_address(handle, index, otlp4, 32).await?;
     route_to(handle, index, name, pod.ipv6.into()).await?;
     route_to(handle, index, name, pod.ipv4.into()).await?;
     handle
@@ -383,6 +403,7 @@ mod tests {
     use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute};
     use rtnetlink::LinkVeth;
     use std::fs::File;
+    use std::net::SocketAddr;
     use std::os::fd::AsRawFd;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -391,11 +412,14 @@ mod tests {
         gateway: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
         gateway4: Ipv4Addr::new(169, 254, 0, 1),
         node4: Ipv4Addr::new(169, 254, 0, 53),
+        otlp4: Ipv4Addr::new(169, 254, 169, 1),
         ipv6: Ipv6Addr::new(0xfd00, 0xfe05, 1, 0, 0, 0, 0, 2),
         ipv4: Ipv4Addr::new(169, 254, 16, 1),
     };
     /// Where the guest sends a packet, through its gateway.
     const OUTSIDE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 99);
+    /// What the guest sends the node's OTLP port.
+    const SPANS: &[u8] = b"spans";
 
     /// Whether this process has a network namespace of its own: no device
     /// but loopback.
@@ -495,7 +519,8 @@ mod tests {
     /// holds the pod's IPv4 /32 and routes everything via the gateway on
     /// its link, as feos-guest does. It sends `OUTSIDE` a packet and
     /// returns how long the gateway's MAC address took to resolve, and
-    /// what it resolved to. The node says when the link is here, and when
+    /// what it resolved to, once it sent `SPANS` to OTLP's port at the
+    /// node. The node says when the link is here, and when
     /// its end is up after the guest's (`up`).
     fn guest(
         namespace: mpsc::Sender<File>,
@@ -564,7 +589,12 @@ mod tests {
                     if let (true, NeighbourState::Reachable, Some(mac)) =
                         (gateway, neighbour.header.state, mac)
                     {
-                        return Ok((start.elapsed(), mac));
+                        let took = start.elapsed();
+                        let otlp = SocketAddr::new(POD.otlp4.into(), 4318);
+                        let mut stream =
+                            std::net::TcpStream::connect_timeout(&otlp, Duration::from_secs(3))?;
+                        std::io::Write::write_all(&mut stream, SPANS)?;
+                        return Ok((took, mac));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -603,7 +633,22 @@ mod tests {
             .output_interface(uplink)
             .build();
         handle.route().add(default).execute().await.unwrap();
+        // As on IronCore: link-local addresses on the uplink's link.
+        let link_local = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(Ipv4Addr::new(169, 254, 0, 0), 16)
+            .scope(RouteScope::Link)
+            .output_interface(uplink)
+            .build();
+        handle.route().add(link_local).execute().await.unwrap();
         enable_forwarding().unwrap();
+        // The resolver's device, with OTLP's address too, and the node's
+        // listener there.
+        dummy_with_addresses(&handle, "feos-dns", &[POD.node4.into(), POD.otlp4.into()])
+            .await
+            .unwrap();
+        let otlp = tokio::net::TcpListener::bind((POD.otlp4, 4318))
+            .await
+            .unwrap();
         assert_eq!(read("/proc/sys/net/ipv4/ip_forward"), "1");
         assert_eq!(read("/proc/sys/net/ipv6/conf/all/forwarding"), "1");
 
@@ -642,8 +687,12 @@ mod tests {
         }
         assert_eq!(
             addresses_on(&handle, tap).await,
-            [(IpAddr::V4(POD.node4), 32), (IpAddr::V6(POD.gateway), 64)],
-            "fe80::1 and the node's IPv4 /32 alone"
+            [
+                (IpAddr::V4(POD.node4), 32),
+                (IpAddr::V4(POD.otlp4), 32),
+                (IpAddr::V6(POD.gateway), 64)
+            ],
+            "fe80::1 and the node's IPv4 /32s alone"
         );
         assert_eq!(
             routes_to(&handle, tap).await,
@@ -685,7 +734,18 @@ mod tests {
         link_is_here.send(()).unwrap();
 
         // The guest asks for its gateway, and the node answers by proxy,
-        // at once, with the TAP device's MAC address.
+        // at once, with the TAP device's MAC address; then it reaches the
+        // node's OTLP port from its own address.
+        let (mut stream, from) = tokio::time::timeout(Duration::from_secs(5), otlp.accept())
+            .await
+            .expect("the guest reaches OTLP's address")
+            .unwrap();
+        assert_eq!(from.ip(), IpAddr::V4(POD.ipv4));
+        let mut sent = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut sent)
+            .await
+            .unwrap();
+        assert_eq!(sent, SPANS);
         let (took, mac) = guest.join().unwrap().unwrap();
         let device = link(&handle, "pod-test").await.unwrap().unwrap();
         let tap_mac = device
@@ -707,18 +767,23 @@ mod tests {
         assert!(proxies(&handle).await.is_empty());
         assert!(routes_to(&handle, tap).await.is_empty());
 
-        // The resolver's device holds its address alone, of either family.
+        // The resolver's device holds its addresses alone, of either
+        // family.
         let resolver: IpAddr = "169.254.0.53".parse().unwrap();
-        dummy_with_address(&handle, "feos-dns", "fd00::53".parse().unwrap())
+        let otlp: IpAddr = "169.254.169.1".parse().unwrap();
+        dummy_with_addresses(&handle, "feos-dns", &["fd00::53".parse().unwrap()])
             .await
             .unwrap();
         let dns = index(&handle, "feos-dns").await.unwrap();
         add_address(&handle, dns, resolver, 24).await.unwrap();
         for _ in 0..2 {
-            dummy_with_address(&handle, "feos-dns", resolver)
+            dummy_with_addresses(&handle, "feos-dns", &[resolver, otlp])
                 .await
                 .unwrap();
-            assert_eq!(addresses_on(&handle, dns).await, [(resolver, 32)]);
+            assert_eq!(
+                addresses_on(&handle, dns).await,
+                [(resolver, 32), (otlp, 32)]
+            );
         }
     }
 }

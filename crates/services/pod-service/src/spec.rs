@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn a_pod_with_a_network_gets_otels_variables_its_own_win() {
-        let otlp = Ipv4Addr::new(169, 254, 0, 53);
+        let otlp = Ipv4Addr::new(169, 254, 169, 1);
         let map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
             pairs
                 .iter()
@@ -600,7 +600,7 @@ mod tests {
                 ("A", "1"),
                 (
                     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-                    "http://169.254.0.53:4318/v1/traces"
+                    "http://169.254.169.1:4318/v1/traces"
                 ),
                 ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
                 ("OTEL_SERVICE_NAME", "web"),

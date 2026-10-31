@@ -10,7 +10,7 @@
 //!   the cluster's ULA through another device than the one it is routed
 //!   to, the mesh's or a pod's TAP.
 //! - `input` takes neighbor discovery, DNS to the resolver and OTLP to its
-//!   address (docs/architecture/traces.md) from pods, nothing else of
+//!   own address (docs/architecture/traces.md) from pods, nothing else of
 //!   theirs.
 //! - `forward` copies the first packets of the TCP connections pods open
 //!   to nflog, passes what belongs to a connection, and sends what is new
@@ -63,16 +63,18 @@ const ND_NEIGHBOR_SOLICIT: u8 = 135;
 const ND_NEIGHBOR_ADVERT: u8 = 136;
 const ND_REDIRECT: u8 = 137;
 const DNS_PORT: u16 = 53;
-/// OTLP's ports, gRPC and HTTP, at the resolver's address.
+/// OTLP's ports, gRPC and HTTP.
 pub const OTLP_PORTS: (u16, u16) = (4317, 4318);
 
 /// What the table needs besides the policy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     /// The resolver's address (`--dns-address`, ADR 0010), which pods
-    /// reach at port 53 over UDP and TCP, and at OTLP's ports over TCP: an
-    /// IPv4 address.
+    /// reach at port 53 over UDP and TCP: an IPv4 address.
     pub dns: IpAddr,
+    /// OTLP's address (`--otlp-address`), which pods reach at
+    /// [`OTLP_PORTS`] over TCP.
+    pub otlp: IpAddr,
     /// The pods' IPv4 addresses (`--pod-ipv4-range`), which are
     /// masqueraded where they leave the node.
     pub ipv4_range: (Ipv4Addr, u8),
@@ -335,10 +337,11 @@ fn prerouting(options: &Options) -> Vec<Rule> {
 }
 
 fn input(options: &Options) -> Vec<Rule> {
-    let resolver = match options.dns {
+    let daddr = |address| match address {
         IpAddr::V4(address) => ipv4_daddr(CmpOp::Eq, address),
         IpAddr::V6(address) => ipv6_daddr(CmpOp::Eq, address),
     };
+    let resolver = daddr(options.dns);
     let dns = |protocol| {
         [
             from_pods(),
@@ -366,7 +369,7 @@ fn input(options: &Options) -> Vec<Rule> {
         dns(TCP),
         [
             from_pods(),
-            resolver.clone(),
+            daddr(options.otlp),
             l4proto(TCP),
             th_dport_range(OTLP_PORTS.0, OTLP_PORTS.1),
             verdict(Verdict::Accept),
@@ -443,6 +446,7 @@ mod tests {
     fn options() -> Options {
         Options {
             dns: IpAddr::V4(v4("169.254.0.53")),
+            otlp: IpAddr::V4(v4("169.254.169.1")),
             ipv4_range: (v4("169.254.16.0"), 20),
             mesh: None,
         }
@@ -814,7 +818,7 @@ mod tests {
             rules[4],
             [
                 from_pods(),
-                resolver.clone(),
+                ipv4_daddr(CmpOp::Eq, v4("169.254.169.1")),
                 l4proto(TCP),
                 th_dport(CmpOp::Gte, 4317),
                 th_dport(CmpOp::Lte, 4318),
@@ -1073,7 +1077,7 @@ mod tests {
                 "iifname \"pod-*\" icmp type redirect drop",
                 "iifname \"pod-*\" ip daddr 169.254.0.53 udp dport 53 accept",
                 "iifname \"pod-*\" ip daddr 169.254.0.53 tcp dport 53 accept",
-                "iifname \"pod-*\" ip daddr 169.254.0.53 tcp dport 4317-4318 accept",
+                "iifname \"pod-*\" ip daddr 169.254.169.1 tcp dport 4317-4318 accept",
                 "ip saddr 169.254.16.0/20 oifname != \"pod-*\" masquerade",
                 "elements = { 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 192.0.2.7, 224.0.0.0/4 }",
             ] {

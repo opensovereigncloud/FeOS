@@ -57,7 +57,13 @@ pub const GATEWAY4: Ipv4Addr = Ipv4Addr::new(169, 254, 0, 1);
 /// The pods' IPv4 addresses by default (`--pod-ipv4-range`): 4096, of
 /// which the first and the last are left out.
 pub const POD_IPV4_RANGE: (Ipv4Addr, u8) = (Ipv4Addr::new(169, 254, 16, 0), 20);
-/// The device that holds the resolver's address.
+/// The node's address for its pods' spans by default (`--otlp-address`,
+/// docs/architecture/traces.md).
+pub const OTLP_ADDRESS: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 1);
+/// The metadata service's address in many clouds, which the node does not
+/// take for its own.
+const METADATA: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+/// The device that holds the resolver's address, and OTLP's.
 pub const DNS_DEVICE: &str = "feos-dns";
 /// The node's default upstream resolvers: Google's and Cloudflare's.
 pub const DNS_UPSTREAMS: [&str; 4] = [
@@ -94,6 +100,8 @@ pub struct Config {
     pub pod_ipv4_range: (Ipv4Addr, u8),
     /// The resolver's address on every node (`--dns-address`).
     pub dns_address: Ipv4Addr,
+    /// Where pods send their spans, on every node (`--otlp-address`).
+    pub otlp_address: Ipv4Addr,
     /// The upstreams of pods that name none (`--dns-upstream`).
     pub dns_upstreams: Vec<IpAddr>,
     /// What no pod reaches (`--deny-prefix`), of either family.
@@ -107,6 +115,7 @@ impl Default for Config {
             mesh: None,
             pod_ipv4_range: POD_IPV4_RANGE,
             dns_address: dns_service::ADDRESS,
+            otlp_address: OTLP_ADDRESS,
             dns_upstreams: DNS_UPSTREAMS
                 .iter()
                 .filter_map(|address| address.parse().ok())
@@ -118,21 +127,53 @@ impl Default for Config {
 
 impl Config {
     /// Checks what the flags say together: the node holds the resolver's
-    /// address, so it must be one of a host and neither the pods' gateway
-    /// nor in their range; and the range must not hold the gateway.
+    /// address and OTLP's, so each must be one of a host and neither the
+    /// pods' gateway nor in their range; OTLP's is neither the resolver's
+    /// nor a metadata service's nor denied; and the range must not hold
+    /// the gateway.
     pub fn check(&self) -> Result<(), String> {
-        let dns = self.dns_address;
-        if dns.is_unspecified() || dns.is_loopback() || dns.is_multicast() || dns.is_broadcast() {
-            return Err(format!("the DNS address {dns} is not one a host has"));
+        let (dns, otlp) = (self.dns_address, self.otlp_address);
+        for (what, address) in [("DNS", dns), ("OTLP", otlp)] {
+            if address.is_unspecified()
+                || address.is_loopback()
+                || address.is_multicast()
+                || address.is_broadcast()
+            {
+                return Err(format!(
+                    "the {what} address {address} is not one a host has"
+                ));
+            }
+            if address == GATEWAY4 {
+                return Err(format!(
+                    "the {what} address {address} is the pods' gateway, which the node must not hold"
+                ));
+            }
         }
-        if dns == GATEWAY4 {
+        if otlp == dns {
+            return Err(format!("the OTLP address {otlp} is the DNS address"));
+        }
+        if otlp == METADATA {
             return Err(format!(
-                "the DNS address {dns} is the pods' gateway, which the node must not hold"
+                "the OTLP address {otlp} is a metadata service's in many clouds"
+            ));
+        }
+        let host = Prefix::V4(otlp, 32);
+        if let Some(denied) = self
+            .deny_prefixes
+            .iter()
+            .find(|denied| denied.contains(&host))
+        {
+            return Err(format!(
+                "the OTLP address {otlp} is in the denied prefix {denied}"
             ));
         }
         let (range, len) = self.pod_ipv4_range;
         let range = Prefix::V4(range, len);
-        for (what, address) in [("the DNS address", dns), ("the pods' gateway", GATEWAY4)] {
+        for (what, address) in [
+            ("the DNS address", dns),
+            ("the OTLP address", otlp),
+            ("the pods' gateway", GATEWAY4),
+        ] {
             if range.contains(&Prefix::V4(address, 32)) {
                 return Err(format!(
                     "the pods' IPv4 range {range} holds {what} {address}"
@@ -411,12 +452,10 @@ impl Network {
         &self.names
     }
 
-    /// Where the node takes its pods' spans (docs/architecture/traces.md):
-    /// the resolver's address, the node's one IPv4 address on their links,
-    /// at [`OTLP_PORTS`]. The pods' gateway would do for them, but the node
-    /// does not hold it.
+    /// Where the node takes its pods' spans (docs/architecture/traces.md),
+    /// at [`OTLP_PORTS`]: an address it holds as it does the resolver's.
     pub fn otlp_address(&self) -> Ipv4Addr {
-        self.config.dns_address
+        self.config.otlp_address
     }
 
     /// The parts, if the network works.
@@ -836,6 +875,7 @@ impl Network {
             gateway: GATEWAY,
             gateway4: GATEWAY4,
             node4: self.config.dns_address,
+            otlp4: self.config.otlp_address,
             ipv6,
             ipv4,
         };
@@ -981,6 +1021,7 @@ impl Network {
     fn rules(&self) -> rules::Options {
         rules::Options {
             dns: IpAddr::V4(self.config.dns_address),
+            otlp: IpAddr::V4(self.config.otlp_address),
             ipv4_range: self.config.pod_ipv4_range,
             mesh: self
                 .mesh
@@ -1034,7 +1075,12 @@ async fn set_up(
     let handle = devices::connect().await?;
     devices::enable_forwarding()?;
     devices::route_unreachable(&handle, prefix, len).await?;
-    devices::dummy_with_address(&handle, DNS_DEVICE, config.dns_address.into()).await?;
+    devices::dummy_with_addresses(
+        &handle,
+        DNS_DEVICE,
+        &[config.dns_address.into(), config.otlp_address.into()],
+    )
+    .await?;
 
     let resolver = Resolver::new(dns_service::Config {
         default_upstreams: config
@@ -1091,8 +1137,9 @@ async fn set_up(
 fn log_set_up(config: &Config, (prefix, len): (Ipv6Addr, u8)) {
     let (range, range_len) = config.pod_ipv4_range;
     info!(
-        "Network: Pods get addresses of {prefix}/{len} and {range}/{range_len}, DNS at {}",
-        config.dns_address
+        "Network: Pods get addresses of {prefix}/{len} and {range}/{range_len}, DNS at {}, \
+         OTLP at {}",
+        config.dns_address, config.otlp_address
     );
 }
 
@@ -1439,6 +1486,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.dns_upstreams.len(), 4);
         assert_eq!(config.dns_address, Ipv4Addr::new(169, 254, 0, 53));
+        assert_eq!(config.otlp_address, Ipv4Addr::new(169, 254, 169, 1));
         assert_eq!(config.pod_ipv4_range, (Ipv4Addr::new(169, 254, 16, 0), 20));
         assert_eq!(config.check(), Ok(()));
     }
@@ -1463,6 +1511,35 @@ mod tests {
             ("10.77.0.53", "169.254.0.0/30"),
         ] {
             assert!(config(dns, range).check().is_err(), "{dns} and {range}");
+        }
+        // OTLP's address, as the resolver's, and neither it nor a metadata
+        // service's nor denied.
+        let otlp = |otlp: &str, range: &str, denied: &[&str]| Config {
+            otlp_address: otlp.parse().unwrap(),
+            pod_ipv4_range: parse_pod_ipv4_range(range).unwrap(),
+            deny_prefixes: denied.iter().map(|p| p.parse().unwrap()).collect(),
+            ..Config::default()
+        };
+        assert_eq!(
+            otlp("169.254.169.1", "169.254.16.0/20", &[]).check(),
+            Ok(())
+        );
+        assert_eq!(otlp("10.77.0.17", "169.254.16.0/20", &[]).check(), Ok(()));
+        for (address, range, denied) in [
+            ("169.254.0.1", "169.254.16.0/20", &[][..]),
+            ("169.254.0.53", "169.254.16.0/20", &[]),
+            ("169.254.169.254", "169.254.16.0/20", &[]),
+            ("0.0.0.0", "169.254.16.0/20", &[]),
+            ("127.0.0.1", "169.254.16.0/20", &[]),
+            ("169.254.16.9", "169.254.16.0/20", &[]),
+            ("169.254.169.1", "169.254.0.0/16", &[]),
+            ("169.254.169.1", "169.254.16.0/20", &["169.254.169.0/24"]),
+            ("169.254.169.1", "169.254.16.0/20", &["169.254.169.1/32"]),
+        ] {
+            assert!(
+                otlp(address, range, denied).check().is_err(),
+                "{address} and {range}, denied {denied:?}"
+            );
         }
     }
 

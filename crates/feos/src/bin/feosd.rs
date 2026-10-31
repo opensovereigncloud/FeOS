@@ -18,7 +18,7 @@ const STATE_LOCK: &str = "/var/lib/feos/feosd.lock";
 
 const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix PREFIX]
              [--pod-ipv4-range PREFIX] [--dns-address ADDRESS]
-             [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
+             [--otlp-address ADDRESS] [--dns-upstream ADDRESS]... [--deny-prefix PREFIX]...
              [--diskd-socket PATH] [--vms-cgroup PATH] [--suspend-on-stop]
              [--stop-grace SECONDS]
              [--control-plane HOST:PORT [--control-plane-name NAME]
@@ -39,6 +39,9 @@ const USAGE: &str = "usage: feosd [--tcp ADDRESS] [--self-upgrade] [--pod-prefix
                            default
   --dns-address ADDRESS    the pods' resolver, an IPv4 address the node holds;
                            169.254.0.53 by default
+  --otlp-address ADDRESS   where pods send their spans over OTLP, ports 4317
+                           and 4318, an IPv4 address the node holds as the
+                           resolver's; 169.254.169.1 by default
   --dns-upstream ADDRESS   an upstream resolver of pods that name none
                            (repeatable); Google's and Cloudflare's by default
   --deny-prefix PREFIX     a prefix of either family no pod reaches
@@ -150,6 +153,12 @@ impl Args {
                     network.dns_address = address
                         .parse()
                         .with_context(|| format!("--dns-address {address}: an IPv4 address"))?;
+                }
+                "--otlp-address" => {
+                    let address = value("an address")?;
+                    network.otlp_address = address
+                        .parse()
+                        .with_context(|| format!("--otlp-address {address}: an IPv4 address"))?;
                 }
                 "--dns-upstream" => {
                     let address = value("an address")?;
@@ -558,6 +567,12 @@ mod tests {
             &["--dns-address", "fd00::53"],
             &["--dns-address", "169.254.0.1"],
             &["--dns-address", "169.254.16.53"],
+            &["--otlp-address", "fd00::1"],
+            &["--otlp-address", "169.254.0.1"],
+            &["--otlp-address", "169.254.0.53"],
+            &["--otlp-address", "169.254.169.254"],
+            &["--otlp-address", "169.254.16.9"],
+            &["--otlp-address", "10.0.0.1", "--deny-prefix", "10.0.0.0/8"],
             &["--dns-upstream", "dns.google"],
             &["--deny-prefix", "169.254.169.254"],
         ] {
@@ -577,6 +592,8 @@ mod tests {
             "10.77.16.0/24",
             "--dns-address",
             "10.77.0.53",
+            "--otlp-address",
+            "10.77.0.17",
             "--dns-upstream",
             "9.9.9.9",
             "--dns-upstream",
@@ -596,6 +613,10 @@ mod tests {
         assert_eq!(
             network.dns_address,
             "10.77.0.53".parse::<std::net::Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            network.otlp_address,
+            "10.77.0.17".parse::<std::net::Ipv4Addr>().unwrap()
         );
         assert_eq!(
             network.dns_upstreams,

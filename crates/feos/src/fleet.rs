@@ -116,7 +116,7 @@ impl Senders for PodSenders {
     }
 }
 
-/// Takes the pods' spans at the resolver's address, once the pods'
+/// Takes the pods' spans at OTLP's address, once the pods'
 /// network is there, and sends them on to the sink over the logs' channel
 /// (docs/architecture/traces.md).
 fn take_spans(pods: &Pods, shipper: Shipper) -> Traces {

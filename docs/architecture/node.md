@@ -446,7 +446,8 @@ resolver) and `traffic-service` (the records).
 |---|---|---|
 | `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120, such as a /64, AWS's /80 or GCP's /96. Without, a node with `--control-plane` takes a /96 of its cluster's [mesh](#the-mesh) |
 | `--pod-ipv4-range PREFIX` | `169.254.16.0/20` | the pods' IPv4 addresses, a /32 each; /1 to /30, with neither the resolver's address nor `169.254.0.1` in it |
-| `--dns-address ADDRESS` | `169.254.0.53` | the pods' resolver, an IPv4 address that the node holds, the same on every node; never `169.254.0.1`. The node takes the pods' spans there too ([traces.md](traces.md)) |
+| `--dns-address ADDRESS` | `169.254.0.53` | the pods' resolver, an IPv4 address that the node holds, the same on every node; never `169.254.0.1` |
+| `--otlp-address ADDRESS` | `169.254.169.1` | where pods send their spans over OTLP ([traces.md](traces.md)), an IPv4 address that the node holds as the resolver's, the same on every node; never `169.254.0.1`, the resolver's, `169.254.169.254`, in the pods' range or in a denied prefix |
 | `--dns-upstream ADDRESS` | Google's and Cloudflare's, IPv6 first | the upstreams of pods that name none (repeatable) |
 | `--deny-prefix PREFIX` | none | what no pod reaches, of either family (repeatable) |
 
@@ -475,12 +476,12 @@ At its start `feosd`:
    advertisements (`accept_ra` 1) go on taking them (2);
 3. routes the pod prefix as `unreachable`: a packet for a pod that is not
    here goes back as unreachable rather than out again;
-4. gives the dummy device `feos-dns` the resolver's address as a /32, and
-   no other global address, and takes the resolver's UDP and TCP sockets
+4. gives the dummy device `feos-dns` the resolver's address and OTLP's
+   as /32s, and no other global address, and takes the resolver's UDP and TCP sockets
    at it, port 53, that were handed to it ([DNS](#dns)), or binds them.
 
 Of the pods' addresses on their links, the node holds the resolver's
-alone. It never holds `169.254.0.1`: where that is the gateway of the
+and OTLP's alone. It never holds `169.254.0.1`: where that is the gateway of the
 node's own network, as in some clouds, the node would lose its own.
 
 Before every boot and resume of a pod, `feosd` makes its TAP device,
@@ -490,9 +491,10 @@ the pod:
 
 - no router advertisements, no address autoconfiguration and no
   link-local address of the kernel's, set before it goes up;
-- the resolver's address, `169.254.0.53/32`, its one IPv4 address; ARP
+- the resolver's address, `169.254.0.53/32`, its first IPv4 address,
+  and OTLP's, `169.254.169.1/32`, its only other; ARP
   answered only for addresses on the device (`arp_ignore` 1), and asked
-  from that address (`arp_announce` 2); forwarding on. Without an address
+  from the first (`arp_announce` 2); forwarding on. Without an address
   of its own, the TAP's ARP for the pod would ask from any address of the
   node, such as `169.254.169.254`, which some hosts hold on `lo` for a
   metadata service of their own; the microVM's MMDS takes every ARP frame
@@ -694,7 +696,7 @@ traffic is not theirs:
 | Chain | What it does |
 |---|---|
 | `prerouting` (filter, -150) | from a pod's TAP: drops packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), of either family, logged as `spoofed`, and router advertisements and redirects of both families; on a mesh, the same for a source in the cluster's ULA through any device |
-| `input` | from pods takes neighbor solicitations and advertisements, DNS to the resolver's address over UDP and TCP, and OTLP there, TCP ports 4317 and 4318 ([traces.md](traces.md)), and drops the rest |
+| `input` | from pods takes neighbor solicitations and advertisements, DNS to the resolver's address over UDP and TCP, and OTLP to OTLP's address, TCP ports 4317 and 4318 ([traces.md](traces.md)), and drops the rest |
 | `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), of both families, before anything else; accepts what belongs to a connection; drops invalid packets from and to pods; then jumps to `from-pods` what comes from a TAP and to `to-pods` what goes to one |
 | `from-pods`, `to-pods` | go through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) to the pod's chains, and drop and log (`no-rule`) what a TAP the maps do not have sends or receives, such as one whose rules failed to be written |
 | `out-<TAP>`, `in-<TAP>` | a pod's chains: drop and log (`deny`) what goes to or comes from a denied address, `return` what a rule of the pod's groups allows, drop and log (`no-rule`) the rest; `out-` of both families, `in-` of IPv6 alone, since nothing new comes in over IPv4 |
