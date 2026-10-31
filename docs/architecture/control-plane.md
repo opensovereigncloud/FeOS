@@ -117,7 +117,7 @@ token of an instance of `ferun-sink` ([The sink](#the-sink)).
 | `--shutdown-grace` | `11m` | how long a stopping instance waits for its requests, its tool calls and its ops |
 | `--activity-retention`, `--traffic-retention`, `--access-log-retention` | `720h`, `168h`, `168h` | how long activity, traffic records and the ingress's access log are kept |
 | `--sink-endpoint` | none | `host:port` of the sink's ingest ([The sink](#the-sink)), named in every telemetry answer to the nodes, which ship their pods' logs there; a name (a headless Service's) is resolved every 10 s and each node is given one of its addresses, the same while it is there, since a node neither resolves the cluster's names nor reaches its ClusterIPs; empty: nothing is shipped |
-| `--sink-url` | none | the sink's HTTP API inside the cluster, e.g. `http://ferun-sink:8080`, which the logs calls read first; empty: the nodes only |
+| `--sink-url` | none | the sink's HTTP API inside the cluster, e.g. `http://ferun-sink:8080`, which the logs calls and the access log read first; empty: the nodes and `access_logs` only |
 | `--log-level` | `info` | |
 
 Fixed timings, not flags (`internal/config`): an instance's heartbeat every
@@ -2504,7 +2504,7 @@ name; one the tenant does not have is 404 "no such environment".
 | `POST …/{env}/clone` `{name, id?, release?, spec?, labels?, secrets?, author?, data?}` | 201 the new environment's status; 409 `id_taken` before the spec is planned, `name_taken`; 422 findings |
 | `GET …/{env}/secrets`, `PUT`, `DELETE …/secrets/{name}` | the names with their latest versions; `{name, version}`; 204, 409 while pinned |
 | `GET …/{env}/incidents[?open=1]`, `…/incidents/{id}` | newest first; one |
-| `GET …/{env}/access-logs[?limit=200&beforeTsNs=&traceId=]` | `{records}`: the newest page of the ingress's access log before `beforeTsNs` (a record's `tsNs`, a string), at most 1000, ascending, of the trace `traceId` (32 lower case hex digits; else 400) when given; each `{tsNs, time, durationNs, ingress, service, instance, host, method, path, proto, status, outcome, attempts, heldNs, bytesIn, bytesOut, clientIp, userAgent, traceId, spanId, parentSpanId}` ([ingress.md](ingress.md#access-log)) |
+| `GET …/{env}/access-logs[?limit=200&beforeTsNs=&traceId=]` | `{records}`: the newest page of the ingress's access log before `beforeTsNs` (a record's `tsNs`, a string), at most 1000, ascending, of the trace `traceId` (32 lower case hex digits; else 400) when given; with `--sink-url` the sink's first ([The sink](#the-sink)); each `{tsNs, time, durationNs, ingress, service, instance, host, method, path, proto, status, outcome, attempts, heldNs, bytesIn, bytesOut, clientIp, userAgent, traceId, spanId, parentSpanId}` ([ingress.md](ingress.md#access-log)) |
 | `GET …/{env}/objects/{kind}/{name}/logs?lines=200&replica=0` | `{lines, source}`, the source `container` or `process`; with `--sink-url` a container's log is the sink's first ([The sink](#the-sink)); 501; 409 "paused" (unless the sink has the instance's lines), `not_running` (also for a replica without an instance yet, or none at all); 404 for a replica beyond the object's ([Logs](#probes-exits-and-restarts)) |
 | `POST …/{env}/services/{name}/restart` | 202: an image service's replicas one at a time, each waited for until it is live again, up to 5 minutes, or an attached service's process |
 | `POST …/{env}/jobs/{name}/run` | 202; 409 `busy` "job X runs already (release N, attempt M)" with `Retry-After: 30` while a run of the job runs, of any release; 409 `not_ready` |
@@ -3018,6 +3018,15 @@ nor waits for. `ferund`'s part:
   its kept tail when the sink has none; a running job's sink lines are
   redacted of its secrets again. An attached service's process log is
   the node's.
+- **The access log.** With `--sink-url` and the caller's bearer,
+  `…/access-logs` reads the ingress's lines of the environment from the
+  sink (ADR 0026 §8): `GET <sink-url>/api/v1/logs?environment=<ID>&source=ingress&direction=backward&since=0&until=<beforeTsNs − 1>&trace=<traceId>&limit=<the rest>`,
+  paged by its `cursor` (at most 8 pages) until `limit` records, each
+  line's JSON an `AccessLogRecord`. When the sink has fewer, the table
+  `access_logs` gives the rest of the page, older than the sink's oldest
+  record (or before `beforeTsNs`); a failing sink leaves the whole page
+  to the table. With an ingress that writes into the sink
+  (`--sink-endpoint` of ferun-ingress) the table only ages out.
 - **`GET /api/v1/tenant`** (tenant class): `{"tenant": "<name>"}`, the
   token's tenant, which the sink asks for its readers; 401 otherwise.
 - **Service tokens.** `ferund service-token --kind sink --name <name>`
