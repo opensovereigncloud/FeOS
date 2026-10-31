@@ -5,6 +5,7 @@ package sink
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -308,7 +309,42 @@ func parseRecord(r *logsv1.LogRecord, now time.Time) (Line, int64, error) {
 	}
 	ln.Text = cleanText(anyText(r.GetBody()))
 	ln.Level, ln.Trace = Extract(ln.Text)
+	// The record's own trace ID and severity win (ADR 0026 §10).
+	if id := r.GetTraceId(); len(id) == 16 && !allZero(id) {
+		ln.Trace = hex.EncodeToString(id)
+	}
+	if ln.Level == LevelUnknown {
+		if lvl := severityLevel(int32(r.GetSeverityNumber())); lvl != 0 {
+			ln.Level = lvl
+		}
+	}
 	return ln, next, nil
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// severityLevel is the level of an OTLP severity number, 0 for none:
+// 1 to 8 (TRACE, DEBUG) debug, 9 to 12 info, 13 to 16 warn, 17 to 24
+// (ERROR, FATAL) error.
+func severityLevel(n int32) int {
+	switch {
+	case n >= 17 && n <= 24:
+		return LevelError
+	case n >= 13 && n <= 16:
+		return LevelWarn
+	case n >= 9 && n <= 12:
+		return LevelInfo
+	case n >= 1 && n <= 8:
+		return LevelDebug
+	}
+	return 0
 }
 
 // cleanText makes s valid UTF-8 without NULs.

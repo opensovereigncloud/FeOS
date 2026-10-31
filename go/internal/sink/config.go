@@ -3,14 +3,15 @@
 
 // Package sink is ferun-sink, the platform's log store (ADR 0026,
 // docs/architecture/sink.md): the nodes' OTLP log ingest over mTLS, the
-// hot stage in its PostgreSQL, the cold stage of gzip NDJSON chunks in an
-// S3 bucket, the read API for tenants, and retention.
+// hot stage in its PostgreSQL, the cold stage in Quickwit's indexes (§10),
+// the read API for tenants, and retention.
 //
 // Every flag has an environment variable FERUN_SINK_<NAME> (the flag's
 // name in upper snake case); a flag given wins over its variable. The
 // secrets come from variables only: SINK_SERVICE_TOKEN, the sink's
 // service token at ferund, and SINK_BUCKET_ACCESS_KEY and
-// SINK_BUCKET_SECRET_KEY, the bucket's keys.
+// SINK_BUCKET_SECRET_KEY, the keys of the bucket of the chunks made
+// before the index, while there are some.
 package sink
 
 import (
@@ -60,8 +61,13 @@ type Config struct {
 	FerunURL string
 	// ServiceToken is the sink's service token at ferund.
 	ServiceToken string
-	// The bucket of the cold stage: its endpoint, region, name and keys,
-	// and the prefix of every object key.
+	// The index (ADR 0026 §10): Quickwit's indexers for ingest, its
+	// searchers for everything else, and the prefix of the log indexes'
+	// names (<prefix>-<days>d).
+	IndexIngestURL, IndexSearchURL, IndexPrefix string
+	// The bucket of the chunks made before the index, until they are
+	// moved: its endpoint, region, name and keys, and the prefix of every
+	// object key. No endpoint: none.
 	BucketEndpoint, BucketRegion, Bucket, BucketPrefix string
 	BucketAccessKey, BucketSecretKey                   string
 	// Retention is how long lines are kept, unless a stream asks for
@@ -72,13 +78,14 @@ type Config struct {
 	LogLevel  slog.Level
 	LogFormat string
 
-	// Tunables, not flags: a stream's lines become a chunk at ChunkBytes
-	// or when the oldest is ChunkAge old; the cold stage looks for streams
-	// due every ChunkInterval, the sweep runs every SweepInterval; a follow
+	// CommitTimeout is the indexes' commit interval: a line is searchable
+	// at most this long after it is stored (Quickwit's
+	// commit_timeout_secs, set when an index is made).
+	CommitTimeout time.Duration
+	// Tunables, not flags: the cold stage looks for streams with hot lines
+	// every ChunkInterval, the sweep runs every SweepInterval; a follow
 	// polls every FollowPoll and sends {} after Heartbeat without a line; a
 	// read scans at most ScanLimit bytes of lines.
-	ChunkBytes    int64
-	ChunkAge      time.Duration
 	ChunkInterval time.Duration
 	SweepInterval time.Duration
 	FollowPoll    time.Duration
@@ -95,9 +102,9 @@ func Default() Config {
 		RetentionMax:  9600 * time.Hour,
 		LogLevel:      slog.LevelInfo,
 		LogFormat:     LogFormatJSON,
-		ChunkBytes:    1 << 20,
-		ChunkAge:      10 * time.Minute,
-		ChunkInterval: 2 * time.Second,
+		IndexPrefix:   "ferun-logs",
+		CommitTimeout: 10 * time.Second,
+		ChunkInterval: time.Second,
 		SweepInterval: 10 * time.Minute,
 		FollowPoll:    500 * time.Millisecond,
 		Heartbeat:     15 * time.Second,
@@ -141,9 +148,13 @@ func register(fs *flag.FlagSet, c *Config) *string {
 	fs.StringVar(&c.DatabaseURL, "database-url", c.DatabaseURL, "the sink's PostgreSQL database (required); PGPASSWORD may hold the password")
 	fs.StringVar(&c.TrustDomain, "trust-domain", c.TrustDomain, "the SPIFFE trust domain (required)")
 	fs.StringVar(&c.FerunURL, "ferun-url", c.FerunURL, "ferund's API inside the cluster, e.g. http://ferund.ferun.svc:8100 (required)")
-	fs.StringVar(&c.BucketEndpoint, "bucket-endpoint", c.BucketEndpoint, "the S3 API's base URL, path-style (required)")
-	fs.StringVar(&c.BucketRegion, "bucket-region", c.BucketRegion, "the bucket's signing region: auto for Cloudflare R2 (required)")
-	fs.StringVar(&c.Bucket, "bucket", c.Bucket, "the bucket (required)")
+	fs.StringVar(&c.IndexIngestURL, "index-ingest-url", c.IndexIngestURL, "Quickwit's indexers, e.g. http://quickwit-indexer:7280 (required)")
+	fs.StringVar(&c.IndexSearchURL, "index-search-url", c.IndexSearchURL, "Quickwit's searchers, e.g. http://quickwit-searcher:7280 (required)")
+	fs.StringVar(&c.IndexPrefix, "index-prefix", c.IndexPrefix, "the prefix of the log indexes' names, <prefix>-<days>d")
+	fs.DurationVar(&c.CommitTimeout, "index-commit-timeout", c.CommitTimeout, "how soon a line is searchable in the index, whole seconds (a new index's commit_timeout_secs)")
+	fs.StringVar(&c.BucketEndpoint, "bucket-endpoint", c.BucketEndpoint, "the S3 API's base URL, path-style, of the chunks made before the index; empty: none")
+	fs.StringVar(&c.BucketRegion, "bucket-region", c.BucketRegion, "the bucket's signing region: auto for Cloudflare R2")
+	fs.StringVar(&c.Bucket, "bucket", c.Bucket, "the bucket of the chunks made before the index")
 	fs.StringVar(&c.BucketPrefix, "bucket-prefix", c.BucketPrefix, "the prefix of every object key, e.g. sink/; empty: none")
 	fs.DurationVar(&c.Retention, "log-retention", c.Retention, "how long lines are kept, unless a stream asks for longer")
 	fs.DurationVar(&c.RetentionMax, "log-retention-max", c.RetentionMax, "the longest a stream may ask for (ferun.retention_days)")
@@ -180,11 +191,24 @@ func (c *Config) Validate() error {
 	if c.ServiceToken == "" {
 		bad("%s is required", EnvServiceToken)
 	}
-	if c.BucketEndpoint == "" || c.BucketRegion == "" || c.Bucket == "" {
-		bad("--bucket-endpoint, --bucket-region and --bucket are required")
+	for _, u := range []struct{ flag, v string }{{"--index-ingest-url", c.IndexIngestURL}, {"--index-search-url", c.IndexSearchURL}} {
+		if p, err := url.Parse(u.v); u.v == "" || err != nil || (p.Scheme != "http" && p.Scheme != "https") || p.Host == "" {
+			bad("%s must be an http(s) URL", u.flag)
+		}
 	}
-	if c.BucketAccessKey == "" || c.BucketSecretKey == "" {
-		bad("%s and %s are required", EnvBucketAccessKey, EnvBucketSecretKey)
+	if c.IndexPrefix == "" || strings.ContainsAny(c.IndexPrefix, "*/ ") {
+		bad("--index-prefix must be a name")
+	}
+	if c.CommitTimeout < time.Second || c.CommitTimeout%time.Second != 0 {
+		bad("--index-commit-timeout must be whole seconds, at least one")
+	}
+	if c.BucketEndpoint != "" {
+		if c.BucketRegion == "" || c.Bucket == "" {
+			bad("--bucket-region and --bucket are required with --bucket-endpoint")
+		}
+		if c.BucketAccessKey == "" || c.BucketSecretKey == "" {
+			bad("%s and %s are required with --bucket-endpoint", EnvBucketAccessKey, EnvBucketSecretKey)
+		}
 	}
 	if strings.HasPrefix(c.BucketPrefix, "/") {
 		bad("--bucket-prefix must not start with a slash")

@@ -11,6 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
 // The sweep's bounds: the chunks one round deletes, and the objects
@@ -45,46 +47,15 @@ func (s *Store) RunSweep(ctx context.Context) error {
 }
 
 // Sweep deletes what is past its stream's retention (by the lines' times
-// and the database's clock): chunks, each object first and its row after;
-// hot lines; trace rows; then the streams with nothing left, the usage of
-// days before yesterday, and the hot stage's empty partitions of past
-// days, after making those ahead. Several instances may sweep at once.
+// and the database's clock): hot lines, then the streams with nothing
+// left in the database (the index drops their lines by its own retention,
+// at least as long: ADR 0026 §10; a read finds no line of a stream that
+// is gone), the usage of days before yesterday, and the hot stage's empty
+// partitions of past days, after making those ahead. Several instances
+// may sweep at once.
 func (s *Store) Sweep(ctx context.Context) error {
 	def, maxRet := s.cfg.Retention.Nanoseconds(), s.cfg.RetentionMax.Nanoseconds()
 	var errs []error
-	for {
-		rows, err := s.db.Pool.Query(ctx, `SELECT c.id, c.key FROM log_chunks c JOIN log_streams s ON s.id = c.stream_id
-			WHERE c.last_ns < `+nowNs+` - `+retentionNs+` ORDER BY c.last_ns LIMIT $3`, def, maxRet, sweepBatch)
-		if err != nil {
-			return fmt.Errorf("expired chunks: %w", err)
-		}
-		type ck struct {
-			id  int64
-			key string
-		}
-		cs, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (ck, error) {
-			var c ck
-			return c, r.Scan(&c.id, &c.key)
-		})
-		if err != nil {
-			return fmt.Errorf("expired chunks: %w", err)
-		}
-		ids := make([]int64, len(cs))
-		keys := make([]string, len(cs))
-		for i, c := range cs {
-			ids[i], keys[i] = c.id, c.key
-		}
-		n, err := s.deleteChunks(ctx, ids, keys)
-		if err != nil {
-			errs = append(errs, err)
-		}
-		if n > 0 {
-			s.log.Info("deleted expired chunks", "chunks", n)
-		}
-		if err != nil || len(cs) < sweepBatch {
-			break
-		}
-	}
 	if _, err := s.db.Pool.Exec(ctx, `WITH d AS (DELETE FROM log_lines l USING log_streams s
 			WHERE l.stream_id = s.id AND l.ts < `+nowNs+` - `+retentionNs+`
 			RETURNING l.stream_id, octet_length(l.text) AS b),
@@ -93,10 +64,6 @@ func (s *Store) Sweep(ctx context.Context) error {
 		FROM g WHERE s.id = g.stream_id`, def, maxRet); err != nil {
 		errs = append(errs, fmt.Errorf("expired hot lines: %w", err))
 	}
-	if _, err := s.db.Pool.Exec(ctx, `DELETE FROM log_traces t USING log_streams s
-		WHERE t.stream_id = s.id AND t.ts < `+nowNs+` - `+retentionNs, def, maxRet); err != nil {
-		errs = append(errs, fmt.Errorf("expired traces: %w", err))
-	}
 	tag, err := s.db.Pool.Exec(ctx, `DELETE FROM log_streams s
 		WHERE s.hot_lines = 0 AND s.chunk_owner IS NULL
 			AND NOT EXISTS (SELECT 1 FROM log_chunks c WHERE c.stream_id = s.id)
@@ -104,7 +71,7 @@ func (s *Store) Sweep(ctx context.Context) error {
 			AND coalesce(s.last_ns, (extract(epoch FROM s.created_at) * 1000000000)::bigint) < `+nowNs+` - `+retentionNs,
 		def, maxRet)
 	if err != nil {
-		errs = append(errs, fmt.Errorf("empty streams: %w", err))
+		errs = append(errs, fmt.Errorf("expired streams: %w", err))
 	} else if tag.RowsAffected() > 0 {
 		s.log.Info("deleted expired streams", "streams", tag.RowsAffected())
 	}
@@ -124,6 +91,10 @@ func (s *Store) Sweep(ctx context.Context) error {
 // deleteChunks deletes chunks: each object, then the rows of those whose
 // object went. It returns how many rows it deleted.
 func (s *Store) deleteChunks(ctx context.Context, ids []int64, keys []string) (int, error) {
+	if s.bucket == nil {
+		_, err := s.db.Pool.Exec(ctx, `DELETE FROM log_chunks WHERE id = ANY($1)`, ids)
+		return len(ids), err
+	}
 	okIDs := make([]int64, 0, len(ids))
 	ok := make([]bool, len(ids))
 	g, gctx := errgroup.WithContext(ctx)
@@ -155,19 +126,32 @@ func (s *Store) deleteChunks(ctx context.Context, ids []int64, keys []string) (i
 }
 
 // DeleteStreams deletes a tenant's streams of an environment or a job:
-// their chunks (objects, then rows), then the streams with their lines and
-// trace rows. It returns how many streams went.
+// it leaves a delete task of them in every log index (Quickwit removes
+// their lines when it rewrites their splits; until then no read finds
+// them, their streams being gone), deletes the chunks of before (objects,
+// then rows), then the streams with their hot lines. It returns how many
+// streams went.
 func (s *Store) DeleteStreams(ctx context.Context, tenant, environment, job string) (int, error) {
 	sel := Selector{Environment: environment, Job: job}
 	streams, err := selectStreams(ctx, s.db.Pool, tenant, streamFilter{sel: sel, limit: maxStreamsRead})
 	if err != nil {
 		return 0, err
 	}
+	if len(streams) > 0 {
+		ids, err := s.index.Indexes(ctx, s.cfg.IndexPrefix+"-")
+		if err != nil {
+			return 0, fmt.Errorf("index: %w", err)
+		}
+		for _, id := range ids {
+			if err := s.index.Delete(ctx, id, quickwit.Query{Tenant: tenant, Environment: environment, Job: job}); err != nil {
+				return 0, fmt.Errorf("index %s: delete: %w", id, err)
+			}
+		}
+	}
 	gone := 0
 	for _, st := range streams {
-		// A chunk made while its stream goes is deleted by its maker;
-		// one recorded meanwhile keeps the stream (no cascade), and the
-		// next round takes it.
+		// A chunk of before is moved or deleted; one moved meanwhile
+		// keeps nothing.
 		for range 3 {
 			rows, err := s.db.Pool.Query(ctx, `SELECT id, key FROM log_chunks WHERE stream_id = $1`, st.ID)
 			if err != nil {
@@ -188,11 +172,13 @@ func (s *Store) DeleteStreams(ctx context.Context, tenant, environment, job stri
 			if err := rows.Err(); err != nil {
 				return gone, err
 			}
-			if _, err := s.deleteChunks(ctx, ids, keys); err != nil {
-				return gone, err
+			if len(ids) > 0 {
+				if _, err := s.deleteChunks(ctx, ids, keys); err != nil {
+					return gone, err
+				}
 			}
-			// The stream's lock keeps the cold stage from recording a
-			// chunk until it is gone; then it finds it gone.
+			// The stream's lock keeps the cold stage from moving its mark
+			// until it is gone; then it finds it gone.
 			deleted := false
 			err = s.db.Tx(ctx, func(tx pgx.Tx) error {
 				deleted = false

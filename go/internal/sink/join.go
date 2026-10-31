@@ -10,6 +10,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
 // maxJoined bounds a joined line's text; one cut there stays partial.
@@ -66,45 +68,53 @@ func (j *joiner) finish(partial bool) bool {
 
 // joinParts completes each partial head of a read with the lines that go
 // on with it, those at or below bound[stream] (the read's snapshot): from
-// the stream's chunks, then its hot lines, read in one snapshot. A head
-// whose rest is not there stays partial.
-func (s *Store) joinParts(ctx context.Context, heads []Line, bound map[int64]int64) error {
+// the index up to the stream's mark, then its hot lines, the mark and the
+// hot lines read in one snapshot. A head whose rest is not there stays
+// partial.
+func (s *Store) joinParts(ctx context.Context, tenant string, heads []Line, streams map[int64]*streamRow,
+	bound map[int64]int64) error {
 	for i := range heads {
 		h := &heads[i]
 		if !h.Partial || h.Cont {
 			continue
 		}
 		upTo, ok := bound[h.Stream]
-		if !ok || upTo <= h.Off {
+		st := streams[h.Stream]
+		if !ok || st == nil || upTo <= h.Off {
 			continue
 		}
 		tx, err := s.db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 		if err != nil {
 			return err
 		}
-		chunks, hot, err := partsOf(ctx, tx, h, upTo)
+		mark, hot, err := partsOf(ctx, tx, h, upTo)
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 		if err != nil {
 			return fmt.Errorf("the rest of a partial line: %w", err)
 		}
-		j := newJoiner(h)
-		for _, c := range chunks {
-			lines, err := s.readChunk(ctx, c)
+		var cold []quickwit.Doc
+		if to := min(mark, upTo); to > h.Off {
+			from := h.Off
+			cold, err = s.index.Search(ctx, s.indexPattern(), quickwit.Query{Tenant: tenant, Stream: st.SID,
+				IOStream: h.Source, OffAfter: &from, OffTo: &to, Order: quickwit.ByOffset, Max: 2000})
 			if err != nil {
-				return err
+				return fmt.Errorf("the rest of a partial line: index: %w", err)
 			}
-			for k := range lines {
-				l := &lines[k]
-				if l.Source == h.Source && l.Off > h.Off && l.Off <= upTo && j.add(l) {
-					break
-				}
+		}
+		j := newJoiner(h)
+		last := h.Off
+		for k := range cold {
+			if cold[k].Off <= last {
+				continue // the index's second copy
 			}
-			if j.done {
+			last = cold[k].Off
+			l := lineOf(cold[k], h.Stream)
+			if j.add(&l) {
 				break
 			}
 		}
 		for k := range hot {
-			if j.add(&hot[k]) {
+			if j.done || j.add(&hot[k]) {
 				break
 			}
 		}
@@ -115,30 +125,22 @@ func (s *Store) joinParts(ctx context.Context, heads []Line, bound map[int64]int
 	return nil
 }
 
-// partsOf lists the chunks of h's stream after h and reads the hot lines
-// of its source after it, at most up to upTo.
-func partsOf(ctx context.Context, tx pgx.Tx, h *Line, upTo int64) ([]chunkRef, []Line, error) {
-	rows, err := tx.Query(ctx, `SELECT id, stream_id, first_ns, last_ns, bytes, first_off, last_off, key FROM log_chunks
-		WHERE stream_id = $1 AND last_off > $2 AND first_off <= $3 ORDER BY first_off LIMIT 64`, h.Stream, h.Off, upTo)
-	if err != nil {
-		return nil, nil, err
+// partsOf reads the mark of h's stream and the hot lines of its source
+// after h, at most up to upTo.
+func partsOf(ctx context.Context, tx pgx.Tx, h *Line, upTo int64) (int64, []Line, error) {
+	var mark int64
+	if err := tx.QueryRow(ctx, `SELECT chunked_last FROM log_streams WHERE id = $1`, h.Stream).Scan(&mark); err != nil {
+		return 0, nil, err
 	}
-	chunks, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (chunkRef, error) {
-		var c chunkRef
-		return c, r.Scan(&c.id, &c.stream, &c.firstNs, &c.lastNs, &c.bytes, &c.firstOff, &c.lastOff, &c.key)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	rows, err = tx.Query(ctx, `SELECT off, partial, cont, text FROM log_lines
+	rows, err := tx.Query(ctx, `SELECT off, partial, cont, text FROM log_lines
 		WHERE stream_id = $1 AND source = $2 AND off > $3 AND off <= $4 ORDER BY off LIMIT 2000`,
 		h.Stream, h.Source, h.Off, upTo)
 	if err != nil {
-		return nil, nil, err
+		return 0, nil, err
 	}
 	hot, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Line, error) {
 		l := Line{Stream: h.Stream, Source: h.Source}
 		return l, r.Scan(&l.Off, &l.Partial, &l.Cont, &l.Text)
 	})
-	return chunks, hot, err
+	return mark, hot, err
 }

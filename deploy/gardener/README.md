@@ -34,6 +34,13 @@ address, ferun-ingress's.
  *.<APPS_ZONE> ── LoadBalancer ── ferun-ingress (2) ── over feos-mesh to the pods
 ```
 
+
+The shoot `fecode` itself is deployed by Flux from a landscape
+repository of its own, with these manifests rendered and its images
+pinned there: on it, the `push-*` targets push an image, and a release
+is a commit to the landscape, not a `deploy-*` or `apply-*` target, whose
+changes Flux sets back.
+
 ## What it needs
 
 - A shoot of three workers or more, one for each instance of
@@ -402,16 +409,32 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
        make -C deploy/gardener apply-ferun-sink
        kubectl -n ferun rollout status deployment/ferun-sink --timeout=5m
 
-5. ferund tells the nodes where to ship (`--sink-endpoint
+5. Quickwit, the index and cold store (ADR 0026 §10): the role
+   `quickwit` of `ferun-db` (step 1's way, in the Secret
+   `ferun-quickwit-db`), then its database, its NetworkPolicy and the
+   Helm release of [`quickwit/values.yaml`](quickwit/values.yaml) (the
+   chart 0.8.17 with Quickwit 0.9.3's image; its splits in the sink's
+   bucket under `quickwit/`, keys of `ferun-sink-bucket`):
+
+       kubectl -n ferun create secret generic ferun-quickwit-db --type=kubernetes.io/basic-auth \
+         --from-literal=username=quickwit --from-literal=password="$(openssl rand -hex 24)"
+       make -C deploy/gardener apply-ferun apply-quickwit
+
+   The sink makes its indexes (`ferun-logs-<days>d`) itself.
+
+6. ferund tells the nodes where to ship (`--sink-endpoint
    ferun-sink-ingest.ferun.svc.cluster.local:4317`, which it resolves
    every 10 s and hands each node one ready instance) and reads from the
    sink (`--sink-url http://ferun-sink.ferun.svc:8080`).
 
 A new image: `make -C deploy/gardener deploy-ferun-sink TAG=<tag>`
 pushes it and rolls the instances. Lines are kept 30 days
-(`FERUN_SINK_LOG_RETENTION`), a tenant's job asks for up to 400
-(`FERUN_SINK_LOG_RETENTION_MAX`); the chunks lie at
-`<prefix>logs/<tenant>/<stream>/<first offset>.ndjson.gz`.
+(`FERUN_SINK_LOG_RETENTION`, the index `ferun-logs-30d`), a tenant's job
+asks for up to 400 (`FERUN_SINK_LOG_RETENTION_MAX`, `ferun-logs-400d`).
+The chunks the sink wrote before Quickwit
+(`<prefix>logs/<tenant>/<stream>/<first offset>.ndjson.gz`) move into
+the index by themselves; once `log_chunks` is empty the bucket's
+variables can go.
 
 ## Moving the database
 

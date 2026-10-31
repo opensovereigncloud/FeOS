@@ -3,14 +3,15 @@
 `ferun-sink` keeps the platform's logs (ADR 0026): every container's
 output of the pods FeRun makes, shipped by the nodes, and the requests
 `ferun-ingress` answered, written by its instances, kept in its
-PostgreSQL first and in the object store after, and read by tenants over
-HTTP. This page is the contract between its parts; the ADR says why.
+PostgreSQL first and in Quickwit's indexes after (ADR 0026 §10), and
+read by tenants over HTTP. This page is the contract between its parts;
+the ADR says why.
 
 ```
 guest ──CRI lines──▶ logs/container.log
                          │ StreamContainerLogs(follow, from_offset)
 feosd (node) ──OTLP LogsService/Export, SinkService (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `sink`
-     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ object store logs/…
+     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Quickwit ferun-logs-<days>d (splits in the object store)
 ferund ──CreatePodRequest.log_labels──▶ feosd                                │
      ◀── GET /api/v1/tenant (a tenant's token) ──────────────────────────────┤
 tenants (FeCode) ── GET /api/v1/logs, /api/v1/log-streams (Bearer) ──────────┘
@@ -234,40 +235,61 @@ Bearer …`); the sink asks `ferund` `GET /api/v1/tenant` with it (`200
 by the token's SHA-256.
 
 **Stages.** `log_streams` (one row per stream key: labels, first and last
-time, next offset, ended; its ID `s_` and 16 random hex digits),
-`log_lines` (hot: stream, offset, time, source, level, partial, text,
-and `cont`: the line goes on with the last of its source, which was
-partial; partitioned by the day it arrived), `log_chunks` (stream,
-first and last offset and time, lines, bytes, levels as a bit set, the
-object's key), `log_traces` (trace ID, stream, time). A stream's lines
-become a chunk at 1 MiB, when the oldest is 10 min old, or when the
-stream ends: gzip NDJSON (`{"o":offset,"t":ns,"s":"stdout","l":"error","p":true,"x":"text"}`
-a line, `"c":true` for `cont`; `s`, `l`, `p` and `c` left out when empty
-or false) at
-`<prefix>logs/<tenant>/<stream id>/<first offset>.ndjson.gz`, at most 16
-MiB of text a chunk, claimed with `FOR UPDATE SKIP LOCKED` and a lease of
-two minutes (the database's clock), the row written and the lines
-deleted in one transaction after the upload. The object store is S3 with
-SigV4 at path-style URLs (`--bucket-endpoint`, `--bucket`,
-`--bucket-region`, `auto` for Cloudflare R2, `--bucket-prefix`, keys
-from `SINK_BUCKET_ACCESS_KEY`, `SINK_BUCKET_SECRET_KEY`), signed with
-the standard library.
+time, next offset, ended, `chunked_last`, the mark of what the index
+holds; its ID `s_` and 16 random hex digits) and `log_lines` (hot:
+stream, offset, time, source, level, partial, text, trace ID, and
+`cont`: the line goes on with the last of its source, which was partial;
+partitioned by the day it arrived) in the database; the cold stage is
+Quickwit (§10). Every second, four loops of each instance claim streams
+with hot lines (at most 32 a round, `FOR UPDATE SKIP LOCKED`, a lease of
+three minutes of the database's clock), send their lines, oldest offset
+first and at most 6 MiB of text a round, to the stream's index with
+`commit=wait_for`, and once Quickwit answers, the split holding them
+published, delete them and move the mark past them, in one transaction a
+stream. A failure of the index holds the round's claims for 30 s. A
+stream's index is `<--index-prefix>-<days>d` (`ferun-logs`): the days of
+`--log-retention`, or of `--log-retention-max` for a stream whose
+`ferun.retention_days` is longer than the default; the sink makes an
+index it does not find (Quickwit's index API), with its retention and
+`--index-commit-timeout` (10 s) as its commit interval. A document is a
+line with its stream's labels: `ts` (ns, the time field), `tenant` (a
+tag), `stream` (the ID), `environment`, `kind`, `object`, `replica`,
+`release`, `instance`, `container`, `job`, `attempt`, `source`,
+`iostream`, `level` (the bit), `trace_id`, `off`, `partial`, `cont`, and
+`text` (Quickwit's `default` tokenizer, with positions). Quickwit has no
+key of its own: a batch sent again is indexed again, and the reads take
+one (stream, offset) once. `--index-ingest-url` names Quickwit's
+indexers, `--index-search-url` its searchers (every other call).
 
-**Level** (§6): a JSON line's `level`, `lvl` or `severity` (a word, or a
+**Chunks of before.** Until 2026-10-31 the cold stage wrote gzip NDJSON
+chunks to the object store (`log_chunks`; `{"o":offset,"t":ns,"s":"stdout","l":"error","p":true,"c":true,"x":"text"}`
+a line at `<prefix>logs/<tenant>/<stream id>/<first offset>.ndjson.gz`).
+With `--bucket-endpoint` (S3 with SigV4 at path-style URLs, `--bucket`,
+`--bucket-region`, `--bucket-prefix`, keys from `SINK_BUCKET_ACCESS_KEY`
+and `SINK_BUCKET_SECRET_KEY`), one instance at a time moves them into the
+index, eight a minute: their lines indexed, then the row and the object
+deleted. Without it, nothing reads them.
+
+**Level** (§6): an OTLP record's severity number when the text gives
+none (1 to 8 debug, 9 to 12 info, 13 to 16 warn, 17 to 24 error); a JSON line's `level`, `lvl` or `severity` (a word, or a
 number on pino's scale: 50 and above error, 40 warn, 30 info, 10 and 20
 debug); else a leading `ERROR`, `WARN`, `WARNING`, `INFO`, `DEBUG`,
 `TRACE`, `FATAL`, `PANIC` (bare, `[…]`, or `level=…`, also after a
 leading `time=` or `ts=` field, as Go's slog writes it), case
 insensitive; mapped to `error` (also fatal, panic, critical), `warn`,
-`info`, `debug` (also trace), or `` (unknown). **Trace ID**: a JSON line's `trace_id`,
+`info`, `debug` (also trace), or `` (unknown). **Trace ID**: an OTLP
+record's `trace_id`, else a JSON line's `trace_id`,
 `traceId` or `traceparent` (its second field): 32 lowercase hex, not all
 zero.
 
 **Retention**: `--log-retention` (720 h) or a stream's
 `ferun.retention_days`, at most `--log-retention-max` (9600 h); a sweep
-every 10 min deletes expired chunks (object, then row), hot lines and
-trace rows by the lines' times, the streams with nothing left, and drops
-empty day partitions of `log_lines`.
+every 10 min deletes expired hot lines by their times, the streams whose
+last line is past their retention and that have nothing left in the
+database, and drops empty day partitions of `log_lines`. Quickwit drops a
+split of an index once its newest line is past the index's retention,
+which is at least the stream's; a read never answers a line of a stream
+that is gone.
 
 ## Reading
 
@@ -279,7 +301,7 @@ All routes need a tenant's token and answer only its streams.
 |---|---|
 | `environment`, `kind`, `object`, `replica`, `instance`, `container`, `job`, `attempt`, `stream`, `source` | the selector; one of `environment`, `job`, `instance`, `stream` is required; `source` is `ingress` or `container` (none: both) |
 | `since`, `until` | RFC 3339 or Unix nanoseconds, both included; `until` defaults to now, `since` to `until` − 1 h (backward) or to the stream's start (forward), and, with `trace`, to the start of what is kept |
-| `q` | words that all appear, case insensitive; `-word` must not |
+| `q` | words that all appear, case insensitive; `-word` must not. The index finds whole words (`erro` finds no `error`; a word with punctuation, `user_id=42`, as a phrase); a line it found must then hold each word as a substring |
 | `re` | an RE2 expression |
 | `level` | a comma list of `error`, `warn`, `info`, `debug`, `unknown` |
 | `trace` | a trace ID |
@@ -335,7 +357,7 @@ most 500.
 
 ### `DELETE /api/v1/log-streams?environment=<id>` or `?job=<id>`
 
-Deletes the streams, their lines and chunks. 204.
+Deletes the streams and their hot lines, and leaves a delete task of the environment's or job's lines in every log index (Quickwit removes them when its janitor rewrites their splits; no read finds them meanwhile). 204.
 
 ## `ferund`
 

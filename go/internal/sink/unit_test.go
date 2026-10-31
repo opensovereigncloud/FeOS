@@ -289,8 +289,9 @@ func TestConfig(t *testing.T) {
 		"FERUN_SINK_NAME": "sink-0", "FERUN_SINK_DATABASE_URL": "postgres://x/sink", "FERUN_SINK_TRUST_DOMAIN": "run.example.com",
 		"FERUN_SINK_FERUN_URL": "http://ferund:8100", "FERUN_SINK_BUCKET_ENDPOINT": "https://acc.eu.r2.cloudflarestorage.com",
 		"FERUN_SINK_BUCKET_REGION": "auto", "FERUN_SINK_BUCKET": "fecode-dev", "FERUN_SINK_BUCKET_PREFIX": "sink",
-		"FERUN_SINK_LOG_QUOTA": "1GiB",
-		EnvServiceToken:        "tok", EnvBucketAccessKey: "ak", EnvBucketSecretKey: "sk",
+		"FERUN_SINK_LOG_QUOTA": "1GiB", "FERUN_SINK_INDEX_INGEST_URL": "http://quickwit-indexer:7280",
+		"FERUN_SINK_INDEX_SEARCH_URL": "http://quickwit-searcher:7280",
+		EnvServiceToken:               "tok", EnvBucketAccessKey: "ak", EnvBucketSecretKey: "sk",
 	}
 	c, err := Parse([]string{"--log-retention", "24h"}, func(k string) string { return env[k] })
 	if err != nil {
@@ -299,6 +300,24 @@ func TestConfig(t *testing.T) {
 	if c.Name != "sink-0" || c.Retention != 24*time.Hour || c.Quota != 1<<30 || c.ServiceToken != "tok" || c.keyPrefix() != "sink/" {
 		t.Errorf("config %+v", c)
 	}
+	if c.IndexPrefix != "ferun-logs" || c.CommitTimeout != 10*time.Second {
+		t.Errorf("index %q, commit %v", c.IndexPrefix, c.CommitTimeout)
+	}
+	// The bucket is only for the chunks of before: without it, no keys.
+	noBucket := map[string]string{}
+	for k, v := range env {
+		if !strings.Contains(k, "BUCKET") {
+			noBucket[k] = v
+		}
+	}
+	if _, err := Parse(nil, func(k string) string { return noBucket[k] }); err != nil {
+		t.Errorf("without a bucket: %v", err)
+	}
+	delete(env, "FERUN_SINK_INDEX_SEARCH_URL")
+	if _, err := Parse(nil, func(k string) string { return env[k] }); err == nil {
+		t.Error("no index passed")
+	}
+	env["FERUN_SINK_INDEX_SEARCH_URL"] = "http://quickwit-searcher:7280"
 	delete(env, EnvServiceToken)
 	if _, err := Parse(nil, func(k string) string { return env[k] }); err == nil {
 		t.Error("no service token passed")

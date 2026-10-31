@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Beside Quickwit's Helm release (values.yaml): its metastore's database
+# in ferun-db, owned by the role quickwit (ferun/postgres.yaml), and the
+# NetworkPolicy that is its only lock: Quickwit has no authentication,
+# so only its own pods and ferun-sink reach it (ADR 0026 §10).
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: ferun-db-quickwit
+  namespace: ferun
+spec:
+  cluster:
+    name: ferun-db
+  name: quickwit
+  owner: quickwit
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: quickwit
+  namespace: ferun
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: quickwit
+  policyTypes: [Ingress]
+  ingress:
+    # Its nodes among themselves: REST, gRPC and the gossip.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: quickwit
+      ports:
+        - {port: 7280, protocol: TCP}
+        - {port: 7281, protocol: TCP}
+        - {port: 7282, protocol: UDP}
+        - {port: 7282, protocol: TCP}
+    # The sink: ingest at the indexers, everything else at the searchers.
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ferun-sink
+      ports:
+        - {port: 7280, protocol: TCP}

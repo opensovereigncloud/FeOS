@@ -6,7 +6,6 @@ package sink
 import (
 	"encoding/base64"
 	"fmt"
-	"math"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -279,7 +278,11 @@ func (q *Query) match(l *Line) bool {
 		return false
 	}
 	if q.Trace != "" {
-		if _, tr := Extract(l.Text); tr != q.Trace {
+		tr := l.Trace
+		if tr == "" {
+			_, tr = Extract(l.Text)
+		}
+		if tr != q.Trace {
 			return false
 		}
 	}
@@ -293,12 +296,4 @@ func (q *Query) inRange(l *Line) bool {
 		return false
 	}
 	return q.Cursor == nil || q.before(*q.Cursor, l.pos())
-}
-
-// chunkStart is the first place of a chunk's lines in the scan's order.
-func (q *Query) chunkStart(c chunkRef) pos {
-	if q.Forward {
-		return pos{TS: c.firstNs, Stream: math.MinInt64, Off: math.MinInt64}
-	}
-	return pos{TS: c.lastNs, Stream: math.MaxInt64, Off: math.MaxInt64}
 }

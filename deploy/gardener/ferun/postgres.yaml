@@ -99,6 +99,12 @@ spec:
         login: true
         passwordSecret:
           name: ferun-sink-db
+      # Quickwit's metastore (quickwit/, ADR 0026 §10).
+      - name: quickwit
+        ensure: present
+        login: true
+        passwordSecret:
+          name: ferun-quickwit-db
   bootstrap:
     initdb:
       database: ferun

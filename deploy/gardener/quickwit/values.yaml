@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Quickwit, the sink's index and cold store (ADR 0026 §10), as the Helm
+# chart quickwit/quickwit 0.8.17 of https://helm.quickwit.io runs it, in
+# the namespace ferun with the release name quickwit (README.md, The
+# sink). No chart ships 0.9 yet: the image is 0.9.3's, the node config
+# stays version 0.8. ${...} are this directory's parameters (envsubst);
+# QW_PG_PASSWORD and the bucket's keys come from Secrets.
+image:
+  repository: quickwit/quickwit
+  tag: v0.9.3
+  digest: sha256:7c3f5061ea7c00921205c295833f152871d057ec1a9e4c9b1d36131dacc420bd
+environment:
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom: {secretKeyRef: {name: ferun-sink-bucket, key: access-key}}
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom: {secretKeyRef: {name: ferun-sink-bucket, key: secret-key}}
+  - name: QW_PG_PASSWORD
+    valueFrom: {secretKeyRef: {name: ferun-quickwit-db, key: password}}
+  # The sink sends logs (and, next, traces) itself: no OTLP or Jaeger
+  # endpoint of Quickwit's own, and no indexes it would make for them.
+  - name: QW_ENABLE_OTLP_ENDPOINT
+    value: "false"
+  - name: QW_ENABLE_JAEGER_ENDPOINT
+    value: "false"
+config:
+  version: 0.8
+  listen_address: 0.0.0.0
+  gossip_listen_port: 7282
+  data_dir: /quickwit/qwdata
+  # Its own database in ferun-db (ferun/postgres.yaml's role quickwit).
+  metastore_uri: postgres://quickwit:${QW_PG_PASSWORD}@ferun-db-rw.ferun.svc:5432/quickwit?sslmode=require
+  default_index_root_uri: s3://${SINK_BUCKET}/quickwit/indexes
+  storage:
+    s3:
+      endpoint: ${SINK_BUCKET_ENDPOINT}
+      region: auto
+      force_path_style_access: true
+      # Cloudflare R2 takes no CRC32C on a single PUT.
+      checksum_algorithm: disabled
+  indexer:
+    split_store_max_num_bytes: 8G
+  ingest_api:
+    max_queue_memory_usage: 1GiB
+    max_queue_disk_usage: 4GiB
+searcher:
+  replicaCount: 2
+  resources:
+    requests: {cpu: 200m, memory: 1Gi}
+    limits: {memory: 4Gi}
+indexer:
+  replicaCount: 1
+  # The write-ahead log and the split store; the sink keeps a line until
+  # its split is published, so a lost volume loses nothing but time.
+  persistentVolume:
+    enabled: true
+    storage: 20Gi
+    storageClass: general-purpose
+  resources:
+    requests: {cpu: 500m, memory: 2Gi}
+    limits: {memory: 6Gi}
+metastore:
+  replicaCount: 1
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+control_plane:
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 1Gi}
+janitor:
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 2Gi}

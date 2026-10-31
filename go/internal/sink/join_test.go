@@ -20,7 +20,6 @@ func part(off int64, ms int, source, text string, partial bool) Line {
 
 func TestPartialLinesJoined(t *testing.T) {
 	cfg := testConfig()
-	cfg.ChunkBytes = 1
 	s, _ := newTestStore(t, cfg)
 	ctx := context.Background()
 	key, l := StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0)
@@ -36,7 +35,7 @@ func TestPartialLinesJoined(t *testing.T) {
 	if err := s.Ingest(ctx, batch(key, l, first)); err != nil {
 		t.Fatal(err)
 	}
-	chunkAll(t, s)
+	indexAll(t, s)
 	second := []Line{
 		part(40, 4, "stdout", "b3 needle", false),
 		part(50, 5, "stdout", "c", false),

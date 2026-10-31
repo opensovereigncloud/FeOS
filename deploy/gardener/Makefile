@@ -64,7 +64,7 @@ cat-yaml = awk 'FNR==1{print "---"}1' $(1)
 
 .PHONY: feos-node push-feos-node deploy-feos feos-k8s push-feos-k8s deploy-feos-k8s
 .PHONY: ferund push-ferund deploy-ferund deploy-ferun-ingress ferun-sink push-ferun-sink deploy-ferun-sink
-.PHONY: manifests apply-feos apply-ferun apply-ferun-db-import apply-ferun-ingress apply-ferun-sink apply-fechat apply-registry FORCE
+.PHONY: manifests apply-feos apply-ferun apply-ferun-db-import apply-ferun-ingress apply-ferun-sink apply-quickwit apply-fechat apply-registry FORCE
 
 # feosd, diskd, feosctl, Firecracker and the guest from the packages, for
 # the feos-node pod (ADR 0020).
@@ -190,6 +190,16 @@ apply-ferun-sink: $(MANIFESTS)/ferun-sink.yaml ## Apply ferun-sink, its database
 	@for s in ferun-sink-token ferun-sink-bucket ferun-sink-db; do \
 	  kubectl -n ferun get secret $$s >/dev/null 2>&1 || { echo "the secret ferun/$$s is missing (README.md, The sink)" >&2; exit 1; }; done
 	kubectl apply -f $<
+
+# Quickwit's release reads the bucket's name and endpoint from the
+# Secret ferun-sink-bucket, as the sink does.
+apply-quickwit: ## Apply Quickwit's database, NetworkPolicy and Helm release (README.md, The sink).
+	kubectl apply -f quickwit/quickwit.yaml
+	helm repo add quickwit https://helm.quickwit.io >/dev/null && helm repo update quickwit >/dev/null
+	SINK_BUCKET=$$(kubectl -n ferun get secret ferun-sink-bucket -o jsonpath='{.data.bucket}' | base64 -d) \
+	SINK_BUCKET_ENDPOINT=$$(kubectl -n ferun get secret ferun-sink-bucket -o jsonpath='{.data.endpoint}' | base64 -d) \
+	  envsubst '$${SINK_BUCKET} $${SINK_BUCKET_ENDPOINT}' <quickwit/values.yaml | \
+	  helm upgrade --install quickwit quickwit/quickwit --version 0.8.17 -n ferun -f - --wait --timeout 10m
 
 apply-fechat: $(MANIFESTS)/fechat.yaml ## Apply FeChat, the k3s manifests.
 	kubectl apply -f $<

@@ -170,11 +170,11 @@ func TestEndToEnd(t *testing.T) {
 	cfg := Default()
 	cfg.Name, cfg.Listen, cfg.IngestListen = "sink-0", "127.0.0.1:0", "127.0.0.1:0"
 	cfg.DatabaseURL, cfg.TrustDomain, cfg.FerunURL, cfg.ServiceToken = dbURL, testTD, fsrv.URL, "svc-token"
-	cfg.ChunkBytes, cfg.ChunkInterval, cfg.FollowPoll = 1, 50*time.Millisecond, 20*time.Millisecond
-	bucket := newMemBucket()
+	cfg.ChunkInterval, cfg.FollowPoll = 50*time.Millisecond, 20*time.Millisecond
+	idx := newMemIndex()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	prog, err := New(ctx, cfg, Deps{Bucket: bucket}, dbtest.Logger(t))
+	prog, err := New(ctx, cfg, Deps{Index: idx}, dbtest.Logger(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Errorf("healthz %d", resp.StatusCode)
 	}
 	// The lines move to the cold stage; the read finds them there.
-	waitFor(t, func() bool { return len(bucket.keys()) > 0 })
+	waitFor(t, func() bool { return idx.count("acme") > 0 })
 	resp, b := get("/api/v1/logs?environment=env1", "tenant-token")
 	if resp.StatusCode != 200 {
 		t.Fatalf("logs: %d %s", resp.StatusCode, b)
@@ -366,7 +366,7 @@ func TestIngressEndToEnd(t *testing.T) {
 	cfg.DatabaseURL, cfg.TrustDomain, cfg.FerunURL, cfg.ServiceToken = dbURL, testTD, fsrv.URL, "svc-token"
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	prog, err := New(ctx, cfg, Deps{Bucket: newMemBucket()}, dbtest.Logger(t))
+	prog, err := New(ctx, cfg, Deps{Index: newMemIndex()}, dbtest.Logger(t))
 	if err != nil {
 		t.Fatal(err)
 	}

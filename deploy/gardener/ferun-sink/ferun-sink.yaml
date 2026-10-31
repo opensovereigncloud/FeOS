@@ -111,6 +111,13 @@ spec:
                 secretKeyRef:
                   name: ferun-sink-token
                   key: token
+            # Quickwit, the index (quickwit/, ADR 0026 §10).
+            - name: FERUN_SINK_INDEX_INGEST_URL
+              value: http://quickwit-indexer.ferun.svc:7280
+            - name: FERUN_SINK_INDEX_SEARCH_URL
+              value: http://quickwit-searcher.ferun.svc:7280
+            # The bucket of the chunks made before the index, while there
+            # are some to move into it.
             - name: FERUN_SINK_BUCKET_ENDPOINT
               valueFrom:
                 secretKeyRef:

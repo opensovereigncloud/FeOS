@@ -20,7 +20,8 @@ import (
 	"github.com/gardenlinux/feos/go/internal/sink/s3"
 )
 
-// Bucket is the object store of the cold stage (s3.Client).
+// Bucket is the object store of the chunks made before the index
+// (s3.Client).
 type Bucket interface {
 	Put(ctx context.Context, key string, body []byte, contentType string) error
 	Get(ctx context.Context, key string, limit int64) ([]byte, error)
@@ -29,13 +30,16 @@ type Bucket interface {
 
 var _ Bucket = (*s3.Client)(nil)
 
-// Store is the sink's database and bucket: the write path, the cold
-// stage, the reads and retention.
+// Store is the sink's database and index: the write path, the cold
+// stage, the reads and retention. The bucket holds the chunks made before
+// the index (ADR 0026 §10) until they are moved; nil: none.
 type Store struct {
-	db     *db.DB
-	bucket Bucket
-	cfg    Config
-	log    *slog.Logger
+	db      *db.DB
+	bucket  Bucket
+	index   Index
+	ensured *ensured
+	cfg     Config
+	log     *slog.Logger
 	// owner names this process in a stream's chunk claim.
 	owner string
 	// scans bounds the reads that scan at once.
@@ -45,12 +49,13 @@ type Store struct {
 // maxScans is how many reads scan at once; more wait.
 const maxScans = 8
 
-// NewStore returns the store over d and bucket.
-func NewStore(d *db.DB, bucket Bucket, cfg Config, log *slog.Logger) *Store {
+// NewStore returns the store over d, index and bucket (nil: no chunks of
+// before to move).
+func NewStore(d *db.DB, index Index, bucket Bucket, cfg Config, log *slog.Logger) *Store {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b)
-	return &Store{db: d, bucket: bucket, cfg: cfg, log: log, owner: cfg.Name + "/" + hex.EncodeToString(b),
-		scans: make(chan struct{}, maxScans)}
+	return &Store{db: d, bucket: bucket, index: index, ensured: &ensured{ids: map[string]bool{}}, cfg: cfg, log: log,
+		owner: cfg.Name + "/" + hex.EncodeToString(b), scans: make(chan struct{}, maxScans)}
 }
 
 // StreamKey is a stream's key as the node names it.
@@ -83,8 +88,8 @@ type Labels struct {
 
 // Line is one stored line. Stream is the stream's row ID; Level a bit;
 // Partial says the next line of its source goes on with it, Cont that it
-// goes on with the last one; Trace the trace ID the text names (filled at
-// ingest only).
+// goes on with the last one; Trace its trace ID, the record's own or the
+// one its text names.
 type Line struct {
 	Stream        int64
 	Off, TS       int64
@@ -120,8 +125,8 @@ func newSID() (string, error) {
 
 // Ingest stores a batch in one transaction: each stream's row (its
 // labels the first write's), its lines once per offset (a line at or
-// below the last chunked one, or already hot, is taken as stored), their
-// trace IDs, the stream's counters and times, and the tenants' usage of
+// below the stream's mark, or already hot, is taken as stored), the
+// stream's counters and times, and the tenants' usage of
 // the day. A stream of a tenant over its quota is left out and Ingest
 // returns ErrQuota (wrapped) after the commit.
 func (s *Store) Ingest(ctx context.Context, batch []StreamBatch) error {
@@ -218,10 +223,9 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 	next, last := b.Next, int64(-1)
 	from := max(chunkedLast, lastOff)
 	var offs, tss []int64
-	var sources, texts []string
+	var sources, texts, traces []string
 	var levels []int16
 	var partials, conts []bool
-	traces := map[int64]Line{}
 	for _, ln := range b.Lines {
 		next = max(next, ln.Off)
 		last = max(last, ln.Off)
@@ -242,28 +246,24 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 		levels = append(levels, int16(ln.Level))
 		partials = append(partials, ln.Partial)
 		texts = append(texts, ln.Text)
-		if ln.Trace != "" {
-			traces[ln.Off] = ln
-		}
+		traces = append(traces, ln.Trace)
 	}
 	var n, bytes int64
 	var minTS, maxTS *int64
-	var trIDs []string
-	var trOffs, trTS []int64
 	if len(offs) > 0 {
-		rows, err := tx.Query(ctx, `INSERT INTO log_lines (stream_id, off, ts, source, level, partial, cont, text)
-			SELECT $1, x.off, x.ts, x.source, x.level, x.partial, x.cont, x.text
-			FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::smallint[], $6::boolean[], $7::boolean[], $8::text[])
-				AS x(off, ts, source, level, partial, cont, text)
+		rows, err := tx.Query(ctx, `INSERT INTO log_lines (stream_id, off, ts, source, level, partial, cont, text, trace)
+			SELECT $1, x.off, x.ts, x.source, x.level, x.partial, x.cont, x.text, x.trace
+			FROM unnest($2::bigint[], $3::bigint[], $4::text[], $5::smallint[], $6::boolean[], $7::boolean[], $8::text[],
+				$9::text[]) AS x(off, ts, source, level, partial, cont, text, trace)
 			WHERE NOT EXISTS (SELECT 1 FROM log_lines l WHERE l.stream_id = $1 AND l.off = x.off)
 			ON CONFLICT DO NOTHING
-			RETURNING off, ts, octet_length(text)`, id, offs, tss, sources, levels, partials, conts, texts)
+			RETURNING ts, octet_length(text)`, id, offs, tss, sources, levels, partials, conts, texts, traces)
 		if err != nil {
 			return 0, fmt.Errorf("lines: %w", err)
 		}
 		for rows.Next() {
-			var off, ts, size int64
-			if err := rows.Scan(&off, &ts, &size); err != nil {
+			var ts, size int64
+			if err := rows.Scan(&ts, &size); err != nil {
 				rows.Close()
 				return 0, err
 			}
@@ -275,20 +275,10 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 			if maxTS == nil || ts > *maxTS {
 				maxTS = &ts
 			}
-			if t, ok := traces[off]; ok {
-				trIDs, trOffs, trTS = append(trIDs, t.Trace), append(trOffs, off), append(trTS, ts)
-			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return 0, fmt.Errorf("lines: %w", err)
-		}
-	}
-	if len(trIDs) > 0 {
-		if _, err := tx.Exec(ctx, `INSERT INTO log_traces (trace_id, stream_id, off, ts)
-			SELECT x.trace_id, $1, x.off, x.ts FROM unnest($2::text[], $3::bigint[], $4::bigint[]) AS x(trace_id, off, ts)
-			ON CONFLICT DO NOTHING`, id, trIDs, trOffs, trTS); err != nil {
-			return 0, fmt.Errorf("traces: %w", err)
 		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE log_streams SET

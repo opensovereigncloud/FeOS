@@ -15,8 +15,14 @@ import (
 
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 	"github.com/gardenlinux/feos/go/internal/sink/s3"
 )
+
+// quickwitQuery selects a tenant's environment, as many as the tests hold.
+func quickwitQuery(tenant, env string) quickwit.Query {
+	return quickwit.Query{Tenant: tenant, Environment: env, Max: 100000}
+}
 
 // memBucket is a bucket in memory.
 type memBucket struct {
@@ -85,11 +91,11 @@ func newTestDB(t *testing.T) *db.DB {
 	return d
 }
 
-func newTestStore(t *testing.T, cfg Config) (*Store, *memBucket) {
+func newTestStore(t *testing.T, cfg Config) (*Store, *memIndex) {
 	t.Helper()
 	d := newTestDB(t)
-	b := newMemBucket()
-	return NewStore(d, b, cfg, dbtest.Logger(t)), b
+	idx := newMemIndex()
+	return NewStore(d, idx, newMemBucket(), cfg, dbtest.Logger(t)), idx
 }
 
 // base is the tests' time of the first line.
@@ -220,12 +226,12 @@ func TestQuota(t *testing.T) {
 	}
 }
 
-// chunkAll makes chunks until none is due.
-func chunkAll(t *testing.T, s *Store) int {
+// indexAll hands every hot line to the index.
+func indexAll(t *testing.T, s *Store) int {
 	t.Helper()
 	total := 0
 	for {
-		n, err := s.chunkRound(context.Background())
+		n, err := s.indexRound(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -236,13 +242,12 @@ func chunkAll(t *testing.T, s *Store) int {
 	}
 }
 
-func TestChunksAndQueries(t *testing.T) {
+func TestIndexAndQueries(t *testing.T) {
 	cfg := testConfig()
-	cfg.ChunkBytes = 100
-	s, bucket := newTestStore(t, cfg)
+	s, idx := newTestStore(t, cfg)
 	ctx := context.Background()
 	key1, key2 := StreamKey{"pod1", "main", "L1"}, StreamKey{"pod2", "main", "L1"}
-	// Stream 1: 30 lines, chunked in pieces; stream 2: interleaved in
+	// Stream 1: 30 lines, indexed in pieces; stream 2: interleaved in
 	// time, kept hot.
 	ln := func(prefix string) func(int) string {
 		return func(i int) string {
@@ -258,30 +263,33 @@ func TestChunksAndQueries(t *testing.T) {
 			lines(int64(i)*10, base+int64(2*i)*int64(time.Millisecond), 10, func(j int) string { return ln("a")(i + j) }))); err != nil {
 			t.Fatal(err)
 		}
-		if n := chunkAll(t, s); n != 1 {
-			t.Fatalf("%d chunks made", n)
+		if n := indexAll(t, s); n != 1 {
+			t.Fatalf("%d streams indexed", n)
 		}
 	}
-	s.cfg.ChunkBytes = 1 << 20
+	// The index holds one of the batches twice, as after an answer lost.
+	idx.dupNext = true
 	if err := s.Ingest(ctx, batch(key2, envLabels("acme", "env1", 1),
-		lines(0, base+int64(time.Millisecond), 30, func(j int) string { return ln("b")(j) }))); err != nil {
+		lines(0, base+int64(time.Millisecond), 10, func(j int) string { return ln("b")(j) }))); err != nil {
 		t.Fatal(err)
 	}
-	// Stream 2 is below the size, too young and open: stays hot.
-	chunkAll(t, s)
-	var chunks, hot int
-	if err := s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_chunks), (SELECT count(*) FROM log_lines)`).Scan(&chunks, &hot); err != nil {
+	indexAll(t, s)
+	// The rest of stream 2 stays hot.
+	if err := s.Ingest(ctx, batch(key2, envLabels("acme", "env1", 1),
+		lines(100, base+int64(11*time.Millisecond), 20, func(j int) string { return ln("b")(j + 10) }))); err != nil {
 		t.Fatal(err)
 	}
-	if chunks != 3 || hot != 30 || len(bucket.keys()) != 3 {
-		t.Fatalf("chunks %d, hot %d, objects %v", chunks, hot, bucket.keys())
+	var hot int
+	if err := s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_lines`).Scan(&hot); err != nil {
+		t.Fatal(err)
 	}
-	for _, k := range bucket.keys() {
-		if !strings.HasPrefix(k, "pre/logs/acme/s_") || !strings.HasSuffix(k, ".ndjson.gz") {
-			t.Errorf("key %s", k)
-		}
+	if n := idx.count("acme"); n != 50 || hot != 20 {
+		t.Fatalf("indexed %d, hot %d", n, hot)
 	}
-	// A line sent again after its chunk is not stored again.
+	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-30d]" {
+		t.Errorf("indexes %v", ids)
+	}
+	// A line sent again after it was indexed is not stored again.
 	if err := s.Ingest(ctx, batch(key1, envLabels("acme", "env1", 0), lines(0, base, 1, ln("a")))); err != nil {
 		t.Fatal(err)
 	}
@@ -361,9 +369,8 @@ func TestChunksAndQueries(t *testing.T) {
 	}
 }
 
-func TestTraceIndex(t *testing.T) {
+func TestTraces(t *testing.T) {
 	cfg := testConfig()
-	cfg.ChunkBytes = 1
 	s, _ := newTestStore(t, cfg)
 	ctx := context.Background()
 	other := "0af7651916cd43dd8448eb211c80319c"
@@ -377,16 +384,12 @@ func TestTraceIndex(t *testing.T) {
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base-int64(48*time.Hour), 5, text))); err != nil {
 		t.Fatal(err)
 	}
-	chunkAll(t, s)
+	indexAll(t, s)
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(100, base, 5, text))); err != nil {
 		t.Fatal(err)
 	}
-	var rows int
-	_ = s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_traces WHERE trace_id = $1`, traceA).Scan(&rows)
-	if rows != 2 {
-		t.Fatalf("%d trace rows", rows)
-	}
-	// Two days back, without since: the trace's index finds both.
+	// Two days back, without since: the index finds the old one, the hot
+	// stage the new.
 	r := mustRead(t, s, "acme", url.Values{"environment": {"e"}, "trace": {traceA}})
 	if len(r.lines) != 2 {
 		t.Errorf("trace: %d lines: %v", len(r.lines), texts(r, false))
@@ -395,10 +398,9 @@ func TestTraceIndex(t *testing.T) {
 
 func TestRetentionAndDelete(t *testing.T) {
 	cfg := testConfig()
-	cfg.ChunkBytes = 1
 	cfg.Retention = 24 * time.Hour
 	cfg.RetentionMax = 72 * time.Hour
-	s, bucket := newTestStore(t, cfg)
+	s, idx := newTestStore(t, cfg)
 	ctx := context.Background()
 	old := base - int64(30*time.Hour)
 	text := func(i int) string { return fmt.Sprintf("line %d", i) }
@@ -417,9 +419,11 @@ func TestRetentionAndDelete(t *testing.T) {
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "ancient"}, ancient, lines(0, base-int64(100*time.Hour), 1, text))); err != nil {
 		t.Fatal(err)
 	}
-	chunkAll(t, s)
-	if n := len(bucket.keys()); n != 3 {
-		t.Fatalf("%d objects", n)
+	indexAll(t, s)
+	// An index per retention: the default's, and the longest's for the
+	// streams that ask for more.
+	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-1d ferun-logs-3d]" || idx.count("acme") != 7 {
+		t.Fatalf("indexes %v, %d documents", ids, idx.count("acme"))
 	}
 	// A hot line past retention goes too.
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "short"}, short, lines(100, old, 1, text))); err != nil {
@@ -436,11 +440,17 @@ func TestRetentionAndDelete(t *testing.T) {
 		streams = append(streams, x)
 	}
 	rows.Close()
-	if fmt.Sprint(streams) != "[long]" || len(bucket.keys()) != 1 {
-		t.Errorf("after the sweep: streams %v, objects %v", streams, bucket.keys())
+	if fmt.Sprint(streams) != "[long]" {
+		t.Errorf("after the sweep: streams %v", streams)
+	}
+	// The index keeps what its own retention keeps; a read finds only the
+	// streams left.
+	r := mustRead(t, s, "acme", url.Values{"environment": {"e"}, "since": {fmt.Sprint(base - int64(200*time.Hour))}})
+	if len(r.lines) != 3 {
+		t.Errorf("after the sweep: %d lines read: %v", len(r.lines), texts(r, false))
 	}
 
-	// DELETE of an environment's streams: objects, rows, lines.
+	// DELETE of an environment's streams: rows, lines, a delete task.
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "new"}, short, lines(0, base, 2, text))); err != nil {
 		t.Fatal(err)
 	}
@@ -457,8 +467,9 @@ func TestRetentionAndDelete(t *testing.T) {
 	}
 	var left, hot int
 	_ = s.db.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_streams), (SELECT count(*) FROM log_lines)`).Scan(&left, &hot)
-	if left != 1 || hot != 2 || len(bucket.keys()) != 0 {
-		t.Errorf("after delete: %d streams, %d hot lines, objects %v", left, hot, bucket.keys())
+	envDocs, _ := idx.Search(ctx, "ferun-logs-*", quickwitQuery("acme", "e"))
+	if left != 1 || hot != 2 || len(envDocs) != 0 {
+		t.Errorf("after delete: %d streams, %d hot lines, %d documents", left, hot, len(envDocs))
 	}
 }
 
@@ -489,17 +500,16 @@ func TestPartitions(t *testing.T) {
 	}
 }
 
-func TestChunkClaimsAcrossInstances(t *testing.T) {
+func TestIndexClaimsAcrossInstances(t *testing.T) {
 	cfg := testConfig()
-	cfg.ChunkBytes = 1
 	d := newTestDB(t)
-	bucket := newMemBucket()
+	idx := newMemIndex()
 	ctx := context.Background()
 	stores := make([]*Store, 4)
 	for i := range stores {
 		c := cfg
 		c.Name = fmt.Sprintf("sink-%d", i)
-		stores[i] = NewStore(d, bucket, c, dbtest.Logger(t))
+		stores[i] = NewStore(d, idx, nil, c, dbtest.Logger(t))
 	}
 	const streams, rounds = 20, 5
 	for r := 0; r < rounds; r++ {
@@ -516,7 +526,7 @@ func TestChunkClaimsAcrossInstances(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for {
-					n, err := s.chunkRound(ctx)
+					n, err := s.indexRound(ctx)
 					if err != nil {
 						errc <- err
 						return
@@ -533,13 +543,12 @@ func TestChunkClaimsAcrossInstances(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	var chunks, hot, lineSum int
-	if err := d.Pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM log_chunks), (SELECT count(*) FROM log_lines),
-		(SELECT coalesce(sum(lines), 0) FROM log_chunks)`).Scan(&chunks, &hot, &lineSum); err != nil {
+	var hot int
+	if err := d.Pool.QueryRow(ctx, `SELECT count(*) FROM log_lines`).Scan(&hot); err != nil {
 		t.Fatal(err)
 	}
-	if chunks != streams*rounds || hot != 0 || lineSum != streams*rounds*5 || bucket.puts != streams*rounds {
-		t.Errorf("chunks %d, hot %d, lines %d, puts %d", chunks, hot, lineSum, bucket.puts)
+	if n := idx.count("acme"); hot != 0 || n != streams*rounds*5 {
+		t.Errorf("hot %d, indexed %d", hot, n)
 	}
 	r := mustRead(t, stores[1], "acme", url.Values{"environment": {"e"}, "limit": {"5000"}, "since": {fmt.Sprint(base - 1)}})
 	if len(r.lines) != streams*rounds*5 {
@@ -547,28 +556,27 @@ func TestChunkClaimsAcrossInstances(t *testing.T) {
 	}
 }
 
-func TestChunkUploadFailure(t *testing.T) {
+func TestIndexFailure(t *testing.T) {
 	cfg := testConfig()
-	cfg.ChunkBytes = 1
-	s, bucket := newTestStore(t, cfg)
+	s, idx := newTestStore(t, cfg)
 	ctx := context.Background()
 	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base, 3, func(int) string { return "x" }))); err != nil {
 		t.Fatal(err)
 	}
-	bucket.failPut = errors.New("bucket down")
-	if _, err := s.chunkRound(ctx); err == nil {
+	idx.failIngest = errors.New("index down")
+	if _, err := s.indexRound(ctx); err == nil {
 		t.Fatal("no error")
 	}
-	// The claim holds: no round takes the stream until it runs out.
-	bucket.failPut = nil
-	if n, err := s.chunkRound(ctx); err != nil || n != 0 {
+	// The claim holds for the backoff: no round takes the stream at once.
+	idx.failIngest = nil
+	if n, err := s.indexRound(ctx); err != nil || n != 0 {
 		t.Fatalf("claimed again at once: %d, %v", n, err)
 	}
 	if _, err := s.db.Pool.Exec(ctx, `UPDATE log_streams SET chunk_lease = now() - interval '1s'`); err != nil {
 		t.Fatal(err)
 	}
-	if n := chunkAll(t, s); n != 1 {
-		t.Fatalf("%d chunks after the lease ran out", n)
+	if n := indexAll(t, s); n != 1 {
+		t.Fatalf("%d streams indexed after the lease ran out", n)
 	}
 	// Lines stay readable throughout.
 	if r := mustRead(t, s, "acme", url.Values{"environment": {"e"}}); len(r.lines) != 3 {
@@ -606,7 +614,6 @@ func (f *followRecorder) snapshot() ([]string, int) {
 
 func TestFollow(t *testing.T) {
 	cfg := testConfig()
-	cfg.ChunkBytes = 1
 	cfg.FollowPoll = 20 * time.Millisecond
 	cfg.Heartbeat = 50 * time.Millisecond
 	s, _ := newTestStore(t, cfg)
@@ -624,12 +631,12 @@ func TestFollow(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- s.Follow(ctx, "acme", q, rec) }()
 	waitFor(t, func() bool { l, _ := rec.snapshot(); return len(l) == 3 })
-	// New lines, some chunked away before the follow sees them, a new
+	// New lines, some indexed before the follow sees them, a new
 	// stream, and a line the filter drops.
 	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(100, base+int64(time.Second), 3, text("new")))); err != nil {
 		t.Fatal(err)
 	}
-	chunkAll(t, s)
+	indexAll(t, s)
 	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(200, base+int64(2*time.Second), 2, text("hot")))); err != nil {
 		t.Fatal(err)
 	}
@@ -669,5 +676,45 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("timed out")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestMoveChunks(t *testing.T) {
+	s, idx := newTestStore(t, testConfig())
+	ctx := context.Background()
+	bucket := s.bucket.(*memBucket)
+	key := StreamKey{"p", "c", "1"}
+	text := func(i int) string { return fmt.Sprintf("ERROR before %d", i) }
+	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(0, base, 3, text))); err != nil {
+		t.Fatal(err)
+	}
+	// The three lines as the chunk the sink made before the index: their
+	// object and row, the stream's mark past them, no hot line.
+	ls := lines(0, base, 3, text)
+	data, err := encodeChunk(ls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := "pre/logs/acme/s_x/0.ndjson.gz"
+	_ = bucket.Put(ctx, k, data, "application/gzip")
+	if _, err := s.db.Pool.Exec(ctx, `WITH d AS (DELETE FROM log_lines)
+		UPDATE log_streams SET hot_lines = 0, hot_bytes = 0, hot_since = NULL, chunked_last = 20`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Pool.Exec(ctx, `INSERT INTO log_chunks (stream_id, first_off, last_off, first_ns, last_ns, lines, bytes, levels, key)
+		SELECT id, 0, 20, $1, $1, 3, 30, 1, $2 FROM log_streams`, base, k); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.moveChunks(ctx); err != nil || n != 1 {
+		t.Fatalf("moved %d: %v", n, err)
+	}
+	var chunks int
+	_ = s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_chunks`).Scan(&chunks)
+	if chunks != 0 || len(bucket.keys()) != 0 || idx.count("acme") != 3 {
+		t.Errorf("after the move: %d chunks, objects %v, %d documents", chunks, bucket.keys(), idx.count("acme"))
+	}
+	r := mustRead(t, s, "acme", url.Values{"environment": {"e"}, "level": {"error"}})
+	if len(r.lines) != 3 {
+		t.Errorf("read %d lines", len(r.lines))
 	}
 }

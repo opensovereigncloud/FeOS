@@ -15,13 +15,14 @@ import (
 	"time"
 
 	"github.com/gardenlinux/feos/go/internal/db"
+	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 	"github.com/gardenlinux/feos/go/internal/sink/s3"
 )
 
 // tenantTTL is how long a token's tenant is kept.
 const tenantTTL = time.Minute
 
-// Program is a running sink: its database, bucket, identity, the two
+// Program is a running sink: its database, index, identity, the two
 // listeners and the loops of the cold stage and the sweep.
 type Program struct {
 	cfg     Config
@@ -37,10 +38,12 @@ type Program struct {
 	ingestUp  chan struct{}
 }
 
-// Deps are what tests replace: the bucket (nil: the S3 client of the
-// configuration) and the HTTP client of the calls to ferund (nil: the
-// default).
+// Deps are what tests replace: the index (nil: Quickwit at the
+// configuration's URLs), the bucket (nil: the S3 client of the
+// configuration, if it names one) and the HTTP client of the calls to
+// ferund (nil: the default).
 type Deps struct {
+	Index  Index
 	Bucket Bucket
 	HTTP   *http.Client
 }
@@ -60,13 +63,22 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	bucket := deps.Bucket
-	if bucket == nil {
+	if bucket == nil && cfg.BucketEndpoint != "" {
 		c, err := s3.New(cfg.BucketEndpoint, cfg.BucketRegion, cfg.Bucket, cfg.BucketAccessKey, cfg.BucketSecretKey)
 		if err != nil {
 			d.Close()
 			return nil, err
 		}
 		bucket = c
+	}
+	index := deps.Index
+	if index == nil {
+		c, err := quickwit.New(cfg.IndexIngestURL, cfg.IndexSearchURL, nil)
+		if err != nil {
+			d.Close()
+			return nil, err
+		}
+		index = c
 	}
 	lis, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -77,7 +89,7 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 		cfg:      cfg,
 		log:      log,
 		db:       d,
-		store:    NewStore(d, bucket, cfg, log),
+		store:    NewStore(d, index, bucket, cfg, log),
 		ident:    NewIdentity(cfg.FerunURL, cfg.ServiceToken, cfg.TrustDomain, cfg.Name, deps.HTTP, log),
 		tenants:  NewTenants(cfg.FerunURL, deps.HTTP, tenantTTL),
 		apiLis:   lis,
@@ -134,7 +146,7 @@ func (p *Program) Run(ctx context.Context) error {
 		}()
 	}
 	run("identity", p.ident.Run)
-	run("cold stage", p.store.RunChunks)
+	run("cold stage", p.store.RunIndex)
 	run("sweep", p.store.RunSweep)
 	run("ingest", p.serveIngest)
 	run("api", p.serveAPI)
