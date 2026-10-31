@@ -89,12 +89,28 @@ pub mod opentelemetry {
                 ));
             }
         }
+        pub mod trace {
+            pub mod v1 {
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/otlp/opentelemetry.proto.trace.v1.rs"
+                ));
+            }
+        }
         pub mod collector {
             pub mod logs {
                 pub mod v1 {
                     include!(concat!(
                         env!("OUT_DIR"),
                         "/otlp/opentelemetry.proto.collector.logs.v1.rs"
+                    ));
+                }
+            }
+            pub mod trace {
+                pub mod v1 {
+                    include!(concat!(
+                        env!("OUT_DIR"),
+                        "/otlp/opentelemetry.proto.collector.trace.v1.rs"
                     ));
                 }
             }

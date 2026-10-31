@@ -42,8 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &[proto_dir],
         )?;
     // OpenTelemetry's protocol (ADR 0026): the node exports its pods' logs
-    // to the sink over OTLP's LogsService. Its packages nest, so they get
-    // a directory and a module tree of their own (lib.rs).
+    // to the sink over OTLP's LogsService, and takes its pods' spans over
+    // TraceService and sends them on to the sink's (§10). Its packages
+    // nest, so they get a directory and a module tree of their own
+    // (lib.rs).
     let otlp_dir = format!("{}/otlp", std::env::var("OUT_DIR")?);
     std::fs::create_dir_all(&otlp_dir)?;
     tonic_build::configure()
@@ -55,5 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )],
             &[proto_dir],
         )?;
+    tonic_build::configure().out_dir(&otlp_dir).compile_protos(
+        &[format!(
+            "{proto_dir}/opentelemetry/proto/collector/trace/v1/trace_service.proto"
+        )],
+        &[proto_dir],
+    )?;
     Ok(())
 }

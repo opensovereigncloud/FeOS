@@ -1,0 +1,240 @@
+# Traces
+
+`ferun-sink` keeps the spans of the pods FeRun makes and of the requests
+`ferun-ingress` answers (ADR 0026 §10, step 10), in its PostgreSQL first
+and in Quickwit's trace index after, and answers them to a tenant in the
+shape of Jaeger's query API. This page is the contract between the
+parts; the ADR says why. Logs are docs/architecture/sink.md; what that
+page says of identities, the hot stage and Quickwit holds here unless
+this one says otherwise.
+
+```
+pod (OTel SDK) ──OTLP/gRPC :4317, OTLP/HTTP protobuf :4318──▶ feosd at 169.254.0.1
+                                   │ the pod by its source address, its ferun.* labels stamped
+feosd (node) ──OTLP TraceService/Export (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `trace_spans`
+ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Quickwit ferun-traces-<days>d
+tenants (FeCode) ── GET /api/v1/jaeger/api/… (Bearer) ─────────┘
+```
+
+Sampling: every span that arrives is kept (ADR 0026, open question 2).
+The ingress records a span of every request it routes to an environment,
+as it writes a line of its access log, and starts a new trace sampled.
+Rate limits on the node and the quota in the sink bound the volume.
+
+## The pod
+
+The node holds `169.254.0.1`, the pods' IPv4 gateway, as an address of
+its own (as the resolver's `169.254.0.53`), and serves OTLP there:
+
+- `:4317`, gRPC: `opentelemetry.proto.collector.trace.v1.TraceService/Export`.
+  `LogsService` and `MetricsService` answer `UNIMPLEMENTED`.
+- `:4318`, HTTP/1.1: `POST /v1/traces` with `Content-Type:
+  application/x-protobuf`, the body an `ExportTraceServiceRequest`,
+  optionally `Content-Encoding: gzip`. The answer is an
+  `ExportTraceServiceResponse` as `application/x-protobuf`. JSON
+  (`application/json`) answers 415; `/v1/logs`, `/v1/metrics` and any
+  other path 404; another method 405.
+- A request is at most 4 MiB on the wire and 16 MiB decompressed (413,
+  `RESOURCE_EXHAUSTED`).
+
+The firewall lets a pod reach these two ports at `169.254.0.1` and
+nothing else of the node there (`iifname "pod-*" ip daddr 169.254.0.1
+tcp dport { 4317, 4318 } accept`). `feosd --otlp-address` names the
+address (default `169.254.0.1`); the ports are fixed.
+
+**Whose spans.** The node knows the pod by the request's source address,
+which the firewall's anti-spoofing rule (`fib saddr . iif oif missing
+drop`) makes the pod's own. An address of no pod with labels answers 403
+(`PERMISSION_DENIED`). A pod sends as itself only.
+
+**Labels.** In every `ResourceSpans` the node removes each resource
+attribute whose key starts with `ferun.`, then adds the pod's labels, the
+same as its log streams carry (sink.md, The OTLP shape) without
+`ferun.container`, `ferun.log_id` and `ferun.retention_days`:
+`ferun.pod`, `ferun.node`, `ferun.tenant`, `ferun.instance`, and those of
+`ferun.environment`, `ferun.kind`, `ferun.object`, `ferun.replica`,
+`ferun.release`, `ferun.job`, `ferun.attempt` the pod has. A resource
+without `service.name` gets the pod's `ferun.object`, else its
+`ferun.job`, else `unknown_service`. Spans, scopes and their attributes
+pass as they came.
+
+**Rate.** A pod may send 1 MiB/s of requests (decompressed), with a
+burst of 8 MiB; beyond, 429 with `Retry-After: 1` (gRPC
+`RESOURCE_EXHAUSTED`). A rate-limited request is not sent on.
+
+**On to the sink.** The node sends the request on to the sink's
+`TraceService/Export` over its sink connection (the node certificate,
+the sink's endpoint from `TelemetryResponse.sink_endpoint`) and answers
+the pod with the sink's answer, within 8 s. It keeps nothing: the SDK's
+batch and its retries are the buffer. The sink's codes map to the pod's:
+
+| sink | gRPC to the pod | HTTP to the pod |
+|---|---|---|
+| OK (with `partial_success`) | OK, the same | 200, the same |
+| `RESOURCE_EXHAUSTED` | `RESOURCE_EXHAUSTED` | 429, `Retry-After: 30` |
+| `UNAVAILABLE`, `DEADLINE_EXCEEDED`, no connection, no sink endpoint | `UNAVAILABLE` | 503, `Retry-After: 2` |
+| `INVALID_ARGUMENT` | `INVALID_ARGUMENT` | 400 |
+| `PERMISSION_DENIED`, other | `INTERNAL` | 500 |
+
+**The environment.** The node gives every container of a pod with a
+network these variables, each unless the container's own environment
+has it:
+
+| variable | value |
+|---|---|
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://169.254.0.1:4318/v1/traces` |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `http/protobuf` |
+| `OTEL_SERVICE_NAME` | the pod's `ferun.object`, else its `ferun.job`; unset without |
+
+Only the traces' endpoint is set, so an SDK sends neither logs nor
+metrics there. A pod's logs stay its output (sink.md).
+
+## The ingress
+
+`ferun-ingress` sends one span per request it writes to its access log,
+from the same buffer, in batches of its own, to the sink's
+`TraceService/Export` with its certificate. One `ResourceSpans` per
+(environment, service) in a batch:
+
+| resource attribute | value |
+|---|---|
+| `service.name` | `ferun-ingress` |
+| `ferun.pod` | `ingress/<instance's name>` |
+| `ferun.source` | `ingress` |
+| `ferun.tenant`, `ferun.environment` | the request's |
+| `ferun.kind`, `ferun.object` | `service`, the service's name |
+
+The span is the request's record (proxy/trace.go): `trace_id`, `span_id`
+the ingress's, `parent_span_id` the client's when its `traceparent` was
+continued, `trace_state` as passed on, `flags` the trace's; `name` the
+method (`GET`); `kind` `SPAN_KIND_SERVER`; `start_time_unix_nano` when
+the request came, `end_time_unix_nano` start plus its duration; `status`
+`STATUS_CODE_ERROR` with the outcome as message for a 5xx or an aborted
+request, else unset. Attributes: `http.request.method`, `url.path`
+(without the query), `server.address` (the host), `network.protocol.version`
+(`1.1`, `2`), `http.response.status_code`, `client.address`,
+`user_agent.original`, `http.request.body.size`,
+`http.response.body.size`, `ferun.outcome`, `ferun.attempts`,
+`ferun.held_ns` (the time the request waited for an instance, int), and
+`ferun.upstream_instance` (the instance that answered). A span the sink
+refused is dropped and counted as a dropped access-log record is; the
+access log's lines are written as before.
+
+## The sink
+
+### Ingest
+
+`TraceService/Export` on the ingest's gRPC server, behind the same
+`authorize`. Each `ResourceSpans` must have `ferun.tenant` and
+`ferun.pod`. From a node, `ferun.source` must not be `ingress` and
+`ferun.pod` must not start `ingress/`; from an ingress, `ferun.source`
+must be `ingress` and `ferun.pod` `ingress/<its name>`. Else the request
+answers `PERMISSION_DENIED`. At most 10,000 spans a request
+(`INVALID_ARGUMENT`).
+
+A span without a valid `trace_id` (16 bytes, not all zero) or `span_id`
+(8 bytes, not all zero) is dropped and counted in the answer's
+`partial_success.rejected_spans`, with an `error_message`. The others
+become documents (below) and are inserted into `trace_spans` in one
+transaction with the tenant's usage; the answer comes after the commit.
+
+**Quota.** Bytes of documents per tenant per day, `--trace-quota`
+(default 1 GiB), counted in `trace_usage` (tenant, day) at ingest.
+Beyond it the request answers `RESOURCE_EXHAUSTED`.
+
+### The hot stage and the indexer
+
+`trace_spans` (migration `0005`) holds a span from its ingest until its
+index has published it: tenant, trace ID, span ID, start, the document
+(`jsonb`), when it came, and the indexer's claim (owner, lease). An
+index on (tenant, trace ID) serves reads of a trace not yet indexed.
+
+The indexer runs beside the logs' (`RunIndex`): it claims up to 5,000
+spans or 6 MiB of documents whose claim is free or expired (lease three
+minutes, `FOR UPDATE SKIP LOCKED`), ingests them into the index with
+`commit=wait_for`, and then deletes them, the claim its own. A round
+that failed leaves the rows to the next claim after the lease. Spans sent
+twice (a node's retry after an answer that did not arrive) are two
+documents; a read keeps one per span ID.
+
+### The index
+
+`<--trace-index-prefix>-<days>d`, default `ferun-traces-30d`
+(`--trace-retention`, 30 days), created at first use as the logs'
+indexes are (`EnsureIndex`), with the logs' commit interval. A document
+is a span:
+
+| field | type | from |
+|---|---|---|
+| `ts` | datetime (ns), the timestamp field, fast | `start_time_unix_nano` |
+| `tenant` | raw text, the tag field | `ferun.tenant` |
+| `environment`, `kind`, `object`, `instance`, `job`, `source`, `pod`, `node` | raw text | the `ferun.*` attributes; `source` `container` unless `ingress` |
+| `replica`, `release`, `attempt` | u64 | the `ferun.*` attributes |
+| `trace_id`, `span_id`, `parent_span_id` | raw text, lower-case hex, `trace_id` fast | the span |
+| `trace_state` | stored, not indexed | the span |
+| `service_name` | raw text, fast | `service.name` |
+| `span_name` | raw text, fast | `name` |
+| `span_kind` | u64 (OTLP's number) | `kind` |
+| `start_ns`, `end_ns`, `duration_ns` | i64, fast | the times; duration end minus start, at least 0 |
+| `status_code` | u64 (0 unset, 1 ok, 2 error) | `status.code` |
+| `status_message` | text | `status.message` |
+| `scope_name`, `scope_version` | raw text | the scope |
+| `resource_attributes`, `span_attributes` | json | the attributes |
+| `events` | array of json `{time_ns, name, attributes}` | `events` |
+| `links` | array of json `{trace_id, span_id, trace_state, attributes}` | `links` |
+
+Attributes become JSON values by their `AnyValue`: string, bool, int (a
+number; beyond ±2^53 a string), double, array, key-value list as an
+object, bytes as base64 text.
+
+### Reading: Jaeger's query API
+
+Under `/api/v1/jaeger`, with a tenant's token as `GET /api/v1/logs`
+takes it (sink.md, Reading); every query is the tenant's own, whatever
+it asks. The paths and answers are those of Jaeger's HTTP query API
+(`jaeger-query`'s `/api/…`), so a client of that API, Grafana's Jaeger
+data source among them, reads them with the base URL
+`<sink>/api/v1/jaeger` and the token as a header.
+
+- `GET /api/v1/jaeger/api/services` → `{"data": [names], "total": n}`,
+  the `service_name`s of the tenant's spans of the last 7 days.
+- `GET /api/v1/jaeger/api/services/{service}/operations` → `{"data":
+  [names], "total": n}`, its `span_name`s of the last 7 days.
+- `GET /api/v1/jaeger/api/traces/{traceID}` → `{"data": [trace]}`; none
+  of the tenant's spans: 404 `{"data": null, "errors": [{"code": 404,
+  "msg": "trace not found"}]}`. The spans come from the index and from
+  `trace_spans`, one per span ID, at most 10,000. FeRun's selectors
+  (below) narrow it to the spans that have them.
+- `GET /api/v1/jaeger/api/traces?service=&operation=&tags=&start=&end=&minDuration=&maxDuration=&limit=`
+  → `{"data": [traces]}`: the traces of the newest spans that match,
+  each whole. `start`, `end` in µs since the epoch (default the last
+  hour); `minDuration`, `maxDuration` as Go durations (`100ms`, `1.5s`);
+  `tags` a JSON object of attribute and value, each matched in the span's
+  or the resource's attributes; `limit` traces, default 20, at most 100.
+  FeRun's own selectors may be added: `environment`, `object`, `job`,
+  `instance`, `source`. `service` is optional here, unlike in Jaeger.
+
+A trace is Jaeger's JSON: `{"traceID", "spans": [...], "processes":
+{"p1": {"serviceName", "tags"}}, "warnings": null}`; a process per
+distinct resource (service name and resource attributes, the `ferun.*`
+among them). A span is `{"traceID", "spanID", "operationName",
+"references": [{"refType": "CHILD_OF", "traceID", "spanID"}],
+"startTime" (µs), "duration" (µs), "tags", "logs", "processID",
+"warnings": null, "flags"}`; a link is a `FOLLOWS_FROM` reference;
+`tags` are the span's attributes as `{"key", "type", "value"}` (`type`
+`string`, `bool`, `int64`, `float64`; arrays and objects as JSON text,
+`string`) plus `span.kind` (`server`, `client`, `producer`, `consumer`,
+`internal`), `otel.status_code` (`OK`, `ERROR`) and
+`otel.status_description` when set, and `error` `true` for an error;
+`logs` are the events, `{"timestamp" (µs), "fields": [tags…, {"key":
+"event", "type": "string", "value": name}]}`.
+
+## FeCode
+
+FeCode reads with its tenant token (tenant `fecode`) and lets only a
+project's members read its environments' traces (as its logs, FeCode
+ADR 0009 §12): its backend passes a member's request on to the sink with
+the environment's FeRun ID as `environment` set by FeCode, never the
+caller's. A trace ID in the Logs tab (a request's, a line's) opens the
+trace: its spans as a waterfall, top to bottom, each with its service,
+name, duration and attributes, and a link to the lines of the trace.
