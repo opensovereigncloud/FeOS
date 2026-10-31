@@ -23,6 +23,7 @@ import (
 
 	sinkv1 "github.com/gardenlinux/feos/go/gen/feos/sink/v1"
 	otlplogsv1 "github.com/gardenlinux/feos/go/gen/otlp/collector/logs/v1"
+	otlptracev1 "github.com/gardenlinux/feos/go/gen/otlp/collector/trace/v1"
 	commonv1 "github.com/gardenlinux/feos/go/gen/otlp/common/v1"
 	logsv1 "github.com/gardenlinux/feos/go/gen/otlp/logs/v1"
 )
@@ -78,8 +79,8 @@ type ingest struct {
 }
 
 // newIngestServer is the ingest's gRPC server: TLS of the identity, nodes
-// and ingresses only, LogsService and SinkService.
-func newIngestServer(store *Store, ident *Identity, log *slog.Logger) *grpc.Server {
+// and ingresses only, LogsService, SinkService and TraceService.
+func newIngestServer(store *Store, traces *Traces, ident *Identity, log *slog.Logger) *grpc.Server {
 	in := &ingest{store: store, ident: ident, log: log}
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(ident.TLSConfig())),
@@ -91,6 +92,7 @@ func newIngestServer(store *Store, ident *Identity, log *slog.Logger) *grpc.Serv
 	)
 	otlplogsv1.RegisterLogsServiceServer(srv, in)
 	sinkv1.RegisterSinkServiceServer(srv, in)
+	otlptracev1.RegisterTraceServiceServer(srv, &traceIngest{traces: traces, log: log})
 	return srv
 }
 

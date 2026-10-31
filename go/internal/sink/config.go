@@ -4,7 +4,8 @@
 // Package sink is ferun-sink, the platform's log store (ADR 0026,
 // docs/architecture/sink.md): the nodes' OTLP log ingest over mTLS, the
 // hot stage in its PostgreSQL, the cold stage in Quickwit's indexes (§10),
-// the read API for tenants, and retention.
+// the read API for tenants, and retention; and its spans
+// (docs/architecture/traces.md), read in the shape of Jaeger's API.
 //
 // Every flag has an environment variable FERUN_SINK_<NAME> (the flag's
 // name in upper snake case); a flag given wins over its variable. The
@@ -74,6 +75,13 @@ type Config struct {
 	LogLevel  slog.Level
 	LogFormat string
 
+	// Traces (docs/architecture/traces.md): the bytes of span documents
+	// a tenant may store a day (0: no quota), how long spans are kept,
+	// and the prefix of the trace index's name (<prefix>-<days>d).
+	TraceQuota       int64
+	TraceRetention   time.Duration
+	TraceIndexPrefix string
+
 	// CommitTimeout is the indexes' commit interval: a line is searchable
 	// at most this long after it is stored (Quickwit's
 	// commit_timeout_secs, set when an index is made).
@@ -106,7 +114,10 @@ func Default() Config {
 		Heartbeat:     15 * time.Second,
 		ScanLimit:     256 << 20,
 
-		IndexPartitions: 16,
+		IndexPartitions:  16,
+		TraceQuota:       1 << 30,
+		TraceRetention:   720 * time.Hour,
+		TraceIndexPrefix: "ferun-traces",
 	}
 }
 
@@ -152,6 +163,9 @@ func register(fs *flag.FlagSet, c *Config) *string {
 	fs.DurationVar(&c.Retention, "log-retention", c.Retention, "how long lines are kept, unless a stream asks for longer")
 	fs.DurationVar(&c.RetentionMax, "log-retention-max", c.RetentionMax, "the longest a stream may ask for (ferun.retention_days)")
 	fs.Var((*byteSize)(&c.Quota), "log-quota", "the bytes a tenant may store a day (bytes, or with a KiB, MiB or GiB suffix); 0: no quota")
+	fs.Var((*byteSize)(&c.TraceQuota), "trace-quota", "the bytes of spans a tenant may store a day (bytes, or with a KiB, MiB or GiB suffix); 0: no quota")
+	fs.DurationVar(&c.TraceRetention, "trace-retention", c.TraceRetention, "how long spans are kept")
+	fs.StringVar(&c.TraceIndexPrefix, "trace-index-prefix", c.TraceIndexPrefix, "the prefix of the trace index's name, <prefix>-<days>d")
 	level := strings.ToLower(c.LogLevel.String())
 	fs.StringVar(&level, "log-level", level, "debug, info, warn or error")
 	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "json or text")
@@ -195,6 +209,11 @@ func (c *Config) Validate() error {
 	if c.IndexPartitions < 1 || c.IndexPartitions > quickwit.MaxPartitions {
 		bad("--index-partitions must be 1 to %d", quickwit.MaxPartitions)
 	}
+	if c.TraceIndexPrefix == "" || strings.ContainsAny(c.TraceIndexPrefix, "*/ ") {
+		bad("--trace-index-prefix must be a name")
+	} else if strings.HasPrefix(c.TraceIndexPrefix+"-", c.IndexPrefix+"-") || strings.HasPrefix(c.IndexPrefix+"-", c.TraceIndexPrefix+"-") {
+		bad("--trace-index-prefix and --index-prefix must not name the same indexes")
+	}
 	if c.CommitTimeout < time.Second || c.CommitTimeout%time.Second != 0 {
 		bad("--index-commit-timeout must be whole seconds, at least one")
 	}
@@ -203,6 +222,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Quota < 0 {
 		bad("--log-quota must not be negative")
+	}
+	if c.TraceRetention <= 0 {
+		bad("--trace-retention must be positive")
 	}
 	if c.LogFormat != LogFormatJSON && c.LogFormat != LogFormatText {
 		bad("--log-format must be %s or %s, not %q", LogFormatJSON, LogFormatText, c.LogFormat)

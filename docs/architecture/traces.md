@@ -137,10 +137,15 @@ A span without a valid `trace_id` (16 bytes, not all zero) or `span_id`
 `partial_success.rejected_spans`, with an `error_message`. The others
 become documents (below) and are inserted into `trace_spans` in one
 transaction with the tenant's usage; the answer comes after the commit.
+A span without a start gets the time it came as its `ts`; a resource
+without `service.name` the service `unknown_service`.
 
 **Quota.** Bytes of documents per tenant per day, `--trace-quota`
 (default 1 GiB), counted in `trace_usage` (tenant, day) at ingest.
-Beyond it the request answers `RESOURCE_EXHAUSTED`.
+Beyond it the request answers `RESOURCE_EXHAUSTED` (the request that
+crosses it is stored; of a request of several tenants, the others'
+spans are stored). A loop of the sink deletes the usage of the days
+before yesterday.
 
 ### The hot stage and the indexer
 
@@ -172,6 +177,7 @@ is a span:
 | `replica`, `release`, `attempt` | u64 | the `ferun.*` attributes |
 | `trace_id`, `span_id`, `parent_span_id` | raw text, lower-case hex, `trace_id` fast | the span |
 | `trace_state` | stored, not indexed | the span |
+| `flags` | u64 | the span's `flags`, its low 8 bits (W3C trace flags) |
 | `service_name` | raw text, fast | `service.name` |
 | `span_name` | raw text, fast | `name` |
 | `span_kind` | u64 (OTLP's number) | `kind` |
@@ -209,10 +215,16 @@ data source among them, reads them with the base URL
   → `{"data": [traces]}`: the traces of the newest spans that match,
   each whole. `start`, `end` in µs since the epoch (default the last
   hour); `minDuration`, `maxDuration` as Go durations (`100ms`, `1.5s`);
-  `tags` a JSON object of attribute and value, each matched in the span's
-  or the resource's attributes; `limit` traces, default 20, at most 100.
+  `tags` a JSON object of attribute and value (a string, a number or a
+  bool; a key without a backslash), each matched in the span's or the
+  resource's attributes; `limit` traces, default 20, at most 100.
   FeRun's own selectors may be added: `environment`, `object`, `job`,
-  `instance`, `source`. `service` is optional here, unlike in Jaeger.
+  `instance`, `source`; they narrow each trace answered as they narrow
+  `/traces/{traceID}`. `service` is optional here, unlike in Jaeger.
+
+FeRun's selectors narrow `/services` and `/services/{service}/operations`
+as well. Every answer has Jaeger's `total`, `limit`, `offset` and
+`errors` beside `data`; a refused query answers 400 with `errors`.
 
 A trace is Jaeger's JSON: `{"traceID", "spans": [...], "processes":
 {"p1": {"serviceName", "tags"}}, "warnings": null}`; a process per

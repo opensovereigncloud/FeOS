@@ -28,6 +28,7 @@ type Program struct {
 	log     *slog.Logger
 	db      *db.DB
 	store   *Store
+	traces  *Traces
 	ident   *Identity
 	tenants *Tenants
 	apiLis  net.Listener
@@ -38,11 +39,13 @@ type Program struct {
 }
 
 // Deps are what tests replace: the index (nil: Quickwit at the
-// configuration's URLs) and the HTTP client of the calls to ferund (nil:
-// the default).
+// configuration's URLs), the trace index (nil: the index, which must
+// serve traces) and the HTTP client of the calls to ferund (nil: the
+// default).
 type Deps struct {
-	Index Index
-	HTTP  *http.Client
+	Index      Index
+	TraceIndex TraceIndex
+	HTTP       *http.Client
 }
 
 // New opens and migrates the database and binds the HTTP API's listener;
@@ -68,6 +71,15 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 		}
 		index = c
 	}
+	traceIndex := deps.TraceIndex
+	if traceIndex == nil {
+		ti, ok := index.(TraceIndex)
+		if !ok {
+			d.Close()
+			return nil, errors.New("the index serves no traces")
+		}
+		traceIndex = ti
+	}
 	lis, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		d.Close()
@@ -78,6 +90,7 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 		log:      log,
 		db:       d,
 		store:    NewStore(d, index, cfg, log),
+		traces:   NewTraces(d, traceIndex, cfg, log),
 		ident:    NewIdentity(cfg.FerunURL, cfg.ServiceToken, cfg.TrustDomain, cfg.Name, deps.HTTP, log),
 		tenants:  NewTenants(cfg.FerunURL, deps.HTTP, tenantTTL),
 		apiLis:   lis,
@@ -122,7 +135,7 @@ func (p *Program) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	errc := make(chan error, 4)
+	errc := make(chan error, 6)
 	run := func(name string, f func(context.Context) error) {
 		wg.Add(1)
 		go func() {
@@ -135,6 +148,7 @@ func (p *Program) Run(ctx context.Context) error {
 	}
 	run("identity", p.ident.Run)
 	run("cold stage", p.store.RunIndex)
+	run("traces", p.traces.Run)
 	run("sweep", p.store.RunSweep)
 	run("ingest", p.serveIngest)
 	run("api", p.serveAPI)
@@ -149,7 +163,7 @@ func (p *Program) Run(ctx context.Context) error {
 
 func (p *Program) serveAPI(ctx context.Context) error {
 	srv := &http.Server{
-		Handler:           newAPI(p.store, p.tenants, p.ingestUp, p.log),
+		Handler:           newAPI(p.store, p.traces, p.tenants, p.ingestUp, p.log),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
@@ -184,7 +198,7 @@ func (p *Program) serveIngest(ctx context.Context) error {
 	p.ingestLis = lis
 	p.mu.Unlock()
 	close(p.ingestUp)
-	srv := newIngestServer(p.store, p.ident, p.log)
+	srv := newIngestServer(p.store, p.traces, p.ident, p.log)
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(lis) }()
 	p.log.Info("ingest listening", "addr", lis.Addr().String())

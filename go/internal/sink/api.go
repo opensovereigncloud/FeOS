@@ -18,21 +18,26 @@ import (
 // api is the HTTP API (sink.md, Reading).
 type api struct {
 	store   *Store
+	traces  *Traces
 	tenants *Tenants
 	ingest  <-chan struct{}
 	log     *slog.Logger
 }
 
 // newAPI returns the HTTP API's handler: /api/v1/logs,
-// /api/v1/log-streams and /healthz; ingest is closed once the ingest
-// serves.
-func newAPI(store *Store, tenants *Tenants, ingest <-chan struct{}, log *slog.Logger) http.Handler {
-	a := &api{store: store, tenants: tenants, ingest: ingest, log: log}
+// /api/v1/log-streams, /api/v1/jaeger/api/… and /healthz; ingest is
+// closed once the ingest serves.
+func newAPI(store *Store, traces *Traces, tenants *Tenants, ingest <-chan struct{}, log *slog.Logger) http.Handler {
+	a := &api{store: store, traces: traces, tenants: tenants, ingest: ingest, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("GET /api/v1/logs", a.tenant(a.logs))
 	mux.HandleFunc("GET /api/v1/log-streams", a.tenant(a.streams))
 	mux.HandleFunc("DELETE /api/v1/log-streams", a.tenant(a.deleteStreams))
+	mux.HandleFunc("GET /api/v1/jaeger/api/services", a.tenant(a.jaegerNames))
+	mux.HandleFunc("GET /api/v1/jaeger/api/services/{service}/operations", a.tenant(a.jaegerNames))
+	mux.HandleFunc("GET /api/v1/jaeger/api/traces/{traceID}", a.tenant(a.jaegerTrace))
+	mux.HandleFunc("GET /api/v1/jaeger/api/traces", a.tenant(a.jaegerFind))
 	return mux
 }
 

@@ -174,7 +174,7 @@ func TestEndToEnd(t *testing.T) {
 	idx := newMemIndex()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	prog, err := New(ctx, cfg, Deps{Index: idx}, dbtest.Logger(t))
+	prog, err := New(ctx, cfg, Deps{Index: idx, TraceIndex: newMemTraceIndex()}, dbtest.Logger(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestIngressEndToEnd(t *testing.T) {
 	cfg.DatabaseURL, cfg.TrustDomain, cfg.FerunURL, cfg.ServiceToken = dbURL, testTD, fsrv.URL, "svc-token"
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	prog, err := New(ctx, cfg, Deps{Index: newMemIndex()}, dbtest.Logger(t))
+	prog, err := New(ctx, cfg, Deps{Index: newMemIndex(), TraceIndex: newMemTraceIndex()}, dbtest.Logger(t))
 	if err != nil {
 		t.Fatal(err)
 	}
