@@ -5,6 +5,7 @@ package sink
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -14,27 +15,77 @@ import (
 )
 
 // followSink is where a follow writes: a line, with its stream the first
-// time, and the heartbeat.
+// time, the heartbeat, and the lines skipped.
 type followSink interface {
 	Line(l Line, st *streamRow) error
 	Heartbeat() error
+	// Skipped says n lines were skipped by the follow's rate.
+	Skipped(n int) error
 }
+
+// ErrFollowScope refuses a follow of more than one object: what can be
+// followed live is an environment's object (a service, an addon, a job,
+// by environment, kind and name), finer its replica, instance or stream,
+// or a tenant's job; an environment as a whole is searched, not followed.
+var ErrFollowScope = errors.New("a follow is of one object: environment, kind and object, or a tenant's job, or an instance or stream of one")
+
+// FollowKey is the topic key of what q's selector follows: one object's,
+// or ErrFollowScope. An instance or a stream is the key of its streams,
+// which must be there and of one object.
+func (s *Store) FollowKey(ctx context.Context, tenant string, sel Selector) (string, error) {
+	switch {
+	case sel.Environment != "" && sel.Kind != "" && sel.Object != "":
+		return streamKey(tenant, sel.Environment, sel.Kind, sel.Object, ""), nil
+	case sel.Environment == "" && sel.Job != "":
+		return streamKey(tenant, "", "", "", sel.Job), nil
+	case sel.Instance != "" || sel.Stream != "":
+		sts, err := selectStreams(ctx, s.db.Pool, tenant, streamFilter{sel: sel, limit: maxStreamsRead})
+		if err != nil {
+			return "", err
+		}
+		key := ""
+		for _, st := range sts {
+			if k := keyOf(st); key == "" {
+				key = k
+			} else if k != key {
+				return "", ErrFollowScope
+			}
+		}
+		if key == "" {
+			return "", fmt.Errorf("%w: no stream of the instance or stream yet", ErrFollowScope)
+		}
+		return key, nil
+	}
+	return "", ErrFollowScope
+}
+
+// The bounds of a follow's lines a second (ADR 0026 §11): rate lines, a
+// burst of burst; beyond them error and warn lines have errRate more, and
+// the rest is skipped, which the follow says once a second ({"skipped"}).
+const (
+	followRate      = 100
+	followBurst     = 500
+	followErrRate   = 50
+	followErrBurst  = 200
+	skippedInterval = time.Second
+)
 
 // Follow answers /api/v1/logs?follow=1: the page a backward read of q
 // gives, then every line stored after it, as the topics bring it, until
-// ctx ends or a write fails (ADR 0026 §11). The topics' partitions the
-// selector's streams may lie in (followPartitions) are read from where
-// they ended before the page was read; a line the page gave is not given
-// again, and a stream of the selector that starts meanwhile is followed
-// too.
+// ctx ends or a write fails (ADR 0026 §11). What it follows is one object
+// (FollowKey): its partition of each log topic, read from where it ended
+// before the page was read; a line the page gave is not given again, and
+// a stream of the object that starts meanwhile is followed too (its key is
+// the same). Lines beyond followRate a second are skipped, error and warn
+// lines last.
 func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSink) error {
+	followed, err := s.FollowKey(ctx, tenant, q.Sel)
+	if err != nil {
+		return err
+	}
 	q.Forward, q.Cursor = false, nil
 	if !q.SinceSet {
 		q.Since = q.Until - int64(time.Hour)
-	}
-	live, err := selectStreams(ctx, s.db.Pool, tenant, streamFilter{sel: q.Sel, live: true, limit: maxStreamsRead})
-	if err != nil {
-		return err
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -46,12 +97,9 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 		if err != nil {
 			return err
 		}
-		from, err := s.pipes.ends(ctx, id, followPartitions(tenant, q.Sel, live, n))
+		from, err := s.pipes.ends(ctx, id, []int32{kafka.Partition(followed, n)})
 		if err != nil {
 			return err
-		}
-		if len(from) == 0 {
-			continue
 		}
 		f, err := s.pipes.log.Follow(id, from)
 		if err != nil {
@@ -101,6 +149,7 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 		}
 	}
 	joins := followJoins{open: map[joinKey]*followJoin{}, cut: map[joinKey]bool{}}
+	limit := newFollowLimit(time.Now())
 	beat := time.NewTicker(s.cfg.Heartbeat)
 	defer beat.Stop()
 	lastWrite := time.Now()
@@ -109,9 +158,12 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 	// streamRetry, at most streamWait.
 	var waiting []waitingDoc
 	for {
-		var retry <-chan time.Time
+		var retry, say <-chan time.Time
 		if len(waiting) > 0 {
 			retry = time.After(streamRetry)
+		}
+		if limit.skipped > 0 {
+			say = time.After(time.Until(limit.said.Add(skippedInterval)))
 		}
 		select {
 		case <-ctx.Done():
@@ -120,6 +172,7 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 			return err
 		case <-beat.C:
 		case <-retry:
+		case <-say:
 		case rs := <-recs:
 			now := time.Now()
 			for _, d := range docsOf(rs) {
@@ -157,7 +210,16 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 			if !q.match(&l) {
 				continue
 			}
+			if !limit.admit(&l, time.Now()) {
+				continue
+			}
 			if err := out.Line(l, byID[l.Stream]); err != nil {
+				return err
+			}
+			lastWrite = time.Now()
+		}
+		if n := limit.skippedDue(time.Now()); n > 0 {
+			if err := out.Skipped(n); err != nil {
 				return err
 			}
 			lastWrite = time.Now()
@@ -174,27 +236,6 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 			clear(given)
 		}
 	}
-}
-
-// followPartitions are the partitions of n a follow of sel reads: an
-// environment's one; a job's: a tenant's job's one and those of its open
-// streams (a run of an environment's job); a stream's or an instance's,
-// those of its streams; every one for a job or an instance that has no
-// stream yet, since its key is not known before.
-func followPartitions(tenant string, sel Selector, live []*streamRow, n int32) []int32 {
-	switch {
-	case sel.Environment != "":
-		return []int32{kafka.Partition(streamKey(tenant, sel.Environment, ""), n)}
-	case sel.Job != "" && len(live) > 0:
-		return append(partitionsOf(live, n), kafka.Partition(streamKey(tenant, "", sel.Job), n))
-	case len(live) > 0:
-		return partitionsOf(live, n)
-	}
-	all := make([]int32, n)
-	for i := range all {
-		all[i] = int32(i)
-	}
-	return all
 }
 
 // waitingDoc is a record a follow took whose stream it has not found yet.
@@ -308,4 +349,46 @@ func (f *followJoins) take(lines []Line, now time.Time) []Line {
 	}
 	slices.SortStableFunc(done, func(a, b Line) int { return cmpPos(a.pos(), b.pos()) })
 	return done
+}
+
+// followLimit is a follow's rate: a bucket of lines, and one more for
+// error and warn lines once it is empty; what neither takes is counted.
+type followLimit struct {
+	tokens, errTokens float64
+	last              time.Time
+	skipped           int
+	said              time.Time
+}
+
+func newFollowLimit(now time.Time) *followLimit {
+	return &followLimit{tokens: followBurst, errTokens: followErrBurst, last: now, said: now}
+}
+
+// admit reports whether l may go now, counting it skipped if not.
+func (f *followLimit) admit(l *Line, now time.Time) bool {
+	dt := now.Sub(f.last).Seconds()
+	f.last = now
+	f.tokens = min(followBurst, f.tokens+dt*followRate)
+	f.errTokens = min(followErrBurst, f.errTokens+dt*followErrRate)
+	switch {
+	case f.tokens >= 1:
+		f.tokens--
+		return true
+	case l.Level&(LevelError|LevelWarn) != 0 && f.errTokens >= 1:
+		f.errTokens--
+		return true
+	}
+	f.skipped++
+	return false
+}
+
+// skippedDue returns the lines skipped since it last said, at most once a
+// skippedInterval.
+func (f *followLimit) skippedDue(now time.Time) int {
+	if f.skipped == 0 || now.Sub(f.said) < skippedInterval {
+		return 0
+	}
+	n := f.skipped
+	f.skipped, f.said = 0, now
+	return n
 }

@@ -138,6 +138,15 @@ func (f *memFollower) Next(ctx context.Context) ([]kafka.Record, error) {
 	}
 }
 
+// Add reads the partitions of from too.
+func (f *memFollower) Add(from map[int32]int64) {
+	f.log.mu.Lock()
+	defer f.log.mu.Unlock()
+	for p, o := range from {
+		f.at[p] = o
+	}
+}
+
 func (f *memFollower) Close() {}
 
 // count is how many records topic holds.

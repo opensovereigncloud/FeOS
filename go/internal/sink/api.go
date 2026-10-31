@@ -159,6 +159,16 @@ func (a *api) fail(w http.ResponseWriter, r *http.Request, err error) {
 
 // follow answers follow=1 as NDJSON.
 func (a *api) follow(w http.ResponseWriter, r *http.Request, tenant string, q Query) {
+	// What is followed is checked before the answer starts: an
+	// environment as a whole is searched, not followed.
+	if _, err := a.store.FollowKey(r.Context(), tenant, q.Sel); err != nil {
+		if errors.Is(err, ErrFollowScope) {
+			apierr.Write(w, apierr.New(http.StatusBadRequest, "%s", err.Error()))
+			return
+		}
+		a.fail(w, r, err)
+		return
+	}
 	rc := http.NewResponseController(w)
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-store")
@@ -172,7 +182,8 @@ func (a *api) follow(w http.ResponseWriter, r *http.Request, tenant string, q Qu
 }
 
 // ndjsonFollow writes a follow's objects: {"line": …, "stream": …} with
-// the stream the first time only, and {}.
+// the stream the first time only, {"skipped": n} when its rate skipped n
+// lines, and {}.
 type ndjsonFollow struct {
 	w    http.ResponseWriter
 	rc   *http.ResponseController
@@ -193,6 +204,13 @@ func (f *ndjsonFollow) Line(l Line, st *streamRow) error {
 		out.Stream = &sj
 	}
 	if err := f.enc.Encode(out); err != nil {
+		return err
+	}
+	return f.rc.Flush()
+}
+
+func (f *ndjsonFollow) Skipped(n int) error {
+	if err := f.enc.Encode(map[string]int{"skipped": n}); err != nil {
 		return err
 	}
 	return f.rc.Flush()

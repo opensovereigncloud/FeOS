@@ -267,7 +267,7 @@ func TestConfig(t *testing.T) {
 	if c.IndexPrefix != "ferun-logs" || c.CommitTimeout != 10*time.Second || c.IndexPartitions != 16 {
 		t.Errorf("index %q, commit %v, %d partitions", c.IndexPrefix, c.CommitTimeout, c.IndexPartitions)
 	}
-	if fmt.Sprint(c.KafkaBrokers) != "[kafka-0:9092 kafka-1:9092]" || c.KafkaPartitions != 12 || c.KafkaReplication != 3 ||
+	if fmt.Sprint(c.KafkaBrokers) != "[kafka-0:9092 kafka-1:9092]" || c.KafkaPartitions != 64 || c.KafkaReplication != 3 ||
 		c.KafkaRetention != 24*time.Hour {
 		t.Errorf("kafka %v, %d partitions, %d replicas, retention %v", c.KafkaBrokers, c.KafkaPartitions, c.KafkaReplication,
 			c.KafkaRetention)

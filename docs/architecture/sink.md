@@ -11,7 +11,7 @@ the ADR says why.
 guest ──CRI lines──▶ logs/container.log
                          │ StreamContainerLogs(follow, from_offset)
 feosd (node) ──OTLP LogsService/Export, SinkService (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `sink` (streams, positions, quota)
-     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Kafka topic ferun-logs-v4-<days>d ──Kafka source──▶ Quickwit index of that name
+     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Kafka topic ferun-logs-v5-<days>d ──Kafka source──▶ Quickwit index of that name
 ferund ──CreatePodRequest.log_labels──▶ feosd                                │
      ◀── GET /api/v1/tenant (a tenant's token) ──────────────────────────────┤
 tenants (FeCode) ── GET /api/v1/logs, /api/v1/log-streams (Bearer) ──────────┘
@@ -242,10 +242,10 @@ last time, next offset, the last offset stored, ended; its ID `s_` and 16
 random hex digits) and `log_usage` (a tenant's bytes of a day) in the
 database; the lines in Kafka, then in Quickwit (§11). A topic per
 index, of its name: `<--index-prefix>-v<version>-<days>d`
-(`ferun-logs-v4-30d`), the days of `--log-retention`, or of
+(`ferun-logs-v5-30d`), the days of `--log-retention`, or of
 `--log-retention-max` for a stream whose `ferun.retention_days` is
 longer than the default. At its start, and only then, the sink makes the
-topic of each class that is not there (`--kafka-partitions` 12,
+topic of each class that is not there (`--kafka-partitions` 64,
 `--kafka-replication` 3, `min.insync.replicas` 2, `retention.ms`
 `--kafka-retention` 24 h, `segment.ms` an hour), its index (Quickwit's
 index API) with its retention, `--index-commit-timeout` (10 s) as its
@@ -257,11 +257,14 @@ the index's document, JSON: `ts` (ns, the time field), `tenant`,
 `release`, `instance`, `container`, `job`, `attempt`, `source`,
 `iostream`, `level` (the bit), `trace_id`, `off`, `partial`, `cont`, and
 `text` (Quickwit's `default` tokenizer, with positions). Its key is
-`<tenant>/<environment>` of its stream, or `<tenant>//<job>` for a stream
-of no environment (a tenant's job), its partition the key's FNV-1a hash
-modulo the topic's partitions, chosen by the sink: a stream's lines are
-in order in one partition, and an environment's streams (its jobs' runs
-among them) share theirs, as a tenant's job's do. The source indexes each record once, the topic's
+its stream's object, `<tenant>/<environment>/<kind>/<object>` (an
+environment's job run: kind `job`, its job's name), or `<tenant>//<job>`
+for a stream of no environment (a tenant's job), its partition the key's
+FNV-1a hash modulo the topic's partitions, chosen by the sink: a
+stream's lines are in order in one partition, and an object's streams
+(its replicas, releases and runs) share theirs. An environment's objects
+spread over the partitions, so one busy service fills its own partition
+and a follow of another reads none of its records. The source indexes each record once, the topic's
 offsets kept in Quickwit's metastore with each split it publishes; a
 batch the sink produced twice (an answer to the node that did not
 arrive, then the node's next send) is indexed twice, and the reads take
@@ -383,11 +386,16 @@ With `follow=1` the answer is `application/x-ndjson`, one object a line:
 `{}` after 15 s without a line. It gives the page a backward read gives
 (`since`, `until`, `limit` and the filters as there), oldest first, then
 every line of the selector's streams stored after it: the topics'
-partitions of the selector (an environment's one; a job's or an
-instance's those of its streams, every one before it has a stream), read
-from their ends of before the page as records come (a fetch waits up to 500 ms); a line the
-page gave is not given again, and a stream of the selector that starts
-meanwhile is followed too. It takes no `cursor`. A
+partition of the selector's object, read from its end of before the page
+as records come (a fetch waits up to 500 ms); a line the page gave is not
+given again, and a stream of the object that starts meanwhile is followed
+too. A follow is of one object: `environment`, `kind` and `object`; a
+tenant's `job`; or an `instance` or `stream` (of one object); any other
+selector is `400` (an environment as a whole is read, not followed). A
+follow gives at most 100 lines a second (a burst of 500), and once those
+are spent 50 more a second of `error` and `warn` lines (a burst of 200);
+the lines it skips it counts and says at most once a second,
+`{"skipped": <n>}`. It takes no `cursor`. A
 `level` of `unknown` selects the lines whose `level` is `""`.
 
 ### `GET /api/v1/log-streams`

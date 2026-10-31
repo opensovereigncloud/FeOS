@@ -74,15 +74,22 @@ func (s *Store) ensure(ctx context.Context, id string, days int) (int32, error) 
 	})
 }
 
-// streamKey is a stream's key in the topics: its tenant and environment,
+// streamKey is a stream's key in the topics: its tenant, environment
+// and object (an environment's service, addon or job, by kind and name),
 // or, for a stream of no environment (a tenant's job), its tenant and job.
-// A read selects by these labels, so the streams it wants lie in few
-// partitions: an environment's, its jobs' runs among them, in one.
-func streamKey(tenant, environment, job string) string {
+// A read selects by these labels: an object's streams, its replicas' and
+// its ingress's, lie in one partition, an environment's in those of its
+// objects.
+func streamKey(tenant, environment, kind, object, job string) string {
 	if environment != "" {
-		return tenant + "/" + environment
+		return tenant + "/" + environment + "/" + kind + "/" + object
 	}
 	return tenant + "//" + job
+}
+
+// keyOf is a stream's key.
+func keyOf(st *streamRow) string {
+	return streamKey(st.Tenant, st.Environment, st.Kind, st.Object, st.Job)
 }
 
 // docOf is a line as its stream's index holds it.
@@ -101,7 +108,7 @@ func recordOf(l Line, st *streamRow, n int32) (kafka.Record, error) {
 	if err != nil {
 		return kafka.Record{}, fmt.Errorf("line %d: %w", l.Off, err)
 	}
-	key := streamKey(st.Tenant, st.Environment, st.Job)
+	key := keyOf(st)
 	return kafka.Record{Partition: kafka.Partition(key, n), Key: []byte(key), Value: v}, nil
 }
 
@@ -154,7 +161,7 @@ func partitionsOf(streams []*streamRow, n int32) []int32 {
 	seen := map[int32]bool{}
 	var out []int32
 	for _, st := range streams {
-		p := kafka.Partition(streamKey(st.Tenant, st.Environment, st.Job), n)
+		p := kafka.Partition(keyOf(st), n)
 		if !seen[p] {
 			seen[p] = true
 			out = append(out, p)

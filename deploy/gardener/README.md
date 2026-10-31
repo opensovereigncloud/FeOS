@@ -418,7 +418,7 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
          --from-literal=username=quickwit --from-literal=password="$(openssl rand -hex 24)"
        make -C deploy/gardener apply-ferun apply-quickwit
 
-   The sink makes its indexes (`ferun-logs-v4-<days>d`) itself, at its start.
+   The sink makes its indexes (`ferun-logs-v5-<days>d`) itself, at its start.
 
 6. Kafka, the log of record (ADR 0026 §11): the sink produces every line
    and span to its topics, Quickwit's indexers read them with their
@@ -438,9 +438,9 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
 
 A new image: `make -C deploy/gardener deploy-ferun-sink TAG=<tag>`
 pushes it and rolls the instances. Lines are kept 30 days
-(`FERUN_SINK_LOG_RETENTION`, the index and topic `ferun-logs-v4-30d`), a
+(`FERUN_SINK_LOG_RETENTION`, the index and topic `ferun-logs-v5-30d`), a
 tenant's job asks for up to 400 (`FERUN_SINK_LOG_RETENTION_MAX`,
-`ferun-logs-v4-400d`).
+`ferun-logs-v5-400d`).
 The chunks the sink wrote before Quickwit all moved into the index on
 2026-10-31.
 

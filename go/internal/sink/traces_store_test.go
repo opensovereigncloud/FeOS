@@ -88,7 +88,7 @@ func TestTraceStore(t *testing.T) {
 	if err := ingestSpans(t, tr, traceRequest(podAttrs("other", "env1", "api"), notAcme)); err != nil {
 		t.Fatal(err)
 	}
-	if id, _ := tr.indexID(); id != "ferun-traces-v3-30d" || fmt.Sprint(topicSpans(t, tr, lg)) != "map[acme:3 other:1]" {
+	if id, _ := tr.indexID(); id != "ferun-traces-v4-30d" || fmt.Sprint(topicSpans(t, tr, lg)) != "map[acme:3 other:1]" {
 		t.Fatalf("topic %s: %v", id, topicSpans(t, tr, lg))
 	}
 	var used int64

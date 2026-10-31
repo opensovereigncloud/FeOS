@@ -263,24 +263,39 @@ func (c *Client) Read(ctx context.Context, topic string, from, to map[int32]int6
 }
 
 // Follower reads partitions of a topic from given offsets on, as records
-// come.
+// come; partitions can be added while it reads.
 type Follower struct {
-	cl *kgo.Client
+	cl    *kgo.Client
+	topic string
 }
 
-// Follow starts reading topic's partitions of from at their offsets.
+// Follow starts reading topic's partitions of from at their offsets (none:
+// none yet, Add adds them).
 func (c *Client) Follow(topic string, from map[int32]int64) (*Follower, error) {
-	want := map[int32]kgo.Offset{}
-	for p, f := range from {
-		want[p] = kgo.NewOffset().At(f)
+	opts := []kgo.Opt{kgo.SeedBrokers(c.seeds...), kgo.FetchMaxWait(500 * time.Millisecond)}
+	if len(from) > 0 {
+		opts = append(opts, kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: offsets(from)}))
 	}
-	cl, err := kgo.NewClient(kgo.SeedBrokers(c.seeds...),
-		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{topic: want}),
-		kgo.FetchMaxWait(500*time.Millisecond))
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("kafka: %w", err)
 	}
-	return &Follower{cl: cl}, nil
+	return &Follower{cl: cl, topic: topic}, nil
+}
+
+// Add reads the partitions of from too, each from its offset.
+func (f *Follower) Add(from map[int32]int64) {
+	if len(from) > 0 {
+		f.cl.AddConsumePartitions(map[string]map[int32]kgo.Offset{f.topic: offsets(from)})
+	}
+}
+
+func offsets(from map[int32]int64) map[int32]kgo.Offset {
+	want := map[int32]kgo.Offset{}
+	for p, o := range from {
+		want[p] = kgo.NewOffset().At(o)
+	}
+	return want
 }
 
 // Next returns the records that came, waiting at most until ctx ends or a

@@ -25,9 +25,11 @@ type Log interface {
 	Follow(topic string, from map[int32]int64) (Follower, error)
 }
 
-// Follower reads partitions as their records come (kafka.Follower).
+// Follower reads partitions as their records come (kafka.Follower);
+// Add adds partitions, each from its offset.
 type Follower interface {
 	Next(ctx context.Context) ([]kafka.Record, error)
+	Add(from map[int32]int64)
 	Close()
 }
 

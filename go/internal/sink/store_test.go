@@ -203,18 +203,18 @@ func TestIngestIdempotent(t *testing.T) {
 		t.Errorf("lines %d, bytes %d, next %d, last %d, env %q", lineCount, bytes, next, lastOff, env)
 	}
 	// A record per (stream, offset), in the stream's partition, keyed by
-	// its tenant, environment and job, its document of the first write's
-	// labels.
+	// its tenant, environment and object, its document of the first
+	// write's labels.
 	sid := streamSID(t, s, key)
 	recs := lg.records(logTopic)
-	part := kafka.Partition("acme/env1", int32(testConfig().KafkaPartitions))
+	part := kafka.Partition("acme/env1/service/api", int32(testConfig().KafkaPartitions))
 	var offs []int64
 	for _, r := range recs {
 		var d quickwit.Doc
 		if err := json.Unmarshal(r.Value, &d); err != nil {
 			t.Fatal(err)
 		}
-		if string(r.Key) != "acme/env1" || r.Partition != part || d.Stream != sid || d.Tenant != "acme" ||
+		if string(r.Key) != "acme/env1/service/api" || r.Partition != part || d.Stream != sid || d.Tenant != "acme" ||
 			d.Environment != "env1" || d.Replica != 0 || d.Release != 3 || d.Source != SourceContainer || d.IOStream != "stdout" {
 			t.Errorf("record %q in %d: %+v", r.Key, r.Partition, d)
 		}
@@ -223,9 +223,9 @@ func TestIngestIdempotent(t *testing.T) {
 	if fmt.Sprint(offs) != "[0 10 20 30 40 50 60]" {
 		t.Errorf("offsets in the topic %v", offs)
 	}
-	// A run of an environment's job lies in its environment's partition, a
+	// A run of an environment's job lies in its object's partition, a
 	// tenant's job (no environment) in its job's.
-	job := Labels{Tenant: "acme", Environment: "env1", Job: "build-1", Attrs: map[string]string{}}
+	job := Labels{Tenant: "acme", Environment: "env1", Kind: "job", Object: "migrate", Attempt: 1, Attrs: map[string]string{}}
 	if err := s.Ingest(ctx, batch(StreamKey{"pod2", "main", "L1"}, job, lines(0, base, 1, func(int) string { return "j" }))); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestIngestIdempotent(t *testing.T) {
 	inEnv, jobs := 0, 0
 	for _, r := range recs {
 		switch string(r.Key) {
-		case "acme/env1":
+		case "acme/env1/service/api", "acme/env1/job/migrate":
 			inEnv++
 		case "acme//build-2":
 			jobs++
@@ -466,7 +466,7 @@ func TestReadTailAndIndex(t *testing.T) {
 	if n, recs := idx.count("acme"), lg.count(logTopic); n != 40 || recs != 70 {
 		t.Fatalf("indexed %d, %d records", n, recs)
 	}
-	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-v4-30d ferun-logs-v4-400d]" {
+	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-v5-30d ferun-logs-v5-400d]" {
 		t.Errorf("indexes %v", ids)
 	}
 	// A read finds the lines of an index of before (version 1,
@@ -714,8 +714,8 @@ func TestRetentionAndDelete(t *testing.T) {
 	idx.sync(lg)
 	// An index (and topic) per retention: the default's, and the longest's
 	// for the streams that ask for more.
-	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-v4-1d ferun-logs-v4-3d]" || idx.count("acme") != 7 ||
-		lg.count("ferun-logs-v4-1d") != 3 || lg.count("ferun-logs-v4-3d") != 4 {
+	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-v5-1d ferun-logs-v5-3d]" || idx.count("acme") != 7 ||
+		lg.count("ferun-logs-v5-1d") != 3 || lg.count("ferun-logs-v5-3d") != 4 {
 		t.Fatalf("indexes %v, %d documents", ids, idx.count("acme"))
 	}
 	// A line in the tail of a stream past retention is not read either.
@@ -786,12 +786,20 @@ type followRecorder struct {
 	lines   []string
 	streams int
 	beats   int
+	skipped int
 }
 
 func (f *followRecorder) Line(l Line, st *streamRow) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lines = append(f.lines, l.Text)
+	return nil
+}
+
+func (f *followRecorder) Skipped(n int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.skipped += n
 	return nil
 }
 
@@ -840,12 +848,12 @@ func TestFollow(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx.sync(lg)
-	rec, stop := follow(t, s, url.Values{"environment": {"e"}, "follow": {"1"}, "q": {"-skip"}})
+	rec, stop := follow(t, s, url.Values{"environment": {"e"}, "kind": {"service"}, "object": {"api"}, "follow": {"1"}, "q": {"-skip"}})
 	waitFor(t, func() bool { l, _ := rec.snapshot(); return len(l) == 3 })
 	// New lines, a commit of the index meanwhile, the new lines in the
-	// topic again (an answer lost), a stream that starts now, a job's
-	// stream of the environment, a line the filter drops and another
-	// environment's line.
+	// topic again (an answer lost), a stream of the object that starts now
+	// (another replica, a job's stream of it), a line the filter drops,
+	// another object's line and another environment's.
 	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(100, base+int64(time.Second), 3, text("new")))); err != nil {
 		t.Fatal(err)
 	}
@@ -864,6 +872,11 @@ func TestFollow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.Ingest(ctx, batch(StreamKey{"x", "c", "1"}, envLabels("acme", "x", 0), lines(0, base+int64(4*time.Second), 1, text("x")))); err != nil {
+		t.Fatal(err)
+	}
+	web := envLabels("acme", "e", 0)
+	web.Object = "web"
+	if err := s.Ingest(ctx, batch(StreamKey{"w", "c", "1"}, web, lines(0, base+int64(4*time.Second), 1, text("web")))); err != nil {
 		t.Fatal(err)
 	}
 	// A line in two parts, in two batches: given once, joined.
@@ -889,25 +902,28 @@ func TestFollow(t *testing.T) {
 	}
 }
 
-// A follow of a job before its stream starts gives the stream's lines;
-// one of a stream gives only that stream's.
+// A follow of a tenant's job or of an object before its stream starts
+// gives the stream's lines; one of a stream gives only that stream's; an
+// environment as a whole is not followed.
 func TestFollowBeforeTheStream(t *testing.T) {
 	cfg := testConfig()
 	cfg.Heartbeat = 20 * time.Millisecond
 	s, _, _ := newTestStore(t, cfg)
 	ctx := context.Background()
-	jl := envLabels("acme", "e", 0)
-	jl.Job = "build-1"
-	other := jl
-	other.Job = "build-2"
+	jl := Labels{Tenant: "acme", Job: "build-1", Attrs: map[string]string{}}
+	other := Labels{Tenant: "acme", Job: "build-2", Attrs: map[string]string{}}
 	byJob, stopJob := follow(t, s, url.Values{"job": {"build-1"}, "follow": {"1"}})
-	byEnvJob, stopEnvJob := follow(t, s, url.Values{"environment": {"e"}, "job": {"build-1"}, "follow": {"1"}})
+	byObject, stopObject := follow(t, s, url.Values{"environment": {"f"}, "kind": {"service"}, "object": {"api"}, "follow": {"1"}})
 	// A follow beats once it reads its partitions: wait for that.
-	for _, rec := range []*followRecorder{byJob, byEnvJob} {
+	for _, rec := range []*followRecorder{byJob, byObject} {
 		waitFor(t, func() bool { _, b := rec.snapshot(); return b > 0 })
 	}
-	for i, l := range []Labels{other, jl} {
-		if err := s.Ingest(ctx, batch(StreamKey{l.Job, "c", "1"}, l, lines(0, base+int64(i), 1, func(int) string { return l.Job }))); err != nil {
+	for i, l := range []Labels{other, jl, envLabels("acme", "f", 0)} {
+		name := l.Job
+		if name == "" {
+			name = "api"
+		}
+		if err := s.Ingest(ctx, batch(StreamKey{name, "c", "1"}, l, lines(0, base+int64(i), 1, func(int) string { return name }))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -920,42 +936,131 @@ func TestFollowBeforeTheStream(t *testing.T) {
 	if err := s.Ingest(ctx, batch(StreamKey{"build-1", "c", "1"}, jl, lines(10, base+10, 1, func(int) string { return "1 again" }))); err != nil {
 		t.Fatal(err)
 	}
-	for _, rec := range []*followRecorder{byJob, byEnvJob, byStream} {
+	for _, rec := range []*followRecorder{byJob, byStream} {
 		waitFor(t, func() bool { l, _ := rec.snapshot(); return strings.Join(l, "|") == "build-1|1 again" || len(l) > 2 })
 	}
-	for name, rec := range map[string]*followRecorder{"job": byJob, "environment and job": byEnvJob, "stream": byStream} {
+	for name, rec := range map[string]*followRecorder{"job": byJob, "stream": byStream} {
 		if l, _ := rec.snapshot(); strings.Join(l, "|") != "build-1|1 again" {
 			t.Errorf("a follow of the %s gave %v", name, l)
 		}
 	}
-	for _, stop := range []func() error{stopJob, stopEnvJob, stopStream} {
+	waitFor(t, func() bool { l, _ := byObject.snapshot(); return len(l) == 1 })
+	if l, _ := byObject.snapshot(); l[0] != "api" {
+		t.Errorf("a follow of the object gave %v", l)
+	}
+	for _, stop := range []func() error{stopJob, stopObject, stopStream} {
 		if err := stop(); err != nil {
 			t.Fatal(err)
 		}
 	}
+	q, _ := parseQuery(url.Values{"environment": {"f"}, "follow": {"1"}}, time.Now())
+	if err := s.Follow(ctx, "acme", q, &followRecorder{}); !errors.Is(err, ErrFollowScope) {
+		t.Errorf("a follow of an environment: %v", err)
+	}
 }
 
-func TestFollowPartitions(t *testing.T) {
-	live := []*streamRow{{Tenant: "acme", Environment: "e"}, {Tenant: "acme", Environment: "e", Job: "j"}}
+// A follow over its rate skips lines, error lines last, and says how many.
+func TestFollowRate(t *testing.T) {
+	cfg := testConfig()
+	cfg.Heartbeat = 20 * time.Millisecond
+	s, _, _ := newTestStore(t, cfg)
+	ctx := context.Background()
+	rec, stop := follow(t, s, url.Values{"environment": {"e"}, "kind": {"service"}, "object": {"api"}, "follow": {"1"}})
+	waitFor(t, func() bool { _, b := rec.snapshot(); return b > 0 })
+	n := followBurst + 300
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base, n, func(i int) string {
+		if i%2 == 0 {
+			return fmt.Sprintf("ERROR %d", i)
+		}
+		return fmt.Sprintf("INFO %d", i)
+	}))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { rec.mu.Lock(); defer rec.mu.Unlock(); return rec.skipped > 0 })
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	given, errs := len(rec.lines), 0
+	for _, l := range rec.lines {
+		if strings.HasPrefix(l, "ERROR") {
+			errs++
+		}
+	}
+	if given+rec.skipped != n || given > followBurst+followErrBurst+followRate+followErrRate {
+		t.Errorf("given %d, skipped %d, of %d", given, rec.skipped, n)
+	}
+	if errs <= given/2 {
+		t.Errorf("%d error lines among %d given: errors not first", errs, given)
+	}
+}
+
+func TestFollowKey(t *testing.T) {
+	s, _, _ := newTestStore(t, testConfig())
+	ctx := context.Background()
+	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base, 1, func(int) string { return "x" }))); err != nil {
+		t.Fatal(err)
+	}
+	inst := envLabels("acme", "e", 0).Instance
 	for _, c := range []struct {
 		sel  Selector
-		want []int32
+		want string
 	}{
-		{Selector{Stream: "s_1"}, partitionsOf(live, 12)},
-		{Selector{Environment: "e", Job: "j"}, []int32{kafka.Partition("acme/e", 12)}},
-		{Selector{Environment: "e"}, []int32{kafka.Partition("acme/e", 12)}},
-		{Selector{Job: "j"}, append(partitionsOf(live, 12), kafka.Partition("acme//j", 12))},
-		{Selector{Job: "j"}, nil},
-		{Selector{Instance: "i"}, partitionsOf(live, 12)},
-		{Selector{Instance: "i"}, nil}, // no stream yet: every partition (below)
+		{Selector{Environment: "e", Kind: "service", Object: "api"}, "acme/e/service/api"},
+		{Selector{Environment: "e", Kind: "service", Object: "api", Replica: new(int)}, "acme/e/service/api"},
+		{Selector{Job: "j"}, "acme//j"},
+		{Selector{Instance: inst}, "acme/e/service/api"},
+		{Selector{Environment: "e"}, ""},
+		{Selector{Environment: "e", Object: "api"}, ""},
+		{Selector{Instance: "nope"}, ""},
 	} {
-		l := live
-		if c.want == nil {
-			l, c.want = nil, []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+		got, err := s.FollowKey(ctx, "acme", c.sel)
+		if c.want == "" {
+			if !errors.Is(err, ErrFollowScope) {
+				t.Errorf("%+v: %q, %v; want ErrFollowScope", c.sel, got, err)
+			}
+			continue
 		}
-		if got := followPartitions("acme", c.sel, l, 12); !slices.Equal(got, c.want) {
-			t.Errorf("%+v: %v, want %v", c.sel, got, c.want)
+		if err != nil || got != c.want {
+			t.Errorf("%+v: %q, %v; want %q", c.sel, got, err, c.want)
 		}
+	}
+}
+
+func TestFollowLimit(t *testing.T) {
+	now := time.Now()
+	f := newFollowLimit(now)
+	info, errl := Line{Level: LevelInfo}, Line{Level: LevelError}
+	n := 0
+	for range followBurst + 100 {
+		if f.admit(&info, now) {
+			n++
+		}
+	}
+	if n != followBurst {
+		t.Errorf("a burst of %d info lines took %d", followBurst+100, n)
+	}
+	// Errors have their own bucket once the lines' is empty.
+	e := 0
+	for range followErrBurst + 10 {
+		if f.admit(&errl, now) {
+			e++
+		}
+	}
+	if e != followErrBurst {
+		t.Errorf("%d error lines over the burst taken, want %d", e, followErrBurst)
+	}
+	if got := f.skippedDue(now); got != 0 {
+		t.Errorf("said %d before a second", got)
+	}
+	if got := f.skippedDue(now.Add(time.Second)); got != 110 {
+		t.Errorf("skipped %d, want 110", got)
+	}
+	// A second later, the rate's lines go again.
+	later := now.Add(2 * time.Second)
+	if !f.admit(&info, later) {
+		t.Error("no line after the bucket refilled")
 	}
 }
 

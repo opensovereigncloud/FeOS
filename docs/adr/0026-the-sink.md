@@ -400,8 +400,8 @@ tenants ── GET /api/v1/logs, /api/v1/jaeger ─▶ ferun-sink: Quickwit + th
 ```
 
 - **One log for every signal.** A topic per index: `<prefix>-v<version>-<days>d`, the
-  index's own name (`ferun-logs-v4-30d`, `ferun-logs-v4-400d`,
-  `ferun-traces-v3-30d`), each indexed by one Kafka source of its index.
+  index's own name (`ferun-logs-v5-30d`, `ferun-logs-v5-400d`,
+  `ferun-traces-v4-30d`, 64 partitions each), each indexed by one Kafka source of its index.
   The topics are a replay buffer, kept a day (`--kafka-retention`); the
   index is the store. Kafka (three nodes in KRaft mode, replication
   three, `min.insync.replicas` two) answers a produce (`acks=all`) once
@@ -421,11 +421,15 @@ tenants ── GET /api/v1/logs, /api/v1/jaeger ─▶ ferun-sink: Quickwit + th
   reads drop (one (stream, offset), one span ID). `log_batches`,
   `log_lines` and `trace_spans` and both indexers go.
 - **The partition is the reader's address.** A log record's key is its
-  stream's tenant and environment (a tenant's job: tenant and job), the
-  partition the key's hash: a stream's lines stay in order, and a read
-  or a follow of an environment, its jobs' runs among them, reads one
-  partition per topic. A span's key is its trace ID: a trace
-  is read from one partition.
+  stream's object: tenant, environment, kind and object (a tenant's job:
+  tenant and job), the partition the key's hash, of 64: a stream's lines
+  stay in order, an object's replicas and releases share a partition,
+  and a follow of a service reads one partition per topic, which a busy
+  neighbour of the same environment rarely shares. A read of a whole
+  environment reads the partitions of its objects. A span's key is its
+  trace ID: a trace is read from one partition. *(First keyed by tenant
+  and environment; on Malte's word the same day keyed by the object, as
+  a follow is of one service.)*
 - **Reading is the index and the tail.** A read asks Quickwit for the
   source's checkpoint first (per partition, what it has published), then
   searches the index as before, then reads the topic's partitions of
@@ -435,10 +439,16 @@ tenants ── GET /api/v1/logs, /api/v1/jaeger ─▶ ferun-sink: Quickwit + th
   reads its trace's partition the same way, so a fresh request's trace
   is found at once; the searches of traces read the index alone, so a
   span is found by a search after a commit (5 s).
-- **Following is the topic.** A follow reads its partitions from their
-  end as records come (a fetch waits up to half a second), after the
-  backward page it gives first; a line it gave on that page is not given
-  again. No database is polled.
+- **Following is the topic, of one object.** A follow reads its object's
+  partition from its end as records come (a fetch waits up to half a
+  second), after the backward page it gives first; a line it gave on
+  that page is not given again. No database is polled. A follow is of
+  one service (or job, or tenant's job, or one of its instances or
+  streams); an environment as a whole is searched, not followed. A
+  follow gives at most 100 lines a second (a burst of 500), then 50 more
+  a second of error and warn lines, and says once a second how many it
+  skipped (`{"skipped": n}`), which FeCode shows: a screen can show no
+  more, and a noisy service must not starve the reader.
 - **On the nodes, nothing changes, on purpose.** The guest's
   `container.log` is the node's buffer and stays its source (§3): feosd
   follows it from the position the sink keeps and sends one batch a

@@ -115,7 +115,7 @@ func Default() Config {
 		ScanLimit:     256 << 20,
 
 		IndexPartitions:  16,
-		KafkaPartitions:  12,
+		KafkaPartitions:  64,
 		KafkaReplication: 3,
 		KafkaRetention:   24 * time.Hour,
 		TraceQuota:       1 << 30,

@@ -89,7 +89,7 @@ func TestKafkaEndToEnd(t *testing.T) {
 		t.Errorf("a phrase: %d lines", len(r.lines))
 	}
 	// A follow gives the page, then what comes.
-	q, err := parseQuery(url.Values{"environment": {"env1"}, "follow": {"1"}, "since": {fmt.Sprint(base - 1)}}, time.Now())
+	q, err := parseQuery(url.Values{"environment": {"env1"}, "kind": {"service"}, "object": {"api"}, "follow": {"1"}, "since": {fmt.Sprint(base - 1)}}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -12,7 +12,7 @@ and Quickwit holds here unless this one says otherwise.
 pod (OTel SDK) ──OTLP/gRPC :4317, OTLP/HTTP protobuf :4318──▶ feosd at 169.254.169.1
                                    │ the pod by its source address, its ferun.* labels stamped
 feosd (node) ──OTLP TraceService/Export (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `trace_usage` (quota)
-ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Kafka ferun-traces-v3-<days>d ──Kafka source──▶ Quickwit index of that name
+ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Kafka ferun-traces-v4-<days>d ──Kafka source──▶ Quickwit index of that name
 tenants (FeCode) ── GET /api/v1/jaeger/api/… (Bearer) ─────────┘
 ```
 
@@ -182,7 +182,7 @@ keeps one per span ID.
 
 ### The index
 
-`<--trace-index-prefix>-v<N>-<days>d`, default `ferun-traces-v3-30d`
+`<--trace-index-prefix>-v<N>-<days>d`, default `ferun-traces-v4-30d`
 (`--trace-retention`, 30 days), created at first use with its topic and source as the logs'
 indexes are, with a commit interval of 5 s. `N` is the
 mapping's version (`quickwit.TraceMappingVersion`): a changed mapping is

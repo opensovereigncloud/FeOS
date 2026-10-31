@@ -296,7 +296,7 @@ func TestEndToEnd(t *testing.T) {
 	// Follow: the page, then a new line, as NDJSON.
 	fctx, fcancel := context.WithCancel(actx)
 	defer fcancel()
-	fr, _ := http.NewRequestWithContext(fctx, http.MethodGet, api+"/api/v1/logs?environment=env1&follow=1", nil)
+	fr, _ := http.NewRequestWithContext(fctx, http.MethodGet, api+"/api/v1/logs?environment=env1&kind=service&object=api&follow=1", nil)
 	fr.Header.Set("Authorization", "Bearer tenant-token")
 	fresp, err := http.DefaultClient.Do(fr)
 	if err != nil {
