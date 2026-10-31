@@ -69,12 +69,15 @@ func (k StreamKey) less(o StreamKey) bool {
 }
 
 // Labels are a stream's labels, set by ferund through the node (sink.md,
-// The OTLP shape); Attrs are all its resource attributes.
+// The OTLP shape) or by the ingress; Attrs are all its resource
+// attributes. Node is "" for an ingress's stream; Source is
+// SourceIngress or SourceContainer.
 type Labels struct {
 	Tenant, Node, Instance, Environment, Kind, Object, Job string
 	Replica, Release, Attempt                              int
 	// RetentionDays is ferun.retention_days, 0 for none.
 	RetentionDays int
+	Source        string
 	Attrs         map[string]string
 }
 
@@ -189,12 +192,16 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (in
 	if l.RetentionDays > 0 {
 		retention = &l.RetentionDays
 	}
+	source := l.Source
+	if source == "" {
+		source = SourceContainer
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO log_streams (sid, pod, container, log_id, tenant, node, instance, environment,
-			kind, object, replica, release, job, attempt, retention_days, labels)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			kind, object, replica, release, job, attempt, retention_days, labels, source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (pod, container, log_id) DO NOTHING`,
 		sid, b.Key.Pod, b.Key.Container, b.Key.LogID, l.Tenant, l.Node, l.Instance, l.Environment,
-		l.Kind, l.Object, l.Replica, l.Release, l.Job, l.Attempt, retention, l.Attrs); err != nil {
+		l.Kind, l.Object, l.Replica, l.Release, l.Job, l.Attempt, retention, l.Attrs, source); err != nil {
 		return 0, fmt.Errorf("stream: %w", err)
 	}
 	var id, chunkedLast, lastOff int64

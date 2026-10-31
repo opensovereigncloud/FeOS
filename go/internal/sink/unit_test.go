@@ -62,6 +62,15 @@ func TestExtract(t *testing.T) {
 	}
 }
 
+func TestParseSelectorSource(t *testing.T) {
+	for src, ok := range map[string]bool{"": true, "ingress": true, "container": true, "node": false} {
+		s, err := parseSelector(url.Values{"environment": {"e1"}, "source": {src}})
+		if (err == nil) != ok || (ok && s.Source != src) {
+			t.Errorf("source %q: %+v, %v", src, s, err)
+		}
+	}
+}
+
 func TestParseQuery(t *testing.T) {
 	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
 	q, err := parseQuery(url.Values{"environment": {"e1"}, "q": {"Foo -bar  baz"}, "level": {"error,unknown"},
@@ -225,7 +234,7 @@ func TestParseExport(t *testing.T) {
 		record(0, 5, "stdout", "INFO hello"), record(12, 0, "stderr", "x\x00y\xff"))
 	req.ResourceLogs = append(req.ResourceLogs, exportRequest(resourceAttrs("p1", "main", "L1", "acme", nil),
 		record(30, 7, "", "third")).ResourceLogs...)
-	got, err := parseExport(req, "node-1", now)
+	got, err := parseExport(req, ingestPeer{node: "node-1"}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +242,8 @@ func TestParseExport(t *testing.T) {
 		t.Fatalf("%d streams", len(got))
 	}
 	b := got[0]
-	if b.Labels.Node != "node-1" || b.Labels.Replica != 2 || b.Labels.RetentionDays != 90 || b.Labels.Tenant != "acme" {
+	if b.Labels.Node != "node-1" || b.Labels.Replica != 2 || b.Labels.RetentionDays != 90 || b.Labels.Tenant != "acme" ||
+		b.Labels.Source != SourceContainer {
 		t.Errorf("labels %+v", b.Labels)
 	}
 	if b.Lines[0].Level != LevelInfo || b.Lines[0].TS != 5 || b.Lines[1].TS != now.UnixNano() || b.Lines[1].Text != "x�y�" {
@@ -243,12 +253,34 @@ func TestParseExport(t *testing.T) {
 		t.Errorf("next %d", b.Next)
 	}
 	bad := exportRequest(resourceAttrs("p1", "main", "L1", "", nil), record(0, 1, "", "x"))
-	if _, err := parseExport(bad, "n", now); err == nil {
+	if _, err := parseExport(bad, ingestPeer{node: "n"}, now); err == nil {
 		t.Error("a resource without a tenant passed")
 	}
 	noOff := exportRequest(resourceAttrs("p1", "main", "L1", "acme", nil), &logsv1.LogRecord{Body: str("x")})
-	if _, err := parseExport(noOff, "n", now); err == nil {
+	if _, err := parseExport(noOff, ingestPeer{node: "n"}, now); err == nil {
 		t.Error("a record without an offset passed")
+	}
+
+	// An ingress's stream is the ingress's of its name alone; every
+	// other stream a node's, never of an ingress/ pod.
+	ing := exportRequest(resourceAttrs("ingress/in-0", "e1/web", "L1", "acme", map[string]string{attrSource: SourceIngress}),
+		record(0, 1, "", `{"level":"warn"}`))
+	got, err = parseExport(ing, ingestPeer{ingress: "in-0"}, now)
+	if err != nil || len(got) != 1 || got[0].Labels.Source != SourceIngress || got[0].Labels.Node != "" ||
+		got[0].Lines[0].Level != LevelWarn {
+		t.Fatalf("an ingress's stream: %+v, %v", got, err)
+	}
+	asNode := exportRequest(resourceAttrs("ingress/in-0", "e1/web", "L1", "acme", nil), record(0, 1, "", "x"))
+	for _, c := range []struct {
+		req *otlplogsv1.ExportLogsServiceRequest
+		p   ingestPeer
+	}{
+		{ing, ingestPeer{node: "n"}}, {ing, ingestPeer{ingress: "in-1"}}, {req, ingestPeer{ingress: "in-0"}},
+		{asNode, ingestPeer{node: "n"}}, {asNode, ingestPeer{ingress: "in-0"}},
+	} {
+		if _, err := parseExport(c.req, c.p, now); !errors.Is(err, errNotYours) {
+			t.Errorf("%+v wrote %v: %v", c.p, c.req.ResourceLogs[0].Resource.Attributes, err)
+		}
 	}
 }
 

@@ -30,6 +30,8 @@ import (
 	sinkv1 "github.com/gardenlinux/feos/go/gen/feos/sink/v1"
 	otlplogsv1 "github.com/gardenlinux/feos/go/gen/otlp/collector/logs/v1"
 	"github.com/gardenlinux/feos/go/internal/db/dbtest"
+	"github.com/gardenlinux/feos/go/internal/ingress/sinklog"
+	"github.com/gardenlinux/feos/go/internal/ingress/wire"
 	"github.com/gardenlinux/feos/go/internal/pki"
 	"github.com/gardenlinux/feos/go/internal/podid"
 )
@@ -330,5 +332,160 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if ferund.certs.Load() != 1 {
 		t.Errorf("%d certificates", ferund.certs.Load())
+	}
+}
+
+// ingressIdentity is an ingress's certificate, issued with pki, and the
+// bundle, as the ingress agent holds them.
+func ingressIdentity(t *testing.T, iss *pki.Issuer, name string) sinklog.Identity {
+	t.Helper()
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	csr, err := pki.CreateCSR(key, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := iss.IssueIngress(csr, name, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := &tls.Certificate{Certificate: c.Chain, PrivateKey: key}
+	return func() (*tls.Certificate, *x509.CertPool, error) { return cert, iss.Bundle(), nil }
+}
+
+// The ingress writes its access log with its own certificate as streams
+// of the services it served (sink.md, The ingress's access log): found
+// by source, level and trace; a node cannot write an ingress's stream,
+// nor an ingress a container's, nor another ingress's.
+func TestIngressEndToEnd(t *testing.T) {
+	dbURL := dbtest.NewDatabase(t)
+	iss := newCA(t)
+	fsrv := httptest.NewServer(&fakeFerund{iss: iss})
+	defer fsrv.Close()
+	cfg := Default()
+	cfg.Name, cfg.Listen, cfg.IngestListen = "sink-0", "127.0.0.1:0", "127.0.0.1:0"
+	cfg.DatabaseURL, cfg.TrustDomain, cfg.FerunURL, cfg.ServiceToken = dbURL, testTD, fsrv.URL, "svc-token"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prog, err := New(ctx, cfg, Deps{Bucket: newMemBucket()}, dbtest.Logger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- prog.Run(ctx) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("run: %v", err)
+		}
+	}()
+	actx, acancel := context.WithTimeout(ctx, 30*time.Second)
+	defer acancel()
+	addr, err := prog.IngestAddr(actx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := sinklog.NewClient(addr.String(), testTD, ingressIdentity(t, iss, "in-0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+	t0 := time.Now().Add(-time.Minute).UTC()
+	rec := func(at time.Duration, path string, status int, outcome, trace string) wire.AccessLogEntry {
+		return wire.AccessLogEntry{Time: t0.Add(at), DurationNs: 1500, Env: "env1", Tenant: "acme", Service: "web",
+			Instance: "i1", Host: "app.apps.example.com", Method: "GET", Path: path, Proto: "HTTP/2.0", Status: status,
+			Outcome: outcome, Attempts: 1, TraceID: trace, SpanID: "00f067aa0ba902b7"}
+	}
+	streams := sinklog.NewStreams("in-0", "3f0c2a4e-8d1b-4c55-9a39-0d6f1b7a2c11")
+	req, taken, skipped := streams.Batch([]wire.AccessLogEntry{
+		rec(0, "/a", 200, "2xx", ""), rec(time.Second, "/b", 503, "5xx", traceA), rec(2*time.Second, "/c", 404, "4xx", ""),
+		{Env: "env1", Service: "web"}, // no tenant: skipped
+	})
+	if taken != 4 || skipped != 1 {
+		t.Fatalf("taken %d, skipped %d", taken, skipped)
+	}
+	// A batch sent again is stored once.
+	for range 2 {
+		if err := client.Export(actx, req); err != nil {
+			t.Fatalf("export: %v", err)
+		}
+	}
+
+	api := "http://" + prog.APIAddr().String()
+	read := func(query string) PageJSON {
+		t.Helper()
+		r, _ := http.NewRequestWithContext(actx, http.MethodGet, api+"/api/v1/logs?"+query, nil)
+		r.Header.Set("Authorization", "Bearer tenant-token")
+		resp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: %d %s", query, resp.StatusCode, b)
+		}
+		var page PageJSON
+		if err := json.Unmarshal(b, &page); err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+	page := read("environment=env1&source=ingress&trace=" + traceA)
+	if len(page.Lines) != 1 || page.Lines[0].Level != "error" || page.Lines[0].Offset != 1 ||
+		page.Lines[0].TS != t0.Add(time.Second).UnixNano() {
+		t.Fatalf("the trace's lines: %+v", page.Lines)
+	}
+	var line sinklog.Line
+	if err := json.Unmarshal([]byte(page.Lines[0].Text), &line); err != nil || line.Path != "/b" || line.Ingress != "in-0" ||
+		line.TraceID != traceA || line.Status != 503 {
+		t.Errorf("line %q: %v", page.Lines[0].Text, err)
+	}
+	st := page.Streams[page.Lines[0].Stream]
+	if st.Source != SourceIngress || st.Node != "" || st.Environment != "env1" || st.Kind != "service" ||
+		st.Object != "web" || st.Container != "env1/web" || st.Tenant != "acme" || st.Lines != 3 {
+		t.Errorf("stream %+v", st)
+	}
+	if page := read("environment=env1&source=ingress&level=warn,error&object=web"); len(page.Lines) != 2 ||
+		page.Lines[0].Level != "error" || page.Lines[1].Level != "warn" {
+		t.Errorf("warn and error: %+v", page.Lines)
+	}
+	if page := read("environment=env1&source=container"); len(page.Lines) != 0 {
+		t.Errorf("containers' lines: %+v", page.Lines)
+	}
+	if page := read("environment=env1"); len(page.Lines) != 3 {
+		t.Errorf("both sources: %+v", page.Lines)
+	}
+
+	// Writes of a stream of another peer are refused.
+	denied := func(what string, creds *tls.Config, req *otlplogsv1.ExportLogsServiceRequest) {
+		t.Helper()
+		conn, err := grpc.NewClient(addr.String(), grpc.WithTransportCredentials(credentials.NewTLS(creds)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		if _, err := otlplogsv1.NewLogsServiceClient(conn).Export(actx, req); status.Code(err) != codes.PermissionDenied {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	ingressTLS := func(name string) *tls.Config {
+		return sinklog.ClientTLS(testTD, ingressIdentity(t, iss, name))
+	}
+	denied("a node writing an ingress's stream", nodeTLS(t, iss, "node-1", false), req)
+	denied("an ingress writing another's stream", ingressTLS("in-1"), req)
+	container := exportRequest(resourceAttrs("abcdefghjkm", "main", "log1", "acme",
+		map[string]string{attrEnvironment: "env1"}), record(0, uint64(t0.UnixNano()), "stdout", "x"))
+	denied("an ingress writing a container's stream", ingressTLS("in-0"), container)
+	conn, err := grpc.NewClient(addr.String(), grpc.WithTransportCredentials(credentials.NewTLS(ingressTLS("in-0"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := sinkv1.NewSinkServiceClient(conn).Positions(actx, &sinkv1.PositionsRequest{}); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("an ingress's Positions: %v", err)
+	}
+	if page := read("environment=env1"); len(page.Lines) != 3 {
+		t.Errorf("after the refusals: %+v", page.Lines)
 	}
 }
