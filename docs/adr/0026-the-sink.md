@@ -1,6 +1,6 @@
 # ADR 0026: The sink — a program of its own that keeps what the platform and its pods say: logs first, traces and audit records after, in the database first and in the object store after
 
-**Status:** Proposed · **Date:** 2026-10-30
+**Status:** Accepted (Malte, 2026-10-30), steps 1 to 7 built and live on shoot `fecode` since 2026-10-31 · **Date:** 2026-10-30
 
 ## Context
 
