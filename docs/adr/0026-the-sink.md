@@ -180,18 +180,53 @@ an environment's or a job's streams. **Quota**: bytes per tenant per day
 tenant's batches with `RESOURCE_EXHAUSTED`, and the node drops and counts
 them as §3 says.
 
-### 8. Traces, next: OTLP from pods, the ingress's spans beside them
+### 8. The ingress's access log is a stream of the application's (proposed 2026-10-31)
 
-The sink takes OTLP traces (`TraceService/Export`, gRPC and HTTP) from
-pods. A pod connects with its certificate (`spiffe://<td>/tenant/<t>/
-sandbox/<id>`, ADR 0014), and the sink labels its spans from the stream
-of that sandbox, so a pod cannot write as another. Spans are stored the
-same way: hot in `spans`, cold in chunks per trace window, indexed by
-trace ID and by service and time. The ingress's server spans come over
-OTLP too, and `access_logs` moves out of `ferund` into the sink then (its
-`…/access-logs` call reading from the sink, as `…/logs` does). That is a
-step of its own with its own decision on sampling, not part of the first
-steps.
+Asked for by Malte on 2026-10-31: the ingress writes its access log into
+the sink itself, tied to the application it served. Until now each
+record went to `ferund` (`PublishAccessLogs`, the table `access_logs`,
+ADR 0021), beside the sink and out of reach of a search of the
+application's logs.
+
+- **A request is a line of the service's.** `ferun-ingress` keeps a
+  stream per (instance of the ingress, its start, environment, service)
+  and writes each request as one JSON line: time, method, host, path
+  (without its query, as now), status, outcome, duration, time held,
+  attempts, bytes in and out, client address, user agent, the instance
+  that answered, and `trace_id`, `span_id`, `parent_span_id`, with
+  `level` from the outcome (5xx and aborted `error`, 4xx `warn`, else
+  `info`). The stream's labels are the service's: `ferun.tenant`,
+  `ferun.environment`, `ferun.kind` `service`, `ferun.object`, and
+  `ferun.source` `ingress`, which a container's stream has not. A search
+  of a service finds its requests beside its containers' lines, "errors
+  only" finds its 5xx too, and the trace index (§5) ties a request to
+  the lines its handling wrote: an application that logs the
+  `traceparent` the ingress sent is found by it.
+- **The ingress ships it, not `ferund`.** The agent exports its batches
+  over OTLP as the nodes do (§3), from its buffer (10,000 records, as
+  now), with its ingress certificate (`spiffe://<td>/ingress/<name>`).
+  The stream's key is the instance's name, the environment and service,
+  and the start, and a record's offset its number in that stream, so a
+  batch sent again is stored once. The sink takes streams with
+  `ferun.source` `ingress` from an ingress's certificate only, and a
+  node's streams from a node's only. The ingress is given the sink's
+  address in its own `--sink-endpoint`; it runs in the cluster's network
+  and resolves the headless Service's name itself.
+- **`ferund` keeps the API, not the table.** `…/access-logs` reads the
+  service's ingress lines from the sink and answers them as it does now,
+  and the trace filter becomes the sink's `trace`. Without a sink, the
+  ingress sends to `ferund` as before. `access_logs` is read for its
+  retention after the switch, then dropped (N−1).
+- **FeCode** shows a service's requests in its Logs tab as a source of
+  their own beside its replicas, a request's trace ID as a link to the
+  lines of its trace (FeCode ADR 0009 §12).
+
+Traces, next: the sink takes OTLP traces (`TraceService/Export`) from
+pods, each with its certificate (`spiffe://<td>/tenant/<t>/sandbox/<id>`,
+ADR 0014), labelled from the stream of that sandbox, so a pod cannot
+write as another; hot in `spans`, cold in chunks, indexed by trace ID.
+The ingress's request lines then become its server spans as well. That
+is a step of its own, with its own decision on sampling.
 
 ### 9. Audit records, next: the same store, never dropped
 
@@ -220,7 +255,11 @@ decided with that step.
 5. **Levels and trace IDs** (§5, §6).
 6. **`ferund` reads from the sink**: the logs call, a job's run's log; a
    run's `log_tail` stops being written.
-7. Later and decided apart: traces (§8), audit records (§9).
+7. **The ingress's access log** (§8): streams per service with
+   `ferun.source` `ingress`, exported by `ferun-ingress` with its
+   certificate, `…/access-logs` read from the sink, FeCode's Logs tab
+   showing requests and their traces.
+8. Later and decided apart: traces (§8), audit records (§9).
 
 ## Alternatives considered
 

@@ -126,6 +126,45 @@ dropped lines has `log.offset` of the first line it dropped and
 last line stored, which the node then sends again and the sink stores
 once.
 
+## The ingress's access log
+
+`ferun-ingress` writes every request it answered for an environment
+into the sink itself (ADR 0026 §8), when `--sink-endpoint` names the
+ingest (its manifest: `ferun-sink-ingest.ferun.svc.cluster.local:4317`;
+it runs in the cluster's network and resolves the name itself); without
+it, it sends to `ferund` as before (`PublishAccessLogs`).
+
+- **Stream**: one per (ingress instance, start of its agent,
+  environment, service). Key: `ferun.pod` = `ingress/<instance name>`,
+  `ferun.container` = `<environment id>/<service>`, `ferun.log_id` = the
+  agent's start (a UUID). Labels: `ferun.tenant` (the environment's
+  owner), `ferun.environment`, `ferun.kind` = `service`, `ferun.object` =
+  the service, `ferun.source` = `ingress`. A record's `log.offset` is its
+  number in the stream from 0, `log.next_offset` the number after;
+  `log.iostream` none.
+- **Line**: the record as JSON, the fields and names of `ferund`'s
+  `AccessLogRecord` (`tsNs` as a string, `time`, `durationNs`,
+  `ingress`, `service`, `instance`, `host`, `method`, `path`, `proto`,
+  `status`, `outcome`, `attempts`, `heldNs`, `bytesIn`, `bytesOut`,
+  `clientIp`, `userAgent`, `traceId`, `spanId`, `parentSpanId`), and
+  `level`: `error` for a 5xx or `aborted`, `warn` for a 4xx, else
+  `info`. The LogRecord's time is the request's start.
+- **TLS**: the ingress presents its certificate
+  (`spiffe://<td>/ingress/<name>`) and checks the sink's as a node does.
+  The sink takes streams with `ferun.source` = `ingress` from an
+  ingress's certificate only, whose name is the key's, and every other
+  stream from a node's certificate only.
+- **Batches**: the agent's buffer (10,000 records) as now, a batch at
+  most 1,000 records or 1 MiB, every second; a failed batch is kept and
+  sent again with backoff (1 to 30 s) while new records wait in the
+  buffer, which drops and counts what overflows it.
+- **Reading**: the selector `source` (`ingress` or `container`; none:
+  both) picks them; a stream's JSON has `source`. `ferund`'s `GET
+  /api/v1/environments/{env}/access-logs` reads them from the sink
+  (`environment`, `source=ingress`, `trace`, backward from `before`) and
+  answers its `AccessLogList` as before, the table `access_logs` only
+  for what the sink does not have.
+
 ## The sink
 
 A program of `go/` (`go/cmd/ferun-sink`, `go/internal/sink`), its own
