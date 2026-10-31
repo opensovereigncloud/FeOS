@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	otlplogsv1 "github.com/gardenlinux/feos/go/gen/otlp/collector/logs/v1"
+	otlptracev1 "github.com/gardenlinux/feos/go/gen/otlp/collector/trace/v1"
 	"github.com/gardenlinux/feos/go/internal/ingress/sinklog"
 	"github.com/gardenlinux/feos/go/internal/ingress/wire"
 )
@@ -39,15 +40,19 @@ const (
 // sink (Config.SinkEndpoint, ADR 0026 §8): the records not sent yet, and
 // held, the batch on its way there, its records out of pending and
 // numbered in their streams; it is sent until the sink takes or refuses
-// it.
+// it. heldSpans are the server spans of held's records
+// (docs/architecture/traces.md, The ingress), sent once after it.
 type accessLog struct {
 	kick chan struct{}
+	name string
 	// send serializes the sends of the loop and of FlushAccessLog; the
-	// sink's streams, held and retry are the sender's.
-	send    sync.Mutex
-	streams *sinklog.Streams
-	held    *otlplogsv1.ExportLogsServiceRequest
-	retry   *backoff
+	// sink's streams, held, heldSpans and retry are the sender's.
+	send       sync.Mutex
+	streams    *sinklog.Streams
+	held       *otlplogsv1.ExportLogsServiceRequest
+	heldSpans  *otlptracev1.ExportTraceServiceRequest
+	heldSpansN int
+	retry      *backoff
 
 	mu      sync.Mutex
 	pending []wire.AccessLogEntry
@@ -56,12 +61,15 @@ type accessLog struct {
 	// sent and dropped count records for the metrics: those the sink
 	// took, and those dropped.
 	sent, dropped uint64
+	// spansSent and spansDropped count the spans of batched records:
+	// those the sink took, and those it did not or that were skipped.
+	spansSent, spansDropped uint64
 }
 
 // newAccessLog returns the buffer of the instance name, whose streams
 // are of this run.
 func newAccessLog(name string) *accessLog {
-	return &accessLog{kick: make(chan struct{}, 1), streams: sinklog.NewStreams(name, uuid.NewString()),
+	return &accessLog{kick: make(chan struct{}, 1), name: name, streams: sinklog.NewStreams(name, uuid.NewString()),
 		retry: newBackoff(sinkRetryMin, sinkRetryMax)}
 }
 
@@ -94,6 +102,14 @@ func (a *Agent) AccessLogCounts() (sent, dropped uint64, pending int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.sent, l.dropped, len(l.pending) + l.heldN
+}
+
+// SpanCounts returns the spans the sink took and those dropped.
+func (a *Agent) SpanCounts() (sent, dropped uint64) {
+	l := a.alog
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.spansSent, l.spansDropped
 }
 
 // accessLogLoop sends the pending records to the sink every
@@ -150,7 +166,8 @@ func (l *accessLog) take(n int) {
 // usual. Without a certificate the records wait. A batch the sink failed
 // to take is sent again after a backoff, the same records under the same
 // offsets, while new records wait in the buffer; one it refuses as
-// invalid or over the tenant's quota is dropped and counted.
+// invalid or over the tenant's quota is dropped and counted. Once the
+// sink took or refused a batch, the batch's spans go, once.
 func (a *Agent) sendToSink(ctx context.Context) time.Duration {
 	l := a.alog
 	l.send.Lock()
@@ -168,9 +185,12 @@ func (a *Agent) sendToSink(ctx context.Context) time.Duration {
 			recs := slices.Clone(l.pending[:min(len(l.pending), sinklog.MaxRecords)])
 			l.mu.Unlock()
 			req, taken, skipped := l.streams.Batch(recs)
+			spans, spansSkipped := sinklog.Spans(l.name, recs[:taken])
+			l.heldSpans, l.heldSpansN = spans, taken-spansSkipped
 			l.mu.Lock()
 			l.take(taken)
 			l.dropped += uint64(skipped)
+			l.spansDropped += uint64(spansSkipped)
 			l.held, l.heldN = req, taken-skipped
 			l.mu.Unlock()
 			if req == nil {
@@ -203,8 +223,32 @@ func (a *Agent) sendToSink(ctx context.Context) time.Duration {
 		if drop {
 			a.rl.warn("access-log", "ingress agent: the sink refused a batch of the access log; dropped", "records", n, "err", err)
 		}
+		if l.heldSpans != nil {
+			a.sendSpans(ctx, l.heldSpans, l.heldSpansN)
+			l.heldSpans, l.heldSpansN = nil, 0
+		}
 		if !more {
 			return 0
 		}
 	}
+}
+
+// sendSpans sends a batch of n spans once: what the sink did not take,
+// refused or failed, is dropped and counted.
+func (a *Agent) sendSpans(ctx context.Context, req *otlptracev1.ExportTraceServiceRequest, n int) {
+	l := a.alog
+	cctx, cancel := context.WithTimeout(ctx, a.tune.callTimeout)
+	rejected, err := a.sink.ExportSpans(cctx, req)
+	cancel()
+	if err != nil {
+		rejected = int64(n)
+		if ctx.Err() == nil {
+			a.rl.warn("spans", "ingress agent: the sink did not take a batch of spans; dropped", "spans", n, "err", err)
+		}
+	}
+	rejected = min(max(rejected, 0), int64(n))
+	l.mu.Lock()
+	l.spansSent += uint64(int64(n) - rejected)
+	l.spansDropped += uint64(rejected)
+	l.mu.Unlock()
 }

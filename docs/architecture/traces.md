@@ -116,9 +116,14 @@ request, else unset. Attributes: `http.request.method`, `url.path`
 `user_agent.original`, `http.request.body.size`,
 `http.response.body.size`, `ferun.outcome`, `ferun.attempts`,
 `ferun.held_ns` (the time the request waited for an instance, int), and
-`ferun.upstream_instance` (the instance that answered). A span the sink
-refused is dropped and counted as a dropped access-log record is; the
-access log's lines are written as before.
+`ferun.upstream_instance` (the instance that answered); a string
+attribute that is empty, and a status code of 0 (none written), are left
+out. A batch of spans goes once, after the sink took or refused the
+lines of the same records: a batch the sink refused or failed to take,
+and the spans it rejected (`partial_success`), are dropped and counted
+(`ferun_ingress_spans_dropped_total`, beside the access log's
+`ferun_ingress_access_log_dropped_total`); the access log's lines are
+written as before.
 
 ## The sink
 

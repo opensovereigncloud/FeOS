@@ -757,7 +757,8 @@ tracing SDK:
   `traceparent: 00-<trace>-<span>-<flags>`, so the application's spans
   are its children. A retry to another instance keeps the span.
 - The span's data is the request's access log record
-  ([Access log](#access-log)); no span is exported over OTLP.
+  ([Access log](#access-log)), which the agent also sends to the sink as
+  an OTLP server span (below).
 
 ### Access log
 
@@ -793,6 +794,14 @@ tracing SDK:
   (`ferun_ingress_access_log_dropped_total`). The agent sends while it
   holds a certificate, with or without its connection to `ferund`, and
   the shutdown sends the rest the same way.
+- **Spans** (ADR 0026 §10, the contract in
+  [traces.md](traces.md#the-ingress)): each batch's records also go as
+  server spans, a batch of their own to the sink's `TraceService/Export`
+  on the same connection, once the sink took or refused the batch's
+  lines. A span batch is sent once: one the sink failed to take or
+  refused, and spans it rejected (`partial_success`), are dropped and
+  counted (`ferun_ingress_spans_dropped_total`); the lines are written
+  as before.
 - **Without `--sink-endpoint`** the access log is not kept: the agent
   says so once at its start (Info) and counts every record as dropped;
   the proxy never waits for it.
@@ -1104,6 +1113,7 @@ expiry.
 | `ferun_ingress_upstream_connections`, `ferun_ingress_endpoints`, `ferun_ingress_endpoint_nodes{admitted}`, `ferun_ingress_hosts` | the data path now |
 | `ferun_ingress_domain_certificates`, `ferun_ingress_acme_challenges`, `ferun_ingress_acme_answers_total{result}` | hosts with a certificate of their own; the challenges in the table; requests under `/.well-known/acme-challenge/`, `answered` or `unknown` |
 | `ferun_ingress_access_log_sent_total`, `…_dropped_total`, `ferun_ingress_access_log_pending` | access log records the sink took, those dropped (no `--sink-endpoint`, a full buffer, a refusal), those waiting (a batch on its way to the sink included) |
+| `ferun_ingress_spans_sent_total`, `…_dropped_total` | server spans of batched records the sink took, and those dropped (failed, refused or rejected by the sink, or without a tenant) |
 | `ferun_ingress_table_age_seconds`, `ferun_ingress_mesh_nodes{handshake}`, `ferun_ingress_mesh_handshake_age_seconds{node}`, `ferun_ingress_mesh_peers`, `ferun_ingress_mesh_configured` | the table's age and the mesh's health |
 | `ferun_ingress_info{name,version}`, `ferun_ingress_ready`, `ferun_ingress_draining`, `ferun_ingress_control_connected`, `ferun_ingress_control_refusals_total`, `ferun_ingress_identity_removed`, `ferun_ingress_identity_not_after_seconds`, `ferun_ingress_tls_not_after_seconds` | the instance |
 

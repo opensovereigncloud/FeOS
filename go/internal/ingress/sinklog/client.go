@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	otlplogsv1 "github.com/gardenlinux/feos/go/gen/otlp/collector/logs/v1"
+	otlptracev1 "github.com/gardenlinux/feos/go/gen/otlp/collector/trace/v1"
 	"github.com/gardenlinux/feos/go/internal/pki"
 )
 
@@ -25,8 +26,9 @@ type Identity func() (*tls.Certificate, *x509.CertPool, error)
 
 // Client exports batches to the sink's ingest.
 type Client struct {
-	cc   *grpc.ClientConn
-	logs otlplogsv1.LogsServiceClient
+	cc     *grpc.ClientConn
+	logs   otlplogsv1.LogsServiceClient
+	traces otlptracev1.TraceServiceClient
 }
 
 // NewClient returns a client of the ingest at endpoint (host:port): the
@@ -41,13 +43,23 @@ func NewClient(endpoint, td string, id Identity) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sink %s: %w", endpoint, err)
 	}
-	return &Client{cc: cc, logs: otlplogsv1.NewLogsServiceClient(cc)}, nil
+	return &Client{cc: cc, logs: otlplogsv1.NewLogsServiceClient(cc), traces: otlptracev1.NewTraceServiceClient(cc)}, nil
 }
 
 // Export sends one request and returns once the sink stored it.
 func (c *Client) Export(ctx context.Context, req *otlplogsv1.ExportLogsServiceRequest) error {
 	_, err := c.logs.Export(ctx, req)
 	return err
+}
+
+// ExportSpans sends one request of spans and returns once the sink
+// stored it, with the number of spans it rejected.
+func (c *Client) ExportSpans(ctx context.Context, req *otlptracev1.ExportTraceServiceRequest) (rejected int64, err error) {
+	resp, err := c.traces.Export(ctx, req)
+	if err != nil {
+		return 0, err
+	}
+	return resp.GetPartialSuccess().GetRejectedSpans(), nil
 }
 
 // Close closes the connection.

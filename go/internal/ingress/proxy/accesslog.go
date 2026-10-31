@@ -93,6 +93,8 @@ func (q *request) record() {
 		TraceID:      id,
 		SpanID:       span,
 		ParentSpanID: parent,
+		TraceState:   q.trace.state,
+		TraceFlags:   q.trace.flags,
 	})
 }
 

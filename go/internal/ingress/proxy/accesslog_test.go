@@ -115,8 +115,10 @@ func TestTraceContinued(t *testing.T) {
 		t.Errorf("tracestate %q", e.Headers["Tracestate"])
 	}
 	r := al.next(t)
-	if r.TraceID != id || r.SpanID != span || r.ParentSpanID != parent {
-		t.Errorf("record's span %s/%s/%s, want %s/%s/%s", r.TraceID, r.SpanID, r.ParentSpanID, id, span, parent)
+	if r.TraceID != id || r.SpanID != span || r.ParentSpanID != parent || r.TraceState != "congo=t61rcWkgMzE" ||
+		r.TraceFlags != 0x01 {
+		t.Errorf("record's span %s/%s/%s %q %x, want %s/%s/%s", r.TraceID, r.SpanID, r.ParentSpanID, r.TraceState,
+			r.TraceFlags, id, span, parent)
 	}
 	if r.Env != testEnv || r.Tenant != "acme" || r.Service != "web" || r.Instance != "w1" || r.Host != testHost ||
 		r.Method != "GET" || r.Path != "/x" || r.Status != http.StatusOK || r.Outcome != "2xx" || r.Attempts != 1 ||
@@ -147,7 +149,8 @@ func TestTraceStarted(t *testing.T) {
 			t.Errorf("tracestate %q passed on without a trace", e.Headers["Tracestate"])
 		}
 		r := al.next(t)
-		if r.TraceID != tp[3:35] || r.SpanID != tp[36:52] || r.ParentSpanID != "" {
+		if r.TraceID != tp[3:35] || r.SpanID != tp[36:52] || r.ParentSpanID != "" || r.TraceState != "" ||
+			r.TraceFlags != flagSampled {
 			t.Errorf("record's span %s/%s/%s for %s", r.TraceID, r.SpanID, r.ParentSpanID, tp)
 		}
 	}

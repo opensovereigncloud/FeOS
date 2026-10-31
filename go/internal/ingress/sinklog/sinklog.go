@@ -5,7 +5,8 @@
 // 0026 §8, docs/architecture/sink.md, The ingress's access log): a
 // stream per (instance, start of its agent, environment, service), each
 // request a JSON line of it, exported over OTLP with the ingress's
-// certificate.
+// certificate; and each request's server span, in batches of their own
+// (docs/architecture/traces.md, The ingress).
 package sinklog
 
 import (

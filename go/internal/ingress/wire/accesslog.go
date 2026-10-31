@@ -18,7 +18,8 @@ const (
 // AccessLogEntry is one request the ingress answered for an environment,
 // which is also the request's server span (W3C Trace Context): TraceID
 // and SpanID name it, ParentSpanID the client's span when the request
-// brought a traceparent. Path is the escaped path without the query.
+// brought a traceparent; TraceState is the tracestate passed on and
+// TraceFlags the trace's flags. Path is the escaped path without the query.
 // Outcome is how it ended: the status class ("2xx" … "5xx"),
 // "upgraded", or "aborted". Instance is the instance the last attempt
 // went to, "" when none; Attempts counts the attempts, HeldNs how long
@@ -48,4 +49,6 @@ type AccessLogEntry struct {
 	TraceID      string    `json:"traceId"`
 	SpanID       string    `json:"spanId"`
 	ParentSpanID string    `json:"parentSpanId"`
+	TraceState   string    `json:"traceState,omitempty"`
+	TraceFlags   byte      `json:"traceFlags"`
 }

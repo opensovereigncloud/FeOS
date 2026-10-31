@@ -205,6 +205,12 @@ func (p *Program) Metrics(w io.Writer) {
 		"Access log records dropped: no sink endpoint, the buffer was full, or the sink refused them.",
 		proxy.Sample{Value: float64(dropped)})
 	gauge("ferun_ingress_access_log_pending", "Access log records waiting to be sent.", float64(pending))
+	spansSent, spansDropped := p.agent.SpanCounts()
+	proxy.WriteMetric(bw, "ferun_ingress_spans_sent_total", "counter",
+		"Server spans the sink took.", proxy.Sample{Value: float64(spansSent)})
+	proxy.WriteMetric(bw, "ferun_ingress_spans_dropped_total", "counter",
+		"Server spans dropped: the sink failed, refused or rejected them, or their record had no tenant.",
+		proxy.Sample{Value: float64(spansDropped)})
 	proxy.WriteMetric(bw, "ferun_ingress_control_refusals_total", "counter",
 		"Connection attempts the control plane refused (PERMISSION_DENIED).", proxy.Sample{Value: float64(as.RefusalsTotal)})
 	if !as.CertNotAfter.IsZero() {
