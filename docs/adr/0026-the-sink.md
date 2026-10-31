@@ -348,15 +348,22 @@ Jaeger-compatible API for traces.
   for that, and drops it with the last chunk (done on 2026-10-31: all
   74 chunks moved, `log_chunks` dropped).
 - **Traces**, next and decided with this: pods send OTLP to their node
-  (`169.254.0.1:4317` and `:4318`, a node address of its own, as DNS's
-  `169.254.0.53`); the node knows the pod by its source address, stamps
-  its `ferun.*` labels as resource attributes and sends on to the sink
-  with its certificate, as it does logs (§3). The sink sends spans to
-  Quickwit's trace index per retention (`ferun-traces-30d`, Quickwit's
-  OTLP trace mapping with the labels), and answers the Jaeger API for a
-  tenant, with the tenant's filter forced, from Quickwit's. The ingress's
-  request lines become its server spans there. Sampling stays open
-  (open question 2).
+  (`169.254.169.1:4317` and `:4318`, a node address of its own, held as
+  DNS's `169.254.0.53` is; not the pods' gateway `169.254.0.1`, which is
+  the node's own gateway on IronCore and which the node never holds);
+  the node knows the pod by its source address, stamps its `ferun.*`
+  labels as resource attributes and sends on to the sink with its
+  certificate, as it does logs (§3). The sink keeps spans in its hot
+  stage (`trace_spans`) until its indexer has them in Quickwit's trace
+  index (`ferun-traces-v1-30d`, a mapping of the sink's own with the
+  labels, partitioned by tenant, environment and job), and answers
+  Jaeger's query API for a tenant itself, the tenant's filter forced;
+  Quickwit's own OTLP and Jaeger endpoints stay off. The ingress's
+  request lines become its server spans there. Every span is kept for
+  now; sampling stays open (open question 2). The contract is
+  docs/architecture/traces.md. *Decided by Malte on 2026-10-31: the hot
+  stage for spans, OTLP over gRPC and HTTP/protobuf (no JSON), no
+  sampling, and the address `169.254.169.1`.*
 - **Deployment.** Quickwit 0.9.3 in the namespace `ferun`: one metastore,
   one control plane, one janitor, one indexer on a persistent volume, two
   searchers; its metastore a database `quickwit` in `ferun-db`, its
