@@ -44,8 +44,8 @@ use crate::volumes::{self, Volumes};
 use feos_proto::container_service::{
     container_service_client::ContainerServiceClient, ContainerConfig,
     ContainerState as GuestContainerState, CreateContainerRequest, GetContainerRequest,
-    ListContainersRequest, LogEntry, StartContainerRequest, StreamContainerLogsRequest,
-    VolumeMount as GuestVolumeMount,
+    ListContainersRequest, LogEntry, StartContainerRequest, StopContainerRequest,
+    StreamContainerLogsRequest, VolumeMount as GuestVolumeMount,
 };
 use feos_proto::disk_service::{Head, MemoryRef};
 use feos_proto::guest_service::{
@@ -112,6 +112,10 @@ const REFRESH: Duration = Duration::from_secs(60);
 /// How long a pod's logs may take to be sent before it is suspended,
 /// hibernates or is deleted (ADR 0026).
 pub const LOG_DRAIN: Duration = Duration::from_secs(5);
+/// How long a stopped or deleted pod's containers may take to exit after
+/// SIGTERM, before its microVM ends them.
+pub const CONTAINER_GRACE: Duration = Duration::from_secs(10);
+const SIGTERM: u32 = 15;
 /// How many request ids a hibernation keeps of the calls that started or
 /// joined it, and a pod of its abandoned hibernations: the last ones.
 const REQUEST_IDS: usize = 16;
@@ -646,6 +650,7 @@ impl Pods {
                 .await;
                 return Ok(());
             }
+            PodState::Running => self.end_running(pod_id).await,
             _ => {}
         }
         match self.vm(pod_id).await?.map(|vm| vm.state()) {
@@ -688,7 +693,7 @@ impl Pods {
     async fn delete_detached(&self, pod_id: &str) -> Result<(), Status> {
         let _lock = self.end_bring_up_and_lock(pod_id).await?;
         if self.info(pod_id)?.state() == PodState::Running {
-            self.drain_logs(pod_id).await;
+            self.end_running(pod_id).await;
         }
         self.delete_vm(pod_id).await?;
         // A pod whose disk cannot go stays, to be deleted again: diskd
@@ -1898,6 +1903,76 @@ impl Pods {
     pub fn set_log_drain(&self, drain: LogDrain) {
         if self.inner.log_drain.set(drain).is_err() {
             warn!("Pods: The pods' logs are drained already");
+        }
+    }
+
+    /// Lets a running pod's containers end before its microVM does, and
+    /// sends what they wrote to their logs (ADR 0026), while the pod is
+    /// still running: [`CONTAINER_GRACE`] and [`LOG_DRAIN`] at most.
+    async fn end_running(&self, pod_id: &str) {
+        self.end_containers(pod_id).await;
+        self.drain_logs(pod_id).await;
+    }
+
+    /// Sends each of the pod's running containers SIGTERM and waits for
+    /// their processes to exit, [`CONTAINER_GRACE`] at most: the guest has
+    /// their last lines in their logs once it reports their exit codes.
+    /// Whatever fails is logged; the stop goes on.
+    async fn end_containers(&self, pod_id: &str) {
+        let names: Vec<String> = match self.info(pod_id) {
+            Ok(info) => info
+                .spec
+                .map(|spec| spec.containers.into_iter().map(|c| c.name).collect())
+                .unwrap_or_default(),
+            Err(_) => return,
+        };
+        let ended = timeout(CONTAINER_GRACE, async {
+            let mut guest = ContainerServiceClient::new(self.guest_channel(pod_id).await?);
+            let mut signalled = Vec::new();
+            for name in names {
+                let request = StopContainerRequest {
+                    container_id: name.clone(),
+                    signal: Some(SIGTERM),
+                    timeout_seconds: None,
+                };
+                // One that does not run is not waited for.
+                if guest.stop_container(request).await.is_ok() {
+                    signalled.push(name);
+                }
+            }
+            while !signalled.is_empty() {
+                let mut running = Vec::new();
+                for name in signalled {
+                    let request = GetContainerRequest {
+                        container_id: name.clone(),
+                    };
+                    let exited = guest
+                        .get_container(request)
+                        .await
+                        .map(|info| info.into_inner().exit_code.is_some())
+                        .unwrap_or(true);
+                    if !exited {
+                        running.push(name);
+                    }
+                }
+                signalled = running;
+                if !signalled.is_empty() {
+                    sleep(POLL).await;
+                }
+            }
+            Ok::<(), Status>(())
+        })
+        .await;
+        match ended {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(
+                "Pods: {pod_id}'s containers were not stopped before its microVM: {}",
+                e.message()
+            ),
+            Err(_) => warn!(
+                "Pods: {pod_id}'s containers did not end within {}s; its microVM ends them",
+                CONTAINER_GRACE.as_secs()
+            ),
         }
     }
 
@@ -3996,6 +4071,56 @@ mod tests {
         assert_eq!(info.log_labels, labels("new"));
         assert_eq!(info.log_redact, ["new-secret"]);
         assert!(pods.list()[0].log_redact.is_empty());
+    }
+
+    /// A stop or a delete of a running pod drains its logs while the pod
+    /// still runs, before its microVM ends: the shipper still follows them
+    /// then. A pod that does not run is not drained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_pods_logs_are_drained_before_its_microvm_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let pods = bare_pods(dir.path());
+        let drained: Arc<Mutex<Vec<(String, PodState)>>> = Arc::default();
+        pods.set_log_drain({
+            let (pods, drained) = (pods.clone(), drained.clone());
+            Arc::new(move |pod_id: String| {
+                let state = pods.info(&pod_id).map(|info| info.state()).ok();
+                drained
+                    .lock()
+                    .unwrap()
+                    .push((pod_id, state.unwrap_or(PodState::Unspecified)));
+                Box::pin(async {})
+            })
+        });
+        let pod = |state: PodState| PodInfo {
+            pod_id: POD.to_string(),
+            state: state as i32,
+            spec: Some(PodSpec::default()),
+            ..Default::default()
+        };
+        pods.pods()
+            .insert(POD.to_string(), Pod::new(pod(PodState::Running)));
+        // Without a microVM service the stop fails after the drain, and
+        // quickly: no guest answers.
+        let started = Instant::now();
+        assert!(pods.stop(POD).await.is_err());
+        assert!(started.elapsed() < CONTAINER_GRACE + LOG_DRAIN);
+        assert!(pods.delete(POD).await.is_err());
+        assert_eq!(
+            *drained.lock().unwrap(),
+            [
+                (POD.to_string(), PodState::Running),
+                (POD.to_string(), PodState::Running)
+            ]
+        );
+        pods.pods()
+            .insert(POD.to_string(), Pod::new(pod(PodState::Failed)));
+        let _ = pods.stop(POD).await;
+        assert_eq!(
+            drained.lock().unwrap().len(),
+            2,
+            "a failed pod is not drained"
+        );
     }
 
     /// A delete takes the pod out and removes its record in one go: a save

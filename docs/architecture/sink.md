@@ -66,11 +66,20 @@ until the sink answers; on an error it is sent again after a backoff (1 s
 to 30 s), to whichever address the endpoint resolves to, and the stream
 reads nothing meanwhile: the guest's log is the buffer, and the node
 holds a batch and a few entries a stream. `RESOURCE_EXHAUSTED` drops the
-batch, counted as the limit's drops are. Before a pod is suspended,
-hibernates or is deleted, `feosd` sends what its containers wrote: each
-stream that follows its log reads until the log was quiet for 400 ms and
-the sink took what it read, for at most 5 s in all; a stream that does
-not follow now (no sink, a backoff) is not waited for. A stop of `feosd`
+batch, counted as the limit's drops are. Before a running pod is
+stopped or deleted, `feosd` lets its containers end: SIGTERM to each,
+and up to 10 s for their processes to exit (the guest writes what they
+wrote before it reports an exit), while the pod still runs and its
+streams follow. Then, as before a pod is suspended or hibernates, it
+sends what its containers wrote: each stream that follows its log reads
+until the log was quiet for 400 ms and the sink took what it read, for
+at most 5 s in all; a stream that does not follow now (no sink, a
+backoff) is not waited for. Only then does the microVM end. A stream
+whose pod no longer runs is let go of, never cut off: it sends what it
+read and what the guest still sends it, for at most 10 s, and is ended
+at the sink (`EndStreams`) once its pod is deleted, also after a stop. A
+pod restarted after a crash goes on from the sink's positions: its log
+is on its disk. A stop of `feosd`
 that suspends its pods does not drain them: the next `feosd` goes on
 from the sink's positions. After a delete it calls
 `SinkService/EndStreams` for the streams whose log it knew, asked again

@@ -19,8 +19,10 @@
 //!
 //! Before a pod pauses, hibernates or is deleted, `drain` sends what its
 //! streams read until their logs are quiet; the pod service bounds it.
-//! After a delete, the pod's streams end (`SinkService/EndStreams`),
-//! asked again until the sink answers. Nothing here touches a pod: it
+//! A stream whose pod no longer runs is let go of, not cut off: it sends
+//! what it read and what the guest still sends it, for [`FINAL_SEND`] at
+//! most. After a delete, the pod's streams end (`SinkService/EndStreams`),
+//! also those let go of before, asked again until the sink answers. Nothing here touches a pod: it
 //! only reads its logs.
 
 mod batch;
@@ -43,7 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot, watch, Notify};
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -67,6 +69,9 @@ const KEYS_PER_CALL: usize = 1000;
 const MAX_ENDS: usize = 10_000;
 /// A drain's requests a stream holds.
 const DRAINS: usize = 4;
+/// How long a stream that is let go of may take to send what it read: the
+/// rest of its log that the guest already sent, and its batch.
+const FINAL_SEND: Duration = Duration::from_secs(10);
 
 /// Where the sink is, and how the node reaches it.
 #[derive(Clone)]
@@ -127,6 +132,9 @@ struct Inner {
     /// The channel to the sink, for the target it was made for.
     channel: Mutex<Option<(String, Arc<ClientConfig>, Channel)>>,
     streams: Mutex<HashMap<(String, String), Handle>>,
+    /// The streams let go of while their pods do not run, until the pods
+    /// are deleted, which ends them, or run again.
+    idle: Mutex<HashMap<(String, String), Handle>>,
     /// The streams to end, and a nudge for whoever ends them.
     ends: Mutex<VecDeque<Key>>,
     ended: Notify,
@@ -134,9 +142,12 @@ struct Inner {
     rescan: Notify,
 }
 
-/// A stream's task, as the shipper holds it.
+/// A stream's task, as the shipper holds it. Dropped, it lets the task
+/// go: the task sends what it read, for [`FINAL_SEND`] at most, and ends.
 struct Handle {
-    task: AbortHandle,
+    task: JoinHandle<()>,
+    /// Taken and dropped: the stream stops.
+    stop: Option<oneshot::Sender<()>>,
     state: Arc<State>,
     drains: mpsc::Sender<oneshot::Sender<()>>,
 }
@@ -163,6 +174,7 @@ impl Shipper {
                 target,
                 channel: Mutex::new(None),
                 streams: Mutex::new(HashMap::new()),
+                idle: Mutex::new(HashMap::new()),
                 ends: Mutex::new(VecDeque::new()),
                 ended: Notify::new(),
                 rescan: Notify::new(),
@@ -197,28 +209,56 @@ impl Shipper {
         }
     }
 
-    /// Pod `pod_id` is deleted: its streams end.
+    /// Pod `pod_id` is deleted: its streams send what they read, and end.
     pub fn deleted(&self, pod_id: &str) {
-        let mut ended = Vec::new();
-        lock(&self.inner.streams).retain(|(pod, container), handle| {
-            if pod != pod_id {
-                return true;
+        let mut gone = Vec::new();
+        for map in [&self.inner.streams, &self.inner.idle] {
+            let mut streams = lock(map);
+            let keys: Vec<_> = streams.keys().filter(|k| k.0 == pod_id).cloned().collect();
+            for key in keys {
+                if let Some(handle) = streams.remove(&key) {
+                    gone.push((key, handle));
+                }
             }
-            handle.task.abort();
-            let log_id = lock(&handle.state.log_id).clone();
-            if !log_id.is_empty() {
-                ended.push(Key {
-                    pod: pod.clone(),
-                    container: container.clone(),
-                    log_id,
-                });
+        }
+        if gone.is_empty() {
+            return;
+        }
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let mut ended = Vec::new();
+            for ((pod, container), handle) in gone {
+                let Handle {
+                    mut task,
+                    stop,
+                    state,
+                    ..
+                } = handle;
+                drop(stop);
+                if timeout(FINAL_SEND + BACKOFF.0, &mut task).await.is_err() {
+                    task.abort();
+                }
+                let log_id = lock(&state.log_id).clone();
+                if !log_id.is_empty() {
+                    ended.push(Key {
+                        pod,
+                        container,
+                        log_id,
+                    });
+                }
             }
-            false
+            inner.end(ended);
         });
+    }
+}
+
+impl Inner {
+    /// Ends the streams `ended` at the sink, behind those before.
+    fn end(&self, ended: Vec<Key>) {
         if ended.is_empty() {
             return;
         }
-        let mut ends = lock(&self.inner.ends);
+        let mut ends = lock(&self.ends);
         ends.extend(ended);
         while ends.len() > MAX_ENDS {
             if let Some(key) = ends.pop_front() {
@@ -229,11 +269,9 @@ impl Shipper {
             }
         }
         drop(ends);
-        self.inner.ended.notify_one();
+        self.ended.notify_one();
     }
-}
 
-impl Inner {
     fn target(&self) -> Option<Target> {
         self.target.borrow().clone()
     }
@@ -318,19 +356,30 @@ async fn supervise<L: Logs>(inner: Arc<Inner>, logs: Arc<L>) {
             .collect();
         {
             let mut streams = lock(&inner.streams);
-            streams.retain(|key, handle| {
-                let keep = wanted.contains_key(key) && !handle.task.is_finished();
-                if !keep {
-                    handle.task.abort();
+            // One let go of sends what it read, and ends; it is kept to be
+            // ended at the sink with its pod.
+            let gone: Vec<_> = streams
+                .keys()
+                .filter(|key| !wanted.contains_key(*key))
+                .cloned()
+                .collect();
+            let mut idle = lock(&inner.idle);
+            for key in gone {
+                if let Some(mut handle) = streams.remove(&key) {
+                    drop(handle.stop.take());
+                    idle.insert(key, handle);
                 }
-                keep
-            });
+            }
+            streams.retain(|_, handle| !handle.task.is_finished());
             for (key, labels) in wanted {
                 if streams.contains_key(&key) {
                     continue;
                 }
+                // Its pod runs again: a stream of its own takes over.
+                idle.remove(&key);
                 let state = Arc::new(State::default());
                 let (drains, requests) = mpsc::channel(DRAINS);
+                let (stop, stopped) = oneshot::channel();
                 let task = tokio::spawn(follow(
                     inner.clone(),
                     logs.clone(),
@@ -338,9 +387,11 @@ async fn supervise<L: Logs>(inner: Arc<Inner>, logs: Arc<L>) {
                     labels,
                     state.clone(),
                     requests,
+                    stopped,
                 ));
                 let handle = Handle {
-                    task: task.abort_handle(),
+                    task,
+                    stop: Some(stop),
                     state,
                     drains,
                 };
@@ -353,8 +404,10 @@ async fn supervise<L: Logs>(inner: Arc<Inner>, logs: Arc<L>) {
             changed = target.changed() => {
                 if changed.is_err() {
                     // The control plane's side is gone: nothing more to ship.
-                    for (_, handle) in lock(&inner.streams).drain() {
-                        handle.task.abort();
+                    for map in [&inner.streams, &inner.idle] {
+                        for (_, handle) in lock(map).drain() {
+                            handle.task.abort();
+                        }
                     }
                     return;
                 }
@@ -375,6 +428,8 @@ enum Done {
     OldGuest,
     /// There is no sink.
     NoTarget,
+    /// It was let go of, and sent what it read.
+    Stopped,
 }
 
 /// Ships one container's log, starting again whenever it ends or fails.
@@ -385,6 +440,7 @@ async fn follow<L: Logs>(
     labels: Arc<Labels>,
     state: Arc<State>,
     mut drains: mpsc::Receiver<oneshot::Sender<()>>,
+    stop: oneshot::Receiver<()>,
 ) {
     let mut stream = Shipping {
         inner,
@@ -393,6 +449,8 @@ async fn follow<L: Logs>(
         labels,
         state,
         warned: false,
+        stop: Some(stop),
+        ending: None,
     };
     let mut wait = BACKOFF.0;
     loop {
@@ -402,24 +460,37 @@ async fn follow<L: Logs>(
         while let Ok(done) = drains.try_recv() {
             let _ = done.send(());
         }
+        if stream.ending.is_some() {
+            return;
+        }
         match done {
             Ok(Done::Again) => wait = BACKOFF.0,
+            Ok(Done::Stopped) => return,
             Ok(Done::Ended) => {
                 wait = BACKOFF.0;
-                sleep(BACKOFF.0).await;
+                if !stream.pause(BACKOFF.0).await {
+                    return;
+                }
             }
             Ok(Done::OldGuest) => {
                 info!(
                     "Logs: The guest of pod {} predates ADR 0026; {}'s log is not shipped",
                     stream.pod, stream.container
                 );
-                sleep(OLD_GUEST_WAIT).await;
+                if !stream.pause(OLD_GUEST_WAIT).await {
+                    return;
+                }
             }
             Ok(Done::NoTarget) => {
                 let mut target = stream.inner.target.clone();
                 while target.borrow_and_update().is_none() {
-                    if target.changed().await.is_err() {
-                        return;
+                    tokio::select! {
+                        changed = target.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                        () = told_to_stop(&mut stream.stop) => return,
                     }
                 }
             }
@@ -443,7 +514,9 @@ async fn follow<L: Logs>(
                     );
                     stream.warned = true;
                 }
-                sleep(wait).await;
+                if !stream.pause(wait).await {
+                    return;
+                }
                 wait = (wait * 2).min(BACKOFF.1);
             }
         }
@@ -459,9 +532,37 @@ struct Shipping {
     state: Arc<State>,
     /// A failure was said at warn, until the sink answers again.
     warned: bool,
+    /// Resolves when the stream is let go of; none once it was.
+    stop: Option<oneshot::Receiver<()>>,
+    /// Since it was let go of: until when it may send what it read.
+    ending: Option<Instant>,
+}
+
+/// Waits until the stream is let go of; for ever once it was.
+async fn told_to_stop(stop: &mut Option<oneshot::Receiver<()>>) {
+    match stop.as_mut() {
+        Some(stopped) => {
+            let _ = stopped.await;
+            *stop = None;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 impl Shipping {
+    /// Waits `wait`; false when the stream is let go of meanwhile.
+    async fn pause(&mut self, wait: Duration) -> bool {
+        tokio::select! {
+            () = sleep(wait) => true,
+            () = told_to_stop(&mut self.stop) => false,
+        }
+    }
+
+    /// The stream is let go of: what it read goes, until [`FINAL_SEND`].
+    fn let_go(&mut self) {
+        self.ending.get_or_insert(Instant::now() + FINAL_SEND);
+    }
+
     fn key(&self, log_id: &str) -> Key {
         Key {
             pod: self.pod.clone(),
@@ -509,6 +610,9 @@ impl Shipping {
         logs: &L,
         drains: &mut mpsc::Receiver<oneshot::Sender<()>>,
     ) -> Result<Done, Status> {
+        if self.ending.is_some() {
+            return Ok(Done::Stopped);
+        }
         let Some(target) = self.inner.target() else {
             return Ok(Done::NoTarget);
         };
@@ -562,7 +666,9 @@ impl Shipping {
         // When the log last said something, or a drain began.
         let mut heard = Instant::now();
         loop {
-            let draining = !waiting.is_empty();
+            // Drained, or let go of: what it read goes once the log is
+            // quiet.
+            let quiet = !waiting.is_empty() || self.ending.is_some();
             tokio::select! {
                 entry = entries.next() => {
                     let entry = match entry {
@@ -573,7 +679,11 @@ impl Shipping {
                             self.send(&mut batch, &resource, &mut limit).await?;
                             return Ok(Done::Ended);
                         }
+                        // The guest is gone: what was read still goes.
                         Some(Err(status)) => {
+                            if let Some(line) = limit.dropped.take() {
+                                batch.push(line, Instant::now());
+                            }
                             self.send(&mut batch, &resource, &mut limit).await?;
                             return Err(status);
                         }
@@ -613,13 +723,20 @@ impl Shipping {
                     }
                     waiting.push(done);
                 }
-                () = sleep_until(heard + DRAIN_QUIET), if draining => {
+                () = told_to_stop(&mut self.stop) => {
+                    self.let_go();
+                    heard = Instant::now();
+                }
+                () = sleep_until(heard + DRAIN_QUIET), if quiet => {
                     if let Some(line) = limit.dropped.take() {
                         batch.push(line, Instant::now());
                     }
                     self.send(&mut batch, &resource, &mut limit).await?;
                     for done in waiting.drain(..) {
                         let _ = done.send(());
+                    }
+                    if self.ending.is_some() {
+                        return Ok(Done::Stopped);
                     }
                 }
             }
@@ -648,7 +765,13 @@ impl Shipping {
                 Ok(channel) => {
                     let request = batch.request(resource, SystemTime::now());
                     let mut client = LogsServiceClient::new(channel);
-                    match timeout(CALL_TIMEOUT, client.export(request)).await {
+                    let deadline = match self.ending {
+                        Some(end) => {
+                            CALL_TIMEOUT.min(end.saturating_duration_since(Instant::now()))
+                        }
+                        None => CALL_TIMEOUT,
+                    };
+                    match timeout(deadline, client.export(request)).await {
                         Ok(Ok(_)) => {
                             if self.warned {
                                 info!(
@@ -681,7 +804,22 @@ impl Shipping {
                 );
                 self.warned = true;
             }
-            sleep(wait).await;
+            // Let go of, it tries until its time is up, and drops the rest.
+            if let Some(end) = self.ending {
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    let lines = batch.take().len();
+                    warn!(
+                        "Logs: {}/{}'s last {lines} lines were not sent: the sink did not take \
+                         them before the stream ended",
+                        self.pod, self.container
+                    );
+                    return Err(Status::unavailable("the stream ended"));
+                }
+                sleep(wait.min(left)).await;
+            } else if !self.pause(wait).await {
+                self.let_go();
+            }
             wait = (wait * 2).min(BACKOFF.1);
         }
     }

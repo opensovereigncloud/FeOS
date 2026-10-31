@@ -1253,10 +1253,21 @@ impl GuestLog {
     }
 }
 
-struct Pods(GuestLog);
+struct Pods(GuestLog, Arc<std::sync::atomic::AtomicBool>);
+
+impl Pods {
+    /// The pod runs with `log`, until the flag says it no longer does.
+    fn new(log: GuestLog) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        (Self(log, running.clone()), running)
+    }
+}
 
 impl Logs for Pods {
     fn pods(&self) -> Vec<ShippedPod> {
+        if !self.1.load(std::sync::atomic::Ordering::Relaxed) {
+            return Vec::new();
+        }
         vec![ShippedPod {
             id: POD.into(),
             labels: [("ferun.tenant".to_string(), "acme".to_string())].into(),
@@ -1348,7 +1359,7 @@ async fn a_node_ships_its_pods_logs_to_the_sink_it_is_told_of() {
     for text in ["first", "second", "third hunter2"] {
         log.append(text);
     }
-    let shipper = Shipper::start(Pods(log.clone()), fleet.sink());
+    let shipper = Shipper::start(Pods::new(log.clone()).0, fleet.sink());
 
     // Without a sink, nothing is shipped.
     wait_for(&seen, "a report", |seen| seen.reports.len() >= 2).await;
@@ -1450,4 +1461,94 @@ async fn a_node_ships_its_pods_logs_to_the_sink_it_is_told_of() {
         .await
         .expect("the sink stays")
         .unwrap();
+}
+
+/// A stream whose pod stops running (it is stopped or deleted) is let go
+/// of: what it read and has not sent yet still goes, and the rest of the
+/// log that the guest sent it.
+#[tokio::test]
+async fn a_stream_let_go_of_sends_what_it_read() {
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let sink_seen = Arc::new(Mutex::new(SinkSeen::default()));
+    let sink_address = sink(&pki, sink_seen.clone()).await;
+    let (token, address) = control_plane(pki, seen.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    seen.lock().unwrap().sink_endpoint = sink_address;
+    let fleet = node(&address, dir.path());
+    let log = GuestLog::default();
+    log.append("started");
+    let (pods, running) = Pods::new(log.clone());
+    let shipper = Shipper::start(pods, fleet.sink());
+    wait_for_sink(&sink_seen, "the first line", |seen| {
+        exported(seen).len() == 1
+    })
+    .await;
+
+    // The container's last words, and the pod gone at once: they are read
+    // into a batch that would wait 500 ms for more.
+    log.append("shutting down");
+    log.append("bye");
+    sleep(Duration::from_millis(50)).await;
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    shipper.changed();
+    wait_for_sink(&sink_seen, "the last lines", |seen| {
+        exported(seen).len() == 3
+    })
+    .await;
+    let offsets: Vec<i64> = log
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.offset as i64)
+        .collect();
+    assert_eq!(exported(&sink_seen.lock().unwrap()), offsets);
+
+    // Stopped, then deleted, as when an instance is replaced: its stream
+    // ends at the sink.
+    shipper.deleted(POD);
+    wait_for_sink(&sink_seen, "the end of the stream", |seen| {
+        !seen.ended.is_empty()
+    })
+    .await;
+    assert_eq!(sink_seen.lock().unwrap().ended[0].log_id, "log-1");
+}
+
+/// A deleted pod's stream sends what it read before it is ended.
+#[tokio::test]
+async fn a_deleted_pods_stream_sends_what_it_read_then_ends() {
+    let pki = Arc::new(Pki::new());
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let sink_seen = Arc::new(Mutex::new(SinkSeen::default()));
+    let sink_address = sink(&pki, sink_seen.clone()).await;
+    let (token, address) = control_plane(pki, seen.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("join-token"), format!("{token}\n")).unwrap();
+    seen.lock().unwrap().sink_endpoint = sink_address;
+    let fleet = node(&address, dir.path());
+    let log = GuestLog::default();
+    log.append("started");
+    let (pods, running) = Pods::new(log.clone());
+    let shipper = Shipper::start(pods, fleet.sink());
+    wait_for_sink(&sink_seen, "the first line", |seen| {
+        exported(seen).len() == 1
+    })
+    .await;
+    log.append("last");
+    sleep(Duration::from_millis(50)).await;
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    shipper.deleted(POD);
+    wait_for_sink(&sink_seen, "the end of the stream", |seen| {
+        !seen.ended.is_empty()
+    })
+    .await;
+    let sink = sink_seen.lock().unwrap();
+    assert_eq!(
+        exported(&sink).len(),
+        2,
+        "the last line came before the end"
+    );
+    assert_eq!(sink.ended.len(), 1);
 }
