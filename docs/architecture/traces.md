@@ -55,7 +55,12 @@ the pods' network is there, with a control plane.
 
 **Whose spans.** The node knows the pod by the request's source address,
 which the firewall's anti-spoofing rule (`fib saddr . iif oif missing
-drop`) makes the pod's own. An address of no pod with labels answers 403
+drop`) makes the pod's own. Every pod on the node with labels counts, in
+whatever state: one that starts sends at once, and an SDK sends what it
+has as its process ends. The node keeps the pods' addresses as their
+events come, and looks at its pods again before it refuses an address it
+does not know, so the first request of a pod that just started is not
+refused. An address of no pod with labels answers 403
 (`PERMISSION_DENIED`). A pod sends as itself only.
 
 **Labels.** In every `ResourceSpans` the node removes each resource

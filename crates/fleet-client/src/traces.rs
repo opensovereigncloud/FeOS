@@ -72,8 +72,10 @@ pub struct TracedPod {
 
 /// What the node has of its pods for their spans.
 pub trait Senders: Send + Sync + 'static {
-    /// The running pods that have labels. It may block briefly, on the
-    /// lock of the pods' records; it runs on the blocking pool.
+    /// The pods on the node that have labels, in whatever state: a pod
+    /// that is starting or ending sends too (an SDK sends what it has as
+    /// its process exits). It may block briefly, on the lock of the pods'
+    /// records; it runs on the blocking pool.
     fn pods(&self) -> Vec<TracedPod>;
 }
 
@@ -89,8 +91,13 @@ pub struct Traces {
 
 struct Inner {
     sink: Sink,
+    /// Where the pods come from.
+    senders: Arc<dyn Senders>,
     /// The pods with labels by their addresses.
     pods: RwLock<HashMap<IpAddr, Arc<Sender>>>,
+    /// Held while the pods are looked at for an address not known yet, so
+    /// that the requests of a pod that just started look once.
+    lookup: tokio::sync::Mutex<()>,
     /// The pods' limits, by their IDs.
     buckets: Mutex<HashMap<String, Bucket>>,
     /// A nudge to look at the pods now.
@@ -263,12 +270,14 @@ impl Traces {
         let traces = Self {
             inner: Arc::new(Inner {
                 sink,
+                senders: Arc::new(senders),
                 pods: RwLock::default(),
+                lookup: tokio::sync::Mutex::default(),
                 buckets: Mutex::default(),
                 rescan: Notify::new(),
             }),
         };
-        tokio::spawn(watch(traces.inner.clone(), Arc::new(senders)));
+        tokio::spawn(watch(traces.inner.clone()));
         traces
     }
 
@@ -305,13 +314,9 @@ impl Traces {
 }
 
 /// Keeps the pods' addresses up to date.
-async fn watch<S: Senders>(inner: Arc<Inner>, senders: Arc<S>) {
+async fn watch(inner: Arc<Inner>) {
     loop {
-        let all = senders.clone();
-        let pods = tokio::task::spawn_blocking(move || all.pods())
-            .await
-            .unwrap_or_default();
-        inner.set_pods(pods);
+        inner.rescan_now().await;
         tokio::select! {
             () = sleep(RESCAN) => {}
             () = inner.rescan.notified() => {}
@@ -351,6 +356,32 @@ impl Inner {
         }
         lock(&self.buckets).retain(|id, _| ids.contains(id));
         *self.pods.write().unwrap_or_else(PoisonError::into_inner) = by_address;
+    }
+
+    /// Looks at the pods now.
+    async fn rescan_now(&self) {
+        let senders = self.senders.clone();
+        let pods = tokio::task::spawn_blocking(move || senders.pods())
+            .await
+            .unwrap_or_default();
+        self.set_pods(pods);
+    }
+
+    /// The pod that sends from `address`; one not known yet is looked for
+    /// among the pods now, since a pod sends as it starts, before the
+    /// event of its start has reached the watch.
+    async fn sender_now(&self, address: Option<IpAddr>) -> Result<Arc<Sender>, Refusal> {
+        match self.sender(address) {
+            Err(Refusal::Unknown) if address.is_some() => {
+                let _one = self.lookup.lock().await;
+                if let Ok(sender) = self.sender(address) {
+                    return Ok(sender);
+                }
+                self.rescan_now().await;
+                self.sender(address)
+            }
+            known => known,
+        }
     }
 
     /// The pod that sends from `address`.
@@ -449,7 +480,7 @@ impl TraceService for Grpc {
         request: tonic::Request<ExportTraceServiceRequest>,
     ) -> Result<tonic::Response<ExportTraceServiceResponse>, Status> {
         let address = request.remote_addr().map(|address| address.ip());
-        let sender = self.0.sender(address).map_err(|e| e.status())?;
+        let sender = self.0.sender_now(address).await.map_err(|e| e.status())?;
         let request = request.into_inner();
         let bytes = request.encoded_len();
         self.0
@@ -635,7 +666,7 @@ async fn answer(inner: &Inner, peer: IpAddr, request: Request<Incoming>) -> Resp
         Ok(gzip) => gzip,
         Err(response) => return response,
     };
-    let sender = match inner.sender(Some(peer)) {
+    let sender = match inner.sender_now(Some(peer)).await {
         Ok(sender) => sender,
         Err(refusal) => return refused(&refusal),
     };
@@ -963,6 +994,48 @@ mod tests {
         assert_eq!(id("169.254.16.1"), Err(Refusal::Unknown));
         assert_eq!(id("169.254.16.3"), Ok("c".to_string()));
         assert!(lock(&inner.buckets).is_empty());
+    }
+
+    /// A pod that sends as it starts, before the watch has seen it, is
+    /// found at its first request; an address of no pod stays refused.
+    #[tokio::test]
+    async fn a_pod_not_seen_yet_is_looked_for() {
+        struct Later(Mutex<Vec<TracedPod>>);
+        impl Senders for Later {
+            fn pods(&self) -> Vec<TracedPod> {
+                lock(&self.0).clone()
+            }
+        }
+        let later = Arc::new(Later(Mutex::default()));
+        struct Shared(Arc<Later>);
+        impl Senders for Shared {
+            fn pods(&self) -> Vec<TracedPod> {
+                self.0.pods()
+            }
+        }
+        let traces = Traces::with_sink(
+            Shared(later.clone()),
+            Box::new(|| Err(Status::unavailable("none"))),
+        );
+        let inner = &traces.inner;
+        inner.rescan_now().await;
+        let address: IpAddr = "169.254.16.7".parse().unwrap();
+        assert_eq!(
+            inner.sender(Some(address)).map(|_| ()),
+            Err(Refusal::Unknown)
+        );
+        lock(&later.0).push(TracedPod {
+            id: "new".into(),
+            labels: labels(&[("ferun.tenant", "acme")]),
+            addresses: vec![address],
+        });
+        let sender = inner.sender_now(Some(address)).await.unwrap();
+        assert_eq!(sender.id, "new");
+        let other: IpAddr = "169.254.16.8".parse().unwrap();
+        assert_eq!(
+            inner.sender_now(Some(other)).await.map(|_| ()),
+            Err(Refusal::Unknown)
+        );
     }
 
     /// A sink that answers with `code`, and keeps what it took.

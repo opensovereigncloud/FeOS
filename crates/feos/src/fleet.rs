@@ -102,7 +102,7 @@ struct PodSenders(Pods);
 impl Senders for PodSenders {
     fn pods(&self) -> Vec<TracedPod> {
         self.0
-            .shipping_logs()
+            .labelled()
             .into_iter()
             .map(|pod| TracedPod {
                 addresses: [&pod.ipv4_address, &pod.ipv6_address]

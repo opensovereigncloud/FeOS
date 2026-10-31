@@ -2016,6 +2016,19 @@ impl Pods {
         pods
     }
 
+    /// The pods that have log labels, in whatever state: those that may
+    /// send spans to the node (docs/architecture/traces.md).
+    pub fn labelled(&self) -> Vec<PodInfo> {
+        let mut pods: Vec<PodInfo> = self
+            .pods()
+            .values()
+            .filter(|pod| !pod.info.log_labels.is_empty())
+            .map(|pod| pod.info.clone())
+            .collect();
+        pods.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
+        pods
+    }
+
     pub fn list(&self) -> Vec<PodInfo> {
         let mut pods: Vec<PodInfo> = self.pods().values().map(Pod::shown).collect();
         pods.sort_by(|a, b| a.pod_id.cmp(&b.pod_id));
