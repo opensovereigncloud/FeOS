@@ -63,7 +63,7 @@ type Config struct {
 	// searchers for everything else, and the prefix of the log indexes'
 	// names (<prefix>-v<version>-<days>d).
 	IndexSearchURL, IndexPrefix string
-	// The log of record (ADR 0026 §11): Redpanda's brokers, and a new
+	// The log of record (ADR 0026 §11): Kafka's brokers, and a new
 	// topic's partitions, replicas and retention.
 	KafkaBrokers                      []string
 	KafkaPartitions, KafkaReplication int
@@ -159,7 +159,7 @@ func register(fs *flag.FlagSet, c *Config) *string {
 	fs.StringVar(&c.TrustDomain, "trust-domain", c.TrustDomain, "the SPIFFE trust domain (required)")
 	fs.StringVar(&c.FerunURL, "ferun-url", c.FerunURL, "ferund's API inside the cluster, e.g. http://ferund.ferun.svc:8100 (required)")
 	fs.StringVar(&c.IndexSearchURL, "index-search-url", c.IndexSearchURL, "Quickwit's REST API at its searchers, e.g. http://quickwit-searcher:7280 (required)")
-	fs.Var((*stringList)(&c.KafkaBrokers), "kafka-brokers", "the Kafka API's brokers (Redpanda), comma-separated host:port, also Quickwit's sources' (required)")
+	fs.Var((*stringList)(&c.KafkaBrokers), "kafka-brokers", "the Kafka cluster's brokers, comma-separated host:port, also Quickwit's sources' (required)")
 	fs.IntVar(&c.KafkaPartitions, "kafka-partitions", c.KafkaPartitions, "the partitions of a new topic")
 	fs.IntVar(&c.KafkaReplication, "kafka-replication", c.KafkaReplication, "the replicas of a new topic's partitions")
 	fs.DurationVar(&c.KafkaRetention, "kafka-retention", c.KafkaRetention, "how long a new topic keeps its records: the replay buffer, not the store")

@@ -3,7 +3,7 @@
 `ferun-sink` keeps the platform's logs (ADR 0026): every container's
 output of the pods FeRun makes, shipped by the nodes, and the requests
 `ferun-ingress` answered, written by its instances, appended to
-Redpanda's topics and indexed from there by Quickwit (ADR 0026 §10,
+Kafka's topics and indexed from there by Quickwit (ADR 0026 §10,
 §11), and read by tenants over HTTP. This page is the contract between its parts;
 the ADR says why.
 
@@ -11,7 +11,7 @@ the ADR says why.
 guest ──CRI lines──▶ logs/container.log
                          │ StreamContainerLogs(follow, from_offset)
 feosd (node) ──OTLP LogsService/Export, SinkService (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `sink` (streams, positions, quota)
-     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Redpanda topic ferun-logs-v3-<days>d ──Kafka source──▶ Quickwit index of that name
+     ▲ TelemetryResponse.sink_endpoint                                       │   └──▶ Kafka topic ferun-logs-v4-<days>d ──Kafka source──▶ Quickwit index of that name
 ferund ──CreatePodRequest.log_labels──▶ feosd                                │
      ◀── GET /api/v1/tenant (a tenant's token) ──────────────────────────────┤
 tenants (FeCode) ── GET /api/v1/logs, /api/v1/log-streams (Bearer) ──────────┘
@@ -198,15 +198,15 @@ database (`sink`, migrations of its own), two ports:
   `LogsService/Export` for the ingresses' access logs ([The ingress's
   access log](#the-ingresss-access-log)), from the first certificate
   on. A batch is stored in one transaction and then answered: each
-  stream's row locked, its new lines produced to its topic (Redpanda
-  answers once every in-sync replica has them), the row and the usage
+  stream's row locked, its new lines produced to its topic (Kafka
+  answers once two of its three replicas have them), the row and the usage
   updated, the commit. A line is stored once per (stream, offset), and
   one at or below the last offset stored counts as stored: a node sends
   a stream's lines in the order of their offsets. A tenant over
   its quota (`--log-quota`, bytes of text a day, UTC, 0: none; reached by
   what is stored, so the batch that crosses it is stored) is refused with
   `RESOURCE_EXHAUSTED`, which names it; the other tenants' streams of the
-  same batch are stored. A failure of the database or of Redpanda is
+  same batch are stored. A failure of the database or of Kafka is
   `UNAVAILABLE`, and nothing of the batch is stored; a request
   over 8 MiB, of more than 10,000 records, or with a resource without
   `ferun.pod`, `ferun.container`, `ferun.log_id` and `ferun.tenant` or a
@@ -240,16 +240,17 @@ by the token's SHA-256.
 **Stages.** `log_streams` (one row per stream key: labels, first and
 last time, next offset, the last offset stored, ended; its ID `s_` and 16
 random hex digits) and `log_usage` (a tenant's bytes of a day) in the
-database; the lines in Redpanda, then in Quickwit (§11). A topic per
+database; the lines in Kafka, then in Quickwit (§11). A topic per
 index, of its name: `<--index-prefix>-v<version>-<days>d`
-(`ferun-logs-v3-30d`), the days of `--log-retention`, or of
+(`ferun-logs-v4-30d`), the days of `--log-retention`, or of
 `--log-retention-max` for a stream whose `ferun.retention_days` is
-longer than the default. The sink makes a topic it does not find
-(`--kafka-partitions` 12, `--kafka-replication` 3, `retention.ms`
-`--kafka-retention` 24 h, `segment.ms` an hour, `write.caching` off), its
-index (Quickwit's index API) with its retention, `--index-commit-timeout`
-(10 s) as its commit interval and `--index-partitions` (16, at most 200)
-partitions, and the index's one Kafka source `kafka` on the topic
+longer than the default. At its start, and only then, the sink makes the
+topic of each class that is not there (`--kafka-partitions` 12,
+`--kafka-replication` 3, `min.insync.replicas` 2, `retention.ms`
+`--kafka-retention` 24 h, `segment.ms` an hour), its index (Quickwit's
+index API) with its retention, `--index-commit-timeout` (10 s) as its
+commit interval and `--index-partitions` (16, at most 200) partitions,
+and the index's one Kafka source `kafka` on the topic
 (`auto.offset.reset` earliest; a session of 10 s). A record is a line as
 the index's document, JSON: `ts` (ns, the time field), `tenant`,
 `stream` (the ID), `environment`, `kind`, `object`, `replica`,
@@ -264,12 +265,9 @@ among them) share theirs, as a tenant's job's do. The source indexes each record
 offsets kept in Quickwit's metastore with each split it publishes; a
 batch the sink produced twice (an answer to the node that did not
 arrive, then the node's next send) is indexed twice, and the reads take
-one (stream, offset) once. `--kafka-brokers` names Redpanda's brokers
-(also the sources'), `--index-search-url` Quickwit's REST API. Until
-2026-10-31 the hot stage was `log_batches` (and before it `log_lines`)
-in the database; what an instance of before left there is produced to
-the topics once and deleted, a stream an instance of before still claims
-left to it; the tables go in the next release.
+one (stream, offset) once. `--kafka-brokers` names Kafka's brokers
+(also the sources'), `--index-search-url` Quickwit's REST API. The hot stage of
+before (`log_batches`, `log_lines`) went on 2026-10-31 (migration `0008`).
 
 **Partitions.** One tenant may hold many projects' environments (FeCode's
 does), so an index's lines are hashed into partitions by their tenant,
@@ -316,8 +314,7 @@ zero.
 **Retention**: `--log-retention` (720 h) or a stream's
 `ferun.retention_days`, at most `--log-retention-max` (9600 h); a sweep
 every 10 min deletes the streams whose last line is past their
-retention (and, while they are there, drops empty day partitions of the
-hot tables of before). A topic keeps its records `--kafka-retention`, a
+retention. A topic keeps its records `--kafka-retention`, a
 replay buffer: an index that falls further behind loses what the topic
 dropped. Quickwit drops a
 split of an index once its newest line is past the index's retention,

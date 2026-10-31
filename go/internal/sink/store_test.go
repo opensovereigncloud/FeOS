@@ -54,7 +54,12 @@ func newTestStore(t *testing.T, cfg Config) (*Store, *memIndex, *memLog) {
 	t.Helper()
 	d := newTestDB(t)
 	idx, lg := newMemIndex(), newMemLog()
-	return NewStore(d, idx, lg, cfg, dbtest.Logger(t)), idx, lg
+	s := NewStore(d, idx, lg, cfg, dbtest.Logger(t))
+	// The program makes the topics and indexes at its start.
+	if err := s.EnsureIndexes(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return s, idx, lg
 }
 
 // base is the tests' time of the first line.
@@ -327,7 +332,7 @@ func TestProduceFailure(t *testing.T) {
 	}
 	b := append(batch(known, envLabels("acme", "e", 0), lines(0, base, 5, text)),
 		batch(fresh, envLabels("acme", "e", 1), lines(0, base, 3, text))...)
-	lg.failProduce = errors.New("redpanda down")
+	lg.failProduce = errors.New("kafka down")
 	if err := s.Ingest(ctx, b); err == nil {
 		t.Fatal("no error")
 	}
@@ -371,6 +376,9 @@ func TestIngestAcrossInstances(t *testing.T) {
 		c := testConfig()
 		c.Name = fmt.Sprintf("sink-%d", i)
 		stores[i] = NewStore(d, idx, lg, c, dbtest.Logger(t))
+		if err := stores[i].EnsureIndexes(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	const streams, rounds = 10, 5
 	var wg sync.WaitGroup
@@ -458,7 +466,7 @@ func TestReadTailAndIndex(t *testing.T) {
 	if n, recs := idx.count("acme"), lg.count(logTopic); n != 40 || recs != 70 {
 		t.Fatalf("indexed %d, %d records", n, recs)
 	}
-	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-v3-30d]" {
+	if ids, _ := idx.Indexes(ctx, ""); fmt.Sprint(ids) != "[ferun-logs-v4-30d ferun-logs-v4-400d]" {
 		t.Errorf("indexes %v", ids)
 	}
 	// A read finds the lines of an index of before (version 1,
@@ -706,8 +714,8 @@ func TestRetentionAndDelete(t *testing.T) {
 	idx.sync(lg)
 	// An index (and topic) per retention: the default's, and the longest's
 	// for the streams that ask for more.
-	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-v3-1d ferun-logs-v3-3d]" || idx.count("acme") != 7 ||
-		lg.count("ferun-logs-v3-1d") != 3 || lg.count("ferun-logs-v3-3d") != 4 {
+	if ids, _ := idx.Indexes(ctx, "ferun-logs-"); fmt.Sprint(ids) != "[ferun-logs-v4-1d ferun-logs-v4-3d]" || idx.count("acme") != 7 ||
+		lg.count("ferun-logs-v4-1d") != 3 || lg.count("ferun-logs-v4-3d") != 4 {
 		t.Fatalf("indexes %v, %d documents", ids, idx.count("acme"))
 	}
 	// A line in the tail of a stream past retention is not read either.
@@ -769,51 +777,6 @@ func TestRetentionAndDelete(t *testing.T) {
 	}
 	if r := mustRead(t, s, "acme", url.Values{"job": {"j1"}}); len(r.lines) != 2 {
 		t.Errorf("the job's: %v", texts(r, false))
-	}
-}
-
-func TestPartitions(t *testing.T) {
-	s, _, _ := newTestStore(t, testConfig())
-	ctx := context.Background()
-	// Of each hot table, an empty partition of last week and one with a
-	// row.
-	for _, table := range hotTables {
-		for _, d := range []string{"2026-01-01", "2026-01-02"} {
-			dd, _ := time.Parse(time.DateOnly, d)
-			if _, err := s.db.Pool.Exec(ctx, fmt.Sprintf(`CREATE TABLE %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')`,
-				partitionName(table, dd), table, d, dd.AddDate(0, 0, 1).Format(time.DateOnly))); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	if err := s.Ingest(ctx, batch(StreamKey{"p", "c", "1"}, envLabels("acme", "e", 0), lines(0, base, 1, func(int) string { return "x" }))); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Pool.Exec(ctx, `INSERT INTO log_lines (day, stream_id, off, ts, source, level, partial, text)
-		SELECT '2026-01-02', id, 99, 1, '', 16, false, 'old' FROM log_streams`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Pool.Exec(ctx, `INSERT INTO log_batches (day, stream_id, first_off, last_off, min_ts, max_ts, lines, bytes, levels, data)
-		SELECT '2026-01-02', id, 98, 98, 1, 1, 1, 3, 16, $1 FROM log_streams`,
-		encodeBatch([]Line{{Off: 98, TS: 1, Level: LevelUnknown, Text: "old"}})); err != nil {
-		t.Fatal(err)
-	}
-	dropped, err := maintainPartitions(ctx, s.db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fmt.Sprint(dropped) != "[log_batches_20260101 log_lines_20260101]" {
-		t.Errorf("dropped %v", dropped)
-	}
-	// Every partition of log_batches compresses its data with lz4.
-	var parts, lz4 int
-	if err := s.db.Pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE a.attcompression = 'l')
-		FROM pg_inherits i JOIN pg_attribute a ON a.attrelid = i.inhrelid AND a.attname = 'data'
-		WHERE i.inhparent = 'log_batches'::regclass`).Scan(&parts, &lz4); err != nil {
-		t.Fatal(err)
-	}
-	if parts != daysAhead+2 || lz4 != parts {
-		t.Errorf("%d partitions, %d with lz4", parts, lz4)
 	}
 }
 

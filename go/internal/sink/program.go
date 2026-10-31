@@ -158,7 +158,7 @@ func (p *Program) Run(ctx context.Context) error {
 		}()
 	}
 	run("identity", p.ident.Run)
-	run("hot rows of before", p.drainHot)
+	run("topics and indexes", p.ensurePipes)
 	run("traces", p.traces.Run)
 	run("sweep", p.store.RunSweep)
 	run("ingest", p.serveIngest)
@@ -231,4 +231,32 @@ func (p *Program) serveIngest(ctx context.Context) error {
 	}
 	<-done
 	return nil
+}
+
+// ensurePipes makes the topics, the indexes and their sources of every
+// log class and of the traces, again every 5 s until they are there: the
+// only place they are made. Ingest and reads answer UNAVAILABLE (503)
+// until then.
+func (p *Program) ensurePipes(ctx context.Context) error {
+	for {
+		err := p.store.EnsureIndexes(ctx)
+		if err == nil {
+			err = p.traces.EnsureIndex(ctx)
+		}
+		if err == nil {
+			p.log.Info("topics and indexes are there")
+			return nil
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		p.log.Error("topics and indexes", "err", err)
+		t := time.NewTimer(5 * time.Second)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil
+		case <-t.C:
+		}
+	}
 }

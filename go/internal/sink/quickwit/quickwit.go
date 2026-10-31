@@ -245,8 +245,10 @@ func (c *Client) do(ctx context.Context, method, url, ctype string, body []byte,
 // their retention empties. Version 1 is the indexes named <prefix>-<days>d
 // (tenant the only tag, no partitions), version 2 partitions by tenant,
 // environment and job, version 3 is the same mapping filled by a Kafka
-// source (ADR 0026 §11): an index has its source from its start.
-const MappingVersion = 3
+// source (ADR 0026 §11): an index has its source from its start; version
+// 4 the same on Apache Kafka in place of Redpanda (a source's brokers do
+// not change).
+const MappingVersion = 4
 
 // MaxPartitions is the most partitions an index may have: Quickwit's
 // max_num_partitions (200 by default), past which it puts every line into

@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: SAP SE or an SAP affiliate company and IronCore contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Apache Kafka, the sink's log of record (ADR 0026 §11), as Strimzi runs
+# it (operator-values.yaml): three nodes in KRaft mode, each a controller
+# and a broker, one a worker, a volume each. Its listener `plain` (9092,
+# no TLS or SASL inside the cluster) admits only ferun-sink and Quickwit:
+# Strimzi makes the NetworkPolicy of its networkPolicyPeers. The sink
+# makes the topics itself, at its start; nothing makes one on its own.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: nodes
+  namespace: ferun
+  labels:
+    strimzi.io/cluster: ferun-log
+spec:
+  replicas: 3
+  roles: [controller, broker]
+  storage:
+    type: persistent-claim
+    size: 20Gi
+    class: general-purpose
+    deleteClaim: false
+  resources:
+    requests: {cpu: 250m, memory: 2Gi}
+    limits: {memory: 2Gi}
+  jvmOptions:
+    -Xms: 1024m
+    -Xmx: 1024m
+  template:
+    pod:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  strimzi.io/cluster: ferun-log
+                  strimzi.io/pool-name: nodes
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: ferun-log
+  namespace: ferun
+spec:
+  kafka:
+    version: 4.3.1
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+        networkPolicyPeers:
+          - podSelector:
+              matchLabels:
+                app: ferun-sink
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: quickwit
+    config:
+      # A produce (acks=all) is answered once two of the three have it.
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      auto.create.topics.enable: false
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2

@@ -42,7 +42,7 @@ func (s *Store) Follow(ctx context.Context, tenant string, q Query, out followSi
 	errc := make(chan error, len(s.classes()))
 	for _, days := range s.classes() {
 		id := s.indexID(days)
-		n, err := s.ensure(ctx, id, days)
+		n, err := s.pipes.open(ctx, id)
 		if err != nil {
 			return err
 		}

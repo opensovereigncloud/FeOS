@@ -187,7 +187,8 @@ func (t *Traces) Ingest(ctx context.Context, spans []traceSpan) error {
 	if len(spans) == 0 {
 		return nil
 	}
-	id, n, err := t.ensure(ctx)
+	id, _ := t.indexID()
+	n, err := t.pipes.open(ctx, id)
 	if err != nil {
 		return err
 	}

@@ -50,9 +50,9 @@ func TestIndexID(t *testing.T) {
 		days   int
 		want   string
 	}{
-		{"ferun-logs", 30, "ferun-logs-v3-30d"},
-		{"ferun-logs", 400, "ferun-logs-v3-400d"},
-		{"x", 1, "x-v3-1d"},
+		{"ferun-logs", 30, "ferun-logs-v4-30d"},
+		{"ferun-logs", 400, "ferun-logs-v4-400d"},
+		{"x", 1, "x-v4-1d"},
 	} {
 		if got := IndexID(c.prefix, c.days); got != c.want {
 			t.Errorf("IndexID(%q, %d) = %q, want %q", c.prefix, c.days, got, c.want)
@@ -85,11 +85,11 @@ func TestIndexConfig(t *testing.T) {
 			Period string `json:"period"`
 		} `json:"retention"`
 	}
-	if err := json.Unmarshal(IndexConfig("ferun-logs-v2-30d", IndexSettings{RetentionDays: 30, CommitSecs: 10, Partitions: 16}), &cfg); err != nil {
+	if err := json.Unmarshal(IndexConfig("ferun-logs-v4-30d", IndexSettings{RetentionDays: 30, CommitSecs: 10, Partitions: 16}), &cfg); err != nil {
 		t.Fatal(err)
 	}
 	m := cfg.DocMapping
-	if cfg.IndexID != "ferun-logs-v2-30d" || cfg.Indexing.CommitSecs != 10 || cfg.Retention.Period != "30 days" ||
+	if cfg.IndexID != "ferun-logs-v4-30d" || cfg.Indexing.CommitSecs != 10 || cfg.Retention.Period != "30 days" ||
 		m.PartitionKey != "hash_mod((tenant,environment,job), 16)" || fmt.Sprint(m.TagFields) != "[tenant environment job]" ||
 		m.Timestamp != "ts" || len(m.FieldMappings) == 0 || m.FieldMappings[0].Name != "ts" || m.FieldMappings[0].Type != "datetime" {
 		t.Errorf("config %+v", cfg)
@@ -157,16 +157,16 @@ func TestEnsure(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	src := Source{Topic: "ferun-logs-v3-30d", Brokers: []string{"rp-0:9092", "rp-1:9092"}}
-	cfg := IndexConfig("ferun-logs-v3-30d", IndexSettings{RetentionDays: 30, CommitSecs: 10, Partitions: 16})
+	src := Source{Topic: "ferun-logs-v4-30d", Brokers: []string{"rp-0:9092", "rp-1:9092"}}
+	cfg := IndexConfig("ferun-logs-v4-30d", IndexSettings{RetentionDays: 30, CommitSecs: 10, Partitions: 16})
 	for range 2 {
-		if err := c.Ensure(ctx, "ferun-logs-v3-30d", cfg, src); err != nil {
+		if err := c.Ensure(ctx, "ferun-logs-v4-30d", cfg, src); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if got := strings.Join(f.calls, ", "); got != "GET /api/v1/indexes/ferun-logs-v3-30d, POST /api/v1/indexes, "+
-		"POST /api/v1/indexes/ferun-logs-v3-30d/sources, GET /api/v1/indexes/ferun-logs-v3-30d, "+
-		"POST /api/v1/indexes/ferun-logs-v3-30d/sources" {
+	if got := strings.Join(f.calls, ", "); got != "GET /api/v1/indexes/ferun-logs-v4-30d, POST /api/v1/indexes, "+
+		"POST /api/v1/indexes/ferun-logs-v4-30d/sources, GET /api/v1/indexes/ferun-logs-v4-30d, "+
+		"POST /api/v1/indexes/ferun-logs-v4-30d/sources" {
 		t.Errorf("calls %s", got)
 	}
 	var body struct {
@@ -178,19 +178,19 @@ func TestEnsure(t *testing.T) {
 			Client map[string]string `json:"client_params"`
 		} `json:"params"`
 	}
-	if err := json.Unmarshal(f.sources["ferun-logs-v3-30d"], &body); err != nil {
+	if err := json.Unmarshal(f.sources["ferun-logs-v4-30d"], &body); err != nil {
 		t.Fatal(err)
 	}
 	if body.SourceID != "kafka" || body.SourceType != "kafka" || body.Format != "json" || body.Params.Topic != src.Topic ||
 		body.Params.Client["bootstrap.servers"] != "rp-0:9092,rp-1:9092" || body.Params.Client["auto.offset.reset"] != "earliest" ||
 		body.Params.Client["session.timeout.ms"] != "10000" || body.Params.Client["heartbeat.interval.ms"] != "3000" {
-		t.Errorf("source %s", f.sources["ferun-logs-v3-30d"])
+		t.Errorf("source %s", f.sources["ferun-logs-v4-30d"])
 	}
 	// Another error than "already exists" is one.
 	f.mu.Lock()
 	f.down = true
 	f.mu.Unlock()
-	if err := c.Ensure(ctx, "ferun-logs-v3-30d", cfg, src); err == nil {
+	if err := c.Ensure(ctx, "ferun-logs-v4-30d", cfg, src); err == nil {
 		t.Error("no error")
 	}
 }

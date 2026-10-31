@@ -15,7 +15,7 @@ import (
 )
 
 // memLog is the log of record in memory: topics of partitions of records,
-// as Redpanda keeps them.
+// as Kafka keeps them.
 type memLog struct {
 	mu          sync.Mutex
 	topics      map[string][][]kafka.Record

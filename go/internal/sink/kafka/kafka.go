@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package kafka is the sink's log of record (ADR 0026 §11): topics on a
-// Kafka API (Redpanda in the reference deployment) that the sink appends
+// Kafka cluster (Apache Kafka in the reference deployment) that the sink appends
 // to, Quickwit's Kafka sources index from, and the sink reads the newest
 // records of back. The sink picks a record's partition itself (Partition),
 // so that a reader knows where a key's records are.
@@ -84,11 +84,13 @@ func Partition(key string, n int32) int32 {
 func (c *Client) EnsureTopic(ctx context.Context, topic string, tc TopicConfig) error {
 	// Retention deletes closed segments only: a segment closes after an
 	// hour, so that a record goes about an hour after its retention, not
-	// weeks. Records are synced to disk before a produce is answered.
+	// weeks. A produce (acks=all) is answered once min.insync.replicas
+	// have it: two of three, so one broker may be down and none lost.
 	retention := strconv.FormatInt(tc.Retention.Milliseconds(), 10)
-	cleanup, segment, caching := "delete", "3600000", "false"
+	cleanup, segment := "delete", "3600000"
+	insync := strconv.Itoa(int(min(tc.Replication, 2)))
 	resp, err := c.adm.CreateTopic(ctx, tc.Partitions, tc.Replication, map[string]*string{
-		"retention.ms": &retention, "cleanup.policy": &cleanup, "segment.ms": &segment, "write.caching": &caching,
+		"retention.ms": &retention, "cleanup.policy": &cleanup, "segment.ms": &segment, "min.insync.replicas": &insync,
 	}, topic)
 	if err == nil {
 		err = resp.Err
@@ -102,17 +104,39 @@ func (c *Client) EnsureTopic(ctx context.Context, topic string, tc TopicConfig) 
 	return nil
 }
 
-// Partitions is how many partitions topic has.
+// Partitions is how many partitions topic has. A topic just made may be
+// unknown to the broker asked for a moment (its metadata spread): that
+// broker is asked again, for at most five seconds.
 func (c *Client) Partitions(ctx context.Context, topic string) (int32, error) {
-	md, err := c.adm.Metadata(ctx, topic)
-	if err != nil {
-		return 0, fmt.Errorf("kafka: metadata %s: %w", topic, err)
+	var last error
+	for try := 0; try < 25; try++ {
+		if try > 0 {
+			c.cl.ForceMetadataRefresh()
+			t := time.NewTimer(200 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return 0, ctx.Err()
+			case <-t.C:
+			}
+		}
+		md, err := c.adm.Metadata(ctx, topic)
+		if err != nil {
+			return 0, fmt.Errorf("kafka: metadata %s: %w", topic, err)
+		}
+		t, ok := md.Topics[topic]
+		switch {
+		case ok && t.Err == nil && len(t.Partitions) > 0:
+			return int32(len(t.Partitions)), nil
+		case ok && t.Err != nil && !kerr.IsRetriable(t.Err):
+			return 0, fmt.Errorf("kafka: topic %s: %w", topic, t.Err)
+		case ok:
+			last = t.Err
+		default:
+			last = kerr.UnknownTopicOrPartition
+		}
 	}
-	t, ok := md.Topics[topic]
-	if !ok || t.Err != nil {
-		return 0, fmt.Errorf("kafka: topic %s: %v", topic, t.Err)
-	}
-	return int32(len(t.Partitions)), nil
+	return 0, fmt.Errorf("kafka: topic %s: %w", topic, last)
 }
 
 // Produce appends recs (each with its Partition) to topic and returns once

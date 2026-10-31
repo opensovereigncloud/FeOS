@@ -1,7 +1,7 @@
 # Traces
 
 `ferun-sink` keeps the spans of the pods FeRun makes and of the requests
-`ferun-ingress` answers (ADR 0026 §10, step 10), appended to a Redpanda
+`ferun-ingress` answers (ADR 0026 §10, step 10), appended to a Kafka
 topic and indexed from there by Quickwit's trace index (§11), and
 answers them to a tenant in the shape of Jaeger's query API. This page is
 the contract between the parts; the ADR says why. Logs are
@@ -12,7 +12,7 @@ and Quickwit holds here unless this one says otherwise.
 pod (OTel SDK) ──OTLP/gRPC :4317, OTLP/HTTP protobuf :4318──▶ feosd at 169.254.169.1
                                    │ the pod by its source address, its ferun.* labels stamped
 feosd (node) ──OTLP TraceService/Export (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `trace_usage` (quota)
-ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Redpanda ferun-traces-v2-<days>d ──Kafka source──▶ Quickwit index of that name
+ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Kafka ferun-traces-v3-<days>d ──Kafka source──▶ Quickwit index of that name
 tenants (FeCode) ── GET /api/v1/jaeger/api/… (Bearer) ─────────┘
 ```
 
@@ -158,8 +158,8 @@ A span without a valid `trace_id` (16 bytes, not all zero) or `span_id`
 `partial_success.rejected_spans`, with an `error_message`. The others
 become documents (below) and are produced to the trace topic in one
 transaction with the tenant's usage, each keyed by its trace ID (a
-trace's spans in one partition); the answer comes after Redpanda has
-them on every in-sync replica and the commit, well within the 8 s the
+trace's spans in one partition); the answer comes after Kafka has
+them on two of its three replicas and the commit, well within the 8 s the
 node gives a pod's export.
 A span without a start gets the time it came as its `ts`; a resource
 without `service.name` the service `unknown_service`.
@@ -175,15 +175,14 @@ before yesterday.
 
 `trace_spans` and its indexer held a span until its index had published
 it until 2026-10-31 (§10); now the trace index's Kafka source takes the
-spans from their topic, of the index's name, made as the log topics are
-(sink.md, Stages). Spans sent twice (a node's retry after an answer that
-did not arrive) are two records and two documents; a read keeps one per
-span ID. What an instance of before left in `trace_spans` is produced to
-the topic once and deleted; the table goes in the next release.
+spans from their topic, of the index's name, made with it at the sink's
+start (sink.md, Stages). Spans sent twice (a node's retry after an
+answer that did not arrive) are two records and two documents; a read
+keeps one per span ID.
 
 ### The index
 
-`<--trace-index-prefix>-v<N>-<days>d`, default `ferun-traces-v2-30d`
+`<--trace-index-prefix>-v<N>-<days>d`, default `ferun-traces-v3-30d`
 (`--trace-retention`, 30 days), created at first use with its topic and source as the logs'
 indexes are, with a commit interval of 5 s. `N` is the
 mapping's version (`quickwit.TraceMappingVersion`): a changed mapping is

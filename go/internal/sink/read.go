@@ -33,11 +33,11 @@ type streamRow struct {
 	FirstNs, LastNs                                             *int64
 	EndedAt                                                     *time.Time
 	Lines, Bytes                                                int64
-	ChunkedLast, LastOff                                        int64
+	LastOff                                                     int64
 }
 
 const streamCols = `id, sid, tenant, instance, container, environment, kind, object, replica, release, job, attempt, node,
-	source, first_ns, last_ns, ended_at, lines, bytes, chunked_last, last_off`
+	source, first_ns, last_ns, ended_at, lines, bytes, last_off`
 
 func scanStream(r pgx.CollectableRow) (*streamRow, error) { return scanStreamWith(r) }
 
@@ -47,7 +47,7 @@ func scanStreamWith(r interface{ Scan(...any) error }, more ...any) (*streamRow,
 	var s streamRow
 	err := r.Scan(append([]any{&s.ID, &s.SID, &s.Tenant, &s.Instance, &s.Container, &s.Environment, &s.Kind, &s.Object,
 		&s.Replica, &s.Release, &s.Job, &s.Attempt, &s.Node, &s.Source, &s.FirstNs, &s.LastNs, &s.EndedAt,
-		&s.Lines, &s.Bytes, &s.ChunkedLast, &s.LastOff}, more...)...)
+		&s.Lines, &s.Bytes, &s.LastOff}, more...)...)
 	return &s, err
 }
 

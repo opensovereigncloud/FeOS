@@ -230,8 +230,8 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (st
 	if err != nil {
 		return streamCount{}, nil, fmt.Errorf("lock stream: %w", err)
 	}
-	topic, days := s.indexOf(keptDays)
-	n, err := s.ensure(ctx, topic, days)
+	topic, _ := s.indexOf(keptDays)
+	n, err := s.pipes.open(ctx, topic)
 	if err != nil {
 		return streamCount{}, nil, err
 	}
@@ -240,7 +240,7 @@ func (s *Store) ingestStream(ctx context.Context, tx pgx.Tx, b *StreamBatch) (st
 	// last of its source when that is partial.
 	slices.SortStableFunc(b.Lines, func(x, y Line) int { return cmpInt(x.Off, y.Off) })
 	c := streamCount{id: st.ID, topic: topic, next: b.Next, last: -1}
-	from := max(st.ChunkedLast, st.LastOff)
+	from := st.LastOff
 	var recs []kafka.Record
 	for _, ln := range b.Lines {
 		c.next = max(c.next, ln.Off)

@@ -112,12 +112,12 @@ spec:
                 secretKeyRef:
                   name: ferun-sink-token
                   key: token
-            # Quickwit, the index (quickwit/, ADR 0026 §10), and Redpanda,
-            # the log of record its sources read (redpanda/, §11).
+            # Quickwit, the index (quickwit/, ADR 0026 §10), and Kafka, the
+            # log of record its sources read (kafka/, §11).
             - name: FERUN_SINK_INDEX_SEARCH_URL
               value: http://quickwit-searcher.ferun.svc:7280
             - name: FERUN_SINK_KAFKA_BROKERS
-              value: redpanda-0.redpanda.ferun.svc.cluster.local:9093,redpanda-1.redpanda.ferun.svc.cluster.local:9093,redpanda-2.redpanda.ferun.svc.cluster.local:9093
+              value: ferun-log-kafka-bootstrap.ferun.svc:9092
             - name: FERUN_SINK_LOG_RETENTION
               value: 720h
             - name: FERUN_SINK_LOG_RETENTION_MAX

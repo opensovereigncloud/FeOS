@@ -39,6 +39,13 @@ func (t *Traces) sweepUsage(ctx context.Context) error {
 	return nil
 }
 
+// EnsureIndex makes the trace index, its topic and its source (at the
+// sink's start).
+func (t *Traces) EnsureIndex(ctx context.Context) error {
+	_, _, err := t.ensure(ctx)
+	return err
+}
+
 // ensure makes the trace index, its topic and its source, and returns the
 // topic's id and partitions.
 func (t *Traces) ensure(ctx context.Context) (string, int32, error) {
@@ -67,7 +74,8 @@ func (t *Traces) tailSpans(ctx context.Context, q quickwit.SpanQuery) ([]quickwi
 	if q.TraceID == "" {
 		return nil, nil
 	}
-	id, n, err := t.ensure(ctx)
+	id, _ := t.indexID()
+	n, err := t.pipes.open(ctx, id)
 	if err != nil {
 		return nil, err
 	}

@@ -25,7 +25,11 @@ import (
 func newTestTraces(t *testing.T, cfg Config) (*Traces, *memTraceIndex, *memLog) {
 	t.Helper()
 	idx, lg := newMemTraceIndex(), newMemLog()
-	return NewTraces(newTestDB(t), idx, lg, cfg, dbtest.Logger(t)), idx, lg
+	tr := NewTraces(newTestDB(t), idx, lg, cfg, dbtest.Logger(t))
+	if err := tr.EnsureIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return tr, idx, lg
 }
 
 // ingestSpans parses a request of a node's and stores it.
@@ -84,7 +88,7 @@ func TestTraceStore(t *testing.T) {
 	if err := ingestSpans(t, tr, traceRequest(podAttrs("other", "env1", "api"), notAcme)); err != nil {
 		t.Fatal(err)
 	}
-	if id, _ := tr.indexID(); id != "ferun-traces-v2-30d" || fmt.Sprint(topicSpans(t, tr, lg)) != "map[acme:3 other:1]" {
+	if id, _ := tr.indexID(); id != "ferun-traces-v3-30d" || fmt.Sprint(topicSpans(t, tr, lg)) != "map[acme:3 other:1]" {
 		t.Fatalf("topic %s: %v", id, topicSpans(t, tr, lg))
 	}
 	var used int64

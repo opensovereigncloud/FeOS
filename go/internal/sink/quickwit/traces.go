@@ -209,8 +209,8 @@ func valueIs(raw json.RawMessage, v string) bool {
 // index's name (TraceIndexID), as MappingVersion is the log indexes': a
 // changed mapping is a new index, and reads search every version until
 // the old one ages out. Version 2 is filled by a Kafka source (ADR 0026
-// §11).
-const TraceMappingVersion = 2
+// §11), version 3 by one on Apache Kafka.
+const TraceMappingVersion = 3
 
 // TraceIndexID is the trace index of a retention in days, in prefix, of
 // TraceMappingVersion: <prefix>-v<version>-<days>d.

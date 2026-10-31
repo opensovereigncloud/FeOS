@@ -136,7 +136,7 @@ func (s *Store) tailDocs(ctx context.Context, streams []*streamRow) ([]quickwit.
 	var out []quickwit.Doc
 	for _, days := range s.classes() {
 		id := s.indexID(days)
-		n, err := s.ensure(ctx, id, days)
+		n, err := s.pipes.open(ctx, id)
 		if err != nil {
 			return nil, err
 		}

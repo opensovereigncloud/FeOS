@@ -14,7 +14,7 @@ import (
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
-// Log is the log of record (ADR 0026 §11): the topics on Redpanda
+// Log is the log of record (ADR 0026 §11): the topics on Kafka
 // (kafka.Client), or a test's.
 type Log interface {
 	EnsureTopic(ctx context.Context, topic string, tc kafka.TopicConfig) error
@@ -67,7 +67,9 @@ func newPipes(log Log, index SourceIndex, cfg Config) *pipes {
 }
 
 // ensure makes id's topic, its index of config and the index's source, and
-// returns the topic's partitions.
+// returns the topic's partitions. Only the sink's start makes them
+// (Program.ensurePipes): the topics are the platform's, fixed, never made
+// by what a tenant does (ADR 0026 §11).
 func (p *pipes) ensure(ctx context.Context, id string, config func() []byte) (int32, error) {
 	p.mu.Lock()
 	n, ok := p.parts[id]
@@ -94,7 +96,7 @@ func (p *pipes) ensure(ctx context.Context, id string, config func() []byte) (in
 	return n, nil
 }
 
-// produce appends recs to id's topic; it returns once Redpanda has them
+// produce appends recs to id's topic; it returns once Kafka has them
 // on every in-sync replica.
 func (p *pipes) produce(ctx context.Context, id string, recs []kafka.Record) error {
 	if len(recs) == 0 {
@@ -143,4 +145,23 @@ func (p *pipes) ends(ctx context.Context, id string, parts []int32) (map[int32]i
 		out[part] = all[part]
 	}
 	return out, nil
+}
+
+// open is how many partitions id's topic has: ensured, or asked of the
+// log; a topic that is not there fails, it is never made here.
+func (p *pipes) open(ctx context.Context, id string) (int32, error) {
+	p.mu.Lock()
+	n, ok := p.parts[id]
+	p.mu.Unlock()
+	if ok {
+		return n, nil
+	}
+	n, err := p.log.Partitions(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	p.mu.Lock()
+	p.parts[id] = n
+	p.mu.Unlock()
+	return n, nil
 }

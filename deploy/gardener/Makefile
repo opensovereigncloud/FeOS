@@ -62,7 +62,7 @@ cat-yaml = awk 'FNR==1{print "---"}1' $(1)
 
 .PHONY: feos-node push-feos-node deploy-feos feos-k8s push-feos-k8s deploy-feos-k8s
 .PHONY: ferund push-ferund deploy-ferund deploy-ferun-ingress ferun-sink push-ferun-sink deploy-ferun-sink
-.PHONY: manifests apply-feos apply-ferun apply-ferun-db-import apply-ferun-ingress apply-ferun-sink apply-quickwit apply-redpanda apply-fechat apply-registry FORCE
+.PHONY: manifests apply-feos apply-ferun apply-ferun-db-import apply-ferun-ingress apply-ferun-sink apply-quickwit apply-kafka apply-fechat apply-registry FORCE
 
 # feosd, diskd, feosctl, Firecracker and the guest from the packages, for
 # the feos-node pod (ADR 0020).
@@ -193,10 +193,11 @@ apply-ferun-sink: $(MANIFESTS)/ferun-sink.yaml ## Apply ferun-sink, its database
 	  kubectl -n ferun get secret $$s >/dev/null 2>&1 || { echo "the secret ferun/$$s is missing (README.md, The sink)" >&2; exit 1; }; done
 	kubectl apply -f $<
 
-apply-redpanda: ## Apply Redpanda's NetworkPolicy and Helm release (README.md, The sink).
-	kubectl apply -f redpanda/networkpolicy.yaml
-	helm repo add redpanda https://charts.redpanda.com >/dev/null && helm repo update redpanda >/dev/null
-	helm upgrade --install redpanda redpanda/redpanda --version 26.2.4 -n ferun -f redpanda/values.yaml --wait --timeout 10m
+apply-kafka: ## Apply Strimzi's operator and the Kafka cluster ferun-log (README.md, The sink).
+	helm upgrade --install strimzi oci://quay.io/strimzi-helm/strimzi-kafka-operator --version 1.3.0 \
+	  -n strimzi --create-namespace -f kafka/operator-values.yaml --wait --timeout 10m
+	kubectl apply -f kafka/kafka.yaml
+	kubectl -n ferun wait kafka/ferun-log --for=condition=Ready --timeout=15m
 
 # Quickwit's release reads the bucket's name and endpoint from the
 # Secret ferun-sink-bucket, as the sink does.

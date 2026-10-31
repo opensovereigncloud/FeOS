@@ -362,7 +362,7 @@ ferun-sink (ADR 0026, [`docs/architecture/sink.md`](../../docs/architecture/sink
 keeps the pods' logs: the Deployment `ferun-sink` of
 [`ferun-sink/`](ferun-sink/ferun-sink.yaml), two instances in the
 namespace `ferun`, over the database `sink` of `ferun-db` (its
-streams, positions and quota), Redpanda and Quickwit. The nodes ship to
+streams, positions and quota), Kafka and Quickwit. The nodes ship to
 its ingest, port 4317, over mTLS
 with their node certificates, each at the address of an instance that
 ferund gives it: the hosts reach no ClusterIP, so the Service
@@ -418,15 +418,18 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
          --from-literal=username=quickwit --from-literal=password="$(openssl rand -hex 24)"
        make -C deploy/gardener apply-ferun apply-quickwit
 
-   The sink makes its indexes (`ferun-logs-v2-<days>d`) itself.
+   The sink makes its indexes (`ferun-logs-v4-<days>d`) itself, at its start.
 
-6. Redpanda, the log of record (ADR 0026 §11): the sink produces every
-   line and span to its topics, Quickwit's indexers read them with their
-   Kafka sources; three brokers of [`redpanda/values.yaml`](redpanda/values.yaml)
-   (the chart 26.2.4), one a worker, and their NetworkPolicy. The sink
-   makes the topics (and the indexes and their sources) itself:
+6. Kafka, the log of record (ADR 0026 §11): the sink produces every line
+   and span to its topics, Quickwit's indexers read them with their
+   Kafka sources; Strimzi's operator ([`kafka/operator-values.yaml`](kafka/operator-values.yaml),
+   the chart 1.3.0, in the namespace `strimzi`) runs the cluster
+   `ferun-log` of [`kafka/kafka.yaml`](kafka/kafka.yaml): Kafka 4.3.1 in
+   KRaft mode, three nodes, one a worker, its listener open to the sink
+   and Quickwit only. The sink makes the topics (and the indexes and
+   their sources) itself, at its start:
 
-       make -C deploy/gardener apply-redpanda
+       make -C deploy/gardener apply-kafka
 
 7. ferund tells the nodes where to ship (`--sink-endpoint
    ferun-sink-ingest.ferun.svc.cluster.local:4317`, which it resolves
@@ -435,11 +438,9 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
 
 A new image: `make -C deploy/gardener deploy-ferun-sink TAG=<tag>`
 pushes it and rolls the instances. Lines are kept 30 days
-(`FERUN_SINK_LOG_RETENTION`, the index `ferun-logs-v2-30d`), a tenant's job
-asks for up to 400 (`FERUN_SINK_LOG_RETENTION_MAX`, `ferun-logs-v2-400d`).
-The indexes of before, `ferun-logs-30d` and `ferun-logs-400d`, are
-read too until their retention has emptied them; then they can be
-deleted (`DELETE /api/v1/indexes/<id>` at Quickwit).
+(`FERUN_SINK_LOG_RETENTION`, the index and topic `ferun-logs-v4-30d`), a
+tenant's job asks for up to 400 (`FERUN_SINK_LOG_RETENTION_MAX`,
+`ferun-logs-v4-400d`).
 The chunks the sink wrote before Quickwit all moved into the index on
 2026-10-31.
 

@@ -17,15 +17,15 @@ import (
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
 )
 
-// TestRedpandaEndToEnd runs the store against a real Kafka API
-// (FERUN_TEST_KAFKA_BROKERS, Redpanda) and Quickwit
+// TestKafkaEndToEnd runs the store against a real Kafka API
+// (FERUN_TEST_KAFKA_BROKERS) and Quickwit
 // (FERUN_TEST_QUICKWIT_URL), which must reach the brokers at the same
 // address: lines read from the topic's tail at once, from the index after
 // its source's commit, each once, and followed as they come.
-func TestRedpandaEndToEnd(t *testing.T) {
+func TestKafkaEndToEnd(t *testing.T) {
 	qw, brokers := os.Getenv("FERUN_TEST_QUICKWIT_URL"), os.Getenv("FERUN_TEST_KAFKA_BROKERS")
 	if qw == "" || brokers == "" {
-		t.Skip("FERUN_TEST_QUICKWIT_URL and FERUN_TEST_KAFKA_BROKERS are not set; skipping a test that needs Quickwit and Redpanda")
+		t.Skip("FERUN_TEST_QUICKWIT_URL and FERUN_TEST_KAFKA_BROKERS are not set; skipping a test that needs Quickwit and Kafka")
 	}
 	cfg := testConfig()
 	cfg.IndexPrefix = fmt.Sprintf("e2e-logs-%d", time.Now().UnixNano())

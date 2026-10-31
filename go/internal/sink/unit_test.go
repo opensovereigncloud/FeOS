@@ -253,7 +253,7 @@ func TestConfig(t *testing.T) {
 	env := map[string]string{
 		"FERUN_SINK_NAME": "sink-0", "FERUN_SINK_DATABASE_URL": "postgres://x/sink", "FERUN_SINK_TRUST_DOMAIN": "run.example.com",
 		"FERUN_SINK_FERUN_URL": "http://ferund:8100",
-		"FERUN_SINK_LOG_QUOTA": "1GiB", "FERUN_SINK_KAFKA_BROKERS": "redpanda-0:9092, redpanda-1:9092,",
+		"FERUN_SINK_LOG_QUOTA": "1GiB", "FERUN_SINK_KAFKA_BROKERS": "kafka-0:9092, kafka-1:9092,",
 		"FERUN_SINK_INDEX_SEARCH_URL": "http://quickwit-searcher:7280",
 		EnvServiceToken:               "tok",
 	}
@@ -267,7 +267,7 @@ func TestConfig(t *testing.T) {
 	if c.IndexPrefix != "ferun-logs" || c.CommitTimeout != 10*time.Second || c.IndexPartitions != 16 {
 		t.Errorf("index %q, commit %v, %d partitions", c.IndexPrefix, c.CommitTimeout, c.IndexPartitions)
 	}
-	if fmt.Sprint(c.KafkaBrokers) != "[redpanda-0:9092 redpanda-1:9092]" || c.KafkaPartitions != 12 || c.KafkaReplication != 3 ||
+	if fmt.Sprint(c.KafkaBrokers) != "[kafka-0:9092 kafka-1:9092]" || c.KafkaPartitions != 12 || c.KafkaReplication != 3 ||
 		c.KafkaRetention != 24*time.Hour {
 		t.Errorf("kafka %v, %d partitions, %d replicas, retention %v", c.KafkaBrokers, c.KafkaPartitions, c.KafkaReplication,
 			c.KafkaRetention)

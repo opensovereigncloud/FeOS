@@ -39,16 +39,13 @@ func (s *Store) RunSweep(ctx context.Context) error {
 // Sweep deletes, by the database's clock, the streams whose last line is
 // past their retention (the index drops their lines by its own retention,
 // at least as long: ADR 0026 §10; a read finds no line of a stream that
-// is gone), the usage of days before yesterday, and, while the hot tables
-// of before are there (§11), their empty partitions of past days, after
-// making those ahead. Several instances may sweep at once.
+// is gone) and the usage of days before yesterday. Several instances may
+// sweep at once.
 func (s *Store) Sweep(ctx context.Context) error {
 	def, maxRet := s.cfg.Retention.Nanoseconds(), s.cfg.RetentionMax.Nanoseconds()
 	var errs []error
 	tag, err := s.db.Pool.Exec(ctx, `DELETE FROM log_streams s
-		WHERE NOT EXISTS (SELECT 1 FROM log_batches b WHERE b.stream_id = s.id)
-			AND NOT EXISTS (SELECT 1 FROM log_lines l WHERE l.stream_id = s.id)
-			AND coalesce(s.last_ns, (extract(epoch FROM s.created_at) * 1000000000)::bigint) < `+nowNs+` - `+retentionNs,
+		WHERE coalesce(s.last_ns, (extract(epoch FROM s.created_at) * 1000000000)::bigint) < `+nowNs+` - `+retentionNs,
 		def, maxRet)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("expired streams: %w", err))
@@ -57,13 +54,6 @@ func (s *Store) Sweep(ctx context.Context) error {
 	}
 	if _, err := s.db.Pool.Exec(ctx, `DELETE FROM log_usage WHERE day < (now() AT TIME ZONE 'utc')::date - 1`); err != nil {
 		errs = append(errs, fmt.Errorf("usage: %w", err))
-	}
-	dropped, err := maintainPartitions(ctx, s.db)
-	if len(dropped) > 0 {
-		s.log.Info("dropped empty partitions", "partitions", dropped)
-	}
-	if err != nil {
-		errs = append(errs, fmt.Errorf("partitions: %w", err))
 	}
 	return errors.Join(errs...)
 }
