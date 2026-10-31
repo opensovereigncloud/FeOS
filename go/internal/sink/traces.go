@@ -23,7 +23,7 @@ import (
 // TraceIndex is the trace index (docs/architecture/traces.md): Quickwit
 // (quickwit.Client) or a test's.
 type TraceIndex interface {
-	EnsureTraceIndex(ctx context.Context, id string, retentionDays, commitSecs int) error
+	EnsureTraceIndex(ctx context.Context, id string, s quickwit.IndexSettings) error
 	IngestSpans(ctx context.Context, id string, docs []json.RawMessage) error
 	SearchSpans(ctx context.Context, pattern string, q quickwit.SpanQuery) ([]quickwit.SpanDoc, error)
 	SpanTerms(ctx context.Context, pattern string, q quickwit.SpanQuery, field string, size int) ([]string, error)
@@ -54,7 +54,7 @@ func NewTraces(d *db.DB, index TraceIndex, cfg Config, log *slog.Logger) *Traces
 // indexID is the trace index: <prefix>-v<mapping version>-<days>d.
 func (t *Traces) indexID() (string, int) {
 	days := durationDays(t.cfg.TraceRetention)
-	return t.cfg.TraceIndexPrefix + "-v" + strconv.Itoa(quickwit.TraceMappingVersion) + "-" + strconv.Itoa(days) + "d", days
+	return quickwit.TraceIndexID(t.cfg.TraceIndexPrefix, days), days
 }
 
 // pattern names every trace index of the sink.

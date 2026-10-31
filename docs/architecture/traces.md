@@ -185,10 +185,11 @@ documents; a read keeps one per span ID.
 indexes are (`EnsureIndex`), with the logs' commit interval. `N` is the
 mapping's version (`quickwit.TraceMappingVersion`): a changed mapping is
 a new index, and reads search `<prefix>-*`, every version, until the old
-one ages out. Spans are partitioned by `hash_mod((tenant, environment,
-job), 32)`, and `tenant`, `environment` and `job` are tag fields, so a
-read of one environment's spans opens only its partition's splits. A
-document is a span:
+one ages out. Spans are partitioned as the log indexes' lines are, by
+`hash_mod((tenant, environment, job), --index-partitions)` (16), and
+`tenant`, `environment` and `job` are tag fields, so a read of one
+environment's spans opens only its partition's splits. A document is a
+span:
 
 | field | type | from |
 |---|---|---|

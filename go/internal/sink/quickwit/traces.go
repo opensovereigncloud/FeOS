@@ -207,19 +207,22 @@ func valueIs(raw json.RawMessage, v string) bool {
 	return false
 }
 
-// TraceMappingVersion is the version of TraceIndexConfig's mapping, in the
-// trace index's name (<prefix>-v<N>-<days>d): a changed mapping is a new
-// index, and reads search every version until the old one ages out.
+// TraceMappingVersion is the version of TraceIndexConfig, in the trace
+// index's name (TraceIndexID), as MappingVersion is the log indexes': a
+// changed mapping is a new index, and reads search every version until
+// the old one ages out.
 const TraceMappingVersion = 1
 
-// TracePartitions is how many partitions a trace index splits its spans
-// into, by tenant, environment and job, so that a read of one
-// environment's spans opens only the splits of its partition.
-const TracePartitions = 32
+// TraceIndexID is the trace index of a retention in days, in prefix, of
+// TraceMappingVersion: <prefix>-v<version>-<days>d.
+func TraceIndexID(prefix string, days int) string {
+	return prefix + "-v" + strconv.Itoa(TraceMappingVersion) + "-" + strconv.Itoa(days) + "d"
+}
 
-// TraceIndexConfig is the configuration of a trace index id whose spans
-// are kept retentionDays, committed every commitSecs.
-func TraceIndexConfig(id string, retentionDays, commitSecs int) []byte {
+// TraceIndexConfig is the configuration of the trace index id: its spans
+// partitioned as the log indexes' lines are, by tenant, environment and
+// job (IndexSettings).
+func TraceIndexConfig(id string, s IndexSettings) []byte {
 	raw := func(name string, fast bool) map[string]any {
 		return map[string]any{"name": name, "type": "text", "tokenizer": "raw", "fast": fast}
 	}
@@ -251,26 +254,28 @@ func TraceIndexConfig(id string, retentionDays, commitSecs int) []byte {
 				{"name": "events", "type": "array<json>"},
 				{"name": "links", "type": "array<json>"},
 			},
-			"timestamp_field":    "ts",
-			"tag_fields":         []string{"tenant", "environment", "job"},
-			"partition_key":      fmt.Sprintf("hash_mod((tenant,environment,job), %d)", TracePartitions),
-			"max_num_partitions": TracePartitions,
+			"timestamp_field": "ts",
+			"tag_fields":      []string{"tenant", "environment", "job"},
+			"partition_key":   partitionKey(s.Partitions),
 		},
-		"indexing_settings": map[string]any{"commit_timeout_secs": commitSecs},
-		"retention":         map[string]any{"period": fmt.Sprintf("%d days", retentionDays), "schedule": "hourly"},
+		"indexing_settings": map[string]any{"commit_timeout_secs": s.CommitSecs},
+		"retention":         map[string]any{"period": fmt.Sprintf("%d days", s.RetentionDays), "schedule": "hourly"},
 	}
 	b, _ := json.Marshal(cfg)
 	return b
 }
 
 // EnsureTraceIndex creates the trace index id unless it exists.
-func (c *Client) EnsureTraceIndex(ctx context.Context, id string, retentionDays, commitSecs int) error {
+func (c *Client) EnsureTraceIndex(ctx context.Context, id string, s IndexSettings) error {
+	if s.Partitions < 1 || s.Partitions > MaxPartitions {
+		return fmt.Errorf("quickwit: %d partitions, not 1 to %d", s.Partitions, MaxPartitions)
+	}
 	err := c.do(ctx, http.MethodGet, c.search+"/api/v1/indexes/"+url.PathEscape(id), "", nil, nil)
 	if err == nil || !IsNotFound(err) {
 		return err
 	}
 	err = c.do(ctx, http.MethodPost, c.search+"/api/v1/indexes", "application/json",
-		TraceIndexConfig(id, retentionDays, commitSecs), nil)
+		TraceIndexConfig(id, s), nil)
 	var e *Error
 	if errors.As(err, &e) && e.Status == http.StatusBadRequest && strings.Contains(e.Message, "already exist") {
 		return nil

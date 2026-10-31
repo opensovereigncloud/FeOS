@@ -25,7 +25,7 @@ type memTraceIndex struct {
 
 func newMemTraceIndex() *memTraceIndex { return &memTraceIndex{docs: map[string][]quickwit.SpanDoc{}} }
 
-func (m *memTraceIndex) EnsureTraceIndex(_ context.Context, id string, _, _ int) error {
+func (m *memTraceIndex) EnsureTraceIndex(_ context.Context, id string, _ quickwit.IndexSettings) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.docs[id]; !ok {

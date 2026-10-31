@@ -39,7 +39,7 @@ func TestTraceIndexQuickwit(t *testing.T) {
 	prefix := fmt.Sprintf("test-traces-%d", time.Now().UnixNano())
 	id := prefix + "-1d"
 	for range 2 {
-		if err := c.EnsureTraceIndex(ctx, id, 1, 1); err != nil {
+		if err := c.EnsureTraceIndex(ctx, id, quickwit.IndexSettings{RetentionDays: 1, CommitSecs: 1, Partitions: 4}); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -91,7 +91,8 @@ func (t *Traces) indexRound(ctx context.Context) (int, error) {
 	}
 	id, days := t.indexID()
 	if !t.ensured.Load() {
-		if err := t.index.EnsureTraceIndex(ctx, id, days, int(t.cfg.CommitTimeout/time.Second)); err != nil {
+		if err := t.index.EnsureTraceIndex(ctx, id, quickwit.IndexSettings{RetentionDays: days,
+			CommitSecs: int(t.cfg.CommitTimeout / time.Second), Partitions: t.cfg.IndexPartitions}); err != nil {
 			return 0, fmt.Errorf("index %s: %w", id, err)
 		}
 		t.ensured.Store(true)
