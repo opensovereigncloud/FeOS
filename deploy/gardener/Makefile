@@ -5,14 +5,12 @@
 # (README.md). Run from the repository's root: make -C deploy/gardener
 # <target>, with KUBECONFIG at the shoot. The parameters come from
 # config.env (config.env.example). Pushing needs `docker login` at
-# PLATFORM_REGISTRY (ferund, ferun-ingress, ferun-sink, feos-node) and
-# REGISTRY (feos-k8s, FeChat). ferund's image and FeChat's manifests are deploy/k3s's, built
+# PLATFORM_REGISTRY, where every image of this deployment lives. ferund's image and FeChat's manifests are deploy/k3s's, built
 # and filled in with this directory's parameters; their routes are this
 # directory's HTTPRoutes in place of k3s's Ingresses.
 
 REPO_ROOT := $(abspath ../..)
 -include config.env
-REGISTRY ?= $(if $(DOMAIN),oci.$(DOMAIN))
 # Where the platform's own images live: GHCR, not the projects' registry
 # (config.env.example); pulled with the Secret ghcr-pull.
 PLATFORM_REGISTRY ?= ghcr.io/gardenlinux/feos
@@ -84,11 +82,11 @@ deploy-feos: push-feos-node ## Push and roll the feos-node DaemonSet, a node at 
 	kubectl -n feos rollout status daemonset/feos-node --timeout=30m
 
 feos-k8s: ## Build the feos-k8s image (ADR 0020).
-	$(call need,REGISTRY)
-	$(DOCKER) build -f feos-k8s/Dockerfile -t $(REGISTRY)/feos-k8s:$(TAG) $(REPO_ROOT)
+	$(call need,PLATFORM_REGISTRY)
+	$(DOCKER) build -f feos-k8s/Dockerfile -t $(PLATFORM_REGISTRY)/feos-k8s:$(TAG) $(REPO_ROOT)
 
 push-feos-k8s: feos-k8s ## Build and push the feos-k8s image.
-	$(DOCKER) push $(REGISTRY)/feos-k8s:$(TAG)
+	$(DOCKER) push $(PLATFORM_REGISTRY)/feos-k8s:$(TAG)
 
 deploy-feos-k8s: $(MANIFESTS)/feos-k8s.yaml push-feos-k8s ## Push, apply and roll feos-k8s.
 	kubectl apply -f $(MANIFESTS)/feos-k8s.yaml
@@ -120,6 +118,7 @@ $(MANIFESTS)/feos.yaml: REGISTRY = $(PLATFORM_REGISTRY)
 $(MANIFESTS)/feos.yaml: FORCE
 	$(call render,DOMAIN REGISTRY WORKER_POOL FERUN_NODES_IP DENY_PREFIXES,cat feos/feos.yaml)
 
+$(MANIFESTS)/feos-k8s.yaml: REGISTRY = $(PLATFORM_REGISTRY)
 $(MANIFESTS)/feos-k8s.yaml: FORCE
 	$(call render,REGISTRY WORKER_POOL NODE_NAME_PREFIX,cat feos/feos-k8s.yaml)
 
@@ -135,8 +134,11 @@ $(MANIFESTS)/ferun-db-import.yaml: FORCE
 	mkdir -p $(@D)
 	kubectl kustomize --load-restrictor LoadRestrictionsNone ferun/import >$@
 
+# FeChat's images are on GHCR too: k3s's pull secret oci-pull is ghcr-pull
+# here.
+$(MANIFESTS)/fechat.yaml: REGISTRY = $(PLATFORM_REGISTRY)
 $(MANIFESTS)/fechat.yaml: FORCE
-	$(call render,DOMAIN REGISTRY OIDC_ISSUER FECHAT_MODEL GATEWAY_NAMESPACE GATEWAY_NAME,$(call cat-yaml,$(addprefix ../k3s/fechat/,namespace.yaml config.yaml app.yaml backend.yaml) fechat/route.yaml))
+	$(call render,DOMAIN REGISTRY OIDC_ISSUER FECHAT_MODEL GATEWAY_NAMESPACE GATEWAY_NAME,$(call cat-yaml,$(addprefix ../k3s/fechat/,namespace.yaml config.yaml app.yaml backend.yaml) fechat/route.yaml) | sed 's/name: oci-pull$$/name: ghcr-pull/')
 
 $(MANIFESTS)/registry.yaml: FORCE
 	$(call render,DOMAIN GATEWAY_NAMESPACE GATEWAY_NAME,cat registry/registry.yaml)

@@ -116,7 +116,7 @@ spec:
         runAsGroup: 65532
         fsGroup: 65532
       imagePullSecrets:
-        - name: oci-pull
+        - name: ghcr-pull
       containers:
         - name: feos-k8s
           image: ${REGISTRY}/feos-k8s:dev

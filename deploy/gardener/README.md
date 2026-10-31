@@ -87,7 +87,7 @@ on make's command line wins over the file.
 | Parameter | What |
 |---|---|
 | `DOMAIN` | the DNS zone: ferund at `run.<DOMAIN>`, FeChat at `chat.<DOMAIN>`, the registry at `oci.<DOMAIN>`; `run.<DOMAIN>` is FeRun's trust domain too |
-| `REGISTRY` | where the images are pushed and pulled; default `oci.<DOMAIN>` |
+| `PLATFORM_REGISTRY` | where the platform's images are pushed and pulled; default `ghcr.io/gardenlinux/feos` |
 | `OIDC_ISSUER` | the OpenID Connect provider, exactly as its discovery document states it |
 | `WORKER_POOL` | the worker pool that runs FeOS, its label `worker.gardener.cloud/pool` |
 | `NODE_NAME_PREFIX` | the beginning of the pool's node names, on IronCore `shoot--<project>--<shoot>-<pool>-`; feos-k8s removes from FeRun only nodes with it, by force, so no other shoot's nodes may match ([`config.env.example`](config.env.example)) |
@@ -157,15 +157,12 @@ The issuer, and the registry, whose secrets
     make -C deploy/gardener apply-registry
     kubectl -n registry create secret generic registry-config --from-file=config.yml=<config.yml>
     kubectl -n registry create secret generic registry-auth --from-file=htpasswd=<htpasswd>
-    docker login <REGISTRY>
 
-Every namespace that pulls from it, `feos` (feos-k8s) and `fechat`,
-needs the secret `oci-pull` with the registry's credentials, as
-[`../k3s/README.md`](../k3s/README.md) makes it. The platform's own
-images, ferund (with ferun-ingress), ferun-sink and feos-node, are on
-GHCR (`PLATFORM_REGISTRY`, `ghcr.io/gardenlinux/feos`), not in the
-projects' registry: while the packages there are not public, the
-namespaces `ferun`, `ferun-ingress` and `feos` need the secret
+That registry holds the projects' images, none of the platform's. The
+platform's images, ferund (with ferun-ingress), ferun-sink, feos-node,
+feos-k8s and FeChat's, are on GHCR (`PLATFORM_REGISTRY`,
+`ghcr.io/gardenlinux/feos`), private: the namespaces `ferun`,
+`ferun-ingress`, `feos` and `fechat` pull them with the secret
 `ghcr-pull`, a token that reads them (`read:packages`), and pushing
 needs a login with `write:packages`:
 
@@ -203,7 +200,6 @@ from `kube-system/shoot-info` and stops if `DENY_PREFIXES` leaves one out:
 
     make packages FEOS_VERSION=...
     make -C deploy/gardener push-feos-node apply-feos
-    kubectl -n feos create secret docker-registry oci-pull ...
     kubectl -n feos create secret docker-registry ghcr-pull ...
     kubectl -n feos create secret generic diskd-s3 --from-env-file=<s3.env> \
       --from-literal=DISKD_S3_PREFIX=<prefix>/
@@ -218,7 +214,7 @@ with `FERUN_TOKEN` the bootstrap token, then the manifests and the
 images:
 
     make -C deploy/gardener apply-fechat
-    REGISTRY=<REGISTRY> fechat/deploy.sh <tag>
+    REGISTRY=ghcr.io/gardenlinux/feos fechat/deploy.sh <tag>
 
 Every other client of FeRun gets a tenant of its own: `POST
 /api/v1/admin/tenants` with `{"name":"<tenant>"}`, which answers with a
