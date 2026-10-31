@@ -51,10 +51,10 @@ func NewTraces(d *db.DB, index TraceIndex, cfg Config, log *slog.Logger) *Traces
 	return &Traces{db: d, index: index, cfg: cfg, log: log, owner: cfg.Name + "/" + hex.EncodeToString(b)}
 }
 
-// indexID is the trace index: <prefix>-<days>d.
+// indexID is the trace index: <prefix>-v<mapping version>-<days>d.
 func (t *Traces) indexID() (string, int) {
 	days := durationDays(t.cfg.TraceRetention)
-	return t.cfg.TraceIndexPrefix + "-" + strconv.Itoa(days) + "d", days
+	return t.cfg.TraceIndexPrefix + "-v" + strconv.Itoa(quickwit.TraceMappingVersion) + "-" + strconv.Itoa(days) + "d", days
 }
 
 // pattern names every trace index of the sink.

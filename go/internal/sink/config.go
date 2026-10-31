@@ -77,7 +77,7 @@ type Config struct {
 
 	// Traces (docs/architecture/traces.md): the bytes of span documents
 	// a tenant may store a day (0: no quota), how long spans are kept,
-	// and the prefix of the trace index's name (<prefix>-<days>d).
+	// and the prefix of the trace index's name (<prefix>-v<N>-<days>d).
 	TraceQuota       int64
 	TraceRetention   time.Duration
 	TraceIndexPrefix string
@@ -165,7 +165,7 @@ func register(fs *flag.FlagSet, c *Config) *string {
 	fs.Var((*byteSize)(&c.Quota), "log-quota", "the bytes a tenant may store a day (bytes, or with a KiB, MiB or GiB suffix); 0: no quota")
 	fs.Var((*byteSize)(&c.TraceQuota), "trace-quota", "the bytes of spans a tenant may store a day (bytes, or with a KiB, MiB or GiB suffix); 0: no quota")
 	fs.DurationVar(&c.TraceRetention, "trace-retention", c.TraceRetention, "how long spans are kept")
-	fs.StringVar(&c.TraceIndexPrefix, "trace-index-prefix", c.TraceIndexPrefix, "the prefix of the trace index's name, <prefix>-<days>d")
+	fs.StringVar(&c.TraceIndexPrefix, "trace-index-prefix", c.TraceIndexPrefix, "the prefix of the trace index's name, <prefix>-v<N>-<days>d")
 	level := strings.ToLower(c.LogLevel.String())
 	fs.StringVar(&level, "log-level", level, "debug, info, warn or error")
 	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "json or text")

@@ -207,6 +207,16 @@ func valueIs(raw json.RawMessage, v string) bool {
 	return false
 }
 
+// TraceMappingVersion is the version of TraceIndexConfig's mapping, in the
+// trace index's name (<prefix>-v<N>-<days>d): a changed mapping is a new
+// index, and reads search every version until the old one ages out.
+const TraceMappingVersion = 1
+
+// TracePartitions is how many partitions a trace index splits its spans
+// into, by tenant, environment and job, so that a read of one
+// environment's spans opens only the splits of its partition.
+const TracePartitions = 32
+
 // TraceIndexConfig is the configuration of a trace index id whose spans
 // are kept retentionDays, committed every commitSecs.
 func TraceIndexConfig(id string, retentionDays, commitSecs int) []byte {
@@ -241,8 +251,10 @@ func TraceIndexConfig(id string, retentionDays, commitSecs int) []byte {
 				{"name": "events", "type": "array<json>"},
 				{"name": "links", "type": "array<json>"},
 			},
-			"timestamp_field": "ts",
-			"tag_fields":      []string{"tenant"},
+			"timestamp_field":    "ts",
+			"tag_fields":         []string{"tenant", "environment", "job"},
+			"partition_key":      fmt.Sprintf("hash_mod((tenant,environment,job), %d)", TracePartitions),
+			"max_num_partitions": TracePartitions,
 		},
 		"indexing_settings": map[string]any{"commit_timeout_secs": commitSecs},
 		"retention":         map[string]any{"period": fmt.Sprintf("%d days", retentionDays), "schedule": "hourly"},

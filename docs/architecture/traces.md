@@ -12,7 +12,7 @@ this one says otherwise.
 pod (OTel SDK) ──OTLP/gRPC :4317, OTLP/HTTP protobuf :4318──▶ feosd at 169.254.0.1
                                    │ the pod by its source address, its ferun.* labels stamped
 feosd (node) ──OTLP TraceService/Export (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `trace_spans`
-ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Quickwit ferun-traces-<days>d
+ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Quickwit ferun-traces-v1-<days>d
 tenants (FeCode) ── GET /api/v1/jaeger/api/… (Bearer) ─────────┘
 ```
 
@@ -164,10 +164,15 @@ documents; a read keeps one per span ID.
 
 ### The index
 
-`<--trace-index-prefix>-<days>d`, default `ferun-traces-30d`
+`<--trace-index-prefix>-v<N>-<days>d`, default `ferun-traces-v1-30d`
 (`--trace-retention`, 30 days), created at first use as the logs'
-indexes are (`EnsureIndex`), with the logs' commit interval. A document
-is a span:
+indexes are (`EnsureIndex`), with the logs' commit interval. `N` is the
+mapping's version (`quickwit.TraceMappingVersion`): a changed mapping is
+a new index, and reads search `<prefix>-*`, every version, until the old
+one ages out. Spans are partitioned by `hash_mod((tenant, environment,
+job), 32)`, and `tenant`, `environment` and `job` are tag fields, so a
+read of one environment's spans opens only its partition's splits. A
+document is a span:
 
 | field | type | from |
 |---|---|---|
