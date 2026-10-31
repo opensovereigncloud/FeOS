@@ -424,13 +424,25 @@ async fn follow<L: Logs>(
                 }
             }
             Err(status) => {
-                debug!(
-                    "Logs: Shipping {}/{} failed: {}; again in {}s",
-                    stream.pod,
-                    stream.container,
-                    status.message(),
-                    wait.as_secs()
-                );
+                // Said once at warn, until shipping works again: a sink
+                // the node cannot reach must not stay silent.
+                if stream.warned {
+                    debug!(
+                        "Logs: Shipping {}/{} failed: {}; again in {}s",
+                        stream.pod,
+                        stream.container,
+                        status.message(),
+                        wait.as_secs()
+                    );
+                } else {
+                    warn!(
+                        "Logs: Shipping {}/{} failed: {}; trying again",
+                        stream.pod,
+                        stream.container,
+                        status.message()
+                    );
+                    stream.warned = true;
+                }
                 sleep(wait).await;
                 wait = (wait * 2).min(BACKOFF.1);
             }
@@ -445,7 +457,7 @@ struct Shipping {
     container: String,
     labels: Arc<Labels>,
     state: Arc<State>,
-    /// A failed export was said, until one succeeds.
+    /// A failure was said at warn, until the sink answers again.
     warned: bool,
 }
 
@@ -525,9 +537,17 @@ impl Shipping {
                 ..self.request()
             }
         } else {
+            let from_offset = self.position(&log_id).await?;
+            if self.warned {
+                info!(
+                    "Logs: The sink is reached again for {}/{}",
+                    self.pod, self.container
+                );
+                self.warned = false;
+            }
             StreamContainerLogsRequest {
                 follow: true,
-                from_offset: self.position(&log_id).await?,
+                from_offset,
                 log_id: log_id.clone(),
                 ..self.request()
             }
