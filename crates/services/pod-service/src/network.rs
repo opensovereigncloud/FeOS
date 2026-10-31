@@ -20,7 +20,7 @@ mod rules;
 
 pub use mesh::PORT as MESH_PORT;
 pub use mesh::{Assignment, Config as MeshConfig, DEVICE as MESH_DEVICE, MTU as MESH_MTU};
-pub use rules::TABLE;
+pub use rules::{OTLP_PORTS, TABLE};
 
 use addresses::{Ipv4Addresses, Ipv6Addresses};
 use devices::PodLink;
@@ -409,6 +409,14 @@ impl Network {
 
     pub fn names(&self) -> &NameTables {
         &self.names
+    }
+
+    /// Where the node takes its pods' spans (docs/architecture/traces.md):
+    /// the resolver's address, the node's one IPv4 address on their links,
+    /// at [`OTLP_PORTS`]. The pods' gateway would do for them, but the node
+    /// does not hold it.
+    pub fn otlp_address(&self) -> Ipv4Addr {
+        self.config.dns_address
     }
 
     /// The parts, if the network works.

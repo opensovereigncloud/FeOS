@@ -446,7 +446,7 @@ resolver) and `traffic-service` (the records).
 |---|---|---|
 | `--pod-prefix PREFIX` | none | the IPv6 prefix the network routes to the node, /1 to /120, such as a /64, AWS's /80 or GCP's /96. Without, a node with `--control-plane` takes a /96 of its cluster's [mesh](#the-mesh) |
 | `--pod-ipv4-range PREFIX` | `169.254.16.0/20` | the pods' IPv4 addresses, a /32 each; /1 to /30, with neither the resolver's address nor `169.254.0.1` in it |
-| `--dns-address ADDRESS` | `169.254.0.53` | the pods' resolver, an IPv4 address that the node holds, the same on every node; never `169.254.0.1` |
+| `--dns-address ADDRESS` | `169.254.0.53` | the pods' resolver, an IPv4 address that the node holds, the same on every node; never `169.254.0.1`. The node takes the pods' spans there too ([traces.md](traces.md)) |
 | `--dns-upstream ADDRESS` | Google's and Cloudflare's, IPv6 first | the upstreams of pods that name none (repeatable) |
 | `--deny-prefix PREFIX` | none | what no pod reaches, of either family (repeatable) |
 
@@ -694,7 +694,7 @@ traffic is not theirs:
 | Chain | What it does |
 |---|---|
 | `prerouting` (filter, -150) | from a pod's TAP: drops packets whose source is not routed back out the TAP (`fib saddr . iif oif missing`), of either family, logged as `spoofed`, and router advertisements and redirects of both families; on a mesh, the same for a source in the cluster's ULA through any device |
-| `input` | from pods takes neighbor solicitations and advertisements and DNS to the resolver's address over UDP and TCP, and drops the rest |
+| `input` | from pods takes neighbor solicitations and advertisements, DNS to the resolver's address over UDP and TCP, and OTLP there, TCP ports 4317 and 4318 ([traces.md](traces.md)), and drops the rest |
 | `forward` | copies the first 4 packets of the TCP connections pods open to nflog group 3 (`ct direction original`, `ct original packets < 5`), of both families, before anything else; accepts what belongs to a connection; drops invalid packets from and to pods; then jumps to `from-pods` what comes from a TAP and to `to-pods` what goes to one |
 | `from-pods`, `to-pods` | go through the verdict maps `pod-out` (by input interface) and `pod-in` (by output interface) to the pod's chains, and drop and log (`no-rule`) what a TAP the maps do not have sends or receives, such as one whose rules failed to be written |
 | `out-<TAP>`, `in-<TAP>` | a pod's chains: drop and log (`deny`) what goes to or comes from a denied address, `return` what a rule of the pod's groups allows, drop and log (`no-rule`) the rest; `out-` of both families, `in-` of IPv6 alone, since nothing new comes in over IPv4 |

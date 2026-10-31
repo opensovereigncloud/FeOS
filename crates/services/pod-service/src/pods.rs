@@ -2321,8 +2321,11 @@ impl Pods {
         self.bake_point(pod_id, spec, channel.clone(), pull_token)
             .await?;
         let mut guest = ContainerServiceClient::new(channel);
+        let labels = self.info(pod_id)?.log_labels;
+        let otlp = self.network().otlp_address();
         for container in &spec.containers {
-            run_container(&mut guest, container, booted, pull_token)
+            let env = spec::otel_env(&container.env, spec, &labels, otlp);
+            run_container(&mut guest, container, env, booted, pull_token)
                 .await
                 .map_err(|e| {
                     Status::new(
@@ -3339,6 +3342,7 @@ async fn thaw(host: &mut HostServiceClient<Channel>, pod_id: &str) -> Result<(),
 async fn run_container(
     guest: &mut ContainerServiceClient<Channel>,
     container: &ContainerSpec,
+    env: HashMap<String, String>,
     booted: bool,
     pull_token: Option<&str>,
 ) -> Result<(), Status> {
@@ -3347,7 +3351,7 @@ async fn run_container(
         config: Some(ContainerConfig {
             image_ref: container.image_ref.clone(),
             command: container.command.clone(),
-            env: container.env.clone(),
+            env,
             volume_mounts: container
                 .volume_mounts
                 .iter()

@@ -9,7 +9,7 @@ page says of identities, the hot stage and Quickwit holds here unless
 this one says otherwise.
 
 ```
-pod (OTel SDK) ──OTLP/gRPC :4317, OTLP/HTTP protobuf :4318──▶ feosd at 169.254.0.1
+pod (OTel SDK) ──OTLP/gRPC :4317, OTLP/HTTP protobuf :4318──▶ feosd at 169.254.0.53
                                    │ the pod by its source address, its ferun.* labels stamped
 feosd (node) ──OTLP TraceService/Export (mTLS, node cert)──▶ ferun-sink ──▶ PostgreSQL `trace_spans`
 ferun-ingress ──TraceService/Export (mTLS, ingress cert)──▶     │   └──▶ Quickwit ferun-traces-v1-<days>d
@@ -23,8 +23,13 @@ Rate limits on the node and the quota in the sink bound the volume.
 
 ## The pod
 
-The node holds `169.254.0.1`, the pods' IPv4 gateway, as an address of
-its own (as the resolver's `169.254.0.53`), and serves OTLP there:
+The node serves OTLP at the resolver's address, `169.254.0.53`
+(`--dns-address`), its one IPv4 address on the pods' links, which it
+holds already. Not at the pods' gateway, `169.254.0.1`: the node never
+holds that (node.md, Devices and routes), since where it is the gateway
+of the node's own network, as on IronCore, the node would lose its own;
+and held on a device other than the pod's TAP, it would no longer be
+answered to the pod's ARP (`arp_ignore` 1).
 
 - `:4317`, gRPC: `opentelemetry.proto.collector.trace.v1.TraceService/Export`.
   `LogsService` and `MetricsService` answer `UNIMPLEMENTED`.
@@ -34,13 +39,16 @@ its own (as the resolver's `169.254.0.53`), and serves OTLP there:
   `ExportTraceServiceResponse` as `application/x-protobuf`. JSON
   (`application/json`) answers 415; `/v1/logs`, `/v1/metrics` and any
   other path 404; another method 405.
-- A request is at most 4 MiB on the wire and 16 MiB decompressed (413,
-  `RESOURCE_EXHAUSTED`).
+- A request is at most 4 MiB on the wire and 6 MiB decompressed, so
+  that it fits the sink's 8 MiB with the labels stamped (413,
+  `RESOURCE_EXHAUSTED`; a gRPC message beyond 4 MiB gets gRPC's own
+  `OUT_OF_RANGE`, before the node sees it).
 
-The firewall lets a pod reach these two ports at `169.254.0.1` and
-nothing else of the node there (`iifname "pod-*" ip daddr 169.254.0.1
-tcp dport { 4317, 4318 } accept`). `feosd --otlp-address` names the
-address (default `169.254.0.1`); the ports are fixed.
+The firewall lets a pod reach these two ports at the resolver's address
+beside DNS, and nothing else of the node (`iifname "pod-*" ip daddr
+169.254.0.53 tcp dport 4317-4318 accept`). `--dns-address` moves the
+address; the ports are fixed. The node serves once the pods' network is
+there, with a control plane.
 
 **Whose spans.** The node knows the pod by the request's source address,
 which the firewall's anti-spoofing rule (`fib saddr . iif oif missing
@@ -78,11 +86,11 @@ batch and its retries are the buffer. The sink's codes map to the pod's:
 
 **The environment.** The node gives every container of a pod with a
 network these variables, each unless the container's own environment
-has it:
+(its spec's) has it; they win over the image's:
 
 | variable | value |
 |---|---|
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://169.254.0.1:4318/v1/traces` |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `http://169.254.0.53:4318/v1/traces`, the resolver's address |
 | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `http/protobuf` |
 | `OTEL_SERVICE_NAME` | the pod's `ferun.object`, else its `ferun.job`; unset without |
 

@@ -9,8 +9,9 @@
 //!   and redirects; on a mesh (ADR 0017), whatever comes from an address of
 //!   the cluster's ULA through another device than the one it is routed
 //!   to, the mesh's or a pod's TAP.
-//! - `input` takes neighbor discovery and DNS to the resolver from pods,
-//!   nothing else of theirs.
+//! - `input` takes neighbor discovery, DNS to the resolver and OTLP to its
+//!   address (docs/architecture/traces.md) from pods, nothing else of
+//!   theirs.
 //! - `forward` copies the first packets of the TCP connections pods open
 //!   to nflog, passes what belongs to a connection, and sends what is new
 //!   from or to a pod's TAP through `from-pods` and `to-pods`. Their
@@ -62,12 +63,15 @@ const ND_NEIGHBOR_SOLICIT: u8 = 135;
 const ND_NEIGHBOR_ADVERT: u8 = 136;
 const ND_REDIRECT: u8 = 137;
 const DNS_PORT: u16 = 53;
+/// OTLP's ports, gRPC and HTTP, at the resolver's address.
+pub const OTLP_PORTS: (u16, u16) = (4317, 4318);
 
 /// What the table needs besides the policy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     /// The resolver's address (`--dns-address`, ADR 0010), which pods
-    /// reach at port 53 over UDP and TCP: an IPv4 address.
+    /// reach at port 53 over UDP and TCP, and at OTLP's ports over TCP: an
+    /// IPv4 address.
     pub dns: IpAddr,
     /// The pods' IPv4 addresses (`--pod-ipv4-range`), which are
     /// masqueraded where they leave the node.
@@ -360,6 +364,14 @@ fn input(options: &Options) -> Vec<Rule> {
         .concat(),
         dns(UDP),
         dns(TCP),
+        [
+            from_pods(),
+            resolver.clone(),
+            l4proto(TCP),
+            th_dport_range(OTLP_PORTS.0, OTLP_PORTS.1),
+            verdict(Verdict::Accept),
+        ]
+        .concat(),
         [from_pods(), verdict(Verdict::Drop)].concat(),
     ]
 }
@@ -763,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn input_takes_neighbor_discovery_and_dns_from_pods() {
+    fn input_takes_neighbor_discovery_dns_and_otlp_from_pods() {
         let table = table(&policy(), &options());
         let rules = &chain(&table, "input").rules;
         assert_eq!(
@@ -797,8 +809,21 @@ mod tests {
                 .concat()
             );
         }
-        assert_eq!(rules[4], [from_pods(), verdict(Verdict::Drop)].concat());
-        assert_eq!(rules.len(), 5);
+        // OTLP, gRPC and HTTP, over TCP alone.
+        assert_eq!(
+            rules[4],
+            [
+                from_pods(),
+                resolver.clone(),
+                l4proto(TCP),
+                th_dport(CmpOp::Gte, 4317),
+                th_dport(CmpOp::Lte, 4318),
+                verdict(Verdict::Accept)
+            ]
+            .concat()
+        );
+        assert_eq!(rules[5], [from_pods(), verdict(Verdict::Drop)].concat());
+        assert_eq!(rules.len(), 6);
         // An IPv6 resolver is matched as such.
         let ipv6 = Options {
             dns: IpAddr::V6(a("fd00::53")),
@@ -1048,6 +1073,7 @@ mod tests {
                 "iifname \"pod-*\" icmp type redirect drop",
                 "iifname \"pod-*\" ip daddr 169.254.0.53 udp dport 53 accept",
                 "iifname \"pod-*\" ip daddr 169.254.0.53 tcp dport 53 accept",
+                "iifname \"pod-*\" ip daddr 169.254.0.53 tcp dport 4317-4318 accept",
                 "ip saddr 169.254.16.0/20 oifname != \"pod-*\" masquerade",
                 "elements = { 0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 192.0.2.7, 224.0.0.0/4 }",
             ] {

@@ -1359,6 +1359,7 @@ version = "0.6.0"
 dependencies = [
  "chrono",
  "feos-proto",
+ "flate2",
  "hyper",
  "hyper-util",
  "log",

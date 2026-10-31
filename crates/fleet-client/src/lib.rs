@@ -37,6 +37,7 @@ mod sink;
 mod telemetry;
 mod tls;
 mod token;
+mod traces;
 mod uplink;
 
 pub use calls::{CallsOn, NodeCalls, OnRuntime};
@@ -46,6 +47,7 @@ pub use node::{server, Incoming, NodeConn};
 pub use sink::{LogStream, Logs, ShippedPod, Shipper, Target as SinkTarget};
 pub use telemetry::{inventory_hash, Diskd, Installed, Inventory};
 pub use token::{check_trust_domain, JoinToken};
+pub use traces::{Senders, TracedPod, Traces};
 
 use chrono::Utc;
 use feos_proto::fleet_service::{JoinMeshRequest, JoinRequest, RenewCertificateRequest};

@@ -14,7 +14,7 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-hyper = { workspace = true }
+hyper = { workspace = true, features = ["server", "http1"] }
 hyper-util = { workspace = true }
 tower = { workspace = true }
 log = { workspace = true }
@@ -29,6 +29,8 @@ tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
 x509-parser = { workspace = true }
 pem = { workspace = true }
+# OTLP/HTTP's gzip, as the image service's layers.
+flate2 = "1.0"
 
 [dev-dependencies]
 tempfile = { workspace = true }

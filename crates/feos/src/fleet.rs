@@ -3,12 +3,13 @@
 
 //! feosd and the control plane (ADR 0015): what the node reports of its
 //! pods, diskd and installed versions, and its pods' events; and its pods'
-//! logs, which go to the sink the control plane names (ADR 0026).
+//! logs and spans, which go to the sink the control plane names (ADR 0026).
 
 use feos_proto::container_service::StreamContainerLogsRequest;
 use feos_proto::pod_service::PodInfo;
 use fleet_client::{
-    Diskd, Fleet, Incoming, Installed, Inventory, LogStream, Logs, ShippedPod, Shipper,
+    Diskd, Fleet, Incoming, Installed, Inventory, LogStream, Logs, Senders, ShippedPod, Shipper,
+    TracedPod, Traces,
 };
 use log::warn;
 use microvm_service::vmm::installed;
@@ -95,10 +96,48 @@ impl Logs for PodLogs {
     }
 }
 
+/// The pods that send spans, as the trace listener knows them.
+struct PodSenders(Pods);
+
+impl Senders for PodSenders {
+    fn pods(&self) -> Vec<TracedPod> {
+        self.0
+            .shipping_logs()
+            .into_iter()
+            .map(|pod| TracedPod {
+                addresses: [&pod.ipv4_address, &pod.ipv6_address]
+                    .into_iter()
+                    .filter_map(|address| address.parse().ok())
+                    .collect(),
+                id: pod.pod_id,
+                labels: pod.log_labels,
+            })
+            .collect()
+    }
+}
+
+/// Takes the pods' spans at the resolver's address, once the pods'
+/// network is there, and sends them on to the sink over the logs' channel
+/// (docs/architecture/traces.md).
+fn take_spans(pods: &Pods, shipper: Shipper) -> Traces {
+    let traces = Traces::start(PodSenders(pods.clone()), shipper);
+    let serving = traces.clone();
+    let pods = pods.clone();
+    tokio::spawn(async move {
+        let mut ready = pods.network().ready();
+        if ready.wait_for(|ready| *ready).await.is_err() {
+            return;
+        }
+        serving.serve(pods.network().otlp_address()).await;
+    });
+    traces
+}
+
 /// Ships the pods' logs to the sink the control plane names, and drains
-/// a pod's before it pauses, hibernates or is deleted.
+/// a pod's before it pauses, hibernates or is deleted; and their spans.
 fn ship_logs(fleet: &Fleet, pods: &Pods) {
     let shipper = Shipper::start(PodLogs(pods.clone()), fleet.sink());
+    let traces = take_spans(pods, shipper.clone());
     let drain = shipper.clone();
     pods.set_log_drain(Arc::new(move |pod_id| {
         let shipper = drain.clone();
@@ -113,8 +152,12 @@ fn ship_logs(fleet: &Fleet, pods: &Pods) {
                         shipper.deleted(&event.pod_id);
                     }
                     shipper.changed();
+                    traces.changed();
                 }
-                Err(RecvError::Lagged(_)) => shipper.changed(),
+                Err(RecvError::Lagged(_)) => {
+                    shipper.changed();
+                    traces.changed();
+                }
                 Err(RecvError::Closed) => return,
             }
         }

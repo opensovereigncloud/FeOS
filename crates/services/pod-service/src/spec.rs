@@ -12,7 +12,8 @@ use feos_proto::microvm::{
 use feos_proto::pod_service::{PodSpec, Resources};
 use feos_utils::filesystem::volume as feos_volume;
 use feos_utils::pod_id::PodId;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::Ipv4Addr;
 use tonic::Status;
 
 const DEFAULT_VCPUS: u32 = 1;
@@ -187,6 +188,45 @@ pub fn volume_ids(spec: &PodSpec) -> Vec<String> {
 /// Whether the pod has a network: unless its spec says none.
 pub fn has_network(spec: &PodSpec) -> bool {
     !spec.network.as_ref().is_some_and(|network| network.none)
+}
+
+/// A container's environment with OpenTelemetry's variables for the node's
+/// OTLP endpoint at `otlp` (docs/architecture/traces.md, "The
+/// environment"), each unless the container's own has it; in a pod with a
+/// network alone. The service's name is the pod's `ferun.object`, else its
+/// `ferun.job`, of its `labels`.
+pub fn otel_env(
+    env: &HashMap<String, String>,
+    spec: &PodSpec,
+    labels: &HashMap<String, String>,
+    otlp: Ipv4Addr,
+) -> HashMap<String, String> {
+    let mut env = env.clone();
+    if !has_network(spec) {
+        return env;
+    }
+    let (_, http) = network::OTLP_PORTS;
+    let service = ["ferun.object", "ferun.job"]
+        .iter()
+        .filter_map(|key| labels.get(*key))
+        .find(|name| !name.is_empty());
+    let defaults = [
+        (
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            Some(format!("http://{otlp}:{http}/v1/traces")),
+        ),
+        (
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+            Some("http/protobuf".to_string()),
+        ),
+        ("OTEL_SERVICE_NAME", service.cloned()),
+    ];
+    for (name, value) in defaults {
+        if let Some(value) = value {
+            env.entry(name.to_string()).or_insert(value);
+        }
+    }
+    env
 }
 
 /// The container names the guest takes as container IDs.
@@ -541,5 +581,55 @@ mod tests {
             })
             .collect();
         assert!(with(many, vec![]).is_err());
+    }
+
+    #[test]
+    fn a_pod_with_a_network_gets_otels_variables_its_own_win() {
+        let otlp = Ipv4Addr::new(169, 254, 0, 53);
+        let map = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let spec = PodSpec::default();
+        let service = map(&[("ferun.object", "web"), ("ferun.job", "j1")]);
+        assert_eq!(
+            otel_env(&map(&[("A", "1")]), &spec, &service, otlp),
+            map(&[
+                ("A", "1"),
+                (
+                    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                    "http://169.254.0.53:4318/v1/traces"
+                ),
+                ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "http/protobuf"),
+                ("OTEL_SERVICE_NAME", "web"),
+            ])
+        );
+        // A job's pod is named after its job; one without either has none.
+        let job = map(&[("ferun.job", "j1")]);
+        let env = otel_env(&HashMap::new(), &spec, &job, otlp);
+        assert_eq!(env["OTEL_SERVICE_NAME"], "j1");
+        let env = otel_env(&HashMap::new(), &spec, &HashMap::new(), otlp);
+        assert!(!env.contains_key("OTEL_SERVICE_NAME"));
+        assert_eq!(env.len(), 2);
+        // The container's own are kept.
+        let own = map(&[
+            ("OTEL_SERVICE_NAME", "mine"),
+            ("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "grpc"),
+        ]);
+        let env = otel_env(&own, &spec, &service, otlp);
+        assert_eq!(env["OTEL_SERVICE_NAME"], "mine");
+        assert_eq!(env["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"], "grpc");
+        assert_eq!(env.len(), 3);
+        // A pod without a network gets nothing.
+        let none = PodSpec {
+            network: Some(feos_proto::pod_service::PodNetwork {
+                none: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(otel_env(&own, &none, &service, otlp), own);
     }
 }

@@ -209,6 +209,16 @@ impl Shipper {
         }
     }
 
+    /// The channel to the sink the control plane names now, the logs' own,
+    /// and the node's name; `UNAVAILABLE` while it names none.
+    pub(crate) fn sink(&self) -> Result<(Channel, String), Status> {
+        let target = self
+            .inner
+            .target()
+            .ok_or_else(|| Status::unavailable("the control plane names no sink"))?;
+        Ok((self.inner.channel(&target)?, target.node))
+    }
+
     /// Pod `pod_id` is deleted: its streams send what they read, and end.
     pub fn deleted(&self, pod_id: &str) {
         let mut gone = Vec::new();
