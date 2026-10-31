@@ -237,7 +237,7 @@ func (s *Store) followPoll(ctx context.Context, tenant string, live streamFilter
 func (s *Store) indexedLines(ctx context.Context, tenant string, st *streamRow, from, to int64, source string) ([]Line, error) {
 	var out []Line
 	for from < to {
-		iq := quickwit.Query{Tenant: tenant, Stream: st.SID, IOStream: source, OffAfter: &from, OffTo: &to,
+		iq := quickwit.Query{Tenant: tenant, Environment: st.Environment, Job: st.Job, Stream: st.SID, IOStream: source, OffAfter: &from, OffTo: &to,
 			Order: quickwit.ByOffset, Max: followBatch}
 		hits, err := s.index.Search(ctx, s.indexPattern(), iq)
 		if err != nil {

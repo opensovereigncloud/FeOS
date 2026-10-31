@@ -95,7 +95,7 @@ func (s *Store) joinParts(ctx context.Context, tenant string, heads []Line, stre
 		var cold []quickwit.Doc
 		if to := min(mark, upTo); to > h.Off {
 			from := h.Off
-			cold, err = s.index.Search(ctx, s.indexPattern(), quickwit.Query{Tenant: tenant, Stream: st.SID,
+			cold, err = s.index.Search(ctx, s.indexPattern(), quickwit.Query{Tenant: tenant, Environment: st.Environment, Job: st.Job, Stream: st.SID,
 				IOStream: h.Source, OffAfter: &from, OffTo: &to, Order: quickwit.ByOffset, Max: 2000})
 			if err != nil {
 				return fmt.Errorf("the rest of a partial line: index: %w", err)
