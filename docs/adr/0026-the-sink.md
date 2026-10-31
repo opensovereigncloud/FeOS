@@ -1,6 +1,6 @@
 # ADR 0026: The sink — a program of its own that keeps what the platform and its pods say: logs first, traces and audit records after, in the database first and in the object store after
 
-**Status:** Accepted (Malte, 2026-10-30), steps 1 to 7 built and live on shoot `fecode` since 2026-10-31 · **Date:** 2026-10-30
+**Status:** Accepted (Malte, 2026-10-30), steps 1 to 7 built and live on shoot `fecode` since 2026-10-31; §10, Quickwit as the index and the cold store, accepted 2026-10-31 (Malte) · **Date:** 2026-10-30
 
 ## Context
 
@@ -106,6 +106,10 @@ counted against its quota in the sink (§7).
 
 ### 4. Two stages: the database first, the object store after
 
+*Changed on 2026-10-31 (§10): the cold stage is Quickwit's. The hot
+stage stays as below, but holds a line only until Quickwit has published
+it, seconds rather than minutes; there are no chunks of the sink's own.*
+
 **Hot.** A batch lands in `log_lines` in the sink's PostgreSQL, one row
 per line (stream, offset, time, source, level, text), partitioned by day
 like `ferund`'s `traffic_records`. Recent reads and following a log come from here.
@@ -125,6 +129,10 @@ upload is overwritten by the next try (the key is the first offset) or
 swept.
 
 ### 5. A few chosen indexes, and the rest scanned
+
+*Changed on 2026-10-31 (§10): Quickwit indexes every word of a line and
+every label, level and trace ID; the sink keeps only the streams'
+table. `log_traces` and the level bits per chunk are gone.*
 
 Like Loki, the sink keeps no full-text index:
 
@@ -244,6 +252,92 @@ kept and sent again), they are kept for `--audit-retention` (one year),
 and a tenant cannot delete them. Which of FeRun's calls write one is
 decided with that step.
 
+### 10. Quickwit is the index and the cold store (2026-10-31)
+
+Decided by Malte on 2026-10-31, when two things changed: traces are
+wanted for certain, not later and maybe, and the platform is to be
+rolled out to a large organisation's teams, so the volume is a
+company's, not a lab's. The
+sink's own chunks answer a selector and a time well and a word poorly:
+a search over weeks is a scan (§5). A trace store of its own would be a
+second program of that kind, with columns, filters per block and
+merges, which is what Grafana Tempo is. [Quickwit](https://quickwit.io)
+(0.9, Apache-2.0) is both, for logs and traces: an index of every word
+in immutable splits in the object store, its metadata in PostgreSQL,
+merges and retention of its own, OTLP for logs and traces, and a
+Jaeger-compatible API for traces.
+
+- **The sink stays the gate.** Nothing else reaches Quickwit: it has no
+  authentication of its own, so a NetworkPolicy lets only `ferun-sink`
+  in. The sink keeps what is FeRun's: the nodes' and ingresses'
+  certificates (§3, §8), the labels `ferund` sets (§2), the streams with
+  their positions and the rule that a line is stored once per (stream,
+  offset), the hot stage and `follow`, the quota, the tenants' reads.
+  `GET /api/v1/logs` keeps its parameters and its answer.
+- **A line goes to Quickwit once it is stored.** The hot stage is the
+  source of truth until Quickwit has the line. The cold stage of §4
+  becomes the indexer: it claims streams with hot lines (`FOR UPDATE
+  SKIP LOCKED`, as the chunks were claimed), sends their lines to
+  Quickwit's ingest with `commit=wait_for`, which answers once the split
+  that holds them is published in the bucket and the metastore, and only
+  then moves the stream's mark (`chunked_last`) past them and deletes them
+  from `log_lines`, in one transaction. Quickwit's write-ahead log is not
+  synced to disk and does not survive a lost volume; waiting for the
+  publish makes that not matter. A line is searchable at most a commit's
+  interval (`commit_timeout_secs`, 10 s) after it is stored, and readable
+  from the hot stage at once.
+- **Once in the store, as far as reads tell.** Quickwit keeps no key of
+  its own: a batch sent again after an answer that did not arrive is
+  indexed twice. Each document carries its stream and offset, and a read
+  drops a line it has already seen, and one above its stream's mark (that
+  one is still in the hot stage of its snapshot). A reader sees each line
+  once; a count over Quickwit's documents may not.
+- **A document is a line with its stream's labels.** Fields: `ts` (ns,
+  the time field), `tenant` (a tag, so a tenant's search prunes splits),
+  `stream`, `environment`, `kind`, `object`, `replica`, `release`,
+  `instance`, `container`, `job`, `attempt`, `source`, `iostream`,
+  `level`, `trace_id`, `off`, `partial`, `cont`, and `text` with every
+  word and its position, so a phrase is found as such.
+- **An index per retention.** Quickwit drops whole splits by age, per
+  index, so a stream's retention picks its index: `ferun-logs-30d` for
+  `--log-retention`, `ferun-logs-400d` for a stream that asks for more,
+  up to `--log-retention-max`. A stream that asks for 90 days is kept for
+  400; never shorter than asked. A read searches `ferun-logs-*`.
+- **What a search is.** A read selects its streams in the database as
+  before (their labels, their marks, the hot lines in one snapshot) and
+  asks Quickwit for the cold part: the selector's labels, the time range,
+  the levels, the trace, and each word of `q` as a phrase in `text`,
+  `-word` as one that must not be there, newest or oldest first, in pages.
+  The words now match whole words, as in every search engine: `erro`
+  finds no `error`. The sink then applies the filters exactly as before
+  (substring, `re`), so what Quickwit found is narrowed, never widened. A
+  read bounded by `ScanLimit` and a cursor answers in pieces as before.
+- **Trace IDs.** The sink takes a record's own `trace_id`, `span_id` and
+  severity when the record has them (OTLP's fields), else what §6 reads
+  from the line. Quickwit indexes `trace_id`, so `log_traces` goes.
+- **Deleting** a tenant's environment or job deletes its streams' rows
+  at once, so no read finds their lines any more, and leaves a delete
+  task in Quickwit, which removes the documents when it rewrites their
+  splits (Quickwit's janitor, within two days).
+- **What was in chunks** moves into Quickwit once, chunk by chunk, after
+  which the chunk's object and row go. The sink keeps its bucket only
+  for that, and drops it with the last chunk.
+- **Traces**, next and decided with this: pods send OTLP to their node
+  (`169.254.0.1:4317` and `:4318`, a node address of its own, as DNS's
+  `169.254.0.53`); the node knows the pod by its source address, stamps
+  its `ferun.*` labels as resource attributes and sends on to the sink
+  with its certificate, as it does logs (§3). The sink sends spans to
+  Quickwit's trace index per retention (`ferun-traces-30d`, Quickwit's
+  OTLP trace mapping with the labels), and answers the Jaeger API for a
+  tenant, with the tenant's filter forced, from Quickwit's. The ingress's
+  request lines become its server spans there. Sampling stays open
+  (open question 2).
+- **Deployment.** Quickwit 0.9.3 in the namespace `ferun`: one metastore,
+  one control plane, one janitor, one indexer on a persistent volume, two
+  searchers; its metastore a database `quickwit` in `ferun-db`, its
+  splits in the sink's bucket under `quickwit/`. Its chart (0.8.17) runs
+  the 0.9.3 image; R2 takes it without request checksums.
+
 ### Steps
 
 1. **The guest's format.** CRI lines with time and stream,
@@ -266,6 +360,12 @@ decided with that step.
    certificate, `…/access-logs` read from the sink, FeCode's Logs tab
    showing requests and their traces.
 8. Later and decided apart: traces (§8), audit records (§9).
+9. **Quickwit** (§10): Quickwit deployed beside the sink; the indexer in
+   place of the chunks, reads, joins and follows from Quickwit,
+   deletion as delete tasks, the indexes per retention, the chunks moved
+   once, `log_traces` dropped, OTLP's own trace IDs and severities.
+10. **Traces** (§10): the node's OTLP listener for pods, spans through the
+    sink into Quickwit, the Jaeger API per tenant, the ingress's spans.
 
 ## Alternatives considered
 
@@ -299,6 +399,17 @@ decided with that step.
   its lines (§6).
 - **The hot stage in memory with a write-ahead log** per sink instance:
   the instances would have to share it, which the database does.
+- **The sink's own chunks for good** (steps 4 and 5, until 2026-10-31):
+  fine for a selector and a time, a scan for a word, and no place for
+  traces without building a trace store as well. Replaced by §10.
+- **Grafana Tempo** for traces (and Loki for logs): AGPL-3.0, and a
+  cluster each with a ring, ingesters and compactors. **ClickHouse**
+  (with an OpenTelemetry schema): strong where traces are aggregated
+  (latencies, rates), but it keeps its data on disks of its own with
+  replicas and Keeper; the object store as its main storage is awkward
+  in the open-source build. The choice if analytics over spans comes to
+  matter more than search. **Jaeger** stores nothing in an object store
+  itself.
 
 ## Consequences
 
@@ -312,8 +423,12 @@ decided with that step.
   log tails stay as the fallback while the sink is down.
 - FeCode drops its own build-log upload (FeCode ADR 0009 §12) once step
   4 is live.
-- Searching is a scan. A query over a month of a busy service reads a
-  lot. Its limit (§5) makes it answer in pieces, not time out.
+- Searching was a scan (§5). With Quickwit (§10) a word is looked up in
+  an index; only `re` and substrings are still scanned, within what the
+  other filters left.
+- Quickwit is a program the platform runs and watches: five kinds of
+  pods, a database, a volume for its indexer, and a NetworkPolicy that is
+  its only lock.
 - The guest's log format changes. A node and guest of before keep the
   old format, and their pods' logs reach the sink from step 3 on only.
 
