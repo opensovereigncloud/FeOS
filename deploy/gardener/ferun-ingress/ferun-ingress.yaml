@@ -353,7 +353,7 @@ spec:
             # The access log goes into the sink (ADR 0026 §8), with the
             # instance's certificate, as streams of the services it
             # served; the instance resolves the headless Service itself.
-            # Without it, it goes to ferund (PublishAccessLogs).
+            # Without it, the access log is not kept.
             - name: FERUN_INGRESS_SINK_ENDPOINT
               value: "ferun-sink-ingest.ferun.svc.cluster.local:4317"
             # Its own join token alone, copied by the init container; the

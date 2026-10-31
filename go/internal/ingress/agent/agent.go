@@ -68,8 +68,8 @@ type Config struct {
 	// Version is the program's version, sent in Hello.
 	Version string
 	// SinkEndpoint is host:port of the sink's ingest (ADR 0026 §8): the
-	// access log goes there, with the instance's certificate, in place of
-	// the control plane. "": to the control plane.
+	// access log goes there, with the instance's certificate. "": the
+	// access log is not kept, and its records are counted as dropped.
 	SinkEndpoint string
 }
 
@@ -251,7 +251,7 @@ func New(cfg Config, deps Deps) (*Agent, error) {
 		order:     shuffled,
 		tried:     map[string]bool{},
 		wakes:     map[wakeKey]*wakeEntry{},
-		alog:      newAccessLog(cfg.Name, cfg.SinkEndpoint != ""),
+		alog:      newAccessLog(cfg.Name),
 		cacheKick: make(chan struct{}, 1),
 		meshKick:  make(chan struct{}, 1),
 	}
@@ -301,15 +301,20 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.runCtx = ctx
 	a.mu.Unlock()
 	var loops sync.WaitGroup
-	loops.Add(3)
+	loops.Add(2)
 	go func() {
 		defer loops.Done()
 		a.cacheLoop(ctx)
 	}()
-	go func() {
-		defer loops.Done()
-		a.accessLogLoop(ctx)
-	}()
+	if a.sink != nil {
+		loops.Add(1)
+		go func() {
+			defer loops.Done()
+			a.accessLogLoop(ctx)
+		}()
+	} else {
+		a.log.Info("ingress agent: no sink endpoint; the access log is not kept, its records are counted as dropped")
+	}
 	go func() {
 		defer loops.Done()
 		a.meshLoop(ctx)

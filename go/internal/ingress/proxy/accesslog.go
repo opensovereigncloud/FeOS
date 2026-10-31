@@ -15,7 +15,7 @@ import (
 )
 
 // AccessLog takes the record of each request the proxy answered for an
-// environment (the agent ships them to the control plane). Record must
+// environment (the agent ships them to the sink). Record must
 // not block: it runs on the request's goroutine after its response.
 type AccessLog interface {
 	Record(wire.AccessLogEntry)

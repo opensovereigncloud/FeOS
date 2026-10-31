@@ -84,7 +84,7 @@ Go's syntax, byte sizes as integers with an optional `KiB`, `MiB` or
 | `--control-plane` | required | the nodes' port of `ferund`, `host:port`, comma-separated, tried in random order |
 | `--control-plane-name` | required | the DNS name the control plane's certificates are verified for: `ferun.<domain>` |
 | `--trust-domain` | required | the SPIFFE trust domain |
-| `--sink-endpoint` | none | the sink's ingest, `host:port`, where the access log goes ([Access log](#access-log)); a name is resolved by the instance, any of its addresses serves; empty: to `ferund` |
+| `--sink-endpoint` | none | the sink's ingest, `host:port`, where the access log goes ([Access log](#access-log)); a name is resolved by the instance, any of its addresses serves; empty: the access log is not kept, its records counted as dropped (logged once at start) |
 | `--listen-http`, `--listen-https`, `--health-listen` | required | an IP address and a port each: the pod's IP, never a wildcard, which would bind the mesh device's address too |
 | `--tls-cert`, `--tls-key` | required | the apps zone's wildcard certificate and its key, PEM, read again every 30 s |
 | `--mesh-device` | `ferun-mesh` | the WireGuard device |
@@ -771,44 +771,35 @@ tracing SDK:
   bytes, other text to 256 bytes. Requests that reach no environment
   (unknown host, a refusal before routing, port 80) are only counted in
   the metrics.
-- The agent keeps up to 10 000 records unsent (at most about 15 MiB)
-  and sends them every second, or as soon as 500 wait, with
-  `PublishAccessLogs` on its connection: a batch of at most 500, the
-  run's ID (drawn when the instance starts), the first record's number
-  and the count of records dropped since the last batch. `ferund` stores
-  each (ingress, run, number) once, so a batch sent again after a lost
-  answer is harmless.
-- A full buffer drops the new record; a batch `ferund` refuses as
-  invalid is dropped; a `ferund` without the method (`UNIMPLEMENTED`)
-  has everything pending dropped and is asked again after a minute; a
-  failed store (`UNAVAILABLE`) keeps the batch for the next send. Drops
-  are counted (`ferun_ingress_access_log_dropped_total`) and reported in
-  the next batch, which `ferund` logs.
-- `ferund` stores the records of environments that exist in
-  `access_logs`, each with its environment's owner, partitioned by day
-  and dropped after `--access-log-retention`
-  ([control-plane.md](control-plane.md)); the owner reads them with
-  `GET /api/v1/environments/{env}/access-logs`.
 - **Into the sink** (ADR 0026 §8, the contract in
-  [sink.md](sink.md#the-ingresss-access-log)). With `--sink-endpoint`
-  the agent sends the records to the sink instead
+  [sink.md](sink.md#the-ingresss-access-log)), its only destination.
+  With `--sink-endpoint` the agent sends the records to the sink
   (`LogsService/Export`, OTLP over gRPC, TLS 1.3 with its ingress
   certificate; the sink's certificate must verify to the trust bundle,
   carry no IP address and name `spiffe://<td>/sink/<name>`, whatever
   address was dialled). The name is resolved by gRPC's DNS resolver and
   dialled again after a lost connection. Each (environment, service)
   is a stream of the run, keyed `ingress/<name>`, `<env>/<service>`, the
-  run's ID, each record a JSON line of it numbered from 0, with the
-  environment's tenant as the proxy routed it. A batch holds at most
-  1,000 records or 1 MiB of lines and is numbered once: one the sink
-  failed to take is sent again as it was after a backoff (1 s, doubling
-  to 30 s), while new records wait in the buffer (10,000 with the
-  batch, as before); one it refuses (`INVALID_ARGUMENT`,
-  `RESOURCE_EXHAUSTED`) is dropped and counted. A record without a
-  tenant is dropped and counted. The agent sends while it holds a
-  certificate, with or without its connection to `ferund`, and the
-  shutdown sends the rest the same way. `ferund` reads the lines back
-  for `…/access-logs`.
+  run's ID (drawn when the instance starts), each record a JSON line of
+  it numbered from 0, with the environment's tenant as the proxy routed
+  it. The agent keeps up to 10,000 records unsent (at most about 15 MiB,
+  the batch on its way included) and sends every second, or as soon as
+  1,000 wait. A batch holds at most 1,000 records or 1 MiB of lines and
+  is numbered once: one the sink failed to take is sent again as it was
+  after a backoff (1 s, doubling to 30 s), while new records wait in the
+  buffer; one it refuses (`INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`) is
+  dropped and counted. A full buffer drops the new record, and a record
+  without a tenant is dropped; both are counted
+  (`ferun_ingress_access_log_dropped_total`). The agent sends while it
+  holds a certificate, with or without its connection to `ferund`, and
+  the shutdown sends the rest the same way.
+- **Without `--sink-endpoint`** the access log is not kept: the agent
+  says so once at its start (Info) and counts every record as dropped;
+  the proxy never waits for it.
+- `ferund` reads the lines back for
+  `GET /api/v1/environments/{env}/access-logs`
+  ([control-plane.md](control-plane.md)); it keeps no copy of its own
+  (its table `access_logs` was dropped on 2026-10-31, migration `0020`).
 
 ### Retries
 
@@ -1112,7 +1103,7 @@ expiry.
 | `ferun_ingress_upstream_connections_cut_total` | open connections to instances closed because the table no longer routes to them |
 | `ferun_ingress_upstream_connections`, `ferun_ingress_endpoints`, `ferun_ingress_endpoint_nodes{admitted}`, `ferun_ingress_hosts` | the data path now |
 | `ferun_ingress_domain_certificates`, `ferun_ingress_acme_challenges`, `ferun_ingress_acme_answers_total{result}` | hosts with a certificate of their own; the challenges in the table; requests under `/.well-known/acme-challenge/`, `answered` or `unknown` |
-| `ferun_ingress_access_log_sent_total`, `…_dropped_total`, `ferun_ingress_access_log_pending` | access log records `ferund` or the sink took, those dropped, those waiting (a batch on its way to the sink included) |
+| `ferun_ingress_access_log_sent_total`, `…_dropped_total`, `ferun_ingress_access_log_pending` | access log records the sink took, those dropped (no `--sink-endpoint`, a full buffer, a refusal), those waiting (a batch on its way to the sink included) |
 | `ferun_ingress_table_age_seconds`, `ferun_ingress_mesh_nodes{handshake}`, `ferun_ingress_mesh_handshake_age_seconds{node}`, `ferun_ingress_mesh_peers`, `ferun_ingress_mesh_configured` | the table's age and the mesh's health |
 | `ferun_ingress_info{name,version}`, `ferun_ingress_ready`, `ferun_ingress_draining`, `ferun_ingress_control_connected`, `ferun_ingress_control_refusals_total`, `ferun_ingress_identity_removed`, `ferun_ingress_identity_not_after_seconds`, `ferun_ingress_tls_not_after_seconds` | the instance |
 
@@ -1143,7 +1134,7 @@ At step 1 of an instance's stop
 ([control-plane.md](control-plane.md#stopping)), the ingress's side
 stops: the nodes' port closes every new `ferun-ingress/1` connection
 before any check, the Sync streams end with `UNAVAILABLE` "instance
-stopping", and Wake, Hold and PublishAccessLogs answer `UNAVAILABLE`. The agents reconnect
+stopping", and Wake and Hold answer `UNAVAILABLE`. The agents reconnect
 to another instance and get a whole table there. Instances of a version
 without the ingress do not know the ALPN and close the connection, and
 send no `ferun_ingress`, which the builders' 5 s backstop covers.

@@ -70,7 +70,7 @@ type Config struct {
 	ControlPlaneName string
 	TrustDomain      string
 	// SinkEndpoint is host:port of the sink's ingest (ADR 0026 §8), where
-	// the access log goes; "": to the control plane.
+	// the access log goes; "": the access log is not kept.
 	SinkEndpoint string
 	// ListenHTTP, ListenHTTPS and HealthListen are the listeners: an IP
 	// address and a port each, never an unspecified address (D20). Port 0
@@ -194,7 +194,7 @@ func registerServe(fs *flag.FlagSet, c *Config) *string {
 		"the DNS name the control plane's certificates are verified for: ferun.<domain> (required)")
 	fs.StringVar(&c.TrustDomain, "trust-domain", c.TrustDomain, "the SPIFFE trust domain (required)")
 	fs.StringVar(&c.SinkEndpoint, "sink-endpoint", c.SinkEndpoint,
-		"host:port of the sink's ingest, where the access log goes (a name is resolved, any of its addresses serves); empty: to the control plane")
+		"host:port of the sink's ingest, where the access log goes (a name is resolved, any of its addresses serves); empty: the access log is not kept")
 	fs.StringVar(&c.ListenHTTP, "listen-http", c.ListenHTTP,
 		"the HTTP listener (redirects to https), an IP address and a port: the pod's IP, never a wildcard (required)")
 	fs.StringVar(&c.ListenHTTPS, "listen-https", c.ListenHTTPS,
