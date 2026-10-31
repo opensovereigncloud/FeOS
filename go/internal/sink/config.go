@@ -9,9 +9,7 @@
 // Every flag has an environment variable FERUN_SINK_<NAME> (the flag's
 // name in upper snake case); a flag given wins over its variable. The
 // secrets come from variables only: SINK_SERVICE_TOKEN, the sink's
-// service token at ferund, and SINK_BUCKET_ACCESS_KEY and
-// SINK_BUCKET_SECRET_KEY, the keys of the bucket of the chunks made
-// before the index, while there are some.
+// service token at ferund.
 package sink
 
 import (
@@ -33,9 +31,7 @@ const EnvPrefix = "FERUN_SINK_"
 
 // The variables of the secrets.
 const (
-	EnvServiceToken    = "SINK_SERVICE_TOKEN"
-	EnvBucketAccessKey = "SINK_BUCKET_ACCESS_KEY"
-	EnvBucketSecretKey = "SINK_BUCKET_SECRET_KEY"
+	EnvServiceToken = "SINK_SERVICE_TOKEN"
 )
 
 // The log formats (--log-format).
@@ -65,11 +61,6 @@ type Config struct {
 	// searchers for everything else, and the prefix of the log indexes'
 	// names (<prefix>-<days>d).
 	IndexIngestURL, IndexSearchURL, IndexPrefix string
-	// The bucket of the chunks made before the index, until they are
-	// moved: its endpoint, region, name and keys, and the prefix of every
-	// object key. No endpoint: none.
-	BucketEndpoint, BucketRegion, Bucket, BucketPrefix string
-	BucketAccessKey, BucketSecretKey                   string
 	// Retention is how long lines are kept, unless a stream asks for
 	// longer (ferun.retention_days); RetentionMax bounds what it asks.
 	Retention, RetentionMax time.Duration
@@ -132,8 +123,6 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	}
 	if getenv != nil {
 		c.ServiceToken = getenv(EnvServiceToken)
-		c.BucketAccessKey = getenv(EnvBucketAccessKey)
-		c.BucketSecretKey = getenv(EnvBucketSecretKey)
 	}
 	if err := c.Validate(); err != nil {
 		return Config{}, err
@@ -152,10 +141,6 @@ func register(fs *flag.FlagSet, c *Config) *string {
 	fs.StringVar(&c.IndexSearchURL, "index-search-url", c.IndexSearchURL, "Quickwit's searchers, e.g. http://quickwit-searcher:7280 (required)")
 	fs.StringVar(&c.IndexPrefix, "index-prefix", c.IndexPrefix, "the prefix of the log indexes' names, <prefix>-<days>d")
 	fs.DurationVar(&c.CommitTimeout, "index-commit-timeout", c.CommitTimeout, "how soon a line is searchable in the index, whole seconds (a new index's commit_timeout_secs)")
-	fs.StringVar(&c.BucketEndpoint, "bucket-endpoint", c.BucketEndpoint, "the S3 API's base URL, path-style, of the chunks made before the index; empty: none")
-	fs.StringVar(&c.BucketRegion, "bucket-region", c.BucketRegion, "the bucket's signing region: auto for Cloudflare R2")
-	fs.StringVar(&c.Bucket, "bucket", c.Bucket, "the bucket of the chunks made before the index")
-	fs.StringVar(&c.BucketPrefix, "bucket-prefix", c.BucketPrefix, "the prefix of every object key, e.g. sink/; empty: none")
 	fs.DurationVar(&c.Retention, "log-retention", c.Retention, "how long lines are kept, unless a stream asks for longer")
 	fs.DurationVar(&c.RetentionMax, "log-retention-max", c.RetentionMax, "the longest a stream may ask for (ferun.retention_days)")
 	fs.Var((*byteSize)(&c.Quota), "log-quota", "the bytes a tenant may store a day (bytes, or with a KiB, MiB or GiB suffix); 0: no quota")
@@ -202,17 +187,6 @@ func (c *Config) Validate() error {
 	if c.CommitTimeout < time.Second || c.CommitTimeout%time.Second != 0 {
 		bad("--index-commit-timeout must be whole seconds, at least one")
 	}
-	if c.BucketEndpoint != "" {
-		if c.BucketRegion == "" || c.Bucket == "" {
-			bad("--bucket-region and --bucket are required with --bucket-endpoint")
-		}
-		if c.BucketAccessKey == "" || c.BucketSecretKey == "" {
-			bad("%s and %s are required with --bucket-endpoint", EnvBucketAccessKey, EnvBucketSecretKey)
-		}
-	}
-	if strings.HasPrefix(c.BucketPrefix, "/") {
-		bad("--bucket-prefix must not start with a slash")
-	}
 	if c.Retention <= 0 || c.RetentionMax < c.Retention {
 		bad("--log-retention must be positive and at most --log-retention-max")
 	}
@@ -223,15 +197,6 @@ func (c *Config) Validate() error {
 		bad("--log-format must be %s or %s, not %q", LogFormatJSON, LogFormatText, c.LogFormat)
 	}
 	return errors.Join(errs...)
-}
-
-// keyPrefix is the bucket prefix as keys start with it: empty, or ending
-// in a slash.
-func (c *Config) keyPrefix() string {
-	if c.BucketPrefix == "" || strings.HasSuffix(c.BucketPrefix, "/") {
-		return c.BucketPrefix
-	}
-	return c.BucketPrefix + "/"
 }
 
 // NewLogger returns the logger of a log format and level, writing to w.
@@ -249,7 +214,7 @@ func Usage(w io.Writer) {
 	c := Default()
 	register(fs, &c)
 	fmt.Fprintln(w, "Usage: ferun-sink [serve] [flags]\n\nRuns the sink until SIGTERM or SIGINT. Every flag has an environment variable "+
-		EnvPrefix+"<NAME>;\nthe secrets come from "+EnvServiceToken+", "+EnvBucketAccessKey+" and "+EnvBucketSecretKey+".\n\nFlags:")
+		EnvPrefix+"<NAME>;\nthe secret comes from "+EnvServiceToken+".\n\nFlags:")
 	fs.SetOutput(w)
 	fs.PrintDefaults()
 }

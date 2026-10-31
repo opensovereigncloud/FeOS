@@ -321,7 +321,8 @@ Jaeger-compatible API for traces.
   splits (Quickwit's janitor, within two days).
 - **What was in chunks** moves into Quickwit once, chunk by chunk, after
   which the chunk's object and row go. The sink keeps its bucket only
-  for that, and drops it with the last chunk.
+  for that, and drops it with the last chunk (done on 2026-10-31: all
+  74 chunks moved, `log_chunks` dropped).
 - **Traces**, next and decided with this: pods send OTLP to their node
   (`169.254.0.1:4317` and `:4318`, a node address of its own, as DNS's
   `169.254.0.53`); the node knows the pod by its source address, stamps

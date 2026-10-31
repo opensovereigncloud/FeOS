@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -145,40 +144,6 @@ func TestCursor(t *testing.T) {
 	}
 }
 
-func TestChunkCodec(t *testing.T) {
-	in := []Line{
-		{Stream: 7, Off: 0, TS: 100, Source: "stdout", Level: LevelError, Text: `{"level":"error"} <&>`},
-		{Stream: 7, Off: 50, TS: 101, Source: "stderr", Level: LevelUnknown, Partial: true, Cont: true, Text: strings.Repeat("x", 70000)},
-		{Stream: 7, Off: 70100, TS: 102, Level: LevelDebug, Text: ""},
-	}
-	data, err := encodeChunk(in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if data[0] != 0x1f || data[1] != 0x8b {
-		t.Fatal("not gzip")
-	}
-	out, err := decodeChunk(data, 7, 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(out) != len(in) {
-		t.Fatalf("%d lines", len(out))
-	}
-	for i := range in {
-		if out[i] != in[i] {
-			t.Errorf("line %d: %+v, want %+v", i, out[i], in[i])
-		}
-	}
-	first, _ := encodeChunk(in[:1])
-	if s := gunzip(t, first); s != `{"o":0,"t":100,"s":"stdout","l":"error","x":"{\"level\":\"error\"} <&>"}`+"\n" {
-		t.Errorf("NDJSON %q", s)
-	}
-	if _, err := decodeChunk(data, 7, 100); err == nil {
-		t.Error("decode beyond the limit succeeded")
-	}
-}
-
 func TestTenants(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -287,31 +252,20 @@ func TestParseExport(t *testing.T) {
 func TestConfig(t *testing.T) {
 	env := map[string]string{
 		"FERUN_SINK_NAME": "sink-0", "FERUN_SINK_DATABASE_URL": "postgres://x/sink", "FERUN_SINK_TRUST_DOMAIN": "run.example.com",
-		"FERUN_SINK_FERUN_URL": "http://ferund:8100", "FERUN_SINK_BUCKET_ENDPOINT": "https://acc.eu.r2.cloudflarestorage.com",
-		"FERUN_SINK_BUCKET_REGION": "auto", "FERUN_SINK_BUCKET": "fecode-dev", "FERUN_SINK_BUCKET_PREFIX": "sink",
+		"FERUN_SINK_FERUN_URL": "http://ferund:8100",
 		"FERUN_SINK_LOG_QUOTA": "1GiB", "FERUN_SINK_INDEX_INGEST_URL": "http://quickwit-indexer:7280",
 		"FERUN_SINK_INDEX_SEARCH_URL": "http://quickwit-searcher:7280",
-		EnvServiceToken:               "tok", EnvBucketAccessKey: "ak", EnvBucketSecretKey: "sk",
+		EnvServiceToken:               "tok",
 	}
 	c, err := Parse([]string{"--log-retention", "24h"}, func(k string) string { return env[k] })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Name != "sink-0" || c.Retention != 24*time.Hour || c.Quota != 1<<30 || c.ServiceToken != "tok" || c.keyPrefix() != "sink/" {
+	if c.Name != "sink-0" || c.Retention != 24*time.Hour || c.Quota != 1<<30 || c.ServiceToken != "tok" {
 		t.Errorf("config %+v", c)
 	}
 	if c.IndexPrefix != "ferun-logs" || c.CommitTimeout != 10*time.Second {
 		t.Errorf("index %q, commit %v", c.IndexPrefix, c.CommitTimeout)
-	}
-	// The bucket is only for the chunks of before: without it, no keys.
-	noBucket := map[string]string{}
-	for k, v := range env {
-		if !strings.Contains(k, "BUCKET") {
-			noBucket[k] = v
-		}
-	}
-	if _, err := Parse(nil, func(k string) string { return noBucket[k] }); err != nil {
-		t.Errorf("without a bucket: %v", err)
 	}
 	delete(env, "FERUN_SINK_INDEX_SEARCH_URL")
 	if _, err := Parse(nil, func(k string) string { return env[k] }); err == nil {

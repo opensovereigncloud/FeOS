@@ -262,13 +262,9 @@ one (stream, offset) once. `--index-ingest-url` names Quickwit's
 indexers, `--index-search-url` its searchers (every other call).
 
 **Chunks of before.** Until 2026-10-31 the cold stage wrote gzip NDJSON
-chunks to the object store (`log_chunks`; `{"o":offset,"t":ns,"s":"stdout","l":"error","p":true,"c":true,"x":"text"}`
-a line at `<prefix>logs/<tenant>/<stream id>/<first offset>.ndjson.gz`).
-With `--bucket-endpoint` (S3 with SigV4 at path-style URLs, `--bucket`,
-`--bucket-region`, `--bucket-prefix`, keys from `SINK_BUCKET_ACCESS_KEY`
-and `SINK_BUCKET_SECRET_KEY`), one instance at a time moves them into the
-index, eight a minute: their lines indexed, then the row and the object
-deleted. Without it, nothing reads them.
+chunks to the object store (`log_chunks`); they all moved into the index
+that day, and the table, the code that moved them and the sink's bucket
+settings went (migration `0007`).
 
 **Level** (§6): an OTLP record's severity number when the text gives
 none (1 to 8 debug, 9 to 12 info, 13 to 16 warn, 17 to 24 error); a JSON line's `level`, `lvl` or `severity` (a word, or a

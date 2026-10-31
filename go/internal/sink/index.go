@@ -4,14 +4,9 @@
 package sink
 
 import (
-	"bufio"
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strconv"
 	"sync"
 	"time"
@@ -19,7 +14,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
-	"github.com/gardenlinux/feos/go/internal/sink/s3"
 )
 
 // Index is the cold stage (ADR 0026 §10): Quickwit (quickwit.Client) or a
@@ -47,8 +41,6 @@ const (
 	// indexBackoff is how long the streams of a round the index failed
 	// wait.
 	indexBackoff = 30 * time.Second
-	// maxObjectBytes bounds a chunk of before (moveChunks) when read.
-	maxObjectBytes = 64 << 20
 )
 
 // indexID is the index of a retention in days: <prefix>-<days>d.
@@ -114,7 +106,7 @@ func lineOf(d quickwit.Doc, id int64) Line {
 
 // RunIndex runs indexWorkers loops that hand the hot lines to the index,
 // each again at once after a round that found work, else after
-// ChunkInterval, and the move of the chunks of before, until ctx ends.
+// ChunkInterval, until ctx ends.
 func (s *Store) RunIndex(ctx context.Context) error {
 	var wg sync.WaitGroup
 	loop := func(name string, round func(context.Context) (int, error), wait time.Duration) {
@@ -140,10 +132,6 @@ func (s *Store) RunIndex(ctx context.Context) error {
 	for range indexWorkers {
 		wg.Add(1)
 		go loop("cold stage", s.indexRound, s.cfg.ChunkInterval)
-	}
-	if s.bucket != nil {
-		wg.Add(1)
-		go loop("chunks of before", s.moveChunks, time.Minute)
 	}
 	wg.Wait()
 	return nil
@@ -321,136 +309,4 @@ func (s *Store) release(cs []*claimed, backoff bool) {
 	if _, err := s.db.Pool.Exec(ctx, sql, args...); err != nil {
 		s.log.Warn("release claims", "err", err)
 	}
-}
-
-// chunkMoveLock lets one instance at a time move the chunks of before.
-const chunkMoveLock int64 = 0x73696e6b_0003
-
-// moveChunks moves the chunks the sink made before Quickwit (ADR 0026
-// §10) into the index, a few a round: their lines are indexed, then the
-// row and the object go. Only one instance moves at a time.
-func (s *Store) moveChunks(ctx context.Context) (int, error) {
-	conn, err := s.db.Pool.Acquire(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer conn.Release()
-	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, chunkMoveLock).Scan(&locked); err != nil || !locked {
-		return 0, err
-	}
-	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, chunkMoveLock) }()
-	rows, err := conn.Query(ctx, `SELECT `+prefixed("s", streamCols)+`, s.retention_days, c.id, c.key
-		FROM log_chunks c JOIN log_streams s ON s.id = c.stream_id ORDER BY c.id LIMIT 8`)
-	if err != nil {
-		return 0, fmt.Errorf("chunks: %w", err)
-	}
-	type chunk struct {
-		id        int64
-		key       string
-		st        *streamRow
-		retention *int
-	}
-	cs, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (chunk, error) {
-		var c chunk
-		st, err := scanStreamWith(r, &c.retention, &c.id, &c.key)
-		c.st = st
-		return c, err
-	})
-	if err != nil {
-		return 0, fmt.Errorf("chunks: %w", err)
-	}
-	moved := 0
-	for _, c := range cs {
-		data, err := s.bucket.Get(ctx, c.key, maxObjectBytes)
-		var lines []Line
-		switch {
-		case errors.Is(err, s3.ErrNotFound):
-		case err != nil:
-			return moved, fmt.Errorf("read chunk %s: %w", c.key, err)
-		default:
-			if lines, err = decodeChunk(data, c.st.ID, maxObjectBytes); err != nil {
-				return moved, fmt.Errorf("chunk %s: %w", c.key, err)
-			}
-		}
-		if len(lines) > 0 {
-			id, days := s.indexOf(c.retention)
-			if err := s.ensure(ctx, id, days); err != nil {
-				return moved, err
-			}
-			docs := make([]quickwit.Doc, len(lines))
-			for i, l := range lines {
-				_, l.Trace = Extract(l.Text)
-				docs[i] = docOf(l, c.st)
-			}
-			if err := s.index.Ingest(ctx, id, docs); err != nil {
-				return moved, fmt.Errorf("index chunk %s: %w", c.key, err)
-			}
-		}
-		if _, err := conn.Exec(ctx, `DELETE FROM log_chunks WHERE id = $1`, c.id); err != nil {
-			return moved, err
-		}
-		if err := s.bucket.Delete(ctx, c.key); err != nil && !errors.Is(err, s3.ErrNotFound) {
-			s.log.Warn("delete a moved chunk's object", "key", c.key, "err", err)
-		}
-		s.log.Info("moved a chunk into the index", "key", c.key, "lines", len(lines))
-		moved++
-	}
-	return moved, nil
-}
-
-// chunkLine is a line of a chunk of before (gzip NDJSON, sink.md).
-type chunkLine struct {
-	O int64  `json:"o"`
-	T int64  `json:"t"`
-	S string `json:"s,omitempty"`
-	L string `json:"l,omitempty"`
-	P bool   `json:"p,omitempty"`
-	C bool   `json:"c,omitempty"`
-	X string `json:"x"`
-}
-
-// encodeChunk writes lines as a chunk of before (for the tests of the
-// move).
-func encodeChunk(lines []Line) ([]byte, error) {
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	enc := json.NewEncoder(zw)
-	enc.SetEscapeHTML(false)
-	for _, l := range lines {
-		if err := enc.Encode(chunkLine{O: l.Off, T: l.TS, S: l.Source, L: LevelName(l.Level), P: l.Partial, C: l.Cont, X: l.Text}); err != nil {
-			return nil, err
-		}
-	}
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-// decodeChunk reads a chunk of before into lines of stream, at most limit
-// bytes uncompressed.
-func decodeChunk(data []byte, stream int64, limit int64) ([]Line, error) {
-	zr, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return nil, fmt.Errorf("chunk: %w", err)
-	}
-	sc := bufio.NewScanner(io.LimitReader(zr, limit))
-	sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
-	var out []Line
-	for sc.Scan() {
-		var c chunkLine
-		if err := json.Unmarshal(sc.Bytes(), &c); err != nil {
-			return nil, fmt.Errorf("chunk line %d: %w", len(out)+1, err)
-		}
-		lvl := levelBit(c.L)
-		if lvl == 0 {
-			lvl = LevelUnknown
-		}
-		out = append(out, Line{Stream: stream, Off: c.O, TS: c.T, Source: c.S, Level: lvl, Partial: c.P, Cont: c.C, Text: c.X})
-	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("chunk: %w", err)
-	}
-	return out, nil
 }

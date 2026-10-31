@@ -16,7 +16,6 @@ import (
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/db/dbtest"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
-	"github.com/gardenlinux/feos/go/internal/sink/s3"
 )
 
 // quickwitQuery selects a tenant's environment, as many as the tests hold.
@@ -24,58 +23,9 @@ func quickwitQuery(tenant, env string) quickwit.Query {
 	return quickwit.Query{Tenant: tenant, Environment: env, Max: 100000}
 }
 
-// memBucket is a bucket in memory.
-type memBucket struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	puts    int
-	failPut error
-}
-
-func newMemBucket() *memBucket { return &memBucket{objects: map[string][]byte{}} }
-
-func (b *memBucket) Put(_ context.Context, key string, body []byte, _ string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.failPut != nil {
-		return b.failPut
-	}
-	b.puts++
-	b.objects[key] = append([]byte(nil), body...)
-	return nil
-}
-
-func (b *memBucket) Get(_ context.Context, key string, _ int64) ([]byte, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	o, ok := b.objects[key]
-	if !ok {
-		return nil, fmt.Errorf("GET %s: %w", key, s3.ErrNotFound)
-	}
-	return o, nil
-}
-
-func (b *memBucket) Delete(_ context.Context, key string) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.objects, key)
-	return nil
-}
-
-func (b *memBucket) keys() []string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	var ks []string
-	for k := range b.objects {
-		ks = append(ks, k)
-	}
-	return ks
-}
-
 func testConfig() Config {
 	c := Default()
 	c.Name = "sink-0"
-	c.BucketPrefix = "pre"
 	return c
 }
 
@@ -95,7 +45,7 @@ func newTestStore(t *testing.T, cfg Config) (*Store, *memIndex) {
 	t.Helper()
 	d := newTestDB(t)
 	idx := newMemIndex()
-	return NewStore(d, idx, newMemBucket(), cfg, dbtest.Logger(t)), idx
+	return NewStore(d, idx, cfg, dbtest.Logger(t)), idx
 }
 
 // base is the tests' time of the first line.
@@ -509,7 +459,7 @@ func TestIndexClaimsAcrossInstances(t *testing.T) {
 	for i := range stores {
 		c := cfg
 		c.Name = fmt.Sprintf("sink-%d", i)
-		stores[i] = NewStore(d, idx, nil, c, dbtest.Logger(t))
+		stores[i] = NewStore(d, idx, c, dbtest.Logger(t))
 	}
 	const streams, rounds = 20, 5
 	for r := 0; r < rounds; r++ {
@@ -676,45 +626,5 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("timed out")
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-func TestMoveChunks(t *testing.T) {
-	s, idx := newTestStore(t, testConfig())
-	ctx := context.Background()
-	bucket := s.bucket.(*memBucket)
-	key := StreamKey{"p", "c", "1"}
-	text := func(i int) string { return fmt.Sprintf("ERROR before %d", i) }
-	if err := s.Ingest(ctx, batch(key, envLabels("acme", "e", 0), lines(0, base, 3, text))); err != nil {
-		t.Fatal(err)
-	}
-	// The three lines as the chunk the sink made before the index: their
-	// object and row, the stream's mark past them, no hot line.
-	ls := lines(0, base, 3, text)
-	data, err := encodeChunk(ls)
-	if err != nil {
-		t.Fatal(err)
-	}
-	k := "pre/logs/acme/s_x/0.ndjson.gz"
-	_ = bucket.Put(ctx, k, data, "application/gzip")
-	if _, err := s.db.Pool.Exec(ctx, `WITH d AS (DELETE FROM log_lines)
-		UPDATE log_streams SET hot_lines = 0, hot_bytes = 0, hot_since = NULL, chunked_last = 20`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.Pool.Exec(ctx, `INSERT INTO log_chunks (stream_id, first_off, last_off, first_ns, last_ns, lines, bytes, levels, key)
-		SELECT id, 0, 20, $1, $1, 3, 30, 1, $2 FROM log_streams`, base, k); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := s.moveChunks(ctx); err != nil || n != 1 {
-		t.Fatalf("moved %d: %v", n, err)
-	}
-	var chunks int
-	_ = s.db.Pool.QueryRow(ctx, `SELECT count(*) FROM log_chunks`).Scan(&chunks)
-	if chunks != 0 || len(bucket.keys()) != 0 || idx.count("acme") != 3 {
-		t.Errorf("after the move: %d chunks, objects %v, %d documents", chunks, bucket.keys(), idx.count("acme"))
-	}
-	r := mustRead(t, s, "acme", url.Values{"environment": {"e"}, "level": {"error"}})
-	if len(r.lines) != 3 {
-		t.Errorf("read %d lines", len(r.lines))
 	}
 }

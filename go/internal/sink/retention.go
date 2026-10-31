@@ -9,17 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"golang.org/x/sync/errgroup"
-
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
-)
-
-// The sweep's bounds: the chunks one round deletes, and the objects
-// deleted at once.
-const (
-	sweepBatch     = 1000
-	deleteParallel = 8
 )
 
 // retentionNs is a stream's retention in SQL, in ns: its
@@ -66,7 +56,6 @@ func (s *Store) Sweep(ctx context.Context) error {
 	}
 	tag, err := s.db.Pool.Exec(ctx, `DELETE FROM log_streams s
 		WHERE s.hot_lines = 0 AND s.chunk_owner IS NULL
-			AND NOT EXISTS (SELECT 1 FROM log_chunks c WHERE c.stream_id = s.id)
 			AND NOT EXISTS (SELECT 1 FROM log_lines l WHERE l.stream_id = s.id)
 			AND coalesce(s.last_ns, (extract(epoch FROM s.created_at) * 1000000000)::bigint) < `+nowNs+` - `+retentionNs,
 		def, maxRet)
@@ -88,49 +77,12 @@ func (s *Store) Sweep(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// deleteChunks deletes chunks: each object, then the rows of those whose
-// object went. It returns how many rows it deleted.
-func (s *Store) deleteChunks(ctx context.Context, ids []int64, keys []string) (int, error) {
-	if s.bucket == nil {
-		_, err := s.db.Pool.Exec(ctx, `DELETE FROM log_chunks WHERE id = ANY($1)`, ids)
-		return len(ids), err
-	}
-	okIDs := make([]int64, 0, len(ids))
-	ok := make([]bool, len(ids))
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(deleteParallel)
-	for i := range keys {
-		g.Go(func() error {
-			if err := s.bucket.Delete(gctx, keys[i]); err != nil {
-				return err
-			}
-			ok[i] = true
-			return nil
-		})
-	}
-	err := g.Wait()
-	for i, id := range ids {
-		if ok[i] {
-			okIDs = append(okIDs, id)
-		}
-	}
-	if len(okIDs) > 0 {
-		if _, derr := s.db.Pool.Exec(ctx, `DELETE FROM log_chunks WHERE id = ANY($1)`, okIDs); derr != nil {
-			return 0, errors.Join(err, fmt.Errorf("delete chunk rows: %w", derr))
-		}
-	}
-	if err != nil {
-		return len(okIDs), fmt.Errorf("delete chunk objects: %w", err)
-	}
-	return len(okIDs), nil
-}
-
 // DeleteStreams deletes a tenant's streams of an environment or a job:
 // it leaves a delete task of them in every log index (Quickwit removes
 // their lines when it rewrites their splits; until then no read finds
-// them, their streams being gone), deletes the chunks of before (objects,
-// then rows), then the streams with their hot lines. It returns how many
-// streams went.
+// them, their streams being gone), then deletes the streams with their
+// hot lines, each under its lock, which keeps the cold stage from moving
+// its mark meanwhile. It returns how many streams went.
 func (s *Store) DeleteStreams(ctx context.Context, tenant, environment, job string) (int, error) {
 	sel := Selector{Environment: environment, Job: job}
 	streams, err := selectStreams(ctx, s.db.Pool, tenant, streamFilter{sel: sel, limit: maxStreamsRead})
@@ -150,66 +102,11 @@ func (s *Store) DeleteStreams(ctx context.Context, tenant, environment, job stri
 	}
 	gone := 0
 	for _, st := range streams {
-		// A chunk of before is moved or deleted; one moved meanwhile
-		// keeps nothing.
-		for range 3 {
-			rows, err := s.db.Pool.Query(ctx, `SELECT id, key FROM log_chunks WHERE stream_id = $1`, st.ID)
-			if err != nil {
-				return gone, err
-			}
-			var ids []int64
-			var keys []string
-			for rows.Next() {
-				var id int64
-				var key string
-				if err := rows.Scan(&id, &key); err != nil {
-					rows.Close()
-					return gone, err
-				}
-				ids, keys = append(ids, id), append(keys, key)
-			}
-			rows.Close()
-			if err := rows.Err(); err != nil {
-				return gone, err
-			}
-			if len(ids) > 0 {
-				if _, err := s.deleteChunks(ctx, ids, keys); err != nil {
-					return gone, err
-				}
-			}
-			// The stream's lock keeps the cold stage from moving its mark
-			// until it is gone; then it finds it gone.
-			deleted := false
-			err = s.db.Tx(ctx, func(tx pgx.Tx) error {
-				deleted = false
-				var one int
-				err := tx.QueryRow(ctx, `SELECT 1 FROM log_streams WHERE id = $1 AND tenant = $2 FOR UPDATE`, st.ID, tenant).Scan(&one)
-				if errors.Is(err, pgx.ErrNoRows) {
-					return nil
-				}
-				if err != nil {
-					return err
-				}
-				// A statement of its own, after the lock: it sees a chunk
-				// committed while it waited.
-				var chunks bool
-				if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM log_chunks WHERE stream_id = $1)`, st.ID).Scan(&chunks); err != nil || chunks {
-					return err
-				}
-				if _, err := tx.Exec(ctx, `DELETE FROM log_streams WHERE id = $1`, st.ID); err != nil {
-					return err
-				}
-				deleted = true
-				return nil
-			})
-			if err != nil {
-				return gone, err
-			}
-			if deleted {
-				gone++
-				break
-			}
+		tag, err := s.db.Pool.Exec(ctx, `DELETE FROM log_streams WHERE id = $1 AND tenant = $2`, st.ID, tenant)
+		if err != nil {
+			return gone, err
 		}
+		gone += int(tag.RowsAffected())
 	}
 	return gone, nil
 }

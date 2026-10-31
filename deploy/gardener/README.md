@@ -13,7 +13,7 @@ what FeOS needs (ublk, tun, vhost-vsock, WireGuard, nftables).
 |---|---|---|
 | [`feos/`](feos/) | namespace `feos`, the DaemonSet `feos-node` on every worker of the pool `WORKER_POOL`, and `feos-k8s` | diskd and feosd in a pod per worker, whose microVMs live in it (ADR 0020); feos-k8s joins new workers and drains cordoned ones in FeRun |
 | [`ferun/`](ferun/) | namespace `ferun` | ferund, three instances, one on each worker, and its PostgreSQL `ferun-db`, a CloudNativePG cluster of three instances, one on each worker ([`ferun/postgres.yaml`](ferun/postgres.yaml)); the k3s manifests of ferund ([`../k3s/ferun`](../k3s/ferun)) with the nodes' port at a shoot address; `https://run.<DOMAIN>` by the HTTPRoute [`ferun/route.yaml`](ferun/route.yaml) in place of k3s's Ingress |
-| [`ferun-sink/`](ferun-sink/) | namespace `ferun` | ferun-sink, two instances over the database `sink` of `ferun-db` and the bucket: the nodes ship logs to its ingest's instances, tenants read at `https://run.<DOMAIN>/api/v1/logs` ([The sink](#the-sink)) |
+| [`ferun-sink/`](ferun-sink/) | namespace `ferun` | ferun-sink, two instances over the database `sink` of `ferun-db` and Quickwit (`quickwit/`): the nodes ship logs to its ingest's instances, tenants read at `https://run.<DOMAIN>/api/v1/logs` ([The sink](#the-sink)) |
 | [`ferun-ingress/`](ferun-ingress/) | namespace `ferun-ingress` | ferun-ingress, an instance on every worker, behind a LoadBalancer of their own with `externalTrafficPolicy: Local`: `https://<label>.<APPS_ZONE>`, public environments' hosts, straight to their pods over the mesh ([The ingress](#the-ingress)) |
 | [`../k3s/fechat`](../k3s/fechat), [`fechat/`](fechat/) | namespace `fechat` | FeChat, unchanged but for its route: `https://chat.<DOMAIN>` by the HTTPRoute [`fechat/route.yaml`](fechat/route.yaml) in place of k3s's Ingress |
 | [`registry/`](registry/) | namespace `registry` | an image registry, `https://oci.<DOMAIN>`: distribution with its blobs in an object store |
@@ -365,8 +365,8 @@ Afterwards:
 ferun-sink (ADR 0026, [`docs/architecture/sink.md`](../../docs/architecture/sink.md))
 keeps the pods' logs: the Deployment `ferun-sink` of
 [`ferun-sink/`](ferun-sink/ferun-sink.yaml), two instances in the
-namespace `ferun`, over the database `sink` of `ferun-db` and the
-platform's bucket. The nodes ship to its ingest, port 4317, over mTLS
+namespace `ferun`, over the database `sink` of `ferun-db` and
+Quickwit. The nodes ship to its ingest, port 4317, over mTLS
 with their node certificates, each at the address of an instance that
 ferund gives it: the hosts reach no ClusterIP, so the Service
 `ferun-sink-ingest` is headless and ferund resolves it; tenants
@@ -394,8 +394,9 @@ certificates (`POST /api/v1/service-certificates`) and answers `GET
        kubectl -n ferun exec deploy/ferund -- /ferund service-token --kind sink --name ferun-sink
        kubectl -n ferun create secret generic ferun-sink-token --from-literal=token=<token>
 
-3. The bucket: the platform's, under a prefix of its own (Cloudflare R2:
-   region `auto`; the key needs read and write on the bucket):
+3. The bucket, where Quickwit keeps its splits (step 5): the platform's
+   (Cloudflare R2: region `auto`; the key needs read and write on the
+   bucket); the sink itself reads no bucket:
 
        kubectl -n ferun create secret generic ferun-sink-bucket \
          --from-literal=endpoint=https://<account>.eu.r2.cloudflarestorage.com \
@@ -431,10 +432,8 @@ A new image: `make -C deploy/gardener deploy-ferun-sink TAG=<tag>`
 pushes it and rolls the instances. Lines are kept 30 days
 (`FERUN_SINK_LOG_RETENTION`, the index `ferun-logs-30d`), a tenant's job
 asks for up to 400 (`FERUN_SINK_LOG_RETENTION_MAX`, `ferun-logs-400d`).
-The chunks the sink wrote before Quickwit
-(`<prefix>logs/<tenant>/<stream>/<first offset>.ndjson.gz`) move into
-the index by themselves; once `log_chunks` is empty the bucket's
-variables can go.
+The chunks the sink wrote before Quickwit all moved into the index on
+2026-10-31.
 
 ## Moving the database
 

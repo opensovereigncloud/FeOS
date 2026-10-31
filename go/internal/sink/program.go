@@ -16,7 +16,6 @@ import (
 
 	"github.com/gardenlinux/feos/go/internal/db"
 	"github.com/gardenlinux/feos/go/internal/sink/quickwit"
-	"github.com/gardenlinux/feos/go/internal/sink/s3"
 )
 
 // tenantTTL is how long a token's tenant is kept.
@@ -39,13 +38,11 @@ type Program struct {
 }
 
 // Deps are what tests replace: the index (nil: Quickwit at the
-// configuration's URLs), the bucket (nil: the S3 client of the
-// configuration, if it names one) and the HTTP client of the calls to
-// ferund (nil: the default).
+// configuration's URLs) and the HTTP client of the calls to ferund (nil:
+// the default).
 type Deps struct {
-	Index  Index
-	Bucket Bucket
-	HTTP   *http.Client
+	Index Index
+	HTTP  *http.Client
 }
 
 // New opens and migrates the database and binds the HTTP API's listener;
@@ -61,15 +58,6 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 	if err := Migrate(ctx, d); err != nil {
 		d.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
-	}
-	bucket := deps.Bucket
-	if bucket == nil && cfg.BucketEndpoint != "" {
-		c, err := s3.New(cfg.BucketEndpoint, cfg.BucketRegion, cfg.Bucket, cfg.BucketAccessKey, cfg.BucketSecretKey)
-		if err != nil {
-			d.Close()
-			return nil, err
-		}
-		bucket = c
 	}
 	index := deps.Index
 	if index == nil {
@@ -89,7 +77,7 @@ func New(ctx context.Context, cfg Config, deps Deps, log *slog.Logger) (*Program
 		cfg:      cfg,
 		log:      log,
 		db:       d,
-		store:    NewStore(d, index, bucket, cfg, log),
+		store:    NewStore(d, index, cfg, log),
 		ident:    NewIdentity(cfg.FerunURL, cfg.ServiceToken, cfg.TrustDomain, cfg.Name, deps.HTTP, log),
 		tenants:  NewTenants(cfg.FerunURL, deps.HTTP, tenantTTL),
 		apiLis:   lis,

@@ -17,25 +17,12 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/gardenlinux/feos/go/internal/db"
-	"github.com/gardenlinux/feos/go/internal/sink/s3"
 )
 
-// Bucket is the object store of the chunks made before the index
-// (s3.Client).
-type Bucket interface {
-	Put(ctx context.Context, key string, body []byte, contentType string) error
-	Get(ctx context.Context, key string, limit int64) ([]byte, error)
-	Delete(ctx context.Context, key string) error
-}
-
-var _ Bucket = (*s3.Client)(nil)
-
 // Store is the sink's database and index: the write path, the cold
-// stage, the reads and retention. The bucket holds the chunks made before
-// the index (ADR 0026 §10) until they are moved; nil: none.
+// stage, the reads and retention.
 type Store struct {
 	db      *db.DB
-	bucket  Bucket
 	index   Index
 	ensured *ensured
 	cfg     Config
@@ -49,12 +36,11 @@ type Store struct {
 // maxScans is how many reads scan at once; more wait.
 const maxScans = 8
 
-// NewStore returns the store over d, index and bucket (nil: no chunks of
-// before to move).
-func NewStore(d *db.DB, index Index, bucket Bucket, cfg Config, log *slog.Logger) *Store {
+// NewStore returns the store over d and index.
+func NewStore(d *db.DB, index Index, cfg Config, log *slog.Logger) *Store {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b)
-	return &Store{db: d, bucket: bucket, index: index, ensured: &ensured{ids: map[string]bool{}}, cfg: cfg, log: log,
+	return &Store{db: d, index: index, ensured: &ensured{ids: map[string]bool{}}, cfg: cfg, log: log,
 		owner: cfg.Name + "/" + hex.EncodeToString(b), scans: make(chan struct{}, maxScans)}
 }
 

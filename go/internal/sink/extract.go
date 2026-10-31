@@ -9,8 +9,8 @@ import (
 	"strings"
 )
 
-// A line's level, as a bit: a chunk keeps the bits of all its lines'
-// levels (log_chunks.levels), a hot line its own (log_lines.level).
+// A line's level, as a bit: a hot line keeps its own (log_lines.level),
+// a document of the index too (its field level).
 const (
 	LevelError   = 1
 	LevelWarn    = 2
